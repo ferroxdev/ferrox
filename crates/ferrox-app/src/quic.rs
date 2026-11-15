@@ -688,7 +688,9 @@ pub(crate) fn apply_congestion(
     profile: ferrox_core::hysteria::BbrProfile,
 ) -> Option<()> {
     use ferrox_core::hysteria::Congestion;
-    let cc = cc?;
+    let Some(cc) = cc else {
+        return Some(());
+    };
     config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
     if matches!(cc, Congestion::Bbr | Congestion::Brutal) {
         config.set_custom_bbr_params(bbr_params(profile));
@@ -5862,7 +5864,10 @@ mod tests {
             assert!(apply_congestion(&mut config, Some(cc), BbrProfile::Standard).is_some());
         }
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
-        assert!(apply_congestion(&mut config, None, BbrProfile::Standard).is_none());
+        assert!(
+            apply_congestion(&mut config, None, BbrProfile::Standard).is_some(),
+            "no choice leaves quiche's CUBIC default"
+        );
     }
 
     #[test]
@@ -7020,7 +7025,8 @@ mod tests {
         cc: Option<ferrox_core::hysteria::Congestion>,
     ) -> (Lane, Lane) {
         let mut server_config = serve_config(identity).expect("serves");
-        apply_lane_congestion(&mut server_config, cc, None);
+        apply_lane_congestion(&mut server_config, cc, None)
+            .expect("the test lane takes its controller");
         server_config.set_active_connection_id_limit(4);
         let mut client_config = if verify {
             quiche_config(roots, None).expect("trusts")
@@ -7030,7 +7036,8 @@ mod tests {
             config.set_application_protos(&[ALPN]).expect("negotiates");
             config
         };
-        apply_lane_congestion(&mut client_config, cc, None);
+        apply_lane_congestion(&mut client_config, cc, None)
+            .expect("the test lane takes its controller");
         client_config.set_active_connection_id_limit(4);
         let server_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
         let server_addr = server_sock.local_addr().expect("addr");

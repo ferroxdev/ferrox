@@ -224,6 +224,8 @@ struct Server {
     auth: String,
     obfs: String,
     hop: Option<ferrox_core::hysteria::Hop>,
+    /// A tuned QUIC lane is its own connection: its windows, controller profile and Brutal rates were negotiated, so a dial with another block may not ride it.
+    quic: Option<ferrox_core::hysteria::QuicParams>,
     roots: Option<ferrox_core::tls::Anchors>,
 }
 
@@ -244,6 +246,7 @@ fn server_of(dial: &Dial) -> Server {
         auth: dial.config.auth.clone(),
         obfs: dial.config.obfs_password.clone(),
         hop: dial.config.hop.clone(),
+        quic: dial.config.quic,
         roots: dial.roots.clone(),
     }
 }
@@ -1220,6 +1223,46 @@ mod tests {
                 .0
                 .port,
             80
+        );
+    }
+
+    #[test]
+    fn a_v1_tuned_plan_is_its_own_pool_key() {
+        // A controller or profile chosen for one lane may not ride a connection negotiated under another.
+        let dial = |quic: Option<ferrox_core::hysteria::QuicParams>| Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port: 443,
+            config: ferrox_core::hysteria::Config {
+                version: 1,
+                auth: "a".to_owned(),
+                quic,
+                ..ferrox_core::hysteria::Config::default()
+            },
+            roots: None,
+        };
+        let bbr = ferrox_core::hysteria::QuicParams {
+            bbr_profile: ferrox_core::hysteria::BbrProfile::Aggressive,
+            ..ferrox_core::hysteria::QuicParams::default()
+        };
+        let cubic = ferrox_core::hysteria::QuicParams {
+            cc: Some(ferrox_core::hysteria::Congestion::Cubic),
+            ..ferrox_core::hysteria::QuicParams::default()
+        };
+        assert_eq!(
+            server_of(&dial(Some(bbr))),
+            server_of(&dial(Some(bbr))),
+            "a tuned lane reuses itself"
+        );
+        assert_ne!(
+            server_of(&dial(Some(bbr))),
+            server_of(&dial(Some(cubic))),
+            "a different profile or controller is a different lane"
+        );
+        assert_ne!(
+            server_of(&dial(None)),
+            server_of(&dial(Some(cubic))),
+            "a tuned lane never rides a plain connection"
         );
     }
 
