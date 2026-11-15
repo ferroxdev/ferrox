@@ -1,6 +1,6 @@
 # KCP / mKCP
 
-The core rung is real, bit-identical and proved against the pinned Go, and the carrier is now wired: VLESS, VMess, Trojan and Shadowsocks all serve and dial over plaintext KCP, and all four carry TLS over it both roles, the session above the connection as it is upstream; REALITY is served only, and the finalmask stack — the `mkcp-legacy` families and the `salamander` wrapper, both roles, the mkcp half oracle-proven like the framer beneath it. Mux stays raw-carrier-only tree-wide; VMess UDP rides KCP and xdrive like every other carrier.
+The core rung is real, bit-identical and proved against the pinned Go, and the carrier is now wired: VLESS, VMess, Trojan and Shadowsocks all serve and dial over plaintext KCP, and all four carry TLS over it both roles, the session above the connection as it is upstream; REALITY is served only, and the finalmask stack — the `mkcp-legacy` families and the `salamander` wrapper, both roles, the mkcp half oracle-proven like the framer beneath it. Mux rides KCP for VLESS, VMess, Trojan and Shadowsocks through the same pooled dial as the raw carrier; VMess UDP rides KCP and xdrive like every other carrier.
 
 The proof is `kcp::oracle::the_scripted_core_matches_the_pinned_go`: a scripted clock drives the sending window's queue/flush/fast-ack behaviour, the ack list, and the RTO estimator — including the cap probe and peer-RTO adoption — and the segments it produces are compared against `scripts/kcp-oracle/expected.txt`, which was recorded from `xray-core/transport/internet/kcp` at the pin in `upstream/pins.toml`. That is the strongest claim in this tree: not "looks right", but byte-for-byte equal to the implementation it replaces, over a script that deliberately probes the estimator's edges. The one path that script does not reach, a repeated segment, is pinned separately by `a_duplicate_segment_is_acknowledged_again_like_the_reference`, whose 25-byte ack is the reference's append order; the list is capped at the receiving window plus 128 entries, and `a_duplicate_flood_evicts_a_duplicate_before_a_new_number` is the checker for that bound.
 
@@ -13,11 +13,11 @@ graph TD
     A["app config: kcpSettings"] --> A2["parsed into kcp::Config:<br/>mtu, tti, capacities, multiplier,<br/>window, both casings"]
     B["core: plaintext to dial or listen"] --> S["segment: cmd, sn, una, ts, rto,<br/>18 B overhead"]
     S --> W["sending window: queue, flush, fast-ack"]
-    W --> K["the scripted clock"]
-    K --> O["segments compared byte for byte<br/>against the pinned Go's output"]
-    O --> P["RTO estimator: srtt, rttvar,<br/>rto capped at 10 s"]
+    W --> P["RTO estimator: srtt, rttvar,<br/>rto capped at 10 s"]
     P --> Q["receiving window: ack list, fast ack"]
     Q --> A2["delivered in order"]
+    W -.->|test only| K["the scripted clock"]
+    K -.-> O["segments compared byte for byte<br/>against the pinned Go's output"]
     W --> X["Encoder::encode: gap copy, then<br/>cascade, fake header or AES-GCM"]
     X --> Y["sendto: the masked datagram"]
     Y --> Z["decode_in_place on recv;<br/>None drops the datagram"]
@@ -40,7 +40,7 @@ The stack this replaces is `upstream/xray-core/transport/internet/finalmask/mkcp
 
 The reference wraps the dialled socket in list order, so the first configured wrapper is the outermost on the wire; its header manager writes a run of `mkcp-legacy` entries front-to-back from the reversed list, so that run's wire order is the reverse of its config order. `Mask::from_spec` takes that wire order and `decode_in_place` strips outermost first with the manager's own slice arithmetic. Empty `header` and empty `value` is `original`; empty `header` with a `value` is `aes128gcm`; `dns` without a `value` packs the reference's default `www.baidu.com`. A frame that is shorter than the chain prefix, fails the `original` hash, or fails the GCM tag decodes to nothing and is dropped there: the socket thread and the accept loop never parse it, never deliver it, and never build a session for it — `a_raw_dial_never_establishes_a_masked_session` and `the_wrong_password_echoes_nothing` are those gates. What actually goes on the wire is proven through a plain UDP relay sitting between the two roles: `the_wire_under_a_masked_session_carries_the_mask` records the first _datagram_, opens it under the same chain and finds the conversation id in it, and counts the overhead — `srtp` outside `aes128gcm` adds exactly 32 bytes — then the session still echoes through the relay.
 
-Two inputs the reference accepts are refused at build time rather than half-implemented: a DNS name containing an escaped dot (`\.`, which `packDomainName` supports), and anything under `finalmask.udp` that is neither `mkcp-legacy` nor `salamander`, a `salamander` with a gecko `packetSize` included — that second family list is in Open rows. The cross-language gate covers the stack in `expected.txt`: 86 mask lines — `original` seals at 21 lengths including the ragged ones, every fake header's counter walk including the dtls length wrap, the dns template's packing, fixed-nonce AES seals and opens, and five composed chains with their opens, tampers and wrong-order refusals — replayed through the shipped `Encoder` and `decode_in_place`.
+Two inputs the reference accepts are refused at build time rather than half-implemented: a DNS name containing an escaped dot (`\.`, which `packDomainName` supports), and anything under `finalmask.udp` that is neither `mkcp-legacy`, `salamander`, nor `filter`, a `salamander` with a gecko `packetSize` included — that second family list is in Open rows. The cross-language gate covers the stack in `expected.txt`: 86 mask lines — `original` seals at 21 lengths including the ragged ones, every fake header's counter walk including the dtls length wrap, the dns template's packing, fixed-nonce AES seals and opens, and five composed chains with their opens, tampers and wrong-order refusals — replayed through the shipped `Encoder` and `decode_in_place`.
 
 ## Measured
 
@@ -48,6 +48,8 @@ Two inputs the reference accepts are refused at build time rather than half-impl
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| syscalls-per-datagram | UNBLESSED | scripts/count-ops.sh |
+| seconds-per-datagram | UNBLESSED | CI bench.yml (no cell yet) |
 | maximum-transmission-unit-bytes | 1350 | ferrox-core-kcp::tests::the_upstream_defaults_are_these |
 | command-only-segment-bytes | 16 | ferrox-core-kcp::tests::the_command_only_layout_is_sixteen_bytes |
 | oracle-runs-against-the-pinned-go | 1 | ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go |
@@ -63,9 +65,7 @@ Two inputs the reference accepts are refused at build time rather than half-impl
 | ack-number-list-reallocations-per-flush | 0 | ferrox-core-kcp::window::tests::the_ack_list_reuses_its_scratch_across_flushes |
 | ack-numbers-reallocations-per-cycle | 0 | ferrox-core-kcp::segment::tests::a_received_ack_reuses_its_number_list |
 | segment-header-staging-copies-per-segment | 0 | ferrox-core-kcp::segment::tests::a_borrowed_payload_serialises_identically_to_an_owned_one |
-
 | segment-list-vectors-per-datagram | 1 | ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next |
-
 | reader-wakeups-per-datagram | 1 | ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries |
 | receiving-lock-acquisitions-per-multi-segment-datagram | 1 | ferrox-core-kcp::connection::tests::a_multi_segment_datagram_takes_the_receiving_lock_once |
 | mask-families-implemented | 9 | ferrox-core-kcp::listener::tests::every_mask_family_echoes_over_loopback |
@@ -89,7 +89,7 @@ Two inputs the reference accepts are refused at build time rather than half-impl
 
 ## Time
 
-**Not measured yet.** `ferrox-core/examples/kcp_bench.rs` exists and is not wired to a workflow that runs it on a named runner, so no throughput figure is quoted. A KCP number measured over a VPN is a measurement of the VPN.
+**No dedicated KCP benchmark yet.** `ferrox-core/examples/kcp_bench.rs` exists and is not wired to a workflow that runs it on a named runner, so no method-level throughput figure is quoted. The end-to-end `vless-kcp-down-8` matrix cells below quote carrier throughput; they do not isolate the KCP core. A KCP number measured over a VPN is a measurement of the VPN.
 
 ## What we removed
 
@@ -125,17 +125,17 @@ The oracle is the gate for all of it: the wire format is fixed by the pinned Go,
 ## What is not removed
 
 - **A fresh 8 KiB buffer per received segment** is gone too: the payload buffer is reused across a segment's lifetime and the ACK path reuses one staging buffer, which is what the `app-rows-serving-over-kcp` row above is measuring the consequence of — four proxy rows now reach a target over KCP that had no KCP carrier at all.
-- **Mux over KCP is refused**, but UDP is not: VMess command 2 rides KCP both roles, plaintext and TLS, and xdrive too, while VLESS, Trojan and Shadowsocks UDP still ride only the raw carrier. `vmess_serves_udp_over_kcp`, `vmess_tls_serves_udp_over_kcp` and `vmess_serves_udp_over_xdrive` are the witnesses; `crates/ferrox-core/src/transport.rs` parses the `kcp`/`mkcp` spelling and the app serves the session above it.
+- **Mux does not change the carrier below it.** A mux flow over KCP still pays one KCP segment and one `sendto` per segment; the mux layer batches frames above that, not datagrams below it. What is carried is real: VLESS, VMess, Trojan and Shadowsocks all open mux over KCP (`vless_mux_kcp`, `open_vmess_mux_kcp`, `trojan_mux_kcp`, `open_ss_mux_kcp`, `open_ss_mux_2022_kcp`), TCP and XUDP alike.
 
 ## Open rows
 
-`ferrox-core/examples/kcp_bench.rs` is not wired to a workflow that runs it on a named runner, so no throughput figure is quoted. The oracle proves the wire format; nothing in CI yet proves the loss behaviour under a real packet layer. The same no-figure rule covers the mask: the 86 lines prove bytes, not speed. The other `finalmask` families — noise, sudoku, xdns, xicmp, realm and udphop — are not in this slice and route to a `prompts.md` add-on; the TCP masks are their own row.
+`ferrox-core/examples/kcp_bench.rs` is not wired to a workflow that runs it on a named runner, so no method-level throughput figure is quoted; the end-to-end `vless-kcp-down-8` cells are the only throughput this page carries. The oracle proves the wire format; nothing in CI yet proves the loss behaviour under a real packet layer. The same no-figure rule covers the mask: the 86 lines prove bytes, not speed. The other `finalmask` families — noise, sudoku, xdns, xicmp, realm and udphop — are not in this slice and route to a `prompts.md` add-on; the TCP masks are their own row.
 
 - **`security: reality` over KCP is served and not dialled**: it is refused at parse rather than sent plain. `security: tls` carries the session in both roles for all four protocols — `a_vless_kcp_session_with_tls_echoes_over_loopback` and `a_shadowsocks_kcp_inbound_that_declares_tls_answers_the_session` / `a_shadowsocks_kcp_dial_under_tls_wraps_the_header_in_the_session` hold their pairs, `a_trojan_kcp_inbound_that_declares_tls_answers_the_session` / `a_trojan_kcp_dial_under_tls_wraps_the_header_in_the_session` and `vmess_tls_serves_udp_over_kcp` / `a_vmess_kcp_dial_under_tls_wraps_the_header_in_the_session` theirs, `a_fingerprint_shapes_the_hello_a_kcp_session_dials` the hello a `fingerprint` writes above the session, and `vless_tls_outbound_parses_diallable_carriers` / `trojan_tls_outbound_parses_diallable_carriers` / `vmess_tls_outbound_parses_diallable_carriers` / `a_vmess_kcp_tls_outbound_parses_and_carries_udp` the parse.
 
 - **A `malloc` and a `free` for every 1 332 bytes sent.** `Connection::write` took `b[offset..offset + n].to_vec()` and `SendingWindow` held `VecDeque<DataSegment>`, so each MSS-sized chunk owned a heap buffer for as long as it was unacknowledged. At the default `mtu - 18` = 1 332 that is about **9 400 allocation pairs a second per direction** at 100 Mbps. The window now keeps one `arena: Vec<u8>` and each cache entry holds a half-open range into it, so a segment is two integers rather than an allocation, and the payload is never staged on its way out. That is `send-payload-buffers-per-window 1` and `send-payload-reallocations-per-window 0`, gated by arena **capacity** — a per-segment `Vec` cannot hold its capacity steady, so the witness is the quantity itself.
 
-Read against the pinned references: Xray's `transport/internet/kcp/connection.go:406` takes `b = buf.New()` per chunk, and `common/buf/buffer.go:41` shows that is a `pool.Get()` — so it is a pool round-trip, not a `malloc`, but it is also an 8 KiB `make([]byte, Size)` whenever the pool is cold, for a 1 332-byte payload. ZeroNet does not carry KCP at all; `zero-protocol`'s lanes are TCP-based and its `run_carrier_writer` coalesces under `WRITE_COALESCE_LIMIT` (`mux.rs:431`), which is the batching idea this tree already applies to VMess via `FRAMES_PER_WRITE`. So the references were ahead on pooling and behind on sizing; this is now ahead on both.
+Read against the pinned references: Xray's `transport/internet/kcp/connection.go:406` takes `b = buf.New()` per chunk, and `common/buf/buffer.go:41` shows that is a `pool.Get()` — so it is a pool round-trip, not a `malloc`, but it is also an 8 KiB `make([]byte, Size)` whenever the pool is cold, for a 1 332-byte payload. ZeroNet does not carry KCP at all; `zero-protocol`'s lanes are TCP-based and its `run_carrier_writer` coalesces under `WRITE_COALESCE_LIMIT` (`mux.rs:431`), which is the batching idea this tree already applies to VMess via `FRAMES_PER_WRITE`. sing-box has no KCP transport at this pin, so there is no core of its to compare. So the references were ahead on pooling and behind on sizing; this is now ahead on both.
 
 **The gate found two leaks in this.** The first version's `trim()` returned early when its dead-prefix marker was zero, which is also the state of a window acknowledged down to empty between bursts, so the "reclaim everything" case was unreachable and the arena grew to 681 984 bytes for 8 live segments of 1 332. The empty-cache check comes first now. The second was the marker itself: nothing advanced it while the cache stayed non-empty — the shape a relay runs, the next eight segments arriving before the last eight are acknowledged — so the arena kept every byte the flow had ever sent, 691 200 bytes for those same 8 live segments after 64 rounds. The prefix is now read from the oldest live range, the same rule whether or not the cache reaches empty, and the marker is gone. `the_arena_serves_every_segment_without_growing` runs both cycles — drained and live-tailed — and fails on capacity the moment `trim` stops reclaiming.
 

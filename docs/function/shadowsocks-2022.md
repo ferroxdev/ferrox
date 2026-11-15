@@ -44,6 +44,7 @@ Every row is a claim with a checker that runs. `scripts/method-counts.txt` holds
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| seconds-per-megabyte | UNBLESSED | CI benchmark-matrix.yml (no per-cipher cell) |
 | aead-calls-per-chunk | 2 | ferrox-core-shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag |
 | maximum-payload-per-chunk | 65535 | ferrox-core-shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag |
 | write-syscalls-per-16KiB-relay-read | 1 | ferrox-app-shadowsocks2022::tests::one_relay_read_becomes_one_write_and_reads_back_whole |
@@ -64,10 +65,13 @@ Every row is a claim with a checker that runs. `scripts/method-counts.txt` holds
 | udp-relay-forward-reallocations-after-the-first | 0 | ferrox-app-shadowsocks2022::tests::a_forwarded_datagram_is_written_into_a_buffer_that_stops_growing |
 | udp-relay-reply-reallocations-after-the-first | 0 | ferrox-app-shadowsocks2022::tests::a_reply_body_is_opened_into_a_buffer_that_stops_growing |
 | udp-server-reply-client-session-bytes | 8 | ferrox-app-shadowsocks2022::tests::udp_server_replies_are_server_typed_and_stay_with_their_session |
-| subkey-heap-buffers-per-connection | 1 | ferrox-core-shadowsocks2022::tests::a_cipher_holds_one_heap_buffer_for_aes_and_none_for_chacha |
+| subkey-heap-buffers-per-connection-aes | 1 | ferrox-core-shadowsocks2022::tests::a_cipher_holds_one_heap_buffer_for_aes_and_none_for_chacha |
+| subkey-heap-buffers-per-connection-chacha | 0 | ferrox-core-shadowsocks2022::tests::a_cipher_holds_one_heap_buffer_for_aes_and_none_for_chacha |
 | subkey-heap-buffers-per-derivation | 0 | ferrox-core-shadowsocks2022::tests::deriving_a_session_subkey_costs_no_heap_buffer |
 
 <!-- counts:end -->
+
+`write-syscalls-per-16KiB-relay-read`, `client-handshake-write-syscalls` and `target-write-syscalls-per-opened-batch` are the full-write case: the checker's writer accepts the whole buffer, so a short write that makes `write_all` retry would add calls the rows do not count. `user-space-copies-per-byte-read` is the in-place `open_chunk` path; a chunk that straddles the window's end moves its own leftovers once per compaction, which the row does not count. `subkey-heap-buffers-per-connection 1` is AES; ChaCha holds none, as the checker's name records.
 
 ## Ops
 
@@ -81,7 +85,7 @@ The row above is `UNBLESSED`: nobody has read a measured number for this symbol 
 
 ## Time
 
-**Not measured yet.** Wall clock for this method needs the same `ferrox-bench` cipher gate the AEAD rung uses, extended to the three 2022 methods at the same chunk lengths, run on a named CI runner. No CI artefact has been read, so this page quotes no duration. Timing needs a named runner; a number from a laptop behind a VPN measures the tunnel.
+**Not measured yet.** Wall clock for this method needs the same `ferrox-bench` cipher gate the AEAD rung uses, extended to the three 2022 methods at the same chunk lengths, run on a named CI runner. `benchmark-matrix.yml` already times `shadowsocks2022-raw-*` end to end, but that is the lane's throughput, not the codec's per-cipher clock; until the matrix carries a per-cipher 2022 timing cell the time row stays unmeasured. No CI artefact has been read, so this page quotes no duration. Timing needs a named runner; a number from a laptop behind a VPN measures the tunnel.
 
 ## What we removed
 

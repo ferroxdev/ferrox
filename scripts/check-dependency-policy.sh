@@ -23,26 +23,120 @@ else
   metadata=""
 fi
 
-if [[ -n "$metadata" ]]; then
-  expressions="$(printf '%s' "$metadata" | python3 -c '
-import json, sys
+policy_check="$(mktemp "${TMPDIR:-/tmp}/ferrox-licences.XXXXXX")"
+trap 'rm -f "$policy_check"' EXIT
+cat >"$policy_check" <<'PY'
+import json, re, sys
+
+selftest = sys.argv[1:2] == ["--selftest"]
+allow = {line.strip().lower() for line in sys.argv[2 if selftest else 1].splitlines() if line.strip()}
+
+class Parser:
+    def __init__(self, tokens):
+        self.tokens = tokens
+        self.at = 0
+
+    def peek(self):
+        return self.tokens[self.at] if self.at < len(self.tokens) else None
+
+    def take(self, want=None):
+        token = self.peek()
+        if token is None or (want is not None and token.upper() != want):
+            raise ValueError(f"expected {want or 'a licence id'}, found {token or 'end'}")
+        self.at += 1
+        return token
+
+    def atom(self):
+        token = self.take()
+        if token == "(":
+            value = self.disjunction()
+            self.take(")")
+            return value
+        if token.upper() in ("WITH", "AND", "OR", ")"):
+            raise ValueError(f"expected a licence id, found {token}")
+        if self.peek() is not None and self.peek().upper() == "WITH":
+            self.take("WITH")
+            exception = self.take()
+            if exception.upper() in ("WITH", "AND", "OR", "(", ")"):
+                raise ValueError(f"expected an exception id, found {exception}")
+            token = f"{token} WITH {exception}"
+        return token.lower() in allow
+
+    def conjunction(self):
+        value = self.atom()
+        while self.peek() is not None and self.peek().upper() == "AND":
+            self.take("AND")
+            value = self.atom() and value
+        return value
+
+    def disjunction(self):
+        value = self.conjunction()
+        while self.peek() is not None and self.peek().upper() == "OR":
+            self.take("OR")
+            value = self.conjunction() or value
+        return value
+
+def allowed(expression):
+    source = expression.replace("/", " OR ")
+    tokens = re.findall(r"\(|\)|[A-Za-z0-9.+-]+", source)
+    leftover = re.sub(r"\(|\)|[A-Za-z0-9.+-]+", " ", source)
+    if leftover.strip():
+        raise ValueError(f"unsupported token `{leftover.strip()}`")
+    parser = Parser(tokens)
+    value = parser.disjunction()
+    if parser.peek() is not None:
+        raise ValueError(f"trailing token {parser.peek()}")
+    return value
+
+if selftest:
+    cases = [
+        ("MIT", True),
+        ("LGPL-2.1-or-later", False),
+        ("MIT OR LGPL-2.1-or-later", True),
+        ("MIT AND LGPL-2.1-or-later", False),
+        ("(MIT OR Apache-2.0) AND BSD-3-Clause", True),
+        ("Apache-2.0 WITH LLVM-exception", True),
+        ("GPL-3.0-no! OR MIT", "error"),
+        ("MIT OR )", "error"),
+        ("MIT OR AND", "error"),
+        ("MIT WITH OR", "error"),
+        ("MIT$", "error"),
+    ]
+    failed = False
+    for expression, want in cases:
+        try:
+            passed = allowed(expression)
+        except ValueError:
+            passed = "error"
+        if passed != want:
+            print(f"::error::selftest: `{expression}` returned {passed}, wanted {want}")
+            failed = True
+    if failed:
+        sys.exit(1)
+    print("check-dependency-policy: selftest ok")
+    sys.exit(0)
+
 graph = json.load(sys.stdin)
-print("\n".join(sorted({p.get("license", "") for p in graph["packages"] if p.get("license")})))
-')"
-  while read -r expression; do
-    [[ -z "$expression" ]] && continue
-    normalised="$(printf '%s' "$expression" | tr -d '()' | tr 'A-Z' 'a-z' | tr '/' ' ')"
-    IFS=', ' read -r -a parts <<<"$normalised"
-    for part in "${parts[@]}"; do
-      [[ -z "$part" || "$part" == "or" || "$part" == "and" ]] && continue
-      if [[ "$part" == "with" || "$part" == *-exception || "$part" == exception-* ]]; then
+expressions = sorted({p["license"] for p in graph["packages"] if p.get("license")})
+failed = False
+for expression in expressions:
+    try:
+        passed = allowed(expression)
+    except ValueError as error:
+        print(f"::error::could not read licence expression `{expression}`: {error}")
+        failed = True
         continue
-      fi
-      if ! grep -qixF "$part" <<<"$allow_list"; then
-        note "the graph carries \`$expression\`, which needs \`$part\`; deny.toml's allow list does not name it"
-      fi
-    done
-  done <<<"$expressions"
+    if not passed:
+        print(f"::error::the graph carries `{expression}`, which names no licence `deny.toml` allows")
+        failed = True
+
+sys.exit(1 if failed else 0)
+PY
+python3 "$policy_check" --selftest "$allow_list" || status=1
+if [[ "${1:-}" != "--selftest" && -n "$metadata" ]]; then
+  if ! printf '%s' "$metadata" | python3 "$policy_check" "$allow_list"; then
+    status=1
+  fi
 fi
 
 if grep -E '^source = "git\+' Cargo.lock >/dev/null; then

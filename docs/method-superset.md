@@ -176,7 +176,7 @@ Optimization targets still standing in this tree. Completed removals live in the
 | # | what | where | bit-identical |
 | --- | --- | --- | --- |
 | 6 | UDP-over-TCP pays two read syscalls per datagram for VLESS and four to six for Trojan, where one amortised window read into a per-connection remainder would cost one | `proxy.rs` `read_udp_datagram`, `read_trojan_datagram` via `read_socks_addr` | yes — `Counting` reader idiom |
-| 7 | zero-fills the allocator counter cannot see (`count::measure` hooks `alloc`/`alloc_zeroed`; a `resize` into spare capacity is a plain `memset`) | `mux::Outgoing::encode_header_into` zeroes `2 + meta` bytes `write_meta` overwrites; `vec![0u8; CHUNK]` relay buffers handed straight to `Read::read`; a `vec![0u8; 65536]` per KCP connection | replace with `with_capacity` + `set_len`; Miri (`safety.yml`) watches the read discipline |
+| 7 | zero-fills paid before the first read overwrites them, visible to `count::measure` as `alloc_zeroed` | a `RelayBuf` window on a pool miss (`vec![0u8; len]`, 16 KiB per direction and 64 KiB after promotion); KCP's 64 KiB datagram room (`vec![0u8; DATAGRAM_MAX]`) | the window is fully initialised and the pool amortises the fill (`a_reused_relay_window_is_not_zeroed` holds zeroed allocations at zero on a hit); a cold flow still pays it, and `the_datagram_room_is_zeroed_once` holds KCP's one 64 KiB fill; Miri (`safety.yml`) watches the read discipline |
 
 ## What is not removed
 

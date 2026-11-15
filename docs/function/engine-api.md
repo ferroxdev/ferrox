@@ -37,7 +37,7 @@ graph TD
     S -- Remove --> T["stop flag + wake dial, wait for close<br/>then drop the registry entry"]
     S -- RemoveOut --> P["drop tag; a flow naming it resolves to blackhole"]
     S -- Alter --> U["VMess account table: add or remove under one lock"]
-    S -- AlterOut --> Q["not an outbound operation / unknown operation"]
+    S -- AlterOut --> Q["trailers-only grpc-status 2<br/>not an outbound operation / unknown operation"]
     S -- Stats --> V["counter map: read or reset by name<br/>inbound and user bytes registered at the flow"]
     S -- Logger --> W["reopen the access path<br/>rotated file picked up, old sink kept on failure"]
     S -- Observatory --> X["observatory snapshot<br/>one OutboundStatus per tag"]
@@ -48,12 +48,10 @@ graph TD
     T --> A
     P --> A
     U --> A
-    Q --> A
     V --> A
     W --> A
     X --> A
     Y --> A
-    E --> A
 ```
 
 ## Measured

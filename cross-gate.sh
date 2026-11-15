@@ -2,6 +2,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 target="${1:?usage: cross-gate.sh <target-triple>}"
+shift
 name="$(basename "$0")"
 
 die() { printf '%s: %s\n' "$name" "$1" >&2; exit "${2:-2}"; }
@@ -51,25 +52,28 @@ SHIM
 cat >"$shim/ar" <<SHIM
 #!/bin/sh
 out=""
-rest=""
 seen_archive=0
-for arg in "\$@"; do
+n=\$#
+while [ "\$n" -gt 0 ]; do
+  arg="\$1"
+  shift
+  n=\$((n - 1))
   case "\$arg" in
     -nologo) ;;
     -out:*) out="\${arg#-out:}" ;;
-    c*) ;;   # `cq` and `cr`: the letters, which llvm-ar wants without the `q`.
+    c*) ;;   # cq and cr: the letters, which llvm-ar wants without the q.
     *)
       if [ "\$seen_archive" = 0 ] && [ -z "\$out" ]; then
         out="\$arg"
         seen_archive=1
       else
-        rest="\$rest \$arg"
+        set -- "\$@" "\$arg"
       fi
       ;;
   esac
 done
 [ -n "\$out" ] || { echo "ar: no archive named in: \$*" >&2; exit 2; }
-exec "$zig" ar rcs "\$out" \$rest
+exec "$zig" ar rcs "\$out" "\$@"
 SHIM
 chmod +x "$shim/cc" "$shim/ar"
 
@@ -79,7 +83,7 @@ export "CC_$normalised=$shim/cc"
 export "AR_$normalised=$shim/ar"
 
 if cargo clippy --workspace --all-targets --locked --target "$target" \
-  --target-dir "$root/target/cross-gate" \
+  --target-dir "$root/target/cross-gate" "$@" \
   -- -D warnings -W clippy::perf -W clippy::suspicious; then
   echo "$name: $target clean"
 else

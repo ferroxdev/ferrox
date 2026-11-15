@@ -2,7 +2,7 @@
 
 FERROX — Fast Efficient Relay Router Overlay X. *ferro*, iron, for Rust; *X*, for Xray.
 
-A from-scratch proxy core, **bit-identical to the implementations it replaces** and **verifiably not slower than any of them**.
+A from-scratch proxy core, **targeting bit-identical output to the implementations it replaces** and a **measured-parity target of never slower than any of them**; the cells where that target is not met yet are named in [the benchmark matrix](docs/benchmarks/matrix.md). Coverage is partial; planned rows are marked in the tables below.
 
 ## Goals
 
@@ -41,7 +41,7 @@ A from-scratch proxy core, **bit-identical to the implementations it replaces** 
 | no operation added or removed | `scripts/count-ops.sh` against `scripts/expected-ops.txt` |
 | not slower at any length ≥ 65 B | benchmark gate; one regressing length fails after a re-measure |
 | upstream conformance | pinned suites run unmodified against `ferrox-app` |
-| xray-core scenario coverage | `conformance.yml`: every `testing/scenarios` test against the binary |
+| xray-core scenario coverage | `conformance.yml` maps all 73 `testing/scenarios` tests; 43 green, 21 fail, 9 have no verdict at this pin |
 | parsers never panic on untrusted bytes | seeded cases over every untrusted entry point |
 | dependency licence and provenance | `deny.toml` + `scripts/check-dependency-policy.sh`; GPL/AGPL refused as dependencies |
 | roadmap coherence | `ferrox-prompt check`: no duplicate id, no gate-less slice, no cycle |
@@ -93,7 +93,7 @@ printf '%s %s %s %s\n' '<doc>' '<key>' '<value>' '<checker>' >> scripts/method-c
 | SOCKS5 + SOCKS4, both roles | [socks](docs/function/socks.md) | 2–3 writes + 3–4 reads per dial | 1 (the relay's own) | `UNBLESSED` | not measured |
 | Reverse tunnel (bridge + portal) | [reverse](docs/function/reverse.md) | 1 write per mux frame | 1 downlink, 0 uplink | `UNBLESSED` | not measured |
 
-`ops` and `time` are `UNBLESSED`/not measured on every row — the honest state. The Foxy, VeePN, Psiphon and WARP lanes end at services and edges outside this tree; their availability and behaviour can change without a commit here, so a lane row is the implementation's state, not a promise that the upstream service accepts it. `scripts/expected-ops.txt` records the exact blessed rows; `scripts/method-ops.txt` is the open list that `ops.yml` measures into the `method-ops` artefact. Every duration comes from a named CI runner (`bench.yml`, `parity.yml`, `compare.yml`, `speedtest.yml`, `benchmark-matrix.yml`); no page quotes a one-off result from a laptop behind a VPN. The per-server grid, its tables and its charts are in [`docs/benchmarks/matrix.md`](docs/benchmarks/matrix.md). A matrix run also publishes `table.md`, `table.csv` and `distribution.csv` in the small `benchmark-matrix-table-*` artifact, so the tables and repeat spread are downloadable without the image bundle; every workflow publishes a `result-*` artifact with the same status facts as the job summary.
+Many `ops` and `time` cells are still `UNBLESSED`/not measured; the rows that carry a number name the test and CI workflow behind it. The Foxy, VeePN, Psiphon and WARP lanes end at services and edges outside this tree; their availability and behaviour can change without a commit here, so a lane row is the implementation's state, not a promise that the upstream service accepts it. `scripts/expected-ops.txt` records the exact blessed rows; `scripts/method-ops.txt` is the open list that `ops.yml` measures into the `method-ops` artefact. Every duration comes from a named CI runner (`bench.yml`, `parity.yml`, `compare.yml`, `speedtest.yml`, `benchmark-matrix.yml`); no page quotes a one-off result from a laptop behind a VPN. The per-server grid, its tables and its charts are in [`docs/benchmarks/matrix.md`](docs/benchmarks/matrix.md). A matrix run also publishes `table.md`, `table.csv` and `distribution.csv` in the small `benchmark-matrix-table-*` artifact, so the tables and repeat spread are downloadable without the image bundle; every workflow publishes a `result-*` artifact with the same status facts as the job summary.
 
 ## Connection methods
 
@@ -284,7 +284,7 @@ Today exactly one method dials per hop. The chaining engine builds stacks as an 
 | 117 | Balancers leastPing/leastLoad/roundRobin/random + urltest/selector | partial — high priority; four balancer strategies reading observatory row 124; urltest and selector planned | — | Xray `router/balancing.go`; sing-box `protocol/group/`; ZeroNet `zero-observatory` |
 | 118 | Built-in DNS app (UDP/TCP/DoT/DoH/DoQ/FakeDNS/cache) | implemented — UDP/TCP/DoT/DoH/DoQ, cache, hosts, FakeDNS, filters and parallel groups; Lua script row 116 | xray scenarios 1/1. | Xray `app/dns`; sing-box `dns/`; ZeroNet `zero-dns`; [page](docs/function/engine-dns.md) |
 | 119 | Reverse tunnel bridge/portal | partial | Partial: modern VLESS reverse both roles; freedom/blackhole only, no xhttp/QUIC/KCP/hysteria/xdrive. | Xray `app/reverse`; ZeroNet `reverse.rs`; xray-core-rust `xray-app-reverse` |
-| 120 | Commander gRPC management API | partial — every service except `AddRule`/`RemoveRule` | xray commander 5/5. | Xray `app/commander`; [page](docs/function/engine-api.md) |
+| 120 | Commander gRPC management API | implemented — every service, including `AddRule`/`RemoveRule` over the live table | `AddRule` appends or replaces the live table and refuses a duplicate tag, an unknown target, or a rule a server inbound cannot evaluate; `RemoveRule` drops every rule with the tag. xray commander 5/5. | Xray `app/commander`; [page](docs/function/engine-api.md) |
 | 121 | Connection-planner ladder (climb on failure, earned descent) | planned — high priority | — | ZeroNet `zero-observatory`; Leaf `app/healthcheck.rs` (the per-outbound latency the balancers read) |
 | 122 | Subnet scanner + server discovery | planned | WARP edge discovery and validation is row 190. | ZeroNet `zero-scanner`, `zero-discovery` |
 | 123 | Load-balancer healthcheck probe inbound | implemented — one exact path, `GET` or a `POST` body signature, and a fixed `200` body | Implemented: one exact path, GET or signed POST, fixed `200`. | Leaf `proxy/hc/`; [front-healthcheck](docs/function/front-healthcheck.md) |
@@ -476,7 +476,7 @@ cargo run -p ferrox-prompt -- next    # the slice
 ./scripts/check.sh --fast             # fmt, clippy and tests while iterating
 ./scripts/check.sh                    # everything ci.yml runs, before the push
 
-cargo run -p ferrox-bench -- --config 'vless://...'   # the comparison table for a link
+# benchmarks and comparisons run in CI only: dispatch bench.yml or benchmark-matrix.yml
 cargo run -p ferrox-app -- check 'vless://...'        # parse offline; `run` dials TCP, sends nothing
 ```
 

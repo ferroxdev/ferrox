@@ -60,6 +60,8 @@ No matrix cell isolates these fields: the bench cells time a relay after the han
 
 What was **not** removed: P-521 remains unreachable on the rustls and shaped lanes because neither carries the group, and `useSystemCA`'s base-pool choice is still not read. A shaped ECH dial with a ceiling below 1.3 is refused, because the reference's ECH path is TLS 1.3 only.
 
+Against xray-core, sing-box and ZeroNet no removal is claimed: each exposes the same version and curve fields through its own TLS library, and the changes here are this tree's dispatch between its own lanes rather than a cheaper shape of theirs.
+
 ## Pins
 
 | what | where |

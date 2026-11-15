@@ -22,7 +22,7 @@ cd ferrox-*-x86_64-pc-windows-msvc
 .\ferrox-cli.exe down
 ```
 
-**macOS and Linux:** run `ferrox-cli.sh`, as shown below.
+**macOS and Linux:** run `ferrox-cli.sh`, as shown below. The shell launcher needs `python3` and `curl` on `PATH`: Python writes and plans the config even for `ports`, and curl proves the connection before traffic is routed. The native Windows launcher needs neither.
 
 ## 30-second start — the Foxy lane
 
@@ -31,12 +31,13 @@ The Foxy lane needs a Firefox account: an email and a password, nothing else. Th
 ```bash
 tar xzf ferrox-*-aarch64-apple-darwin.tar.gz   # or your platform's package
 cd ferrox-*-aarch64-apple-darwin
-./ferrox-cli.sh up --foxy --vpn    # asks email + password and the carrier, then connects
+./ferrox-cli.sh up --foxy --vpn    # macOS: asks email + password, then arms the system proxy
+./ferrox-cli.sh up --foxy          # Linux: same lane, no --vpn; point apps at the fronts
 ./ferrox-cli.sh status             # uptime, carrier, quota left, exit IP and country
 ./ferrox-cli.sh down               # stop and clear the system proxy
 ```
 
-The flags and prompts are identical on Windows; use `.\ferrox-cli.exe` in place of `./ferrox-cli.sh`.
+On Linux there is no `--vpn`: use the command without it and point apps at the fronts as shown under Ports below. The prompts are identical on Windows; use `.\ferrox-cli.exe` in place of `./ferrox-cli.sh`.
 
 On Windows the native launcher keeps config and account files under `%APPDATA%\ferrox` and pid/log/system-proxy state under `%LOCALAPPDATA%\ferrox`, owner-only through NTFS ACLs. The `~/.config/ferrox` paths below describe macOS and Linux.
 
@@ -79,7 +80,8 @@ Run more than one lane at once — each named instance owns its config, pid, log
 VeePN needs nothing typed in: no account, no server. The plane launches this device anonymously, names a region, and lists the upstreams that answer for the pair it printed, so one command starts the lane:
 
 ```bash
-./ferrox-cli.sh up --veepn --vpn    # anonymous: no account, no server
+./ferrox-cli.sh up --veepn --vpn    # macOS: anonymous, no account, no server
+./ferrox-cli.sh up --veepn          # Linux: same lane, no --vpn; point apps at the fronts
 ./ferrox-cli.sh status
 ./ferrox-cli.sh down
 ```
@@ -91,16 +93,18 @@ VeePN needs nothing typed in: no account, no server. The plane launches this dev
 Every share link this build dials goes through the same one command; anything beyond the link shapes rides `--config` (any config the binary serves is used verbatim — see USAGE.md §5 for the full inbound/outbound list):
 
 ```bash
-./ferrox-cli.sh up --vless 'vless://uuid@host:443?type=ws&security=tls&sni=host&path=/ws' --vpn
-./ferrox-cli.sh up --vmess host:443 --uuid ID --vpn
-./ferrox-cli.sh up --trojan host:443 --password PW --vpn
-./ferrox-cli.sh up --ss host:8388 --method aes-256-gcm --password PW --vpn
+./ferrox-cli.sh up --vless 'vless://uuid@host:443?type=ws&security=tls&sni=host&path=/ws'
+./ferrox-cli.sh up --vmess host:443 --uuid ID
+./ferrox-cli.sh up --trojan host:443 --password PW
+./ferrox-cli.sh up --ss host:8388 --method aes-256-gcm --password PW
 ./ferrox-cli.sh up --config mine.json
 ```
 
+Add `--vpn` on macOS to arm the system proxy; on Linux run them as shown and point apps at the fronts.
+
 Here the server is in the link or the `HOST:PORT` — unlike Foxy, these lanes dial the server you name. An invocation that cannot start the lane it names is refused before anything runs: `up --vless` with no link prints the example, `up --vmess` without `--uuid` names the missing id, and a rejected `up` leaves a lane that is already carrying traffic untouched.
 
-The Psiphon lane is native: `./ferrox-cli.sh up --psiphon --vpn` fetches the signed server list and speaks OSSH/SSH itself, with no `psiphon-tunnel-core` and no account. `--psiphon-cdn` asks for CDN fronting and beast mode in one flag; `--psiphon-conduit-mode private` and `--psiphon-cdn-profile fronted` name the two settings directly. A fronted entry is dialled through its CDN front with the version-4 meek cookie; a list with no fronted entry falls back to SSH/OSSH with one line, and conduit still needs volunteer relays. The public private-compartment id is the default; `--psiphon-compartment ID` overrides it.
+The Psiphon lane is native: `./ferrox-cli.sh up --psiphon --vpn` on macOS (or `./ferrox-cli.sh up --psiphon` on Linux, with apps pointed at the fronts) fetches the signed server list and speaks OSSH/SSH itself, with no `psiphon-tunnel-core` and no account. `--psiphon-cdn` asks for CDN fronting and beast mode in one flag; `--psiphon-conduit-mode private` and `--psiphon-cdn-profile fronted` name the two settings directly. A fronted entry is dialled through its CDN front with the version-4 meek cookie; a list with no fronted entry falls back to SSH/OSSH with one line, and conduit still needs volunteer relays. The public private-compartment id is the default; `--psiphon-compartment ID` overrides it.
 
 ## Ports, on every platform
 
@@ -118,8 +122,7 @@ Use `socks5h://` (the `h`) so names resolve at the exit, not on your machine.
 
 ## Verify the download
 
-Every release includes `SHA256SUMS` beside the packages. To check just the
-package you downloaded:
+Every release includes `SHA256SUMS` beside the packages. To check just the package you downloaded:
 
 ```bash
 # Linux

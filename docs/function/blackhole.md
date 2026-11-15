@@ -1,6 +1,6 @@
 # The blackhole sink
 
-Row 28: a `blackhole` outbound swallows the flow, and the same sink is an inbound: every flow that reaches its listener gets the same answer. It answers the client with one of the reference's three answers — nothing, the 403 its own `http.Response.Write` serialises, or the bytes the config carries — and then ends the flow: the peer's read side ends with the answer, and an answer that was written has the peer's bytes read to their end, so the close is a finish and not the reset an unread request earns.
+Row 28: a `blackhole` outbound swallows the flow, and the same sink is an inbound: every flow that reaches its listener gets the same answer. It answers the client with one of the reference's three answers — nothing, the 403 its own `http.Response.Write` serialises, or the bytes the config carries — and then ends the flow: the peer's read side ends with the answer, and an answer that was written reads the peer's bytes until their end or the `sinkGrace` deadline. A peer that finishes inside the grace gets a finish and not the reset an unread request earns; a peer still sending at the deadline can be reset with bytes unread, and a read that starts just before it may run to the socket timeout. A read that fails ends the drain.
 
 The answer's bytes are the reference's own. The oracle (`scripts/blackhole-oracle`) drives the pinned `xray-core`'s handler over a pipe and records every octet it wrote; `ferrox-core`'s `blackhole` module is compared to that record octet for octet, and the answer the writer receives is the config's own buffer — the pointer it sees is the pointer the answer holds, and a clone of the answer does not move it.
 
@@ -8,7 +8,7 @@ The config is the reference's shape — `{"response": {"type": "none" | "http" |
 
 The sink is the last resort of the untagged lane: a config that names a dial takes the dial, and a config that names only the sink takes the sink. A routing rule names it by tag, and a rule that sends a flow to the tag gets the sink.
 
-The sink is also a listener. An inbound whose protocol is `blackhole` (or its `block` alias) binds the configured address and gives every accepted flow the answer the outbound would have written, then the same half-close. An answer with bytes drains the peer's request within `sinkGrace`; `none` and an empty `custom` answer close without draining, because there is nothing to take in. The shared reader means the three types, the lower-case fold and the startup refusal are the same code, so the inbound cannot answer with bytes the outbound would not. The pinned inbound is `xray-core-rust`'s `BlackholeInboundHandler`, and it is TCP: neither `xray-core` nor sing-box registers a blackhole inbound, so no reference serves a datagram listener.
+The sink is also a listener. An inbound whose protocol is `blackhole` (or its `block` alias) binds the configured address and gives every accepted flow the answer the outbound would have written, then the same half-close. An answer with bytes drains the peer's request until its end or the `sinkGrace` deadline; `none` and an empty `custom` answer close without draining, because there is nothing to take in. The shared reader means the three types, the lower-case fold and the startup refusal are the same code, so the inbound cannot answer with bytes the outbound would not. The pinned inbound is `xray-core-rust`'s `BlackholeInboundHandler`, and it is TCP: neither `xray-core` nor sing-box registers a blackhole inbound, so no reference serves a datagram listener.
 
 xray registers `block` as another name for the handler, and both the only-lane and the tagged-rule path accept it (`upstream/xray-core/infra/conf/xray.go:27-53`).
 
@@ -23,7 +23,7 @@ graph TD
     L["blackhole inbound:<br/>the listener accepts"] --> B
     B --> A["the answer: the config's own bytes,<br/>one write, no copy"]
     B --> D["the peer's bytes, read in 16 KiB windows,<br/>and only when an answer waits to be taken in"]
-    D --> E["the close: a finish, not the reset<br/>an unread request earns"]
+    D --> E["the close: a finish when the peer ends<br/>inside the grace, a reset if bytes remain"]
 ```
 
 ## Measured
@@ -32,6 +32,7 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| syscalls-per-answered-flow | UNBLESSED | scripts/count-ops.sh |
 | answer-bytes-the-reference-writes | 101 | ferrox-core-blackhole::tests::the_answer_is_the_bytes_the_pinned_go_writes |
 | inbound-http-answer-bytes | 101 | ferrox-app-proxy::tests::a_blackhole_inbound_serves_all_three_answers |
 | answer-writes-per-flow | 1 | ferrox-core-blackhole::tests::the_answer_is_one_write |
@@ -70,11 +71,11 @@ The copy the answer used to cost. `xray-core` stages the answer in a fresh `buf.
 
 The 403 that was not the reference's. ZeroNet spells the `http` answer with `Connection` before `Cache-Control` and three trailing CRLFs, which is not what `xray-core` writes. The bytes here are the reference's own, proved by the oracle: `HTTP/1.1 403 Forbidden`, the headers in the order Go's `Header.WriteSubset` sorts them, the `Content-Length: 0` Go adds for a status that allows a body, and the blank line last.
 
-The inbound's per-flow clone. `xray-core-rust`'s `BlackholeInboundHandler` clones its whole `ResponseConfig` for every accepted connection and writes the clone; this listener shares the `Response`'s `Arc<[u8]>` across its threads, so a configured answer is allocated once at startup and not per flow. It also drains when it answered something: the Rust inbound writes the answer and closes with the peer's bytes unread, while this one ends its write side and reads them, so the close is a finish.
+The inbound's per-flow clone. `xray-core-rust`'s `BlackholeInboundHandler` clones its whole `ResponseConfig` for every accepted connection and writes the clone; this listener shares the `Response`'s `Arc<[u8]>` across its threads, so a configured answer is allocated once at startup and not per flow. It also drains when it answered something: the Rust inbound writes the answer and closes with the peer's bytes unread, while this one ends its write side and reads them, so the close is a finish when the peer ends inside the grace.
 
 ## What was not removed
 
-The peer's bytes are read, not skipped, when there is an answer to protect, and that is a read per window the reference does not pay: `xray-core` never reads the TCP lane's request at all, so its close earns the reset an unread request earns, and the answer it wrote a moment earlier can be swallowed by it. Reading them is what makes the close a finish, and the window is the price. The `http` answer's own shape is Go's serialisation and not this tree's: 101 bytes with Go's header order and its empty-body length line, because the bytes on the wire are the reference's and not ours. The datagram lane still refuses the association with `0x07` instead of answering the first datagram the way the reference's UDP ray does — that is the routing row's decision, and this row does not reopen it. The inbound is TCP only, as the pinned inbound is; the outbound's datagram lane remains the only answer either role gives a datagram, and no reference serves a blackhole UDP listener. The one-second hold the reference keeps is not gone but bounded by `sinkGrace`, 500 ms by default; a configured grace above one second can hold a sink longer, and a peer that closes sooner ends it sooner.
+The peer's bytes are read, not skipped, when there is an answer to protect, and that is a read per window the reference does not pay: `xray-core` never reads the TCP lane's request at all, so its close earns the reset an unread request earns, and the answer it wrote a moment earlier can be swallowed by it. Reading them is what makes the close a finish when the peer ends inside the grace, and the window is the price. The `http` answer's own shape is Go's serialisation and not this tree's: 101 bytes with Go's header order and its empty-body length line, because the bytes on the wire are the reference's and not ours. The datagram lane still refuses the association with `0x07` instead of answering the first datagram the way the reference's UDP ray does — that is the routing row's decision, and this row does not reopen it. The inbound is TCP only, as the pinned inbound is; the outbound's datagram lane remains the only answer either role gives a datagram, and no reference serves a blackhole UDP listener. The one-second hold the reference keeps is not gone but bounded by `sinkGrace`, 500 ms by default; a configured grace above one second can hold a sink longer, and a peer that closes sooner ends it sooner.
 
 ## Pins
 

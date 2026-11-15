@@ -1483,6 +1483,30 @@ def check_config_fronts(state: pathlib.Path) -> int:
         )
         return 1
 
+    for label, listener in (("missing", None), ("empty", "")):
+        deaf = state / f"config-listen-{label}.json"
+        inbound = {"protocol": "http", "port": free_port()}
+        if listener is not None:
+            inbound["listen"] = listener
+        deaf.write_text(
+            json.dumps({"inbounds": [inbound], "outbounds": []}),
+            encoding="utf-8",
+        )
+        run, recorded = config_lane(state, deaf, trace=False)
+        output = run.stdout + run.stderr
+        if (
+            run.returncode == 0
+            or recorded
+            or (state / "lane.pid").exists()
+            or "loopback" not in output
+        ):
+            print(
+                f"check-cli-lane: a config with {label} listen was armed instead"
+                f" of refused:\n{recorded}\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+
     no_front = state / "config-no-front.json"
     no_front.write_text(
         json.dumps(
@@ -1553,7 +1577,7 @@ def check_config_fronts(state: pathlib.Path) -> int:
 
     print(
         "check-cli-lane: a config lane arms the fronts and ports it serves, and"
-        " refuses an exposed, frontless or silent one"
+        " refuses an exposed, unbounded, frontless or silent one"
     )
     return 0
 
@@ -2510,6 +2534,28 @@ def check_proxy_cleanup(state: pathlib.Path) -> int:
     print("check-cli-lane: a failed proxy clear is named and down exits nonzero")
 
     reset_fake_net(state)
+    victim = subprocess.Popen(["sleep", "60"])
+    try:
+        (state / "lane.pid").write_text(f"{victim.pid}\n", encoding="utf-8")
+        down = run(["down"], env_for(state))
+        output = down.stdout + down.stderr
+        if (
+            down.returncode != 0
+            or victim.poll() is not None
+            or (state / "lane.pid").exists()
+        ):
+            print(
+                "check-cli-lane: down killed a process that had reused a stale"
+                f" lane pid:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+    finally:
+        victim.terminate()
+        victim.wait(timeout=WATCH)
+    print("check-cli-lane: down leaves a process that reused a stale lane pid alone")
+
+    reset_fake_net(state)
     seed_service_proxy(state, "socks", "127.0.0.1", 10808)
     status = run(["status"], env_for(state))
     output = status.stdout + status.stderr
@@ -2965,6 +3011,40 @@ def check_stale_proxy_reconciled(state: pathlib.Path) -> int:
         seed_service_proxy(state, "socks", "127.0.0.1", 10808)
         (state / "system-proxy.ports").write_text("10808 -\n", encoding="utf-8")
         (state / "lane.pid").write_text("999999\n", encoding="utf-8")
+
+    fabricate()
+    live = subprocess.Popen(["sleep", "60"])
+    try:
+        (state / "lane-work.pid").write_text(f"{live.pid}\n", encoding="utf-8")
+        (state / "system-proxy.owner").write_text(f"{state}\n", encoding="utf-8")
+        status = subprocess.run(
+            [str(CLI), "status"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env_for(state, darwin=True),
+        )
+        output = status.stdout + status.stderr
+        calls = state / "networksetup.calls"
+        recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+        if (
+            status.returncode == 0
+            or "-setsocksfirewallproxystate Wi-Fi off" not in recorded
+            or proxy_field(state, "socks-enabled") != "off"
+            or (state / "system-proxy.ports").exists()
+        ):
+            print(
+                "check-cli-lane: a live named lane hid the dead owner's armed"
+                f" proxy:\n{recorded}\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+    finally:
+        live.terminate()
+        live.wait(timeout=WATCH)
+        (state / "lane-work.pid").unlink(missing_ok=True)
+        (state / "system-proxy.owner").unlink(missing_ok=True)
 
     fabricate()
     status = subprocess.run(

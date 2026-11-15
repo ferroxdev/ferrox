@@ -21,24 +21,27 @@ graph TD
     L["one hostname lookup"] --> H{"hosts map matches?"}
     H -- yes --> A["the mapped IPs, TTL 10,<br/>or the rule's rcode"]
     H -- no --> S{"queryStrategy"}
-    S -- UseSys --> Y["system resolver"]
-    S -- UseIP / UseIP4 / UseIP6 --> M["match servers by domains,<br/>then fall back"]
+    S -- UseSys --> Y["system resolver: the system's<br/>addresses, deduped and<br/>family-filtered"]
+    S -- UseIP / UseIP4 / UseIP6 / unset --> M["match servers by domains,<br/>then fall back"]
     M --> G["policyID groups:<br/>race on the server pool,<br/>then the next"]
-    G --> F["expected / unexpected<br/>IP filter"]
-    F --> R["route: the configured outbound"]
+    G --> Z{"per-server cache hit?"}
+    Z -- yes --> F["expected / unexpected<br/>IP filter (a cache hit too)"]
+    Z -- no --> W{"after the miss: +local / DoQ?"}
+    W -- yes --> X["direct dial"]
+    W -- no --> R["route: the configured outbound"]
     R --> U["UDP datagram"]
     R --> T["TCP / TLS framed message"]
     R --> D["DoH POST over HTTP/2"]
-    M --> X["+local and DoQ:<br/>direct dial"]
     X --> U
     X --> T
     X --> D
     X --> Q["DoQ over QUIC"]
-    U --> K["cache: A and AAAA per server"]
+    U --> K["cache: A and AAAA per server<br/>written only after a miss"]
     T --> K
     D --> K
     Q --> K
-    K --> A
+    K --> F
+    F --> N["the first non-empty filtered<br/>server answer, or the last<br/>rcode / empty / failed"]
 ```
 
 ## What was removed
