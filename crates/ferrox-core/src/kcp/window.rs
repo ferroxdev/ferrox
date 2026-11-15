@@ -389,6 +389,11 @@ impl AckList {
         !self.entries.is_empty()
     }
 
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        self.entries.len()
+    }
+
     pub fn flush(
         &mut self,
         current: u32,

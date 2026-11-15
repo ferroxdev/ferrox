@@ -207,6 +207,8 @@ impl SendingWorker {
     }
 }
 
+const ACK_WAKE_SEGMENTS: usize = 16;
+
 pub struct ReceivingWorker {
     ctx: Arc<Ctx>,
     /// Spent payload buffers, ready to be filled by the next inbound segment.
@@ -245,6 +247,12 @@ impl ReceivingWorker {
     #[must_use]
     pub fn update_necessary(&self) -> bool {
         self.acklist.is_pending()
+    }
+
+    /// The pending ack count at which the socket thread wakes the flush clock: a sender's window must keep sliding between ticks, without a wake per datagram.
+    #[must_use]
+    pub fn ack_batch_due(&self) -> bool {
+        self.acklist.pending() >= ACK_WAKE_SEGMENTS
     }
 
     #[must_use]

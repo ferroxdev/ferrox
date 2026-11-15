@@ -259,7 +259,7 @@ pub struct Connection {
     closer: Mutex<Option<Box<Closer>>>,
     terminated: AtomicBool,
     started: AtomicBool,
-    write_pending: AtomicBool,
+    flush_pending: AtomicBool,
     #[cfg(any(test, not(miri)))]
     last_flush: Mutex<Instant>,
     #[cfg(any(test, not(miri)))]
@@ -345,7 +345,7 @@ impl Connection {
             closer: Mutex::new(Some(closer)),
             terminated: AtomicBool::new(false),
             started: AtomicBool::new(false),
-            write_pending: AtomicBool::new(false),
+            flush_pending: AtomicBool::new(false),
             #[cfg(any(test, not(miri)))]
             last_flush: Mutex::new(now.checked_sub(tick).unwrap_or(now)),
             #[cfg(any(test, not(miri)))]
@@ -378,7 +378,7 @@ impl Connection {
         let last_flush = *self.last_flush.lock().unwrap();
         let last_uncond = *self.last_uncond.lock().unwrap();
         let due = draining
-            || self.write_pending.swap(false, Ordering::SeqCst)
+            || self.flush_pending.swap(false, Ordering::SeqCst)
             || now.saturating_duration_since(last_flush) >= tick;
         if due
             && (draining
@@ -456,6 +456,7 @@ impl Connection {
         self.last_incoming_time.store(current, Ordering::SeqCst);
         let mut woke = false;
         let mut receiving = None;
+        let mut ack_due = false;
         for seg in segments.drain(..) {
             if seg.conversation() != self.ctx.meta.conversation {
                 break;
@@ -474,6 +475,7 @@ impl Connection {
                     });
                     receiving.process_segment(d);
                     woke |= receiving.is_data_available();
+                    ack_due |= receiving.ack_batch_due();
                 }
                 Segment::Ack(a) => {
                     drop(receiving.take());
@@ -524,6 +526,11 @@ impl Connection {
         // One wake for the datagram: a reader parked on the generation counter needs it to change once, not once per segment.
         if woke {
             self.data_input.signal();
+        }
+        // A batch of acks owes a flush before the tick: a sender whose window the acks slide must not wait out the packet timer for every window.
+        if ack_due {
+            self.flush_pending.store(true, Ordering::SeqCst);
+            Self::wake_update();
         }
     }
 }
@@ -707,7 +714,7 @@ impl Connection {
             offset += n;
         }
         if pushed {
-            self.write_pending.store(true, Ordering::SeqCst);
+            self.flush_pending.store(true, Ordering::SeqCst);
             Self::wake_update();
         }
         Ok(b.len())
@@ -1266,16 +1273,15 @@ mod tests {
         );
     }
 
-    /// A burst of inbound segments is one flush per tick, not one per segment: the worker's clock is the `tti`, and an ack that is already pending when a tick opens joins that tick's flush.
-    #[cfg_attr(miri, ignore = "waits on the worker's wall-clock tick")]
+    /// An ack batch is the wakeup: the sender's window slides every sixteen accepted segments instead of waiting out the tick, and a shorter run leaves the flush to the tick.
     #[test]
-    fn a_burst_of_inbound_segments_does_not_flush_once_per_segment() {
+    fn an_ack_batch_flushes_before_the_tick() {
         let local = ([127, 0, 0, 1], 1).into();
         let config = Config {
             tti: 5000,
             ..Config::default()
         };
-        let conn = Connection::new(
+        let conn = Connection::new_unstarted(
             ConnMetadata {
                 local,
                 remote: local,
@@ -1285,14 +1291,23 @@ mod tests {
             Box::new(|| {}),
             config,
         );
-        for number in 0..40 {
-            conn.input(&mut vec![data(number, 0, b"payload")]);
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let flushes = conn.flush_calls();
+        let mut fifteen: Vec<Segment> = (0..15).map(|n| data(n, 0, b"payload")).collect();
+        conn.input(&mut fifteen);
         assert!(
-            flushes <= 2,
-            "40 segments over 400 ms flushed {flushes} times; a five-second tick allows one"
+            !conn.flush_pending.load(Ordering::SeqCst),
+            "fifteen acks woke the flush clock instead of waiting for the tick"
+        );
+        conn.input(&mut vec![data(15, 0, b"payload")]);
+        assert!(
+            conn.flush_pending.load(Ordering::SeqCst),
+            "the sixteenth ack did not wake the flush clock"
+        );
+        let before = conn.flush_calls();
+        let next = conn.poll(Instant::now());
+        assert_eq!(conn.flush_calls(), before + 1, "the batch did not flush");
+        assert!(
+            next.saturating_duration_since(Instant::now()) >= Duration::from_millis(4000),
+            "a flushed connection did not park for the tick"
         );
     }
 
