@@ -2440,6 +2440,10 @@ mod tests {
 
     /// A retried handshake's transcript opens with a synthetic `message_hash` and a
     /// `HelloRetryRequest`, so the binding must read the second hello pair.
+    #[cfg_attr(
+        miri,
+        ignore = "reaches ring's CPUID FFI through the record KDF and transcript hash"
+    )]
     #[test]
     fn a_retried_handshake_binds_the_second_hello_pair() {
         let suite = Suite::Aes128GcmSha256;

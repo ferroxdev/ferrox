@@ -1823,6 +1823,7 @@ struct Session13<S: Stream> {
     plain_at: usize,
     plain_end: usize,
     expected_finished: Vec<u8>,
+    reply_update: bool,
     eof: bool,
 }
 
@@ -2017,6 +2018,7 @@ impl<S: Stream> Session13<S> {
             plain_at: 0,
             plain_end: 0,
             expected_finished,
+            reply_update: false,
             eof: false,
         })
     }
@@ -2038,7 +2040,7 @@ impl<S: Stream> Session13<S> {
                     Err(error) => return Err(TlsError::from(error)),
                 }
             }
-            if self.phase == Phase::Flight {
+            if self.phase == Phase::Flight && self.pending_at == self.pending.len() {
                 self.pending.clear();
                 self.pending_at = 0;
                 self.phase = Phase::Finished;
@@ -2162,24 +2164,8 @@ impl<S: Stream> Session13<S> {
                 self.plain_end = plen;
             }
             22 => {
-                let mut reply = false;
-                let mut at = 0;
-                while at + 4 <= plen {
-                    let len = u24(&body[at + 1..at + 4]).unwrap_or(usize::MAX);
-                    if at + 4 + len > plen {
-                        break;
-                    }
-                    if body[at] == 24 {
-                        reply |= body.get(at + 4) == Some(&1);
-                        if let Some(keys) = self.read_key.as_mut() {
-                            keys.update();
-                        }
-                    }
-                    at += 4 + len;
-                }
-                if reply {
-                    self.send_key_update()?;
-                }
+                self.hs.extend_from_slice(&body[..plen]);
+                self.process_post_handshake()?;
             }
             21 => self.eof = true,
             _ => {}
@@ -2211,21 +2197,22 @@ impl<S: Stream> Session13<S> {
             }
             self.hs.drain(..end);
         }
-        if reply {
-            self.send_key_update()?;
-        }
+        self.reply_update |= reply;
         Ok(())
     }
 
-    fn send_key_update(&mut self) -> Result<(), TlsError> {
+    /// The queued answer goes out in wire order: the next seal stages it ahead of its own record.
+    fn seal_key_update(&mut self, out: &mut Vec<u8>) -> Result<(), TlsError> {
+        if !self.reply_update {
+            return Ok(());
+        }
         let keys = self
             .write_key
             .as_mut()
             .ok_or_else(|| TlsError::Other("reality: no write keys".to_owned()))?;
-        let mut out = Vec::with_capacity(32);
-        crate::tls::shaped::record::seal13(keys, 22, &[24, 0], &mut out)?;
-        self.io.write_all(&out).map_err(TlsError::from)?;
+        crate::tls::shaped::record::seal13(keys, 22, &handshake_message(24, &[0]), out)?;
         keys.update();
+        self.reply_update = false;
         Ok(())
     }
 
@@ -2237,6 +2224,7 @@ impl<S: Stream> Session13<S> {
         if self.phase != Phase::Done {
             self.handshake_io()?;
         }
+        self.seal_key_update(out).map_err(io_error)?;
         let keys = self
             .write_key
             .as_mut()
@@ -2390,6 +2378,7 @@ impl<S: Stream> TlsProvider for Session13<S> {
         if self.phase != Phase::Done {
             self.handshake_io()?;
         }
+        self.seal_key_update(out).map_err(io_error)?;
         let total: usize = parts.iter().map(|part| part.len()).sum();
         let keys = self
             .write_key
