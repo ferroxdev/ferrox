@@ -1,0 +1,385 @@
+name: release
+
+# Ships the lanes. On a version tag (or on demand) this builds `ferrox-app`
+# for every platform a user can run it on and attaches one package per platform
+# to the GitHub Release: the binary, the launcher beside it (`ferrox-cli.exe`,
+# `ferrox-cli.cmd`, and the `ferrox-cli.sh` fallback on Windows, `ferrox-cli.sh`
+# elsewhere), and the two
+# pages that make trying a lane three commands — `login`, `up --foxy --vpn` (or
+# `up --veepn --vpn` with no account), `down` — with no toolchain, no repository
+# and no config by hand.
+#
+# Nothing here dials a connection: the job compiles, smoke-runs the binary's
+# own version line, and packages. Whether a lane carries bytes is gated by
+# foxy-relay.yml, veepn-relay.yml and the parity matrix, never by a release
+# build. Every leg must go green for the release to be written; a platform
+# that cannot build holds the release rather than shipping a page that
+# promises it.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: an existing tag (vX.Y.Z) to rebuild onto; leave empty to ship the version Cargo.toml declares
+        required: false
+        default: ""
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# The release job writes the tag and the assets; the build jobs only read.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: the version to ship
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: name the release
+        id: v
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          WANT: ${{ github.event.inputs.tag }}
+        run: |
+          valid_version() {
+            printf '%s' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+          }
+          if [ "$EVENT" = push ]; then
+            valid_version "$REF_NAME" || { echo "::error::the pushed tag must be vX.Y.Z, got: $REF_NAME"; exit 1; }
+            echo "version=$REF_NAME" >> "$GITHUB_OUTPUT"
+          elif [ -n "$WANT" ]; then
+            valid_version "$WANT" || { echo "::error::the tag input must name an existing vX.Y.Z tag, got: $WANT"; exit 1; }
+            echo "version=$WANT" >> "$GITHUB_OUTPUT"
+          else
+            # Nothing typed: the version this workspace declares is the version
+            # to ship, so pressing the button once is the whole interaction.
+            DECLARED="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
+            [ -n "$DECLARED" ] || { echo "::error::cannot read the workspace version from Cargo.toml"; exit 1; }
+            valid_version "v$DECLARED" || { echo "::error::Cargo.toml declares a non-vX.Y.Z version: $DECLARED"; exit 1; }
+            echo "version=v$DECLARED" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: ${{ matrix.target }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-26.04-arm
+            pkg: aarch64-linux-gnu
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-26.04
+            pkg: x86_64-linux-gnu
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release-${{ matrix.target }}-${{ matrix.os }}
+      - name: install the QUIC build tool
+        if: runner.os == 'Windows'
+        shell: bash
+        run: choco install nasm -y --no-progress || { choco list --local-only 2>/dev/null | grep -iq nasm; }
+      - name: build the binary
+        shell: bash
+        env:
+          # The same crypto cfgs ci.yml arms and .cargo/config.toml documents:
+          # aarch64 consults them, x86_64 consults neither, so every package
+          # holds the runtime-dispatching build the local gates measured.
+          RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8
+        run: cargo build --locked --release -p ferrox-app -p ferrox-cli --target "${{ matrix.target }}"
+      - name: prove the binaries run
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/ferrox-app"
+          CLI="target/${{ matrix.target }}/release/ferrox-cli"
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; CLI="$CLI.exe"; fi
+          "$BIN" version
+          "$CLI" --help >/dev/null
+      - name: package the lane kit
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          NAME: ${{ matrix.pkg || matrix.target }}
+        run: |
+          BIN="target/${{ matrix.target }}/release/ferrox-app"
+          CLI="target/${{ matrix.target }}/release/ferrox-cli"
+          WINDOWS=0
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; CLI="$CLI.exe"; WINDOWS=1; fi
+          if [ "$WINDOWS" = 1 ]; then bash dist/ferrox-cli.sh --help >/dev/null; fi
+          PKG="ferrox-${VERSION#v}-${NAME}"
+          rm -rf "$PKG" && mkdir -p "$PKG"
+          if [ "$WINDOWS" = 1 ]; then
+            cp "$BIN" "$CLI" dist/ferrox-cli.sh dist/ferrox-cli.cmd dist/README.md dist/USAGE.md "$PKG/"
+            sed -i 's/\r$//' "$PKG/ferrox-cli.sh"
+            if grep -q $'\r' "$PKG/ferrox-cli.sh"; then
+              echo "::error::$PKG.zip has a CRLF ferrox-cli.sh"
+              exit 1
+            fi
+            bash -n "$PKG/ferrox-cli.sh" || { echo "::error::$PKG.zip has an invalid ferrox-cli.sh"; exit 1; }
+            grep -q 'ferrox-cli.exe' "$PKG/ferrox-cli.cmd" || { echo "::error::$PKG.zip has an invalid ferrox-cli.cmd"; exit 1; }
+          else
+            cp "$BIN" dist/ferrox-cli.sh dist/README.md dist/USAGE.md "$PKG/"
+          fi
+          chmod +x "$PKG"/* 2>/dev/null || true
+          case "$(uname -s)" in
+            Darwin|Linux)
+              COPYFILE_DISABLE=1 tar --no-xattrs -czf "$PKG.tar.gz" "$PKG" ;;
+            *)
+              7z a -tzip "$PKG.zip" "$PKG" >/dev/null
+              if [ "$WINDOWS" = 1 ]; then
+                7z l "$PKG.zip" | grep -q 'ferrox-cli.exe' || { echo "::error::$PKG.zip has no ferrox-cli.exe"; exit 1; }
+                7z l "$PKG.zip" | grep -q 'ferrox-cli.cmd' || { echo "::error::$PKG.zip has no ferrox-cli.cmd"; exit 1; }
+                7z l "$PKG.zip" | grep -q 'ferrox-cli.sh' || { echo "::error::$PKG.zip has no ferrox-cli.sh"; exit 1; }
+              fi ;;
+          esac
+          rm -rf "$PKG"
+          ls -l ferrox-*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.target }}
+          path: ferrox-*
+          if-no-files-found: error
+
+  release:
+    name: publish ${{ needs.plan.outputs.version }}
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: packages
+          merge-multiple: true
+      - name: fetch the optional country database
+        shell: bash
+        run: |
+          curl -fsSL --retry 3 -o packages/GeoLite2-Country.mmdb \
+            https://github.com/mojolabs-id/GeoLite2-Database/releases/download/2026.11.01/GeoLite2-Country.mmdb
+          test -s packages/GeoLite2-Country.mmdb
+      - name: write the checksums
+        shell: bash
+        run: |
+          cd packages
+          rm -f SHA256SUMS
+          sha256sum ./*.tar.gz ./*.zip ./*.mmdb >SHA256SUMS
+          sha256sum --check SHA256SUMS
+          cat SHA256SUMS
+      - name: the handout
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          BODY: |-
+            ## Ferrox VERSION_PLACEHOLDER
+
+            Unpack the package for your platform. The engine and launcher are side by side; no cargo, repository, or config is needed.
+
+            ### What is new in this build
+
+            - **`--warp`**: chain any lane through a one-tap Cloudflare WARP registration (WireGuard, with the MASQUE dialect as its peer). No account and no client binary: `ferrox-cli up --foxy --warp`.
+            - **Foxy sign-in over WARP**: on the Foxy lane `--warp` is applied before the account plane, so the Firefox sign-in and the carrier catalogue see a WARP exit instead of a region block. An explicit `--upstream` still wins.
+            - **VMess share links**: `ferrox-cli up --vmess 'vmess://...'` reads the v2rayN base64-JSON form and the standard URI form, with the carrier, TLS, REALITY, ALPN, fingerprint and pin fields mapped the same way as VLESS. `--vmess HOST:PORT --uuid ID` still works. `--vless` now reads the full field set: every supported carrier, early data, `alpn`, `fp`, `allowInsecure`, certificate pins, verify names and REALITY's `pbk`/`sid`/`spx`/`pqv`.
+            - **More carriers on existing lanes**: xHTTP (including h2/h3 and stream modes), HTTP/3, MASQUE/Connect-UDP, REALITY over QUIC and KCP, and the Linux TUN system stack. Psiphon keeps CDN fronting and the wider establishment race.
+
+            These packages are rebuilt from the commit that carries this release; `SHA256SUMS` is regenerated for every asset, so a download from an older date cannot be mixed with this one.
+
+            ### Windows: use `ferrox-cli.exe`
+
+            It is native and needs no Bash, WSL, or Python.
+
+            ```powershell
+            Expand-Archive ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip -DestinationPath .
+            cd ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc
+            .\ferrox-cli.exe up --foxy --vpn
+            .\ferrox-cli.exe status
+            .\ferrox-cli.exe down
+            ```
+
+            If PowerShell opens WSL and prints `execvpe(/bin/bash) failed`, use `.\ferrox-cli.exe` as shown; do not run `bash ./ferrox-cli.sh`. `ferrox-cli.cmd` forwards to the same binary from `cmd.exe`; the zip's `ferrox-cli.sh` is Git Bash only and ports-only.
+
+            ### macOS and Linux
+
+            ```bash
+            tar xzf ferrox-VERSION_PLACEHOLDER-x86_64-apple-darwin.tar.gz   # choose your package
+            cd ferrox-VERSION_PLACEHOLDER-x86_64-apple-darwin
+            ./ferrox-cli.sh up --foxy
+            ./ferrox-cli.sh status
+            ./ferrox-cli.sh down
+            ```
+
+            On macOS, add `--vpn` to `up` to point the system proxy at the fronts. On Linux, use the loopback fronts directly.
+
+            On Windows, replace `./ferrox-cli.sh` with `.\ferrox-cli.exe` in the Foxy, VeePN and protocol lane commands below. The Windows launcher does not accept the Psiphon flags or the lane-specific `locations`/`location` selectors; use the macOS/Linux package for those.
+
+            ### Lanes
+
+            | lane | what it needs | start it |
+            | --- | --- | --- |
+            | Foxy | a Firefox account: email and password; no server | `ferrox-cli up --foxy` |
+            | VeePN | nothing: anonymous, no account, no server | `ferrox-cli up --veepn` |
+            | Psiphon | nothing: no account, no client binary | `ferrox-cli up --psiphon` |
+            | VLESS | a `vless://` link | `ferrox-cli up --vless 'vless://...'` |
+            | VMess | a `vmess://` link, or `HOST:PORT` and a user id | `ferrox-cli up --vmess 'vmess://...'` |
+            | Trojan | `HOST:PORT` and a password | `ferrox-cli up --trojan host:443 --password PW` |
+            | Shadowsocks | `HOST:PORT`, method, and password | `ferrox-cli up --ss host:8388 --method aes-256-gcm --password PW` |
+            | Any config | a JSON config the binary serves | `ferrox-cli up --config mine.json` |
+
+            Psiphon is native: the lane fetches the signed server list and speaks OSSH/SSH itself, with no `psiphon-tunnel-core` and no account.
+
+            Direct SSH/OSSH:
+
+            ```bash
+            ./ferrox-cli.sh up --psiphon
+            ```
+
+            CDN-fronted, for a network that blocks direct SSH/OSSH:
+
+            ```bash
+            ./ferrox-cli.sh up --psiphon-cdn
+            ```
+
+            `--psiphon-cdn` keeps the entries that carry a CDN front and widens the establishment race ("beast mode"), so more fronted servers are tried inside the readiness window. The tunnel is still the same OSSH/SSH transport: the fronted-meek relay carries the handshake in `POST /` bodies over one CDN connection (TLS, plain HTTP or HTTP/3), and the first request carries the reference's version-4 meek cookie. If the signed list has no fronted entry, the lane prints one line and falls back to direct SSH/OSSH instead of refusing to start.
+
+            `--psiphon-fronted` is the same shortcut. To ask for one half only, use `--psiphon-cdn-profile fronted` for the CDN front or `--psiphon-aggressive` for the wider race. `--psiphon-conduit-mode private` is a separate in-proxy WebRTC path, not the CDN shortcut, and it needs volunteer relays.
+
+            On macOS, add `--vpn` to either command. On Linux, point apps at the local fronts: SOCKS5 `127.0.0.1:10808`, HTTP `127.0.0.1:8080`, or mixed `127.0.0.1:10809`.
+
+            Every lane takes the same country spelling. `--country DE` and `--psiphon-region DE` are the same on this lane; `--region nl` is the VeePN spelling. List before you pick:
+
+            ```bash
+            ./ferrox-cli.sh locations --psiphon
+            ./ferrox-cli.sh location --psiphon DE
+            ```
+
+            ### Exit locations
+
+            Each lane lists and remembers its own exit:
+
+            ```bash
+            ./ferrox-cli.sh locations --foxy              # countries and cities
+            ./ferrox-cli.sh locations --veepn             # VeePN region ids (ferrox-cli.sh only)
+            ./ferrox-cli.sh locations --psiphon           # regions in the signed list (ferrox-cli.sh only)
+            ./ferrox-cli.sh location DE --foxy
+            ./ferrox-cli.sh location nl --veepn
+            ./ferrox-cli.sh location US --psiphon
+            ```
+
+            All lanes serve the same loopback fronts: SOCKS5 `127.0.0.1:10808`, HTTP and HTTPS `127.0.0.1:8080`, and mixed `127.0.0.1:10809`.
+
+            `--vpn` points the system proxy at those fronts only after a real flow answers. It is supported on macOS by `ferrox-cli.sh` and on Windows by `ferrox-cli.exe`. Without `--vpn`, point apps at a front directly. This build does not create a TUN device, so apps that ignore proxies and raw UDP are not captured.
+
+            | package | platform |
+            | --- | --- |
+            | `ferrox-VERSION_PLACEHOLDER-aarch64-apple-darwin.tar.gz` | macOS on Apple Silicon |
+            | `ferrox-VERSION_PLACEHOLDER-x86_64-apple-darwin.tar.gz` | macOS on Intel |
+            | `ferrox-VERSION_PLACEHOLDER-aarch64-linux-gnu.tar.gz` | Linux on aarch64 |
+            | `ferrox-VERSION_PLACEHOLDER-x86_64-linux-gnu.tar.gz` | Linux on x86_64 |
+            | `ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip` | Windows x86_64: native launcher, `ferrox-cli.cmd`, and Git Bash fallback |
+
+            ### Verify the download
+
+            `SHA256SUMS` lists every package; compare it with the matching line. Linux:
+
+            ```bash
+            grep 'ferrox-VERSION_PLACEHOLDER-.*-linux-gnu.tar.gz' SHA256SUMS | sha256sum --check -
+            ```
+
+            macOS:
+
+            ```bash
+            grep 'ferrox-VERSION_PLACEHOLDER-.*-apple-darwin.tar.gz' SHA256SUMS | shasum -a 256 -c -
+            ```
+
+            Windows:
+
+            ```powershell
+            Get-FileHash .\ferrox-*-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+            ```
+
+            `README.md` in each package is the quickstart; `USAGE.md` is the full manual. `GeoLite2-Country.mmdb` is a separate optional asset for configs that ask the binary for country data; it is not unpacked by the lane packages. Its checksum is in the same `SHA256SUMS`.
+        run: |
+          printf '%s\n\nBuilt by `release.yml` from commit `%s`.\n' "$BODY" "${GITHUB_SHA::8}" \
+            | sed "s/VERSION_PLACEHOLDER/${VERSION#v}/g" >RELEASE-BODY.md
+          head -5 RELEASE-BODY.md
+      - name: publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This job holds no checkout, so the repo has to be named for gh.
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          shopt -s nullglob
+          assets=(packages/*)
+          [ "${#assets[@]}" -gt 0 ] || { echo "::error::no packages came back" ; exit 1; }
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" "${assets[@]}" --clobber
+            gh release edit "$VERSION" --notes-file RELEASE-BODY.md
+          elif [ "$EVENT" = workflow_dispatch ]; then
+            # A dispatched release of a version with no tag yet: cut the tag at
+            # the commit that built these packages, so the assets and the tag
+            # can never disagree about what this version is.
+            gh release create "$VERSION" --target "$GITHUB_SHA" \
+              --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" --notes-file RELEASE-BODY.md "${assets[@]}"
+          else
+            gh release create "$VERSION" --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" \
+              --notes-file RELEASE-BODY.md "${assets[@]}"
+          fi
+          gh release view "$VERSION" --json tagName,assets \
+            --jq '.tagName + ": " + ([.assets[].name] | join(", "))'
+      - name: the links, on the run page
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          {
+            echo "### Ferrox $VERSION is shipping"
+            echo
+            for f in packages/*; do
+              n="$(basename "$f")"
+              echo "- [$n](https://github.com/$GITHUB_REPOSITORY/releases/download/$VERSION/$n)"
+            done
+            echo
+            echo "Three commands from any of them: unpack, \`./ferrox-cli.sh up --foxy --vpn\` on macOS/Linux or \`.\\ferrox-cli.exe up --foxy --vpn\` on Windows (or \`--veepn\` for no account), done — the CLI asks for the account the first time."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  result:
+    name: result
+    needs: [plan, build, release]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: release
+          needs: ${{ toJSON(needs) }}
