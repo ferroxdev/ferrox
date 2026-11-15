@@ -1260,23 +1260,33 @@ struct Flow {
     signaled: Arc<AtomicBool>,
 }
 
-/// The relay function the TUN handler calls per TCP flow: takes the proxied Connection and
-/// the destination extracted from the packet headers. An error means the proxy leg was
-/// refused, so the device's established flow is reset rather than left silent.
-pub(crate) type Relay =
-    Arc<dyn Fn(Connection, crate::proxy::Destination) -> io::Result<()> + Send + Sync>;
+/// The relay function the TUN handler calls per TCP flow: takes the proxied Connection, the lane
+/// the dial already resolved for a fallback flow, and the destination from the packet headers. An
+/// error means the proxy leg was refused, so the device's established flow is reset rather than
+/// left silent.
+pub(crate) type Relay = Arc<
+    dyn Fn(Connection, Option<&crate::proxy::Lane>, crate::proxy::Destination) -> io::Result<()>
+        + Send
+        + Sync,
+>;
 
 /// The direct dial: a lane that reaches its edge with the destination alone hands the handler the
 /// connected stream, so a device flow owes no loopback pair and no second thread.
 pub(crate) type Dial = Arc<dyn Fn(&crate::proxy::Destination) -> DialOutcome + Send + Sync>;
 
 /// What a direct dial found: a stream the device speaks through, a lane the front's own
-/// `serve_connect` has to carry over the loopback pair, or a target the edge refused.
+/// `serve_connect` has to carry over the loopback pair (already resolved, so it is not picked
+/// twice), or a target the edge refused.
 pub(crate) enum DialOutcome {
     Direct(Connection),
-    Fallback,
+    Fallback(crate::proxy::Lane),
     Refused,
 }
+
+/// The device's datagram dial: the SOCKS5 association the outbound's own server answers, opened
+/// once and ridden by every leg, so a device datagram crosses no loopback association and no
+/// second SOCKS server. `None` keeps the front-served association.
+pub(crate) type Datagram = crate::proxy::Datagram;
 
 /// The datagram entry the TUN handler rides per UDP flow: handed the client half of an association, it runs the same SOCKS5 UDP server the SOCKS inbound reaches, `serve_socks_udp`.
 pub(crate) type Associate = Arc<dyn Fn(Connection) + Send + Sync>;
@@ -1360,12 +1370,16 @@ pub(crate) struct Handler {
     associate: Associate,
     /// The lanes this front can reach without the loopback pair; a flow the dial falls back on keeps the pair.
     dial: Option<Dial>,
+    /// The outbound's own datagram association, when its lane has one the handler can ride directly.
+    datagram: Option<Datagram>,
     flows: Flows,
     legs: Legs,
     frame: Vec<u8>,
     /// Reused render buffer for every device-bound packet this thread emits (SYN-ACK, pure ACK, ICMP reply), so the emit path allocates nothing in steady state.
     emit: Vec<u8>,
     association: Option<Association>,
+    /// The direct datagram lane this handler opened, kept alive by its control connection.
+    direct_datagram: Option<crate::proxy::DirectDatagram>,
     ended_tx: mpsc::Sender<Ended>,
     ended_rx: mpsc::Receiver<Ended>,
     udp_idle: std::time::Duration,
@@ -1379,6 +1393,7 @@ impl Handler {
             device,
             relay,
             associate,
+            None,
             None,
             Flows::default(),
             Legs::default(),
@@ -1398,6 +1413,7 @@ impl Handler {
             relay,
             associate,
             Some(dial),
+            None,
             Flows::default(),
             Legs::default(),
             &Spec::new(None, None),
@@ -1411,6 +1427,7 @@ impl Handler {
         relay: Relay,
         associate: Associate,
         dial: Option<Dial>,
+        datagram: Option<Datagram>,
         flows: Flows,
         legs: Legs,
         spec: &Spec,
@@ -1422,11 +1439,13 @@ impl Handler {
             relay,
             associate,
             dial,
+            datagram,
             flows,
             legs,
             frame: Vec::with_capacity(FRAME_CAP),
             emit,
             association: None,
+            direct_datagram: None,
             ended_tx,
             ended_rx,
             udp_idle: spec.udp_idle(),
@@ -1481,15 +1500,21 @@ impl Handler {
         let Some((udp, payload)) = udp_head(body) else {
             return Ok(());
         };
-        if self.association.is_none() {
-            if let Ok(association) = Association::open(&self.associate) {
-                self.association = Some(association);
+        if self.association.is_none() && self.direct_datagram.is_none() {
+            if let Some(open) = &self.datagram {
+                self.direct_datagram = open();
+            }
+            if self.direct_datagram.is_none() {
+                if let Ok(association) = Association::open(&self.associate) {
+                    self.association = Some(association);
+                }
             }
         }
-        let Some(association) = &self.association else {
-            return Ok(());
+        let relay = match (&self.direct_datagram, &self.association) {
+            (Some(direct), _) => direct.relay,
+            (None, Some(association)) => association.relay,
+            (None, None) => return Ok(()),
         };
-        let relay = association.relay;
         let target = SocketAddr::new(ip.destination, udp.destination_port);
         // An endpoint-independent mapping keys on the client source alone; the frame still names each datagram's destination, and the reply's source comes back off that frame.
         let (key, pinned) = if self.endpoint_independent_nat {
@@ -1756,65 +1781,71 @@ impl Handler {
                 initial
             };
             let mut pkt = vec![0u8; body + payload_cap];
+            let (direct, lane, refused) = match dial.map(|dial| dial(&destination)) {
+                Some(DialOutcome::Direct(stream)) => (Some(stream), None, false),
+                Some(DialOutcome::Fallback(lane)) => (None, Some(lane), false),
+                Some(DialOutcome::Refused) => (None, None, true),
+                None => (None, None, false),
+            };
             let mut outcome = None;
             let mut reader;
-            match dial.map(|dial| dial(&destination)) {
-                Some(DialOutcome::Direct(upstream)) => {
-                    let Ok(write) = upstream.try_clone() else {
-                        refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
-                        return;
-                    };
-                    // Silence past the idle budget is death: an untimed read parks a thread, and with it the flow's lane, for the life of the process.
-                    if upstream
-                        .set_read_timeout(Some(budgets::udp_idle()))
-                        .is_err()
-                    {
-                        refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
-                        return;
-                    }
-                    *flow
-                        .write_half
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(write);
-                    reader = upstream;
-                }
-                Some(DialOutcome::Refused) => {
+            if let Some(upstream) = direct {
+                let Ok(write) = upstream.try_clone() else {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                };
+                // Silence past the idle budget is death: an untimed read parks a thread, and with it the flow's lane, for the life of the process.
+                if upstream
+                    .set_read_timeout(Some(budgets::udp_idle()))
+                    .is_err()
+                {
                     refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
                     return;
                 }
-                Some(DialOutcome::Fallback) | None => {
-                    let Ok((tun_half, proxy_half)) = Self::flow_pair() else {
-                        refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
-                        return;
-                    };
-                    let Ok(write_half) = tun_half.try_clone() else {
-                        refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
-                        return;
-                    };
-                    let Ok(proxy_hold) = proxy_half.try_clone() else {
-                        refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
-                        return;
-                    };
-                    if tun_half
-                        .set_read_timeout(Some(budgets::udp_idle()))
-                        .is_err()
-                    {
-                        refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
-                        return;
-                    }
-                    *flow
-                        .write_half
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(write_half);
-                    reader = tun_half;
-                    let (outcome_tx, outcome_rx) = mpsc::channel();
-                    outcome = Some(outcome_rx);
-                    budgets::spawn(move || {
-                        let _ = outcome_tx.send(relay(proxy_half, destination).is_ok());
-                        // The duplicate holds the pair's far end open until the verdict is queued, so an EOF before it is a clean remote close, not a refusal.
-                        drop(proxy_hold);
-                    });
+                // The handler writes this half on the queue's own thread while it holds the flow, so a peer that stops reading must not park the queue: the timeout turns it into a short write the device retransmits.
+                let _ = write.set_write_timeout(Some(budgets::relay_quantum()));
+                *flow
+                    .write_half
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(write);
+                reader = upstream;
+            } else if refused {
+                refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                return;
+            } else {
+                let Ok((tun_half, proxy_half)) = Self::flow_pair() else {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                };
+                let Ok(write_half) = tun_half.try_clone() else {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                };
+                let Ok(proxy_hold) = proxy_half.try_clone() else {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                };
+                if tun_half
+                    .set_read_timeout(Some(budgets::udp_idle()))
+                    .is_err()
+                {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
                 }
+                let _ = write_half.set_write_timeout(Some(budgets::relay_quantum()));
+                *flow
+                    .write_half
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(write_half);
+                reader = tun_half;
+                let (outcome_tx, outcome_rx) = mpsc::channel();
+                outcome = Some(outcome_rx);
+                budgets::spawn(move || {
+                    let ok = relay(proxy_half, lane.as_ref(), destination).is_ok();
+                    let _ = outcome_tx.send(ok);
+                    // The duplicate holds the pair's far end open until the verdict is queued, so an EOF before it is a clean remote close, not a refusal.
+                    drop(proxy_hold);
+                });
             }
             // The device reset the tuple while the lane dialed: the entry is gone, so nothing answers.
             if flow.signaled.load(Relaxed) {
@@ -1822,7 +1853,7 @@ impl Handler {
                 return;
             }
             // The handshake answers only once the pipe exists, so the device's first segment has somewhere to land.
-            if !render_tcp_headers_ip(
+            let rendered = render_tcp_headers_ip(
                 (local_ip, local_port),
                 (remote_ip, remote_port),
                 syn_seq.wrapping_add(1),
@@ -1832,8 +1863,25 @@ impl Handler {
                 0,
                 false,
                 &mut pkt[..body],
-            ) || !matches!(dev_writer.write_packet(&pkt[..body]), Ok(true))
-            {
+            );
+            // A device that dropped the SYN-ACK has not refused the lane: retry the same packet for one relay quantum before resetting, so a transient refusal cannot kill a connection the device will retransmit the SYN for.
+            let handshake = rendered && {
+                let deadline = std::time::Instant::now() + budgets::relay_quantum();
+                loop {
+                    match dev_writer.write_packet(&pkt[..body]) {
+                        Ok(true) => break true,
+                        Ok(false)
+                            if std::time::Instant::now() < deadline
+                                && !flow.signaled.load(Relaxed) =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Ok(false) => break false,
+                        Err(_) => break false,
+                    }
+                }
+            };
+            if !handshake {
                 refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
                 return;
             }
@@ -2016,6 +2064,9 @@ impl Drop for Handler {
     fn drop(&mut self) {
         if let Some(association) = self.association.take() {
             let _ = association.control.shutdown(Shutdown::Both);
+        }
+        if let Some(direct) = self.direct_datagram.take() {
+            let _ = direct.control.shutdown(Shutdown::Both);
         }
     }
 }
@@ -2243,7 +2294,7 @@ mod tests {
         let (a, mut peer) = peer_with_deadline().unwrap();
         let payload: Vec<u8> = (0..4_000u32).map(|i| (i % 251) as u8).collect();
         let sent = payload.clone();
-        let relay: Relay = Arc::new(move |mut conn: Connection, _dest| {
+        let relay: Relay = Arc::new(move |mut conn: Connection, _lane, _dest| {
             conn.write_all(&sent)?;
             Ok(())
         });
@@ -2440,7 +2491,7 @@ mod tests {
         let (a, mut first) = unix_socketpair().unwrap();
         let (b, mut second) = unix_socketpair().unwrap();
         let (seen_tx, seen_rx) = mpsc::channel();
-        let relay: Relay = Arc::new(move |mut conn: Connection, _dest| {
+        let relay: Relay = Arc::new(move |mut conn: Connection, _lane, _dest| {
             let mut got = [0u8; 5];
             conn.read_exact(&mut got)?;
             let _ = seen_tx.send(got);
@@ -2453,6 +2504,7 @@ mod tests {
             Arc::clone(&relay),
             no_associate(),
             None,
+            None,
             flows.clone(),
             Legs::default(),
             &spec,
@@ -2461,6 +2513,7 @@ mod tests {
             Device::from_handle(b, DEFAULT_MTU),
             relay,
             no_associate(),
+            None,
             None,
             flows,
             Legs::default(),
@@ -2938,7 +2991,7 @@ mod tests {
         let device = Device::from_handle(a, DEFAULT_MTU);
         let mut peer = b;
 
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::new(device, relay, no_associate());
 
         let syn = build_tcp_packet(
@@ -3024,7 +3077,7 @@ mod tests {
         let (a, b) = unix_socketpair().unwrap();
         let device = Device::from_handle(a, DEFAULT_MTU);
         let mut peer = b;
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::new(device, relay, no_associate());
 
         let request = icmp_echo([10, 0, 0, 2], [10, 0, 0, 1], 0x1234, 0x0007, b"ping data");
@@ -3064,7 +3117,7 @@ mod tests {
         let (a, b) = unix_socketpair().unwrap();
         let (_release, hold) = std::sync::mpsc::channel::<()>();
         let hold = Arc::new(std::sync::Mutex::new(hold));
-        let relay: Relay = Arc::new(move |_conn, _dest| {
+        let relay: Relay = Arc::new(move |_conn, _lane, _dest| {
             let _ = hold.lock().unwrap().recv();
             Ok(())
         });
@@ -3125,7 +3178,7 @@ mod tests {
         let (a, b) = unix_socketpair().unwrap();
         let (_release, hold) = std::sync::mpsc::channel::<()>();
         let hold = Arc::new(std::sync::Mutex::new(hold));
-        let relay: Relay = Arc::new(move |_conn, _dest| {
+        let relay: Relay = Arc::new(move |_conn, _lane, _dest| {
             let _ = hold.lock().unwrap().recv();
             Ok(())
         });
@@ -3467,7 +3520,7 @@ mod tests {
         });
         let mut handler = Handler::with_dial(
             Device::from_handle(a, DEFAULT_MTU),
-            Arc::new(|_conn, _dest| Ok(())),
+            Arc::new(|_conn, _lane, _dest| Ok(())),
             no_associate(),
             dial,
         );
@@ -3596,7 +3649,7 @@ mod tests {
     fn a_datagram_flow_frames_the_association_and_returns_the_echo() {
         let (a, mut peer) = peer_with_deadline().unwrap();
         let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::new(
             Device::from_handle(a, DEFAULT_MTU),
             relay,
@@ -3630,6 +3683,86 @@ mod tests {
         assert_eq!(payload, b"who-is");
     }
 
+    /// A direct datagram lane frames the outbound's own relay and renders its answer without the
+    /// front's loopback association: the handler writes the same RFC 1928 request the association
+    /// path writes, and the leg reader turns the relay's framed answer back into a device packet.
+    #[cfg(unix)]
+    #[test]
+    fn a_direct_datagram_lane_frames_the_relay_without_the_association() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+        upstream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let relay_address = upstream.local_addr().unwrap();
+        let seen = frames.clone();
+        // The relay every leg frames onto: the outbound server's own echo, no front association behind it.
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((n, src)) = upstream.recv_from(&mut buf) {
+                let frame = buf[..n].to_vec();
+                let Some((target, payload)) = crate::proxy::parse_socks_udp(&frame) else {
+                    continue;
+                };
+                let mut back = vec![0u8, 0, 0];
+                crate::proxy::push_socks_addr(&mut back, &target);
+                back.extend_from_slice(payload);
+                seen.lock().unwrap().push(frame);
+                if upstream.send_to(&back, src).is_err() {
+                    break;
+                }
+            }
+        });
+        let (control, _hold) = UnixStream::pair().unwrap();
+        let slot = Arc::new(std::sync::Mutex::new(Some(Connection::from(control))));
+        let open: Datagram = Arc::new(move || {
+            let control = slot.lock().unwrap().take()?;
+            Some(crate::proxy::DirectDatagram {
+                relay: relay_address,
+                control,
+            })
+        });
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+        let associate: Associate = Arc::new(|_conn| {
+            unreachable!("a direct datagram lane must not open the front association")
+        });
+        let mut handler = Handler::on(
+            Device::from_handle(a, DEFAULT_MTU),
+            relay,
+            associate,
+            None,
+            Some(open),
+            Flows::default(),
+            Legs::default(),
+            &Spec::new(None, None),
+        );
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let query = datagram(SCRIPT_CLIENT, [198, 51, 100, 7], 51500, 53, b"who-is");
+        peer.write_all(&query).unwrap();
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+
+        let mut want = vec![0u8, 0, 0, 1, 198, 51, 100, 7, 0, 53];
+        want.extend_from_slice(b"who-is");
+        wait_for_frames(&frames, 1);
+        assert_eq!(
+            frames.lock().unwrap().first().map(Vec::as_slice),
+            Some(want.as_slice()),
+            "the direct lane writes the same frame the association path writes"
+        );
+
+        let n = next_datagram(&mut peer, &mut buf);
+        let (ip, body) = ipv4_head(&buf[..n]).unwrap();
+        assert_eq!(
+            (ip.source, ip.destination),
+            ([198, 51, 100, 7], SCRIPT_CLIENT)
+        );
+        let (udp, payload) = udp_head(body).unwrap();
+        assert_eq!((udp.source_port, udp.destination_port), (53, 51500));
+        assert_eq!(payload, b"who-is");
+    }
+
     /// A multi-queue device's datagram gate: the queue that never saw the association still finds
     /// the leg, so one client source keeps one socket instead of one per queue.
     #[cfg(unix)]
@@ -3638,13 +3771,14 @@ mod tests {
         let (a, mut first) = unix_socketpair().unwrap();
         let (b, mut second) = unix_socketpair().unwrap();
         let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let spec = Spec::new(None, None).with_endpoint_independent_nat(true);
         let legs = Legs::default();
         let mut one = Handler::on(
             Device::from_handle(a, DEFAULT_MTU),
             Arc::clone(&relay),
             echo_associate(frames.clone()),
+            None,
             None,
             Flows::default(),
             legs.clone(),
@@ -3654,6 +3788,7 @@ mod tests {
             Device::from_handle(b, DEFAULT_MTU),
             relay,
             echo_associate(frames),
+            None,
             None,
             Flows::default(),
             legs,
@@ -3680,12 +3815,13 @@ mod tests {
     fn an_endpoint_independent_leg_serves_every_destination() {
         let (a, mut peer) = peer_with_deadline().unwrap();
         let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let spec = Spec::new(None, None).with_endpoint_independent_nat(true);
         let mut handler = Handler::on(
             Device::from_handle(a, DEFAULT_MTU),
             relay,
             echo_associate(frames.clone()),
+            None,
             None,
             Flows::default(),
             Legs::default(),
@@ -3725,7 +3861,7 @@ mod tests {
     fn the_default_datagram_leg_is_per_destination() {
         let (a, mut peer) = peer_with_deadline().unwrap();
         let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::new(
             Device::from_handle(a, DEFAULT_MTU),
             relay,
@@ -3801,7 +3937,7 @@ mod tests {
         let wanted: usize = flows.iter().map(|flow| flow.datagrams.len()).sum();
         let dials: Dials = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (a, mut peer) = peer_with_deadline().unwrap();
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::new(
             Device::from_handle(a, DEFAULT_MTU),
             relay,
@@ -3928,7 +4064,7 @@ mod tests {
     #[test]
     fn the_response_bytes_come_back_as_ip_packets() {
         let (a, mut peer) = peer_with_deadline().unwrap();
-        let relay: Relay = Arc::new(|mut conn: Connection, _dest| {
+        let relay: Relay = Arc::new(|mut conn: Connection, _lane, _dest| {
             use std::io::Write;
             let _ = conn.write_all(b"pong\n");
             Ok(())
@@ -3991,8 +4127,9 @@ mod tests {
             "",
             crate::socks::Version::V5,
         ));
-        let relay: Relay =
-            Arc::new(move |conn, dest| crate::proxy::serve_device_flow(conn, &out, &dest));
+        let relay: Relay = Arc::new(move |conn, lane, dest| {
+            crate::proxy::serve_device_flow(conn, lane, &out, &dest)
+        });
         let (a, mut peer) = peer_with_deadline().unwrap();
         let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let flow = FlowSpec {
@@ -4196,7 +4333,7 @@ mod tests {
         });
         let (a, mut peer) = peer_with_deadline().unwrap();
         let (gone_tx, gone_rx) = std::sync::mpsc::channel::<()>();
-        let relay: Relay = Arc::new(move |mut conn: Connection, _dest| {
+        let relay: Relay = Arc::new(move |mut conn: Connection, _lane, _dest| {
             let mut sink = Vec::new();
             let _ = conn.read_to_end(&mut sink);
             let _ = gone_tx.send(());
@@ -4261,7 +4398,7 @@ mod tests {
     #[test]
     fn a_closed_proxy_leg_sends_fin_after_its_bytes() {
         let (a, mut peer) = peer_with_deadline().unwrap();
-        let relay: Relay = Arc::new(|mut conn: Connection, _dest| {
+        let relay: Relay = Arc::new(|mut conn: Connection, _lane, _dest| {
             use std::io::Write;
             let _ = conn.write_all(b"reply");
             Ok(())
@@ -4321,7 +4458,7 @@ mod tests {
     #[test]
     fn a_refused_proxy_leg_resets_the_device_flow() {
         let (a, mut peer) = peer_with_deadline().unwrap();
-        let relay: Relay = Arc::new(|_conn: Connection, _dest| {
+        let relay: Relay = Arc::new(|_conn: Connection, _lane, _dest| {
             Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"))
         });
         let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
@@ -4404,7 +4541,7 @@ mod tests {
     #[test]
     fn the_syn_ack_numbers_wrap_at_the_sequence_space_boundary() {
         let (a, mut peer) = unix_socketpair().unwrap();
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let syn = build_tcp_packet(
             ([10, 0, 0, 2], 44444),

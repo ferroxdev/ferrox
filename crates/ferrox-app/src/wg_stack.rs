@@ -2107,6 +2107,7 @@ impl ServerStack {
             std::thread::spawn(move || {
                 let _ = serve_device_flow(
                     proxy.with_peer(peer),
+                    None,
                     &out,
                     &Destination::Address(destination),
                 );
