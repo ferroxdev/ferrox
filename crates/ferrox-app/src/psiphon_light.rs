@@ -380,8 +380,12 @@ fn decode_entry(encoded: &[u8]) -> Result<ProxyEntry, String> {
 /// the leaf's SANs, then its CN; dates are not checked.
 fn verify_name(leaf: &[u8], expected: &str) -> bool {
     let mut names = Vec::new();
-    collect_names(leaf, 0, leaf.len(), 0, &mut names);
+    let mut san_present = false;
+    collect_names(leaf, 0, leaf.len(), 0, &mut san_present, &mut names);
     if names.is_empty() {
+        if san_present {
+            return false;
+        }
         let mut common_name = None;
         collect_subject_common_name(leaf, &mut common_name);
         common_name.is_some_and(|name| matches_name(&name, expected))
@@ -391,7 +395,14 @@ fn verify_name(leaf: &[u8], expected: &str) -> bool {
 }
 
 /// Collect every DNS name in one certificate DER element.
-fn collect_names(der: &[u8], at: usize, end: usize, depth: usize, out: &mut Vec<String>) {
+fn collect_names(
+    der: &[u8],
+    at: usize,
+    end: usize,
+    depth: usize,
+    san_present: &mut bool,
+    out: &mut Vec<String>,
+) {
     if depth > 32 {
         return;
     }
@@ -401,6 +412,7 @@ fn collect_names(der: &[u8], at: usize, end: usize, depth: usize, out: &mut Vec<
             return;
         };
         if tag == 0x06 && der.get(body..body + 3) == Some(&[0x55, 0x1d, 0x11][..]) {
+            *san_present = true;
             let mut after = next;
             if let Some((0x01, _, after_bool)) = element(der, after) {
                 after = after_bool;
@@ -410,7 +422,7 @@ fn collect_names(der: &[u8], at: usize, end: usize, depth: usize, out: &mut Vec<
             }
         }
         if tag & 0x20 != 0 {
-            collect_names(der, body, next, depth + 1, out);
+            collect_names(der, body, next, depth + 1, san_present, out);
         }
         at = next;
     }
