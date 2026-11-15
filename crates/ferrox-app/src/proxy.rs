@@ -53989,6 +53989,7 @@ mod tests {
             short_id: [1, 35, 69, 103, 137, 171, 205, 239],
             fingerprint: "chrome".to_owned(),
             key_log: None,
+            mldsa65_verify: None,
         })
     }
 
@@ -67232,6 +67233,7 @@ mod tests {
             short_id: [1, 35, 69, 103, 137, 171, 205, 239],
             fingerprint: "chrome".to_owned(),
             key_log: None,
+            mldsa65_verify: None,
         });
         let id = uuid_bytes(REALITY_TEST_ID).expect("id");
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");

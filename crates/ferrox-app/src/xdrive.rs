@@ -7841,6 +7841,7 @@ mod tests {
             short_id: [0; 8],
             fingerprint: "chrome".to_owned(),
             key_log: None,
+            mldsa65_verify: None,
         }));
         let mut rotated = reality.clone();
         rotated.reality = Some(Arc::new(RealityClientConfig {
@@ -7849,6 +7850,7 @@ mod tests {
             short_id: [0; 8],
             fingerprint: "chrome".to_owned(),
             key_log: None,
+            mldsa65_verify: None,
         }));
         assert_ne!(
             share_key(&reality, None),

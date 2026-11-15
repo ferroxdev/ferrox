@@ -68,6 +68,7 @@ pub struct Session<S: Stream> {
     client12: Option<Direction>,
     alpn: Option<Vec<u8>>,
     leaf: Option<Vec<u8>>,
+    binding: Option<([u8; 1952], [u8; 32])>,
     done: bool,
     eof: bool,
     ccs_sent: bool,
@@ -273,6 +274,7 @@ impl<S: Stream> Session<S> {
             client12: None,
             alpn: None,
             leaf: None,
+            binding: None,
             done: false,
             eof: false,
             ccs_sent: false,
@@ -309,6 +311,37 @@ impl<S: Stream> Session<S> {
 
     pub(crate) fn closed(&self) -> bool {
         self.eof
+    }
+
+    /// The `ClientHello` and `ServerHello` as they crossed the wire, each with its
+    /// four-byte handshake header, which is what REALITY's binding signs.
+    pub(crate) fn handshake_hellos(&self) -> Option<(&[u8], &[u8])> {
+        fn one(bytes: &[u8]) -> Option<(usize, &[u8])> {
+            let body = bytes.get(1..4)?;
+            let len =
+                4 + usize::try_from(u32::from_be_bytes([0, body[0], body[1], body[2]])).ok()?;
+            Some((len, bytes.get(..len)?))
+        }
+        let (client_len, client) = one(&self.transcript)?;
+        let rest = self.transcript.get(client_len..)?;
+        let (_, server) = one(rest)?;
+        Some((client, server))
+    }
+
+    /// The REALITY binding check runs over the certificate the server just sent,
+    /// before this client's Finished is owed, as Xray's `VerifyPeerCertificate` does.
+    pub(crate) fn set_mldsa65_binding(&mut self, verify: &[u8; 1952], auth_key: &[u8; 32]) {
+        self.binding = Some((*verify, *auth_key));
+    }
+
+    fn verify_binding(&self, leaf: &[u8]) -> Result<(), TlsError> {
+        let Some((verify, auth_key)) = &self.binding else {
+            return Ok(());
+        };
+        let (client_hello, server_hello) = self.handshake_hellos().ok_or_else(|| {
+            TlsError::Other("reality: the handshake transcript is incomplete".to_owned())
+        })?;
+        crate::tls::reality::verify_leaf_binding(verify, auth_key, leaf, client_hello, server_hello)
     }
 
     /// The plaintext buffer, which a carrier record with room in the caller's window never stages into.
@@ -540,6 +573,9 @@ impl<S: Stream> Session<S> {
             self.transcript.extend_from_slice(&msg);
             let ocsp = leaf_ocsp(&msg[4..])?;
             self.verify_chain(&chain, &ocsp)?;
+            if let Some(leaf) = chain.first() {
+                self.verify_binding(leaf)?;
+            }
 
             msg = self.next_expect(15)?;
             let signed = std::mem::take(&mut self.transcript);
@@ -2362,6 +2398,7 @@ mod tests {
             client12: None,
             alpn: None,
             leaf: None,
+            binding: None,
             done: true,
             eof: false,
             ccs_sent: false,

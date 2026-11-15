@@ -7,6 +7,8 @@ use crate::tls::rustls_backend::RustlsServerProvider;
 #[cfg(test)]
 use aes_gcm::aead::Payload;
 use aes_gcm::aead::{Aead as _, AeadInOut as _, KeyInit as _};
+use ml_dsa::Signer as _;
+use ml_dsa::Verifier as _;
 use ring::signature::KeyPair as _;
 
 const GROUP_X25519: u16 = 0x001d;
@@ -50,6 +52,8 @@ pub struct RealityServerConfig {
     pub dest: Option<String>,
     pub xver: u8,
     pub show: bool,
+    /// Seed of the ML-DSA-65 key that signs the per-handshake binding, Xray's `mldsa65Seed`.
+    pub mldsa65_seed: Option<[u8; 32]>,
 }
 
 /// The two ends of a socket, for the PROXY-protocol header a cover origin is
@@ -109,19 +113,32 @@ impl<S: Stream> std::fmt::Debug for Proxied<S> {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+enum ServerInner<S: Stream> {
+    Stock(RustlsServerProvider<Replay<RecordLimiter<S>>>),
+    Tls13(Session13<RecordLimiter<S>>),
+}
+
+#[derive(Debug)]
 pub struct RealityServer<S: Stream> {
-    inner: RustlsServerProvider<Replay<RecordLimiter<S>>>,
+    inner: ServerInner<S>,
 }
 
 impl<S: Stream> RealityServer<S> {
     pub fn transport(&self) -> &S {
-        self.inner.get_ref().transport().get_ref()
+        match &self.inner {
+            ServerInner::Stock(inner) => inner.get_ref().transport().get_ref(),
+            ServerInner::Tls13(inner) => inner.io.get_ref(),
+        }
     }
 
     /// Whether bytes the client's hello read past are still waiting to be replayed, so a raw
     /// transport read would miss them.
     pub fn has_pending(&self) -> bool {
-        self.inner.get_ref().has_pending()
+        match &self.inner {
+            ServerInner::Stock(inner) => inner.get_ref().has_pending(),
+            ServerInner::Tls13(_) => false,
+        }
     }
 
     /// Reads the `ClientHello`, authenticates it, and answers with the session or
@@ -136,7 +153,7 @@ impl<S: Stream> RealityServer<S> {
         edges: Edges,
     ) -> Result<RealityAccept<S>, TlsError> {
         let mut replay = Replay::new(RecordLimiter::new(io));
-        let (mut raw, body, hello) = match read_client_hello(&mut replay) {
+        let (mut raw, mut body, hello) = match read_client_hello(&mut replay) {
             Ok(heard) => heard,
             Err((why, read)) => {
                 if read.is_empty() {
@@ -145,13 +162,33 @@ impl<S: Stream> RealityServer<S> {
                 return splice(cfg, replay.into_inner().into_inner(), &read, edges);
             }
         };
-        let auth_key = match body {
-            Body::Inline { len } => authenticate(cfg, &mut raw[5..5 + len], &hello, now_ms),
-            Body::Split(mut split) => authenticate(cfg, &mut split, &hello, now_ms),
+        let auth_key = match &mut body {
+            Body::Inline { len } => authenticate(cfg, &mut raw[5..5 + *len], &hello, now_ms),
+            Body::Split(split) => authenticate(cfg, split, &hello, now_ms),
         };
         let Some(auth_key) = auth_key else {
             return splice(cfg, replay.into_inner().into_inner(), &raw, edges);
         };
+        if let Some(seed) = cfg.mldsa65_seed {
+            let client_hello = match body {
+                Body::Inline { len } => raw[5..5 + len].to_vec(),
+                Body::Split(split) => split,
+            };
+            let hello13 = parse_tls13_hello(&client_hello).ok_or_else(|| {
+                TlsError::Other("reality: ClientHello carries no usable TLS 1.3 offer".to_owned())
+            })?;
+            let session = Session13::new(
+                replay.into_inner(),
+                &client_hello,
+                hello13,
+                &auth_key,
+                &seed,
+                first_name(cfg),
+            )?;
+            return Ok(RealityAccept::Session(Self {
+                inner: ServerInner::Tls13(session),
+            }));
+        }
         let identity = super::TlsServerConfig {
             alpn: Vec::new(),
             min_version: None,
@@ -175,7 +212,7 @@ impl<S: Stream> RealityServer<S> {
         };
         replay.set_prefix(raw);
         Ok(RealityAccept::Session(Self {
-            inner: RustlsServerProvider::accept_reality(identity, replay)?,
+            inner: ServerInner::Stock(RustlsServerProvider::accept_reality(identity, replay)?),
         }))
     }
 }
@@ -186,64 +223,102 @@ impl<S: Stream> TlsProvider for RealityServer<S> {
     }
 
     fn suites(&self) -> Vec<String> {
-        self.inner.suites()
+        match &self.inner {
+            ServerInner::Stock(inner) => inner.suites(),
+            ServerInner::Tls13(inner) => inner.suites(),
+        }
     }
 
     fn handshake(&mut self) -> Result<(), TlsError> {
-        self.inner.handshake()
+        match &mut self.inner {
+            ServerInner::Stock(inner) => inner.handshake(),
+            ServerInner::Tls13(inner) => inner.handshake(),
+        }
     }
 
     fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
-        self.inner.open(ciphertext, buf)
+        match &mut self.inner {
+            ServerInner::Stock(inner) => inner.open(ciphertext, buf),
+            ServerInner::Tls13(inner) => inner.open(ciphertext, buf),
+        }
     }
 
     fn alpn(&self) -> Option<&[u8]> {
-        self.inner.alpn()
+        match &self.inner {
+            ServerInner::Stock(inner) => inner.alpn(),
+            ServerInner::Tls13(inner) => inner.alpn(),
+        }
     }
 
     fn closed(&self) -> bool {
-        self.inner.closed()
+        match &self.inner {
+            ServerInner::Stock(inner) => inner.closed(),
+            ServerInner::Tls13(inner) => inner.closed(),
+        }
     }
 
     /// The name the client's hello replayed into the session, so the inner
     /// handshake's own answer is the matched one.
     fn sni(&self) -> Option<&[u8]> {
-        self.inner.sni()
+        match &self.inner {
+            ServerInner::Stock(inner) => inner.sni(),
+            ServerInner::Tls13(inner) => inner.sni(),
+        }
     }
 
     fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
-        self.inner.seal_into(plaintext, out)
+        match &mut self.inner {
+            ServerInner::Stock(inner) => inner.seal_into(plaintext, out),
+            ServerInner::Tls13(inner) => TlsProvider::seal_into(inner, plaintext, out),
+        }
     }
 
     fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
-        self.inner.seal_slices_into(parts, out)
+        match &mut self.inner {
+            ServerInner::Stock(inner) => inner.seal_slices_into(parts, out),
+            ServerInner::Tls13(inner) => inner.seal_slices_into(parts, out),
+        }
     }
 }
 
 // Already bounded outside: the accept path reads through a limiter from the first byte.
 impl<S: Stream> super::RecordAlignment for RealityServer<S> {
     fn disarm_record_alignment(&mut self) {
-        self.inner.disarm_record_alignment();
+        if let ServerInner::Stock(inner) = &mut self.inner {
+            inner.disarm_record_alignment();
+        }
     }
 
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
-        self.inner.write_all_slices(parts)
+        match &mut self.inner {
+            ServerInner::Stock(inner) => inner.write_all_slices(parts),
+            ServerInner::Tls13(inner) => inner.write_all_slices(parts),
+        }
     }
 }
 
 impl<S: Stream> Read for RealityServer<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.inner.read(buf)
+        match &mut self.inner {
+            ServerInner::Stock(inner) => inner.read(buf),
+            ServerInner::Tls13(inner) => inner.read(buf),
+        }
     }
 }
 
 impl<S: Stream> Write for RealityServer<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(buf)
+        match &mut self.inner {
+            ServerInner::Stock(inner) => inner.write(buf),
+            ServerInner::Tls13(inner) => inner.write(buf),
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        match &mut self.inner {
+            ServerInner::Stock(inner) => inner.flush(),
+            ServerInner::Tls13(inner) => inner.flush(),
+        }
     }
 }
 
@@ -984,11 +1059,35 @@ fn certificate_capacity(name_len: usize) -> usize {
 /// A leaf bound to one authentication key. The proof is the last sixty-four
 /// bytes, which is what the oracle in the tests reads.
 fn bound_certificate(auth_key: &[u8; 32], name: &str) -> Vec<u8> {
+    bound_certificate_binding(auth_key, name, None)
+}
+
+/// The leaf with the optional ML-DSA-65 binding extension: its value signs an
+/// HMAC over the leaf's key and both handshake messages, as Xray's
+/// `mldsa65Seed` builds it.
+fn bound_certificate_binding(
+    auth_key: &[u8; 32],
+    name: &str,
+    binding: Option<(&[u8; 32], &[u8], &[u8])>,
+) -> Vec<u8> {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA512, auth_key);
     let proof = ring::hmac::sign(&key, public_key());
     let key = public_key();
+    let signature = binding.map(|(seed, client_hello, server_hello)| {
+        let mut mac =
+            ring::hmac::Context::with_key(&ring::hmac::Key::new(ring::hmac::HMAC_SHA512, auth_key));
+        mac.update(key);
+        mac.update(client_hello);
+        mac.update(server_hello);
+        let digest = mac.sign();
+        let signing = ml_dsa::SigningKey::<ml_dsa::MlDsa65>::from_seed(&(*seed).into());
+        signing.sign(digest.as_ref()).encode().to_vec()
+    });
 
-    let mut der = Vec::with_capacity(certificate_capacity(name.len()));
+    let mut der = Vec::with_capacity(
+        certificate_capacity(name.len())
+            + signature.as_ref().map_or(0, |sig| extension_len(sig.len())),
+    );
     wrap(&mut der, 0x30, |der| {
         wrap(der, 0x30, |der| {
             item(der, 0xa0, &[0x02, 0x01, 0x02]);
@@ -1008,6 +1107,17 @@ fn bound_certificate(auth_key: &[u8; 32], name: &str) -> Vec<u8> {
                     der.extend_from_slice(key);
                 });
             });
+            if let Some(signature) = &signature {
+                // Extensions explicitly tagged [3]; the first value is the binding signature.
+                wrap(der, 0xa3, |der| {
+                    wrap(der, 0x30, |der| {
+                        wrap(der, 0x30, |der| {
+                            item(der, 0x06, &[0x01, 0x2b]);
+                            item(der, 0x04, signature);
+                        });
+                    });
+                });
+            }
         });
         algorithm(der);
         wrap(der, 0x03, |der| {
@@ -1017,6 +1127,27 @@ fn bound_certificate(auth_key: &[u8; 32], name: &str) -> Vec<u8> {
     });
     debug_assert_eq!(&der[der.len() - SIGNATURE_LEN..], proof.as_ref());
     der
+}
+
+/// The bytes an `[3]` extension list holding one `OCTET STRING` adds to a certificate.
+fn extension_len(value: usize) -> usize {
+    let octet = 1 + length_header(value) + value;
+    let extension = 1 + length_header(octet) + octet;
+    let sequence = 1 + length_header(extension) + extension;
+    1 + length_header(sequence) + sequence
+}
+
+/// The DER length header's own size for a body of `len` bytes.
+fn length_header(len: usize) -> usize {
+    if len < 0x80 {
+        1
+    } else if len < 0x100 {
+        2
+    } else if len < 0x1_0000 {
+        3
+    } else {
+        5
+    }
 }
 
 /// One element with no children of its own.
@@ -1099,6 +1230,8 @@ pub struct RealityClientConfig {
     pub fingerprint: String,
     /// The `realitySettings.masterKeyLog` file this dial appends its traffic secrets to, or `None`.
     pub key_log: Option<std::sync::Arc<crate::tls::MasterKeyLog>>,
+    /// The ML-DSA-65 public key the leaf's binding must verify against, Xray's `mldsa65Verify`.
+    pub mldsa65_verify: Option<[u8; 1952]>,
 }
 
 /// The version reported in the sealed session id, the pinned Xray-core release.
@@ -1174,6 +1307,9 @@ impl<S: Stream> RealityClientSession<S> {
             )?,
         };
         session.inner.set_key_log(cfg.key_log.clone());
+        if let Some(verify) = cfg.mldsa65_verify {
+            session.inner.set_mldsa65_binding(&verify, &auth_key);
+        }
         session.handshake()?;
         Ok(session)
     }
@@ -1405,6 +1541,72 @@ fn spki_key(tbs: &[u8]) -> Option<[u8; 32]> {
     }
 }
 
+/// The first certificate extension's `OCTET STRING` value: the ML-DSA-65
+/// binding Xray reads from `certs[0].Extensions[0].Value`.
+fn parse_leaf_binding(der: &[u8]) -> Option<&[u8]> {
+    fn element(bytes: &[u8]) -> Option<(u8, &[u8], usize)> {
+        let tag = *bytes.first()?;
+        let (header, len) = der_len(bytes)?;
+        Some((tag, bytes.get(header..header + len)?, header + len))
+    }
+    let (_, tbs, _) = signed_parts(der)?;
+    let (header, len) = der_len(tbs)?;
+    let mut rest = tbs.get(header..header + len)?;
+    while !rest.is_empty() {
+        let (tag, body, total) = element(rest)?;
+        if tag == 0xa3 {
+            let (tag, extensions, _) = element(body)?;
+            if tag != 0x30 {
+                return None;
+            }
+            let (tag, extension, _) = element(extensions)?;
+            if tag != 0x30 {
+                return None;
+            }
+            let mut fields = extension;
+            while !fields.is_empty() {
+                let (tag, value, total) = element(fields)?;
+                if tag == 0x04 {
+                    return Some(value);
+                }
+                fields = fields.get(total..)?;
+            }
+            return None;
+        }
+        rest = rest.get(total..)?;
+    }
+    None
+}
+
+/// Verifies the leaf's ML-DSA-65 binding over `HMAC-SHA512(auth_key, key || ClientHello || ServerHello)`.
+pub(crate) fn verify_leaf_binding(
+    verify: &[u8; 1952],
+    auth_key: &[u8; 32],
+    leaf: &[u8],
+    client_hello: &[u8],
+    server_hello: &[u8],
+) -> Result<(), TlsError> {
+    let (public, _) = parse_leaf(leaf).ok_or_else(|| {
+        TlsError::Other("reality: the leaf is not a bound certificate".to_owned())
+    })?;
+    let signature = parse_leaf_binding(leaf).ok_or_else(|| {
+        TlsError::Other("reality: the leaf carries no ML-DSA-65 binding".to_owned())
+    })?;
+    let mut mac =
+        ring::hmac::Context::with_key(&ring::hmac::Key::new(ring::hmac::HMAC_SHA512, auth_key));
+    mac.update(&public);
+    mac.update(client_hello);
+    mac.update(server_hello);
+    let digest = mac.sign();
+    let encoded = ml_dsa::EncodedVerifyingKey::<ml_dsa::MlDsa65>::try_from(&verify[..])
+        .map_err(|_| TlsError::Other("reality: mldsa65Verify is not a key".to_owned()))?;
+    let key = ml_dsa::VerifyingKey::<ml_dsa::MlDsa65>::decode(&encoded);
+    let signature = ml_dsa::Signature::<ml_dsa::MlDsa65>::try_from(signature)
+        .map_err(|_| TlsError::Other("reality: the binding is not a signature".to_owned()))?;
+    key.verify(digest.as_ref(), &signature)
+        .map_err(|_| TlsError::Other("reality: the ML-DSA-65 binding did not verify".to_owned()))
+}
+
 /// One DER length prefix: the header that carries it, then the value length.
 fn der_len(bytes: &[u8]) -> Option<(usize, usize)> {
     let first = *bytes.get(1)?;
@@ -1450,6 +1652,718 @@ fn sequence(parts: &[&[u8]]) -> Vec<u8> {
         out.extend_from_slice(part);
     }
     out
+}
+
+/// The `ClientHello` fields the REALITY server's own TLS 1.3 session needs: the
+/// suite and key share to answer, the session id to echo, and the name to report.
+struct Tls13Hello {
+    session_id: Vec<u8>,
+    suite: u16,
+    server_name: Vec<u8>,
+    share: (u16, Vec<u8>),
+}
+
+fn u24(bytes: &[u8]) -> Option<usize> {
+    let head = bytes.get(..3)?;
+    Some((usize::from(head[0]) << 16) | (usize::from(head[1]) << 8) | usize::from(head[2]))
+}
+
+/// Reads a TLS 1.3 `ClientHello`: the first offered suite this tree keys, the
+/// preferred key share the client actually sent, and the SNI.
+fn parse_tls13_hello(msg: &[u8]) -> Option<Tls13Hello> {
+    if msg.first() != Some(&1) {
+        return None;
+    }
+    let len = u24(msg.get(1..)?)?;
+    let msg = msg.get(..4 + len)?;
+    let mut at = 4 + 2;
+    at += 32;
+    let session_len = usize::from(*msg.get(at)?);
+    at += 1;
+    if session_len > 32 {
+        return None;
+    }
+    let session_id = msg.get(at..at + session_len)?.to_vec();
+    at += session_len;
+    let suites_len = usize::from(u16::from_be_bytes(
+        <[u8; 2]>::try_from(msg.get(at..at + 2)?).ok()?,
+    ));
+    at += 2;
+    let suites = msg.get(at..at + suites_len)?;
+    at += suites_len;
+    let suite = [0x1301u16, 0x1302, 0x1303].into_iter().find(|wanted| {
+        suites
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .any(|pair| u16::from_be_bytes(*pair) == *wanted)
+    })?;
+    let compression_len = usize::from(*msg.get(at)?);
+    at += 1 + compression_len;
+    let ext_len = usize::from(u16::from_be_bytes(
+        <[u8; 2]>::try_from(msg.get(at..at + 2)?).ok()?,
+    ));
+    at += 2;
+    msg.get(at..at + ext_len)?;
+
+    let mut tls13 = false;
+    let mut server_name = Vec::new();
+    let mut share = None;
+    for (kind, ext) in extensions(msg, at, ext_len) {
+        match kind {
+            0x0000 => server_name = server_name_bytes(ext).unwrap_or_default(),
+            0x002b => tls13 = offers_tls13(ext),
+            0x0033 => share = select_share(ext),
+            _ => {}
+        }
+    }
+    if !tls13 {
+        return None;
+    }
+    Some(Tls13Hello {
+        session_id,
+        suite,
+        server_name,
+        share: share?,
+    })
+}
+
+fn server_name_bytes(ext: &[u8]) -> Option<Vec<u8>> {
+    let len = usize::from(u16::from_be_bytes(<[u8; 2]>::try_from(ext.get(..2)?).ok()?));
+    let list = ext.get(2..2 + len)?;
+    let mut at = 0;
+    while at + 3 <= list.len() {
+        let kind = list[at];
+        let len = usize::from(u16::from_be_bytes([list[at + 1], list[at + 2]]));
+        at += 3;
+        let name = list.get(at..at + len)?;
+        if kind == 0 {
+            return Some(name.to_vec());
+        }
+        at += len;
+    }
+    None
+}
+
+/// The share the server answers: the hybrid when offered, its draft spelling
+/// next, then plain X25519, which every shaped hello carries as a fallback.
+fn select_share(ext: &[u8]) -> Option<(u16, Vec<u8>)> {
+    let len = usize::from(u16::from_be_bytes(<[u8; 2]>::try_from(ext.get(..2)?).ok()?));
+    let list = ext.get(2..2 + len)?;
+    let mut hybrid = None;
+    let mut draft = None;
+    let mut plain = None;
+    let mut at = 0;
+    while at + 4 <= list.len() {
+        let group = u16::from_be_bytes([list[at], list[at + 1]]);
+        let len = usize::from(u16::from_be_bytes([list[at + 2], list[at + 3]]));
+        at += 4;
+        let share = list.get(at..at + len)?;
+        at += len;
+        match (group, share.len()) {
+            (GROUP_X25519_MLKEM768, n) if n == MLKEM768_KEY_LEN + 32 => {
+                hybrid.get_or_insert_with(|| (group, share.to_vec()));
+            }
+            (GROUP_X25519_MLKEM768_DRAFT, n) if n == MLKEM768_KEY_LEN + 32 => {
+                draft.get_or_insert_with(|| (group, share.to_vec()));
+            }
+            (GROUP_X25519, 32) => {
+                plain.get_or_insert_with(|| (group, share.to_vec()));
+            }
+            _ => {}
+        }
+    }
+    hybrid.or(draft).or(plain)
+}
+
+fn handshake_message(kind: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.push(kind);
+    let len = body.len() as u32;
+    out.extend_from_slice(&len.to_be_bytes()[1..]);
+    out.extend_from_slice(body);
+    out
+}
+
+fn certificate_message(cert: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(3 + 4 + cert.len() + 2);
+    body.push(0);
+    let entry = 3 + cert.len() + 2;
+    body.extend_from_slice(&(entry as u32).to_be_bytes()[1..]);
+    body.extend_from_slice(&(cert.len() as u32).to_be_bytes()[1..]);
+    body.extend_from_slice(cert);
+    body.extend_from_slice(&[0, 0]);
+    handshake_message(11, &body)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Phase {
+    Flight,
+    Finished,
+    Done,
+}
+
+/// The REALITY server's own TLS 1.3 session. The stock provider hands its
+/// certificate to rustls before the `ServerHello` exists, and rustls draws its
+/// key share outside `secure_random`, so the ML-DSA-65 binding needs this
+/// smaller handshake: one suite, one key share, one certificate.
+struct Session13<S: Stream> {
+    io: S,
+    suite_id: u16,
+    sni: Vec<u8>,
+    phase: Phase,
+    pending: Vec<u8>,
+    pending_at: usize,
+    client_hs: Option<crate::tls::shaped::record::Direction>,
+    read_key: Option<crate::tls::shaped::record::Direction>,
+    write_key: Option<crate::tls::shaped::record::Direction>,
+    inbuf: Vec<u8>,
+    hs: Vec<u8>,
+    plain: Vec<u8>,
+    plain_at: usize,
+    plain_end: usize,
+    expected_finished: Vec<u8>,
+    eof: bool,
+}
+
+impl<S: Stream> Session13<S> {
+    #[allow(clippy::too_many_lines)]
+    fn new(
+        io: S,
+        client_hello: &[u8],
+        hello: Tls13Hello,
+        auth_key: &[u8; 32],
+        seed: &[u8; 32],
+        name: &str,
+    ) -> Result<Self, TlsError> {
+        use crate::tls::shaped::{kdf, record};
+        use x25519_dalek::{PublicKey as XPublic, StaticSecret};
+
+        let bad = |why: &str| TlsError::Other(format!("reality: {why}"));
+
+        let mut random = [0u8; 32];
+        getrandom::fill(&mut random).map_err(|e| bad(&format!("no entropy: {e}")))?;
+
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret).map_err(|e| bad(&format!("no entropy: {e}")))?;
+        let secret = StaticSecret::from(secret);
+        let public = XPublic::from(&secret);
+
+        let (share, shared) = match hello.share.0 {
+            GROUP_X25519 => {
+                let peer: [u8; 32] = hello
+                    .share
+                    .1
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| bad("X25519 share is not 32 bytes"))?;
+                let shared = x25519_dalek::x25519(secret.to_bytes(), peer);
+                if shared == [0u8; 32] {
+                    return Err(bad("X25519 shared secret was all zero"));
+                }
+                (public.as_bytes().to_vec(), shared.to_vec())
+            }
+            group @ (GROUP_X25519_MLKEM768 | GROUP_X25519_MLKEM768_DRAFT) => {
+                use ml_kem::kem::Key as KemKey;
+                let draft = group == GROUP_X25519_MLKEM768_DRAFT;
+                let (mlkem, x_share) = if draft {
+                    (&hello.share.1[32..], &hello.share.1[..32])
+                } else {
+                    (
+                        &hello.share.1[..MLKEM768_KEY_LEN],
+                        &hello.share.1[MLKEM768_KEY_LEN..],
+                    )
+                };
+                let encoded = KemKey::<ml_kem::EncapsulationKey<ml_kem::MlKem768>>::try_from(mlkem)
+                    .map_err(|_| bad("ML-KEM encapsulation key is not 1184 bytes"))?;
+                let key = ml_kem::EncapsulationKey::<ml_kem::MlKem768>::new(&encoded)
+                    .map_err(|_| bad("ML-KEM encapsulation key is invalid"))?;
+                let mut draw = [0u8; 32];
+                getrandom::fill(&mut draw).map_err(|e| bad(&format!("no entropy: {e}")))?;
+                let (ciphertext, shared_key) =
+                    key.encapsulate_deterministic(&ml_kem::B32::from(draw));
+                let x_peer: [u8; 32] = x_share
+                    .try_into()
+                    .map_err(|_| bad("hybrid X25519 share is not 32 bytes"))?;
+                let x_shared = x25519_dalek::x25519(secret.to_bytes(), x_peer);
+                if x_shared == [0u8; 32] {
+                    return Err(bad("X25519 shared secret was all zero"));
+                }
+                let mut share = Vec::with_capacity(1088 + 32);
+                let mut shared = Vec::with_capacity(64);
+                if draft {
+                    share.extend_from_slice(public.as_bytes());
+                    share.extend_from_slice(ciphertext.as_ref());
+                    shared.extend_from_slice(&x_shared);
+                    let mixed = crate::tls::shaped::keys::draft_shared(shared_key.as_ref(), &share);
+                    shared.extend_from_slice(&mixed);
+                } else {
+                    share.extend_from_slice(ciphertext.as_ref());
+                    share.extend_from_slice(public.as_bytes());
+                    shared.extend_from_slice(shared_key.as_ref());
+                    shared.extend_from_slice(&x_shared);
+                }
+                (share, shared)
+            }
+            _ => return Err(bad("unsupported key share group")),
+        };
+
+        let suite = record::Suite::from_id(hello.suite)
+            .filter(|suite| suite.is_tls13())
+            .ok_or(TlsError::NoSharedCipher)?;
+        let hash = suite.hash();
+
+        let mut body = Vec::with_capacity(64 + share.len());
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&random);
+        body.push(hello.session_id.len() as u8);
+        body.extend_from_slice(&hello.session_id);
+        body.extend_from_slice(&hello.suite.to_be_bytes());
+        body.push(0);
+        let mut exts = Vec::with_capacity(16 + share.len());
+        exts.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+        exts.extend_from_slice(&[0x00, 0x33]);
+        exts.extend_from_slice(&((4 + share.len()) as u16).to_be_bytes());
+        exts.extend_from_slice(&hello.share.0.to_be_bytes());
+        exts.extend_from_slice(&(share.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&share);
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+        let server_hello = handshake_message(2, &body);
+
+        let mut transcript = client_hello.to_vec();
+        transcript.extend_from_slice(&server_hello);
+
+        let zeros = vec![0u8; hash.len()];
+        let early = kdf::extract(hash, &zeros, &zeros);
+        let derived = kdf::derive(hash, &early, b"derived", &[]);
+        let handshake_secret = kdf::extract(hash, &derived, &shared);
+        let client_hs = kdf::derive(hash, &handshake_secret, b"c hs traffic", &transcript);
+        let server_hs = kdf::derive(hash, &handshake_secret, b"s hs traffic", &transcript);
+        let derived2 = kdf::derive(hash, &handshake_secret, b"derived", &[]);
+        let master = kdf::extract(hash, &derived2, &zeros);
+        let mut write_key = record::Direction::tls13(suite, &server_hs);
+
+        let ee = handshake_message(8, &[0, 0]);
+        transcript.extend_from_slice(&ee);
+        let cert =
+            bound_certificate_binding(auth_key, name, Some((seed, client_hello, &server_hello)));
+        let certificate = certificate_message(&cert);
+        transcript.extend_from_slice(&certificate);
+
+        let signed = hash.hash(&transcript);
+        let mut content = Vec::with_capacity(64 + 33 + 1 + signed.len());
+        content.extend_from_slice(&[0x20u8; 64]);
+        content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        content.push(0);
+        content.extend_from_slice(&signed);
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(&pkcs8())
+            .map_err(|_| bad("the fixed Ed25519 key is not a PKCS#8 key"))?;
+        let proof = pair.sign(&content);
+        let mut verify = Vec::with_capacity(2 + 2 + proof.as_ref().len());
+        verify.extend_from_slice(&0x0807u16.to_be_bytes());
+        verify.extend_from_slice(&(proof.as_ref().len() as u16).to_be_bytes());
+        verify.extend_from_slice(proof.as_ref());
+        let certificate_verify = handshake_message(15, &verify);
+        transcript.extend_from_slice(&certificate_verify);
+
+        let server_finished =
+            kdf::verify_data(hash, &kdf::finished_key(hash, &server_hs), &transcript);
+        let finished = handshake_message(20, &server_finished);
+        transcript.extend_from_slice(&finished);
+        let expected_finished =
+            kdf::verify_data(hash, &kdf::finished_key(hash, &client_hs), &transcript);
+
+        let server_ap = kdf::derive(hash, &master, b"s ap traffic", &transcript);
+        let client_ap = kdf::derive(hash, &master, b"c ap traffic", &transcript);
+
+        let mut pending = Vec::with_capacity(
+            5 + server_hello.len()
+                + 6
+                + ee.len()
+                + certificate.len()
+                + certificate_verify.len()
+                + finished.len()
+                + 4 * 64,
+        );
+        pending.push(22);
+        pending.extend_from_slice(&[0x03, 0x03]);
+        pending.extend_from_slice(&(server_hello.len() as u16).to_be_bytes());
+        pending.extend_from_slice(&server_hello);
+        pending.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+        for message in [
+            ee.as_slice(),
+            certificate.as_slice(),
+            certificate_verify.as_slice(),
+            finished.as_slice(),
+        ] {
+            record::seal13(&mut write_key, 22, message, &mut pending)
+                .map_err(|e| bad(&format!("sealing the flight: {e}")))?;
+        }
+
+        Ok(Self {
+            io,
+            suite_id: hello.suite,
+            sni: hello.server_name,
+            phase: Phase::Flight,
+            pending,
+            pending_at: 0,
+            client_hs: Some(record::Direction::tls13(suite, &client_hs)),
+            read_key: Some(record::Direction::tls13(suite, &client_ap)),
+            write_key: Some(record::Direction::tls13(suite, &server_ap)),
+            inbuf: Vec::new(),
+            hs: Vec::new(),
+            plain: Vec::new(),
+            plain_at: 0,
+            plain_end: 0,
+            expected_finished,
+            eof: false,
+        })
+    }
+
+    fn drive(&mut self) -> Result<(), TlsError> {
+        if self.phase == Phase::Done {
+            return Ok(());
+        }
+        loop {
+            if self.pending_at < self.pending.len() {
+                match self.io.write(&self.pending[self.pending_at..]) {
+                    Ok(0) => return Err(TlsError::Closed),
+                    Ok(n) => {
+                        self.pending_at += n;
+                        continue;
+                    }
+                    Err(error) if TlsError::is_timeout(&error) => return Err(TlsError::Timeout),
+                    Err(error) => return Err(TlsError::from(error)),
+                }
+            }
+            if self.phase == Phase::Flight {
+                self.pending.clear();
+                self.pending_at = 0;
+                self.phase = Phase::Finished;
+            }
+            if self.read_finished()? {
+                return Ok(());
+            }
+            let mut buf = [0u8; 16_384];
+            match self.io.read(&mut buf) {
+                Ok(0) => return Err(TlsError::Closed),
+                Ok(n) => self.inbuf.extend_from_slice(&buf[..n]),
+                Err(error) if TlsError::is_timeout(&error) => return Err(TlsError::Timeout),
+                Err(error) => return Err(TlsError::from(error)),
+            }
+        }
+    }
+
+    fn read_finished(&mut self) -> Result<bool, TlsError> {
+        loop {
+            let Some((header, len)) = record_head(&self.inbuf) else {
+                return Ok(false);
+            };
+            if self.inbuf.len() < 5 + len {
+                return Ok(false);
+            }
+            let mut body = self.inbuf[5..5 + len].to_vec();
+            self.inbuf.drain(..5 + len);
+            match header[0] {
+                0x14 => continue,
+                0x15 => {
+                    self.eof = true;
+                    return Err(TlsError::Closed);
+                }
+                0x17 => {}
+                _ => {
+                    return Err(TlsError::Other(
+                        "reality: unexpected record type".to_owned(),
+                    ));
+                }
+            }
+            let keys = self
+                .client_hs
+                .as_mut()
+                .ok_or_else(|| TlsError::Other("reality: no client handshake keys".to_owned()))?;
+            let (kind, plen) = crate::tls::shaped::record::open13(keys, header, &mut body)?;
+            match kind {
+                22 => {
+                    self.hs.extend_from_slice(&body[..plen]);
+                    if self.hs.len() >= 4 {
+                        let len = u24(&self.hs[1..4]).unwrap_or(usize::MAX);
+                        if self.hs.len() < 4 + len {
+                            return Ok(false);
+                        }
+                        let message: Vec<u8> = self.hs.drain(..4 + len).collect();
+                        if message[0] != 20 {
+                            return Err(TlsError::Other(
+                                "reality: expected the client Finished".to_owned(),
+                            ));
+                        }
+                        if message[4..] != self.expected_finished[..] {
+                            return Err(TlsError::Other(
+                                "reality: client Finished did not verify".to_owned(),
+                            ));
+                        }
+                        self.phase = Phase::Done;
+                        self.client_hs = None;
+                        return Ok(true);
+                    }
+                }
+                21 => {
+                    self.eof = true;
+                    return Err(TlsError::Closed);
+                }
+                _ => {
+                    return Err(TlsError::Other(
+                        "reality: application record before Finished".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn deliver(&mut self, buf: &mut [u8]) -> usize {
+        let n = (self.plain_end - self.plain_at).min(buf.len());
+        buf[..n].copy_from_slice(&self.plain[self.plain_at..self.plain_at + n]);
+        self.plain_at += n;
+        if self.plain_at == self.plain_end {
+            self.plain.clear();
+            self.plain_at = 0;
+            self.plain_end = 0;
+        }
+        n
+    }
+
+    fn process_record(&mut self) -> Result<bool, TlsError> {
+        let Some((header, len)) = record_head(&self.inbuf) else {
+            return Ok(false);
+        };
+        if self.inbuf.len() < 5 + len {
+            return Ok(false);
+        }
+        let mut body = self.inbuf[5..5 + len].to_vec();
+        self.inbuf.drain(..5 + len);
+        if header[0] == 0x14 {
+            return Ok(true);
+        }
+        if header[0] == 0x15 {
+            self.eof = true;
+            return Ok(false);
+        }
+        if header[0] != 0x17 {
+            return Ok(true);
+        }
+        let keys = self
+            .read_key
+            .as_mut()
+            .ok_or_else(|| TlsError::Other("reality: no read keys".to_owned()))?;
+        let (kind, plen) = crate::tls::shaped::record::open13(keys, header, &mut body)?;
+        match kind {
+            23 => {
+                self.plain.clear();
+                self.plain.extend_from_slice(&body[..plen]);
+                self.plain_at = 0;
+                self.plain_end = plen;
+            }
+            22 => {
+                let mut at = 0;
+                while at + 4 <= plen {
+                    let len = u24(&body[at + 1..at + 4]).unwrap_or(usize::MAX);
+                    if at + 4 + len > plen {
+                        break;
+                    }
+                    if body[at] == 24 {
+                        if let Some(keys) = self.read_key.as_mut() {
+                            keys.update();
+                        }
+                    }
+                    at += 4 + len;
+                }
+            }
+            21 => self.eof = true,
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn handshake_io(&mut self) -> std::io::Result<()> {
+        self.drive().map_err(io_error)
+    }
+
+    fn seal_plain(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+        if self.phase != Phase::Done {
+            self.handshake_io()?;
+        }
+        let keys = self
+            .write_key
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("reality: no write keys"))?;
+        for chunk in plaintext.chunks(16_384) {
+            crate::tls::shaped::record::seal13(keys, 23, chunk, out).map_err(io_error)?;
+        }
+        Ok(plaintext.len())
+    }
+}
+
+fn record_head(bytes: &[u8]) -> Option<([u8; 5], usize)> {
+    let head = bytes.get(..5)?;
+    let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
+    (len <= MAX_RECORD).then(|| ([head[0], head[1], head[2], head[3], head[4]], len))
+}
+
+fn io_error(error: TlsError) -> std::io::Error {
+    match error {
+        TlsError::Timeout => std::io::Error::from(std::io::ErrorKind::TimedOut),
+        TlsError::Closed => std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+        TlsError::Other(why) => std::io::Error::other(why),
+        other => std::io::Error::other(format!("{other:?}")),
+    }
+}
+
+impl<S: Stream> std::fmt::Debug for Session13<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session13")
+            .field("suite", &self.suite_id)
+            .field("phase", &self.phase)
+            .field("eof", &self.eof)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: Stream> Read for Session13<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.handshake_io()?;
+        loop {
+            if self.plain_at < self.plain_end {
+                return Ok(self.deliver(buf));
+            }
+            match self.process_record() {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    if error == TlsError::Closed {
+                        return Ok(0);
+                    }
+                    return Err(io_error(error));
+                }
+            }
+            if self.eof {
+                return Ok(0);
+            }
+            let mut chunk = [0u8; 16_384];
+            match self.io.read(&mut chunk) {
+                Ok(0) => {
+                    self.eof = true;
+                    return Ok(0);
+                }
+                Ok(n) => self.inbuf.extend_from_slice(&chunk[..n]),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl<S: Stream> Write for Session13<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut out = Vec::with_capacity(buf.len() + 5 + 16);
+        self.seal_plain(buf, &mut out)?;
+        self.io.write_all(&out)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.io.flush()
+    }
+}
+
+impl<S: Stream> TlsProvider for Session13<S> {
+    fn name() -> &'static str {
+        "tls13"
+    }
+
+    fn suites(&self) -> Vec<String> {
+        vec![format!("0x{:04x}", self.suite_id)]
+    }
+
+    fn handshake(&mut self) -> Result<(), TlsError> {
+        self.drive()
+    }
+
+    fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+        if self.phase != Phase::Done {
+            self.handshake_io()?;
+        }
+        if self.plain_at < self.plain_end {
+            return Ok((self.deliver(buf), 0));
+        }
+        let consumed = ciphertext.len();
+        self.inbuf.extend_from_slice(ciphertext);
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let before = self.inbuf.len();
+            match self.process_record() {
+                Ok(true) => {}
+                Ok(false) | Err(TlsError::Closed) => break,
+                Err(error) => return Err(io_error(error)),
+            }
+            if self.plain_at < self.plain_end {
+                filled += self.deliver(&mut buf[filled..]);
+                if filled == buf.len() {
+                    break;
+                }
+            }
+            if self.inbuf.len() == before {
+                break;
+            }
+        }
+        Ok((filled, consumed))
+    }
+
+    fn alpn(&self) -> Option<&[u8]> {
+        None
+    }
+
+    fn closed(&self) -> bool {
+        self.eof
+    }
+
+    fn sni(&self) -> Option<&[u8]> {
+        Some(&self.sni)
+    }
+
+    fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.seal_plain(plaintext, out)
+    }
+
+    fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
+        if self.phase != Phase::Done {
+            self.handshake_io()?;
+        }
+        let total: usize = parts.iter().map(|part| part.len()).sum();
+        let keys = self
+            .write_key
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("reality: no write keys"))?;
+        if total <= 16_384 {
+            crate::tls::shaped::record::seal13_parts(keys, 23, parts, out).map_err(io_error)
+        } else {
+            for part in parts {
+                for chunk in part.chunks(16_384) {
+                    crate::tls::shaped::record::seal13(keys, 23, chunk, out).map_err(io_error)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+impl<S: Stream> super::RecordAlignment for Session13<S> {
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        let mut out = Vec::new();
+        self.seal_slices_into(parts, &mut out)?;
+        self.io.write_all(&out)
+    }
 }
 
 #[cfg(test)]
@@ -1512,6 +2426,17 @@ mod tests {
         let len = u32::try_from(body.len() - 4).unwrap();
         body[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
         body
+    }
+
+    #[test]
+    fn a_client_hello_may_omit_the_legacy_session_id() {
+        let mut body = hello_body(&[0x11; 32], &[0x22; 32], SNI);
+        body[38] = 0;
+        body.drain(39..71);
+        let len = u32::try_from(body.len() - 4).unwrap();
+        body[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
+        let hello = parse_tls13_hello(&body).expect("an empty legacy session id is legal");
+        assert_eq!(hello.session_id.as_slice(), &[] as &[u8]);
     }
 
     fn tlv_header(kind: u16, body: &[u8]) -> Vec<u8> {
@@ -2656,6 +3581,7 @@ mod tests {
             short_id: SHORT_ID,
             fingerprint: "chrome".to_owned(),
             key_log: None,
+            mldsa65_verify: None,
         }
     }
 
@@ -2762,6 +3688,90 @@ mod tests {
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("reads");
         assert_eq!(&back, b"ping");
+        server.join().expect("joins");
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_client_verifies_the_mldsa65_binding_and_echoes() {
+        use ml_dsa::Keypair as _;
+        let seed = [0x42u8; 32];
+        let signing = ml_dsa::SigningKey::<ml_dsa::MlDsa65>::from_seed(&seed.into());
+        let encoded = signing.verifying_key().encode();
+        let verify: [u8; 1952] = encoded.as_slice().try_into().expect("1952-byte key");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("timeout");
+            let mut cfg = settings();
+            cfg.mldsa65_seed = Some(seed);
+            let accepted =
+                RealityServer::accept(&cfg, 0, stream, Edges::default()).expect("accepts");
+            let mut session = match accepted {
+                RealityAccept::Session(session) => session,
+                RealityAccept::Proxied(_) => panic!("the client authenticates"),
+            };
+            session.handshake().expect("handshakes");
+            let mut buf = [0u8; 4];
+            session.read_exact(&mut buf).expect("reads");
+            session.write_all(&buf).expect("echoes");
+            session.flush().expect("flushes");
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        let mut cfg = client_config(server_public());
+        cfg.mldsa65_verify = Some(verify);
+        let mut client = RealityClientSession::connect(&cfg, 1_700_000_000, stream).expect("dials");
+        client.write_all(b"ping").expect("writes");
+        client.flush().expect("flushes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("reads");
+        assert_eq!(&back, b"ping");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn a_client_refuses_a_binding_that_does_not_verify() {
+        let seed = [0x42u8; 32];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("timeout");
+            let mut cfg = settings();
+            cfg.mldsa65_seed = Some(seed);
+            let accepted =
+                RealityServer::accept(&cfg, 0, stream, Edges::default()).expect("accepts");
+            if let RealityAccept::Session(mut session) = accepted {
+                assert!(
+                    session.handshake().is_err(),
+                    "the client must refuse before it owes a Finished"
+                );
+            }
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        let mut cfg = client_config(server_public());
+        cfg.mldsa65_verify = Some([0u8; 1952]);
+        let error = RealityClientSession::connect(&cfg, 1_700_000_000, stream)
+            .expect_err("a wrong verify key refuses the binding");
+        assert!(
+            format!("{error}").contains("ML-DSA-65 binding did not verify"),
+            "the refusal names the binding: {error}"
+        );
         server.join().expect("joins");
     }
 

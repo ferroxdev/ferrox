@@ -100,7 +100,7 @@ fn agree_x25519(secret: &StaticSecret, peer: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Kyber's remove-the-final-hash trick, as uTLS applies it to an ML-KEM shared key.
-fn draft_shared(k: &[u8], ciphertext: &[u8]) -> [u8; 32] {
+pub(crate) fn draft_shared(k: &[u8], ciphertext: &[u8]) -> [u8; 32] {
     use sha3::Digest as _;
     use shake::{ExtendableOutput as _, Update as _, XofReader as _};
     let mut hash = sha3::Sha3_256::new();
