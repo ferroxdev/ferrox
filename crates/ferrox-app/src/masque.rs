@@ -28,6 +28,8 @@ use crate::wg_stack::{self, ClientFlow, Packet, ToTunnel, UdpForwarder, UdpRoute
 use crate::wireguard::DeviceConfig;
 
 const TICK: Duration = Duration::from_millis(10);
+/// Bounds how long an inner acknowledgement waits for the pump to take the outbound queue.
+const IO_TICK: Duration = Duration::from_millis(1);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
 /// Reconnect schedule: the first dial is immediate, a failure doubles from a second to a
 /// minute, and only a lane that lived past the stable window clears the history.
@@ -64,13 +66,13 @@ pub(crate) const EARLY_BYTES: usize = 1 << 20;
 /// The most capsule bytes one HTTP/3 request stream may hold while a capsule is incomplete, the
 /// same ceiling the HTTP/2 path uses.
 const CAPSULE_CAP: usize = 1 << 20;
-/// Frames the connection may hold before `dgram_send` refuses more: the
-/// reference queues 32, and a peer that drains slower drops what the wire
-/// delivers above its own receive queue, which the inner TCP then backs off
-/// from for seconds.
-const DGRAM_INFLIGHT: usize = 32;
-/// The client queues a whole stack batch, not the acknowledgement's grain; the server keeps `DGRAM_INFLIGHT`.
+/// Frames the connection may hold before `dgram_send` refuses more: a short server queue
+/// makes the loop wait for a wake between batches while the inner window still has room.
+const DGRAM_INFLIGHT: usize = QUEUE;
+/// The client queues a whole stack batch, not the acknowledgement's grain.
 const DGRAM_SEND_QUEUE: usize = QUEUE;
+/// The comparator's receive queue: a full one drops its oldest, and the inner TCP pays that in a retransmit.
+const DGRAM_RECV_QUEUE: usize = 65_536;
 /// A burst the reader has not drained is a lost DATAGRAM and a second of inner TCP RTO; aether asks up to 7 MiB of its lanes.
 const MASQUE_BUFFER: i32 = 4 << 20;
 /// The server's own connection ID: a short header carries no length, so the demultiplexer reads exactly this many bytes.
@@ -1254,7 +1256,7 @@ fn client_config(spec: &ClientSpec) -> Result<quiche::Config, String> {
         quic::quiche_config(&tls.roots, None)
             .ok_or("masque: no certificate authorities for the edge")?
     };
-    config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
+    config.enable_dgram(true, DGRAM_RECV_QUEUE, DGRAM_SEND_QUEUE);
     cap_datagram(&mut config, spec.max_datagram);
     Ok(config)
 }
@@ -1306,7 +1308,7 @@ fn warp_config(warp: &Warp, max_datagram: usize) -> Result<quiche::Config, Strin
     let _ = std::fs::remove_file(&certificate);
     let _ = std::fs::remove_file(&key);
     loaded?;
-    config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
+    config.enable_dgram(true, DGRAM_RECV_QUEUE, DGRAM_SEND_QUEUE);
     cap_datagram(&mut config, max_datagram);
     Ok(config)
 }
@@ -1927,7 +1929,7 @@ fn io(
             }
         }
         quic::flush_egress(&mut conn, sock);
-        if !quic::pump_once(&mut conn, sock, local, TICK) || conn.is_closed() {
+        if !quic::pump_once(&mut conn, sock, local, IO_TICK) || conn.is_closed() {
             break;
         }
         if moved && quic::path_failed(&mut conn, local) {
@@ -2126,7 +2128,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     let Some(mut config) = quic::serve_config(&identity) else {
         return Err("unreadable masque tls identity".to_owned());
     };
-    config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
+    config.enable_dgram(true, DGRAM_RECV_QUEUE, DGRAM_INFLIGHT);
     let tcp = identity
         .alpn
         .iter()
@@ -5983,7 +5985,7 @@ mod tests {
             kernel_rx: false,
         };
         let mut server_config = quic::serve_config(&identity).expect("serves");
-        server_config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
+        server_config.enable_dgram(true, DGRAM_RECV_QUEUE, DGRAM_INFLIGHT);
         let spec = ClientSpec {
             address: "127.0.0.1".to_owned(),
             port: 0,

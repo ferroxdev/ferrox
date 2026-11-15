@@ -298,6 +298,37 @@ def socks_connect(port, host, target_port):
     return (time.monotonic() - start) * 1000.0
 
 
+def udp_counters():
+    """Return the kernel's UDP error counters, or None where /proc/net/snmp is absent."""
+    try:
+        lines = pathlib.Path("/proc/net/snmp").read_text().splitlines()
+    except OSError:
+        return None
+    for first, second in zip(lines, lines[1:]):
+        if not (first.startswith("Udp: ") and second.startswith("Udp: ")):
+            continue
+        names = first.split()[1:]
+        values = second.split()[1:]
+        keys = ("InErrors", "RcvbufErrors", "SndbufErrors", "InCsumErrors")
+        counted = [(name, int(value)) for name, value in zip(names, values) if name in keys]
+        return dict(counted) if counted else None
+    return None
+
+
+def udp_delta(before, after):
+    """Return the counters that moved between two snapshots."""
+    if before is None or after is None:
+        return None
+    return {name: after.get(name, 0) - before.get(name, 0) for name in before}
+
+
+def udp_text(drops):
+    """Render only the counters a run moved."""
+    if not drops:
+        return ""
+    return " ".join(f"{name}={value}" for name, value in drops.items() if value)
+
+
 def curl_download(port, url, out_path, timeout):
     """Download through the engine's SOCKS front and return its transfer record."""
     result = run([
@@ -519,11 +550,13 @@ def measure_engine(name, binary, adapter, config, socks_port, url, out_dir, repe
         "note": setup_error,
     }
     if setup_ms is not None:
+        udp_before = udp_counters()
         try:
             download = curl_download(socks_port, url[2], out_dir / f"{name}-{repeat}.bin", 300)
             record.update(download)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, KeyError) as error:
             record["note"] = f"download: {error}"
+        record["udp_drops"] = udp_delta(udp_before, udp_counters())
     peak_rss = startup_rss
     cpu_end = startup_cpu
     try:
@@ -690,14 +723,14 @@ def main():
                 f"{item['exit']} | {(item.get('note') or '').replace('|', '/')[:160]} |"
             )
         lines += ["", "## Client runs", "",
-                  "| provenance | server | engine | repeat | startup ms | setup ms | MiB/s | peak RSS MiB | cpu ms | ok | note |",
-                  "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+                  "| provenance | server | engine | repeat | startup ms | setup ms | MiB/s | peak RSS MiB | cpu ms | udp drops | ok | note |",
+                  "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
         for item in rows:
             lines.append(
                 f"| {item['provenance']} | {item['server']} | {item['engine']} | {item['repeat']} | "
                 f"{display(item.get('startup_ms'))} | {display(item.get('setup_ms'))} | "
                 f"{display(item.get('mib_s'))} | {display(item.get('rss_mib'))} | "
-                f"{display(item.get('cpu_millis'))} | {item.get('ok')} | "
+                f"{display(item.get('cpu_millis'))} | {udp_text(item.get('udp_drops'))} | {item.get('ok')} | "
                 f"{(item.get('note') or '').replace('|', '/')[:160]} |"
             )
         if not any(row.get("ok") for row in rows if row.get("server") == "cloudflare"):
