@@ -1777,10 +1777,17 @@ mod tests {
         let (mut client, waited) = api_connection(Duration::from_millis(500));
         served_settings(&mut client);
         let block = vec![0u8; h2::HEAD_CAP];
-        client
-            .write_all(&h2::frame_head(block.len(), h2::T_HEADERS, 0, 1))
-            .expect("writes the first block");
-        client.write_all(&block).expect("writes its bytes");
+        for (index, chunk) in block.chunks(16 * 1024).enumerate() {
+            let kind = if index == 0 {
+                h2::T_HEADERS
+            } else {
+                h2::T_CONT
+            };
+            client
+                .write_all(&h2::frame_head(chunk.len(), kind, 0, 1))
+                .expect("writes the frame head");
+            client.write_all(chunk).expect("writes the frame bytes");
+        }
         client
             .write_all(&h2::frame_head(1, h2::T_CONT, 0, 1))
             .expect("writes the continuation head");
