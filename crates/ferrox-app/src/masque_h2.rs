@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use ferrox_core::foxy::{connectip, frames};
 use ferrox_core::tls::{CertEntry, ServerKeyKind, TlsConfig, TlsProvider as _, TlsServerConfig};
 
+use crate::conn::Connection;
 use crate::h2::{self, Decoder};
 use crate::masque::{self, deliver, withdrawn, Granted, ServerSpec, Shared, AUTH_REALM};
 use crate::wg_stack::{Packet, UdpRoutes};
@@ -66,7 +67,7 @@ impl Deadline {
 }
 
 pub(crate) struct DeadlineStream {
-    io: TcpStream,
+    io: Connection,
     deadline: Deadline,
     read_wait: std::cell::Cell<Duration>,
     read_tight: std::cell::Cell<bool>,
@@ -74,7 +75,7 @@ pub(crate) struct DeadlineStream {
 }
 
 impl DeadlineStream {
-    fn new(io: TcpStream, deadline: Deadline) -> Self {
+    fn new(io: Connection, deadline: Deadline) -> Self {
         Self {
             io,
             deadline,
@@ -129,8 +130,15 @@ impl DeadlineStream {
     }
 }
 
+/// Hold the outer clock while a masked handshake opens its own: the mask reads the
+/// thread-local cap once, so it must see the deadline this handler was given, not its
+/// two-minute default.
+pub(crate) fn handshake_cap(deadline: &Deadline) -> crate::budgets::HandshakeCap {
+    crate::budgets::cap_handshake(deadline.remaining().unwrap_or(HANDSHAKE))
+}
+
 /// Wrap a TCP stream in the handshake clock and disable Nagle.
-pub(crate) fn handshake_stream(tcp: TcpStream) -> (DeadlineStream, Deadline) {
+pub(crate) fn handshake_stream(tcp: Connection) -> (DeadlineStream, Deadline) {
     let _ = tcp.set_nodelay(true);
     let deadline = Deadline::default();
     deadline.arm(Instant::now() + HANDSHAKE);
@@ -212,6 +220,9 @@ pub(crate) fn serve(
             let Ok(stream) = stream else {
                 continue;
             };
+            if spec.rejects_tcp(stream.peer_addr().ok()) {
+                continue;
+            }
             let Some(slot) = slots.acquire() else {
                 continue;
             };
@@ -248,13 +259,19 @@ fn connection(
 ) {
     let deadline = Deadline::default();
     deadline.arm(Instant::now() + HANDSHAKE);
-    let io = DeadlineStream::new(stream, deadline.clone());
+    let io = Connection::from(stream).with_mask_role(
+        spec.tcp_mask.as_ref(),
+        ferrox_core::finalmask::MaskRole::Server,
+    );
+    let io = DeadlineStream::new(io, deadline.clone());
+    let cap = handshake_cap(&deadline);
     let Ok(mut tls) = ferrox_core::tls::accept(identity, io) else {
         return;
     };
     if tls.handshake().is_err() {
         return;
     }
+    drop(cap);
     deadline.arm(Instant::now() + HANDSHAKE);
     if tls.alpn() == Some(b"http/1.1") {
         deadline.clear();
@@ -286,6 +303,9 @@ pub(crate) fn serve_cleartext(shared: Arc<Shared>, spec: Arc<ServerSpec>, listen
             let Ok(stream) = stream else {
                 continue;
             };
+            if spec.rejects_tcp(stream.peer_addr().ok()) {
+                continue;
+            }
             let Some(slot) = slots.acquire() else {
                 continue;
             };
@@ -309,14 +329,21 @@ pub(crate) fn serve_cleartext(shared: Arc<Shared>, spec: Arc<ServerSpec>, listen
 
 /// Serve one prior-knowledge h2c connection over bare TCP.
 fn connection_cleartext(stream: TcpStream, shared: Arc<Shared>, spec: Arc<ServerSpec>) {
+    let stream = Connection::from(stream).with_mask_role(
+        spec.tcp_mask.as_ref(),
+        ferrox_core::finalmask::MaskRole::Server,
+    );
     let mut wire = cleartext_wire(stream);
-    if wire.preface() {
+    let cap = handshake_cap(&wire.deadline);
+    let ready = wire.preface();
+    drop(cap);
+    if ready {
         Session::new(shared, spec).run(&mut wire);
     }
 }
 
 /// Wrap a cleartext TCP stream in the same clock the TLS carrier uses.
-fn cleartext_wire(stream: TcpStream) -> Wire {
+fn cleartext_wire(stream: Connection) -> Wire {
     let (io, deadline) = handshake_stream(stream);
     io.set_read_timeout(Some(READ_WAIT));
     Wire {
@@ -475,8 +502,14 @@ fn dial_until_bound(
     }
 }
 
-fn connect_edge(edge: SocketAddr) -> Result<TcpStream, String> {
-    dial_until_bound(edge, |edge| TcpStream::connect_timeout(&edge, HANDSHAKE))
+fn connect_edge(
+    edge: SocketAddr,
+    sockopt: Option<&crate::sockopt::SocketOptions>,
+) -> Result<TcpStream, String> {
+    dial_until_bound(edge, |edge| match sockopt {
+        Some(options) => options.connect_edge(edge, HANDSHAKE),
+        None => TcpStream::connect_timeout(&edge, HANDSHAKE),
+    })
 }
 
 /// Build the CONNECT fields for WARP or RFC 9484 plus the configured headers.
@@ -612,6 +645,7 @@ fn handshake(
 
 impl Client {
     /// Dial the edge over TLS, negotiate h2, and handshake.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dial(
         tls_config: &TlsConfig,
         insecure: bool,
@@ -620,16 +654,22 @@ impl Client {
         authority: &str,
         path: &str,
         headers: &[(String, String)],
+        mask: Option<&ferrox_core::finalmask::Chain>,
+        sockopt: Option<&crate::sockopt::SocketOptions>,
     ) -> Result<Self, String> {
-        let tcp = connect_edge(edge)?;
+        let tcp = connect_edge(edge, sockopt)?;
         let _ = tcp.set_read_timeout(Some(HANDSHAKE));
         let _ = tcp.set_write_timeout(Some(HANDSHAKE));
+        let tcp =
+            Connection::from(tcp).with_mask_role(mask, ferrox_core::finalmask::MaskRole::Client);
         let (tcp, deadline) = handshake_stream(tcp);
+        let cap = handshake_cap(&deadline);
         let owned = warp_tls(tls_config, warp);
         let mut tls = ferrox_core::tls::connect(owned.as_ref().unwrap_or(tls_config), tcp)
             .map_err(|error| format!("tls: {error}"))?;
         tls.handshake()
             .map_err(|error| format!("tls handshake: {error}"))?;
+        drop(cap);
         if tls.alpn() != Some(b"h2".as_slice()) {
             return Err("the edge did not negotiate h2".to_owned());
         }
@@ -654,16 +694,21 @@ impl Client {
         authority: &str,
         path: &str,
         headers: &[(String, String)],
+        mask: Option<&ferrox_core::finalmask::Chain>,
+        sockopt: Option<&crate::sockopt::SocketOptions>,
     ) -> Result<Self, String> {
-        let tcp = connect_edge(edge)?;
+        let tcp = connect_edge(edge, sockopt)?;
         let _ = tcp.set_read_timeout(Some(READ_WAIT));
         let _ = tcp.set_write_timeout(Some(HANDSHAKE));
+        let tcp =
+            Connection::from(tcp).with_mask_role(mask, ferrox_core::finalmask::MaskRole::Client);
         let (tcp, deadline) = handshake_stream(tcp);
         let mut tcp = tcp;
         tcp.set_read_timeout(Some(READ_WAIT));
+        let cap = handshake_cap(&deadline);
         tcp.write_all(h2::MAGIC)
             .map_err(|error| format!("preface: {error}"))?;
-        handshake(
+        let answer = handshake(
             Box::new(tcp),
             deadline,
             None,
@@ -671,7 +716,9 @@ impl Client {
             path,
             headers,
             "http",
-        )
+        );
+        drop(cap);
+        answer
     }
 
     /// Ask for both families and wait for the assignment inside the handshake clock.
@@ -709,6 +756,7 @@ impl Client {
         to_stack: &Sender<Packet>,
         routes: &UdpRoutes,
         keepalive: Option<Duration>,
+        alive: &AtomicBool,
     ) {
         self.to_stack = Some(to_stack.clone());
         self.routes = Some(routes.clone());
@@ -718,7 +766,7 @@ impl Client {
         self.early_bytes = 0;
         let mut capsule = Vec::new();
         let mut ping_at = None;
-        while !self.wire.closed && !self.end {
+        while !self.wire.closed && !self.end && alive.load(Ordering::Relaxed) {
             self.pump();
             if self.wire.closed || self.end {
                 break;
@@ -1956,7 +2004,7 @@ mod tests {
         let (stream, _) = listener.accept().expect("accepts");
         let deadline = Deadline::default();
         deadline.arm(Instant::now());
-        let mut stream = DeadlineStream::new(stream, deadline);
+        let mut stream = DeadlineStream::new(stream.into(), deadline);
         let start = Instant::now();
         let mut error = None;
         let mut byte = [0u8; 1];
@@ -2051,7 +2099,7 @@ mod tests {
         let address = listener.local_addr().expect("an address");
         let client = TcpStream::connect(address).expect("a client");
         let (server, _) = listener.accept().expect("a server");
-        let wire = cleartext_wire(server);
+        let wire = cleartext_wire(server.into());
         assert!(wire
             .deadline
             .remaining()
@@ -2262,7 +2310,7 @@ mod tests {
         }
         let (to_stack, _) = mpsc::channel();
         let routes = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        client.run(&receiver, &to_stack, &routes, None);
+        client.run(&receiver, &to_stack, &routes, None, &AtomicBool::new(true));
         assert!(client.end);
         assert_eq!(client.queued.len(), QUEUED_CAP);
         assert_eq!(receiver.try_iter().count(), 1);
@@ -2302,7 +2350,7 @@ mod tests {
         client.wire.stream = Box::new(std::io::Cursor::new(Vec::<u8>::new().into_boxed_slice()));
         let (to_stack, _) = mpsc::channel();
         let routes = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        client.run(&receiver, &to_stack, &routes, None);
+        client.run(&receiver, &to_stack, &routes, None, &AtomicBool::new(true));
         assert!(client.wire.closed);
         assert!(!client.end, "write failure alone closes the wire");
         assert_eq!(
@@ -2324,7 +2372,13 @@ mod tests {
         drop(sender);
         let (to_stack, _) = mpsc::channel();
         let routes = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        client.run(&receiver, &to_stack, &routes, Some(Duration::ZERO));
+        client.run(
+            &receiver,
+            &to_stack,
+            &routes,
+            Some(Duration::ZERO),
+            &AtomicBool::new(true),
+        );
         let written = out.lock().expect("a recorder");
         assert!(
             written

@@ -1455,7 +1455,7 @@ fn dial_from(
 
 /// Hand the target to the outbound a `dialerProxy` names over a loopback pipe, then return the
 /// other end to the dialer. The hop owns its own source, options and strategy; the pipe owns none.
-fn dial_through_proxy(
+pub(crate) fn dial_through_proxy(
     target: SocketAddr,
     tag: &str,
     options: &crate::sockopt::SocketOptions,
@@ -1558,7 +1558,7 @@ fn udp_lane_supported(out: &Outbound) -> bool {
 /// connected to a shim that frames each datagram into the hop's own UDP lane, so the hop owns the
 /// carrier and its source, options and strategy, and the pipe owns none.
 #[allow(clippy::too_many_lines)]
-fn dial_udp_through_proxy(
+pub(crate) fn dial_udp_through_proxy(
     target: SocketAddr,
     tag: &str,
     options: &crate::sockopt::SocketOptions,
@@ -3747,6 +3747,15 @@ fn route_shared_with_api(
     }
     if let Some(options) = &shared.default_sockopts {
         options.install_route(&shared);
+    }
+    for outbound in shared
+        .tagged
+        .values()
+        .chain(std::iter::once(&shared.default))
+    {
+        if let Outbound::Masque(masque) = outbound {
+            masque.install_route(&shared);
+        }
     }
     let _ = shared.self_weak.set(Arc::downgrade(&shared));
     shared.bind_loopbacks();

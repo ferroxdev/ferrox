@@ -188,6 +188,16 @@ impl Mask {
         self.entries.is_empty()
     }
 
+    /// The bytes the chain adds to every datagram: each entry's gap plus the
+    /// AES tag that grows the frame, so a caller can reserve them inside an MTU.
+    #[must_use]
+    pub fn overhead(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| entry.size() + if entry.is_aes() { 16 } else { 0 })
+            .sum()
+    }
+
     /// Strips the mask from a received datagram in place and returns the
     /// framer's bytes inside the caller's own buffer. A datagram that is
     /// short for the chain, or that fails the `original` hash or the AES tag,

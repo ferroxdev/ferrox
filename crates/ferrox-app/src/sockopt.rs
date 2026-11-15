@@ -1,7 +1,7 @@
 use crate::json::Json;
 use socket2::{Domain, Protocol, SockAddr, Socket, TcpKeepalive, Type};
 use std::io;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs as _, UdpSocket};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -55,6 +55,7 @@ pub(crate) struct SocketOptions {
     domain: DomainStrategy,
     address_port: AddressPortStrategy,
     keep_alive: Option<KeepAlive>,
+    keep_alive_set: bool,
     congestion: Option<String>,
     window_clamp: Option<i32>,
     user_timeout: Option<i32>,
@@ -143,6 +144,11 @@ pub(crate) fn parse_outbound(node: Option<&Json>) -> Result<Option<SocketOptions
     parse_with(node, "the outbound")
 }
 
+/// The same options on an inbound's listener or accepted stream.
+pub(crate) fn parse_inbound(node: Option<&Json>) -> Result<Option<SocketOptions>, String> {
+    parse_with(node, "the inbound")
+}
+
 /// The transparent mode an inbound's `streamSettings.sockopt` names.
 pub(crate) fn inbound_tproxy(settings: Option<&Json>) -> Result<Tproxy, String> {
     let node = settings.and_then(|settings| settings.get("sockopt"));
@@ -204,6 +210,14 @@ fn parse_with(node: Option<&Json>, dialer: &str) -> Result<Option<SocketOptions>
         },
     };
     let keep_alive = Some(keep_alive(node)?);
+    let keep_alive_set = ["tcpKeepAliveIdle", "tcpKeepAliveInterval"]
+        .into_iter()
+        .any(|key| {
+            int(node, key)
+                .ok()
+                .flatten()
+                .is_some_and(|value| value != 0)
+        });
     let address_port = address_port(node)?;
     let congestion = text(node, "tcpCongestion")?;
     let window_clamp = int(node, "tcpWindowClamp")?.filter(|value| *value > 0);
@@ -220,6 +234,7 @@ fn parse_with(node: Option<&Json>, dialer: &str) -> Result<Option<SocketOptions>
         domain,
         address_port,
         keep_alive,
+        keep_alive_set,
         congestion,
         window_clamp,
         user_timeout,
@@ -262,6 +277,29 @@ fn warn_unsupported(node: &Json, dialer: &str) {
     }
     if matches!(node.get("tcpMptcp"), Some(Json::Bool(true))) {
         eprintln!("sockopt.tcpMptcp is not wired; {dialer} dials a plain TCP socket");
+    }
+    if matches!(
+        node.get("receiveOriginalDestAddress"),
+        Some(Json::Bool(true))
+    ) {
+        eprintln!(
+            "sockopt.receiveOriginalDestAddress is not wired; {dialer} reads no bound destination"
+        );
+    }
+    if matches!(node.get("acceptProxyProtocol"), Some(Json::Bool(true))) {
+        eprintln!("sockopt.acceptProxyProtocol is not wired; {dialer} reads no PROXY header");
+    }
+    if matches!(node.get("v6only"), Some(Json::Bool(true))) {
+        eprintln!("sockopt.v6only is not wired; {dialer} keeps the platform default");
+    }
+    if node
+        .get("trustedXForwardedFor")
+        .and_then(Json::as_arr)
+        .is_some_and(|list| !list.is_empty())
+    {
+        eprintln!(
+            "sockopt.trustedXForwardedFor is not wired; {dialer} reads no forwarded-for header"
+        );
     }
 }
 
@@ -457,18 +495,60 @@ impl SocketOptions {
         roll(&set).ok_or_else(|| format!("ech: {host} resolved to nothing this strategy allows"))
     }
 
+    /// Resolve a name under this socket config's `domainStrategy` and
+    /// `addressPortStrategy`, the way its `connect_to` and `apply_to_udp` will
+    /// dial it.
+    pub(crate) fn resolve_addr(&self, host: &str, port: u16) -> Option<SocketAddr> {
+        self.resolve(host, port).ok()
+    }
+
     /// The options a TCP dial's socket takes before it connects, whichever dial owns it.
     pub(crate) fn apply_to(&self, socket: &Socket, target: SocketAddr) -> io::Result<()> {
-        self.apply(socket, target, true)
+        self.apply(socket, target, true, false)
     }
 
     /// The options a datagram dial's socket takes before it binds and connects.
     pub(crate) fn apply_to_datagram(&self, socket: &Socket, target: SocketAddr) -> io::Result<()> {
-        self.apply(socket, target, false)
+        self.apply(socket, target, false, false)
     }
 
-    fn apply(&self, socket: &Socket, addr: SocketAddr, tcp: bool) -> io::Result<()> {
-        if tcp {
+    /// The same options on a bound datagram socket the caller already owns.
+    pub(crate) fn apply_to_udp(&self, socket: &UdpSocket, target: SocketAddr) -> io::Result<()> {
+        self.apply_to_datagram(&socket2::SockRef::from(socket), target)
+    }
+
+    /// The same options on a bound listener; accepted sockets inherit them.
+    pub(crate) fn apply_to_listener(&self, listener: &TcpListener) -> io::Result<()> {
+        let target = listener.local_addr()?;
+        self.apply(&socket2::SockRef::from(listener), target, true, true)
+    }
+
+    /// Dial a TCP edge with these options on the socket before it connects.
+    pub(crate) fn connect_to(&self, addr: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+        let socket = Socket::new(domain_of(addr), Type::STREAM, Some(Protocol::TCP))?;
+        self.apply_to(&socket, addr)?;
+        socket.connect_timeout(&SockAddr::from(addr), timeout)?;
+        Ok(TcpStream::from(socket))
+    }
+
+    /// Dial a TCP edge through `dialerProxy` when this config names one, or
+    /// straight with these options when it does not.
+    pub(crate) fn connect_edge(
+        &self,
+        addr: SocketAddr,
+        timeout: Duration,
+    ) -> io::Result<TcpStream> {
+        let Some(tag) = self.dialer_proxy() else {
+            return self.connect_to(addr, timeout);
+        };
+        match crate::proxy::dial_through_proxy(addr, tag, self)? {
+            crate::conn::Connection::Tcp(stream) => Ok(stream),
+            _ => Err(io::Error::other("dialerProxy returned a non-TCP stream")),
+        }
+    }
+
+    fn apply(&self, socket: &Socket, addr: SocketAddr, tcp: bool, listen: bool) -> io::Result<()> {
+        if tcp && (!listen || self.keep_alive_set) {
             match self.keep_alive {
                 Some(KeepAlive::Enabled { idle, interval }) => {
                     let params = TcpKeepalive::new()
@@ -481,7 +561,7 @@ impl SocketOptions {
                 None => {}
             }
         }
-        platform::apply(self, socket, addr, tcp)?;
+        platform::apply(self, socket, addr, tcp, listen)?;
         self.apply_custom(
             socket,
             if tcp {
@@ -538,7 +618,7 @@ pub(crate) fn connect(
         .map_err(|e| format!("ech: tcp socket: {e}"))?;
     if let Some(options) = options {
         options
-            .apply(&socket, addr, true)
+            .apply(&socket, addr, true, false)
             .map_err(|e| format!("ech: tcp options: {e}"))?;
     }
     socket
@@ -566,7 +646,7 @@ pub(crate) fn datagram(
         .map_err(|e| format!("ech: udp socket: {e}"))?;
     if let Some(options) = options {
         options
-            .apply(&socket, addr, false)
+            .apply(&socket, addr, false, false)
             .map_err(|e| format!("ech: udp options: {e}"))?;
     }
     let bind = if addr.is_ipv4() {
@@ -651,6 +731,7 @@ mod platform {
         socket: &Socket,
         addr: SocketAddr,
         tcp: bool,
+        listen: bool,
     ) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -664,7 +745,12 @@ mod platform {
             }
             if tcp {
                 if let Some(tfo) = options.tfo {
-                    set_int(socket, libc::IPPROTO_TCP, libc::TCP_FASTOPEN_CONNECT, tfo)?;
+                    let name = if listen {
+                        libc::TCP_FASTOPEN
+                    } else {
+                        libc::TCP_FASTOPEN_CONNECT
+                    };
+                    set_int(socket, libc::IPPROTO_TCP, name, tfo)?;
                 }
                 if let Some(congestion) = &options.congestion {
                     set_str(socket, libc::IPPROTO_TCP, libc::TCP_CONGESTION, congestion)?;
@@ -714,10 +800,13 @@ mod platform {
             }
             if tcp {
                 if let Some(tfo) = options.tfo {
-                    set_int(socket, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, tfo * 2)?;
+                    let value = if listen { tfo } else { tfo * 2 };
+                    set_int(socket, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, value)?;
                 }
-                if let Some(max_seg) = options.max_seg {
-                    set_int(socket, libc::IPPROTO_TCP, libc::TCP_MAXSEG, max_seg)?;
+                if !listen {
+                    if let Some(max_seg) = options.max_seg {
+                        set_int(socket, libc::IPPROTO_TCP, libc::TCP_MAXSEG, max_seg)?;
+                    }
                 }
                 let _ = (
                     &options.congestion,
@@ -729,7 +818,7 @@ mod platform {
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = (options, addr, tcp);
+            let _ = (options, addr, tcp, listen);
         }
         Ok(())
     }
@@ -805,6 +894,7 @@ mod platform {
         _socket: &Socket,
         _addr: SocketAddr,
         _tcp: bool,
+        _listen: bool,
     ) -> io::Result<()> {
         Ok(())
     }
@@ -886,6 +976,16 @@ mod tests {
         assert!(
             refused(r#"{"tcpKeepAliveIdle":10,"tcpKeepAliveInterval":-1}"#).contains("disagree")
         );
+    }
+
+    /// The reference's listener applies keepalive only for a nonzero idle or interval: a positive
+    /// pair enables it and a negative one disables it, while an explicit zero stays the proto default.
+    #[test]
+    fn a_nonzero_keepalive_reaches_the_listener() {
+        assert!(parsed(r#"{"tcpKeepAliveIdle":11}"#).keep_alive_set);
+        assert!(parsed(r#"{"tcpKeepAliveIdle":-1}"#).keep_alive_set);
+        assert!(!parsed(r#"{"tcpKeepAliveIdle":0}"#).keep_alive_set);
+        assert!(!parsed("{}").keep_alive_set);
     }
 
     #[test]
@@ -1044,7 +1144,7 @@ mod tests {
         let options = parsed(r#"{"interface":"ferrox-no-such-interface","mark":1}"#);
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket");
         let err = options
-            .apply(&socket, "127.0.0.1:9".parse().expect("addr"), true)
+            .apply(&socket, "127.0.0.1:9".parse().expect("addr"), true, false)
             .expect_err("the interface is absent");
         assert!(err.to_string().contains("SO_BINDTODEVICE"), "{err}");
     }

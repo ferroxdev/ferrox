@@ -34,6 +34,53 @@ const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
 const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(60);
 const RECONNECT_STABLE: Duration = Duration::from_secs(10);
+/// The reference's Brutal sender is a token bucket; quiche has no such congestion controller, so
+/// a `brutal` block paces the bytes its BBR lane actually put on the wire.
+struct Pacer {
+    rate: u64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl Pacer {
+    fn new(rate: u64) -> Self {
+        Self {
+            rate,
+            tokens: 0.0,
+            last: Instant::now(),
+        }
+    }
+
+    /// The rate a `quicParams` block names for this direction, when it names Brutal.
+    fn rate(params: Option<ferrox_core::hysteria::QuicParams>, uplink: bool) -> Option<u64> {
+        let params = params?;
+        if params.cc != Some(ferrox_core::hysteria::Congestion::Brutal) {
+            return None;
+        }
+        let rate = if uplink {
+            params.brutal_up
+        } else {
+            params.brutal_down
+        };
+        (rate > 0).then_some(rate)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn account(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let earned = now.duration_since(self.last).as_secs_f64() * self.rate as f64;
+        self.tokens = (self.tokens + earned).min(self.rate as f64) - bytes as f64;
+        if self.tokens < 0.0 {
+            std::thread::sleep(Duration::from_secs_f64(-self.tokens / self.rate as f64));
+            self.tokens = 0.0;
+        }
+        self.last = Instant::now();
+    }
+}
+
 /// The reference's quiet-period keepalive when `xmux.hKeepAlivePeriod` is absent.
 const H3_KEEPALIVE: Duration = Duration::from_secs(10);
 const H2_KEEPALIVE: Duration = Duration::from_secs(45);
@@ -89,8 +136,20 @@ pub(crate) struct MasqueOut {
 
 #[derive(Debug)]
 struct Slot {
-    inner: Option<Arc<Inner>>,
+    lanes: Vec<PoolLane>,
     reconnect: Reconnect,
+    target: usize,
+    concurrency: usize,
+}
+
+/// One lane in the pool: its stack, when the reuse window retires it, and how many flows reach it.
+#[derive(Debug)]
+struct PoolLane {
+    inner: Arc<Inner>,
+    expires: Option<Instant>,
+    cap: u64,
+    requests: u64,
+    active: Arc<AtomicUsize>,
 }
 
 #[derive(Debug)]
@@ -132,6 +191,7 @@ struct Inner {
     to_tunnel: ToTunnel,
     routes: UdpRoutes,
     alive: Arc<AtomicBool>,
+    retire: Arc<AtomicBool>,
     stable: Arc<AtomicBool>,
 }
 
@@ -149,12 +209,15 @@ impl std::fmt::Debug for MasqueOut {
 impl MasqueOut {
     pub(crate) fn new(outbound: &Json) -> Result<Self, String> {
         let spec = ClientSpec::from(outbound)?;
+        let now = Instant::now();
         Ok(Self {
-            spec,
             inner: Mutex::new(Slot {
-                inner: None,
-                reconnect: Reconnect::new(Instant::now()),
+                target: spec.xmux.connections(),
+                concurrency: spec.xmux.concurrency(),
+                lanes: Vec::new(),
+                reconnect: Reconnect::new(now),
             }),
+            spec,
         })
     }
 
@@ -162,8 +225,73 @@ impl MasqueOut {
         crate::proxy::resolve_outbound(&self.spec.address, self.spec.port)
     }
 
+    /// Bind the retained outbound options to the route table, so a `dialerProxy` hop resolves
+    /// through the same handler every other carrier uses.
+    pub(crate) fn install_route(&self, route: &Arc<crate::proxy::RouteShared>) {
+        if let Some(options) = self.spec.sockopt.as_deref() {
+            options.install_route(route);
+        }
+    }
+
     fn ensure(&self) -> Result<Arc<Inner>, String> {
         self.ensure_at(Instant::now(), || open(&self.spec))
+    }
+
+    /// A lane plus the lease that keeps its stack and connection alive while a datagram
+    /// relay or fixed-target forwarder runs on it.
+    fn ensure_leased(&self) -> Result<(Arc<Inner>, crate::wg_stack::FlowLease), String> {
+        self.ensure_flow_at(Instant::now(), || open(&self.spec))
+    }
+
+    /// Drop every lane whose stack ended or whose reuse window closed, and roll the reconnect
+    /// history forward only when nothing live remains to answer.
+    fn prune(slot: &mut Slot, now: Instant) {
+        let mut stable = false;
+        let mut died = false;
+        let mut retired = false;
+        slot.lanes.retain(|lane| {
+            let alive = lane.inner.alive.load(Ordering::Acquire);
+            let expired = lane.expires.is_some_and(|at| now >= at);
+            if alive && !expired {
+                return true;
+            }
+            if alive {
+                retired = true;
+            } else {
+                died = true;
+                stable |= lane.inner.stable.load(Ordering::Relaxed);
+            }
+            Self::end(lane);
+            false
+        });
+        if died {
+            if stable {
+                slot.reconnect.reset(now);
+            } else {
+                slot.reconnect.advance(now);
+            }
+        } else if retired {
+            slot.reconnect.reset(now);
+        }
+    }
+
+    /// Take a lane out of the pool: an idle one stops now, a busy one stops when its
+    /// last flow drops, so its stack thread and connection are never left behind.
+    fn end(lane: &PoolLane) {
+        lane.inner.retire.store(true, Ordering::Release);
+        if lane.active.load(Ordering::Acquire) == 0 {
+            lane.inner.alive.store(false, Ordering::Release);
+        }
+    }
+
+    fn lane(xmux: &Xmux, now: Instant, inner: Inner) -> PoolLane {
+        PoolLane {
+            inner: Arc::new(inner),
+            expires: xmux.reusable().map(|period| now + period),
+            cap: xmux.request_cap(),
+            requests: 0,
+            active: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     fn ensure_at(
@@ -175,19 +303,9 @@ impl MasqueOut {
             .inner
             .lock()
             .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
-        if let Some(inner) = slot
-            .inner
-            .as_ref()
-            .filter(|inner| inner.alive.load(Ordering::Acquire))
-        {
-            return Ok(Arc::clone(inner));
-        }
-        if let Some(dead) = slot.inner.take() {
-            if dead.stable.load(Ordering::Relaxed) {
-                slot.reconnect.reset(now);
-            } else {
-                slot.reconnect.advance(now);
-            }
+        Self::prune(&mut slot, now);
+        if let Some(lane) = slot.lanes.first() {
+            return Ok(Arc::clone(&lane.inner));
         }
         if !slot.reconnect.due(now) {
             let wait = slot.reconnect.next_dial.duration_since(now);
@@ -196,20 +314,109 @@ impl MasqueOut {
                 wait.as_secs_f64()
             ));
         }
-        let inner = match dial() {
-            Ok(inner) => Arc::new(inner),
+        let lane = match dial() {
+            Ok(inner) => Self::lane(&self.spec.xmux, now, inner),
             Err(reason) => {
                 slot.reconnect.advance(now);
                 return Err(reason);
             }
         };
-        slot.inner = Some(Arc::clone(&inner));
+        let inner = Arc::clone(&lane.inner);
+        slot.lanes.push(lane);
         Ok(inner)
     }
 
+    /// Choose the least-loaded lane with room, or open one while the pool is under its target.
+    fn ensure_flow_at(
+        &self,
+        now: Instant,
+        mut dial: impl FnMut() -> Result<Inner, String>,
+    ) -> Result<(Arc<Inner>, crate::wg_stack::FlowLease), String> {
+        let mut slot = self
+            .inner
+            .lock()
+            .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
+        Self::prune(&mut slot, now);
+        slot.lanes.retain(|lane| {
+            if lane.requests < lane.cap {
+                true
+            } else {
+                Self::end(lane);
+                false
+            }
+        });
+        if slot.lanes.is_empty() {
+            if !slot.reconnect.due(now) {
+                let wait = slot.reconnect.next_dial.duration_since(now);
+                return Err(format!(
+                    "masque: reconnecting in {:.1}s",
+                    wait.as_secs_f64()
+                ));
+            }
+            match dial() {
+                Ok(inner) => {
+                    let lane = Self::lane(&self.spec.xmux, now, inner);
+                    slot.lanes.push(lane);
+                }
+                Err(reason) => {
+                    slot.reconnect.advance(now);
+                    return Err(reason);
+                }
+            }
+        }
+        let concurrency = slot.concurrency;
+        let spread = self.spec.xmux.max_connections.high > 0
+            && concurrency == usize::MAX
+            && slot.lanes.iter().all(|lane| lane.requests > 0)
+            && slot.lanes.len() < slot.target
+            && slot.reconnect.due(now);
+        let fresh = if spread {
+            if let Ok(inner) = dial() {
+                slot.lanes.push(Self::lane(&self.spec.xmux, now, inner));
+                Some(slot.lanes.len() - 1)
+            } else {
+                slot.reconnect.advance(now);
+                None
+            }
+        } else {
+            None
+        };
+        let eligible = fresh
+            .or_else(|| {
+                slot.lanes.iter().position(|lane| {
+                    lane.active.load(Ordering::Acquire) < concurrency && lane.requests < lane.cap
+                })
+            })
+            .or_else(|| {
+                if slot.lanes.len() < slot.target && slot.reconnect.due(now) {
+                    if let Ok(inner) = dial() {
+                        slot.lanes.push(Self::lane(&self.spec.xmux, now, inner));
+                        Some(slot.lanes.len() - 1)
+                    } else {
+                        slot.reconnect.advance(now);
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| "masque: no lane could be opened".to_owned())?;
+        let lane = &mut slot.lanes[eligible];
+        lane.requests = lane.requests.saturating_add(1);
+        lane.active.fetch_add(1, Ordering::AcqRel);
+        Ok((
+            Arc::clone(&lane.inner),
+            crate::wg_stack::FlowLease::retiring(
+                Arc::clone(&lane.active),
+                Arc::clone(&lane.inner.retire),
+                Arc::clone(&lane.inner.alive),
+            ),
+        ))
+    }
+
     pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination, prefix: &[u8]) {
-        let inner = match self.ensure() {
-            Ok(inner) => inner,
+        let (inner, lease) = match self.ensure_flow_at(Instant::now(), || open(&self.spec)) {
+            Ok(lane) => lane,
             Err(reason) => {
                 eprintln!("masque: {reason}");
                 return;
@@ -225,6 +432,7 @@ impl MasqueOut {
                 client,
                 destinations: vec![destination],
                 prefix: prefix.to_vec(),
+                lease: Some(lease),
             })
             .is_err()
         {
@@ -250,8 +458,8 @@ impl MasqueOut {
     }
 
     pub(crate) fn serve_udp(&self, relay: &UdpSocket, associate: Option<&Connection>) {
-        match self.ensure() {
-            Ok(inner) => {
+        match self.ensure_leased() {
+            Ok((inner, _lease)) => {
                 let remote = self.spec.remote_dns.as_slice();
                 wg_stack::client_udp(
                     relay,
@@ -312,7 +520,7 @@ impl MasqueOut {
                     Err(error) if crate::proxy::is_udp_gone(&error) => continue,
                     Err(_) => break,
                 }
-                let inner = match tunnel.ensure() {
+                let (inner, _lease) = match tunnel.ensure_leased() {
                     Ok(inner) => {
                         reported = false;
                         inner
@@ -376,25 +584,46 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
     if uses_h2(tls) {
         return open_h2(spec);
     }
-    let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port)
-        .ok_or_else(|| format!("cannot resolve masque `{}:{}`", spec.address, spec.port))?;
+    let options = spec.sockopt.as_deref();
+    let (sock, peer, local) = if let Some(tag) = options.and_then(|options| options.dialer_proxy())
+    {
+        let options = options.expect("a dialerProxy tag names its options");
+        let peer = options
+            .resolve_addr(&spec.address, spec.port)
+            .ok_or_else(|| format!("cannot resolve masque `{}:{}`", spec.address, spec.port))?;
+        let (sock, stop) = crate::proxy::dial_udp_through_proxy(peer, tag, options)
+            .ok_or_else(|| format!("masque `dialerProxy: {tag}` has no UDP lane"))?;
+        let local = sock
+            .local_addr()
+            .map_err(|error| format!("masque dialerProxy `{tag}`: {error}"))?;
+        (Datagram::proxied(sock, peer, stop), peer, local)
+    } else {
+        let (sock, peer, local) = quic::udp_to_server_with(&spec.address, spec.port, options)
+            .ok_or_else(|| format!("cannot resolve masque `{}:{}`", spec.address, spec.port))?;
+        (Datagram::plain(sock), peer, local)
+    };
     let net = quic::network_generation();
-    quic::set_receive_buffer(&sock, MASQUE_BUFFER);
-    quic::set_send_buffer(&sock, MASQUE_BUFFER);
-    let sock = Datagram::plain(sock);
+    sock.tune_buffers(MASQUE_BUFFER);
+    let sock = sock.with_options(spec.sockopt.clone());
+    let sock = match spec.udp_mask.clone() {
+        Some(mask) => sock.with_udp_mask(mask, Vec::new()),
+        None => sock,
+    };
+    let sock = sock.with_gso(spec.quic.is_none_or(|params| !params.disable_gso));
     let mut lane = establish(spec, &sock, peer, local)?;
     let addresses = lane.addresses.clone();
     let mtu = lane.mtu;
     let initial = std::mem::take(&mut lane.packets);
     let alive = Arc::clone(&lane.alive);
     let keepalive = spec.keepalive(H3_KEEPALIVE);
+    let pacer = Pacer::rate(spec.quic, true).map(Pacer::new);
     Ok(assemble(
         addresses,
         mtu,
         spec.large_segments,
         initial,
         alive,
-        move |from_tunnel, to_stack, routes| {
+        move |from_tunnel, to_stack, routes, _stop| {
             io(
                 lane,
                 &sock,
@@ -402,6 +631,7 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
                 peer,
                 net,
                 keepalive,
+                pacer,
                 from_tunnel,
                 to_stack,
                 routes,
@@ -447,6 +677,8 @@ fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
         &authority,
         &spec.path,
         &spec.headers,
+        spec.tcp_mask.as_ref(),
+        spec.sockopt.as_deref(),
     )
     .map_err(|reason| format!("masque: {reason}"))?;
     let addresses = client.addresses.clone();
@@ -458,8 +690,8 @@ fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
         spec.large_segments,
         initial,
         Arc::new(AtomicBool::new(true)),
-        move |from_tunnel, to_stack, routes| {
-            client.run(&from_tunnel, &to_stack, &routes, keepalive);
+        move |from_tunnel, to_stack, routes, stop| {
+            client.run(&from_tunnel, &to_stack, &routes, keepalive, &stop);
         },
     ))
 }
@@ -472,9 +704,16 @@ fn open_h1(spec: &ClientSpec) -> Result<Inner, String> {
         .ok_or("masque: HTTP/1.1 requires security tls")?;
     let edge = resolve_edge(spec)?;
     let authority = authority(spec);
-    let mut client =
-        crate::masque_h1::Client::dial(tls, edge, &authority, &spec.path, &spec.headers)
-            .map_err(|reason| format!("masque: {reason}"))?;
+    let mut client = crate::masque_h1::Client::dial(
+        tls,
+        edge,
+        &authority,
+        &spec.path,
+        &spec.headers,
+        spec.tcp_mask.as_ref(),
+        spec.sockopt.as_deref(),
+    )
+    .map_err(|reason| format!("masque: {reason}"))?;
     let addresses = client.addresses.clone();
     let mtu = client.mtu.min(spec.mtu);
     let initial = std::mem::take(&mut client.packets);
@@ -484,8 +723,8 @@ fn open_h1(spec: &ClientSpec) -> Result<Inner, String> {
         spec.large_segments,
         initial,
         Arc::new(AtomicBool::new(true)),
-        move |from_tunnel, to_stack, routes| {
-            client.run(&from_tunnel, &to_stack, &routes);
+        move |from_tunnel, to_stack, routes, stop| {
+            client.run(&from_tunnel, &to_stack, &routes, &stop);
         },
     ))
 }
@@ -495,9 +734,15 @@ fn open_h2c(spec: &ClientSpec) -> Result<Inner, String> {
     let edge = resolve_edge(spec)?;
     let authority = authority(spec);
     let keepalive = spec.keepalive(H2_KEEPALIVE);
-    let mut client =
-        crate::masque_h2::Client::dial_cleartext(edge, &authority, &spec.path, &spec.headers)
-            .map_err(|reason| format!("masque: {reason}"))?;
+    let mut client = crate::masque_h2::Client::dial_cleartext(
+        edge,
+        &authority,
+        &spec.path,
+        &spec.headers,
+        spec.tcp_mask.as_ref(),
+        spec.sockopt.as_deref(),
+    )
+    .map_err(|reason| format!("masque: {reason}"))?;
     let addresses = client.addresses.clone();
     let mtu = client.mtu.min(spec.mtu);
     let initial = std::mem::take(&mut client.packets);
@@ -507,8 +752,8 @@ fn open_h2c(spec: &ClientSpec) -> Result<Inner, String> {
         spec.large_segments,
         initial,
         Arc::new(AtomicBool::new(true)),
-        move |from_tunnel, to_stack, routes| {
-            client.run(&from_tunnel, &to_stack, &routes, keepalive);
+        move |from_tunnel, to_stack, routes, stop| {
+            client.run(&from_tunnel, &to_stack, &routes, keepalive, &stop);
         },
     ))
 }
@@ -516,8 +761,11 @@ fn open_h2c(spec: &ClientSpec) -> Result<Inner, String> {
 /// Resolve the configured edge to the first address it names, after the
 /// socket config's `addressPortStrategy` replaces it.
 fn resolve_edge(spec: &ClientSpec) -> Result<SocketAddr, String> {
-    crate::proxy::resolve_outbound(&spec.address, spec.port)
-        .ok_or_else(|| format!("masque: cannot resolve `{}:{}`", spec.address, spec.port))
+    let resolved = match spec.sockopt.as_deref() {
+        Some(options) => options.resolve_addr(&spec.address, spec.port),
+        None => crate::proxy::resolve_outbound(&spec.address, spec.port),
+    };
+    resolved.ok_or_else(|| format!("masque: cannot resolve `{}:{}`", spec.address, spec.port))
 }
 
 /// The stack every carrier feeds, and the thread that hands the handshake's
@@ -528,7 +776,7 @@ fn assemble(
     large_segments: bool,
     initial: Vec<Vec<u8>>,
     alive: Arc<AtomicBool>,
-    run: impl FnOnce(Receiver<Vec<u8>>, Sender<Packet>, UdpRoutes) + Send + 'static,
+    run: impl FnOnce(Receiver<Vec<u8>>, Sender<Packet>, UdpRoutes, Arc<AtomicBool>) + Send + 'static,
 ) -> Inner {
     let config = Arc::new(DeviceConfig {
         secret: [0u8; 32],
@@ -563,12 +811,13 @@ fn assemble(
     let watch = Arc::clone(&alive);
     let settled = Arc::new(AtomicBool::new(false));
     let stable = Arc::clone(&settled);
+    let stop = Arc::clone(&alive);
     std::thread::spawn(move || {
         let opened = Instant::now();
         for packet in initial {
             deliver(&packets_tx, &io_routes, &packet);
         }
-        run(from_tunnel, packets_tx, io_routes);
+        run(from_tunnel, packets_tx, io_routes, stop);
         if opened.elapsed() >= RECONNECT_STABLE {
             stable.store(true, Ordering::Relaxed);
         }
@@ -580,6 +829,7 @@ fn assemble(
         to_tunnel: to_tunnel.into(),
         routes,
         alive,
+        retire: Arc::new(AtomicBool::new(false)),
         stable: settled,
     }
 }
@@ -595,6 +845,136 @@ struct Lane {
     alive: Arc<AtomicBool>,
 }
 
+/// The reference's lane policy: one CONNECT-IP request per lane, the pool and reuse caps the
+/// request names, and the quiet-period keepalive every carrier reads.
+#[derive(Clone, Copy, Debug)]
+struct Xmux {
+    max_connections: ferrox_core::finalmask::Range,
+    max_concurrency: ferrox_core::finalmask::Range,
+    c_max_reuse_times: ferrox_core::finalmask::Range,
+    h_max_request_times: ferrox_core::finalmask::Range,
+    h_max_reusable_secs: ferrox_core::finalmask::Range,
+    h_keep_alive: Option<i64>,
+}
+
+impl Xmux {
+    fn from(transport: Option<&Json>) -> Result<Self, String> {
+        let zero = ferrox_core::finalmask::Range::ordered(0, 0);
+        let Some(settings) = transport.and_then(|transport| transport.get("xmux")) else {
+            return Ok(Self::defaults());
+        };
+        let range = |key: &str| -> Result<ferrox_core::finalmask::Range, String> {
+            match settings.get(key) {
+                None | Some(Json::Null) => Ok(zero),
+                Some(value) => crate::config::int32_range(value)
+                    .ok_or_else(|| format!("masque `xmux.{key}` is not a range")),
+            }
+        };
+        let max_connections = range("maxConnections")?;
+        let max_concurrency = range("maxConcurrency")?;
+        let c_max_reuse_times = range("cMaxReuseTimes")?;
+        let h_max_request_times = range("hMaxRequestTimes")?;
+        let h_max_reusable_secs = range("hMaxReusableSecs")?;
+        let h_keep_alive = match settings.get("hKeepAlivePeriod") {
+            None | Some(Json::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .ok_or("masque `xmux.hKeepAlivePeriod` is not an integer")?,
+            ),
+        };
+        if max_connections.high > 0 && max_concurrency.high > 0 {
+            return Err(
+                "masque `xmux.maxConnections` cannot be set with `maxConcurrency`".to_owned(),
+            );
+        }
+        // The reference defaults only a whole empty block; a partial block keeps zero as no cap and no expiry.
+        let blank = [
+            max_connections,
+            max_concurrency,
+            c_max_reuse_times,
+            h_max_request_times,
+            h_max_reusable_secs,
+        ]
+        .iter()
+        .all(|range| range.low == 0 && range.high == 0)
+            && h_keep_alive.is_none_or(|seconds| seconds == 0);
+        let (max_connections, h_max_reusable_secs) = if blank {
+            (
+                ferrox_core::finalmask::Range::ordered(1, 1),
+                ferrox_core::finalmask::Range::ordered(1800, 3000),
+            )
+        } else {
+            (max_connections, h_max_reusable_secs)
+        };
+        Ok(Self {
+            max_connections,
+            max_concurrency,
+            c_max_reuse_times,
+            h_max_request_times,
+            h_max_reusable_secs,
+            h_keep_alive,
+        })
+    }
+
+    /// The reference's default when no `xmux` block names one.
+    fn defaults() -> Self {
+        Self {
+            max_connections: ferrox_core::finalmask::Range::ordered(1, 1),
+            max_concurrency: ferrox_core::finalmask::Range::ordered(0, 0),
+            c_max_reuse_times: ferrox_core::finalmask::Range::ordered(0, 0),
+            h_max_request_times: ferrox_core::finalmask::Range::ordered(0, 0),
+            h_max_reusable_secs: ferrox_core::finalmask::Range::ordered(1800, 3000),
+            h_keep_alive: None,
+        }
+    }
+
+    /// How many lanes the pool may hold; zero is uncapped, as the reference leaves it.
+    fn connections(&self) -> usize {
+        if self.max_connections.high <= 0 {
+            usize::MAX
+        } else {
+            self.max_connections
+                .pick()
+                .unwrap_or(self.max_connections.low)
+                .clamp(1, i64::from(u32::MAX)) as usize
+        }
+    }
+
+    /// Zero means uncapped, as the reference leaves it.
+    fn concurrency(&self) -> usize {
+        if self.max_concurrency.high <= 0 {
+            usize::MAX
+        } else {
+            self.max_concurrency
+                .pick()
+                .unwrap_or(self.max_concurrency.low)
+                .clamp(1, i64::MAX) as usize
+        }
+    }
+
+    /// The smaller of the configured reuse and request caps; zero names no cap.
+    fn request_cap(&self) -> u64 {
+        [self.c_max_reuse_times, self.h_max_request_times]
+            .into_iter()
+            .filter(|range| range.high > 0)
+            .map(|range| range.pick().unwrap_or(range.low).clamp(1, i64::MAX) as u64)
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
+    fn reusable(&self) -> Option<Duration> {
+        (self.h_max_reusable_secs.high > 0).then(|| {
+            let seconds = self
+                .h_max_reusable_secs
+                .pick()
+                .unwrap_or(self.h_max_reusable_secs.low)
+                .clamp(1, i64::MAX) as u64;
+            Duration::from_secs(seconds)
+        })
+    }
+}
+
 #[derive(Clone)]
 struct ClientSpec {
     address: String,
@@ -605,9 +985,14 @@ struct ClientSpec {
     headers: Vec<(String, String)>,
     remote_dns: Vec<IpAddr>,
     warp: Option<Warp>,
-    keepalive: Option<i64>,
+    xmux: Xmux,
     large_segments: bool,
+    quic: Option<ferrox_core::hysteria::QuicParams>,
+    tcp_mask: Option<ferrox_core::finalmask::Chain>,
+    udp_mask: Option<ferrox_core::kcp::Mask>,
+    sockopt: Option<Arc<crate::sockopt::SocketOptions>>,
     mtu: usize,
+    mtu_named: bool,
     max_datagram: usize,
 }
 
@@ -655,6 +1040,7 @@ fn masque_endpoint(settings: &Json) -> Result<(String, u16), String> {
 
 impl ClientSpec {
     /// Parse an outbound's settings, transport, and WARP block.
+    #[allow(clippy::too_many_lines)]
     fn from(outbound: &Json) -> Result<Self, String> {
         let settings = outbound
             .get("settings")
@@ -670,9 +1056,8 @@ impl ClientSpec {
         } else {
             Some(crate::config::outbound_tls(outbound, &address)?)
         };
-        let transport = outbound
-            .get("streamSettings")
-            .and_then(|settings| settings.get("masqueSettings"));
+        let stream = outbound.get("streamSettings");
+        let transport = stream.and_then(|settings| settings.get("masqueSettings"));
         let warp = transport
             .and_then(|settings| settings.get("warp"))
             .map(Warp::from)
@@ -703,13 +1088,28 @@ impl ClientSpec {
             .or_else(|| warp.as_ref().map(|_| WARP_HOST.to_owned()));
         let mut headers = client_headers(transport);
         credentials(user, pass, &mut headers)?;
-        let keepalive = keepalive(transport)?;
+        let xmux = Xmux::from(transport)?;
         let remote_dns = remote_dns(settings)?;
         let large_segments = settings
             .get("largeSegments")
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        let quic = crate::config::hysteria_quic_params(stream)
+            .map_err(|why| format!("masque quicParams: {why}"))?;
+        let tcp_mask = Some(
+            crate::config::tcp_mask(stream)
+                .ok_or("masque names a finalmask.tcp stage this tree cannot carry")?,
+        );
+        let (udp_mask, _) = crate::config::kcp_mask(stream)
+            .ok_or("masque names a finalmask.udp stage this tree cannot carry")?;
+        let sockopt = crate::sockopt::parse_outbound(stream.and_then(|s| s.get("sockopt")))
+            .map_err(|why| format!("masque sockopt: {why}"))?
+            .map(Arc::new);
         let mtu = configured_mtu(settings);
+        let mtu_named = settings
+            .get("mtu")
+            .and_then(Json::as_u32)
+            .is_some_and(|mtu| mtu > 0);
         let max_datagram = settings
             .get("maxDatagram")
             .and_then(Json::as_u32)
@@ -725,9 +1125,14 @@ impl ClientSpec {
             headers,
             remote_dns,
             warp,
-            keepalive,
+            xmux,
             large_segments,
+            quic,
+            tcp_mask,
+            udp_mask: (!udp_mask.is_empty()).then_some(udp_mask),
+            sockopt,
             mtu,
+            mtu_named,
             max_datagram,
         })
     }
@@ -735,7 +1140,14 @@ impl ClientSpec {
     /// The keepalive the carrier sends when it has been quiet: xray's
     /// `xmux.hKeepAlivePeriod` in seconds, or the carrier's own default.
     fn keepalive(&self, default: Duration) -> Option<Duration> {
-        match self.keepalive {
+        if let Some(seconds) = self
+            .quic
+            .map(|params| params.keep_alive)
+            .filter(|seconds| *seconds != 0)
+        {
+            return Some(Duration::from_secs(seconds));
+        }
+        match self.xmux.h_keep_alive {
             None | Some(0) => Some(default),
             Some(seconds) if seconds > 0 => Some(Duration::from_secs(seconds as u64)),
             Some(_) => None,
@@ -755,9 +1167,14 @@ impl std::fmt::Debug for ClientSpec {
             .field("headers", &headers)
             .field("remote_dns", &self.remote_dns)
             .field("warp", &self.warp)
-            .field("keepalive", &self.keepalive)
+            .field("xmux", &self.xmux)
             .field("large_segments", &self.large_segments)
+            .field("quic", &self.quic)
+            .field("tcp_mask", &self.tcp_mask.is_some())
+            .field("udp_mask", &self.udp_mask.is_some())
+            .field("sockopt", &self.sockopt.is_some())
             .field("mtu", &self.mtu)
+            .field("mtu_named", &self.mtu_named)
             .field("max_datagram", &self.max_datagram)
             .finish()
     }
@@ -826,20 +1243,6 @@ fn client_headers(transport: Option<&Json>) -> Vec<(String, String)> {
     });
     browser_user_agent(&mut headers);
     headers
-}
-
-/// xray's `xmux.hKeepAlivePeriod` is seconds; a zero names the carrier default and a negative value disables it.
-fn keepalive(transport: Option<&Json>) -> Result<Option<i64>, String> {
-    let Some(seconds) = transport
-        .and_then(|settings| settings.get("xmux"))
-        .and_then(|xmux| xmux.get("hKeepAlivePeriod"))
-    else {
-        return Ok(None);
-    };
-    seconds
-        .as_i64()
-        .map(Some)
-        .ok_or_else(|| "masque `xmux.hKeepAlivePeriod` is not an integer".to_owned())
 }
 
 fn remote_dns(settings: &Json) -> Result<Vec<IpAddr>, String> {
@@ -1236,7 +1639,9 @@ fn split_host_port(text: &str) -> Option<(String, u16)> {
 
 fn client_config(spec: &ClientSpec) -> Result<quiche::Config, String> {
     if let Some(warp) = &spec.warp {
-        return warp_config(warp, spec.max_datagram);
+        let mut config = warp_config(warp, spec.max_datagram)?;
+        apply_spec_quic(&mut config, spec);
+        return Ok(config);
     }
     let tls = spec
         .tls
@@ -1255,8 +1660,17 @@ fn client_config(spec: &ClientSpec) -> Result<quiche::Config, String> {
             .ok_or("masque: no certificate authorities for the edge")?
     };
     config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
+    apply_spec_quic(&mut config, spec);
     cap_datagram(&mut config, spec.max_datagram);
     Ok(config)
+}
+
+/// The stream's `quicParams` when it names one; a `finalmask.udp` chain rides
+/// outside the QUIC payload, as the reference's wrapped packet conn does.
+fn apply_spec_quic(config: &mut quiche::Config, spec: &ClientSpec) {
+    if let Some(params) = spec.quic {
+        quic::apply_hysteria_quic(config, &params, false);
+    }
 }
 
 /// The WARP TLS handshake: the client presents the certificate minted from the
@@ -1381,11 +1795,12 @@ fn attempt(
             stream.poll(&mut conn, sock, local, TICK)?;
             addresses = assigned(&mut stream);
         }
+        let mtu = lane_mtu(spec, &conn, stream.id)?;
         return Ok(Lane {
             conn,
             stream: stream.id,
             addresses: addresses.unwrap_or_else(|| warp.local_addresses()),
-            mtu: spec.mtu,
+            mtu,
             packets: stream.packets,
             alive: Arc::new(AtomicBool::new(true)),
         });
@@ -1409,14 +1824,38 @@ fn attempt(
     if addresses.is_empty() {
         return Err("masque: no address assigned".to_owned());
     }
+    let mtu = lane_mtu(spec, &conn, stream.id)?;
     Ok(Lane {
         conn,
         stream: stream.id,
         addresses,
-        mtu: spec.mtu,
+        mtu,
         packets: stream.packets,
         alive: Arc::new(AtomicBool::new(true)),
     })
+}
+
+/// The datagram ceiling the handshake negotiated, minus the CONNECT-IP stream
+/// prefix. xray refuses a tunnel below its 1280-byte minimum rather than
+/// advertising a packet the datagram cannot carry.
+fn probed_mtu(conn: &quiche::Connection, stream: u64) -> usize {
+    let prefix = frames::quic_varint_len(stream / 4) + 1;
+    conn.dgram_max_writable_len()
+        .map_or(0, |max| max.saturating_sub(prefix))
+}
+
+/// A config-named `mtu` overrides the probe, which otherwise has to clear the reference's floor.
+fn lane_mtu(spec: &ClientSpec, conn: &quiche::Connection, stream: u64) -> Result<usize, String> {
+    if spec.mtu_named {
+        return Ok(spec.mtu);
+    }
+    let mtu = probed_mtu(conn, stream);
+    if mtu < DEFAULT_MTU {
+        return Err(format!(
+            "the tunnel carries only {mtu}-byte packets, less than {DEFAULT_MTU}"
+        ));
+    }
+    Ok(mtu)
 }
 
 /// Every assignment the edge sent, in order: a WARP client uses the addresses
@@ -1864,6 +2303,7 @@ impl Stream {
 /// packet to the stack, a UDP packet to the loopback lane waiting on its port.
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn io(
     lane: Lane,
     sock: &Datagram,
@@ -1871,6 +2311,7 @@ fn io(
     peer: SocketAddr,
     net: u64,
     keepalive: Option<Duration>,
+    mut pacer: Option<Pacer>,
     from_tunnel: Receiver<Vec<u8>>,
     to_stack: Sender<Packet>,
     routes: UdpRoutes,
@@ -1882,6 +2323,7 @@ fn io(
         mut conn,
         stream,
         addresses,
+        alive,
         ..
     } = lane;
     let mut control = Stream {
@@ -1891,6 +2333,10 @@ fn io(
     let mut unsent: Option<Vec<u8>> = None;
     let mut keepalive_at = keepalive.map(|period| Instant::now() + period);
     loop {
+        if !alive.load(Ordering::Relaxed) {
+            let _ = conn.close(false, 0, b"retired");
+            break;
+        }
         let now = quic::network_generation();
         if now != generation {
             match quic::rebind_path(&mut conn, sock, peer) {
@@ -1910,6 +2356,7 @@ fn io(
         }
         let sent_before = conn.stats().sent;
         let recv_before = conn.stats().recv;
+        let sent_bytes_before = conn.stats().sent_bytes;
         while let Some(packet) = unsent.take().or_else(|| from_tunnel.try_recv().ok()) {
             match send_datagram(&mut conn, stream, &packet) {
                 Emission::Queued => {}
@@ -1971,6 +2418,9 @@ fn io(
             }
         }
         quic::flush_egress(&mut conn, sock);
+        if let Some(pacer) = pacer.as_mut() {
+            pacer.account(conn.stats().sent_bytes.saturating_sub(sent_bytes_before));
+        }
     }
 }
 
@@ -2107,10 +2557,11 @@ fn lane_udp_bind(address: &str) -> std::io::Result<UdpSocket> {
             "the lane the test holds",
         ));
     }
-    UdpSocket::bind(address)
+    quic::bind_datagram(address)
 }
 
 /// Open a server inbound's socket and spawn its demultiplexer, stack and forwarder.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Result<u16, String> {
     let spec = Arc::new(ServerSpec::from(inbound)?);
     let security = inbound
@@ -2127,6 +2578,9 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         return Err("unreadable masque tls identity".to_owned());
     };
     config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
+    if let Some(params) = spec.quic {
+        quic::apply_hysteria_quic(&mut config, &params, true);
+    }
     let tcp = identity
         .alpn
         .iter()
@@ -2158,7 +2612,24 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     };
     quic::set_receive_buffer(&sock, MASQUE_BUFFER);
     quic::set_send_buffer(&sock, MASQUE_BUFFER);
-    let sock = Arc::new(Datagram::plain(sock));
+    if let Some(options) = &spec.sockopt {
+        options
+            .apply_to_udp(&sock, local)
+            .map_err(|error| format!("masque sockopt on `{address}`: {error}"))?;
+    }
+    if let Some(listener) = &h2_listener {
+        if let Some(options) = &spec.sockopt {
+            options
+                .apply_to_listener(listener)
+                .map_err(|error| format!("masque sockopt on `{address}`: {error}"))?;
+        }
+    }
+    let sock = match &spec.udp_mask {
+        Some(mask) => Datagram::masked(sock, mask.clone(), spec.udp_filters.clone()),
+        None => Datagram::plain(sock),
+    };
+    let sock = sock.with_options(spec.sockopt.clone());
+    let sock = Arc::new(sock.with_gso(spec.quic.is_none_or(|params| !params.disable_gso)));
     let (packets, packets_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
         pool: Mutex::new(spec.pool.clone()),
@@ -2213,6 +2684,11 @@ fn serve_cleartext_inbound(
     let local = listener
         .local_addr()
         .map_err(|error| format!("masque `{address}` has no local address: {error}"))?;
+    if let Some(options) = &spec.sockopt {
+        options
+            .apply_to_listener(&listener)
+            .map_err(|error| format!("masque sockopt on `{address}`: {error}"))?;
+    }
     let (packets, packets_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
         pool: Mutex::new(spec.pool.clone()),
@@ -2248,7 +2724,13 @@ pub(crate) struct ServerSpec {
     pub(crate) path: String,
     pool: AddressPool,
     mtu: usize,
+    mtu_named: bool,
     pub(crate) warp: bool,
+    pub(crate) tcp_mask: Option<ferrox_core::finalmask::Chain>,
+    pub(crate) udp_mask: Option<ferrox_core::kcp::Mask>,
+    pub(crate) udp_filters: Vec<ferrox_core::finalmask::SourceFilter>,
+    quic: Option<ferrox_core::hysteria::QuicParams>,
+    sockopt: Option<Arc<crate::sockopt::SocketOptions>>,
 }
 
 impl std::fmt::Debug for ServerSpec {
@@ -2259,7 +2741,13 @@ impl std::fmt::Debug for ServerSpec {
             .field("path", &self.path)
             .field("pool", &self.pool)
             .field("mtu", &self.mtu)
+            .field("mtu_named", &self.mtu_named)
             .field("warp", &self.warp)
+            .field("quic", &self.quic)
+            .field("tcp_mask", &self.tcp_mask.is_some())
+            .field("udp_mask", &self.udp_mask.is_some())
+            .field("udp_filters", &self.udp_filters)
+            .field("sockopt", &self.sockopt.is_some())
             .finish()
     }
 }
@@ -2317,13 +2805,44 @@ impl ServerSpec {
             .filter(|path| !path.is_empty())
             .map_or_else(|| DEFAULT_PATH.to_owned(), expand_path);
         let mtu = configured_mtu(settings);
+        let mtu_named = settings
+            .get("mtu")
+            .and_then(Json::as_u32)
+            .is_some_and(|mtu| mtu > 0);
+        let stream = inbound.get("streamSettings");
+        let quic = crate::config::hysteria_quic_params(stream)
+            .map_err(|why| format!("masque quicParams: {why}"))?;
+        let tcp_mask = Some(
+            crate::config::tcp_mask(stream)
+                .ok_or("masque names a finalmask.tcp stage this tree cannot carry")?,
+        );
+        let (udp_mask, udp_filters) = crate::config::kcp_mask(stream)
+            .ok_or("masque names a finalmask.udp stage this tree cannot carry")?;
+        let sockopt = crate::sockopt::parse_inbound(stream.and_then(|s| s.get("sockopt")))
+            .map_err(|why| format!("masque sockopt: {why}"))?
+            .map(Arc::new);
         Ok(Self {
             users,
             path,
             pool,
             mtu,
+            mtu_named,
             warp,
+            tcp_mask,
+            udp_mask: (!udp_mask.is_empty() || !udp_filters.is_empty()).then_some(udp_mask),
+            udp_filters,
+            quic,
+            sockopt,
         })
+    }
+
+    /// The serving-side `filter` stages a TCP carrier applies before its
+    /// handshake, or none when the config names no allow/deny list.
+    pub(crate) fn rejects_tcp(&self, peer: Option<SocketAddr>) -> bool {
+        let ip = peer.map(|peer| peer.ip());
+        self.tcp_mask
+            .as_ref()
+            .is_some_and(|chain| chain.filters().iter().any(|filter| filter.rejects(ip)))
     }
 
     pub(crate) fn accepts_protocol(&self, protocol: &[u8]) -> bool {
@@ -2559,7 +3078,13 @@ pub(crate) fn test_spec() -> ServerSpec {
         path: DEFAULT_PATH.to_owned(),
         pool: test_pool(),
         mtu: DEFAULT_MTU,
+        mtu_named: false,
         warp: false,
+        tcp_mask: None,
+        udp_mask: None,
+        udp_filters: Vec::new(),
+        quic: None,
+        sockopt: None,
     }
 }
 
@@ -2827,6 +3352,19 @@ fn demux(
         let Ok(mut guard) = config.lock() else {
             continue;
         };
+        if spec
+            .quic
+            .as_ref()
+            .is_some_and(|params| params.disable_stateless_reset)
+        {
+            guard.set_stateless_reset_token(None);
+        } else {
+            let mut token = [0u8; 16];
+            if getrandom::fill(&mut token).is_err() {
+                continue;
+            }
+            guard.set_stateless_reset_token(Some(u128::from_le_bytes(token)));
+        }
         let Ok(conn) = quiche::accept(&scid, None, local, from, &mut guard) else {
             continue;
         };
@@ -2907,6 +3445,7 @@ fn worker(
     worker_id: u64,
 ) {
     let (sender, outgoing) = mpsc::sync_channel(QUEUE);
+    let mut pacer = Pacer::rate(spec.quic, false).map(Pacer::new);
     let mut tunnel = Tunnel {
         stream: None,
         buf: Vec::new(),
@@ -2933,6 +3472,7 @@ fn worker(
         if conn.is_closed() {
             return;
         }
+        let sent_bytes_before = conn.stats().sent_bytes;
         // A held datagram waits for the acknowledgement that frees the send queue; it wakes this worker as a datagram of its own, so polling a shorter grain only burns CPU.
         let wait = conn.timeout().unwrap_or(TICK).min(TICK);
         match rx.recv_timeout(wait) {
@@ -2989,6 +3529,9 @@ fn worker(
         }
         register_sources(&mut conn, &routes, worker_id, &tx, &mut tunnel.registered);
         quic::flush_egress(&mut conn, &sock);
+        if let Some(pacer) = pacer.as_mut() {
+            pacer.account(conn.stats().sent_bytes.saturating_sub(sent_bytes_before));
+        }
     }
 }
 
@@ -3071,9 +3614,22 @@ fn service(
                 send_stream(conn, id, &head, true).ok();
                 tunnel.rejected = true;
             }
-        } else if !tunnel.rejected && !parse_capsules(conn, tunnel, spec.mtu) {
-            let _ = conn.close(false, 0, b"capsule bound");
-            tunnel.rejected = true;
+        } else if !tunnel.rejected {
+            let probed = tunnel.stream.map(|stream| probed_mtu(conn, stream));
+            let capsules = tunnel.udp.is_some() && probed.is_some_and(|mtu| mtu < MIN_MTU);
+            let (mtu, refused) = match (spec.mtu_named, probed) {
+                (true, _) | (false, None) => (spec.mtu, false),
+                (false, Some(_)) if capsules => (spec.mtu, false),
+                (false, Some(mtu)) if mtu < DEFAULT_MTU => (mtu, true),
+                (false, Some(mtu)) => (mtu, false),
+            };
+            if refused {
+                let _ = conn.close(false, 0, b"mtu");
+                tunnel.rejected = true;
+            } else if !parse_capsules(conn, tunnel, mtu) {
+                let _ = conn.close(false, 0, b"capsule bound");
+                tunnel.rejected = true;
+            }
         }
     }
     if tunnel.opened && !tunnel.rejected {
@@ -3742,7 +4298,7 @@ mod tests {
             false,
             Vec::new(),
             Arc::new(AtomicBool::new(true)),
-            move |from_tunnel, _to_stack, _routes| {
+            move |from_tunnel, _to_stack, _routes, _stop| {
                 let _ = held.recv();
                 for _ in from_tunnel.iter().take(QUEUE + 1) {}
             },
@@ -3807,9 +4363,14 @@ mod tests {
             headers: Vec::new(),
             remote_dns: Vec::new(),
             warp: None,
-            keepalive: None,
+            xmux: Xmux::defaults(),
             large_segments: false,
+            quic: None,
+            tcp_mask: None,
+            udp_mask: None,
+            sockopt: None,
             mtu: DEFAULT_MTU,
+            mtu_named: false,
             max_datagram: quic::MAX_DATAGRAM,
         };
         let mut config = client_config(&spec).expect("config");
@@ -4004,8 +4565,65 @@ mod tests {
             to_tunnel: to_tunnel.into(),
             routes: Arc::default(),
             alive: Arc::new(AtomicBool::new(false)),
+            retire: Arc::new(AtomicBool::new(false)),
             stable: Arc::new(AtomicBool::new(stable)),
         }
+    }
+
+    /// A lane that is still live carries its reuse window; `end` marks retirement first so a lease
+    /// dropping concurrently cannot miss it, and the last lease is what clears `alive`.
+    #[test]
+    fn a_retired_lane_clears_after_its_last_lease() {
+        let masque = MasqueOut::new(&outbound(0)).expect("outbound");
+        let mut inner = dead_lane(true);
+        inner.alive = Arc::new(AtomicBool::new(true));
+        masque.inner.lock().expect("slot").lanes.push(PoolLane {
+            inner: Arc::new(inner),
+            expires: None,
+            cap: u64::MAX,
+            requests: 0,
+            active: Arc::new(AtomicUsize::new(0)),
+        });
+        let (_, lease) = masque.ensure_leased().expect("the live lane is reused");
+        let slot = masque.inner.lock().expect("slot");
+        MasqueOut::end(&slot.lanes[0]);
+        assert!(slot.lanes[0].inner.retire.load(Ordering::Acquire));
+        assert!(
+            slot.lanes[0].inner.alive.load(Ordering::Acquire),
+            "a busy lane stays alive while its flow runs"
+        );
+        drop(lease);
+        assert!(!slot.lanes[0].inner.alive.load(Ordering::Acquire));
+    }
+
+    /// A live lane reaching its planned reuse window is a healthy retirement, not a failed dial:
+    /// the next flow dials at once instead of waiting out a reconnect backoff.
+    #[test]
+    fn a_planned_expiry_keeps_the_reconnect_history_clear() {
+        let masque = MasqueOut::new(&outbound(0)).expect("outbound");
+        let start = Instant::now();
+        let mut inner = dead_lane(false);
+        inner.alive = Arc::new(AtomicBool::new(true));
+        {
+            let mut slot = masque.inner.lock().expect("slot");
+            slot.reconnect.attempts = 3;
+            slot.reconnect.next_dial = start + RECONNECT_MAX;
+            slot.lanes.push(PoolLane {
+                inner: Arc::new(inner),
+                expires: Some(start),
+                cap: u64::MAX,
+                requests: 0,
+                active: Arc::new(AtomicUsize::new(0)),
+            });
+        }
+        let mut dials = 0;
+        masque
+            .ensure_at(start, || {
+                dials += 1;
+                Ok(dead_lane(false))
+            })
+            .expect("an expired healthy lane does not hold the backoff");
+        assert_eq!(dials, 1);
     }
 
     #[test]
@@ -4145,7 +4763,13 @@ mod tests {
             path: DEFAULT_PATH.to_owned(),
             pool: AddressPool::default(),
             mtu: DEFAULT_MTU,
+            mtu_named: false,
             warp: false,
+            tcp_mask: None,
+            udp_mask: None,
+            udp_filters: Vec::new(),
+            quic: None,
+            sockopt: None,
         };
         let victim: IpAddr = "10.14.0.3".parse().expect("an address");
         let (to_victim, forwarded) = mpsc::sync_channel(4);
@@ -4220,7 +4844,13 @@ mod tests {
             path: DEFAULT_PATH.to_owned(),
             pool: AddressPool::default(),
             mtu: DEFAULT_MTU,
+            mtu_named: false,
             warp: false,
+            tcp_mask: None,
+            udp_mask: None,
+            udp_filters: Vec::new(),
+            quic: None,
+            sockopt: None,
         };
         let owner: IpAddr = "10.14.0.2".parse().expect("an address");
         let packet = ipv4_packet([10, 14, 0, 2], [192, 0, 2, 1]);
@@ -4684,9 +5314,14 @@ mod tests {
             headers: Vec::new(),
             remote_dns: Vec::new(),
             warp: None,
-            keepalive: None,
+            xmux: Xmux::defaults(),
             large_segments: false,
+            quic: None,
+            tcp_mask: None,
+            udp_mask: None,
+            sockopt: None,
             mtu: DEFAULT_MTU,
+            mtu_named: false,
             max_datagram: quic::MAX_DATAGRAM,
         };
         let mut config = client_config(&spec)?;
@@ -5335,6 +5970,40 @@ mod tests {
         .expect("the disabled outbound");
         let off = ClientSpec::from(&off).expect("the disabled spec");
         assert_eq!(off.keepalive(H3_KEEPALIVE), None);
+    }
+
+    #[test]
+    fn xmux_names_the_lane_pool_and_the_reuse_window() {
+        let outbound = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"xmux":{"maxConnections":"2-4","hMaxReusableSecs":60,"hKeepAlivePeriod":-1}}}}"#,
+        )
+        .expect("the xmux outbound");
+        let spec = ClientSpec::from(&outbound).expect("the xmux spec");
+        assert_eq!(spec.xmux.max_connections.low, 2);
+        assert_eq!(spec.xmux.max_connections.high, 4);
+        assert!((2..4).contains(&spec.xmux.connections()));
+        assert_eq!(spec.xmux.reusable(), Some(Duration::from_secs(60)));
+        assert_eq!(spec.keepalive(H3_KEEPALIVE), None);
+        assert_eq!(spec.xmux.concurrency(), usize::MAX);
+        let conflict = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"xmux":{"maxConnections":2,"maxConcurrency":8}}}}"#,
+        )
+        .expect("the conflicting outbound");
+        assert!(ClientSpec::from(&conflict).is_err());
+        let empty = crate::json::parse(r#"{"xmux":{}}"#).expect("the empty xmux");
+        let xmux = Xmux::from(Some(&empty)).expect("the empty xmux");
+        assert_eq!(xmux.connections(), 1);
+        assert!((1800..3000).contains(&xmux.reusable().expect("the reuse window").as_secs()));
+        let named = crate::json::parse(r#"{"xmux":{"hKeepAlivePeriod":30}}"#).expect("the xmux");
+        let xmux = Xmux::from(Some(&named)).expect("the named xmux");
+        assert_eq!(xmux.connections(), usize::MAX);
+        assert_eq!(xmux.reusable(), None);
+        let concurrent =
+            crate::json::parse(r#"{"xmux":{"maxConcurrency":2}}"#).expect("the concurrency");
+        let xmux = Xmux::from(Some(&concurrent)).expect("the concurrent xmux");
+        assert_eq!(xmux.connections(), usize::MAX);
+        assert_eq!(xmux.concurrency(), 2);
+        assert_eq!(xmux.reusable(), None);
     }
 
     #[test]
@@ -5997,9 +6666,14 @@ mod tests {
             headers: Vec::new(),
             remote_dns: Vec::new(),
             warp: None,
-            keepalive: None,
+            xmux: Xmux::defaults(),
             large_segments: false,
+            quic: None,
+            tcp_mask: None,
+            udp_mask: None,
+            sockopt: None,
             mtu: DEFAULT_MTU,
+            mtu_named: false,
             max_datagram: quic::MAX_DATAGRAM,
         };
         let mut client_config = client_config(&spec).expect("client config");

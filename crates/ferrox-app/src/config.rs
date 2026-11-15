@@ -1810,7 +1810,7 @@ pub(crate) fn stream_carrier(settings: Option<&Json>) -> Carrier {
         .find(|(aliases, _)| aliases.contains(&network))
         .map_or_else(unknown, |(_, resolve)| resolve(settings, network));
     // The reference puts the chain on the TCP connection under whichever transport rides it; this tree arms it only where a carrier reaches that connection, so any other carrier refuses the config rather than dialling or serving it unmasked.
-    if has_tcp_mask(settings) && !matches!(carrier, Carrier::Raw(_)) {
+    if has_tcp_mask(settings) && !matches!(carrier, Carrier::Raw(_) | Carrier::Masque) {
         return unknown();
     }
     carrier
@@ -1881,7 +1881,7 @@ fn resolve_kcp(settings: Option<&Json>, network: &str) -> Carrier {
 /// The `finalmask.udp` chain for a KCP carrier, in wire order (outermost first). `Some(default)`
 /// means no finalmask at all; `None` refuses the carrier — an unknown udp mask type, a gecko packet
 /// size, a bad header name or an unpackable dns domain must never silently dial unmasked.
-fn kcp_mask(
+pub(crate) fn kcp_mask(
     settings: Option<&Json>,
 ) -> Option<(
     ferrox_core::kcp::Mask,
@@ -2575,7 +2575,7 @@ fn single_range(conf: Option<&Json>, key: &str) -> Option<ferrox_core::finalmask
 }
 
 /// One `Int32Range` as the reference reads it: a plain number, or a string that spells one.
-fn int32_range(value: &Json) -> Option<ferrox_core::finalmask::Range> {
+pub(crate) fn int32_range(value: &Json) -> Option<ferrox_core::finalmask::Range> {
     use ferrox_core::finalmask::Range;
     match value {
         Json::Num(n) if n.fract() == 0.0 => Some(Range::ordered(*n as i64, *n as i64)),
@@ -2718,14 +2718,8 @@ pub(crate) fn hysteria_quic_params(
         "aggressive" => BbrProfile::Aggressive,
         _ => return Err("unknown bbr profile".to_owned()),
     };
-    let up = match node.get("brutalUp") {
-        Some(value) => bandwidth(value)?,
-        None => 0,
-    };
-    let down = match node.get("brutalDown") {
-        Some(value) => bandwidth(value)?,
-        None => 0,
-    };
+    let up = node.get("brutalUp").map_or(Ok(0), bandwidth)?;
+    let down = node.get("brutalDown").map_or(Ok(0), bandwidth)?;
     if up > 0 && up < 65536 {
         return Err("BrutalUp must be at least 65536 bytes per second".to_owned());
     }
@@ -2777,6 +2771,7 @@ pub(crate) fn hysteria_quic_params(
         bbr_profile,
         brutal_up: up,
         brutal_down: down,
+        brutal_disable_loss_compensation: flag(node, "brutalDisableLossCompensation"),
         init_stream_window: init_stream,
         max_stream_window: max_stream,
         init_connection_window: init_connection,
@@ -2784,6 +2779,7 @@ pub(crate) fn hysteria_quic_params(
         max_idle: max_idle as u64,
         keep_alive: keep_alive as u64,
         no_path_mtu: flag(node, "disablePathMTUDiscovery"),
+        disable_gso: flag(node, "disableGSO"),
         max_incoming_streams: max_incoming as u64,
         disable_stateless_reset: flag(node, "disableStatelessReset"),
         disable_chrome_parrot: flag(node, "disableChromeParrot"),

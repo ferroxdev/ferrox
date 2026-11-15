@@ -749,17 +749,44 @@ fn int32(raw: u64) -> i32 {
         .cast_signed()
 }
 
-/// xray's `SocketConfig` as far as a stream reads it: the system dial this tree puts under
-/// `freedom` already resolves a name to an address, which is `USE_IP`; a transparent front's
-/// `tproxy` mode is carried, its original-destination marker is read, a named `dialer_proxy`
-/// tags the outbound socket, and every other option shapes a dial this tree does not carry
-/// and is refused by number.
+fn uint32(raw: u64) -> Result<i64, String> {
+    u32::try_from(raw)
+        .map(i64::from)
+        .map_err(|_| format!("{raw} is past a uint32"))
+}
+
+/// xray's `SocketConfig` in the dialect `sockopt` reads: mark, fast open, transparent mode,
+/// domain strategy, keep-alive, congestion, interface, the three TCP bounds, custom options,
+/// the address/port strategy and the named dialer proxy are carried; the fields the helper
+/// warns about keep their name, and the rest are read and dropped.
+#[allow(clippy::too_many_lines)]
 fn socket_settings(bytes: &[u8]) -> Result<Option<Json>, String> {
     let mut reader = Reader::new(bytes, "xray.transport.internet.SocketConfig");
+    let mut mark = 0i32;
+    let mut tfo = 0i32;
     let mut tproxy = None;
+    let mut domain = 0u64;
     let mut dialer_proxy = None;
+    let mut keep_alive_interval = 0i32;
+    let mut keep_alive_idle = 0i32;
+    let mut congestion = None;
+    let mut interface = None;
+    let mut window_clamp = 0i32;
+    let mut user_timeout = 0i32;
+    let mut max_seg = 0i32;
+    let mut penetrate = false;
+    let mut mptcp = false;
+    let mut custom = Vec::new();
+    let mut address_port = 0u64;
+    let mut happy = false;
+    let mut receive_original = false;
+    let mut accept_proxy = false;
+    let mut v6only = false;
+    let mut trusted_forwarded = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
+            (1, 0) => mark = int32(reader.varint()?),
+            (2, 0) => tfo = int32(reader.varint()?),
             (3, 0) => {
                 tproxy = match reader.varint()? {
                     0 => None,
@@ -770,27 +797,166 @@ fn socket_settings(bytes: &[u8]) -> Result<Option<Json>, String> {
                     }
                 };
             }
-            (4, 0) => {
-                reader.varint()?;
-            }
-            (8, 0) => {
-                let strategy = reader.varint()?;
-                if strategy > 1 {
-                    return Err(reader.uncarried(&format!("socket domain strategy {strategy}")));
-                }
-            }
+            (4, 0) => receive_original = reader.varint()? != 0,
+            (7, 0) => accept_proxy = reader.varint()? != 0,
+            (14, 0) => v6only = reader.varint()? != 0,
+            (8, 0) => domain = reader.varint()?,
             (9, 2) => dialer_proxy = Some(account_text(&mut reader)?),
+            (10, 0) => keep_alive_interval = int32(reader.varint()?),
+            (11, 0) => keep_alive_idle = int32(reader.varint()?),
+            (12, 2) => congestion = Some(account_text(&mut reader)?),
+            (13, 2) => interface = Some(account_text(&mut reader)?),
+            (15, 0) => window_clamp = int32(reader.varint()?),
+            (16, 0) => user_timeout = int32(reader.varint()?),
+            (17, 0) => max_seg = int32(reader.varint()?),
+            (18, 0) => penetrate = reader.varint()? != 0,
+            (19, 0) => mptcp = reader.varint()? != 0,
+            (20, 2) => custom.push(socket_custom(reader.bytes()?)?),
+            (21, 0) => address_port = reader.varint()?,
+            (22, 2) => {
+                reader.bytes()?;
+                happy = true;
+            }
+            (23, 2) => trusted_forwarded.push(account_text(&mut reader)?),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
     let mut pairs = Vec::new();
+    if mark != 0 {
+        pairs.push(("mark", Json::Num(f64::from(mark))));
+    }
+    if tfo != 0 {
+        pairs.push(("tcpFastOpen", Json::Num(f64::from(tfo))));
+    }
     if let Some(tproxy) = tproxy {
         pairs.push(("tproxy", Json::Str(tproxy.to_owned())));
+    }
+    if let Some(strategy) = domain_strategy(domain)? {
+        pairs.push(("domainStrategy", Json::Str(strategy.to_owned())));
     }
     if let Some(dialer_proxy) = dialer_proxy.filter(|tag| !tag.is_empty()) {
         pairs.push(("dialerProxy", Json::Str(dialer_proxy)));
     }
+    if keep_alive_idle != 0 || keep_alive_interval != 0 {
+        pairs.push(("tcpKeepAliveIdle", Json::Num(f64::from(keep_alive_idle))));
+        pairs.push((
+            "tcpKeepAliveInterval",
+            Json::Num(f64::from(keep_alive_interval)),
+        ));
+    }
+    if let Some(congestion) = congestion.filter(|name| !name.is_empty()) {
+        pairs.push(("tcpCongestion", Json::Str(congestion)));
+    }
+    if let Some(interface) = interface.filter(|name| !name.is_empty()) {
+        pairs.push(("interface", Json::Str(interface)));
+    }
+    if window_clamp != 0 {
+        pairs.push(("tcpWindowClamp", Json::Num(f64::from(window_clamp))));
+    }
+    if user_timeout != 0 {
+        pairs.push(("tcpUserTimeout", Json::Num(f64::from(user_timeout))));
+    }
+    if max_seg != 0 {
+        pairs.push(("tcpMaxSeg", Json::Num(f64::from(max_seg))));
+    }
+    if penetrate {
+        pairs.push(("penetrate", Json::Bool(true)));
+    }
+    if mptcp {
+        pairs.push(("tcpMptcp", Json::Bool(true)));
+    }
+    if !custom.is_empty() {
+        pairs.push(("customSockopt", Json::Arr(custom)));
+    }
+    if let Some(strategy) = address_port_strategy(address_port)? {
+        pairs.push(("addressPortStrategy", Json::Str(strategy.to_owned())));
+    }
+    if happy {
+        pairs.push(("happyEyeballs", object(Vec::new())));
+    }
+    if receive_original {
+        pairs.push(("receiveOriginalDestAddress", Json::Bool(true)));
+    }
+    if accept_proxy {
+        pairs.push(("acceptProxyProtocol", Json::Bool(true)));
+    }
+    if v6only {
+        pairs.push(("v6only", Json::Bool(true)));
+    }
+    if !trusted_forwarded.is_empty() {
+        pairs.push((
+            "trustedXForwardedFor",
+            Json::Arr(trusted_forwarded.into_iter().map(Json::Str).collect()),
+        ));
+    }
     Ok((!pairs.is_empty()).then(|| object(pairs)))
+}
+
+fn domain_strategy(value: u64) -> Result<Option<&'static str>, String> {
+    Ok(Some(match value {
+        0 => return Ok(None),
+        1 => "useip",
+        2 => "useipv4",
+        3 => "useipv6",
+        4 => "useipv4v6",
+        5 => "useipv6v4",
+        6 => "forceip",
+        7 => "forceipv4",
+        8 => "forceipv6",
+        9 => "forceipv4v6",
+        10 => "forceipv6v4",
+        other => {
+            return Err(format!(
+            "xray.transport.internet.SocketConfig: socket domain strategy {other} is not carried"
+        ))
+        }
+    }))
+}
+
+fn address_port_strategy(value: u64) -> Result<Option<&'static str>, String> {
+    Ok(Some(match value {
+        0 => return Ok(None),
+        1 => "srvportonly",
+        2 => "srvaddressonly",
+        3 => "srvportandaddress",
+        4 => "txtportonly",
+        5 => "txtaddressonly",
+        6 => "txtportandaddress",
+        other => {
+            return Err(format!(
+                "xray.transport.internet.SocketConfig: socket address and port strategy {other} is not carried"
+            ))
+        }
+    }))
+}
+
+fn socket_custom(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.CustomSockopt");
+    let mut system = String::new();
+    let mut network = String::new();
+    let mut level = String::new();
+    let mut opt = String::new();
+    let mut value = String::new();
+    let mut kind = String::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => system = account_text(&mut reader)?,
+            (2, 2) => network = account_text(&mut reader)?,
+            (3, 2) => level = account_text(&mut reader)?,
+            (4, 2) => opt = account_text(&mut reader)?,
+            (5, 2) => value = account_text(&mut reader)?,
+            (6, 2) => kind = account_text(&mut reader)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(object(vec![
+        ("system", Json::Str(system)),
+        ("network", Json::Str(network)),
+        ("level", Json::Str(level)),
+        ("opt", Json::Str(opt)),
+        ("value", Json::Str(value)),
+        ("type", Json::Str(kind)),
+    ]))
 }
 
 /// One stream policy as this tree's JSON dialect spells it: the network, and the security the
@@ -804,6 +970,9 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut security_type = String::new();
     let mut security: Option<(&'static str, Json)> = None;
     let mut sockopt = None;
+    let mut udp_masks = Vec::new();
+    let mut tcp_masks = Vec::new();
+    let mut quic_policy = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (2, 2) => {
@@ -825,7 +994,10 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
             }
             (5, 2) => network = account_text(&mut reader)?,
             (6, 2) => sockopt = socket_settings(reader.bytes()?)?,
-            (8..=12, _) => return Err(reader.uncarried("address, mask or quic policy on a stream")),
+            (8..=9, _) => return Err(reader.uncarried("address or port on a stream")),
+            (10, 2) => udp_masks.push(mask_stage(reader.bytes()?, true)?),
+            (11, 2) => tcp_masks.push(mask_stage(reader.bytes()?, false)?),
+            (12, 2) => quic_policy = Some(quic_params(reader.bytes()?)?),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
@@ -840,6 +1012,19 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut pairs = vec![("network", Json::Str(network.clone()))];
     if let Some(sockopt) = sockopt {
         pairs.push(("sockopt", sockopt));
+    }
+    let mut finalmask = Vec::new();
+    if !udp_masks.is_empty() {
+        finalmask.push(("udp", Json::Arr(udp_masks)));
+    }
+    if !tcp_masks.is_empty() {
+        finalmask.push(("tcp", Json::Arr(tcp_masks)));
+    }
+    if let Some(params) = quic_policy {
+        finalmask.push(("quicParams", params));
+    }
+    if !finalmask.is_empty() {
+        pairs.push(("finalmask", object(finalmask)));
     }
     if let Some(settings) = transport_settings {
         let key = match network.as_str() {
@@ -989,16 +1174,14 @@ fn masque_transport(bytes: &[u8]) -> Result<Json, String> {
     let mut path = String::new();
     let mut headers = Vec::new();
     let mut warp = None;
+    let mut xmux = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => host = account_text(&mut reader)?,
             (2, 2) => path = account_text(&mut reader)?,
             (3, 2) => headers.push(masque_header(reader.bytes()?)?),
             (4, 2) => warp = Some(masque_warp(reader.bytes()?)?),
-            (5, 2) => {
-                // One connection carries every flow here; the mux policy names how the reference splits it, not a wire byte.
-                reader.bytes()?;
-            }
+            (5, 2) => xmux = Some(masque_xmux(reader.bytes()?)?),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
@@ -1015,7 +1198,61 @@ fn masque_transport(bytes: &[u8]) -> Result<Json, String> {
     if let Some(warp) = warp {
         pairs.push(("warp", warp));
     }
+    if let Some(xmux) = xmux {
+        pairs.push(("xmux", xmux));
+    }
     Ok(object(pairs))
+}
+
+/// `splithttp.XmuxConfig`: the lane pool's ranges, each an `Int32Range`, and the keepalive.
+#[allow(clippy::cast_precision_loss)]
+fn masque_xmux(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.splithttp.XmuxConfig");
+    let mut ranges = [None; 5];
+    let mut keepalive = 0i64;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1..=5, 2) => {
+                let slot = usize::try_from(field - 1).expect("a range field is 1..=5");
+                ranges[slot] = Some(masque_range(reader.bytes()?)?);
+            }
+            (6, 0) => keepalive = reader.varint()?.cast_signed(),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let names = [
+        "maxConcurrency",
+        "maxConnections",
+        "cMaxReuseTimes",
+        "hMaxRequestTimes",
+        "hMaxReusableSecs",
+    ];
+    let mut pairs = Vec::new();
+    for (name, range) in names.into_iter().zip(ranges) {
+        if let Some((from, to)) = range {
+            if from != 0 || to != 0 {
+                pairs.push((name, Json::Str(format!("{from}-{to}"))));
+            }
+        }
+    }
+    if keepalive != 0 {
+        pairs.push(("hKeepAlivePeriod", Json::Num(keepalive as f64)));
+    }
+    Ok(object(pairs))
+}
+
+fn masque_range(bytes: &[u8]) -> Result<(i32, i32), String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.splithttp.RangeConfig");
+    let mut from = 0i32;
+    let mut to = 0i32;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => from = int32(reader.varint()?),
+            (2, 0) => to = int32(reader.varint()?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((from, to))
 }
 
 fn masque_warp(bytes: &[u8]) -> Result<Json, String> {
@@ -1059,6 +1296,378 @@ fn masque_header(bytes: &[u8]) -> Result<Json, String> {
         ("name", Json::Str(name)),
         ("value", Json::Str(value)),
     ]))
+}
+
+/// One `StreamConfig` mask: the typed stage a stream names, in the dialect
+/// `finalmask.tcp`/`finalmask.udp` spells. A stage this tree does not carry is
+/// refused by its message name rather than dropped, so a config never dials
+/// unmasked because its wrapper was skipped.
+#[allow(clippy::too_many_lines)]
+fn mask_stage(typed: &[u8], udp: bool) -> Result<Json, String> {
+    let (name, value) = typed_message(typed)?;
+    let (kind, settings) = match name.as_str() {
+        "xray.transport.internet.finalmask.salamander.Config" => {
+            let mut reader =
+                Reader::new(value, "xray.transport.internet.finalmask.salamander.Config");
+            let mut password = String::new();
+            while let Some((field, wire)) = reader.field()? {
+                match (field, wire) {
+                    (1, 2) => password = account_text(&mut reader)?,
+                    _ => return Err(reader.refuse(field, wire)),
+                }
+            }
+            (
+                "salamander",
+                object(vec![("password", Json::Str(password))]),
+            )
+        }
+        "xray.transport.internet.finalmask.filter.Config" => {
+            let mut reader = Reader::new(value, "xray.transport.internet.finalmask.filter.Config");
+            let mut blocked = Vec::new();
+            let mut allowed = Vec::new();
+            while let Some((field, wire)) = reader.field()? {
+                match (field, wire) {
+                    (1, 2) => blocked.push(Json::Str(ip_rule(reader.bytes()?)?)),
+                    (2, 2) => allowed.push(Json::Str(ip_rule(reader.bytes()?)?)),
+                    _ => return Err(reader.refuse(field, wire)),
+                }
+            }
+            let mut pairs = Vec::new();
+            if !blocked.is_empty() {
+                pairs.push(("blockedSourceIPs", Json::Arr(blocked)));
+            }
+            if !allowed.is_empty() {
+                pairs.push(("allowedSourceIPs", Json::Arr(allowed)));
+            }
+            ("filter", object(pairs))
+        }
+        "xray.transport.internet.finalmask.mkcp.original.Config" => {
+            ("mkcp-legacy", object(Vec::new()))
+        }
+        "xray.transport.internet.finalmask.mkcp.aes128gcm.Config" => {
+            let mut reader = Reader::new(
+                value,
+                "xray.transport.internet.finalmask.mkcp.aes128gcm.Config",
+            );
+            let mut password = String::new();
+            while let Some((field, wire)) = reader.field()? {
+                match (field, wire) {
+                    (1, 2) => password = account_text(&mut reader)?,
+                    _ => return Err(reader.refuse(field, wire)),
+                }
+            }
+            ("mkcp-legacy", object(vec![("value", Json::Str(password))]))
+        }
+        "xray.transport.internet.finalmask.mkcp.header.Config" => {
+            let mut reader = Reader::new(
+                value,
+                "xray.transport.internet.finalmask.mkcp.header.Config",
+            );
+            let mut id = 0i64;
+            let mut domain = String::new();
+            while let Some((field, wire)) = reader.field()? {
+                match (field, wire) {
+                    (1, 0) => id = i64::from(int32(reader.varint()?)),
+                    (1, 2) => {
+                        id = unpacked_ints(reader.bytes()?)?
+                            .first()
+                            .copied()
+                            .unwrap_or(0);
+                    }
+                    (2, 2) => domain = account_text(&mut reader)?,
+                    _ => return Err(reader.refuse(field, wire)),
+                }
+            }
+            let header = match id {
+                0 => "dns",
+                1 => "dtls",
+                2 => "srtp",
+                3 => "utp",
+                4 => "wechat",
+                5 => "wireguard",
+                _ => return Err(format!("mkcp header {id} is not carried")),
+            };
+            (
+                "mkcp-legacy",
+                object(vec![
+                    ("header", Json::Str(header.to_owned())),
+                    ("value", Json::Str(domain)),
+                ]),
+            )
+        }
+        "xray.transport.internet.finalmask.fragment.Config" => {
+            let (kind, settings) = fragment_stage(value)?;
+            (kind, settings)
+        }
+        "xray.transport.internet.finalmask.sudoku.Config" => {
+            let (kind, settings) = sudoku_stage(value)?;
+            (kind, settings)
+        }
+        "xray.transport.internet.finalmask.xmc.Config" => {
+            let (kind, settings) = xmc_stage(value)?;
+            (kind, settings)
+        }
+        other => {
+            return Err(format!(
+                "{} mask `{other}` is not carried",
+                if udp { "udp" } else { "tcp" }
+            ))
+        }
+    };
+    Ok(object(vec![
+        ("type", Json::Str(kind.to_owned())),
+        ("settings", settings),
+    ]))
+}
+
+fn unpacked_ints(bytes: &[u8]) -> Result<Vec<i64>, String> {
+    let mut reader = Reader::new(bytes, "a packed int64 list");
+    let mut values = Vec::new();
+    while reader.more() {
+        values.push(reader.varint()?.cast_signed());
+    }
+    Ok(values)
+}
+
+fn fragment_stage(bytes: &[u8]) -> Result<(&'static str, Json), String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.finalmask.fragment.Config");
+    let mut from = 0i64;
+    let mut to = 0i64;
+    let mut split_min = 0i64;
+    let mut split_max = 0i64;
+    let mut lengths_min = Vec::new();
+    let mut lengths_max = Vec::new();
+    let mut delays_min = Vec::new();
+    let mut delays_max = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => from = reader.varint()?.cast_signed(),
+            (2, 0) => to = reader.varint()?.cast_signed(),
+            (7, 0) => split_min = reader.varint()?.cast_signed(),
+            (8, 0) => split_max = reader.varint()?.cast_signed(),
+            (9, 0) => lengths_min.push(reader.varint()?.cast_signed()),
+            (10, 0) => lengths_max.push(reader.varint()?.cast_signed()),
+            (11, 0) => delays_min.push(reader.varint()?.cast_signed()),
+            (12, 0) => delays_max.push(reader.varint()?.cast_signed()),
+            (9, 2) => lengths_min.extend(unpacked_ints(reader.bytes()?)?),
+            (10, 2) => lengths_max.extend(unpacked_ints(reader.bytes()?)?),
+            (11, 2) => delays_min.extend(unpacked_ints(reader.bytes()?)?),
+            (12, 2) => delays_max.extend(unpacked_ints(reader.bytes()?)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    let packets = match (from, to) {
+        (0, 0) => String::new(),
+        (0, 1) => "tlshello".to_owned(),
+        _ => format!("{from}-{to}"),
+    };
+    if !packets.is_empty() {
+        pairs.push(("packets", Json::Str(packets)));
+    }
+    if !lengths_min.is_empty() {
+        pairs.push(("lengths", Json::Arr(range_pairs(lengths_min, lengths_max)?)));
+    }
+    if !delays_min.is_empty() {
+        pairs.push(("delays", Json::Arr(range_pairs(delays_min, delays_max)?)));
+    }
+    if split_min != 0 || split_max != 0 {
+        pairs.push(("maxSplit", Json::Str(format!("{split_min}-{split_max}"))));
+    }
+    Ok(("fragment", object(pairs)))
+}
+
+fn range_pairs(low: Vec<i64>, high: Vec<i64>) -> Result<Vec<Json>, String> {
+    if low.len() != high.len() {
+        return Err("a finalmask fragment range has unmatched ends".to_owned());
+    }
+    Ok(low
+        .into_iter()
+        .zip(high)
+        .map(|(low, high)| Json::Str(format!("{low}-{high}")))
+        .collect())
+}
+
+fn sudoku_stage(bytes: &[u8]) -> Result<(&'static str, Json), String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.finalmask.sudoku.Config");
+    let mut password = String::new();
+    let mut ascii = String::new();
+    let mut custom_table = String::new();
+    let mut padding_min = 0i64;
+    let mut padding_max = 0i64;
+    let mut custom_tables = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => password = account_text(&mut reader)?,
+            (2, 2) => ascii = account_text(&mut reader)?,
+            (3, 2) => custom_table = account_text(&mut reader)?,
+            (4, 0) => padding_min = uint32(reader.varint()?)?,
+            (5, 0) => padding_max = uint32(reader.varint()?)?,
+            (7, 2) => custom_tables.push(Json::Str(account_text(&mut reader)?)),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = vec![
+        ("password", Json::Str(password)),
+        ("ascii", Json::Str(ascii)),
+        ("customTable", Json::Str(custom_table)),
+        ("paddingMin", exact_signed(padding_min)?),
+        ("paddingMax", exact_signed(padding_max)?),
+    ];
+    if !custom_tables.is_empty() {
+        pairs.push(("customTables", Json::Arr(custom_tables)));
+    }
+    Ok(("sudoku", object(pairs)))
+}
+
+fn xmc_stage(bytes: &[u8]) -> Result<(&'static str, Json), String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.finalmask.xmc.Config");
+    let mut password = String::new();
+    let mut hostname = String::new();
+    let mut profiles = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => password = account_text(&mut reader)?,
+            (10, 2) => hostname = account_text(&mut reader)?,
+            (8 | 9, 2) => {
+                reader.bytes()?;
+            }
+            (11, 2) => profiles.push(xmc_profile(reader.bytes()?)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((
+        "xmc",
+        object(vec![
+            ("password", Json::Str(password)),
+            ("hostname", Json::Str(hostname)),
+            ("profiles", Json::Arr(profiles)),
+        ]),
+    ))
+}
+
+fn xmc_profile(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.finalmask.xmc.Profile");
+    let mut username = String::new();
+    let mut uuid = Vec::new();
+    let mut textures_value = String::new();
+    let mut textures_signature = String::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => username = account_text(&mut reader)?,
+            (2, 2) => uuid = reader.bytes()?.to_vec(),
+            (3, 2) => textures_value = account_text(&mut reader)?,
+            (4, 2) => textures_signature = account_text(&mut reader)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    if uuid.len() != 16 {
+        return Err("xmc profile uuid is not 16 bytes".to_owned());
+    }
+    let uuid = hex(&uuid);
+    Ok(object(vec![
+        ("username", Json::Str(username)),
+        ("uuid", Json::Str(uuid)),
+        ("texturesValue", Json::Str(textures_value)),
+        ("texturesSignature", Json::Str(textures_signature)),
+    ]))
+}
+
+fn quic_params(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.QuicParams");
+    let mut pairs = Vec::new();
+    let mut cc = String::new();
+    let mut bbr = String::new();
+    let mut up = 0u64;
+    let mut down = 0u64;
+    let mut loss = false;
+    let mut init_stream = 0u64;
+    let mut max_stream = 0u64;
+    let mut init_conn = 0u64;
+    let mut max_conn = 0u64;
+    let mut idle = 0i64;
+    let mut keepalive = 0i64;
+    let mut no_pmtu = false;
+    let mut chrome = false;
+    let mut gso = false;
+    let mut incoming = 0i64;
+    let mut no_reset = false;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => cc = account_text(&mut reader)?,
+            (2, 2) => bbr = account_text(&mut reader)?,
+            (3, 0) => up = reader.varint()?,
+            (4, 0) => down = reader.varint()?,
+            (5, 0) => loss = reader.varint()? != 0,
+            (6, 0) => init_stream = reader.varint()?,
+            (7, 0) => max_stream = reader.varint()?,
+            (8, 0) => init_conn = reader.varint()?,
+            (9, 0) => max_conn = reader.varint()?,
+            (10, 0) => idle = reader.varint()?.cast_signed(),
+            (11, 0) => keepalive = reader.varint()?.cast_signed(),
+            (12, 0) => no_pmtu = reader.varint()? != 0,
+            (13, 0) => chrome = reader.varint()? != 0,
+            (14, 0) => gso = reader.varint()? != 0,
+            (15, 0) => incoming = reader.varint()?.cast_signed(),
+            (16, 0) => no_reset = reader.varint()? != 0,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    if !cc.is_empty() {
+        pairs.push(("congestion", Json::Str(cc)));
+    }
+    if !bbr.is_empty() {
+        pairs.push(("bbrProfile", Json::Str(bbr)));
+    }
+    if up != 0 {
+        pairs.push((
+            "brutalUp",
+            exact_count(up.checked_mul(8).ok_or("brutalUp overflows a bit rate")?)?,
+        ));
+    }
+    if down != 0 {
+        pairs.push((
+            "brutalDown",
+            exact_count(
+                down.checked_mul(8)
+                    .ok_or("brutalDown overflows a bit rate")?,
+            )?,
+        ));
+    }
+    if loss {
+        pairs.push(("brutalDisableLossCompensation", Json::Bool(true)));
+    }
+    for (key, value) in [
+        ("initStreamReceiveWindow", init_stream),
+        ("maxStreamReceiveWindow", max_stream),
+        ("initConnectionReceiveWindow", init_conn),
+        ("maxConnectionReceiveWindow", max_conn),
+    ] {
+        if value != 0 {
+            pairs.push((key, exact_count(value)?));
+        }
+    }
+    for (key, value) in [("maxIdleTimeout", idle), ("keepAlivePeriod", keepalive)] {
+        if value != 0 {
+            pairs.push((key, exact_signed(value)?));
+        }
+    }
+    if no_pmtu {
+        pairs.push(("disablePathMTUDiscovery", Json::Bool(true)));
+    }
+    if chrome {
+        pairs.push(("disableChromeParrot", Json::Bool(true)));
+    }
+    if gso {
+        pairs.push(("disableGSO", Json::Bool(true)));
+    }
+    if incoming != 0 {
+        pairs.push(("maxIncomingStreams", exact_signed(incoming)?));
+    }
+    if no_reset {
+        pairs.push(("disableStatelessReset", Json::Bool(true)));
+    }
+    Ok(object(pairs))
 }
 
 /// The security settings a stream names, keyed the dialect's spelling of the dial that reads it.
@@ -1468,6 +2077,17 @@ fn reality_key<'a>(role: &str, reader: &mut Reader<'a>) -> Result<&'a [u8; 32], 
 fn exact_count(value: u64) -> Result<Json, String> {
     const EXACT: u64 = 1 << 53;
     if value < EXACT {
+        #[allow(clippy::cast_precision_loss)] // the guard above makes the cast exact
+        return Ok(Json::Num(value as f64));
+    }
+    Err(format!(
+        "{value} is past the count a JSON number spells exactly"
+    ))
+}
+
+fn exact_signed(value: i64) -> Result<Json, String> {
+    const EXACT: i64 = 1 << 53;
+    if (-EXACT..EXACT).contains(&value) {
         #[allow(clippy::cast_precision_loss)] // the guard above makes the cast exact
         return Ok(Json::Num(value as f64));
     }
@@ -4862,18 +5482,23 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_socket_use_ip_policy_decodes_and_another_option_is_refused() {
+    fn a_stream_socket_use_ip_policy_and_mark_both_decode() {
         let policy = receiver_stream(5000, &bytes_field(6, &varint_field(8, 1)));
         to_json(&config(&http_inbound(&policy, &[]), &freedom_outbound()))
             .expect("the system dial is USE_IP");
 
         let marked = receiver_stream(5000, &bytes_field(6, &varint_field(1, 1)));
-        let error = to_json(&config(&http_inbound(&marked, &[]), &freedom_outbound()))
-            .expect_err("a mark is refused");
-        assert!(
-            error.contains("xray.transport.internet.SocketConfig"),
-            "{error}"
-        );
+        let json = to_json(&config(&http_inbound(&marked, &[]), &freedom_outbound()))
+            .expect("a mark decodes");
+        let mark = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("streamSettings")
+            .and_then(|stream| stream.get("sockopt"))
+            .and_then(|sockopt| sockopt.get("mark"))
+            .and_then(Json::as_i64);
+        assert_eq!(mark, Some(1));
     }
 
     #[test]
@@ -4922,6 +5547,62 @@ mod tests {
     fn an_empty_socket_dialer_proxy_names_no_hop() {
         let socket = message(&[bytes_field(9, b"")]);
         assert!(socket_settings(&socket).expect("decodes").is_none());
+    }
+
+    #[test]
+    fn a_stream_mask_and_quic_policy_become_finalmask() {
+        let salamander = typed(
+            "xray.transport.internet.finalmask.salamander.Config",
+            &bytes_field(1, b"gawrgura"),
+        );
+        let fragment = typed(
+            "xray.transport.internet.finalmask.fragment.Config",
+            &message(&[varint_field(2, 1)]),
+        );
+        let quic = message(&[
+            bytes_field(1, b"reno"),
+            varint_field(10, 30),
+            varint_field(14, 1),
+        ]);
+        let stream = message(&[
+            bytes_field(5, b"masque"),
+            bytes_field(10, &salamander),
+            bytes_field(11, &fragment),
+            bytes_field(12, &quic),
+        ]);
+        let json = stream_settings(&stream).expect("the stream decodes");
+        let finalmask = json.get("finalmask").expect("finalmask");
+        let udp = finalmask
+            .get("udp")
+            .and_then(Json::as_arr)
+            .expect("udp masks");
+        assert_eq!(
+            udp[0].get("type").and_then(Json::as_str),
+            Some("salamander")
+        );
+        assert_eq!(
+            udp[0]
+                .get("settings")
+                .and_then(|settings| settings.get("password"))
+                .and_then(Json::as_str),
+            Some("gawrgura")
+        );
+        let tcp = finalmask
+            .get("tcp")
+            .and_then(Json::as_arr)
+            .expect("tcp masks");
+        assert_eq!(tcp[0].get("type").and_then(Json::as_str), Some("fragment"));
+        assert_eq!(
+            tcp[0]
+                .get("settings")
+                .and_then(|settings| settings.get("packets"))
+                .and_then(Json::as_str),
+            Some("tlshello")
+        );
+        let quic = finalmask.get("quicParams").expect("quic policy");
+        assert_eq!(quic.get("congestion").and_then(Json::as_str), Some("reno"));
+        assert_eq!(quic.get("maxIdleTimeout").and_then(Json::as_i64), Some(30));
+        assert_eq!(quic.get("disableGSO").and_then(Json::as_bool), Some(true));
     }
 
     #[test]
@@ -7952,6 +8633,41 @@ mod tests {
                 ("value", Json::Str("Basic x".to_owned())),
             ])]))
         );
+    }
+
+    #[test]
+    fn a_masque_xmux_block_carries_its_ranges_and_keepalive() {
+        let max_connections = message(&[varint_field(1, 2), varint_field(2, 4)]);
+        let reusable = message(&[varint_field(1, 60), varint_field(2, 60)]);
+        let xmux = message(&[
+            bytes_field(2, &max_connections),
+            bytes_field(5, &reusable),
+            varint_field(6, u64::MAX),
+        ]);
+        let settings = message(&[bytes_field(5, &xmux)]);
+        let raw = message(&[
+            bytes_field(
+                2,
+                &typed("xray.transport.internet.masque.Config", &settings),
+            ),
+            bytes_field(3, b"masque"),
+        ]);
+        let (json, _) = transport_config(&raw).expect("the transport decodes");
+        let json = json.expect("masque settings");
+        let xmux = json.get("xmux").expect("xmux");
+        assert_eq!(
+            xmux.get("maxConnections").and_then(Json::as_str),
+            Some("2-4")
+        );
+        assert_eq!(
+            xmux.get("hMaxReusableSecs").and_then(Json::as_str),
+            Some("60-60")
+        );
+        assert_eq!(
+            xmux.get("hKeepAlivePeriod").and_then(Json::as_i64),
+            Some(-1)
+        );
+        assert!(xmux.get("maxConcurrency").is_none());
     }
 
     #[test]

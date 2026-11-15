@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, UdpSocket};
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
@@ -141,6 +141,41 @@ pub(crate) struct ClientFlow {
     pub(crate) client: Connection,
     pub(crate) destinations: Vec<SocketAddr>,
     pub(crate) prefix: Vec<u8>,
+    pub(crate) lease: Option<FlowLease>,
+}
+
+/// Counts a live flow against the lane that carried it, and gives the count back when the
+/// stack retires the flow.
+pub(crate) struct FlowLease {
+    active: Arc<AtomicUsize>,
+    retiring: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
+}
+
+impl FlowLease {
+    /// A lease on a lane the pool may retire: the last flow out closes it, so a
+    /// removed lane never keeps its stack, threads or connection alive.
+    pub(crate) fn retiring(
+        active: Arc<AtomicUsize>,
+        retire: Arc<AtomicBool>,
+        alive: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            active,
+            retiring: Some((retire, alive)),
+        }
+    }
+}
+
+impl Drop for FlowLease {
+    fn drop(&mut self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if let Some((retire, alive)) = &self.retiring {
+                if retire.load(Ordering::Acquire) {
+                    alive.store(false, Ordering::Release);
+                }
+            }
+        }
+    }
 }
 
 /// The route table of live client datagram lanes, keyed by the loopback relay
@@ -394,6 +429,7 @@ struct Flow {
     down_shutdown: bool,
     established: bool,
     done: bool,
+    lease: Option<FlowLease>,
 }
 
 impl Flow {
@@ -413,6 +449,7 @@ impl Flow {
             down_shutdown: false,
             established: false,
             done: false,
+            lease: None,
         }
     }
 
@@ -1594,7 +1631,7 @@ impl ClientStack {
     }
 
     /// Race a client flow's destinations and keep the first connected socket.
-    fn connect(&mut self, flow: ClientFlow) -> std::io::Result<()> {
+    fn connect(&mut self, mut flow: ClientFlow) -> std::io::Result<()> {
         flow.client.set_nonblocking(true)?;
         let mut candidates = Vec::new();
         let mut refused = None;
@@ -1651,6 +1688,7 @@ impl ClientStack {
         let mut routed = Flow::new(handle, flow.client, local_port);
         routed.races = candidates;
         routed.pending_up = flow.prefix;
+        routed.lease = flow.lease.take();
         self.flows.push(routed);
         Ok(())
     }
@@ -3391,6 +3429,7 @@ mod tests {
                 client: proxy,
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
+                lease: None,
             })
             .expect("connect");
         stack.poll();
@@ -3554,6 +3593,7 @@ mod tests {
                 client: proxy,
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
+                lease: None,
             })
             .expect("connect");
         stack.poll();
@@ -4331,6 +4371,7 @@ mod tests {
                 client: proxy,
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
+                lease: None,
             })
             .expect("connect");
         stack.poll();
@@ -4352,6 +4393,7 @@ mod tests {
                 client: proxy,
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
+                lease: None,
             })
             .expect("connect");
         stack.poll();
@@ -5512,6 +5554,7 @@ mod client_tests {
                 client: proxy,
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
+                lease: None,
             })
             .expect("connect");
         stack.poll();
