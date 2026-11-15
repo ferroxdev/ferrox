@@ -1685,6 +1685,7 @@ fn client_config(spec: &ClientSpec) -> Result<quiche::Config, String> {
 fn apply_spec_quic(config: &mut quiche::Config, spec: &ClientSpec) {
     if let Some(params) = spec.quic {
         quic::apply_hysteria_quic(config, &params, false);
+        let _ = quic::apply_lane_congestion(config, params.cc, Some(&params));
     }
 }
 
@@ -2595,6 +2596,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
     if let Some(params) = spec.quic {
         quic::apply_hysteria_quic(&mut config, &params, true);
+        let _ = quic::apply_lane_congestion(&mut config, params.cc, Some(&params));
     }
     let tcp = identity
         .alpn

@@ -604,7 +604,7 @@ pub(crate) fn tune_transport(config: &mut quiche::Config) {
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM);
 }
 
-/// The reference's `finalmask.quicParams` windows, idle bound, stream cap, congestion and BBR profile, with `bbrProfile` reaching quiche behind `internal`; a zero field takes the reference's default, the Brutal rate is `apply_hysteria_pacing`, the parrot's zero-length source ID is `hysteria_client_cid`, and `brutal*` and `disableChromeParrot` have no knob here.
+/// The reference's `finalmask.quicParams` windows, idle bound, stream cap, congestion and BBR profile, with `bbrProfile` reaching quiche behind `internal`; a zero field takes the reference's default. The controller is `apply_lane_congestion`, the Brutal rate is `apply_hysteria_pacing`, the parrot's zero-length source ID is `hysteria_client_cid`, and `brutalDisableLossCompensation` has no sender here.
 pub(crate) fn apply_hysteria_quic(
     config: &mut quiche::Config,
     params: &ferrox_core::hysteria::QuicParams,
@@ -637,30 +637,74 @@ pub(crate) fn apply_hysteria_quic(
     if params.no_path_mtu {
         config.discover_pmtu(false);
     }
-    if let Some(cc) = params.cc {
-        let _ = config.set_cc_algorithm_name(cc.quiche_name());
-    }
-    if params.cc != Some(ferrox_core::hysteria::Congestion::Reno) {
-        let mut bbr = quiche::BbrParams::default();
-        match params.bbr_profile {
-            ferrox_core::hysteria::BbrProfile::Standard => {}
-            ferrox_core::hysteria::BbrProfile::Conservative => {
-                bbr.startup_pacing_gain = Some(2.25);
-                bbr.startup_cwnd_gain = Some(1.75);
-                bbr.drain_pacing_gain = Some(1.0 / 2.25);
-                bbr.startup_full_bw_rounds = Some(2);
-                bbr.enable_overestimate_avoidance = Some(true);
-            }
-            ferrox_core::hysteria::BbrProfile::Aggressive => {
-                bbr.startup_pacing_gain = Some(3.0);
-                bbr.startup_cwnd_gain = Some(2.25);
-                bbr.startup_full_bw_rounds = Some(4);
-            }
+}
+
+/// The knobs a `bbrProfile` names in quiche's BBR2, read against the reference's three profiles: the standard
+/// profile is quiche's own gains, so it overrides nothing; the other two move the startup and drain gains and
+/// the rounds startup waits before it exits.
+#[must_use]
+pub(crate) fn bbr_params(profile: ferrox_core::hysteria::BbrProfile) -> quiche::BbrParams {
+    use ferrox_core::hysteria::BbrProfile;
+    let mut params = quiche::BbrParams::default();
+    match profile {
+        BbrProfile::Standard => {}
+        BbrProfile::Conservative => {
+            params.startup_cwnd_gain = Some(1.75);
+            params.startup_pacing_gain = Some(2.25);
+            params.startup_full_bw_rounds = Some(2);
+            params.drain_cwnd_gain = Some(1.75);
+            params.drain_pacing_gain = Some(1.0 / 2.25);
+            params.probe_bw_cwnd_gain = Some(1.75);
+            params.probe_bw_up_cwnd_gain = Some(1.75);
+            params.enable_overestimate_avoidance = Some(true);
         }
-        if params.bbr_profile != ferrox_core::hysteria::BbrProfile::Standard {
-            config.set_custom_bbr_params(bbr);
+        BbrProfile::Aggressive => {
+            params.startup_cwnd_gain = Some(2.25);
+            params.startup_pacing_gain = Some(3.0);
+            params.startup_full_bw_rounds = Some(4);
+            params.drain_cwnd_gain = Some(2.25);
+            params.drain_pacing_gain = Some(1.0 / 3.0);
+            params.probe_bw_cwnd_gain = Some(2.5);
+            params.probe_bw_up_cwnd_gain = Some(2.25);
         }
     }
+    params
+}
+
+/// The controller a lane runs: the `quicParams` choice when the block names one, else the lane's own default.
+#[must_use]
+pub(crate) fn lane_controller(
+    cc: Option<ferrox_core::hysteria::Congestion>,
+    default_bbr: bool,
+) -> Option<ferrox_core::hysteria::Congestion> {
+    cc.or(default_bbr.then_some(ferrox_core::hysteria::Congestion::Bbr))
+}
+
+/// Install one lane's controller. `None` leaves quiche's CUBIC default alone; BBR, and a Brutal block whose
+/// reference fallback is BBR, also take the profile's knobs.
+pub(crate) fn apply_congestion(
+    config: &mut quiche::Config,
+    cc: Option<ferrox_core::hysteria::Congestion>,
+    profile: ferrox_core::hysteria::BbrProfile,
+) -> Option<()> {
+    use ferrox_core::hysteria::Congestion;
+    let cc = cc?;
+    config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
+    if matches!(cc, Congestion::Bbr | Congestion::Brutal) {
+        config.set_custom_bbr_params(bbr_params(profile));
+    }
+    Some(())
+}
+
+/// The controller a lane with a `quicParams` block runs: the block's profile, or the reference's standard where no block is present.
+pub(crate) fn apply_lane_congestion(
+    config: &mut quiche::Config,
+    cc: Option<ferrox_core::hysteria::Congestion>,
+    params: Option<&ferrox_core::hysteria::QuicParams>,
+) -> Option<()> {
+    use ferrox_core::hysteria::BbrProfile;
+    let profile = params.map_or(BbrProfile::Standard, |params| params.bbr_profile);
+    apply_congestion(config, cc, profile)
 }
 
 /// The peak rate a Brutal lane's own `brutalUp` names, in the megabits per second quiche's pacing ceiling
@@ -774,7 +818,13 @@ pub(crate) fn with_config<T>(
             Arc::clone(cell)
         } else {
             let staged = crate::foxy::debug_on().then(Instant::now);
-            let config = quiche_config(roots, None)?;
+            let mut config = quiche_config(roots, None)?;
+            // An h3 service lane with no `quicParams` runs the reference's BBR, never quiche's CUBIC default.
+            apply_congestion(
+                &mut config,
+                Some(ferrox_core::hysteria::Congestion::Bbr),
+                ferrox_core::hysteria::BbrProfile::Standard,
+            )?;
             debug_staged(staged);
             let cell = Arc::new(Mutex::new(config));
             configs.insert(roots.to_vec(), Arc::clone(&cell));
@@ -5621,6 +5671,268 @@ mod tests {
         );
     }
 
+    /// The knobs a profile overrides, read against quiche's own defaults: the count is the row the page publishes.
+    fn moved_knobs(params: &quiche::BbrParams) -> Vec<&'static str> {
+        let d = quiche::BbrParams::default();
+        [
+            (
+                "startup_cwnd_gain",
+                params.startup_cwnd_gain == d.startup_cwnd_gain,
+            ),
+            (
+                "startup_pacing_gain",
+                params.startup_pacing_gain == d.startup_pacing_gain,
+            ),
+            (
+                "full_bw_threshold",
+                params.full_bw_threshold == d.full_bw_threshold,
+            ),
+            (
+                "startup_full_bw_rounds",
+                params.startup_full_bw_rounds == d.startup_full_bw_rounds,
+            ),
+            (
+                "startup_full_loss_count",
+                params.startup_full_loss_count == d.startup_full_loss_count,
+            ),
+            (
+                "drain_cwnd_gain",
+                params.drain_cwnd_gain == d.drain_cwnd_gain,
+            ),
+            (
+                "drain_pacing_gain",
+                params.drain_pacing_gain == d.drain_pacing_gain,
+            ),
+            (
+                "enable_reno_coexistence",
+                params.enable_reno_coexistence == d.enable_reno_coexistence,
+            ),
+            (
+                "enable_overestimate_avoidance",
+                params.enable_overestimate_avoidance == d.enable_overestimate_avoidance,
+            ),
+            (
+                "probe_bw_probe_up_pacing_gain",
+                params.probe_bw_probe_up_pacing_gain == d.probe_bw_probe_up_pacing_gain,
+            ),
+            (
+                "probe_bw_probe_down_pacing_gain",
+                params.probe_bw_probe_down_pacing_gain == d.probe_bw_probe_down_pacing_gain,
+            ),
+            (
+                "probe_bw_cwnd_gain",
+                params.probe_bw_cwnd_gain == d.probe_bw_cwnd_gain,
+            ),
+            (
+                "probe_bw_up_cwnd_gain",
+                params.probe_bw_up_cwnd_gain == d.probe_bw_up_cwnd_gain,
+            ),
+            (
+                "probe_rtt_pacing_gain",
+                params.probe_rtt_pacing_gain == d.probe_rtt_pacing_gain,
+            ),
+            (
+                "probe_rtt_cwnd_gain",
+                params.probe_rtt_cwnd_gain == d.probe_rtt_cwnd_gain,
+            ),
+            (
+                "max_probe_up_queue_rounds",
+                params.max_probe_up_queue_rounds == d.max_probe_up_queue_rounds,
+            ),
+            ("loss_threshold", params.loss_threshold == d.loss_threshold),
+            (
+                "initial_pacing_rate_bytes_per_second",
+                params.initial_pacing_rate_bytes_per_second
+                    == d.initial_pacing_rate_bytes_per_second,
+            ),
+            (
+                "min_cwnd_packets",
+                params.min_cwnd_packets == d.min_cwnd_packets,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, same)| (!same).then_some(name))
+        .collect()
+    }
+
+    #[test]
+    fn the_three_profiles_move_the_gains_and_nothing_else() {
+        use ferrox_core::hysteria::BbrProfile;
+        let conservative = bbr_params(BbrProfile::Conservative);
+        let aggressive = bbr_params(BbrProfile::Aggressive);
+        assert_eq!(
+            bbr_params(BbrProfile::Standard),
+            quiche::BbrParams::default(),
+            "the standard profile is quiche's own gains, never a silent second set"
+        );
+        assert_eq!(
+            moved_knobs(&conservative),
+            [
+                "startup_cwnd_gain",
+                "startup_pacing_gain",
+                "startup_full_bw_rounds",
+                "drain_cwnd_gain",
+                "drain_pacing_gain",
+                "enable_overestimate_avoidance",
+                "probe_bw_cwnd_gain",
+                "probe_bw_up_cwnd_gain",
+            ],
+            "eight knobs, and the same eight the reference's conservative profile names"
+        );
+        assert_eq!(
+            moved_knobs(&aggressive),
+            [
+                "startup_cwnd_gain",
+                "startup_pacing_gain",
+                "startup_full_bw_rounds",
+                "drain_cwnd_gain",
+                "drain_pacing_gain",
+                "probe_bw_cwnd_gain",
+                "probe_bw_up_cwnd_gain",
+            ],
+            "aggressive leaves the overestimate guard on quiche's default"
+        );
+        assert_eq!(
+            (
+                conservative.startup_pacing_gain,
+                conservative.startup_cwnd_gain,
+                conservative.startup_full_bw_rounds,
+                conservative.drain_pacing_gain,
+                conservative.probe_bw_up_cwnd_gain,
+            ),
+            (
+                Some(2.25),
+                Some(1.75),
+                Some(2),
+                Some(1.0 / 2.25),
+                Some(1.75)
+            )
+        );
+        assert_eq!(
+            (
+                aggressive.startup_pacing_gain,
+                aggressive.startup_cwnd_gain,
+                aggressive.startup_full_bw_rounds,
+                aggressive.drain_pacing_gain,
+                aggressive.probe_bw_up_cwnd_gain,
+            ),
+            (Some(3.0), Some(2.25), Some(4), Some(1.0 / 3.0), Some(2.25))
+        );
+        assert_eq!(conservative.enable_overestimate_avoidance, Some(true));
+    }
+
+    #[test]
+    fn a_lane_defaults_to_the_references_controller_only_when_it_asks() {
+        use ferrox_core::hysteria::Congestion;
+        assert_eq!(
+            lane_controller(None, false),
+            None,
+            "no block, no choice: quiche's CUBIC"
+        );
+        assert_eq!(
+            lane_controller(None, true),
+            Some(Congestion::Bbr),
+            "an h3 lane is the reference's BBR"
+        );
+        assert_eq!(
+            lane_controller(Some(Congestion::Cubic), true),
+            Some(Congestion::Cubic)
+        );
+        assert_eq!(
+            lane_controller(Some(Congestion::Reno), false),
+            Some(Congestion::Reno)
+        );
+        assert_eq!(
+            lane_controller(Some(Congestion::Brutal), true),
+            Some(Congestion::Brutal)
+        );
+    }
+
+    #[test]
+    fn a_named_controller_reaches_the_lane() {
+        use ferrox_core::hysteria::{BbrProfile, Congestion};
+        for (cc, name) in [
+            (Congestion::Cubic, "cubic"),
+            (Congestion::Reno, "reno"),
+            (Congestion::Bbr, "bbr"),
+            (Congestion::Brutal, "bbr"),
+        ] {
+            let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
+            assert_eq!(cc.quiche_name(), name);
+            assert!(apply_congestion(&mut config, Some(cc), BbrProfile::Standard).is_some());
+        }
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
+        assert!(apply_congestion(&mut config, None, BbrProfile::Standard).is_none());
+    }
+
+    #[test]
+    fn every_controller_carries_the_same_bytes() {
+        use ferrox_core::hysteria::Congestion;
+        let identity = minted_identity_for("first.test");
+        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i * 7) as u8).collect();
+        for cc in [
+            Congestion::Cubic,
+            Congestion::Reno,
+            Congestion::Bbr,
+            Congestion::Brutal,
+        ] {
+            let (mut client, mut server) = lane_pair_raw(
+                &identity,
+                Some("first.test"),
+                &identity.certs[0].cert_chain,
+                None,
+                true,
+                Some(cc),
+            );
+            let mut sent = 0;
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 8192];
+            for _ in 0..600 {
+                if sent < payload.len() {
+                    match client.conn.stream_send(0, &payload[sent..], false) {
+                        Ok(n) => sent += n,
+                        Err(quiche::Error::Done) => {}
+                        Err(error) => panic!("{cc:?} sends: {error:?}"),
+                    }
+                    if sent == payload.len() {
+                        client.conn.stream_send(0, b"", true).expect("finishes");
+                    }
+                }
+                pass(
+                    &mut client.conn,
+                    &client.sock,
+                    &mut server.conn,
+                    &server.sock,
+                    server.addr,
+                );
+                pass(
+                    &mut server.conn,
+                    &server.sock,
+                    &mut client.conn,
+                    &client.sock,
+                    client.addr,
+                );
+                loop {
+                    match server.conn.stream_recv(0, &mut buf) {
+                        Ok((n, fin)) => {
+                            got.extend_from_slice(&buf[..n]);
+                            if fin {
+                                break;
+                            }
+                        }
+                        Err(quiche::Error::Done) => break,
+                        Err(error) => panic!("{cc:?} reads: {error:?}"),
+                    }
+                }
+                if got.len() == payload.len() {
+                    break;
+                }
+            }
+            assert_eq!(got.len(), payload.len(), "{cc:?} delivers every byte");
+            assert!(got == payload, "{cc:?} carries the payload byte for byte");
+        }
+    }
+
     #[test]
     fn a_brutal_rate_becomes_a_pacing_ceiling_in_megabits() {
         use ferrox_core::hysteria::Congestion;
@@ -6126,8 +6438,14 @@ mod tests {
             .certs
             .push(minted_identity_for("second.test").certs.remove(0));
         identity.reject_unknown_sni = true;
-        let (client, server) =
-            lane_pair_raw(&identity, None, &identity.certs[0].cert_chain, None, false);
+        let (client, server) = lane_pair_raw(
+            &identity,
+            None,
+            &identity.certs[0].cert_chain,
+            None,
+            false,
+            None,
+        );
         assert!(
             !client.conn.is_established() && !server.conn.is_established(),
             "an unnamed hello is refused when the list rejects unknown names"
@@ -6147,6 +6465,7 @@ mod tests {
             &identity.certs[0].cert_chain,
             None,
             false,
+            None,
         );
         assert!(
             !client.conn.is_established() && !server.conn.is_established(),
@@ -6684,7 +7003,7 @@ mod tests {
         roots: &[Vec<u8>],
         offer: Option<&[u8]>,
     ) -> (Lane, Lane) {
-        let (client, server) = lane_pair_raw(identity, name, roots, offer, true);
+        let (client, server) = lane_pair_raw(identity, name, roots, offer, true, None);
         assert!(
             client.conn.is_established() && server.conn.is_established(),
             "the lane handshook over the very sweep under test"
@@ -6698,8 +7017,10 @@ mod tests {
         roots: &[Vec<u8>],
         offer: Option<&[u8]>,
         verify: bool,
+        cc: Option<ferrox_core::hysteria::Congestion>,
     ) -> (Lane, Lane) {
         let mut server_config = serve_config(identity).expect("serves");
+        apply_lane_congestion(&mut server_config, cc, None);
         server_config.set_active_connection_id_limit(4);
         let mut client_config = if verify {
             quiche_config(roots, None).expect("trusts")
@@ -6709,6 +7030,7 @@ mod tests {
             config.set_application_protos(&[ALPN]).expect("negotiates");
             config
         };
+        apply_lane_congestion(&mut client_config, cc, None);
         client_config.set_active_connection_id_limit(4);
         let server_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
         let server_addr = server_sock.local_addr().expect("addr");

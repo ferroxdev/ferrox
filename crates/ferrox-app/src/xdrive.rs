@@ -674,6 +674,7 @@ fn quic_of(
     let cc = match text("congestion").as_str() {
         "" | "bbr" => Some(Congestion::Bbr),
         "reno" => Some(Congestion::Reno),
+        "cubic" => Some(Congestion::Cubic),
         "brutal" | "force-brutal" => Some(Congestion::Brutal),
         other => return Err(format!("unsupported congestion control over h3: {other}")),
     };

@@ -470,6 +470,10 @@ carrier-quic quic-config-builds-per-warm-dial 0 ferrox-app-quic::tests::one_trus
 carrier-quic quic-config-lookup-allocations 0 ferrox-app-quic::tests::a_warm_config_lookup_allocates_nothing
 carrier-quic quic-resumed-dials-before-each-cold-one 1 ferrox-app-quic::tests::a_second_dial_to_an_edge_leaves_with_early_data
 carrier-quic client-migrations 1 ferrox-app-quic::tests::a_stream_migrates_its_connection_to_a_new_local
+carrier-quic congestion-controllers 3 ferrox-core-hysteria::tests::congestion_spellings_map_to_the_paced_default
+carrier-quic bbr-profiles 3 ferrox-app-quic::tests::the_three_profiles_move_the_gains_and_nothing_else
+carrier-quic bbr-knobs-set-by-a-profile 8 ferrox-app-quic::tests::the_three_profiles_move_the_gains_and_nothing_else
+carrier-quic standard-profile-overrides 0 ferrox-app-quic::tests::the_three_profiles_move_the_gains_and_nothing_else
 
 reality-tls ops-retired-instructions UNBLESSED scripts/count-ops.sh
 reality-tls tls-providers 1 ferrox-core::active_backends

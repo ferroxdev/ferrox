@@ -72,8 +72,12 @@ fn connect(dial: &Dial) -> Option<Session> {
     let roots = dial.roots.as_deref().unwrap_or(&[]);
     let (sock, peer, local) = crate::quic::udp_to_server(&dial.address, dial.port)?;
     let cid = crate::quic::hysteria_client_cid(dial.config.quic.as_ref())?;
-    let mut config =
-        crate::quic::quiche_config_alpn(roots, Some(dial.config.cc.quiche_name()), &[wire::ALPN])?;
+    let mut config = crate::quic::quiche_config_alpn(roots, None, &[wire::ALPN])?;
+    crate::quic::apply_lane_congestion(
+        &mut config,
+        Some(dial.config.cc),
+        dial.config.quic.as_ref(),
+    )?;
     if let Some(params) = &dial.config.quic {
         crate::quic::apply_hysteria_quic(&mut config, params, false);
     }
@@ -535,7 +539,7 @@ fn server_config(
 ) -> Option<quiche::Config> {
     let mut config = crate::quic::tls_config(identity)?;
     config.set_application_protos(&[wire::ALPN]).ok()?;
-    config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
+    crate::quic::apply_lane_congestion(&mut config, Some(cc), quic)?;
     config.enable_dgram(true, 1024, 1024);
     config.set_max_idle_timeout(30_000);
     config.set_initial_max_data(20 * 1024 * 1024);
