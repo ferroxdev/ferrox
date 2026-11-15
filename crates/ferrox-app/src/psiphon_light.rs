@@ -1271,9 +1271,7 @@ mod tests {
         stream.write_all(b"hello").expect("write");
         assert!(!stream.write_padding_done);
         assert_ne!(stream.inner.get_ref(), b"hello");
-        stream
-            .write_all(&[0u8; PADDING_MAX])
-            .expect("stop padding");
+        stream.write_all(&[0u8; PADDING_MAX]).expect("stop padding");
         assert!(stream.write_padding_done);
         let mut rest = [0u8; 3];
         stream.read_exact(&mut rest).expect("plain");
