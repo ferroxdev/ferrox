@@ -4,9 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::IoSliceMut;
 use std::io::{IoSlice, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{
-    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::thread;
