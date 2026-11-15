@@ -86,7 +86,7 @@ printf '%s %s %s %s\n' '<doc>' '<key>' '<value>' '<checker>' >> scripts/method-c
 | Psiphon lane (native SSH/OSSH, SOCKS + HTTP edges, upstream hop) | [carrier-psiphon](docs/function/carrier-psiphon.md) | 1 handshake per tunnel | 0 per flow clone | `UNBLESSED` | native vs console client, live (CI) |
 | Hysteria v2 | [carrier-hysteria](docs/function/carrier-hysteria.md) | 1 handshake per pooled outbound | 0 extra on datagram lane | `UNBLESSED` | not measured |
 | REALITY / TLS | [reality-tls](docs/function/reality-tls.md) | per handshake | per handshake | `UNBLESSED` | `vless-tls-raw-*` arm (CI) |
-| KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment | in place, pooled | `UNBLESSED` | not measured |
+| KCP | [kcp](docs/function/kcp.md) | 1 sendmmsg per up to 64 segments | in place, pooled | `UNBLESSED` | not measured |
 | dokodemo-door inbound | [front-dokodemo](docs/function/front-dokodemo.md) | 1 send + 1 recv per datagram; 1 recvmsg + 1 sendto per transparent datagram | 1 (the relay's own) + 1 reply socket per transparent `(client, original)` | `UNBLESSED` | not measured |
 | health observatory + `leastPing`/`leastLoad` | [engine-observatory](docs/function/engine-observatory.md) | 1 dial per probe | 0 per sample put | `UNBLESSED` | not measured |
 | healthcheck inbound | [front-healthcheck](docs/function/front-healthcheck.md) | 1 answer write | 0 (prebuilt) | `UNBLESSED` | not measured |

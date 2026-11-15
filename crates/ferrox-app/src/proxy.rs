@@ -71021,7 +71021,7 @@ mod tests {
                     remote: local,
                     conversation,
                 },
-                Box::new(|_| Ok(())),
+                Box::new(|_: &[u8]| Ok(())),
                 Box::new(|| {}),
                 ferrox_core::kcp::Config::default(),
             ));

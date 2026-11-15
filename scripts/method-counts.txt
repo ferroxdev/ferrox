@@ -531,6 +531,8 @@ kcp receive-parse-allocations-per-segment 0 ferrox-core-kcp::segment::tests::a_d
 kcp ack-number-list-reallocations-per-flush 0 ferrox-core-kcp::window::tests::the_ack_list_reuses_its_scratch_across_flushes
 kcp ack-numbers-reallocations-per-cycle 0 ferrox-core-kcp::segment::tests::a_received_ack_reuses_its_number_list
 kcp segment-header-staging-copies-per-segment 0 ferrox-core-kcp::segment::tests::a_borrowed_payload_serialises_identically_to_an_owned_one
+kcp send-syscalls-per-flush UNBLESSED scripts/count-ops.sh
+kcp send-batches-per-200-segments 4 ferrox-core-kcp::window::tests::a_batched_flush_is_the_same_segments_in_the_same_order
 kcp segment-list-vectors-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next
 kcp reader-wakeups-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries
 kcp receiving-lock-acquisitions-per-multi-segment-datagram 1 ferrox-core-kcp::connection::tests::a_multi_segment_datagram_takes_the_receiving_lock_once

@@ -26,6 +26,8 @@ struct Outgoing {
 pub struct SendingWindow {
     cache: VecDeque<Outgoing>,
     arena: Vec<u8>,
+    /// The arena ranges the current flush owes the wire, filled by `prepare` and read by `emit_ready` so the header writes and the send do not interleave.
+    ready: Vec<(u32, u32)>,
     total_in_flight: u32,
 }
 
@@ -155,9 +157,52 @@ impl SendingWindow {
         option: SegmentOption,
         write: &mut dyn FnMut(&[u8]),
     ) -> Option<u32> {
+        let rate = self.prepare(current, rto, max_in_flight, conv, sending_next, option);
+        self.emit_ready(&mut |segments: &[&[u8]]| {
+            for &segment in segments {
+                write(segment);
+            }
+        });
+        rate
+    }
+
+    /// The same segments `flush` writes, handed over in batches so a socket writer can send a flush in one call.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one header build per segment, not an API surface"
+    )]
+    pub(crate) fn flush_batched(
+        &mut self,
+        current: u32,
+        rto: u32,
+        max_in_flight: u32,
+        conv: u16,
+        sending_next: u32,
+        option: SegmentOption,
+        write: &mut dyn FnMut(&[&[u8]]),
+    ) -> Option<u32> {
+        let rate = self.prepare(current, rto, max_in_flight, conv, sending_next, option);
+        self.emit_ready(write);
+        rate
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one header build per segment, not an API surface"
+    )]
+    fn prepare(
+        &mut self,
+        current: u32,
+        rto: u32,
+        max_in_flight: u32,
+        conv: u16,
+        sending_next: u32,
+        option: SegmentOption,
+    ) -> Option<u32> {
         let mut lost = 0u32;
         let mut in_flight = 0u32;
-        // `self.cache` and `self.arena` are disjoint fields, so a segment's header is written into the arena and the whole range handed out while the entry it came from is still borrowed from the cache.
+        self.ready.clear();
+        // `self.cache`, `self.ready` and `self.arena` are disjoint fields, so a segment's header is written into the arena and its whole range recorded while the entry it came from is still borrowed from the cache.
         for seg in &mut self.cache {
             if current.wrapping_sub(seg.timeout) >= 0x7FFF_FFFF {
                 continue;
@@ -171,7 +216,7 @@ impl SendingWindow {
             seg.transmit += 1;
             let start = seg.start;
             let end = seg.end;
-            // Drop the fresh header into the gap, then hand the writer the whole arena range: the payload goes to the socket without a second copy.
+            // Drop the fresh header into the gap, then record the whole arena range: the payload goes to the socket without a second copy.
             write_data_header(
                 OutgoingHeader {
                     conv,
@@ -183,7 +228,7 @@ impl SendingWindow {
                 (end - start - DATA_HEADER) as u16,
                 &mut self.arena[start..start + DATA_HEADER],
             );
-            write(&self.arena[start..end]);
+            self.ready.push((start as u32, end as u32));
             in_flight += 1;
             if in_flight >= max_in_flight {
                 break;
@@ -193,6 +238,23 @@ impl SendingWindow {
             Some(lost * 100 / self.total_in_flight)
         } else {
             None
+        }
+    }
+
+    fn emit_ready(&self, write: &mut dyn FnMut(&[&[u8]])) {
+        const PER_CALL: usize = 64;
+        let mut batch: [&[u8]; PER_CALL] = [&[]; PER_CALL];
+        let mut count = 0;
+        for &(start, end) in &self.ready {
+            batch[count] = &self.arena[start as usize..end as usize];
+            count += 1;
+            if count == PER_CALL {
+                write(&batch[..count]);
+                count = 0;
+            }
+        }
+        if count > 0 {
+            write(&batch[..count]);
         }
     }
 }
@@ -466,6 +528,34 @@ mod tests {
 
     fn seg_payload(segment: &[u8]) -> &[u8] {
         &segment[DATA_HEADER..]
+    }
+
+    /// The batched writer is the single-segment writer with fewer calls: same segments, same order, same bytes.
+    #[test]
+    fn a_batched_flush_is_the_same_segments_in_the_same_order() {
+        let mut single = SendingWindow::new();
+        let mut batched = SendingWindow::new();
+        for n in 0..200u32 {
+            let payload = [n as u8; 64];
+            single.push(n, &payload);
+            batched.push(n, &payload);
+        }
+        let mut one = Vec::new();
+        single.flush(0, 100, 1024, 7, 3, SegmentOption::NONE, &mut |segment| {
+            one.push(segment.to_vec());
+        });
+        let mut many = Vec::new();
+        let mut calls = 0;
+        batched.flush_batched(0, 100, 1024, 7, 3, SegmentOption::NONE, &mut |batch| {
+            calls += 1;
+            assert!(batch.len() <= 64, "a batch stays inside one call's worth");
+            for &segment in batch {
+                many.push(segment.to_vec());
+            }
+        });
+        assert_eq!(one, many);
+        assert_eq!(one.len(), 200);
+        assert_eq!(calls, 4, "200 segments leave in four calls");
     }
 
     #[test]

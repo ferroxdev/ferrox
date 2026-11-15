@@ -11,7 +11,7 @@ mod worker;
 mod oracle;
 
 pub use config::Config;
-pub use connection::{ConnError, ConnMetadata, Connection, State};
+pub use connection::{ConnError, ConnMetadata, Connection, SegmentWriter, State};
 pub use listener::{dial, dial_with, fresh_conversation, Listener};
 pub use mask::{Encoder, HeaderKind, Mask, Spec, SpecError};
 pub use segment::{

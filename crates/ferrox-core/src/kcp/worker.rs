@@ -176,15 +176,15 @@ impl SendingWorker {
             } else {
                 SegmentOption::NONE
             };
-            let rate = self.window.flush(
+            let rate = self.window.flush_batched(
                 current,
                 rto,
                 cwnd,
                 conv,
                 first_unack,
                 option,
-                &mut |segment| {
-                    let _ = ctx.emit_slice(segment);
+                &mut |segments| {
+                    let _ = ctx.emit_slices(segments);
                 },
             );
             if let Some(rate) = rate {

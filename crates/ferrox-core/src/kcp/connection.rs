@@ -34,7 +34,25 @@ impl State {
     }
 }
 
-type Writer = Box<dyn FnMut(&[u8]) -> io::Result<()> + Send>;
+/// Where a connection hands its segments; a socket writer may send a whole flush in one call.
+pub trait SegmentWriter: Send {
+    fn send(&mut self, segment: &[u8]) -> io::Result<()>;
+
+    fn send_batch(&mut self, segments: &[&[u8]]) -> io::Result<()> {
+        for segment in segments {
+            self.send(segment)?;
+        }
+        Ok(())
+    }
+}
+
+impl<F: FnMut(&[u8]) -> io::Result<()> + Send> SegmentWriter for F {
+    fn send(&mut self, segment: &[u8]) -> io::Result<()> {
+        self(segment)
+    }
+}
+
+type Writer = Box<dyn SegmentWriter>;
 
 #[cfg(test)]
 type LockGate = dyn Fn(&'static str) + Send + Sync;
@@ -200,7 +218,7 @@ impl Ctx {
                 let OutputSink { buf, write } = &mut *sink;
                 buf.clear();
                 enc(buf);
-                write(buf)
+                write.send(buf)
             };
             match outcome {
                 Ok(()) => return Ok(()),
@@ -217,7 +235,30 @@ impl Ctx {
         for _ in 0..WRITE_ATTEMPTS {
             let outcome = {
                 let mut sink = self.output.lock().unwrap();
-                (sink.write)(data)
+                sink.write.send(data)
+            };
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(e) if transient(&e) => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| io::Error::other("segment write")))
+    }
+
+    /// A flush's segments leave in one socket call where the writer can take a batch; a failed call sent nothing, so the retry repeats no datagram.
+    pub(crate) fn emit_slices(&self, segments: &[&[u8]]) -> io::Result<()> {
+        if segments.len() <= 1 {
+            return match segments.first() {
+                Some(&segment) => self.emit_slice(segment),
+                None => Ok(()),
+            };
+        }
+        let mut last = None;
+        for _ in 0..WRITE_ATTEMPTS {
+            let outcome = {
+                let mut sink = self.output.lock().unwrap();
+                sink.write.send_batch(segments)
             };
             match outcome {
                 Ok(()) => return Ok(()),
@@ -865,7 +906,7 @@ mod tests {
                 remote: local,
                 conversation: 4,
             },
-            Box::new(|_| Ok(())),
+            Box::new(|_: &[u8]| Ok(())),
             Box::new(|| {}),
             Config::default(),
         );
@@ -906,7 +947,7 @@ mod tests {
                 remote: local,
                 conversation: 4,
             },
-            Box::new(|_| Ok(())),
+            Box::new(|_: &[u8]| Ok(())),
             Box::new(|| {}),
             Config::default(),
         );
@@ -932,7 +973,7 @@ mod tests {
                 remote: local,
                 conversation: 4,
             },
-            Box::new(|_| Ok(())),
+            Box::new(|_: &[u8]| Ok(())),
             Box::new(|| {}),
             Config::default(),
         );
@@ -960,7 +1001,7 @@ mod tests {
                 remote: local,
                 conversation: 4,
             },
-            Box::new(|_| Ok(())),
+            Box::new(|_: &[u8]| Ok(())),
             Box::new(|| {}),
             Config::default(),
         );
@@ -1019,7 +1060,7 @@ mod tests {
                 remote: local,
                 conversation: 4,
             },
-            Box::new(|_| Ok(())),
+            Box::new(|_: &[u8]| Ok(())),
             Box::new(|| {}),
             Config::default(),
         )
@@ -1281,7 +1322,7 @@ mod tests {
                 remote: local,
                 conversation: 4,
             },
-            Box::new(|_| Ok(())),
+            Box::new(|_: &[u8]| Ok(())),
             Box::new(|| {}),
             config,
         );

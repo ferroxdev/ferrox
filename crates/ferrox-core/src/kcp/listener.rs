@@ -11,11 +11,142 @@ use super::config::Config;
 /// The room a datagram is received into: the largest a KCP datagram can be.
 const DATAGRAM_MAX: usize = 65_536;
 
-use super::connection::{ConnMetadata, Connection};
+use super::connection::{ConnMetadata, Connection, SegmentWriter};
 use super::mask::Encoder;
 use super::segment::{read_segment, Command, Segment};
 
-type Writer = Box<dyn FnMut(&[u8]) -> io::Result<()> + Send>;
+type Writer = Box<dyn SegmentWriter>;
+
+/// The connection's socket; a flush leaves as one `sendmmsg` and every segment is still its own datagram.
+struct UdpWriter {
+    sock: UdpSocket,
+    peer: Option<SocketAddr>,
+    mask: Option<Encoder>,
+}
+
+impl UdpWriter {
+    fn new(sock: UdpSocket, peer: Option<SocketAddr>, config: &Config) -> Self {
+        let mask = (!config.mask.is_empty()).then(|| Encoder::new(&config.mask));
+        Self { sock, peer, mask }
+    }
+}
+
+fn send_one(sock: &UdpSocket, peer: Option<SocketAddr>, data: &[u8]) -> io::Result<()> {
+    match peer {
+        Some(addr) => sock.send_to(data, addr).map(|_| ()),
+        None => sock.send(data).map(|_| ()),
+    }
+}
+
+impl SegmentWriter for UdpWriter {
+    fn send(&mut self, segment: &[u8]) -> io::Result<()> {
+        let Self { sock, peer, mask } = self;
+        match mask {
+            None => send_one(sock, *peer, segment),
+            Some(enc) => match enc.encode(segment) {
+                Some(wire) => send_one(sock, *peer, wire),
+                None => Err(io::Error::other("no entropy for the mask")),
+            },
+        }
+    }
+
+    // A masked segment is encoded into the encoder's one buffer, so it is sent before the next is built; unmasked segments go out together.
+    fn send_batch(&mut self, segments: &[&[u8]]) -> io::Result<()> {
+        if self.mask.is_some() {
+            for &segment in segments {
+                self.send(segment)?;
+            }
+            return Ok(());
+        }
+        send_many(&self.sock, self.peer, segments)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_many(sock: &UdpSocket, peer: Option<SocketAddr>, segments: &[&[u8]]) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    const PER_CALL: usize = 64;
+    let (storage, namelen) = peer.map_or_else(
+        || (unsafe { std::mem::zeroed::<libc::sockaddr_storage>() }, 0),
+        sockaddr_of,
+    );
+    let fd = sock.as_raw_fd();
+    let mut sent = 0;
+    while sent < segments.len() {
+        let take = (segments.len() - sent).min(PER_CALL);
+        let mut iovs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; PER_CALL];
+        let mut msgs: [libc::mmsghdr; PER_CALL] = unsafe { std::mem::zeroed() };
+        for (i, segment) in segments[sent..sent + take].iter().enumerate() {
+            iovs[i] = libc::iovec {
+                iov_base: segment.as_ptr().cast_mut().cast(),
+                iov_len: segment.len(),
+            };
+            msgs[i].msg_hdr.msg_iov = &raw mut iovs[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+            if peer.is_some() {
+                msgs[i].msg_hdr.msg_name = (&raw const storage).cast_mut().cast();
+                msgs[i].msg_hdr.msg_namelen = namelen;
+            }
+        }
+        let sent_now = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), take as libc::c_uint, 0) };
+        if sent_now < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if sent_now == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "sendmmsg sent nothing",
+            ));
+        }
+        sent += sent_now as usize;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn send_many(sock: &UdpSocket, peer: Option<SocketAddr>, segments: &[&[u8]]) -> io::Result<()> {
+    for segment in segments {
+        send_one(sock, peer, segment)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        SocketAddr::V4(addr) => {
+            // SAFETY: a `sockaddr_in` is shorter and no more aligned than the storage it is built in.
+            let sin = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in>() };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = addr.port().to_be();
+            sin.sin_addr = libc::in_addr {
+                s_addr: u32::from_ne_bytes(addr.ip().octets()),
+            };
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        SocketAddr::V6(addr) => {
+            // SAFETY: a `sockaddr_in6` is shorter and no more aligned than the storage it is built in.
+            let sin6 = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in6>() };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = addr.port().to_be();
+            sin6.sin6_addr = libc::in6_addr {
+                s6_addr: addr.ip().octets(),
+            };
+            sin6.sin6_scope_id = addr.scope_id();
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
+}
 
 static NEXT_CONVERSATION: AtomicU16 = AtomicU16::new(1);
 
@@ -155,18 +286,8 @@ fn start(
             return Err(e);
         }
     };
-    // A masked dial wraps the socket writer in the encoder; an unmasked dial keeps the previous closure untouched.
-    let writer: Writer = if config.mask.is_empty() {
-        Box::new(move |data: &[u8]| sock_w.send(data).map(|_| ()))
-    } else {
-        let mut enc = Encoder::new(&config.mask);
-        Box::new(move |data: &[u8]| {
-            let Some(wire) = enc.encode(data) else {
-                return Err(io::Error::other("no entropy for the mask"));
-            };
-            sock_w.send(wire).map(|_| ())
-        })
-    };
+    // A masked dial wraps the socket in the encoder; an unmasked dial keeps the plain writer.
+    let writer: Writer = Box::new(UdpWriter::new(sock_w, None, &config));
     let closer_client = Arc::clone(client);
     let closer = Box::new(move || {
         release_client(&closer_client, conv);
@@ -325,17 +446,8 @@ impl Listener {
                         let Ok(sock_w) = sock_r.try_clone() else {
                             continue;
                         };
-                        let writer: Writer = if inner.config.mask.is_empty() {
-                            Box::new(move |data: &[u8]| sock_w.send_to(data, src).map(|_| ()))
-                        } else {
-                            let mut enc = Encoder::new(&inner.config.mask);
-                            Box::new(move |data: &[u8]| {
-                                let Some(wire) = enc.encode(data) else {
-                                    return Err(io::Error::other("no entropy for the mask"));
-                                };
-                                sock_w.send_to(wire, src).map(|_| ())
-                            })
-                        };
+                        let writer: Writer =
+                            Box::new(UdpWriter::new(sock_w, Some(src), &inner.config));
                         let sessions_slot = Arc::downgrade(&inner);
                         let closer: Box<dyn FnOnce() + Send> = Box::new(move || {
                             if let Some(inner) = sessions_slot.upgrade() {
@@ -430,6 +542,32 @@ mod tests {
         assert_eq!(room.len(), DATAGRAM_MAX, "and it is the whole datagram");
     }
 
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore = "binds loopback UDP sockets and waits")]
+    #[test]
+    fn a_batch_leaves_as_separate_datagrams() {
+        let receiver =
+            UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind sender");
+        let segments: [&[u8]; 3] = [b"one", b"two", b"three"];
+        send_many(
+            &sender,
+            Some(receiver.local_addr().expect("addr")),
+            &segments,
+        )
+        .expect("send");
+        let mut buf = [0u8; 64];
+        let mut got = Vec::new();
+        for _ in 0..segments.len() {
+            let (n, _) = receiver.recv_from(&mut buf).expect("recv");
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(got, segments.iter().map(|s| s.to_vec()).collect::<Vec<_>>());
+    }
+
     #[cfg_attr(miri, ignore = "binds loopback UDP sockets and waits")]
     #[test]
     fn the_listener_caps_sessions_before_accept() {
@@ -483,7 +621,7 @@ mod tests {
                 remote: local,
                 conversation: 1,
             },
-            Box::new(|_| Ok(())),
+            Box::new(|_: &[u8]| Ok(())),
             closer,
             Config::default(),
         );
