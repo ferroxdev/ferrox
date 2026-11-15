@@ -5,7 +5,7 @@ use std::io::IoSliceMut;
 use std::io::{IoSlice, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{
-    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
@@ -3901,11 +3901,11 @@ pub(crate) struct FoxyOut {
     /// Until when the probes are known to answer a country other than the pin: a sweep that reached an edge and agreed with none is the answer, and re-asking it per flow buys the same refusal again.
     exit_refuted_until: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The carrier each flow kind (TCP, UDP, CONNECT-IP) last opened, so `auto` can report the rung it actually used.
-    selected: std::sync::Arc<[AtomicU8; 3]>,
+    selected: std::sync::Arc<std::sync::Mutex<[u8; 3]>>,
 }
 
-fn carrier_slots() -> std::sync::Arc<[AtomicU8; 3]> {
-    std::sync::Arc::new(std::array::from_fn(|_| AtomicU8::new(u8::MAX)))
+fn carrier_slots() -> std::sync::Arc<std::sync::Mutex<[u8; 3]>> {
+    std::sync::Arc::new(std::sync::Mutex::new([u8::MAX; 3]))
 }
 
 impl FoxyOut {
@@ -3960,8 +3960,11 @@ impl FoxyOut {
             "ip" => 2,
             _ => return,
         };
-        if self.selected[slot].swap(carrier.key(), Ordering::Relaxed) != carrier.key() {
-            eprintln!("foxy: carrier {kind} {}", carrier.name());
+        if let Ok(mut selected) = self.selected.lock() {
+            if selected[slot] != carrier.key() {
+                selected[slot] = carrier.key();
+                eprintln!("foxy: carrier {kind} {}", carrier.name());
+            }
         }
     }
 
@@ -59668,9 +59671,10 @@ mod tests {
         foxy.note_carrier("tcp", Carrier::H1);
         foxy.note_carrier("udp", Carrier::H3);
         foxy.note_carrier("ip", Carrier::H2);
-        assert_eq!(foxy.selected[0].load(Ordering::Relaxed), Carrier::H1.key());
-        assert_eq!(foxy.selected[1].load(Ordering::Relaxed), Carrier::H3.key());
-        assert_eq!(foxy.selected[2].load(Ordering::Relaxed), Carrier::H2.key());
+        let selected = foxy.selected.lock().unwrap();
+        assert_eq!(selected[0], Carrier::H1.key());
+        assert_eq!(selected[1], Carrier::H3.key());
+        assert_eq!(selected[2], Carrier::H2.key());
     }
 
     /// The per-flow walk of the ladder costs no heap: the order is held in a fixed array, the edge's name is shared, and the pins and the hop are shared. A flow that collected the order into a vector, and copied the edge's four strings per carrier, paid for a list that never changes.

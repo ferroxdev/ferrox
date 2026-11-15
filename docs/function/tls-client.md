@@ -69,14 +69,10 @@ The two parse rows are the seven carrier forms in `tls_stream_cases`: raw, `kcp`
 
 ## What we removed
 
-- **The silent raw fallback.**  A SOCKS outbound with `security: "tls"` used to
-ignore the field and dial plain TCP; an HTTP outbound with a carrier used to keep the TLS config but dial its transport raw, so a `ws` config reached the server as a TLS ClientHello on the bare socket.  Both now hand the carrier to the session. `socks_tls_over_raw_reaches_echo`, `socks_tls_over_ws_reaches_echo`, `http_tls_over_raw_reaches_echo` and `http_tls_over_ws_reaches_echo` are the witnesses.
-- **The KCP refusal.** SOCKS and HTTP outbounds with `security: "tls"` and
-`network: "kcp"` used to be refused at parse time. They now dial KCP, run TLS inside it, and relay the front header inside that session; `socks_tls_over_kcp_reaches_echo` and `http_tls_over_kcp_reaches_echo` are the witnesses.
-- **The second relay shape.** The carried SOCKS and HTTP fronts split the session
-into one reader and one writer and hand it to `relay_sink`, so one direction's read cannot hold the other direction's write behind a shared lock. The raw branch uses the same split. The tests drive both branches; the point is structural, not a new copy count, so `relay-staging-copies-per-byte` stays `UNBLESSED`.
-- **The single-read SOCKS handshake.** The TLS session polls its transport on a 1 ms
-quantum; a handshake read that took the first `WouldBlock` for a refusal reset a flow under load. The SOCKS greeting, request and bound-address reads now wait out the poll under the handshake budget, and `a_handshake_read_waits_out_a_polled_transport` is the deterministic witness.
+- **The silent raw fallback.**  A SOCKS outbound with `security: "tls"` used to ignore the field and dial plain TCP; an HTTP outbound with a carrier used to keep the TLS config but dial its transport raw, so a `ws` config reached the server as a TLS ClientHello on the bare socket.  Both now hand the carrier to the session. `socks_tls_over_raw_reaches_echo`, `socks_tls_over_ws_reaches_echo`, `http_tls_over_raw_reaches_echo` and `http_tls_over_ws_reaches_echo` are the witnesses.
+- **The KCP refusal.** SOCKS and HTTP outbounds with `security: "tls"` and `network: "kcp"` used to be refused at parse time. They now dial KCP, run TLS inside it, and relay the front header inside that session; `socks_tls_over_kcp_reaches_echo` and `http_tls_over_kcp_reaches_echo` are the witnesses.
+- **The second relay shape.** The carried SOCKS and HTTP fronts split the session into one reader and one writer and hand it to `relay_sink`, so one direction's read cannot hold the other direction's write behind a shared lock. The raw branch uses the same split. The tests drive both branches; the point is structural, not a new copy count, so `relay-staging-copies-per-byte` stays `UNBLESSED`.
+- **The single-read SOCKS handshake.** The TLS session polls its transport on a 1 ms quantum; a handshake read that took the first `WouldBlock` for a refusal reset a flow under load. The SOCKS greeting, request and bound-address reads now wait out the poll under the handshake budget, and `a_handshake_read_waits_out_a_polled_transport` is the deterministic witness.
 
 The bullets above are removals against earlier Ferrox, not against the references. Against Xray-core, sing-box and ZeroNet no instruction, syscall, copy or time removal is claimed: each also dials TLS and hands it to the carrier, and this page has no comparison cell for a ratio.  The two parse rows and six echo rows are correctness witnesses; the four cost rows stay `UNBLESSED`.
 
