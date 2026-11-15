@@ -55,32 +55,15 @@ graph TD
 ## What was removed, and what was not
 
 - **The "parse `ocspStapling` as a ticker only" shape.** The field already named the reload
-  interval; now it names the staple fetch on the same one, for file-backed and inline entries
-  alike, and `reload_interval` takes the min of both. `reread` compares a fresh fetch against what
-  the listener serves, not what the config started with, so one new response swaps the config once
-  and a steady cache re-reads forever returns false (`a_renewed_staple_swaps_the_served_response`,
-  `a_file_backed_listener_reloads_the_certificate_it_serves`).
+interval; now it names the staple fetch on the same one, for file-backed and inline entries alike, and `reload_interval` takes the min of both. `reread` compares a fresh fetch against what the listener serves, not what the config started with, so one new response swaps the config once and a steady cache re-reads forever returns false (`a_renewed_staple_swaps_the_served_response`, `a_file_backed_listener_reloads_the_certificate_it_serves`).
 - **The missing VMess session cache.** `SessionHistory`-less headers were admitted twice; the
-  admission now refuses inside the lifetime, with the sweep folded into the check itself so no
-  extra thread exists. `the_history_refuses_a_session_within_its_lifetime`,
-  `the_history_names_the_user_and_the_body_material` and `the_history_sweeps_its_expired_entries`
-  carry the three verdicts.
+admission now refuses inside the lifetime, with the sweep folded into the check itself so no extra thread exists. `the_history_refuses_a_session_within_its_lifetime`, `the_history_names_the_user_and_the_body_material` and `the_history_sweeps_its_expired_entries` carry the three verdicts.
 - **The shaped lane's refusal of a status message.** A shaped server now answers with
-  `CertificateStatus` after the chain when its cert staples, and the shaped client consumes it
-  before the exchange instead of reading it as unexpected (`a_shaped_client_consumes_a_stapled_chains_status`).
+`CertificateStatus` after the chain when its cert staples, and the shaped client consumes it before the exchange instead of reading it as unexpected (`a_shaped_client_consumes_a_stapled_chains_status`).
 - **No second stapling mechanism.** xray-core-rust wraps the resolver in `ocsp-stapler`'s
-  background worker; this tree staples by attaching the response to the `CertifiedKey` every lane
-  already builds, and refreshes through the cert ticker it already runs. The costs that were *not*
-  removed: no client lane in this tree validates the staple — the rustls verifier traces it, the
-  Boring lane passes an empty response to its verify callback, and the shaped client carries it to
-  the same chain verifier — and the configured `https` responder is refused: Go's `http.Post`
-  would dial it, and this fetch is `http`-only, so a cert naming only `https` responders staples
-  nothing, warned once at load.
+background worker; this tree staples by attaching the response to the `CertifiedKey` every lane already builds, and refreshes through the cert ticker it already runs. The costs that were *not* removed: no client lane in this tree validates the staple — the rustls verifier traces it, the Boring lane passes an empty response to its verify callback, and the shaped client carries it to the same chain verifier — and the configured `https` responder is refused: Go's `http.Post` would dial it, and this fetch is `http`-only, so a cert naming only `https` responders staples nothing, warned once at load.
 - **The fetch is bounded once connected, not in total.** xray's fetch blocks dialing with no
-  bound; the fetch here bounds each read and write at 10 s and caps the response at 64 KiB, and
-  the connect runs on the process's own timeout the way `reality`'s splice dials, so a slow drip
-  responder can hold the ticker thread far longer than any one timeout. That is the named ceiling:
-  a slower responder gives up where Go holds a single write open.
+bound; the fetch here bounds each read and write at 10 s and caps the response at 64 KiB, and the connect runs on the process's own timeout the way `reality`'s splice dials, so a slow drip responder can hold the ticker thread far longer than any one timeout. That is the named ceiling: a slower responder gives up where Go holds a single write open.
 
 ## Pins
 

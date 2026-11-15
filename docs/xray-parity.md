@@ -32,8 +32,8 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | TUN inbound (`proxy/tun`) | done (row 32) |
 | uTLS fingerprints per connection | implemented, client (row 41): 50 names onto 31 pinned presets; psk and random families are not byte-gated |
 | ECH | done, both roles and both transports: `echSockopt` is applied to the DNS query socket, TLS serves and accepts an offer, and QUIC both dials with the same list and serves it while a client that omits it still falls back; an accepted offer is unchanged, a rejected TLS offer is redialled once with the BoringSSL retry list where Go's `SendAsRetry=false` sends none — a deliberate superset, not an open gap — and a rejected QUIC dial fails without a retry (row 42) |
-| VLESS stream encryption (`encryption` field, XOR/MLKEM) | partial (row 37): both roles raw/TLS/REALITY and carried ws/gRPC/httpUpgrade/xhttp (H1)/http header, Vision on raw, server UDP/mux/reverse and client UDP/mux served; Vision over carried and xhttp H2 open |
-| XTLS Vision UDP-over-443 flow | planned (row 38) |
+| VLESS stream encryption (`encryption` field, XOR/MLKEM) | implemented (row 37): both roles raw/TLS/REALITY and carried ws/gRPC/httpUpgrade/xhttp (H1/h2c)/http header, with Vision over carried; server UDP/mux/reverse and client UDP/mux served; xhttp over H2 is not carried |
+| XTLS Vision UDP-over-443 flow | implemented, outbound only (row 38): strips to Vision and widens the UDP 443 gate |
 | REALITY ML-DSA-65 binding (`mldsa65Seed` / `mldsa65Verify`) | partial (row 164; both fields are validated with the reference's lengths and messages, a seeded server signs the leaf's first extension with a deterministic ML-DSA-65 key over `HMAC-SHA512(auth_key, public \|\| ClientHello.Raw \|\| ServerHello.Raw)`, and a client with `mldsa65Verify` checks it; the ZeroNet oracle row `reality_with_the_mldsa65_binding_matches_the_oracle` is not wired yet) |
 
 ### Transports
