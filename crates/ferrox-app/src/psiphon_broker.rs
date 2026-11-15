@@ -513,6 +513,12 @@ impl Client {
         self.nat_type = nat_type;
     }
 
+    /// Apply this dial's remaining offer budget to a shared client.
+    pub(crate) fn set_offer_timeouts(&mut self, offer: Duration, personal: Duration) {
+        self.offer_timeout = offer;
+        self.offer_personal_timeout = personal;
+    }
+
     /// Build a client from a broker spec and one paired front.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect(

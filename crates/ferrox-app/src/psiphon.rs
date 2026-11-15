@@ -8149,13 +8149,15 @@ fn push_scan_builtin_candidates(
         let slots = u64::try_from(remaining / left).unwrap_or(0);
         let count = spec.candidate_count().min(slots);
         let mut number = 0;
-        while number < count {
+        let mut emitted = 0;
+        while emitted < count && number < spec.candidate_count() {
             let Some((candidate, next)) = spec.select_probe(number, skipped, shuffle_key) else {
                 break;
             };
             if !push_scan_variant(server, &candidate, front, expanded, variants) {
                 return;
             }
+            emitted += 1;
             number = next.max(number.saturating_add(1));
         }
     }

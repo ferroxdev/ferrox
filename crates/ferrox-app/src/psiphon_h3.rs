@@ -150,7 +150,7 @@ impl FramedQuic {
 
     fn receive(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if self.record.is_empty() {
-            while self.header_at < self.header.len() {
+            if self.header_at < self.header.len() {
                 match self.stream.read(&mut self.header[self.header_at..]) {
                     Ok(0) if self.header_at == 0 => return Ok(0),
                     Ok(0) => {
@@ -163,6 +163,9 @@ impl FramedQuic {
                     Err(error) => return Err(error),
                 }
             }
+            if self.header_at < self.header.len() {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
             let length = usize::from(u16::from_be_bytes(self.header));
             self.header_at = 0;
             if length == 0 || length > buffer.len() {
@@ -174,19 +177,20 @@ impl FramedQuic {
             self.record.resize(length, 0);
             self.record_at = 0;
         }
-        while self.record_at < self.record.len() {
-            match self.stream.read(&mut self.record[self.record_at..]) {
-                Ok(0) => {
-                    self.record.clear();
-                    self.record_at = 0;
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "psiphon h3 truncated datagram record",
-                    ));
-                }
-                Ok(count) => self.record_at += count,
-                Err(error) => return Err(error),
+        match self.stream.read(&mut self.record[self.record_at..]) {
+            Ok(0) => {
+                self.record.clear();
+                self.record_at = 0;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "psiphon h3 truncated datagram record",
+                ));
             }
+            Ok(count) => self.record_at += count,
+            Err(error) => return Err(error),
+        }
+        if self.record_at < self.record.len() {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
         if self.record.len() > buffer.len() {
             self.record.clear();

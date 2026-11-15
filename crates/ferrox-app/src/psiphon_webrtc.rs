@@ -1111,6 +1111,7 @@ pub(crate) struct WebRtcStream {
     input: InputChannel,
     pending: Arc<Mutex<(Vec<u8>, usize)>>,
     stop: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<String>>>,
     padding_sent: Arc<AtomicBool>,
     shaping: Option<Arc<Mutex<Shaping>>>,
     media: bool,
@@ -1127,6 +1128,7 @@ impl Clone for WebRtcStream {
             input: Arc::clone(&self.input),
             pending: Arc::clone(&self.pending),
             stop: Arc::clone(&self.stop),
+            failure: Arc::clone(&self.failure),
             padding_sent: Arc::clone(&self.padding_sent),
             shaping: self.shaping.as_ref().map(Arc::clone),
             media: self.media,
@@ -1143,6 +1145,8 @@ impl WebRtcStream {
         let (input_tx, input) = mpsc::sync_channel(16);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let failure = Arc::new(Mutex::new(None));
+        let thread_failure = Arc::clone(&failure);
         let media = webrtc.media.is_some();
         let shaping = webrtc
             .shaping
@@ -1159,6 +1163,7 @@ impl WebRtcStream {
                     out_rx,
                     input_tx,
                     thread_stop,
+                    thread_failure,
                     unframed,
                     driver_shaping,
                 );
@@ -1169,6 +1174,7 @@ impl WebRtcStream {
             input: Arc::new(Mutex::new(input)),
             pending: Arc::new(Mutex::new((Vec::new(), 0))),
             stop,
+            failure,
             padding_sent,
             shaping,
             media,
@@ -1209,6 +1215,9 @@ impl Read for WebRtcStream {
             }
             pending.0.clear();
             pending.1 = 0;
+            if let Some(error) = lock(&self.failure).as_ref().cloned() {
+                return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
+            }
             let input = lock(&self.input);
             let timeout = *lock(&self.read_timeout);
             let received = match timeout {
@@ -1226,6 +1235,9 @@ impl Read for WebRtcStream {
                     return Err(io::Error::from(ErrorKind::TimedOut));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
+                    if let Some(error) = lock(&self.failure).as_ref().cloned() {
+                        return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
+                    }
                     return Err(io::Error::from(ErrorKind::UnexpectedEof));
                 }
             }
@@ -1289,6 +1301,9 @@ impl WebRtcStream {
 
     /// Queue one framed message, respecting the current write timeout.
     fn send(&self, message: Vec<u8>) -> io::Result<()> {
+        if let Some(error) = lock(&self.failure).as_ref().cloned() {
+            return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
+        }
         let timeout = *lock(&self.write_timeout);
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         let mut message = message;
@@ -1328,6 +1343,7 @@ fn drive(
     out: Receiver<Vec<u8>>,
     input: SyncSender<Result<Vec<u8>, String>>,
     stop: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<String>>>,
     raw: bool,
     shaping: Option<Arc<Mutex<Shaping>>>,
 ) {
@@ -1343,8 +1359,10 @@ fn drive(
                 Ok(data) if data.is_empty() => {}
                 Ok(data) => {
                     if let Err(error) = webrtc.send(&data) {
+                        *lock(&failure) = Some(error);
                         backlog.clear();
-                        backlog.push_back(Err(error));
+                        stop.store(true, Ordering::Release);
+                        return;
                     }
                     wrote = true;
                 }
@@ -1673,16 +1691,14 @@ impl Conduit {
             )?)));
         }
         let key = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}",
             broker.public_key,
             broker.root_secret,
             front.host,
             front.dial,
             front.port,
             front.disable_sni,
-            front.provider_id.as_deref().unwrap_or(""),
-            offer_timeout.as_nanos(),
-            offer_personal_timeout.as_nanos()
+            front.provider_id.as_deref().unwrap_or("")
         );
         if let Some((_, client)) = lock(&self.clients).iter().find(|(known, _)| known == &key) {
             return Ok(Arc::clone(client));
@@ -1867,13 +1883,7 @@ impl Conduit {
             self.offer_personal_timeout.min(max)
         });
         let client = self
-            .shared_client(
-                broker,
-                front,
-                budget,
-                offer_timeout.min(remaining),
-                offer_personal_timeout.min(remaining),
-            )
+            .shared_client(broker, front, budget, offer_timeout, offer_personal_timeout)
             .map_err(|error| (error, false))?;
         let offer_secret = crate::psiphon_ssh::random::<32>();
         let media_secret = weighted(self.media_streams, random_unit()).then_some(offer_secret);
@@ -1904,16 +1914,30 @@ impl Conduit {
             secret: offer_secret,
             traffic_shaping: shaping,
         };
-        let offer = lock(&client)
-            .client_offer(
-                destination,
-                &self.common,
-                &self.personal,
-                &sdp,
-                metrics,
-                &settings,
-            )
-            .map_err(|error| (error, false))?;
+        let offer_remaining = deadline.saturating_duration_since(Instant::now());
+        if offer_remaining.is_zero() {
+            return Err((
+                "psiphon conduit: offer retry window expired".to_owned(),
+                false,
+            ));
+        }
+        let offer = {
+            let mut client = lock(&client);
+            client.set_offer_timeouts(
+                offer_timeout.min(offer_remaining),
+                offer_personal_timeout.min(offer_remaining),
+            );
+            client
+                .client_offer(
+                    destination,
+                    &self.common,
+                    &self.personal,
+                    &sdp,
+                    metrics,
+                    &settings,
+                )
+                .map_err(|error| (error, false))?
+        };
         if offer.answer_sdp.is_empty() {
             return Err((
                 format!(
