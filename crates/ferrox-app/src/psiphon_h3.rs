@@ -105,7 +105,41 @@ impl DeadFront {
 enum Link {
     Udp(UdpSocket),
     WebRtc(WebRtcStream),
-    Quic(crate::psiphon_quic::QuicStream),
+    Quic(FramedQuic),
+}
+
+/// Carry one QUIC datagram per two-byte length-prefixed record on a reliable
+/// inner stream, so a byte-stream read cannot merge or split datagrams.
+struct FramedQuic(crate::psiphon_quic::QuicStream);
+
+impl FramedQuic {
+    fn send(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let length = u16::try_from(buffer.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "psiphon h3 datagram too large")
+        })?;
+        self.0.write_all(&length.to_be_bytes())?;
+        self.0.write_all(buffer)?;
+        Ok(buffer.len())
+    }
+
+    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut length = [0u8; 2];
+        match self.0.read(&mut length) {
+            Ok(0) => return Ok(0),
+            Ok(1) => self.0.read_exact(&mut length[1..])?,
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+        let length = usize::from(u16::from_be_bytes(length));
+        if length == 0 || length > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "psiphon h3 invalid datagram record",
+            ));
+        }
+        self.0.read_exact(&mut buffer[..length])?;
+        Ok(length)
+    }
 }
 
 impl Link {
@@ -113,7 +147,7 @@ impl Link {
         match self {
             Self::Udp(socket) => socket.send(buffer),
             Self::WebRtc(stream) => stream.write(buffer),
-            Self::Quic(stream) => stream.write(buffer),
+            Self::Quic(stream) => stream.send(buffer),
         }
     }
 
@@ -121,7 +155,7 @@ impl Link {
         match self {
             Self::Udp(socket) => socket.recv(buffer),
             Self::WebRtc(stream) => stream.read(buffer),
-            Self::Quic(stream) => stream.read(buffer),
+            Self::Quic(stream) => stream.receive(buffer),
         }
     }
 
@@ -133,7 +167,7 @@ impl Link {
                 Ok(())
             }
             Self::Quic(stream) => {
-                stream.set_read_timeout(Some(wait));
+                stream.0.set_read_timeout(Some(wait));
                 Ok(())
             }
         }
@@ -216,7 +250,7 @@ impl H3 {
         sni: &str,
         timeout: Duration,
     ) -> Result<Self, String> {
-        Self::connect_link(Link::Quic(stream), dial, sni, timeout, timeout)
+        Self::connect_link(Link::Quic(FramedQuic(stream)), dial, sni, timeout, timeout)
     }
 
     /// Open HTTP/3 over one datagram path.

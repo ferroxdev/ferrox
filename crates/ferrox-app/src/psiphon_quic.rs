@@ -880,9 +880,6 @@ impl Read for QuicStream {
         }
         let mut state = lock(&self.shared.state);
         loop {
-            if let Some(error) = state.error.clone() {
-                return Err(io::Error::new(ErrorKind::BrokenPipe, error));
-            }
             if state.read_at < state.recv.len() {
                 let available = &state.recv[state.read_at..];
                 let count = buf.len().min(available.len());
@@ -897,6 +894,9 @@ impl Read for QuicStream {
                     state.read_at = 0;
                 }
                 return Ok(count);
+            }
+            if let Some(error) = state.error.clone() {
+                return Err(io::Error::new(ErrorKind::BrokenPipe, error));
             }
             if state.eof {
                 return Ok(0);
@@ -1536,9 +1536,6 @@ impl Engine {
             at = end;
         }
         self.peer_params = true;
-        if self.stream == 0 {
-            self.stream = self.data;
-        }
         if self.bidi == 0 {
             return Err("psiphon quic: peer refuses a stream".to_owned());
         }
@@ -1923,7 +1920,7 @@ impl Engine {
 
     fn pad_initial(&self, payload: &mut Vec<u8>, _pn: u64) {
         let header = long_header_len(true, self.dcid.len(), self.scid.len(), 4);
-        let filled = header + 4 + payload.len() + 16;
+        let filled = header + payload.len() + 16;
         let target = self.max_datagram.min(MAX_PAYLOAD);
         if filled < target {
             payload.resize(payload.len() + (target - filled), 0);
@@ -3444,6 +3441,17 @@ mod tests {
         engine.pad_initial(&mut payload, 0);
         let packet = engine.seal(INITIAL, 0, &payload).expect("initial");
         assert!(packet.len() <= 1171);
+    }
+
+    #[test]
+    fn a_direct_quic_initial_reaches_the_minimum_datagram_size() {
+        let mut engine = test_engine();
+        engine.packet_limit = MAX_PACKET_SIZE;
+        engine.max_datagram = 1200;
+        let mut payload = Vec::new();
+        engine.pad_initial(&mut payload, 0);
+        let packet = engine.seal(INITIAL, 0, &payload).expect("initial");
+        assert_eq!(packet.len(), 1200);
     }
 
     #[test]

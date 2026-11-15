@@ -16,6 +16,7 @@ const NONCE_LEN: usize = 24;
 pub(crate) struct SlokStore {
     path: Option<PathBuf>,
     keys: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+    dirty: AtomicBool,
 }
 
 impl SlokStore {
@@ -28,6 +29,7 @@ impl SlokStore {
         Arc::new(Self {
             path,
             keys: Mutex::new(keys),
+            dirty: AtomicBool::new(false),
         })
     }
 
@@ -40,7 +42,14 @@ impl SlokStore {
             return true;
         }
         match self.keys.lock() {
-            Ok(mut keys) => keys.insert(id, key).is_some(),
+            Ok(mut keys) => {
+                let duplicate = keys.get(&id).is_some_and(|existing| existing == &key);
+                if !duplicate {
+                    self.dirty.store(true, Ordering::Release);
+                }
+                keys.insert(id, key);
+                duplicate
+            }
             Err(_) => true,
         }
     }
@@ -48,16 +57,22 @@ impl SlokStore {
     fn clear(&self) {
         if let Ok(mut keys) = self.keys.lock() {
             keys.clear();
+            self.dirty.store(true, Ordering::Release);
         }
     }
 
-    fn save(&self) {
+    fn save(&self) -> Result<(), String> {
+        if !self.dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let Some(path) = self.path.as_deref() else {
-            return;
+            self.dirty.store(false, Ordering::Release);
+            return Ok(());
         };
-        let Ok(keys) = self.keys.lock() else {
-            return;
-        };
+        let keys = self
+            .keys
+            .lock()
+            .map_err(|_| "slok store lock is poisoned".to_owned())?;
         let mut text = String::new();
         for (id, key) in keys.iter() {
             text.push_str(&ferrox_core::b64::encode(id));
@@ -66,7 +81,8 @@ impl SlokStore {
             text.push('\n');
         }
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create state directory: {error}"))?;
         }
         let mut temporary = path.as_os_str().to_owned();
         temporary.push(format!(".{}.tmp", std::process::id()));
@@ -78,12 +94,12 @@ impl SlokStore {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        let Ok(mut file) = options.open(&temporary) else {
-            return;
-        };
-        if file.write_all(text.as_bytes()).is_err() {
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| format!("create temporary state file: {error}"))?;
+        if let Err(error) = file.write_all(text.as_bytes()) {
             let _ = std::fs::remove_file(&temporary);
-            return;
+            return Err(format!("write state file: {error}"));
         }
         #[cfg(unix)]
         {
@@ -91,9 +107,12 @@ impl SlokStore {
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
         drop(file);
-        if std::fs::rename(&temporary, path).is_err() {
+        if let Err(error) = std::fs::rename(&temporary, path) {
             let _ = std::fs::remove_file(&temporary);
+            return Err(format!("replace state file: {error}"));
         }
+        self.dirty.store(false, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -143,23 +162,21 @@ impl ServerEvents {
             .map_err(|_| "psiphon osl: request is not UTF-8".to_owned())?;
         let request =
             json::parse(text).map_err(|_| "psiphon osl: request is not JSON".to_owned())?;
-        let mut changed = false;
         if request
             .get("clear_local_sloks")
             .and_then(Json::as_bool)
             .unwrap_or(false)
         {
             self.sloks.clear();
-            changed = true;
         }
         let Some(sloks) = request
             .get("seed_payload")
             .and_then(|seed| seed.get("SLOKs"))
             .and_then(Json::as_arr)
         else {
-            if changed {
-                self.sloks.save();
-            }
+            self.sloks
+                .save()
+                .map_err(|error| format!("psiphon osl: {error}"))?;
             return Ok(Vec::new());
         };
         for slok in sloks {
@@ -179,7 +196,6 @@ impl ServerEvents {
             };
             let duplicate = self.sloks.seed(id.clone(), key);
             if !duplicate {
-                changed = true;
                 self.seeded.store(true, Ordering::Release);
             }
             if self.emit_sloks {
@@ -189,9 +205,9 @@ impl ServerEvents {
                 );
             }
         }
-        if changed {
-            self.sloks.save();
-        }
+        self.sloks
+            .save()
+            .map_err(|error| format!("psiphon osl: {error}"))?;
         Ok(Vec::new())
     }
 
@@ -500,7 +516,7 @@ mod tests {
         let path = directory.join("osl-sloks");
         let store = SlokStore::open(Some(path.clone()));
         store.seed(b"id".to_vec(), vec![7u8; KEY_LEN]);
-        store.save();
+        store.save().expect("save");
         let mode = std::fs::metadata(&path)
             .expect("slok file")
             .permissions()
@@ -589,10 +605,42 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ferrox-osl-{}", std::process::id()));
         let store = SlokStore::open(Some(path.clone()));
         assert!(!store.seed(vec![1; 32], vec![2; 32]));
-        store.save();
+        store.save().expect("save");
         drop(store);
         let reopened = SlokStore::open(Some(path.clone()));
         assert_eq!(reopened.get(&[1; 32]), Some(vec![2; 32]));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_replaced_slok_is_persisted() {
+        let directory =
+            std::env::temp_dir().join(format!("ferrox-osl-replace-{}", std::process::id()));
+        let path = directory.join("sloks");
+        let store = SlokStore::open(Some(path.clone()));
+        assert!(!store.seed(vec![1; 32], vec![2; 32]));
+        store.save().expect("save");
+        assert!(!store.seed(vec![1; 32], vec![3; 32]));
+        store.save().expect("replace");
+        drop(store);
+        let reopened = SlokStore::open(Some(path));
+        assert_eq!(reopened.get(&[1; 32]), Some(vec![3; 32]));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_failed_save_stays_dirty_and_is_retried() {
+        let directory =
+            std::env::temp_dir().join(format!("ferrox-osl-dirty-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("directory");
+        let blocked = directory.join("blocked");
+        std::fs::create_dir(&blocked).expect("blocked path");
+        let store = SlokStore::open(Some(blocked));
+        assert!(!store.seed(vec![1; 32], vec![2; 32]));
+        assert!(store.save().is_err());
+        assert!(store.dirty.load(Ordering::Acquire));
+        assert!(store.save().is_err());
+        assert!(store.dirty.load(Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

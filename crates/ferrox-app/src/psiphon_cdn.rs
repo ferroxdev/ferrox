@@ -1262,12 +1262,25 @@ impl ScanSpec {
     /// Pick one candidate in the reference's shuffled order, probing past
     /// temporarily skipped candidates and falling back to the first probe when
     /// every probed candidate is skipped.
+    #[cfg(test)]
     pub(crate) fn select(
         &self,
         candidate_number: u64,
         skipped: &HashSet<String>,
         shuffle_key: &str,
     ) -> Option<ScanCandidate> {
+        self.select_probe(candidate_number, skipped, shuffle_key)
+            .map(|(candidate, _)| candidate)
+    }
+
+    /// Select a candidate and return the next unprobed candidate number, so a
+    /// caller that walked past a skipped candidate never selects it again.
+    pub(crate) fn select_probe(
+        &self,
+        candidate_number: u64,
+        skipped: &HashSet<String>,
+        shuffle_key: &str,
+    ) -> Option<(ScanCandidate, u64)> {
         if self.count == 0 {
             return None;
         }
@@ -1278,17 +1291,21 @@ impl ScanSpec {
             .max(1);
         let mut fallback = None;
         for probe in 0..probe_limit {
-            let candidate = self.candidate_at(
-                self.permuted_index(candidate_number.saturating_add(probe), shuffle_key),
-            )?;
+            let number = candidate_number.saturating_add(probe);
+            let candidate = self.candidate_at(self.permuted_index(number, shuffle_key))?;
             if fallback.is_none() {
                 fallback = Some(candidate.clone());
             }
             if !skipped.contains(&candidate.key()) {
-                return Some(candidate);
+                return Some((candidate, number.saturating_add(1)));
             }
         }
-        fallback
+        fallback.map(|candidate| {
+            (
+                candidate,
+                candidate_number.saturating_add(probe_limit).max(1),
+            )
+        })
     }
 }
 
@@ -1745,6 +1762,22 @@ mod tests {
             seen.len(),
             usize::try_from(spec.candidate_count()).expect("count")
         );
+    }
+
+    #[test]
+    fn scan_selection_advances_past_the_probes_it_used() {
+        let spec = super::ScanSpec::from_config(
+            &["192.0.2.9".to_owned()],
+            &["a.example".to_owned(), "b.example".to_owned()],
+        )
+        .expect("spec");
+        let first = spec
+            .select(0, &std::collections::HashSet::new(), "seed")
+            .expect("candidate");
+        let skipped = std::collections::HashSet::from([first.key()]);
+        let (next, number) = spec.select_probe(0, &skipped, "seed").expect("candidate");
+        assert_ne!(next, first);
+        assert_eq!(number, 2);
     }
 
     #[test]

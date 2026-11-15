@@ -125,6 +125,7 @@ pub(crate) struct WebRtc {
     debug: bool,
     shaping: Option<(TrafficShapingParameters, [u8; 32])>,
     media_shaping: Option<Shaping>,
+    send_timeout: Duration,
 }
 
 impl WebRtc {
@@ -228,6 +229,7 @@ impl WebRtc {
                 debug,
                 shaping: None,
                 media_shaping: None,
+                send_timeout: Duration::from_secs(30),
             },
             offer.to_sdp_string(),
         ))
@@ -287,6 +289,7 @@ impl WebRtc {
         let channel = self
             .channel
             .ok_or_else(|| "psiphon webrtc: data channel is closed".to_owned())?;
+        let deadline = Instant::now() + self.send_timeout;
         loop {
             let accepted = self
                 .rtc
@@ -300,7 +303,10 @@ impl WebRtc {
             if accepted {
                 return Ok(());
             }
-            self.wait(next)?;
+            if Instant::now() >= deadline {
+                return Err("psiphon webrtc write timed out".to_owned());
+            }
+            self.wait(next.min(deadline))?;
         }
     }
 
@@ -433,12 +439,17 @@ impl WebRtc {
     }
 
     /// Move the engine onto a driver thread and expose it as an `io` stream.
-    pub(crate) fn into_stream(self, timeout: Duration) -> Result<WebRtcStream, String> {
+    pub(crate) fn into_stream(mut self, timeout: Duration) -> Result<WebRtcStream, String> {
+        self.send_timeout = timeout;
         WebRtcStream::spawn(self, timeout, false)
     }
 
     /// Move the engine onto a driver thread and preserve each write as one datagram.
-    pub(crate) fn into_datagram_stream(self, timeout: Duration) -> Result<WebRtcStream, String> {
+    pub(crate) fn into_datagram_stream(
+        mut self,
+        timeout: Duration,
+    ) -> Result<WebRtcStream, String> {
+        self.send_timeout = timeout;
         WebRtcStream::spawn(self, timeout, true)
     }
 
@@ -1662,8 +1673,16 @@ impl Conduit {
             )?)));
         }
         let key = format!(
-            "{}|{}|{}|{}|{}",
-            broker.public_key, broker.root_secret, front.host, front.dial, front.port
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            broker.public_key,
+            broker.root_secret,
+            front.host,
+            front.dial,
+            front.port,
+            front.disable_sni,
+            front.provider_id.as_deref().unwrap_or(""),
+            offer_timeout.as_nanos(),
+            offer_personal_timeout.as_nanos()
         );
         if let Some((_, client)) = lock(&self.clients).iter().find(|(known, _)| known == &key) {
             return Ok(Arc::clone(client));
@@ -1856,8 +1875,8 @@ impl Conduit {
                 offer_personal_timeout.min(remaining),
             )
             .map_err(|error| (error, false))?;
-        let media_secret = weighted(self.media_streams, random_unit())
-            .then(|| lock(&client).root_obfuscation_secret());
+        let offer_secret = crate::psiphon_ssh::random::<32>();
+        let media_secret = weighted(self.media_streams, random_unit()).then_some(offer_secret);
         let (mut webrtc, sdp) = WebRtc::offer(
             address,
             &self.stun_servers,
@@ -1871,18 +1890,26 @@ impl Conduit {
             media_secret,
         )
         .map_err(|error| (error, false))?;
-        let secret = lock(&client).root_obfuscation_secret();
-        if media_secret.is_some() {
-            if weighted(self.media_traffic_shaping, random_unit()) {
-                lock(&client).set_traffic_shaping(self.media_traffic_shaping_parameters.clone());
-                webrtc.set_traffic_shaping(self.media_traffic_shaping_parameters.clone(), secret);
-            }
-        } else if weighted(self.traffic_shaping, random_unit()) {
-            lock(&client).set_traffic_shaping(self.traffic_shaping_parameters.clone());
-            webrtc.set_traffic_shaping(self.traffic_shaping_parameters.clone(), secret);
+        let shaping = if media_secret.is_some() {
+            weighted(self.media_traffic_shaping, random_unit())
+                .then(|| self.media_traffic_shaping_parameters.clone())
+        } else {
+            weighted(self.traffic_shaping, random_unit())
+                .then(|| self.traffic_shaping_parameters.clone())
+        };
+        if let Some(parameters) = shaping.as_ref() {
+            webrtc.set_traffic_shaping(parameters.clone(), offer_secret);
         }
         let offer = lock(&client)
-            .client_offer(destination, &self.common, &self.personal, &sdp, metrics)
+            .client_offer(
+                destination,
+                &self.common,
+                &self.personal,
+                &sdp,
+                metrics,
+                offer_secret,
+                shaping.as_ref(),
+            )
             .map_err(|error| (error, false))?;
         if offer.answer_sdp.is_empty() {
             return Err((
@@ -1935,7 +1962,7 @@ impl Conduit {
                     SocketAddr::new(address, 0),
                     self.timeout,
                     stream,
-                    secret,
+                    offer_secret,
                 )
                 .map_err(|error| (error, false))?,
             )

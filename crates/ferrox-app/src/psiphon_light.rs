@@ -380,12 +380,24 @@ fn decode_entry(encoded: &[u8]) -> Result<ProxyEntry, String> {
 /// the leaf's SANs, then its CN; dates are not checked.
 fn verify_name(leaf: &[u8], expected: &str) -> bool {
     let mut names = Vec::new();
-    collect_names(leaf, 0, leaf.len(), 0, &mut names);
-    names.iter().any(|name| matches_name(name, expected))
+    let mut common_name = None;
+    collect_names(leaf, 0, leaf.len(), 0, &mut names, &mut common_name);
+    if names.is_empty() {
+        common_name.is_some_and(|name| matches_name(&name, expected))
+    } else {
+        names.iter().any(|name| matches_name(name, expected))
+    }
 }
 
 /// Collect every DNS name in one certificate DER element.
-fn collect_names(der: &[u8], at: usize, end: usize, depth: usize, out: &mut Vec<String>) {
+fn collect_names(
+    der: &[u8],
+    at: usize,
+    end: usize,
+    depth: usize,
+    out: &mut Vec<String>,
+    common_name: &mut Option<String>,
+) {
     if depth > 32 {
         return;
     }
@@ -404,11 +416,13 @@ fn collect_names(der: &[u8], at: usize, end: usize, depth: usize, out: &mut Vec<
             }
         } else if tag == 0x06 && der.get(body..body + 3) == Some(&[0x55, 0x04, 0x03][..]) {
             if let Some((0x0c | 0x13 | 0x16, body, end)) = element(der, next) {
-                out.push(String::from_utf8_lossy(&der[body..end]).into_owned());
+                if common_name.is_none() {
+                    *common_name = Some(String::from_utf8_lossy(&der[body..end]).into_owned());
+                }
             }
         }
         if tag & 0x20 != 0 {
-            collect_names(der, body, next, depth + 1, out);
+            collect_names(der, body, next, depth + 1, out, common_name);
         }
         at = next;
     }
@@ -656,7 +670,8 @@ fn relay<T: Read + Write + ShutdownWrite>(mut stream: T, mut peer: TcpStream) {
             stream.shutdown_write();
             upload_eof = false;
         }
-        if !peer_eof && !upload_blocked && pending(&peer) {
+        let peer_state = if peer_eof { None } else { ready(&peer) };
+        if !upload_blocked && peer_state.is_some() {
             match peer.read(&mut up) {
                 Ok(0) => {
                     peer_eof = true;
@@ -671,7 +686,7 @@ fn relay<T: Read + Write + ShutdownWrite>(mut stream: T, mut peer: TcpStream) {
                 Err(_) => return,
             }
         }
-        if down_at == down_len && !stream_eof && (upload_blocked || !pending(&peer)) {
+        if down_at == down_len && !stream_eof && (upload_blocked || peer_state != Some(true)) {
             match stream.read(&mut down) {
                 Ok(0) => stream_eof = true,
                 Ok(count) => {
@@ -688,12 +703,17 @@ fn relay<T: Read + Write + ShutdownWrite>(mut stream: T, mut peer: TcpStream) {
     }
 }
 
-/// Whether the loopback peer has bytes ready, without consuming them.
-fn pending(peer: &TcpStream) -> bool {
+/// Whether the loopback peer has bytes ready (`Some(true)`), reached EOF
+/// (`Some(false)`), or has nothing to report yet (`None`), without consuming.
+fn ready(peer: &TcpStream) -> Option<bool> {
     let _ = peer.set_nonblocking(true);
-    let ready = matches!(peer.peek(&mut [0u8; 1]), Ok(count) if count > 0);
+    let state = match peer.peek(&mut [0u8; 1]) {
+        Ok(0) => Some(false),
+        Ok(_) => Some(true),
+        Err(_) => None,
+    };
     let _ = peer.set_nonblocking(false);
-    ready
+    state
 }
 
 /// Whether a read timeout means the other direction should get a turn.
@@ -706,8 +726,8 @@ fn idle(error: &io::Error) -> bool {
 pub(crate) struct LightStream<T> {
     inner: T,
     header: Vec<u8>,
-    header_sent: bool,
-    padding_done: bool,
+    read_padding_done: bool,
+    write_padding_done: bool,
     wire: Vec<u8>,
     wire_at: usize,
     payload: std::ops::Range<usize>,
@@ -719,15 +739,17 @@ pub(crate) struct LightStream<T> {
 impl<T> LightStream<T> {
     /// Wrap the TLS stream with the header its first write must carry.
     fn new(inner: T, header: Vec<u8>) -> Self {
+        let mut pending = Vec::with_capacity(header.len());
+        pending.extend_from_slice(&header);
         Self {
             inner,
             header,
-            header_sent: false,
-            padding_done: false,
+            read_padding_done: false,
+            write_padding_done: false,
             wire: Vec::with_capacity(BUFFER),
             wire_at: 0,
             payload: 0..0,
-            pending: Vec::new(),
+            pending,
             pending_at: 0,
             shutdown: None,
         }
@@ -760,7 +782,7 @@ impl<T: Read> Read for LightStream<T> {
                 return Ok(count);
             }
             self.compact();
-            if self.padding_done {
+            if self.read_padding_done {
                 if self.wire_at == self.wire.len() {
                     return self.inner.read(out);
                 }
@@ -779,7 +801,7 @@ impl<T: Read> Read for LightStream<T> {
             let padding = u16::from_be_bytes([self.wire[at], self.wire[at + 1]]);
             if padding == STOP_PADDING {
                 self.wire_at += 2;
-                self.padding_done = true;
+                self.read_padding_done = true;
                 continue;
             }
             if self.wire.len() - at < 4 {
@@ -850,20 +872,16 @@ impl<T: Write> Write for LightStream<T> {
         if buf.is_empty() {
             return Ok(0);
         }
-        if self.padding_done {
+        if self.write_padding_done {
             self.pending.extend_from_slice(buf);
             self.drain()?;
             return Ok(buf.len());
         }
-        let mut frame = Vec::with_capacity(self.header.len() + buf.len() + 2 + 17);
-        if !self.header_sent {
-            frame.extend_from_slice(&self.header);
-            self.header_sent = true;
-        }
-        let mut size = frame.len() + buf.len() + 2 + 17;
+        let mut frame = Vec::with_capacity(buf.len() + 2 + 17);
+        let mut size = self.header.len() + buf.len() + 2 + 17;
         if size > PADDING_MAX {
             frame.extend_from_slice(&STOP_PADDING.to_be_bytes());
-            self.padding_done = true;
+            self.write_padding_done = true;
         } else {
             size += 2;
             let min = PADDING_MIN.saturating_sub(size);
@@ -1186,6 +1204,41 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn the_header_is_sent_before_application_data() {
+        let mut stream = LightStream::new(Vec::new(), vec![0xaa, 0xbb]);
+        stream.flush().expect("header");
+        assert_eq!(stream.inner, vec![0xaa, 0xbb]);
+        stream.write_all(b"hello").expect("first");
+        assert_eq!(&stream.inner[..2], &[0xaa, 0xbb]);
+        assert!(stream.inner.windows(5).any(|window| window == b"hello"));
+    }
+
+    #[test]
+    fn reads_and_writes_stop_padding_independently() {
+        let mut stream = LightStream::new(io::Cursor::new(Vec::new()), Vec::new());
+        stream.wire.extend_from_slice(&1u16.to_be_bytes());
+        stream.wire.extend_from_slice(&2u16.to_be_bytes());
+        stream.wire.push(0);
+        stream.wire.extend_from_slice(b"hi");
+        stream.wire.extend_from_slice(&STOP_PADDING.to_be_bytes());
+        stream.wire.extend_from_slice(b"rest");
+        let mut out = [0u8; 2];
+        stream.read_exact(&mut out).expect("padded");
+        assert!(!stream.read_padding_done);
+        assert!(!stream.write_padding_done);
+        let mut first = [0u8; 1];
+        stream.read_exact(&mut first).expect("stop");
+        assert!(stream.read_padding_done);
+        assert_eq!(&first, b"r");
+        stream.write_all(b"hello").expect("write");
+        assert!(stream.write_padding_done);
+        assert_ne!(stream.inner.get_ref(), b"hello");
+        let mut rest = [0u8; 3];
+        stream.read_exact(&mut rest).expect("plain");
+        assert_eq!(&rest, b"est");
     }
 
     #[test]

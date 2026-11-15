@@ -469,13 +469,11 @@ pub(crate) struct Client {
     broker: Broker,
     static_secret: [u8; 32],
     root: [u8; 32],
-    offer_secret: [u8; 32],
     transport: Box<dyn Transport>,
     session: Option<Session>,
     offer_timeout: Duration,
     offer_personal_timeout: Duration,
     relay_timeout: Duration,
-    traffic_shaping: Option<TrafficShapingParameters>,
     nat_type: u64,
 }
 
@@ -495,25 +493,13 @@ impl Client {
             broker,
             static_secret,
             root,
-            offer_secret: random::<32>(),
             transport,
             session: None,
             offer_timeout: DEFAULT_OFFER_TIMEOUT,
             offer_personal_timeout: DEFAULT_OFFER_PERSONAL_TIMEOUT,
             relay_timeout: DEFAULT_RELAY_TIMEOUT,
-            traffic_shaping: None,
             nat_type: 0,
         })
-    }
-
-    /// Set the data-channel traffic shaping the proxy should apply.
-    pub(crate) fn set_traffic_shaping(&mut self, parameters: TrafficShapingParameters) {
-        self.traffic_shaping = Some(parameters);
-    }
-
-    /// The root obfuscation secret this dial carries, which seeds both shaping PRNGs.
-    pub(crate) fn root_obfuscation_secret(&self) -> [u8; 32] {
-        self.offer_secret
     }
 
     /// Record the locally discovered NAT type on the offer.
@@ -579,6 +565,8 @@ impl Client {
         personal_compartments: &[[u8; 32]],
         sdp: &str,
         metrics: &Metrics,
+        offer_secret: [u8; 32],
+        traffic_shaping: Option<&TrafficShapingParameters>,
     ) -> Result<Offer, String> {
         if common_compartments.is_empty() && personal_compartments.is_empty() {
             return Err("psiphon broker: no compartments".to_owned());
@@ -593,8 +581,8 @@ impl Client {
             personal_compartments,
             sdp,
             &metrics,
-            self.offer_secret,
-            self.traffic_shaping.as_ref(),
+            offer_secret,
+            traffic_shaping,
         );
         self.transport
             .set_timeout(if personal_compartments.is_empty() {
@@ -652,10 +640,23 @@ impl Client {
                 (Value::UInt(2), Value::Bytes(request.to_vec())),
             ]),
         )?;
+        let result = self.session_round_trip(&round_trip, round_trip_id);
+        if result.is_err() {
+            self.session = None;
+        }
+        result
+    }
+
+    /// Complete one session round trip, reusing the established session if there is one.
+    fn session_round_trip(
+        &mut self,
+        round_trip: &[u8],
+        round_trip_id: [u8; 32],
+    ) -> Result<Vec<u8>, String> {
         let plain = if self.session.is_none() {
-            self.handshake(&round_trip)?
+            self.handshake(round_trip)?
         } else {
-            let payload = self.send_packet(&round_trip)?;
+            let payload = self.send_packet(round_trip)?;
             let reply = self.transport.round_trip(&payload)?;
             self.receive_packet(&reply)?
         };
@@ -971,7 +972,6 @@ fn client_offer_request(
             Value::Array(vec![Value::UInt(1), Value::UInt(3), Value::UInt(4)]),
         ),
         (Value::UInt(6), Value::Bytes(offer_secret.to_vec())),
-        (Value::UInt(7), Value::Bool(true)),
         (
             Value::UInt(9),
             Value::Bytes(destination.packed_server_entry.clone()),
@@ -1963,6 +1963,8 @@ mod tests {
                 &[],
                 "v=0\r\n",
                 &Metrics::new(Value::Map(vec![])),
+                [3; 32],
+                None,
             )
             .unwrap();
         assert_eq!(offer.answer_sdp, "answer");

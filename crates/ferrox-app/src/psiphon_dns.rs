@@ -1022,7 +1022,7 @@ fn query(
     }
     drop(sender);
     let mut addresses = Vec::new();
-    let mut ttl = Duration::ZERO;
+    let mut ttl: Option<Duration> = None;
     let mut error = io::Error::new(io::ErrorKind::NotFound, "no DNS answer");
     let mut answered = false;
     for _ in 0..2 {
@@ -1039,11 +1039,7 @@ fn query(
         match result {
             Ok((found, found_ttl)) if !found.is_empty() => {
                 answered = true;
-                ttl = if ttl.is_zero() {
-                    found_ttl
-                } else {
-                    ttl.min(found_ttl)
-                };
+                ttl = Some(ttl.map_or(found_ttl, |ttl| ttl.min(found_ttl)));
                 addresses.extend(found);
             }
             Ok(_) => {
@@ -1061,7 +1057,7 @@ fn query(
     if addresses.is_empty() {
         Err(error)
     } else {
-        Ok((addresses, ttl))
+        Ok((addresses, ttl.unwrap_or(Duration::ZERO)))
     }
 }
 
@@ -1346,6 +1342,59 @@ mod tests {
             reply.extend_from_slice(&[0, 4, 203, 0, 113, 7]);
         }
         socket.send_to(&reply, peer).expect("reply");
+    }
+
+    #[test]
+    /// A zero TTL is a value, not a missing answer, and wins the aggregate.
+    fn a_zero_ttl_is_not_treated_as_unset() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
+        let server = socket.local_addr().expect("address");
+        let responder = thread::spawn(move || {
+            for _ in 0..2 {
+                let mut request = [0u8; 512];
+                let (count, peer) = socket.recv_from(&mut request).expect("query");
+                let request = &request[..count];
+                let question_end = 12
+                    + request[12..]
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .expect("question")
+                    + 5;
+                let record =
+                    u16::from_be_bytes([request[question_end - 4], request[question_end - 3]]);
+                let ttl = if record == 1 { 0u32 } else { 60 };
+                let mut reply = Vec::new();
+                reply.extend_from_slice(&request[..2]);
+                reply.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+                reply.extend_from_slice(&request[12..question_end]);
+                reply.extend_from_slice(&[0xc0, 0x0c]);
+                reply.extend_from_slice(&record.to_be_bytes());
+                reply.extend_from_slice(&[0, 1]);
+                reply.extend_from_slice(&ttl.to_be_bytes());
+                reply.extend_from_slice(&[0, 0]);
+                if record == 28 {
+                    reply.extend_from_slice(&[0, 16]);
+                    reply.extend_from_slice(&[
+                        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7,
+                    ]);
+                } else {
+                    reply.extend_from_slice(&[0, 4, 203, 0, 113, 7]);
+                }
+                socket.send_to(&reply, peer).expect("reply");
+            }
+        });
+        let mut config = Config::from_servers(&[server]);
+        config.request_timeout = std::time::Duration::from_millis(50);
+        let (_, ttl) = super::query(
+            "psiphon.test",
+            server,
+            &config,
+            None,
+            super::QuestionMatch::None,
+        )
+        .expect("query");
+        responder.join().expect("responder");
+        assert_eq!(ttl, std::time::Duration::ZERO);
     }
 
     #[test]
