@@ -146,9 +146,7 @@ pub(crate) fn parse_outbound(node: Option<&Json>) -> Result<Option<SocketOptions
 /// The transparent mode an inbound's `streamSettings.sockopt` names.
 pub(crate) fn inbound_tproxy(settings: Option<&Json>) -> Result<Tproxy, String> {
     let node = settings.and_then(|settings| settings.get("sockopt"));
-    Ok(parse_with(node, "the inbound")?
-        .map(|options| options.tproxy)
-        .unwrap_or_default())
+    Ok(parse_with(node, "the inbound")?.map_or_default(|options| options.tproxy))
 }
 
 fn parse_with(node: Option<&Json>, dialer: &str) -> Result<Option<SocketOptions>, String> {

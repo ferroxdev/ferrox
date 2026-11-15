@@ -69,7 +69,7 @@ jobs:
       - name: trust the mounted checkout
         if: steps.provision.outcome == 'success'
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.100.0
         if: steps.provision.outcome == 'success'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:

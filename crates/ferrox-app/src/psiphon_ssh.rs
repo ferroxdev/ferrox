@@ -2315,7 +2315,7 @@ impl Session {
         let body = http_response_body(&response)?;
         let config = body
             .split(|byte| *byte == b'\n')
-            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .map(|line| line.trim_suffix(b"\r"))
             .find_map(|line| line.strip_prefix(b"Config: "))
             .ok_or_else(|| "psiphon web api: no Config line".to_owned())?;
         Ok(parse_handshake(config))
@@ -4873,14 +4873,13 @@ fn parse_handshake(body: &[u8]) -> HandshakeState {
     let strings = |key: &str| {
         json.get(key)
             .and_then(crate::json::Json::as_arr)
-            .map(|items| {
+            .map_or_default(|items| {
                 items
                     .iter()
                     .filter_map(crate::json::Json::as_str)
                     .map(str::to_owned)
                     .collect()
             })
-            .unwrap_or_default()
     };
     let value = |key: &str| {
         json.get(key)
@@ -4985,8 +4984,7 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
             };
             let reason = take_u32(body, &mut at).unwrap_or(0);
             let description = take_str(body, &mut at)
-                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-                .unwrap_or_default();
+                .map_or_default(|bytes| String::from_utf8_lossy(bytes).into_owned());
             if let Some(state) = lock(&inner.channels).remove(&local) {
                 if reason == CHANNEL_REJECT_SPLIT_TUNNEL {
                     state.split_tunnel();

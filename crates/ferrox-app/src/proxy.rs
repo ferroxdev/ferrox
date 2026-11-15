@@ -203,9 +203,7 @@ impl DokodemoRewrite {
             .or_else(|| local.map(|local| local.port()))
             .unwrap_or(0);
         let mut dest = dokodemo_destination(host, port);
-        let key = local
-            .map(|local| local.port().to_string())
-            .unwrap_or_default();
+        let key = local.map_or_default(|local| local.port().to_string());
         if let Some(entry) = port_map.get(&key) {
             if let Some(host) = entry.host.as_deref() {
                 dest = dokodemo_destination(host, dest.port());
@@ -12382,13 +12380,12 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
     let auths: Vec<String> = settings
         .and_then(|node| node.get("users"))
         .and_then(Json::as_arr)
-        .map(|users| {
+        .map_or_default(|users| {
             users
                 .iter()
                 .filter_map(|user| user.get("auth").and_then(Json::as_str).map(str::to_owned))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     if auths.is_empty() {
         eprintln!("hysteria inbound in {path} names no user auth: serves nothing");
         return false;
@@ -12472,13 +12469,12 @@ fn serve_hysteria_v1_inbound(address: &str, inbound: &Json, freedom: bool, path:
     let auths: Vec<String> = settings
         .and_then(|node| node.get("users"))
         .and_then(Json::as_arr)
-        .map(|users| {
+        .map_or_default(|users| {
             users
                 .iter()
                 .filter_map(|user| user.get("auth").and_then(Json::as_str).map(str::to_owned))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     if auths.is_empty() {
         eprintln!("hysteria inbound in {path} names no user auth: serves nothing");
         return false;
@@ -24661,7 +24657,7 @@ fn serve_connect_freedom(
 /// must relay before reading the response head or the two sides wait on each other.
 fn http_head_has_body(head: &[u8]) -> bool {
     head.split(|byte| *byte == b'\n').skip(1).any(|line| {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = line.trim_suffix(b"\r");
         let Some(colon) = line.iter().position(|byte| *byte == b':') else {
             return false;
         };
@@ -25924,7 +25920,7 @@ enum ProxyRequest {
 fn http_proxy_request(mut head: Vec<u8>) -> Option<ProxyRequest> {
     let line_end = ferrox_core::foxy::octet_in(&head, 0, b'\n');
     let raw = &head[..line_end.unwrap_or(head.len())];
-    let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+    let line = raw.trim_suffix(b"\r");
     let mut parts = line.split(|byte| *byte == b' ');
     let method = parts.next()?;
     let target = parts.next()?;
@@ -26146,7 +26142,7 @@ fn header_names_are_tokens(head: &[u8]) -> bool {
             return true;
         };
         let raw = &head[at..end];
-        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let line = raw.trim_suffix(b"\r");
         if line.is_empty() {
             return true;
         }
@@ -26179,7 +26175,7 @@ fn drop_invalid_header_names(head: &mut Vec<u8>) {
             return;
         };
         let raw = &head[at..end];
-        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let line = raw.trim_suffix(b"\r");
         if line.is_empty() {
             return;
         }
@@ -26237,7 +26233,7 @@ fn drop_header(head: &mut Vec<u8>, name: &str) {
 /// without its query, and an absolute target with no path naming the empty one the reference parses.
 fn request_line_attributes(head: &[u8]) -> Option<(String, String)> {
     let end = ferrox_core::foxy::octet_in(head, 0, b'\n')?;
-    let line = head[..end].strip_suffix(b"\r").unwrap_or(&head[..end]);
+    let line = head[..end].trim_suffix(b"\r");
     let mut parts = line.split(|byte| *byte == b' ');
     let method = std::str::from_utf8(parts.next()?).ok()?;
     let target = std::str::from_utf8(parts.next()?).ok()?;
@@ -26289,7 +26285,7 @@ fn forward_headers<'a>(head: &'a [u8], attrs: &mut crate::router::Attributes<'a>
             break;
         };
         let raw = &head[at..end];
-        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let line = raw.trim_suffix(b"\r");
         if line.is_empty() {
             break;
         }
@@ -26328,7 +26324,7 @@ fn connection_named(head: &[u8], from: usize) -> &[u8] {
             break;
         };
         let raw = &head[at..end];
-        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let line = raw.trim_suffix(b"\r");
         if line.is_empty() {
             break;
         }
@@ -27458,10 +27454,7 @@ fn source_allowed(
 
 /// The lane's idle is measured from the last datagram in either direction.
 fn idle_for(activity: &Mutex<Instant>) -> Duration {
-    activity
-        .lock()
-        .map(|last| last.elapsed())
-        .unwrap_or_default()
+    activity.lock().map_or_default(|last| last.elapsed())
 }
 
 /// A datagram in either direction is activity: the lane's idle budget measures silence, not a request without a reply.
@@ -36939,7 +36932,7 @@ fn inbound_vmess_users(inbound: &Json) -> crate::vmess::UsersRef {
                 .and_then(Json::as_arr)
                 .or_else(|| settings.get("users").and_then(Json::as_arr))
         })
-        .map(|clients| {
+        .map_or_default(|clients| {
             clients
                 .iter()
                 .filter_map(|client| {
@@ -36961,8 +36954,7 @@ fn inbound_vmess_users(inbound: &Json) -> crate::vmess::UsersRef {
                     })
                 })
                 .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        });
     crate::vmess::Users::with(entries)
 }
 
@@ -37368,7 +37360,7 @@ fn ss2022_identities(inbound: &Json) -> Vec<(String, u32)> {
         .get("settings")
         .and_then(|s| s.get("users"))
         .and_then(Json::as_arr)
-        .map(|listed| {
+        .map_or_default(|listed| {
             listed
                 .iter()
                 .map(|user| {
@@ -37382,7 +37374,6 @@ fn ss2022_identities(inbound: &Json) -> Vec<(String, u32)> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// Every email a configured user carries, across the whole config: a generated fallback name must
@@ -37491,15 +37482,14 @@ fn inbound_trojan_keys(inbound: &Json) -> std::sync::Arc<[[u8; 56]]> {
         .get("settings")
         .and_then(|s| s.get("clients"))
         .and_then(Json::as_arr)
-        .map(|clients| {
+        .map_or_default(|clients| {
             clients
                 .iter()
                 .filter_map(|client| client.get("password").and_then(Json::as_str))
                 .filter(|password| !password.is_empty())
                 .map(trojan_key)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     if keys.is_empty() {
         let password = inbound_password(inbound);
         if password.is_empty() {
@@ -38405,7 +38395,7 @@ fn freedom_range_text(text: &str) -> Option<(i64, i64)> {
         return Some((0, 0));
     }
     let leading = text.starts_with('-');
-    let (left, right) = text.strip_prefix('-').unwrap_or(text).split_once('-')?;
+    let (left, right) = text.trim_prefix('-').split_once('-')?;
     let left = if leading {
         format!("-{left}")
     } else {
@@ -39411,8 +39401,7 @@ pub(crate) fn mint_foxy_pass(config: &str, out: &str) -> ! {
     // The allowance on the pass's own line, so an account knows how much is left before a flow is refused for having none.
     let allowance = pass
         .allowance_line()
-        .map(|line| format!(" quota=\"{line}\""))
-        .unwrap_or_default();
+        .map_or_default(|line| format!(" quota=\"{line}\""));
     println!("minted=1 expires_at={:?}{allowance}", pass.expires_at);
     std::process::exit(0);
 }
@@ -46672,12 +46661,11 @@ mod tests {
         log: Option<&str>,
         xhttp_path: Option<&str>,
     ) -> String {
-        let log = log
-            .map(|path| format!(r#", "masterKeyLog": "{}""#, path.replace('\\', "\\\\")))
-            .unwrap_or_default();
-        let xhttp = xhttp_path
-            .map(|path| format!(r#", "xhttpSettings": {{"path": "{path}"}}"#))
-            .unwrap_or_default();
+        let log = log.map_or_default(|path| {
+            format!(r#", "masterKeyLog": "{}""#, path.replace('\\', "\\\\"))
+        });
+        let xhttp =
+            xhttp_path.map_or_default(|path| format!(r#", "xhttpSettings": {{"path": "{path}"}}"#));
         format!(
             r#"{{"outbounds": [{{"protocol": "vless", "settings": {{"vnext": [{{"address": "127.0.0.1",
             "port": {server_port}, "users": [{{"id": "{REALITY_TEST_ID}", "flow": "{flow}"}}]}}]}},
@@ -66973,17 +66961,14 @@ mod tests {
         let mut back = [0u8; 4];
         if let Err(e) = client.read_exact(&mut back) {
             let prefix = format!("{port} ");
-            let log = crate::quic::QSTAGES
-                .lock()
-                .map(|stages| {
-                    stages
-                        .iter()
-                        .filter(|line| line.starts_with(&prefix))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default();
+            let log = crate::quic::QSTAGES.lock().map_or_default(|stages| {
+                stages
+                    .iter()
+                    .filter(|line| line.starts_with(&prefix))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
             panic!("{who} echoes failed: {e:?}\nstages for {port}:\n{log}");
         }
         assert_eq!(back, want, "{who} echo mismatch");
@@ -73242,7 +73227,7 @@ mod tests {
                 break;
             };
             let raw = &head[at..at + end];
-            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+            let line = raw.trim_suffix(b"\r");
             if line.is_empty() {
                 break;
             }

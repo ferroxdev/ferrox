@@ -91,7 +91,7 @@ impl Pins {
     pub fn parse<I: IntoIterator<Item = String>>(pins: I) -> Self {
         let mut entries = Vec::new();
         for pin in pins {
-            let raw = pin.strip_prefix("sha256/").unwrap_or(&pin);
+            let raw = pin.trim_prefix("sha256/");
             if let Some(bytes) = b64::decode(raw.as_bytes()) {
                 if let Ok(entry) = <[u8; 32]>::try_from(bytes.as_slice()) {
                     entries.push(entry);
@@ -108,7 +108,7 @@ impl Pins {
     pub fn parse_checked<I: IntoIterator<Item = String>>(pins: I) -> Option<Self> {
         let mut entries = Vec::new();
         for pin in pins {
-            let raw = pin.strip_prefix("sha256/").unwrap_or(&pin);
+            let raw = pin.trim_prefix("sha256/");
             let bytes = b64::decode(raw.as_bytes())?;
             entries.push(<[u8; 32]>::try_from(bytes.as_slice()).ok()?);
         }

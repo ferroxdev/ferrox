@@ -1264,14 +1264,13 @@ fn parse_config(root: &crate::json::Json) -> Result<DeviceConfig, RegisterError>
     let ports: Vec<u16> = endpoint
         .get("ports")
         .and_then(crate::json::Json::as_arr)
-        .map(|ports| {
+        .map_or_default(|ports| {
             ports
                 .iter()
                 .filter_map(crate::json::Json::as_u32)
                 .filter_map(|port| u16::try_from(port).ok())
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let port = if ports.is_empty() || ports.contains(&WIREGUARD_PORT) {
         WIREGUARD_PORT
     } else {
@@ -1577,14 +1576,13 @@ impl Identity {
 fn wireguard_addresses(value: &crate::json::Json) -> Vec<IpAddr> {
     value
         .get("wireguard")
-        .map(|wireguard| json_addresses(wireguard.get("address")))
-        .unwrap_or_default()
+        .map_or_default(|wireguard| json_addresses(wireguard.get("address")))
 }
 
 fn json_addresses(value: Option<&crate::json::Json>) -> Vec<IpAddr> {
     value
         .and_then(crate::json::Json::as_arr)
-        .map(|items| {
+        .map_or_default(|items| {
             items
                 .iter()
                 .filter_map(crate::json::Json::as_str)
@@ -1592,7 +1590,6 @@ fn json_addresses(value: Option<&crate::json::Json>) -> Vec<IpAddr> {
                 .filter_map(|text| text.parse().ok())
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 fn address_json(addresses: &[IpAddr]) -> crate::json::Json {
@@ -2839,8 +2836,7 @@ impl KeyPaths {
 fn derive_sibling_path(base: &Path, suffix: &str) -> PathBuf {
     let name = base
         .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_default();
+        .map_or_default(|name| name.to_string_lossy().to_string());
     let derived = match name.rfind('.') {
         Some(dot) if dot > 0 => format!("{}-{}{}", &name[..dot], suffix, &name[dot..]),
         _ => format!("{name}-{suffix}"),

@@ -1380,7 +1380,7 @@ fn set_status_text(source: &str, id: u32, status: Status) -> Result<String, Stri
     let mut replaced = false;
     for line in source.lines() {
         if line.trim_start().starts_with("```") {
-            in_block = !in_block;
+            in_block.toggle();
         } else if !in_block {
             if let Some(body) = line.strip_prefix("## ") {
                 current = section_id(body.trim_end());
@@ -1548,8 +1548,7 @@ fn class_spent(
     let first = state
         .candidates(prompt.targets)
         .first()
-        .map(|row| row.key())
-        .unwrap_or_default();
+        .map_or_default(|row| row.key());
     let others: Vec<String> = library
         .prompts
         .iter()

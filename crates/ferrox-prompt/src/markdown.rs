@@ -722,7 +722,7 @@ fn parse_prompt(
     for (offset, section_line) in section.iter().enumerate() {
         let field_line = line + offset + 1;
         if is_fence(section_line) {
-            in_block = !in_block;
+            in_block.toggle();
             continue;
         }
         if in_block {
@@ -907,7 +907,7 @@ fn section_has_field(section: &[&str], key: &str) -> bool {
     let mut in_block = false;
     for line in section {
         if is_fence(line) {
-            in_block = !in_block;
+            in_block.toggle();
         } else if !in_block {
             if let Some((found, _)) = field(line) {
                 if found == key {

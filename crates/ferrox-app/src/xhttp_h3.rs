@@ -1027,10 +1027,7 @@ impl H3Client {
         if !tls.cert_pins.is_empty() {
             let chain: Vec<Vec<u8>> = match conn.peer_cert_chain() {
                 Some(chain) => chain.iter().map(|cert| cert.to_vec()).collect(),
-                None => conn
-                    .peer_cert()
-                    .map(|cert| vec![cert.to_vec()])
-                    .unwrap_or_default(),
+                None => conn.peer_cert().map_or_default(|cert| vec![cert.to_vec()]),
             };
             if !ferrox_core::tls::verify_cert_pinned(&chain, &tls.cert_pins, server_name) {
                 return None;

@@ -285,7 +285,7 @@ fn looks_like_challenge(page: &str) -> bool {
 
 /// A challenge body may only send the solver to the caller's own host or a Firefox host, never an arbitrary origin or an explicit port.
 fn trusted_origin(origin: &str, own: &str) -> bool {
-    let host = origin.strip_prefix("https://").unwrap_or(origin);
+    let host = origin.trim_prefix("https://");
     !host.contains(':')
         && (host.eq_ignore_ascii_case(own) || host.to_ascii_lowercase().ends_with(".firefox.com"))
 }

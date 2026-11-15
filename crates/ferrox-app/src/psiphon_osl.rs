@@ -23,8 +23,7 @@ impl SlokStore {
         let keys = path
             .as_deref()
             .and_then(|path| std::fs::read_to_string(path).ok())
-            .map(|text| load(&text))
-            .unwrap_or_default();
+            .map_or_default(|text| load(&text));
         Arc::new(Self {
             path,
             keys: Mutex::new(keys),

@@ -191,7 +191,11 @@ append_pem 562
 # recycle and their witness tests move the same ferrox-core test binary's
 # thin-LTO layout; dns.rs is untouched and the five decisions still walk 4096
 # times. ops.yml run 43603010310.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893360 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 52384866 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# Re-blessed 52384866 by the Rust 1.100.0 migration: the compiler relinks
+# this fuel-core test binary and dns.rs is untouched; the five decisions still
+# walk 4096 times. ops.yml run 43718159405.
+
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
@@ -220,7 +224,11 @@ vision::Linkferrox_app::vision::tests::Fake::pump 26240 vision::tests::the_frame
 # for a real name are unchanged.
 # The stats landing (#1722) split the parser into `decode_trojan_request_index`, so
 # the wrapper the probe names now pays one call and a destructure: 1170 -> 1182.
-proxy::decode_trojan_request 1182 proxy::tests::the_trojan_header_costs_two_reads_not_seven
+proxy::decode_trojan_request 1175 proxy::tests::the_trojan_header_costs_two_reads_not_seven
+# Re-blessed 1175 by the Rust 1.100.0 migration: proxy.rs now uses
+# trim_suffix in the header scan and the frame reads seven fewer instructions;
+# the reads and wire bytes are unchanged. ops.yml run 43718159405.
+
 
 # Blessed 73251 by grpc-common-varint: the probe's one-byte varints and sub-128
 # envelope lengths now take a straight path instead of the loop; the same row
@@ -235,7 +243,10 @@ grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else 73251 g
 # for the field walk in run 43298148854, so 98304 (22.8%) came out. The fast
 # read is compiled only into the wide monomorph, so the one-byte row above
 # keeps its 73251 walk.
-grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else 332283 grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else
+grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else 332295 grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else
+# Re-blessed 332295 by the Rust 1.100.0 migration: the same probe and bytes,
+# twelve more in the frame's setup. ops.yml run 43718159405.
+
 # Blessed 102414 by grpc-common-varint-write: 4096 two-byte Hunk lengths of
 # 16375 now take the direct write, against 118798 for the byte loop on the same
 # run, so the loop took 16384 (13.8%) out. The read keeps its loop: a direct
@@ -247,7 +258,11 @@ grpc::tests::direct_write_probe 102414 grpc::tests::the_direct_write_costs_the_s
 # lookups. The walk reads 311301 on the same probe (run 43408759589), so 163840
 # (52.6%) came out; the chosen payload is equal at every cap 8..=70000 and the
 # bytes, frames and window splits are unchanged.
-grpc::tests::multi_payload_probe 147461 grpc::tests::the_multi_payload_fixed_point_costs_less_than_the_walk
+grpc::tests::multi_payload_probe 196613 grpc::tests::the_multi_payload_fixed_point_costs_less_than_the_walk
+# Re-blessed 196613 by the Rust 1.100.0 migration: +49152 is 12 per call, while
+# the same run's walk probe reads 409605 (+24 per call), so the fit removes
+# 52 per call instead of 40; the chosen payloads are unchanged.
+
 # sniff::Sniffing::inspect is reported in scripts/method-ops.txt, not gated:
 # its loopback probe's frame has read 1228 and 1231 on the same source, so an
 # exact row here would be a coin flip. The probe test still asserts the domain
@@ -311,7 +326,11 @@ ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::t
 # Re-blessed 47621538 by p2-kcp-mkcp: the KCP receive path and its witness tests
 # link into the same ferrox-app bin, moving its thin-LTO layout;
 # psiphon_shadowsocks.rs is untouched. ops.yml run 43603010310.
-ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621526 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47646096 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+# Re-blessed 47646096 by the Rust 1.100.0 migration: psiphon_shadowsocks.rs is
+# untouched and the frame moved with the ferrox-app bin's relink. ops.yml run
+# 43718159405.
+
 # The fused size-line walk: 256 turns over a twelve-byte line, the first digit
 # changed each turn so the call is not hoisted. The hex run is parsed in place
 # and only a non-closing terminator pays a second, CRLF-only pass; the line is
@@ -322,7 +341,11 @@ ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_co
 # write and keeps nothing. 323610 is 1264.1 per turn; the two widths and the
 # zero delay never draw, so the probe prices the cuts and the 32-record gather.
 # The record bytes are the same as the merge-copy path this replaced.
-ferrox_core::finalmask::tests::merged_hello_probe 323610 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
+ferrox_core::finalmask::tests::merged_hello_probe 321306 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
+# Re-blessed 321306 by the Rust 1.100.0 migration: finalmask.rs is untouched
+# and the same 256 hellos now cost nine fewer instructions per turn.
+# ops.yml run 43718159405.
+
 # The client request built by `request`: one address type byte, the address and
 # the port, written in one match with the vector's room reserved exactly once,
 # through `spare_capacity_mut` and one `copy_nonoverlapping` per field so no
@@ -334,7 +357,11 @@ ferrox_core::socks::request 758 socks::tests::the_client_writes_the_bytes_the_pi
 # head, seven 8 KiB payload records, trailer) through an AES engine and a discard
 # sink. A record wholly inside the payload part is sealed from that part, so only
 # the two records that cross a part boundary are copied; 50871336 is 198716.2 per turn.
-ferrox_core::vless_encryption::tests::sealed_write_probe 50871336 vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
+ferrox_core::vless_encryption::tests::sealed_write_probe 50873708 vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
+# Re-blessed 50873708 by the Rust 1.100.0 migration: vless_encryption.rs uses
+# trim_suffix on the duration and the same seal-and-copy moved 2364. ops.yml run
+# 43718159405.
+
 # The mux decode probe: 4096 decodes of one fixed New/domain frame, so the row
 # prices the frame walk and nothing else. The probe branch built from origin/main
 # read 634880 (155 a call); splitting the frame once, fusing the status with the

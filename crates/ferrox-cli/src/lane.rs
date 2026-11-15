@@ -24,8 +24,7 @@ fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_default()
+        .map_or_default(Path::to_path_buf)
 }
 
 fn candidate_bin() -> PathBuf {

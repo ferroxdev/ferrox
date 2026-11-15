@@ -402,7 +402,7 @@ fn sniff_http(
             break;
         };
         let line = &bytes[at..line_end];
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = line.trim_suffix(b"\r");
         if line.is_empty() {
             break;
         }

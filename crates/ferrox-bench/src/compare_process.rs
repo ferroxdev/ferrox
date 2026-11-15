@@ -1731,7 +1731,7 @@ fn check_io(root: &Json, moved: f64) -> Result<(), Error> {
 fn read_samples(root: &Json) -> Vec<(parity::Phase, crate::ps::Sample)> {
     root.get("samples")
         .and_then(Json::as_arr)
-        .map(|items| {
+        .map_or_default(|items| {
             items
                 .iter()
                 .map(|item| {
@@ -1762,7 +1762,6 @@ fn read_samples(root: &Json) -> Vec<(parity::Phase, crate::ps::Sample)> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// The kernel tally under the names `/proc/<pid>/io` prints it. Half a tally is no tally: a sample

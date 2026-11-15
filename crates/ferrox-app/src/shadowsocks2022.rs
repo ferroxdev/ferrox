@@ -327,8 +327,7 @@ fn accept_on(
     // The identity header names one account: the flow line reads that user and the counters ride both legs.
     let meter = identities
         .get(idx)
-        .map(|(email, level)| authenticate(email, *level))
-        .unwrap_or_default();
+        .map_or_default(|(email, level)| authenticate(email, *level));
     let mut recv = Cipher::from_psk(method, &user, &salt_probe)?;
     let (target, early) = read_request(reader, &mut recv)?;
     let server_salt = fresh_salt(method.key_len())?;

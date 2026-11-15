@@ -1649,7 +1649,7 @@ mod tests {
                 } else {
                     u32::from(*byte)
                 });
-                high = !high;
+                high.toggle();
             }
             let mut total = sum;
             while total >> 16 != 0 {

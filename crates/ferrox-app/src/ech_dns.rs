@@ -121,7 +121,7 @@ fn question(name: &str, id: u16, edns: bool) -> Result<Vec<u8>, String> {
     out.extend_from_slice(&0u16.to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
     out.extend_from_slice(&u16::from(edns).to_be_bytes());
-    let name = name.strip_suffix('.').unwrap_or(name);
+    let name = name.trim_suffix('.');
     for label in name.split('.') {
         if label.is_empty() || label.len() > 63 {
             return Err(format!("ech: invalid DNS name {name}"));

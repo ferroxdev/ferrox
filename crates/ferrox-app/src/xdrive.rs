@@ -440,14 +440,13 @@ impl Settings {
         let secrets = drive
             .get("secrets")
             .and_then(Json::as_arr)
-            .map(|items| {
+            .map_or_default(|items| {
                 items
                     .iter()
                     .filter_map(Json::as_str)
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            });
         let number = |name: &str| {
             drive
                 .get(name)
@@ -4860,7 +4859,7 @@ impl Storage for S3 {
         let mut entries = Vec::new();
         self.pages(&key, "/", |page| {
             for full in page.keys.iter().chain(&page.prefixes) {
-                let rest = full.strip_prefix(key.as_str()).unwrap_or(full);
+                let rest = full.trim_prefix(key.as_str());
                 let name = rest.split('/').next().unwrap_or(rest);
                 if !name.is_empty() && valid_s3_name(name) && seen.insert(name.to_owned()) {
                     entries.push(Entry {
@@ -5054,7 +5053,7 @@ fn validate_s3(
             ));
         }
     }
-    if !valid_s3_name(folder.strip_suffix('/').unwrap_or(folder)) {
+    if !valid_s3_name(folder.trim_suffix('/')) {
         return Err(carrier_error(
             "S3 remoteFolder must be a nonempty relative prefix without empty, '.' or '..' components",
         ));

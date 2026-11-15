@@ -1020,7 +1020,7 @@ fn is_tchar(byte: u8) -> bool {
 }
 
 fn field_name_ok(name: &[u8]) -> bool {
-    let name = name.strip_prefix(b":").unwrap_or(name);
+    let name = name.trim_prefix(b":");
     !name.is_empty() && name.iter().copied().all(is_tchar)
 }
 
@@ -1172,14 +1172,14 @@ pub fn parse_origin_response(raw: &[u8]) -> Option<OriginResponse> {
     let mut chunked = false;
     let mut length = None;
     for line in lines {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = line.trim_suffix(b"\r");
         if line.is_empty() {
             continue;
         }
         let mut parts = line.splitn(2, |&byte| byte == b':');
         let name = parts.next()?;
         let value = match parts.next() {
-            Some(value) => value.strip_prefix(b" ").unwrap_or(value),
+            Some(value) => value.trim_prefix(b" "),
             None => continue,
         };
         let name = String::from_utf8_lossy(name).into_owned();
