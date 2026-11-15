@@ -15804,7 +15804,7 @@ fn serve_tun_inbound(
     };
     let flows = crate::tun::Flows::default();
     let legs = crate::tun::Legs::default();
-    let dial = device_dial(out);
+    let dial = Some(device_dial(out));
     for device in devices {
         let outbound = out.clone();
         let relay: crate::tun::Relay =
@@ -24579,9 +24579,9 @@ pub(crate) fn serve_device_flow(
 /// The device front's direct dial: a lane whose destination is its whole request hands the handler
 /// the connected stream, so the flow owes no loopback pair and no relay thread. Every other lane
 /// reports `Fallback` and keeps the front's own `serve_connect`.
-pub(crate) fn device_dial(out: &Outbound) -> Option<crate::tun::Dial> {
+pub(crate) fn device_dial(out: &Outbound) -> crate::tun::Dial {
     let out = out.clone();
-    Some(std::sync::Arc::new(move |dest: &Destination| {
+    std::sync::Arc::new(move |dest: &Destination| {
         let (lane, tag) = out.resolved_lane_with_protocol(
             dest,
             crate::router::Network::Tcp,
@@ -24595,7 +24595,7 @@ pub(crate) fn device_dial(out: &Outbound) -> Option<crate::tun::Dial> {
             return crate::tun::DialOutcome::Fallback;
         }
         let tag = tag
-            .map(|tag| tag.into_owned())
+            .map(std::borrow::Cow::into_owned)
             .or_else(default_outbound_tag);
         let _outbound = OutboundTag::enter(tag.as_deref());
         let _source = SendThroughGuard::enter(SEND_THROUGH.with(std::cell::Cell::take));
@@ -24614,7 +24614,7 @@ pub(crate) fn device_dial(out: &Outbound) -> Option<crate::tun::Dial> {
             Some(tunnel) => crate::tun::DialOutcome::Direct(tunnel),
             None => crate::tun::DialOutcome::Refused,
         }
-    }))
+    })
 }
 
 /// One mux `New` target for a flow the portal carries.

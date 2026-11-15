@@ -1744,7 +1744,7 @@ impl Handler {
 
         let ended_tx = self.ended_tx.clone();
         let flow = response_flow;
-        std::thread::spawn(move || {
+        budgets::spawn(move || {
             let _ = send.thread.set(std::thread::current());
             let gso_capable = dev_writer.gso();
             let initial = (mss.load(Relaxed) as usize).max(1);
@@ -1809,7 +1809,7 @@ impl Handler {
                     reader = tun_half;
                     let (outcome_tx, outcome_rx) = mpsc::channel();
                     outcome = Some(outcome_rx);
-                    std::thread::spawn(move || {
+                    budgets::spawn(move || {
                         let _ = outcome_tx.send(relay(proxy_half, destination).is_ok());
                         // The duplicate holds the pair's far end open until the verdict is queued, so an EOF before it is a clean remote close, not a refusal.
                         drop(proxy_hold);
@@ -3501,7 +3501,7 @@ mod tests {
         // The push the device just sent is acknowledged before the lane's answer, so the next segment the device reads is that ACK.
         let (ack, ack_payload) = next_tcp_packet(&mut peer, &mut buf);
         assert_eq!(ack.flags, FLAG_ACK);
-        assert!(ack_payload.is_empty());
+        assert_eq!(ack_payload, [] as [u8; 0]);
 
         lane.write_all(b"pong").unwrap();
         let (reply, payload) = next_tcp_packet(&mut peer, &mut buf);
@@ -3511,7 +3511,7 @@ mod tests {
         lane.shutdown(Shutdown::Write).unwrap();
         let (end, payload) = next_tcp_packet(&mut peer, &mut buf);
         assert_eq!(end.flags, FLAG_FIN | FLAG_ACK);
-        assert!(payload.is_empty());
+        assert_eq!(payload, [] as [u8; 0]);
     }
 
     #[cfg(unix)]
