@@ -1789,6 +1789,15 @@ mod tests {
             client.write_all(chunk).expect("writes the frame bytes");
         }
         client
+            .write_all(&h2::frame_head(8, h2::T_PING, 0, 0))
+            .expect("writes the ping");
+        client.write_all(b"12345678").expect("writes the ping body");
+        let (len, kind, flags, _) = h2::read_head(&mut client).expect("reads the ack");
+        assert_eq!((len, kind, flags), (8, h2::T_PING, h2::F_ACK));
+        let mut body = vec![0u8; len];
+        client.read_exact(&mut body).expect("reads the ping body");
+        assert_eq!(body, b"12345678");
+        client
             .write_all(&h2::frame_head(1, h2::T_CONT, 0, 1))
             .expect("writes the continuation head");
         client
