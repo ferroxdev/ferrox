@@ -49,6 +49,7 @@ graph TD
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | syscalls-per-transport-record | UNBLESSED | scripts/count-ops.sh |
 | wireguard-raw-down-8-client-ubuntu-arm-mib-per-second | 220 | CI benchmark-matrix.yml run 43127254767 |
+| seconds-per-relayed-megabyte | 0.0045 | CI benchmark-matrix.yml run 43127254767 (220 MiB/s down-8) |
 | route-scan-instructions | 68609 | scripts/count-ops.sh |
 | route-table-instructions | 585 | scripts/count-ops.sh |
 | transport-header-bytes | 16 | ferrox-core-wireguard::tests::the_reference_message_sizes |

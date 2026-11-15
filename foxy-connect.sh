@@ -133,8 +133,8 @@ lane_meta_file() { printf '%s/lane.meta' "$CONF_DIR"; }
 write_lane_meta() {
   local meta
   meta="$(lane_meta_file)"
-  printf 'mode=%s\nsocks_port=%s\nhttp_port=%s\nmixed_port=%s\ncountry=%s\ncity=%s\ncarrier=%s\nupstream=%s\n' \
-    "$MODE" "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" "$COUNTRY" "$CITY" "$CARRIER" "$UPSTREAM" >"$meta" ||
+  printf 'mode=%s\nsocks_port=%s\nhttp_port=%s\nmixed_port=%s\ncountry=%s\ncity=%s\ncarrier=%s\nupstream=%s\nbin=%s\n' \
+    "$MODE" "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" "$COUNTRY" "$CITY" "$CARRIER" "$UPSTREAM" "$BIN" >"$meta" ||
     die "could not write $meta; the lane was not started."
   chmod 600 "$meta" 2>/dev/null || true
 }
@@ -142,6 +142,7 @@ write_lane_meta() {
 load_lane_meta() {
   local meta field value mode="$MODE" socks_port="$SOCKS_PORT" http_port="$HTTP_PORT"
   local mixed_port="$MIXED_PORT" country="$COUNTRY" city="$CITY" carrier="$CARRIER" upstream="$UPSTREAM"
+  local bin="$BIN"
   meta="$(lane_meta_file)"
   [ -r "$meta" ] || return 1
   while IFS='=' read -r field value; do
@@ -154,11 +155,43 @@ load_lane_meta() {
       city) city="$value" ;;
       carrier) carrier="$value" ;;
       upstream) upstream="$value" ;;
+      bin) bin="$value" ;;
     esac
   done <"$meta"
   case "$mode" in socks|http|mixed|all|vpn) ;; *) return 1 ;; esac
   MODE="$mode" SOCKS_PORT="$socks_port" HTTP_PORT="$http_port" MIXED_PORT="$mixed_port"
-  COUNTRY="$country" CITY="$city" CARRIER="$carrier" UPSTREAM="$upstream"
+  COUNTRY="$country" CITY="$city" CARRIER="$carrier" UPSTREAM="$upstream" BIN="$bin"
+}
+
+lane_lock_dir() { printf '%s/lane.lock' "$CONF_DIR"; }
+
+# One start at a time: two calls can both see no lane before either writes the
+# pid, and the loser would overwrite the winner's record.
+acquire_lane_lock() {
+  local lock owner i
+  lock="$(lane_lock_dir)"
+  for i in 1 2 3 4 5; do
+    if mkdir "$lock" 2>/dev/null; then break; fi
+    owner="$(cat "$lock/owner" 2>/dev/null || true)"
+    if [ -z "$owner" ]; then sleep 0.1; owner="$(cat "$lock/owner" 2>/dev/null || true)"; fi
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+      die "another foxy-connect start is running (pid $owner)."
+    fi
+    rm -rf "$lock"
+  done
+  [ -d "$lock" ] || die "could not lock $CONF_DIR; nothing was started."
+  printf '%s\n' "$$" >"$lock/owner" || die "could not record the lane lock; nothing was started."
+  trap 'rm -rf "$(lane_lock_dir)"' EXIT
+}
+
+lane_recorded_bin() {
+  local meta key value
+  meta="$(lane_meta_file)"
+  [ -r "$meta" ] || return 1
+  while IFS='=' read -r key value; do
+    if [ "$key" = bin ] && [ -n "$value" ]; then printf '%s\n' "$value"; return 0; fi
+  done <"$meta"
+  return 1
 }
 
 lane_pid_matches() {
@@ -179,7 +212,9 @@ lane_running() {
 }
 
 stop_lane() {
-  local pid_file pid i rc=0
+  local pid_file pid i rc=0 saved_bin="$BIN" recorded
+  recorded="$(lane_recorded_bin || true)"
+  [ -n "$recorded" ] && BIN="$recorded"
   pid_file="$(lane_pid_file)"
   if [ -f "$pid_file" ]; then
     pid="$(cat "$pid_file" 2>/dev/null || true)"
@@ -211,6 +246,7 @@ stop_lane() {
   if [ "$CLEAR_VPN" = 1 ] || [ -f "$CONF_DIR/system-proxy.ports" ] || [ -f "$CONF_DIR/system-proxy.state" ]; then
     system_proxy_off || rc=$?
   fi
+  BIN="$saved_bin"
   return "$rc"
 }
 
@@ -240,15 +276,13 @@ system_proxy_snapshot() {
 # Restore one field only while it still points at the port this lane armed.
 proxy_restore_kind() {
   local svc="$1" kind="$2" ours="$3" prior_on="$4" prior_srv="$5" prior_port="$6"
-  local get set setter line enabled server port
+  local get set setter line server port
   case "$kind" in
     socks) get=-getsocksfirewallproxy; set=-setsocksfirewallproxystate; setter=-setsocksfirewallproxy ;;
     web) get=-getwebproxy; set=-setwebproxystate; setter=-setwebproxy ;;
     secureweb) get=-getsecurewebproxy; set=-setsecurewebproxystate; setter=-setsecurewebproxy ;;
   esac
   line="$(networksetup "$get" "$svc" 2>/dev/null)" || return 1
-  enabled="$(proxy_field "$line" Enabled | tr '[:upper:]' '[:lower:]')"
-  [ "$enabled" = yes ] || return 0
   server="$(proxy_field "$line" Server)"
   port="$(proxy_field "$line" Port)"
   case "$server" in 127.*|localhost|::1) ;; *) return 0 ;; esac
@@ -409,6 +443,7 @@ carrier_selected() {
     line="$(grep -F "foxy: carrier $kind " "$LOG" 2>/dev/null | tail -n 1 || true)"
     [ -n "$line" ] && printf '%s %s\n' "$kind" "${line##* }"
   done
+  return 0
 }
 
 # One flow through the first front, and the pinned country is the assertion: the
@@ -630,6 +665,7 @@ case "$MODE" in socks|http|mixed|all|vpn) ;; *) die "unknown mode $MODE (socks, 
 CITY="$(printf '%s' "$CITY" | tr '[:lower:]' '[:upper:]')"
 case "$CARRIER" in auto|h1|h2|h3|http/1.1|http/2|quic) ;; *) CARRIER="auto";; esac
 
+acquire_lane_lock
 if lane_running; then stop_lane || die "the system proxy could not be cleared; fix it before starting another lane."; fi
 CFG="$CONF_DIR/foxy-$COUNTRY.json"
 write_config "$CFG"

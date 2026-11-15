@@ -25,8 +25,8 @@ graph TD
     S -- UseIP / UseIP4 / UseIP6 / unset --> M["match servers by domains,<br/>then fall back"]
     M --> G["policyID groups:<br/>race on the server pool,<br/>then the next"]
     G --> Z{"per-server cache hit?"}
-    Z -- yes --> F["expected / unexpected<br/>IP filter"]
-    Z -- no --> W{"+local / DoQ?"}
+    Z -- yes --> F["expected / unexpected<br/>IP filter (a cache hit too)"]
+    Z -- no --> W{"after the miss: +local / DoQ?"}
     W -- yes --> X["direct dial"]
     W -- no --> R["route: the configured outbound"]
     R --> U["UDP datagram"]
@@ -36,7 +36,7 @@ graph TD
     X --> T
     X --> D
     X --> Q["DoQ over QUIC"]
-    U --> K["cache: A and AAAA per server"]
+    U --> K["cache: A and AAAA per server<br/>written only after a miss"]
     T --> K
     D --> K
     Q --> K

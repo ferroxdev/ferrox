@@ -2362,6 +2362,7 @@ choose_carrier() {
 }
 
 start_lane() {
+  local new_cfg new_fronts
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
   touch "$LANES_FILE"
@@ -2370,11 +2371,15 @@ start_lane() {
   # and a bad link must not send the user to a build before saying what is wrong.
   build_config
   require_bin
-  write_lane_meta
+  # stop_lane reads the old meta to name the process it must kill, so keep the
+  # new lane's settings aside until that process is gone.
+  new_cfg="$CFG"; new_fronts="$FRONTS"
   if lane_running; then
     say "a lane${INSTANCE:+ '$INSTANCE'} is already running (pid $(lane_pid)); stopping it first."
     stop_lane 0
   fi
+  CFG="$new_cfg"; FRONTS="$new_fronts"
+  write_lane_meta
   if [ "$DEBUG" = 1 ]; then
     FOXY_DEBUG=1 "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
   else

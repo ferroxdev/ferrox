@@ -28438,13 +28438,13 @@ fn open_foxy_ip_tunnel(
                     debug_lane(edge, carrier, || "connect-ip opened".to_owned());
                     clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                     foxy.carrier_answered(edge, carrier);
-                    foxy.note_carrier("ip", carrier);
                     let Some(granted) = assigned else {
                         debug_lane(edge, carrier, || {
                             "the edge granted no address, so the tunnel carries nothing".to_owned()
                         });
                         continue;
                     };
+                    foxy.note_carrier("ip", carrier);
                     *width = granted.width();
                     source[..*width].copy_from_slice(granted.bytes());
                     // The tunnel read waits no longer than the association's own tick: a longer quantum paces every upload at one packet per wait.
