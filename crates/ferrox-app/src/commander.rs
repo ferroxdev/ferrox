@@ -2379,6 +2379,66 @@ mod tests {
         }
     }
 
+    /// A TUIC inbound is a QUIC listener like the h3 carriers, so remove frees its port and the
+    /// next add binds it again.
+    #[test]
+    fn tuic_inbounds_stop_with_their_handler() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"default","protocol":"freedom"}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let api = Api::new(ApiConfig {
+            tag: "api".to_owned(),
+            listen: None,
+            handler: true,
+            stats: false,
+            logger: false,
+            observatory: false,
+            routing: false,
+        });
+        let runtime = std::sync::Arc::new(crate::proxy::test_runtime(&root));
+        api.set_runtime(std::sync::Arc::clone(&runtime));
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["tuic.test".to_owned()]).expect("mints");
+        let certificate = pem_lines(&minted.cert.pem());
+        let key = pem_lines(&minted.signing_key.serialize_pem());
+        let port = free_udp_port();
+        let inbound = format!(
+            r#"{{"tag":"tuic","protocol":"tuic","listen":"127.0.0.1","port":{port},"settings":{{"users":[{{"uuid":"00112233-4455-6677-8899-aabbccddeeff","password":"secret"}}]}},"streamSettings":{{"security":"tls","tlsSettings":{{"alpn":["h3"],"certificates":[{{"certificate":[{certificate}],"key":[{key}]}}]}}}}}}"#
+        );
+        let config = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"tag":"default","protocol":"freedom"}}],"routing":{{}},"inbounds":[{inbound}]}}"#
+        ))
+        .expect("parses the tuic inbound");
+        assert_eq!(
+            crate::proxy::serve_dynamic_inbounds(
+                &runtime,
+                &config,
+                &crate::xray_pb::Seed::default(),
+                &api,
+            ),
+            1
+        );
+        assert!(std::net::UdpSocket::bind(("127.0.0.1", port)).is_err());
+        let mut remove = Vec::new();
+        field_str(&mut remove, 1, "tuic");
+        assert!(api.remove_inbound(&remove).is_ok());
+        drop(
+            std::net::UdpSocket::bind(("127.0.0.1", port))
+                .unwrap_or_else(|error| panic!("tuic left its QUIC port bound: {error}")),
+        );
+        assert_eq!(
+            crate::proxy::serve_dynamic_inbounds(
+                &runtime,
+                &config,
+                &crate::xray_pb::Seed::default(),
+                &api,
+            ),
+            1
+        );
+        assert!(api.remove_inbound(&remove).is_ok());
+    }
+
     #[test]
     fn alter_outbound_reports_what_the_reference_reports() {
         let mut operation = Vec::new();

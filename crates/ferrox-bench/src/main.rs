@@ -18,6 +18,7 @@ mod muxframe;
 mod parity;
 mod ps;
 mod stats;
+mod tuicbench;
 
 use count::Counting;
 use std::fmt::Write as _;
@@ -968,6 +969,7 @@ fn main() {
 
     let (frames, seals, muxed, early, aes_gcm_rows, b64_rows) = if codec {
         let frames = gate_four(&mut report);
+        report.push_str(&tuicbench::report());
         let seals = gate_seven(&key, &nonce, &mut report);
         let muxed = gate_six(&mut report);
         let early = gate_eight(&mut report);

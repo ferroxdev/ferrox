@@ -82,6 +82,7 @@ mod sockopt;
 mod socks;
 mod stats;
 mod transparent;
+mod tuic;
 mod tun;
 mod tun_stack;
 #[cfg(unix)]
