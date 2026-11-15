@@ -1803,7 +1803,13 @@ impl Handler {
                     return;
                 }
                 // The handler writes this half on the queue's own thread while it holds the flow, so a peer that stops reading must not park the queue: the timeout turns it into a short write the device retransmits.
-                let _ = write.set_write_timeout(Some(budgets::relay_quantum()));
+                if write
+                    .set_write_timeout(Some(budgets::relay_quantum()))
+                    .is_err()
+                {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                }
                 *flow
                     .write_half
                     .lock()
@@ -1832,7 +1838,13 @@ impl Handler {
                     refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
                     return;
                 }
-                let _ = write_half.set_write_timeout(Some(budgets::relay_quantum()));
+                if write_half
+                    .set_write_timeout(Some(budgets::relay_quantum()))
+                    .is_err()
+                {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                }
                 *flow
                     .write_half
                     .lock()
