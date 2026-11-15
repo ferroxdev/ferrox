@@ -29,7 +29,10 @@ graph TD
     P --> K{"carrier is KCP?"}
     K -->|yes| KD["kcp_dial_session:<br/>KCP, then TLS handshake"]
     KD --> F
-    K -->|no| D["dial_tls_session:<br/>TCP, then TLS handshake"]
+    K -->|no| H{"xhttp + h3 ALPN?"}
+    H -->|yes| Q["QUIC session (UDP, not inside the TCP dial)"]
+    Q --> F
+    H -->|no| D["dial_tls_session:<br/>TCP, then TLS handshake"]
     D --> W{"carrier"}
     W -->|raw| R["TlsHalf pair"]
     W -->|ws| WS["ws connect inside TLS"]
@@ -37,7 +40,6 @@ graph TD
     W -->|httpheader| HH["header-only lane inside TLS"]
     W -->|grpc| G["gRPC frame lane inside TLS"]
     W -->|xhttp| X["xhttp stream(s) inside TLS"]
-    W -->|"xhttp + h3 ALPN"| Q["QUIC session (UDP, not inside the TCP dial)"]
     R --> F["front header: SOCKS5 or HTTP CONNECT"]
     WS --> F
     HU --> F

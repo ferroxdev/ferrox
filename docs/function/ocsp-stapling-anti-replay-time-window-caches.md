@@ -47,7 +47,7 @@ graph TD
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | syscalls-per-relayed-megabyte | UNBLESSED | scripts/count-ops.sh |
-| relay-staging-copies-per-byte | UNBLESSED | not measured |
+| relay-staging-copies-per-byte | UNBLESSED | no copy checker yet |
 | seconds-per-relayed-megabyte | UNBLESSED | .github/workflows/bench.yml |
 | ocsp-fetch-unit-tests | 11 | ferrox-core-tls::ocsp::tests |
 | ocsp-handshake-witness-tests | 5 | ferrox-core-tls::rustls_backend::tests::a_stapled_identity_reaches_the_client_and_is_checked |

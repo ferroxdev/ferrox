@@ -23,9 +23,10 @@ graph TD
     H -- no --> S{"queryStrategy"}
     S -- UseSys --> Y["system resolver"]
     S -- UseIP / UseIP4 / UseIP6 --> M["match servers by domains,<br/>then fall back"]
-    M --> G["policyID groups:<br/>race on the server pool,<br/>then the next"]
-    G --> F["expected / unexpected<br/>IP filter"]
-    F --> R["route: the configured outbound"]
+    M --> Z{"cache hit?"}
+    Z -- yes --> F
+    Z -- no --> G["policyID groups:<br/>race on the server pool,<br/>then the next"]
+    G --> R["route: the configured outbound"]
     R --> U["UDP datagram"]
     R --> T["TCP / TLS framed message"]
     R --> D["DoH POST over HTTP/2"]
@@ -34,10 +35,12 @@ graph TD
     X --> T
     X --> D
     X --> Q["DoQ over QUIC"]
-    U --> K["cache: A and AAAA per server"]
-    T --> K
-    D --> K
-    Q --> K
+    U --> F["expected / unexpected<br/>IP filter"]
+    T --> F
+    D --> F
+    Q --> F
+    Y --> F
+    F --> K["cache: A and AAAA per server"]
     K --> A
 ```
 

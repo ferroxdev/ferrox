@@ -19,7 +19,7 @@ graph TD
     P -->|same tag or depth cap| D["named inbound's own dial<br/>when one was built"]
     D --> S["named inbound serves<br/>checks its own id, key or password"]
     S --> F["freedom dials the target"]
-    O --> Z["0 bytes added by the re-inject<br/>1 relay copy per byte, the relay's own"]
+    O --> Z["0 bytes added by the re-inject<br/>relay copy count: UNBLESSED<br/>no checker yet"]
 ```
 
 ## Measured
@@ -36,7 +36,7 @@ graph TD
 | protobuf-outbound-decoded | 1 | ferrox-app-xray_pb::tests::the_loopback_outbound_decodes_to_the_json_this_tree_serves |
 <!-- counts:end -->
 
-Syscalls: a routed second pass adds no local connect; the unrouted path adds one extra local TCP connect per flow plus the named inbound's own handshake reads and writes. No checker counts either yet. The sniffer adds `peek` calls on the client until it reads a whole HTTP head or a whole TLS ClientHello, or 200 ms pass; the re-inject itself adds none. Copies: the routed second pass stages nothing per flow, and the redialled session copies exactly what a direct dial copies, so the only copy is the relay's own — with no loopback-side pointer-identity test to separate it from a direct dial's, it stays prose, not a manifest row. The worst case the tests do not reach is a payload past both relay promotions on the unrouted path: the 64 KiB echo already promotes each of the two relay legs past `RELAY_SMALL_BUFFER` once each, exactly as a direct dial promotes its one, and a larger payload only pipelines further — no second promotion, no deadlock, since both legs stay duplex.
+Syscalls: a routed second pass adds no local connect; the unrouted path adds one extra local TCP connect per flow plus the named inbound's own handshake reads and writes. No checker counts either yet. The sniffer adds `peek` calls on the client until it reads a whole HTTP head or a whole TLS ClientHello, or 200 ms pass; the re-inject itself adds none. Copies: the routed second pass stages nothing per flow, and the redialled session copies exactly what a direct dial copies, so the only copy is the relay's own — with no loopback-side pointer-identity test to separate it from a direct dial's, it stays prose, not a manifest row. The worst case the tests do not reach is a payload past both relay promotions on the unrouted path: the 64 KiB echo already promotes each of the two relay legs past `RELAY_SMALL_BUFFER` once each, exactly as a direct dial promotes its one, and a larger payload only pipelines further — no second promotion, no deadlock, since both legs stay duplex. On macOS/aarch64 the count gate is CI-only: `scripts/count-ops.sh` needs valgrind, which has no build there.
 
 ## Ops
 

@@ -40,6 +40,9 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| syscalls-per-handshake | UNBLESSED | scripts/count-ops.sh |
+| handshake-copies-per-byte | UNBLESSED | no copy checker yet |
+| seconds-per-handshake | UNBLESSED | CI bench.yml (no cell yet) |
 | oracle-cases-replayed-byte-identical | 10 | ferrox-core-tls::cipher_suites::tests::oracle_replay_matches_go |
 | cipher-suite-ids-reachable-by-rustls | 9 | ferrox-core-tls::rustls_backend::tests::the_reachable_set_is_the_tls13_trio_and_ring_s_six_tls12_aead_suites |
 | cipher-suite-ids-reachable-by-boring | 11 | ferrox-core-tls::rustls_backend::tests::the_legacy_lane_covers_the_cbc_and_static_rsa_ids_ring_has_not |
@@ -155,11 +158,9 @@ ids are reachable.
   last and its offer completes (`an_ech_offer_rides_the_stock_shaped_hello`, which dials with
   `Fingerprint::stock()`). A preset shapes its own hello and accepts ECH only when the preset
   has an ECH slot: `hellochrome_58` has none and its offer is refused before the handshake
-  (`a_profile_without_an_ech_slot_is_refused`). A TLS 1.2-only list with an ECH config stays on
-  rustls unless it names an id neither backend carries, such as `0xc007`, which
-  `needs_stock_hello` sends to the stock shaped hello before the ECH check. An ECH config whose
-  maximum is below TLS 1.3 also stays on rustls, where `with_ech` enables only TLS 1.3. That is
-  the remaining ECH boundary.
+  (`a_profile_without_an_ech_slot_is_refused`). A TLS 1.2-only list with an ECH config is refused:
+  a client maximum below TLS 1.3 cannot carry ECH, so the dial stops before a lane that would
+  drop the config is built. That is the remaining ECH boundary.
 - **Curves carry over.** The three stock groups a `curvePreferences` list can name here map to
   BoringSSL's `P-256`/`P-384`/`X25519`, so the legacy hello keeps the named group order; the
   ML-KEM hybrid is shaped-lane only, so the stock lane never names it.
@@ -192,11 +193,13 @@ derivation.
   to BoringSSL drops rustls's appended `0x00ff` and lets `enableSessionResumption` carry: the
   lane keeps a 32-entry LRU of `SslSession`s keyed by the same inputs as the context, and
   `a_legacy_dial_resumes_a_tls12_session` dials twice, asserting the first is fresh and the
-  second reused. The costs that were *not* removed: an ECH config below a TLS 1.3 maximum keeps
-  rustls and its SCSV, and the cache is process-global and bounded, so a session older than the
-  32 most recently used is dropped rather than kept forever.
+  second reused. The costs that were *not* removed: an ECH config below a TLS 1.3 maximum is
+  refused before the handshake, and the cache is process-global and bounded, so a session older
+  than the 32 most recently used is dropped rather than kept forever.
 - **A copy of the suite order on every dial.** The config cache keys on the anchors, pins, `ALPN` and suite order, and building that key cloned the `Vec<u16>` order on every lookup — a heap buffer and a six-byte copy on each repeat handshake for a list the config named once. The order now lives behind one `Arc<[u16]>`, so a repeat dial's key is a reference-count bump. `a_repeat_dial_keys_the_config_without_copying_the_suite_order` measures the cached lookup at 0 allocations (it was 1 allocation / 6 bytes), and `a_crafted_list_reorders_the_dialer_hello_to_the_reference` still holds the field byte-identical.
 - The two-pass shape a naive re-order would use. Rather than copy the config list and then sort it with a comparator that recomputes membership, `hello_ids` walks the fixed `crypto/tls` preference array once and takes the intersection — one `contains` per preference entry, no second pass, and the TLS 1.3 append is a `extend_from_slice`, not a per-element compare. Byte-identity across the whole input the reference sees is the gate.
+
+Against the references, no removal is claimed: xray-core hands the list to Go's `crypto/tls`, sing-box takes it through `utls`, and ZeroNet vendors rustls, so each inherits its library's suite order and SCSV. The mixed-list and ECH lanes here are this tree's own dispatch, not a cheaper shape of theirs.
 
 ## Pins
 

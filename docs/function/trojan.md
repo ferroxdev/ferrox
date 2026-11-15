@@ -42,6 +42,7 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | 1182 | scripts/count-ops.sh |
+| syscalls-per-handshake | UNBLESSED | scripts/count-ops.sh |
 | password-bytes-on-the-wire | 56 | ferrox-app-proxy::tests::trojan_key_is_sha224_hex |
 | framing-bytes-added-after-the-header | 0 | ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers |
 | udp-framing-bytes-per-datagram | 2 | ferrox-app-proxy::tests::trojan_udp_frames_carry |
@@ -56,6 +57,8 @@ graph TD
 | key-bytes-compared-early-exit | 0 | ferrox-app-proxy::tests::the_key_compare_reads_every_byte |
 | numeric-domain-header-allocations | 0 | ferrox-app-proxy::tests::the_trojan_numeric_domain_header_allocates_nothing |
 <!-- counts:end -->
+
+`udp-framing-bytes-per-datagram` counts the two-byte length prefix only; the SOCKS address and the two-byte CRLF that surround it scale with the address type and are not in that row.
 
 ## Ops
 

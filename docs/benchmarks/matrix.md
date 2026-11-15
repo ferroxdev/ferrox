@@ -90,9 +90,8 @@ xray-core server with the xray-core client, so both rows are removed.
 The coverage holes with no number — a client that cannot use a ferrox server at all — are tracked in [#480](https://github.com/FerroxCo/ferrox/issues/480):
 `shadowsocks2022-raw-down-8--srv-ferrox` drops xray-core-rust and zeronet, and
 xray-core-rust reads 0 in hysteria and reality-grpc on both servers. The
-remaining untested lanes, including UDP, more than 16 flows and carriers
-without a cell, stay in #384, #387 and #388 rather than being inferred from
-these rows. `sing-box` is absent as a client from the `xhttp`, `kcp`, `quic` and
+remaining gaps — additional UDP cells, flows beyond 64 and carriers without a
+cell — stay in #384, #387 and #388 rather than being inferred from these rows. `sing-box` is absent as a client from the `xhttp`, `kcp`, `quic` and
 `vless-hysteria` cells and the three `vless-encryption-*` scenarios because its
 pinned dialect has no such transport and no VLESS `encryption` field. It also
 carries no stream layer on a Shadowsocks outbound, so the Shadowsocks and

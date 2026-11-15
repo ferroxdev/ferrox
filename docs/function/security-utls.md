@@ -22,7 +22,9 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
-| oracle-cases-replayed-byte-identical | 50 | ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls |
+| syscalls-per-shaped-dial | UNBLESSED | scripts/count-ops.sh |
+| seconds-per-shaped-dial | UNBLESSED | CI benchmark-matrix.yml (no handshake clock) |
+| oracle-cases-replayed | 50 | ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls |
 | distinct-presets-behind-those-names | 31 | ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls |
 | shaped-dials-that-complete-a-tls13-handshake | 1 | ferrox-core-tls::rustls_backend::tests::a_shaped_chrome_handshake_reaches_a_stock_server |
 | shaped-dials-that-answer-a-tls13-client-auth-request | 1 | ferrox-core-tls::rustls_backend::tests::a_shaped_chrome_handshake_answers_a_client_certificate_request |

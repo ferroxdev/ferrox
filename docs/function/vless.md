@@ -2,7 +2,7 @@
 
 VLESS has no framing. One request header, then the stream is the stream, and the whole method's cost is in reading that header without copying it and encoding it without allocating.
 
-The header is `version(1) | uuid(16) | addonsLen(1) | addons | command(1) | address | port`. `addons` is a protobuf whose only field this tree honours is `Flow`, the XTLS Vision selector; a header that carries a flow gets 2 add-on bytes and nothing else. For `xtls-rprx-vision` the command byte and the address are still written — Vision is a framing *around* VLESS, not a replacement for its target field. The outbound-only `xtls-rprx-vision-udp443` alias is normalized to `xtls-rprx-vision` before encoding, so it writes the same header bytes and only widens the client UDP gate to port 443; the inbound has no alias, matching the reference's config builder.
+The header is `version(1) | uuid(16) | addonsLen(1) | addons | command(1) | port(2) | address type(1) | address`. `addons` is a protobuf whose only field this tree honours is `Flow`, the XTLS Vision selector; a header that carries a flow gets 18 add-on bytes — a two-byte protobuf tag and length, then the sixteen-byte flow name — and nothing else. For `xtls-rprx-vision` the command byte and the address are still written — Vision is a framing *around* VLESS, not a replacement for its target field. The outbound-only `xtls-rprx-vision-udp443` alias is normalized to `xtls-rprx-vision` before encoding, so it writes the same header bytes and only widens the client UDP gate to port 443; the inbound has no alias, matching the reference's config builder.
 
 A dial keeps the destination the shape the client gave it: a name leaves as ATYP 2 plus its bytes and the edge answers the lookup, so nothing on this machine asks its own resolver for a host the tunnel was meant to carry. Only `Freedom`, the Foxy direct split and a UDP front that already resolved the datagram's destination look a name up here.
 
@@ -13,7 +13,7 @@ A dial keeps the destination the shape the client gave it: a name leaves as ATYP
 ```mermaid
 graph TD
     A["outbound needs a target"] --> B["request_header_len: the exact length,<br/>computed, not discovered"]
-    B --> C["encode_into: version, uuid,<br/>addons, command, address, port"]
+    B --> C["encode_into: version, uuid,<br/>addons, command, port, address"]
     C --> D["one write_all with header +<br/>the first payload in the same call"]
     D --> E(("wire"))
     F(("wire")) --> G["server: read the header<br/>address parsed in place"]
@@ -36,7 +36,6 @@ Both directions ride the relay lanes, and one direction ending does not end the 
 | request-header-allocations | 0 | ferrox-bench-gate-2 |
 | request-header-bytes-zero-filled | 0 | ferrox-bench-gate-2 |
 | address-families-encoded | 4 | ferrox-core-vless::tests::header_address_families_encode_stably |
-| vision-addons-bytes | 2 | ferrox-core-vless::tests::non_vision_header_carries_empty_addons |
 | reality-outbound-rows-dialled | 6 | ferrox-app-proxy::tests::vless_outbound_with_reality_dials_raw_and_every_carrier |
 | vision-header-targets-matching-core | 2 | ferrox-app-proxy::tests::vision_header_matches_the_core_encoder |
 | dial-header-reallocations | 0 | ferrox-app-proxy::tests::dial_headers_are_sized_to_the_bytes_they_hold |

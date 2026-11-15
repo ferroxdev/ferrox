@@ -17,10 +17,6 @@ scripts/socks5-oracle/script.txt -text
 scripts/blackhole-oracle/expected.txt -text
 scripts/blackhole-oracle/script.txt -text
 
-# Same reason, for every other checked-in expectation in this tree.
-**/fixtures/** -text
-**/*.golden -text
-
 # The engine-cache key hashes this file on every runner; a converted checkout
 # would key a cache the build never wrote.
 upstream/pins.toml -text
@@ -29,3 +25,9 @@ upstream/pins.toml -text
 # breaks both with a syntax error at the first function body.
 *.sh text eol=lf
 *.cmd text eol=crlf
+
+# Same reason, for every other checked-in expectation in this tree. This
+# follows the shell rules so a fixture keeps its bytes even when its name ends
+# in `.sh` or `.cmd`.
+**/fixtures/** -text
+**/*.golden -text

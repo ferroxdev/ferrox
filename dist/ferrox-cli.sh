@@ -81,6 +81,7 @@ TOKEN_FILE="$CONF_DIR/foxy-token.json"
 LOCATION_FILE=""
 LOCATIONS_FILE=""
 PID_FILE="$CONF_DIR/lane.pid"
+META_FILE="$CONF_DIR/lane.meta"
 LOG="$CONF_DIR/lane.log"
 PROXY_PORTS="$STATE_DIR/system-proxy.ports"
 PROXY_STATE="$STATE_DIR/system-proxy.state"
@@ -119,6 +120,7 @@ EXCLUDE_DOMAINS=""
 EXCLUDE_PORTS=""
 UPSTREAM=""
 WANT_WARP=0
+WARP_STARTED=0
 WARP_CFG=""
 WARP_PID_FILE=""
 WARP_LOG=""
@@ -189,6 +191,17 @@ DEBUG=0
 die() { echo "ferrox-cli: $*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
 rule() { printf '%s\n' "----------------------------------------------------------------"; }
+
+# The shell launcher writes and plans configs with Python and proves the lane
+# with curl; name a missing one before it looks like a lane failure.
+require_tools() {
+  local missing="" tool
+  for tool in python3 curl; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+  done
+  [ -z "$missing" ] ||
+    die "missing required command(s):$missing. The shell launcher needs python3 (to write and plan configs) and curl (to prove the connection); install them, or use the native ferrox-cli.exe on Windows."
+}
 
 # A flag that takes a value must have one. `shift 2` on a lone flag fails
 # without consuming it, and the parse loop would ask the same question forever.
@@ -393,9 +406,30 @@ EOF
 
 shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
+resolve_real() {
+  local path="$1" dir base
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$path" && return 0
+  fi
+  dir="$(cd -P "$(dirname "$path")" 2>/dev/null && pwd)" || { printf '%s\n' "$path"; return 0; }
+  base="$(basename "$path")"
+  printf '%s/%s\n' "${dir%/}" "$base"
+}
+
+credentials_inside_repo() {
+  local real root
+  root="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  real="$(resolve_real "$CREDS")"
+  root="$(resolve_real "$root")"
+  case "$real" in "$root"/*) return 0 ;; esac
+  return 1
+}
+
 action_login() {
   reconcile_stale_proxy || die "login: the stale system proxy could not be cleared; run ferrox-cli down."
-  local email="$EMAIL" pass="$PASSWORD"
+  credentials_inside_repo &&
+    die "$CREDS would be written inside the repository; point FOXY_CREDENTIALS outside it"
+  local email="${EMAIL:-${FOXY_EMAIL:-}}" pass="${PASSWORD:-${FOXY_PASS:-}}"
   if [ -z "$email" ]; then
     printf 'firefox account email: ' && read -r email
   fi
@@ -422,17 +456,18 @@ action_login() {
 }
 
 read_credentials() {
-  [ -f "$CREDS" ] || return 0
-  case "$CREDS" in "$ROOT"/*)
-    if git -C "$ROOT" ls-files --error-unmatch "$CREDS" >/dev/null 2>&1; then
-      die "$CREDS is tracked by git; move it outside the repository"
-    fi ;;
-  esac
-  # shellcheck disable=SC1090
-  . "$CREDS"
-  # A named flag beats a stored file: what you typed this minute is what you mean.
-  EMAIL="${EMAIL:-${FOXY_EMAIL:-$EMAIL}}"
-  PASSWORD="${PASSWORD:-${FOXY_PASS:-$PASSWORD}}"
+  local env_email="${FOXY_EMAIL:-}" env_pass="${FOXY_PASS:-}" file_email="" file_pass=""
+  if [ -f "$CREDS" ]; then
+    credentials_inside_repo &&
+      die "$CREDS resolves inside the repository; move it outside"
+    # shellcheck disable=SC1090
+    . "$CREDS"
+    file_email="${FOXY_EMAIL:-}"
+    file_pass="${FOXY_PASS:-}"
+  fi
+  # A named flag beats the environment, which beats a stored file.
+  EMAIL="${EMAIL:-${env_email:-$file_email}}"
+  PASSWORD="${PASSWORD:-${env_pass:-$file_pass}}"
 }
 
 # The account a stored session belongs to, so a launch can resume it even when
@@ -736,7 +771,7 @@ PY
 
 # One JSON writer for every outbound: python3 already carries this tree's scripts.
 write_config() {
-  local outbound="$1"
+  local outbound="$1" rc=0
   python3 - "$CFG" "$outbound" "$FRONTS" "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" <<'PY'
 import json, sys
 
@@ -753,6 +788,8 @@ doc = {
 with open(cfg, "w") as handle:
     json.dump(doc, handle, indent=2)
 PY
+  rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
   chmod 600 "$CFG"
 }
 
@@ -811,8 +848,8 @@ PY
 
 # A config lane serves the proxy inbounds its file names, so the fronts and the
 # ports a system proxy may point at come from that file, not from the defaults.
-# A selected front must be loopback before it is armed, and a file with none is
-# refused by name.
+# A selected front must be reachable at 127.0.0.1 before it is armed, and a file
+# with no proxy inbound is refused by name for --vpn.
 config_fronts() {
   python3 - "$CONFIG_FILE" "$WANT_VPN" "$FRONTS_SET" "$FRONTS" <<'PY'
 import json, sys
@@ -841,26 +878,27 @@ if explicit == "1":
     if missing:
         sys.exit(f"the config serves no {missing[0]} inbound; --fronts names it")
     order = [front for front in order if front in wanted]
-if vpn == "1":
-    if not order:
-        sys.exit("the config serves no socks, http or mixed inbound; --vpn needs one")
-    checked = set()
-    for inbound in document.get("inbounds", []):
-        if not isinstance(inbound, dict):
-            continue
-        name = inbound.get("protocol")
-        if name not in order or name in checked:
-            continue
-        checked.add(name)
-        listen = inbound.get("listen")
-        loopback = isinstance(listen, str) and (
-            listen == "::1" or listen == "localhost" or listen.startswith("127.")
+if vpn == "1" and not order:
+    sys.exit("the config serves no socks, http or mixed inbound; --vpn needs one")
+# This launcher reaches every front on 127.0.0.1, so an inbound bound to another
+# address would never answer the startup probe or the system proxy. `0.0.0.0` and
+# `::1` are refused with it: a wildcard front is reachable but also exposed, and
+# an IPv6-loopback front is not the address the probe and the system proxy use.
+checked = set()
+for inbound in document.get("inbounds", []):
+    if not isinstance(inbound, dict):
+        continue
+    name = inbound.get("protocol")
+    if name not in order or name in checked:
+        continue
+    checked.add(name)
+    listen = inbound.get("listen")
+    reachable = listen in (None, "", "127.0.0.1", "localhost")
+    if not reachable:
+        sys.exit(
+            f"inbound `{name}` listens on {listen}, not loopback; this launcher"
+            " reaches a front on 127.0.0.1, so use 127.0.0.1 or localhost"
         )
-        if not loopback:
-            sys.exit(
-                f"inbound `{name}` listens on {listen or 'all interfaces'}, not loopback;"
-                " --vpn needs 127.0.0.1 or ::1"
-            )
 print(",".join(order))
 PY
 }
@@ -872,6 +910,28 @@ adopt_lane_ports() {
   local planned
   planned="$(plan_ports 0 2>/dev/null)" || return 1
   read -r SOCKS_PORT HTTP_PORT MIXED_PORT <<<"$planned"
+}
+
+# The running lane's config path and fronts, so a later status or ports reads
+# the addresses it actually serves instead of the defaults.
+write_lane_meta() {
+  ( umask 077
+    {
+      printf 'config=%s\n' "$(resolve_real "$CFG")"
+      printf 'fronts=%s\n' "$FRONTS"
+    } >"$META_FILE"
+  )
+}
+
+load_lane_meta() {
+  [ -f "$META_FILE" ] || return 1
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      config=*) CFG="${line#config=}" ;;
+      fronts=*) FRONTS="${line#fronts=}"; FRONTS_SET=1 ;;
+    esac
+  done <"$META_FILE"
 }
 
 foxy_outbound() {
@@ -2048,8 +2108,23 @@ stale_proxy_endpoint() {
   return 1
 }
 
+lane_running_in() {
+  local dir="$1" pidfile pid
+  for pidfile in "$dir"/lane*.pid; do
+    [ -f "$pidfile" ] || continue
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+  done
+  return 1
+}
+
 reconcile_stale_proxy() {
   lane_running && return 0
+  local owner=""
+  if [ -r "$PROXY_OWNER" ]; then
+    owner="$(cat "$PROXY_OWNER" 2>/dev/null || true)"
+    [ -n "$owner" ] && lane_running_in "$owner" && return 0
+  fi
   # A marker left by a lane that is not alive is a dead arm: restore it before
   # anything else, whether or not the services still show the endpoint.
   if [ -e "$PROXY_STATE" ] || [ -e "$PROXY_PORTS" ]; then
@@ -2071,6 +2146,7 @@ apply_instance() {
   [ -n "$INSTANCE" ] && suffix="-$INSTANCE"
   CFG="$CONF_DIR/lane$suffix.json"
   PID_FILE="$CONF_DIR/lane$suffix.pid"
+  META_FILE="$CONF_DIR/lane$suffix.meta"
   LOG="$CONF_DIR/lane$suffix.log"
   WARP_CFG="$CONF_DIR/warp-hop$suffix.json"
   WARP_PID_FILE="$CONF_DIR/warp-hop$suffix.pid"
@@ -2287,6 +2363,7 @@ start_lane() {
   # and a bad link must not send the user to a build before saying what is wrong.
   build_config
   require_bin
+  write_lane_meta
   if lane_running; then
     say "a lane${INSTANCE:+ '$INSTANCE'} is already running (pid $(lane_pid)); stopping it first."
     stop_lane 0
@@ -2352,6 +2429,7 @@ warp_hop_running() {
 }
 
 start_warp_hop() {
+  WARP_STARTED=0
   if warp_hop_running; then
     UPSTREAM="socks5://127.0.0.1:$(cat "$WARP_PORT_FILE")"
     say "warp hop already up (pid $(cat "$WARP_PID_FILE")); the lane chains through it."
@@ -2376,6 +2454,7 @@ PY
   say "warp hop: registering once and racing WireGuard against MASQUE..."
   "$BIN" run -c "$WARP_CFG" >"$WARP_LOG" 2>&1 &
   pid=$!
+  WARP_STARTED=1
   echo "$pid" > "$WARP_PID_FILE"
   echo "$port" > "$WARP_PORT_FILE"
   for _ in $(seq 1 120); do
@@ -2408,6 +2487,7 @@ forget_lane_config() {
   case "$CFG" in
     "$CONF_DIR"/lane*.json) rm -f "$CFG" ;;
   esac
+  rm -f "$META_FILE"
 }
 
 # The account is shared, so signing out ends every lane; each owns its pid and config.
@@ -2658,11 +2738,19 @@ warp_ladder() {
   WANT_WARP=1
 }
 
+# An interruption before the lane exists can still leave the warp hop this
+# attempt started; stop only that, never a lane that was already running.
+interrupt_before_lane() {
+  [ "$WARP_STARTED" = 1 ] && stop_warp_hop
+  say "interrupted: the attempt was stopped; the log stays at $LOG."
+}
+
 action_up() {
   reconcile_stale_proxy || die "the stale system proxy could not be cleared; run ferrox-cli down."
   if [ "$WANT_VPN" = 1 ] && ! system_proxy_preflight; then exit 1; fi
   choose_carrier
   for _ in 1 2; do
+    trap 'interrupt_before_lane; exit 130' INT TERM
     start_lane
     # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
     trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
@@ -2710,6 +2798,7 @@ action_serve() {
   if [ "$WANT_VPN" = 1 ] && ! system_proxy_preflight; then exit 1; fi
   choose_carrier
   for _ in 1 2; do
+    trap 'interrupt_before_lane; exit 130' INT TERM
     start_lane
     # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.
     trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
@@ -2813,21 +2902,36 @@ action_ports() {
     say "unnamed lane)."
     return 0
   fi
+  local front want_socks="" want_http=""
+  for front in ${FRONTS//,/ }; do
+    case "$front" in
+      socks) want_socks="$SOCKS_PORT" ;;
+      http) want_http="$HTTP_PORT" ;;
+      mixed)
+        [ -n "$want_socks" ] || want_socks="$MIXED_PORT"
+        [ -n "$want_http" ] || want_http="$MIXED_PORT" ;;
+    esac
+  done
   rule
-  cat <<EOF
-macOS, System Settings > Network > <service> > Details... > Proxies:
-  Web proxy (HTTP)     127.0.0.1:$HTTP_PORT
-  Secure web proxy     127.0.0.1:$HTTP_PORT
-  SOCKS proxy          127.0.0.1:$SOCKS_PORT
-Turn on all three, leave "Proxy server requires password" off (the fronts are
-unauthenticated and loopback-only), and put local names in "Bypass proxy
-settings for these hosts and domains":  *.local, 169.254/16
-
-One app instead of the whole system:
-  curl --socks5-hostname 127.0.0.1:$SOCKS_PORT https://example.com
-  curl -x http://127.0.0.1:$HTTP_PORT https://example.com
-  HTTPS_PROXY=http://127.0.0.1:$HTTP_PORT ALL_PROXY=socks5h://127.0.0.1:$SOCKS_PORT git clone ...
-EOF
+  say "macOS, System Settings > Network > <service> > Details... > Proxies:"
+  [ -n "$want_http" ] && say "  Web proxy (HTTP)     127.0.0.1:$want_http"
+  [ -n "$want_http" ] && say "  Secure web proxy     127.0.0.1:$want_http"
+  [ -n "$want_socks" ] && say "  SOCKS proxy          127.0.0.1:$want_socks"
+  say "Turn on the fronts listed above, leave \"Proxy server requires password\" off (the fronts are"
+  say "unauthenticated and loopback-only), and put local names in \"Bypass proxy"
+  say "settings for these hosts and domains\":  *.local, 169.254/16"
+  say
+  say "One app instead of the whole system:"
+  [ -n "$want_socks" ] && say "  curl --socks5-hostname 127.0.0.1:$want_socks https://example.com"
+  [ -n "$want_http" ] && say "  curl -x http://127.0.0.1:$want_http https://example.com"
+  if [ -n "$want_http" ] && [ -n "$want_socks" ]; then
+    say "  HTTPS_PROXY=http://127.0.0.1:$want_http ALL_PROXY=socks5h://127.0.0.1:$want_socks git clone ..."
+  elif [ -n "$want_http" ]; then
+    say "  HTTPS_PROXY=http://127.0.0.1:$want_http git clone ..."
+  elif [ -n "$want_socks" ]; then
+    say "  ALL_PROXY=socks5h://127.0.0.1:$want_socks git clone ..."
+  fi
+  return 0
 }
 
 action_version() {
@@ -3064,7 +3168,7 @@ case "$ACTION" in
       case " $seen " in *" $port "*) die "two fronts cannot share port $port; nothing was started." ;; esac
       seen="$seen $port"
     done ;;
-  status|ports) adopt_lane_ports || true ;;
+  status|ports) load_lane_meta || true; adopt_lane_ports || true ;;
 esac
 
 # A VeePN flow pays a launch and a list before bytes move, so its first probe
@@ -3115,13 +3219,13 @@ require_bin() {
 }
 
 case "$ACTION" in
-  up) action_up ;;
-  serve) action_serve ;;
+  up) require_tools; action_up ;;
+  serve) require_tools; action_serve ;;
   __supervise) action_supervise ;;
   login) action_login ;;
   logout) action_logout ;;
-  locations) action_locations ;;
-  location) action_location ;;
+  locations) require_tools; action_locations ;;
+  location) require_tools; action_location ;;
   down)
     down_rc=0
     if [ "$ALL" = 1 ]; then
@@ -3139,8 +3243,8 @@ case "$ACTION" in
     else
       say "lane${INSTANCE:+ '$INSTANCE'} stopped; the lane config is removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it."
     fi ;;
-  status) action_status ;;
-  ports) action_ports ;;
+  status) require_tools; action_status ;;
+  ports) require_tools; action_ports ;;
   tun) action_tun ;;
   version) action_version ;;
 esac

@@ -1,6 +1,6 @@
 # XTLS Vision
 
-Vision is the one framing in this tree that *stops existing*. Once the inner TLS handshake is over, the padding frames stop and the stream becomes the raw socket, so the framing's cost should be zero from that point on — not amortised, not small. Zero.
+Vision is the one framing in this tree that *stops existing*. Once the inner TLS handshake is over, the padding frames stop; command `1` (`end`) leaves the outer TLS session in place and only ends the Vision framing, while command `2` (`direct`) hands the raw socket over. Either way the framing's cost should be zero from that point on — not amortised, not small. Zero.
 
 The framing is: the first frame is prefixed with the 16-byte user UUID; every frame is then `command(1) | length(2) | padLength(2) | content | padding`. Commands are `0` continue, `1` end, `2` direct. Padding is zero-filled and its length comes from the same seed table Xray uses (`{900, 500, 900, 256}`); the cap that follows the seed is this tree's and not the reference's, and the difference is named below. One frame carries at most 8171 content bytes — Xray's `buf.Size` of 8192 less the uuid and the header — so a longer write leaves as several frames, never as one frame the reference's reader refuses.
 
@@ -18,7 +18,7 @@ graph TD
     R1["socket read"] --> R2{"framing live?"}
     R2 -- yes --> R3["delivery walk: have → caller<br/>1 copy per byte, bounded by the 16 KiB window"]
     R2 -- no --> R4["read straight into the caller's buffer<br/>0 copies per byte"]
-    R3 --> R5["command 1 or 2 ends the framing"]
+    R3 --> R5["command 1 ends the framing, outer TLS stays<br/>command 2 hands over the raw socket"]
     R4 --> R6(("caller"))
     R5 --> R6
 ```
@@ -36,7 +36,7 @@ graph TD
 | largest-framed-block-bytes | 8171 | ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound |
 | tls-buffers-inspected-before-the-switch | 8 | ferrox-app-vision::tests::both_directions_spend_the_same_filter_budget |
 | feed-bytes-zeroed-per-steady-read | 0 | ferrox-app-vision::tests::a_steady_read_builds_no_feed |
-    | user-space-copies-per-byte-while-framed | 1 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
+| user-space-copies-per-byte-while-framed | 1 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
 | user-space-copies-per-byte-after-the-switch | 0 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
 | user-space-copies-per-byte-written-while-framed | 0 | ferrox-app-vision::tests::the_writer_hands_the_callers_payload_by_pointer |
 | uuid-bytes-copied-per-link | 0 | ferrox-app-vision::tests::the_writer_hands_the_uuid_by_pointer_on_the_first_frame |

@@ -2,7 +2,7 @@
 
 FERROX — Fast Efficient Relay Router Overlay X. *ferro*, iron, for Rust; *X*, for Xray.
 
-A from-scratch proxy core, **bit-identical to the implementations it replaces** and **verifiably not slower than any of them**.
+A from-scratch proxy core, **targeting bit-identical output to the implementations it replaces** and **verifiably not slower than any of them**. Coverage is partial; planned rows are marked in the tables below.
 
 ## Goals
 
@@ -41,7 +41,7 @@ A from-scratch proxy core, **bit-identical to the implementations it replaces** 
 | no operation added or removed | `scripts/count-ops.sh` against `scripts/expected-ops.txt` |
 | not slower at any length ≥ 65 B | benchmark gate; one regressing length fails after a re-measure |
 | upstream conformance | pinned suites run unmodified against `ferrox-app` |
-| xray-core scenario coverage | `conformance.yml`: every `testing/scenarios` test against the binary |
+| xray-core scenario coverage | `conformance.yml` maps all 73 `testing/scenarios` tests; 43 green, 21 fail, 9 have no verdict at this pin |
 | parsers never panic on untrusted bytes | seeded cases over every untrusted entry point |
 | dependency licence and provenance | `deny.toml` + `scripts/check-dependency-policy.sh`; GPL/AGPL refused as dependencies |
 | roadmap coherence | `ferrox-prompt check`: no duplicate id, no gate-less slice, no cycle |
@@ -93,7 +93,7 @@ printf '%s %s %s %s\n' '<doc>' '<key>' '<value>' '<checker>' >> scripts/method-c
 | SOCKS5 + SOCKS4, both roles | [socks](docs/function/socks.md) | 2–3 writes + 3–4 reads per dial | 1 (the relay's own) | `UNBLESSED` | not measured |
 | Reverse tunnel (bridge + portal) | [reverse](docs/function/reverse.md) | 1 write per mux frame | 1 downlink, 0 uplink | `UNBLESSED` | not measured |
 
-`ops` and `time` are `UNBLESSED`/not measured on every row — the honest state. The Foxy, VeePN, Psiphon and WARP lanes end at services and edges outside this tree; their availability and behaviour can change without a commit here, so a lane row is the implementation's state, not a promise that the upstream service accepts it. `scripts/expected-ops.txt` records the exact blessed rows; `scripts/method-ops.txt` is the open list that `ops.yml` measures into the `method-ops` artefact. Every duration comes from a named CI runner (`bench.yml`, `parity.yml`, `compare.yml`, `speedtest.yml`, `benchmark-matrix.yml`); no page quotes a one-off result from a laptop behind a VPN. The per-server grid, its tables and its charts are in [`docs/benchmarks/matrix.md`](docs/benchmarks/matrix.md). A matrix run also publishes `table.md`, `table.csv` and `distribution.csv` in the small `benchmark-matrix-table-*` artifact, so the tables and repeat spread are downloadable without the image bundle; every workflow publishes a `result-*` artifact with the same status facts as the job summary.
+Many `ops` and `time` cells are still `UNBLESSED`/not measured; the rows that carry a number name the test and CI workflow behind it. The Foxy, VeePN, Psiphon and WARP lanes end at services and edges outside this tree; their availability and behaviour can change without a commit here, so a lane row is the implementation's state, not a promise that the upstream service accepts it. `scripts/expected-ops.txt` records the exact blessed rows; `scripts/method-ops.txt` is the open list that `ops.yml` measures into the `method-ops` artefact. Every duration comes from a named CI runner (`bench.yml`, `parity.yml`, `compare.yml`, `speedtest.yml`, `benchmark-matrix.yml`); no page quotes a one-off result from a laptop behind a VPN. The per-server grid, its tables and its charts are in [`docs/benchmarks/matrix.md`](docs/benchmarks/matrix.md). A matrix run also publishes `table.md`, `table.csv` and `distribution.csv` in the small `benchmark-matrix-table-*` artifact, so the tables and repeat spread are downloadable without the image bundle; every workflow publishes a `result-*` artifact with the same status facts as the job summary.
 
 ## Connection methods
 
@@ -476,7 +476,7 @@ cargo run -p ferrox-prompt -- next    # the slice
 ./scripts/check.sh --fast             # fmt, clippy and tests while iterating
 ./scripts/check.sh                    # everything ci.yml runs, before the push
 
-cargo run -p ferrox-bench -- --config 'vless://...'   # the comparison table for a link
+# benchmarks and comparisons run in CI only: dispatch bench.yml or benchmark-matrix.yml
 cargo run -p ferrox-app -- check 'vless://...'        # parse offline; `run` dials TCP, sends nothing
 ```
 

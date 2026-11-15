@@ -31,20 +31,24 @@ graph TD
     B -- "IP packet (h2c)" --> H2CC["capsule → DATA"]
     H2CC --> H2CT["TCP (prior knowledge)"]
     D --> E["quiche server conn"]
-    E --> F["datagram_split:<br/>stream + packet"]
+    E --> F["datagram_split:<br/>h3 stream + packet"]
     H2["TCP + TLS (ALPN h2)"] --> H2F["HTTP/2 frames:<br/>SETTINGS + HEADERS"]
     H2F --> H2S["capsule stream<br/>(DATA frames)"]
-    H2S --> F
+    H2S -- "IP packet (capsule)" --> G
     H1T --> H1S["GET + Upgrade: connect-ip → 101"]
     H2CT --> H2CS["HTTP/2 preface + CONNECT"]
-    H1S --> F
-    H2CS --> F
+    H1S -- "IP packet (capsule)" --> G
+    H2CS -- "IP packet (capsule)" --> G
     F --> G{"TCP or UDP?"}
     G -- TCP --> H["freedom dial, relay"]
     G -- UDP --> I["freedom datagram, relay"]
     G -- "ICMP echo to own address" --> IC["icmp_echo_reply:<br/>swap, flip type, checksum"]
     H & I & IC --> J["reply packet"]
-    J --> C
+    J -- "h3 reply" --> C
+    J -- "h2 / h2c reply" --> JC["capsule → DATA"]
+    JC --> JT["TLS / TCP"]
+    J -- "h1 reply" --> JH1["capsule stream"]
+    JH1 --> JH1T["TLS / TCP (ALPN http/1.1)"]
     S["quiche server socket"] --> T["Header::from_slice<br/>local CID length 16"]
     T --> U{"known SCID?"}
     U -- no --> V["accept + worker thread"]

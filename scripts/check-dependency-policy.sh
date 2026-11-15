@@ -24,25 +24,78 @@ else
 fi
 
 if [[ -n "$metadata" ]]; then
-  expressions="$(printf '%s' "$metadata" | python3 -c '
-import json, sys
+  policy_check="$(mktemp "${TMPDIR:-/tmp}/ferrox-licences.XXXXXX")"
+  trap 'rm -f "$policy_check"' EXIT
+  cat >"$policy_check" <<'PY'
+import json, re, sys
+
+allow = {line.strip().lower() for line in sys.argv[1].splitlines() if line.strip()}
 graph = json.load(sys.stdin)
-print("\n".join(sorted({p.get("license", "") for p in graph["packages"] if p.get("license")})))
-')"
-  while read -r expression; do
-    [[ -z "$expression" ]] && continue
-    normalised="$(printf '%s' "$expression" | tr -d '()' | tr 'A-Z' 'a-z' | tr '/' ' ')"
-    IFS=', ' read -r -a parts <<<"$normalised"
-    for part in "${parts[@]}"; do
-      [[ -z "$part" || "$part" == "or" || "$part" == "and" ]] && continue
-      if [[ "$part" == "with" || "$part" == *-exception || "$part" == exception-* ]]; then
+expressions = sorted({p["license"] for p in graph["packages"] if p.get("license")})
+failed = False
+
+class Parser:
+    def __init__(self, tokens):
+        self.tokens = tokens
+        self.at = 0
+
+    def peek(self):
+        return self.tokens[self.at] if self.at < len(self.tokens) else None
+
+    def take(self, want=None):
+        token = self.peek()
+        if token is None or (want is not None and token.upper() != want):
+            raise ValueError(f"expected {want or 'a licence id'}, found {token or 'end'}")
+        self.at += 1
+        return token
+
+    def atom(self):
+        token = self.take()
+        if token == "(":
+            value = self.disjunction()
+            self.take(")")
+            return value
+        if token.upper() == "WITH":
+            raise ValueError("WITH without a licence before it")
+        if self.peek() is not None and self.peek().upper() == "WITH":
+            self.take("WITH")
+            token = f"{token} WITH {self.take()}"
+        return token.lower() in allow
+
+    def conjunction(self):
+        value = self.atom()
+        while self.peek() is not None and self.peek().upper() == "AND":
+            self.take("AND")
+            value = self.atom() and value
+        return value
+
+    def disjunction(self):
+        value = self.conjunction()
+        while self.peek() is not None and self.peek().upper() == "OR":
+            self.take("OR")
+            value = self.conjunction() or value
+        return value
+
+for expression in expressions:
+    try:
+        tokens = re.findall(r"\(|\)|[A-Za-z0-9.+-]+", expression.replace("/", " OR "))
+        parser = Parser(tokens)
+        passed = parser.disjunction()
+        if parser.peek() is not None:
+            raise ValueError(f"trailing token {parser.peek()}")
+    except ValueError as error:
+        print(f"::error::could not read licence expression `{expression}`: {error}")
+        failed = True
         continue
-      fi
-      if ! grep -qixF "$part" <<<"$allow_list"; then
-        note "the graph carries \`$expression\`, which needs \`$part\`; deny.toml's allow list does not name it"
-      fi
-    done
-  done <<<"$expressions"
+    if not passed:
+        print(f"::error::the graph carries `{expression}`, which names no licence `deny.toml` allows")
+        failed = True
+
+sys.exit(1 if failed else 0)
+PY
+  if ! printf '%s' "$metadata" | python3 "$policy_check" "$allow_list"; then
+    status=1
+  fi
 fi
 
 if grep -E '^source = "git\+' Cargo.lock >/dev/null; then

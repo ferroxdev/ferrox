@@ -1,6 +1,6 @@
 # The blackhole sink
 
-Row 28: a `blackhole` outbound swallows the flow, and the same sink is an inbound: every flow that reaches its listener gets the same answer. It answers the client with one of the reference's three answers — nothing, the 403 its own `http.Response.Write` serialises, or the bytes the config carries — and then ends the flow: the peer's read side ends with the answer, and an answer that was written has the peer's bytes read to their end, so the close is a finish and not the reset an unread request earns.
+Row 28: a `blackhole` outbound swallows the flow, and the same sink is an inbound: every flow that reaches its listener gets the same answer. It answers the client with one of the reference's three answers — nothing, the 403 its own `http.Response.Write` serialises, or the bytes the config carries — and then ends the flow: the peer's read side ends with the answer, and an answer that was written has the peer's bytes read to their end within `sinkGrace`, so the close is a finish and not the reset an unread request earns.
 
 The answer's bytes are the reference's own. The oracle (`scripts/blackhole-oracle`) drives the pinned `xray-core`'s handler over a pipe and records every octet it wrote; `ferrox-core`'s `blackhole` module is compared to that record octet for octet, and the answer the writer receives is the config's own buffer — the pointer it sees is the pointer the answer holds, and a clone of the answer does not move it.
 
@@ -32,6 +32,7 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| syscalls-per-answered-flow | UNBLESSED | scripts/count-ops.sh |
 | answer-bytes-the-reference-writes | 101 | ferrox-core-blackhole::tests::the_answer_is_the_bytes_the_pinned_go_writes |
 | inbound-http-answer-bytes | 101 | ferrox-app-proxy::tests::a_blackhole_inbound_serves_all_three_answers |
 | answer-writes-per-flow | 1 | ferrox-core-blackhole::tests::the_answer_is_one_write |

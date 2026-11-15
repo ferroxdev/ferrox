@@ -65,6 +65,9 @@ No duration is claimed. The answer is one write of a fixed string; benchmarks ar
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| syscalls-per-answer | UNBLESSED | scripts/count-ops.sh |
+| answer-copies-per-byte-written | 0 | ferrox-app-proxy::hc_tests::an_hc_answer_is_prebuilt_without_allocating |
+| seconds-per-answer | UNBLESSED | CI bench.yml (no cell yet) |
 | answer-allocations | 0 | ferrox-app-proxy::hc_tests::an_hc_answer_is_prebuilt_without_allocating |
 | answer-bytes | 85 | ferrox-app-proxy::hc_tests::an_hc_answer_is_prebuilt_without_allocating |
 <!-- counts:end -->

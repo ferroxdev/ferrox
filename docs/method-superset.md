@@ -176,7 +176,7 @@ Optimization targets still standing in this tree. Completed removals live in the
 | # | what | where | bit-identical |
 | --- | --- | --- | --- |
 | 6 | UDP-over-TCP pays two read syscalls per datagram for VLESS and four to six for Trojan, where one amortised window read into a per-connection remainder would cost one | `proxy.rs` `read_udp_datagram`, `read_trojan_datagram` via `read_socks_addr` | yes — `Counting` reader idiom |
-| 7 | zero-fills the allocator counter cannot see (`count::measure` hooks `alloc`/`alloc_zeroed`; a `resize` into spare capacity is a plain `memset`) | `mux::Outgoing::encode_header_into` zeroes `2 + meta` bytes `write_meta` overwrites; `vec![0u8; CHUNK]` relay buffers handed straight to `Read::read`; a `vec![0u8; 65536]` per KCP connection | replace with `with_capacity` + `set_len`; Miri (`safety.yml`) watches the read discipline |
+| 7 | zero-fills the allocator counter cannot see (`count::measure` hooks `alloc`/`alloc_zeroed`; a `resize` into spare capacity is a plain `memset`) | `mux::Outgoing::encode_header_into` zeroes `2 + meta` bytes `write_meta` overwrites; `vec![0u8; CHUNK]` relay buffers handed straight to `Read::read`; a `vec![0u8; 65536]` per KCP connection | initialize every byte before `set_len`, or use `spare_capacity_mut` only where a writer initializes it; a relay buffer passed to `Read::read` stays zero-filled; Miri (`safety.yml`) watches the read discipline |
 
 ## What is not removed
 

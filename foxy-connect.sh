@@ -136,35 +136,156 @@ lane_running() {
 }
 
 stop_lane() {
-  local pid_file pid
+  local pid_file pid i rc=0
   pid_file="$(lane_pid_file)"
   if [ -f "$pid_file" ]; then
     pid="$(cat "$pid_file" 2>/dev/null || true)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
+      for i in $(seq 1 50); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+        for i in $(seq 1 20); do
+          kill -0 "$pid" 2>/dev/null || break
+          sleep 0.1
+        done
+      fi
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "lane pid $pid did not exit after SIGKILL; keeping $pid_file." >&2
+        rc=1
+      else
+        rm -f "$pid_file"
+      fi
+    else
+      rm -f "$pid_file"
     fi
-    rm -f "$pid_file"
   fi
-  if [ "$CLEAR_VPN" = 1 ]; then system_proxy_off; fi
+  if [ "$CLEAR_VPN" = 1 ] || [ -f "$CONF_DIR/system-proxy.ports" ] || [ -f "$CONF_DIR/system-proxy.state" ]; then
+    system_proxy_off || rc=$?
+  fi
+  return "$rc"
 }
 
-# The only ports the system proxy was pointed at, so down clears exactly those.
+proxy_field() {
+  printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -n 1
+}
+
+# One service's prior proxy settings, tab-separated, so down can put back only
+# the fields this script changed.
+system_proxy_snapshot() {
+  local svc="$1" line s_on s_srv s_port w_on w_srv w_port e_on e_srv e_port
+  line="$(networksetup -getsocksfirewallproxy "$svc" 2>/dev/null)" || return 1
+  s_on="$(proxy_field "$line" Enabled | tr '[:upper:]' '[:lower:]')"
+  s_srv="$(proxy_field "$line" Server)"; s_port="$(proxy_field "$line" Port)"
+  line="$(networksetup -getwebproxy "$svc" 2>/dev/null)" || return 1
+  w_on="$(proxy_field "$line" Enabled | tr '[:upper:]' '[:lower:]')"
+  w_srv="$(proxy_field "$line" Server)"; w_port="$(proxy_field "$line" Port)"
+  line="$(networksetup -getsecurewebproxy "$svc" 2>/dev/null)" || return 1
+  e_on="$(proxy_field "$line" Enabled | tr '[:upper:]' '[:lower:]')"
+  e_srv="$(proxy_field "$line" Server)"; e_port="$(proxy_field "$line" Port)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$svc" "${s_on:--}" "${s_srv:--}" "${s_port:--}" \
+    "${w_on:--}" "${w_srv:--}" "${w_port:--}" \
+    "${e_on:--}" "${e_srv:--}" "${e_port:--}"
+}
+
+# Restore one field only while it still points at the port this lane armed.
+proxy_restore_kind() {
+  local svc="$1" kind="$2" ours="$3" prior_on="$4" prior_srv="$5" prior_port="$6"
+  local get set setter line enabled server port
+  case "$kind" in
+    socks) get=-getsocksfirewallproxy; set=-setsocksfirewallproxystate; setter=-setsocksfirewallproxy ;;
+    web) get=-getwebproxy; set=-setwebproxystate; setter=-setwebproxy ;;
+    secureweb) get=-getsecurewebproxy; set=-setsecurewebproxystate; setter=-setsecurewebproxy ;;
+  esac
+  line="$(networksetup "$get" "$svc" 2>/dev/null)" || return 1
+  enabled="$(proxy_field "$line" Enabled | tr '[:upper:]' '[:lower:]')"
+  [ "$enabled" = yes ] || return 0
+  server="$(proxy_field "$line" Server)"
+  port="$(proxy_field "$line" Port)"
+  case "$server" in 127.*|localhost|::1) ;; *) return 0 ;; esac
+  [ "$port" = "$ours" ] || return 0
+  if [ -n "$prior_srv" ] && [ "$prior_srv" != - ] &&
+    [ -n "$prior_port" ] && [ "$prior_port" != - ]; then
+    networksetup "$setter" "$svc" "$prior_srv" "$prior_port" 2>/dev/null || return 1
+    if [ "$prior_on" = yes ]; then
+      networksetup "$set" "$svc" on 2>/dev/null || return 1
+    else
+      networksetup "$set" "$svc" off 2>/dev/null || return 1
+    fi
+  else
+    networksetup "$set" "$svc" off 2>/dev/null || return 1
+  fi
+}
+
+# The record holds the ports and every service this lane armed plus its prior
+# settings; a failure keeps the record so a later down can retry.
 system_proxy_off() {
-  if [ -f "$CONF_DIR/system-proxy.ports" ]; then
-    local ports socks http
-    ports="$(cat "$CONF_DIR/system-proxy.ports")"
+  local ports_file="$CONF_DIR/system-proxy.ports"
+  local state_file="$CONF_DIR/system-proxy.state"
+  if [ ! -f "$ports_file" ] && [ ! -f "$state_file" ]; then return 0; fi
+  if ! command -v networksetup >/dev/null 2>&1; then
+    rm -f "$ports_file" "$state_file"
+    return 0
+  fi
+  local socks="" http="" ports="" failed=0 svc kind get set line enabled server port want
+  local s_on s_srv s_port w_on w_srv w_port e_on e_srv e_port
+  if [ -r "$ports_file" ]; then
+    ports="$(cat "$ports_file")"
     socks="${ports%% *}"; http="${ports##* }"
-    command -v networksetup >/dev/null 2>&1 || return 0
+  fi
+  if [ -f "$state_file" ] && [ -z "$ports" ]; then
+    echo "system proxy: $state_file has no port record; keeping it for a retry." >&2
+    return 1
+  fi
+  if [ -r "$state_file" ] && [ -s "$state_file" ]; then
+    while IFS=$'\t' read -r svc s_on s_srv s_port w_on w_srv w_port e_on e_srv e_port; do
+      [ -z "$svc" ] && continue
+      case "$svc" in *\**) continue;; esac
+      if [ -n "$socks" ] && [ "$socks" != - ]; then
+        proxy_restore_kind "$svc" socks "$socks" "$s_on" "$s_srv" "$s_port" ||
+          { echo "system proxy: could not restore SOCKS on '$svc'." >&2; failed=1; }
+      fi
+      if [ -n "$http" ] && [ "$http" != - ]; then
+        proxy_restore_kind "$svc" web "$http" "$w_on" "$w_srv" "$w_port" ||
+          { echo "system proxy: could not restore Web on '$svc'." >&2; failed=1; }
+        proxy_restore_kind "$svc" secureweb "$http" "$e_on" "$e_srv" "$e_port" ||
+          { echo "system proxy: could not restore Secure Web on '$svc'." >&2; failed=1; }
+      fi
+    done < "$state_file"
+  else
     while IFS= read -r svc; do
       [ -z "$svc" ] && continue
       case "$svc" in *\**) continue;; esac
-      networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null || true
-      networksetup -setwebproxystate "$svc" off 2>/dev/null || true
-      networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
+      for kind in socks web secureweb; do
+        case "$kind" in
+          socks) get=-getsocksfirewallproxy; set=-setsocksfirewallproxystate; want="$socks" ;;
+          web) get=-getwebproxy; set=-setwebproxystate; want="$http" ;;
+          secureweb) get=-getsecurewebproxy; set=-setsecurewebproxystate; want="$http" ;;
+        esac
+        [ -n "$want" ] && [ "$want" != - ] || continue
+        line="$(networksetup "$get" "$svc" 2>/dev/null)" ||
+          { echo "system proxy: could not read $kind on '$svc'." >&2; failed=1; continue; }
+        enabled="$(proxy_field "$line" Enabled | tr '[:upper:]' '[:lower:]')"
+        [ "$enabled" = yes ] || continue
+        server="$(proxy_field "$line" Server)"
+        port="$(proxy_field "$line" Port)"
+        case "$server" in 127.*|localhost|::1) ;; *) continue ;; esac
+        [ "$port" = "$want" ] || continue
+        networksetup "$set" "$svc" off 2>/dev/null ||
+          { echo "system proxy: could not clear $kind on '$svc'." >&2; failed=1; }
+      done
     done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
-    rm -f "$CONF_DIR/system-proxy.ports"
-    echo "system proxy cleared (was SOCKS $socks, HTTP $http)."
   fi
+  if [ "$failed" = 1 ]; then
+    echo "system proxy: the clear failed; $ports_file is kept for a retry." >&2
+    return 1
+  fi
+  rm -f "$ports_file" "$state_file"
+  echo "system proxy cleared (was SOCKS ${socks:--}, HTTP ${http:--})."
   return 0
 }
 
@@ -173,11 +294,20 @@ system_proxy_on() {
     echo "no networksetup here: the fronts stay local, point your apps at them by hand." >&2
     return 0
   fi
-  local any=0
+  local ports_file="$CONF_DIR/system-proxy.ports"
+  local state_file="$CONF_DIR/system-proxy.state"
+  if [ -f "$ports_file" ] || [ -f "$state_file" ]; then
+    system_proxy_off || return 1
+  fi
+  local any=0 svc snapshot
+  : > "$state_file"; chmod 600 "$state_file" 2>/dev/null || true
+  printf '%s %s\n' "$SOCKS_PORT" "$HTTP_PORT" > "$ports_file"
   while IFS= read -r svc; do
     [ -z "$svc" ] && continue
     case "$svc" in *\**) continue;; esac
+    snapshot="$(system_proxy_snapshot "$svc")" || continue
     networksetup -setsocksfirewallproxy "$svc" 127.0.0.1 "$SOCKS_PORT" 2>/dev/null || continue
+    printf '%s\n' "$snapshot" >> "$state_file"
     networksetup -setsocksfirewallproxystate "$svc" on 2>/dev/null || true
     networksetup -setwebproxy "$svc" 127.0.0.1 "$HTTP_PORT" 2>/dev/null || true
     networksetup -setwebproxystate "$svc" on 2>/dev/null || true
@@ -185,24 +315,30 @@ system_proxy_on() {
     networksetup -setsecurewebproxystate "$svc" on 2>/dev/null || true
     any=1
   done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
-  [ "$any" = 1 ] || die "no network service took the proxy"
-  echo "$SOCKS_PORT $HTTP_PORT" > "$CONF_DIR/system-proxy.ports"
+  if [ "$any" != 1 ]; then
+    system_proxy_off >/dev/null 2>&1 || true
+    die "no network service took the proxy"
+  fi
   echo "system proxy on: SOCKS 127.0.0.1:$SOCKS_PORT, HTTP(S) 127.0.0.1:$HTTP_PORT"
   echo "scope: apps that honour the system proxy (browsers included). No utun device:"
   echo "README rows 29/58, slice P46."
 }
 
-exit_country() {
-  local first port
-  first="$(fronts_for "$MODE" | head -n 1)"
-  port="$(front_port "$first")"
+front_trace() {
+  local front="$1" port="$2"
   local -a via=(-fsSL --max-time 30 --noproxy '')
-  if [ "$first" = http ]; then
+  if [ "$front" = http ]; then
     via+=(-x "http://127.0.0.1:$port")
   else
     via+=(--socks5-hostname "127.0.0.1:$port")
   fi
-  curl "${via[@]}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^(loc|ip)=' || true
+  curl "${via[@]}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true
+}
+
+exit_country() {
+  local first
+  first="$(fronts_for "$MODE" | head -n 1)"
+  front_trace "$first" "$(front_port "$first")" | grep -E '^(loc|ip)=' || true
 }
 
 # One flow through the first front, and the pinned country is the assertion: the
@@ -241,10 +377,10 @@ wait_port() {
 # 1 MB off the same host the CI legs use, over one of the local fronts.
 download_1mb() {
   local front="$1" carrier="$2" want="$3"
-  local port out got
+  local port out got loc
   port="$(front_port "$front")"
   out="$CONF_DIR/check-$front-$carrier.bin"
-  local -a curl_args=(-sS --max-time 300)
+  local -a curl_args=(-sS --max-time 300 --noproxy '')
   if [ "$front" = http ]; then
     curl_args+=(-x "http://127.0.0.1:$port")
   else
@@ -253,8 +389,14 @@ download_1mb() {
   if curl "${curl_args[@]}" 'https://speed.cloudflare.com/__down?bytes=1000000' -o "$out"; then
     got="$(wc -c < "$out" | tr -d ' ')"
     if [ "$got" = 1000000 ]; then
-      echo "ok   $front over $carrier: 1000000 B"
-      return 0
+      loc="$(front_trace "$front" "$port" | sed -n 's/^loc=//p' | tr '[:lower:]' '[:upper:]')"
+      if [ "$loc" = "$want" ]; then
+        echo "ok   $front over $carrier: 1000000 B from $loc"
+        return 0
+      fi
+      rm -f "$out"
+      echo "FAIL $front over $carrier: exit reads ${loc:-unknown}, wanted $want" >&2
+      return 1
     fi
   fi
   rm -f "$out"
@@ -264,9 +406,14 @@ download_1mb() {
 
 write_config() {
   local cfg="$1"; shift
-  python3 - "$cfg" "$EMAIL" "$PASS" "$CODE" "$COUNTRY" "$CITY" "$CARRIER" "$UPSTREAM" "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" "$MODE" <<'PY'
-import json, sys
-cfg, email, password, code, country, city, carrier, upstream, socks, http, mixed, mode = sys.argv[1:13]
+  FERR_EMAIL="$EMAIL" FERR_PASS="$PASS" FERR_CODE="$CODE" FERR_UPSTREAM="$UPSTREAM" \
+    python3 - "$cfg" "$COUNTRY" "$CITY" "$CARRIER" "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" "$MODE" <<'PY'
+import json, os, sys
+cfg, country, city, carrier, socks, http, mixed, mode = sys.argv[1:9]
+email = os.environ["FERR_EMAIL"]
+password = os.environ["FERR_PASS"]
+code = os.environ["FERR_CODE"]
+upstream = os.environ["FERR_UPSTREAM"]
 settings = {"email": email, "password": password, "country": country, "carrier": carrier}
 if code:
     settings["code"] = code
@@ -331,10 +478,32 @@ mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
 
 if [ "$ACTION" = countries ]; then list_countries; exit 0; fi
 if [ "$ACTION" = down ]; then
-  CLEAR_VPN=1; stop_lane
+  CLEAR_VPN=1
+  if ! stop_lane; then
+    echo "the lane stopped, but the system proxy could not be cleared; its record is kept; run down again." >&2
+    exit 1
+  fi
   # The lane configs carry the account password, so they go when the lane does.
   rm -f "$CONF_DIR"/foxy-*.json
   echo "lane stopped; configs under $CONF_DIR removed."
+  exit 0
+fi
+if [ "$ACTION" = status ]; then
+  if ! lane_running; then
+    echo "lane not running (pid file $(lane_pid_file) absent)."
+    exit 1
+  fi
+  echo "lane running (pid $(cat "$(lane_pid_file)")), fronts:"
+  for front in $(fronts_for "$MODE"); do
+    case "$front" in
+      http) echo "  HTTP CONNECT  http://127.0.0.1:$HTTP_PORT   (curl -x, browsers' HTTP proxy)" ;;
+      socks) echo "  SOCKS5        socks5://127.0.0.1:$SOCKS_PORT (curl --socks5-hostname, UDP-aware)" ;;
+      mixed) echo "  mixed         http://127.0.0.1:$MIXED_PORT   (socks and http on one port)" ;;
+    esac
+  done
+  echo "exit country: $COUNTRY, carrier: $CARRIER${UPSTREAM:+, upstream $UPSTREAM}"
+  echo "log:  $LOG   stop: ./foxy-connect.sh down"
+  exit_country
   exit 0
 fi
 
@@ -357,21 +526,23 @@ fi
 
 if [ -n "$CREDENTIALS" ] && [ -f "$CREDENTIALS" ]; then
   # A credentials file inside this repository is a secret someone is about to
-  # commit: it is refused rather than read.
-  case "$CREDENTIALS" in
-    "$FERROX_ROOT"/*)
-      if git -C "$FERROX_ROOT" ls-files --error-unmatch "$CREDENTIALS" >/dev/null 2>&1; then
-        die "$CREDENTIALS is tracked by git; move it to $HOME/.ferrox/credentials (0600)"
-      fi ;;
+  # commit: it is refused rather than read, however it is spelled or tracked.
+  if command -v python3 >/dev/null 2>&1; then
+    cred_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CREDENTIALS")"
+    root_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$FERROX_ROOT")"
+  else
+    cred_real="$CREDENTIALS"
+    root_real="$(cd "$FERROX_ROOT" && pwd -P)"
+  fi
+  case "$cred_real" in
+    "$root_real"/*)
+      die "$CREDENTIALS resolves inside the repository; move it to $HOME/.ferrox/credentials (0600)" ;;
   esac
+  explicit_email="$EMAIL"; explicit_pass="$PASS"
   # shellcheck disable=SC1090
   . "$CREDENTIALS"
-  EMAIL="${FOXY_EMAIL:-$EMAIL}"
-  PASS="${FOXY_PASS:-$PASS}"
-fi
-if [ "$ACTION" = status ] && ! lane_running; then
-  echo "lane not running (pid file $(lane_pid_file) absent)."
-  exit 1
+  EMAIL="${explicit_email:-${FOXY_EMAIL:-$EMAIL}}"
+  PASS="${explicit_pass:-${FOXY_PASS:-$PASS}}"
 fi
 if [ -n "$EMAIL" ] && [ -z "$PASS" ] && [ -t 0 ]; then
   printf 'Firefox password for %s: ' "$EMAIL" >&2
@@ -387,7 +558,7 @@ case "$MODE" in socks|http|mixed|all|vpn) ;; *) die "unknown mode $MODE (socks, 
 CITY="$(printf '%s' "$CITY" | tr '[:lower:]' '[:upper:]')"
 case "$CARRIER" in auto|h1|h2|h3|http/1.1|http/2|quic) ;; *) CARRIER="auto";; esac
 
-if lane_running && [ "$ACTION" != status ]; then stop_lane; fi
+if lane_running; then stop_lane || die "the system proxy could not be cleared; fix it before starting another lane."; fi
 CFG="$CONF_DIR/foxy-$COUNTRY.json"
 write_config "$CFG"
 echo "config: $CFG (mode 0600, under $CONF_DIR)"
@@ -411,11 +582,6 @@ echo "exit country: $COUNTRY, carrier: $CARRIER${UPSTREAM:+, upstream $UPSTREAM}
 echo "curl: curl --socks5-hostname 127.0.0.1:$SOCKS_PORT https://api.ipify.org"
 echo "log:  $LOG   stop: ./foxy-connect.sh down"
 
-if [ "$ACTION" = status ]; then
-  exit_country
-  exit 0
-fi
-
 if [ "$ACTION" = check ]; then
   first="$(fronts_for "$MODE" | head -n 1)"
   port="$(front_port "$first")"
@@ -434,8 +600,10 @@ if [ "$ACTION" = check ]; then
     download_1mb "$front" "$CARRIER" "$COUNTRY" || DOWN_FAILED=1
   done
   # Each carrier proves the lane itself: auto is a start, so each explicit
-  # carrier gets its own lane start.
+  # carrier gets its own lane start. The last test leaves a SOCKS-only lane, so
+  # put the mode and fronts this check found back before returning.
   if [ "$CARRIER" = auto ]; then
+    check_mode="$MODE"
     for carrier in h1 h2 h3; do
       stop_lane
       MODE="socks"
@@ -447,7 +615,21 @@ if [ "$ACTION" = check ]; then
       wait_port "$SOCKS_PORT" || { echo "carrier $carrier never listened" >&2; DOWN_FAILED=1; continue; }
       download_1mb socks "$carrier" "$COUNTRY" || DOWN_FAILED=1
     done
+    stop_lane
+    MODE="$check_mode"
     CARRIER="auto"
+    CFG="$CONF_DIR/foxy-$COUNTRY.json"
+    write_config "$CFG"
+    FRONTS="$(fronts_for "$MODE" | tr '\n' ' ')"
+    "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
+    echo "$!" > "$(lane_pid_file)"
+    for front in $FRONTS; do
+      port="$(front_port "$front")"
+      wait_port "$port" || { echo "the original fronts did not reopen" >&2; DOWN_FAILED=1; break; }
+    done
+    if [ "$MODE" = vpn ] && [ "${DOWN_FAILED:-0}" != 1 ]; then
+      prove_flow && system_proxy_on || DOWN_FAILED=1
+    fi
   fi
   if [ "${DOWN_FAILED:-0}" = 1 ]; then
     echo "check failed; see $LOG" >&2
