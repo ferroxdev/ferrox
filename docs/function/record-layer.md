@@ -65,6 +65,7 @@ graph TD
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | syscalls-per-megabyte | UNBLESSED | scripts/count-ops.sh |
 | user-space-copies-per-megabyte | UNBLESSED | no copy checker yet |
+| seconds-per-megabyte | UNBLESSED | CI bench.yml (gate 3) |
 | discarded-keystream-blocks | 0 | ferrox-bench-gate-2 |
 | allocations-per-fill | 0 | ferrox-bench-gate-2 |
 | zero-filled-bytes-per-fill | 0 | ferrox-bench-gate-2 |
@@ -188,7 +189,7 @@ This also bounds what the ladder-head guards on the four-lane rungs can assume: 
 
 Against the references: xray-core's stream cipher is replaced by the block ladder, so a call does not refill per record; sing-box's one-shot AEAD forces a refill per call, which the ladder avoids; ZeroNet's explicit 8→4→2→1 ladder is matched at the four-lane rung, while the unreachable two-lane rung is deleted rather than copied.
 - **The sixteen-block pass is checked by the runners, not here.** Nothing this repository builds on can execute `avx512f` without a machine that has it, so `chacha::avx512::Z16` is not run on the machine reading this — and an emulator does not stand in: a `x86_64` build of this crate run under Rosetta on Apple silicon reports `avx512f` false, which is the very `is_x86_feature_detected!` the test reads on its first line and the dispatch itself calls, so the body returns before it runs a block. The pass's *shape* is checked everywhere: `chacha::wide` carries the same body over sixteen `u32`, and the differential test beside it holds that instantiation to `portable::U4` at every length to 2072 bytes and four start counters, head and headless. What is left to a machine with AVX-512 is one instruction — the gather whose `idx & 0x10` bit picks the source register — so the honest split is: the index table is proved a transpose here, the pass over it is proved the ladder here, and the one instruction that applies it is proved on the two `x86_64` runners of `bench.yml` and in the `x86_64` job of `ci.yml`. If no runner carried `avx512f`, the test would still return without testing anything, which is why the machine line of each run quoted under `## Time` is quoted beside the number: the claim is a claim about those machines.
-- **`ops-retired-instructions` is still `UNBLESSED` on every page.** The tree's blessed exact counts are `append_pem`, the DNS decide probe and the Vision pump; none is a row on this page. The table above counts allocations, zero-filled bytes and fixed block sizes; the removed operations named above — copies, passes, blocks and absorbs — are not counted, and the retired-instruction figure for each is not measured, so no page states one.
+- **`ops-retired-instructions` is still `UNBLESSED` on this page.** None of the tree's blessed exact counts is a row on this page. The table above counts allocations, zero-filled bytes and fixed block sizes; the removed operations named above — copies, passes, blocks and absorbs — are not counted, and the retired-instruction figure for each is not measured, so this page states none.
 
 ## Pins
 

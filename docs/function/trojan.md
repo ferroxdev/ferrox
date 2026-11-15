@@ -43,6 +43,7 @@ graph TD
 | --- | --- | --- |
 | ops-retired-instructions | 1182 | scripts/count-ops.sh |
 | syscalls-per-handshake | UNBLESSED | scripts/count-ops.sh |
+| trojan-tls-raw-down-8-ubuntu-x86-64-mib-per-second | 2814.1 | CI benchmark-matrix.yml trojan-tls-raw-down-8 |
 | password-bytes-on-the-wire | 56 | ferrox-app-proxy::tests::trojan_key_is_sha224_hex |
 | framing-bytes-added-after-the-header | 0 | ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers |
 | udp-framing-bytes-per-datagram | 2 | ferrox-app-proxy::tests::trojan_udp_frames_carry |

@@ -63,7 +63,7 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | Observatory / burst probe | implemented (row 124): legacy and burst probes, `leastPing`/`leastLoad`, healthcheck front |
 | Reverse portal / bridge | partial (row 119): modern VLESS reverse both roles; freedom/blackhole only, no xhttp/QUIC/KCP/hysteria/xdrive |
 | Stats, metrics (Prometheus), policy manager | implemented (row 54): reference counters, an online map with source IPs and last-seen times, access log and policies |
-| `app/commander` gRPC API (config/inbound/outbound/log/router/stats) | partial (row 120): every service except `AddRule`/`RemoveRule` |
+| `app/commander` gRPC API (config/inbound/outbound/log/router/stats) | implemented (row 120): every service, including `AddRule`/`RemoveRule` over the live table; an add refuses a duplicate tag, an unknown target, or a rule a server inbound cannot evaluate |
 | Geodata (.dat) loader/downloader | partial (row 115): geodata refresh carried inside routing; the full loader/downloader surface is not |
 | OCSP, antireplay, time-window caches | implemented (row 49): OCSP fetch and staple on every lane, plus the VMess session-history cache |
 | Freedom fragment, VLESS encryption fragment | freedom fragment done (row 45); VLESS encryption implemented (row 37) |

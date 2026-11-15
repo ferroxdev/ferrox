@@ -45,8 +45,10 @@ graph TD
     G -- "ICMP echo to own address" --> IC["icmp_echo_reply:<br/>swap, flip type, checksum"]
     H & I & IC --> J["reply packet"]
     J -- "h3 reply" --> C
-    J -- "h2 / h2c reply" --> JC["capsule → DATA"]
+    J -- "h2 reply" --> JC["capsule → DATA"]
     JC --> JT["TLS / TCP"]
+    J -- "h2c reply" --> JC2["capsule → DATA"]
+    JC2 --> JT2["TCP (prior knowledge)"]
     J -- "h1 reply" --> JH1["capsule stream"]
     JH1 --> JH1T["TLS / TCP (ALPN http/1.1)"]
     S["quiche server socket"] --> T["Header::from_slice<br/>local CID length 16"]

@@ -15,15 +15,17 @@ graph TD
     D["dial: stock hello with a zeroed tag<br/>for the AAD, then with the seal"] --> C["client: ClientHello with a key share"]
     C --> S["server: read the whole hello<br/>across however many records"]
     S --> X["find the X25519 share<br/>prefer a plain one over a hybrid"]
-    S -->|"a hello that breaks a parse rule"| D
+    S -->|"a hello that breaks a parse rule"| CO["dial the cover origin"]
     X --> G["one X25519 group operation"]
     G --> K["HKDF the shared secret<br/>into the authentication key"]
     K --> A["open the sealed session id<br/>over the zeroed hello as AAD"]
     A --> I["compare the 8-byte shortId<br/>and the clock and the client version"]
     I --> P["HandshakeContext:<br/>the TLS 1.3 exchange proceeds"]
-    A -->|"no authed hello"| CO["dial the cover origin"]
-    CO --> H["PROXY-protocol header<br/>then the hello the server read"]
+    A -->|"no authed hello"| CO
+    CO -->|"xver > 0"| H["PROXY-protocol header<br/>then the hello the server read"]
+    CO -->|"xver = 0"| H0["the hello the server read,<br/>no PROXY header"]
     H --> R["splice: bytes in, bytes out<br/>paced by the rate limit its side was given"]
+    H0 --> R
     P --> V["with Vision: the padding<br/>frames stop and the socket is raw"]
     V --> L["relay: bytes in, bytes out"]
     FR["a carrier frame: head, payload<br/>and tail as separate slices"] --> FC["one lock, one call:<br/>the parts are segments of one payload"]
@@ -177,13 +179,7 @@ What is **not** removed, and stays named: a REALITY hello is the named parrot's 
 
 `verifyPeerCertByName` replaces the name a chain is checked against: xray turns its own SNI check off and verifies once per listed name, so a front whose certificate names another host connects where the SNI alone would refuse it. `tls_verify_names` splits the comma list the reference splits, and `Named` loops the names over whichever verifier the config chose, so a pinned CA is still the root and the first name the chain answers accepts the dial. `verify_peer_cert_by_name_checks_the_name_the_config_names` holds all three verdicts: a listed name that matches accepts, a list that matches nothing refuses, and no list at all keeps the SNI's check and refuses.
 
-`masterKeyLog` appends every secret a handshake derives to the file the config names, which is what a capture needs to decrypt the session offline.
-The path is opened when the config is built with create, append and `0600`, as xray's `os.OpenFile` does; an empty name or `none` logs nothing, and a path that cannot be opened is reported and the dial or listener proceeds without it.
-Both client builds write — the shaped hello's own key schedule hands over `CLIENT_HANDSHAKE_TRAFFIC_SECRET`, `SERVER_HANDSHAKE_TRAFFIC_SECRET`, `CLIENT_TRAFFIC_SECRET_0` and `SERVER_TRAFFIC_SECRET_0`, and the stock rustls config sets the key log rustls reads — and a listener names the same field for its side through rustls.
-The shaped TLS 1.2 path writes `CLIENT_RANDOM` the same way, though no witness drives a 1.2 handshake with a log.
-The REALITY lane opens `realitySettings.masterKeyLog` with the same helper, as xray's reality dial builds its own writer (`reality/config.go:67`) separately from `tlsSettings`, and the sealed hello's key schedule hands it the four TLS 1.3 secrets; `a_reality_master_key_log_records_the_sealed_handshake` is the witness.
-`a_master_key_log_records_the_secrets_the_config_names` is the witness: two outbounds naming different files each append their own secrets because the config cache keys on the handle rather than the file's path, the stock hello's file is written, the listener's file carries its server secrets, every line reads `label <64 hex> <hex>` in NSS form, and a path inside a directory that does not exist still completes the dial.
-The protobuf seam carries the same field (`tls.Config.master_key_log`, 15), and the reality config's own (`reality.Config.master_key_log`, 31).
+`masterKeyLog` appends every secret a handshake derives to the file the config names, which is what a capture needs to decrypt the session offline. The path is opened when the config is built with create, append and `0600`, as xray's `os.OpenFile` does; an empty name or `none` logs nothing, and a path that cannot be opened is reported and the dial or listener proceeds without it. Both client builds write — the shaped hello's own key schedule hands over `CLIENT_HANDSHAKE_TRAFFIC_SECRET`, `SERVER_HANDSHAKE_TRAFFIC_SECRET`, `CLIENT_TRAFFIC_SECRET_0` and `SERVER_TRAFFIC_SECRET_0`, and the stock rustls config sets the key log rustls reads — and a listener names the same field for its side through rustls. The shaped TLS 1.2 path writes `CLIENT_RANDOM` the same way, though no witness drives a 1.2 handshake with a log. The REALITY lane opens `realitySettings.masterKeyLog` with the same helper, as xray's reality dial builds its own writer (`reality/config.go:67`) separately from `tlsSettings`, and the sealed hello's key schedule hands it the four TLS 1.3 secrets; `a_reality_master_key_log_records_the_sealed_handshake` is the witness. `a_master_key_log_records_the_secrets_the_config_names` is the witness: two outbounds naming different files each append their own secrets because the config cache keys on the handle rather than the file's path, the stock hello's file is written, the listener's file carries its server secrets, every line reads `label <64 hex> <hex>` in NSS form, and a path inside a directory that does not exist still completes the dial. The protobuf seam carries the same field (`tls.Config.master_key_log`, 15), and the reality config's own (`reality.Config.master_key_log`, 31).
 
 ## Pins
 

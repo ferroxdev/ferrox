@@ -2,7 +2,7 @@
 
 FERROX — Fast Efficient Relay Router Overlay X. *ferro*, iron, for Rust; *X*, for Xray.
 
-A from-scratch proxy core, **targeting bit-identical output to the implementations it replaces** and **verifiably not slower than any of them**. Coverage is partial; planned rows are marked in the tables below.
+A from-scratch proxy core, **targeting bit-identical output to the implementations it replaces** and a **measured-parity target of never slower than any of them**; the cells where that target is not met yet are named in [the benchmark matrix](docs/benchmarks/matrix.md). Coverage is partial; planned rows are marked in the tables below.
 
 ## Goals
 
@@ -284,7 +284,7 @@ Today exactly one method dials per hop. The chaining engine builds stacks as an 
 | 117 | Balancers leastPing/leastLoad/roundRobin/random + urltest/selector | partial — high priority; four balancer strategies reading observatory row 124; urltest and selector planned | — | Xray `router/balancing.go`; sing-box `protocol/group/`; ZeroNet `zero-observatory` |
 | 118 | Built-in DNS app (UDP/TCP/DoT/DoH/DoQ/FakeDNS/cache) | implemented — UDP/TCP/DoT/DoH/DoQ, cache, hosts, FakeDNS, filters and parallel groups; Lua script row 116 | xray scenarios 1/1. | Xray `app/dns`; sing-box `dns/`; ZeroNet `zero-dns`; [page](docs/function/engine-dns.md) |
 | 119 | Reverse tunnel bridge/portal | partial | Partial: modern VLESS reverse both roles; freedom/blackhole only, no xhttp/QUIC/KCP/hysteria/xdrive. | Xray `app/reverse`; ZeroNet `reverse.rs`; xray-core-rust `xray-app-reverse` |
-| 120 | Commander gRPC management API | partial — every service except `AddRule`/`RemoveRule` | xray commander 5/5. | Xray `app/commander`; [page](docs/function/engine-api.md) |
+| 120 | Commander gRPC management API | implemented — every service, including `AddRule`/`RemoveRule` over the live table | `AddRule` appends or replaces the live table and refuses a duplicate tag, an unknown target, or a rule a server inbound cannot evaluate; `RemoveRule` drops every rule with the tag. xray commander 5/5. | Xray `app/commander`; [page](docs/function/engine-api.md) |
 | 121 | Connection-planner ladder (climb on failure, earned descent) | planned — high priority | — | ZeroNet `zero-observatory`; Leaf `app/healthcheck.rs` (the per-outbound latency the balancers read) |
 | 122 | Subnet scanner + server discovery | planned | WARP edge discovery and validation is row 190. | ZeroNet `zero-scanner`, `zero-discovery` |
 | 123 | Load-balancer healthcheck probe inbound | implemented — one exact path, `GET` or a `POST` body signature, and a fixed `200` body | Implemented: one exact path, GET or signed POST, fixed `200`. | Leaf `proxy/hc/`; [front-healthcheck](docs/function/front-healthcheck.md) |

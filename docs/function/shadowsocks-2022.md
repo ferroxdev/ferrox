@@ -44,6 +44,7 @@ Every row is a claim with a checker that runs. `scripts/method-counts.txt` holds
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| seconds-per-megabyte | UNBLESSED | CI benchmark-matrix.yml (no per-cipher cell) |
 | aead-calls-per-chunk | 2 | ferrox-core-shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag |
 | maximum-payload-per-chunk | 65535 | ferrox-core-shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag |
 | write-syscalls-per-16KiB-relay-read | 1 | ferrox-app-shadowsocks2022::tests::one_relay_read_becomes_one_write_and_reads_back_whole |

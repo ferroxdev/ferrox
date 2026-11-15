@@ -1,24 +1,8 @@
 # OCSP stapling and the anti-replay / time-window caches
 
-xray-core's `ocspStapling` is a seconds interval on a `certificates` entry: its `setupOcspTicker`
-fetches the leaf's OCSP status on that interval and staples the answer into the handshake, and its
-cert-file reload rides the same interval, so one ticker serves both. Its anti-replay caches are
-three time-window maps: the `antireplay.ReplayFilter` for VMess auth ids (120 s stamp window) and
-Shadowsocks-2022 salts (30 s stamp window), the VMess `SessionHistory` for session ids (3 min
-lifetime, 30 s sweep), and the VLESS-encryption ticket store (live-minute expiry with a per-session
-nfs-key set).
+xray-core's `ocspStapling` is a seconds interval on a `certificates` entry: its `setupOcspTicker` fetches the leaf's OCSP status on that interval and staples the answer into the handshake, and its cert-file reload rides the same interval, so one ticker serves both. Its anti-replay caches are three time-window maps: the `antireplay.ReplayFilter` for VMess auth ids (120 s stamp window) and Shadowsocks-2022 salts (30 s stamp window), the VMess `SessionHistory` for session ids (3 min lifetime, 30 s sweep), and the VLESS-encryption ticket store (live-minute expiry with a per-session nfs-key set).
 
-`crates/ferrox-core/src/tls/ocsp.rs` is the fetch: a minimal DER walker reads the leaf's Authority
-Information Access for the responder (and the issuer URL when the chain names no issuer), builds
-the CertID xray's `ocsp.CreateRequest` builds — SHA-1 over the issuer's subject name and public
-key, the leaf's serial — and posts it over plain HTTP. `TlsServerConfig.renew` re-fetches on the
-existing ticker and swaps the staple only when the bytes change, so a steady responder never
-rebuilds the listener; the config preloads once at identity build the way xray-core-rust's stapler
-`preload`s, rather than waiting an interval for the first status. `oneTimeLoading` pins the
-identity as read, so an entry naming both staples nothing. `VMess::SessionHistory` was the
-one cache this tree did not carry: `accept_request` now refuses a header whose user, body key and
-body IV were admitted inside the lifetime, with the sweep folded into the admission so no second
-thread exists.
+`crates/ferrox-core/src/tls/ocsp.rs` is the fetch: a minimal DER walker reads the leaf's Authority Information Access for the responder (and the issuer URL when the chain names no issuer), builds the CertID xray's `ocsp.CreateRequest` builds — SHA-1 over the issuer's subject name and public key, the leaf's serial — and posts it over plain HTTP. `TlsServerConfig.renew` re-fetches on the existing ticker and swaps the staple only when the bytes change, so a steady responder never rebuilds the listener; the config preloads once at identity build the way xray-core-rust's stapler `preload`s, rather than waiting an interval for the first status. `oneTimeLoading` pins the identity as read, so an entry naming both staples nothing. `VMess::SessionHistory` was the one cache this tree did not carry: `accept_request` now refuses a header whose user, body key and body IV were admitted inside the lifetime, with the sweep folded into the admission so no second thread exists.
 
 ## Data path
 
@@ -62,14 +46,11 @@ graph TD
   tls::ocsp::tests::a_chain_staples_from_a_loopback_responder 'ocsp::staple_for'
 ```
 
-`UNBLESSED`. The fetch runs once per interval at config time, not per byte relayed; its cost is a
-config-load cost, and no row here quotes it as a figure until `ops.yml` measures it.
+`UNBLESSED`. The fetch runs once per interval at config time, not per byte relayed; its cost is a config-load cost, and no row here quotes it as a figure until `ops.yml` measures it.
 
 ## Time
 
-**Not measured yet.** Stapling changes handshake bytes, not a relay hot path; the `benchmark-matrix.yml`,
-`bench.yml` and `parity.yml` CI cells that would exercise a stapled listener run in CI, and no CI
-artefact has been read. The benchmark is the dispatch, never a laptop run.
+**Not measured yet.** Stapling changes handshake bytes, not a relay hot path; the `benchmark-matrix.yml`, `bench.yml` and `parity.yml` CI cells that would exercise a stapled listener run in CI, and no CI artefact has been read. The benchmark is the dispatch, never a laptop run.
 
 ## What was removed, and what was not
 

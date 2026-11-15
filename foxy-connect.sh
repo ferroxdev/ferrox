@@ -70,7 +70,7 @@ usage: ./foxy-connect.sh <action> [options]
 actions
   up                 start the lane and print how to use it (default action)
   down               stop the lane and clear the system proxy this set
-  status             show the session, then the exit IP and country
+  status             show the session, the carriers actually opened, then the exit IP and country
   check              one 1 MB download per method: socks, http front, mixed,
                      and per carrier h1/h2/h3; each asserts 1000000 bytes and
                      the pinned country
@@ -126,6 +126,40 @@ front_port() {
 }
 
 lane_pid_file() { printf '%s/lane.pid' "$CONF_DIR"; }
+
+lane_meta_file() { printf '%s/lane.meta' "$CONF_DIR"; }
+
+# The launch settings a later status needs. No credential is written here.
+write_lane_meta() {
+  local meta
+  meta="$(lane_meta_file)"
+  printf 'mode=%s\nsocks_port=%s\nhttp_port=%s\nmixed_port=%s\ncountry=%s\ncity=%s\ncarrier=%s\nupstream=%s\n' \
+    "$MODE" "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" "$COUNTRY" "$CITY" "$CARRIER" "$UPSTREAM" >"$meta" ||
+    die "could not write $meta; the lane was not started."
+  chmod 600 "$meta" 2>/dev/null || true
+}
+
+load_lane_meta() {
+  local meta field value mode="$MODE" socks_port="$SOCKS_PORT" http_port="$HTTP_PORT"
+  local mixed_port="$MIXED_PORT" country="$COUNTRY" city="$CITY" carrier="$CARRIER" upstream="$UPSTREAM"
+  meta="$(lane_meta_file)"
+  [ -r "$meta" ] || return 1
+  while IFS='=' read -r field value; do
+    case "$field" in
+      mode) mode="$value" ;;
+      socks_port) socks_port="$value" ;;
+      http_port) http_port="$value" ;;
+      mixed_port) mixed_port="$value" ;;
+      country) country="$value" ;;
+      city) city="$value" ;;
+      carrier) carrier="$value" ;;
+      upstream) upstream="$value" ;;
+    esac
+  done <"$meta"
+  case "$mode" in socks|http|mixed|all|vpn) ;; *) return 1 ;; esac
+  MODE="$mode" SOCKS_PORT="$socks_port" HTTP_PORT="$http_port" MIXED_PORT="$mixed_port"
+  COUNTRY="$country" CITY="$city" CARRIER="$carrier" UPSTREAM="$upstream"
+}
 
 lane_pid_matches() {
   local pid="$1" command
@@ -328,8 +362,11 @@ system_proxy_on() {
     [ -z "$svc" ] && continue
     case "$svc" in *\**) continue;; esac
     snapshot="$(system_proxy_snapshot "$svc")" || continue
+    if ! printf '%s\n' "$snapshot" >>"$state_file"; then
+      system_proxy_off >/dev/null 2>&1 || true
+      die "could not record the proxy settings for '$svc'; nothing was left armed."
+    fi
     networksetup -setsocksfirewallproxy "$svc" 127.0.0.1 "$SOCKS_PORT" 2>/dev/null || continue
-    printf '%s\n' "$snapshot" >> "$state_file"
     networksetup -setsocksfirewallproxystate "$svc" on 2>/dev/null || true
     networksetup -setwebproxy "$svc" 127.0.0.1 "$HTTP_PORT" 2>/dev/null || true
     networksetup -setwebproxystate "$svc" on 2>/dev/null || true
@@ -361,6 +398,17 @@ exit_country() {
   local first
   first="$(fronts_for "$MODE" | head -n 1)"
   front_trace "$first" "$(front_port "$first")" | grep -E '^(loc|ip)=' || true
+}
+
+# The rung each flow kind last opened, from the lane's own log. `auto` chooses per
+# kind (TCP, UDP, CONNECT-IP), so status names each one instead of guessing.
+carrier_selected() {
+  local kind line
+  [ -r "$LOG" ] || return 0
+  for kind in tcp udp ip; do
+    line="$(grep -F "foxy: carrier $kind " "$LOG" 2>/dev/null | tail -n 1 || true)"
+    [ -n "$line" ] && printf '%s %s\n' "$kind" "${line##* }"
+  done
 }
 
 # One flow through the first front, and the pinned country is the assertion: the
@@ -506,7 +554,7 @@ if [ "$ACTION" = down ]; then
     exit 1
   fi
   # The lane configs carry the account password, so they go when the lane does.
-  rm -f "$CONF_DIR"/foxy-*.json
+  rm -f "$CONF_DIR"/foxy-*.json "$(lane_meta_file)"
   echo "lane stopped; configs under $CONF_DIR removed."
   exit 0
 fi
@@ -515,6 +563,7 @@ if [ "$ACTION" = status ]; then
     echo "lane not running (pid file $(lane_pid_file) absent)."
     exit 1
   fi
+  load_lane_meta || echo "foxy-connect: lane metadata missing; showing the current environment." >&2
   echo "lane running (pid $(cat "$(lane_pid_file)")), fronts:"
   for front in $(fronts_for "$MODE"); do
     case "$front" in
@@ -523,7 +572,8 @@ if [ "$ACTION" = status ]; then
       mixed) echo "  mixed         http://127.0.0.1:$MIXED_PORT   (socks and http on one port)" ;;
     esac
   done
-  echo "exit country: $COUNTRY, carrier: $CARRIER${UPSTREAM:+, upstream $UPSTREAM}"
+  selection="$(carrier_selected | awk '{printf "%s%s %s", sep, $1, $2; sep=", "}')"
+  echo "exit country: $COUNTRY, carrier: $CARRIER (${selection:-not selected yet})${UPSTREAM:+, upstream $UPSTREAM}"
   echo "log:  $LOG   stop: ./foxy-connect.sh down"
   exit_country
   exit 0
@@ -583,6 +633,7 @@ case "$CARRIER" in auto|h1|h2|h3|http/1.1|http/2|quic) ;; *) CARRIER="auto";; es
 if lane_running; then stop_lane || die "the system proxy could not be cleared; fix it before starting another lane."; fi
 CFG="$CONF_DIR/foxy-$COUNTRY.json"
 write_config "$CFG"
+write_lane_meta
 echo "config: $CFG (mode 0600, under $CONF_DIR)"
 "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
 echo "$!" > "$(lane_pid_file)"
@@ -632,6 +683,7 @@ if [ "$ACTION" = check ]; then
       CARRIER="$carrier"
       CFG="$CONF_DIR/foxy-$COUNTRY-$carrier.json"
       write_config "$CFG"
+      write_lane_meta
       "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
       echo "$!" > "$(lane_pid_file)"
       wait_port "$SOCKS_PORT" || { echo "carrier $carrier never listened" >&2; DOWN_FAILED=1; continue; }
@@ -642,6 +694,7 @@ if [ "$ACTION" = check ]; then
     CARRIER="auto"
     CFG="$CONF_DIR/foxy-$COUNTRY.json"
     write_config "$CFG"
+    write_lane_meta
     FRONTS="$(fronts_for "$MODE" | tr '\n' ' ')"
     "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
     echo "$!" > "$(lane_pid_file)"

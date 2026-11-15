@@ -122,8 +122,7 @@ Use `socks5h://` (the `h`) so names resolve at the exit, not on your machine.
 
 ## Verify the download
 
-Every release includes `SHA256SUMS` beside the packages. To check just the
-package you downloaded:
+Every release includes `SHA256SUMS` beside the packages. To check just the package you downloaded:
 
 ```bash
 # Linux

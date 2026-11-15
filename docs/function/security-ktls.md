@@ -16,10 +16,10 @@ graph TD
     TX -->|no| U["seal13 under the shared epoch"]
     U --> UW["write ciphertext:<br/>userspace record layer"]
     RX -->|yes| R["recvmsg:<br/>kernel decrypts,<br/>TLS_GET_RECORD_TYPE"]
-    RX -->|no| O["open13 under the shared epoch"]
-    O --> OR["recv ciphertext:<br/>userspace record layer"]
+    RX -->|no| OR["recv ciphertext:<br/>userspace record layer"]
+    OR --> O["open13 under the shared epoch"]
     R --> KU["KeyUpdate:<br/>rekey RX, queue TX reply"]
-    OR --> KU
+    O --> KU
     W --> KU
     UW --> KU
 ```

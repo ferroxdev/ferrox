@@ -17,6 +17,7 @@
 record-layer ops-retired-instructions UNBLESSED scripts/count-ops.sh
 record-layer syscalls-per-megabyte UNBLESSED scripts/count-ops.sh
 record-layer user-space-copies-per-megabyte UNBLESSED no copy checker yet
+record-layer seconds-per-megabyte UNBLESSED CI bench.yml (gate 3)
 record-layer discarded-keystream-blocks 0 ferrox-bench-gate-2
 record-layer allocations-per-fill 0 ferrox-bench-gate-2
 record-layer zero-filled-bytes-per-fill 0 ferrox-bench-gate-2
@@ -53,6 +54,7 @@ shadowsocks stream-udp-datagram-reallocations-after-the-first 0 ferrox-app-shado
 
 # --- Shadowsocks 2022 -------------------------------------------------------
 shadowsocks-2022 ops-retired-instructions UNBLESSED scripts/count-ops.sh
+shadowsocks-2022 seconds-per-megabyte UNBLESSED CI benchmark-matrix.yml (no per-cipher cell)
 shadowsocks-2022 aead-calls-per-chunk 2 ferrox-core-shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
 shadowsocks-2022 maximum-payload-per-chunk 65535 ferrox-core-shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
 shadowsocks-2022 write-syscalls-per-16KiB-relay-read 1 ferrox-app-shadowsocks2022::tests::one_relay_read_becomes_one_write_and_reads_back_whole
@@ -123,6 +125,7 @@ vless sealed-record-write-instructions 50871336 scripts/count-ops.sh
 # --- Trojan -----------------------------------------------------------------
 trojan ops-retired-instructions 1182 scripts/count-ops.sh
 trojan syscalls-per-handshake UNBLESSED scripts/count-ops.sh
+trojan trojan-tls-raw-down-8-ubuntu-x86-64-mib-per-second 2814.1 CI benchmark-matrix.yml trojan-tls-raw-down-8
 trojan password-bytes-on-the-wire 56 ferrox-app-proxy::tests::trojan_key_is_sha224_hex
 trojan framing-bytes-added-after-the-header 0 ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers
 trojan udp-framing-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_frames_carry
@@ -455,8 +458,8 @@ carrier-quic pump-threads-started-by-an-app-driven-lease 0 ferrox-app-foxy::loop
 carrier-quic flows-per-lane-before-it-is-handed-back 64 ferrox-app-foxy::loopback::a_lane_that_lent_its_whole_grant_of_flows_is_handed_back
 carrier-quic receive-buffer-floor-bytes-armed-per-lane 262144 ferrox-app-quic::tests::a_quic_socket_arms_both_of_its_buffers
 carrier-quic send-buffer-floor-bytes-armed-per-lane 262144 ferrox-app-quic::tests::a_quic_socket_arms_both_of_its_buffers
-carrier-quic quic-bytes-parked-per-unread-stream 1048576 ferrox-app-proxy::tests::an_edge_cannot_park_more_than_the_window_unread
-carrier-quic quic-bytes-parked-per-unread-connection 2097152 ferrox-app-proxy::tests::an_edge_cannot_park_more_than_the_window_unread
+carrier-quic quic-bytes-parked-per-unread-stream 4194304 ferrox-app-proxy::tests::an_edge_cannot_park_more_than_the_window_unread
+carrier-quic quic-bytes-parked-per-unread-connection 16777216 ferrox-app-proxy::tests::an_edge_cannot_park_more_than_the_window_unread
 carrier-quic stream-window-ceiling-bytes 8000000 ferrox-app-quic::tests::the_window_ceiling_leaves_the_autotuner_room
 carrier-quic connection-window-ceiling-bytes 32000000 ferrox-app-quic::tests::the_window_ceiling_leaves_the_autotuner_room
 carrier-quic send-datagram-bytes 1350 ferrox-app-quic::tests::the_lane_sends_the_datagram_its_buffer_holds
@@ -1006,6 +1009,7 @@ engine-api seconds-per-api-call UNBLESSED CI bench.yml (no cell yet)
 # --- wireguard tunnel, both roles ---------------------------------------------
 wireguard ops-retired-instructions UNBLESSED scripts/count-ops.sh
 wireguard syscalls-per-transport-record UNBLESSED scripts/count-ops.sh
+wireguard wireguard-raw-down-8-client-ubuntu-arm-mib-per-second 220 CI benchmark-matrix.yml run 43127254767
 wireguard route-scan-instructions 68609 scripts/count-ops.sh
 wireguard route-table-instructions 585 scripts/count-ops.sh
 wireguard transport-header-bytes 16 ferrox-core-wireguard::tests::the_reference_message_sizes

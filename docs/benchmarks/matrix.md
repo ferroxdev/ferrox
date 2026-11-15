@@ -1,115 +1,27 @@
 # Benchmark matrix
 
-Every cell measures one client engine against a fixed server engine on loopback.
-The grid runs `ferrox` and `xray-core` as servers for every scenario they admit,
-and `sing-box` as a third server in the standalone Hysteria v1 cell, where
-`xray-core` reads v2 only, in the VLESS-over-QUIC cell, where `xray-core`
-has no QUIC transport at its pin, and in the WireGuard cells, whose pinned
-endpoint carries both roles. Every client the scenario's protocol and carrier
-admit is measured: `ferrox`, `xray-core`, `xray-core-rust`, `zeronet`,
-`sing-box`, and in the standard and full tiers `xray-rust` and `leaf`.
-`xray-core` is the reference wherever it participates; the standalone Hysteria
-v1 cell has no `xray-core` control and is left to its ratio row. The pinned
-`sing-box` serves every scenario except the `xhttp` and `kcp` carriers, VLESS
-over `hysteria`, and the `vless-encryption-*` arms, which are omitted from its
-cells rather than failed: it has no such transport and its VLESS has no
-`encryption` field. Each remaining sing-box cell reads the same client outbound
-translated by `scripts/xray-to-singbox.py`; the Hysteria v1 cell translates both
-the standalone client and the server, which sing-box carries at its pin. At its
-pin sing-box strips the X25519MLKEM768 key share from a REALITY handshake, which
-xray-core's REALITY server requires, so `scripts/patch-sing-box.py` restores it
-before the build and the cell measures the transport rather than a TLS refusal.
-The nightly standard run also builds and runs sing-box, so the translated
-client is exercised without a full dispatch.
+Every cell measures one client engine against a fixed server engine on loopback. The grid runs `ferrox` and `xray-core` as servers for every scenario they admit, and `sing-box` as a third server in the standalone Hysteria v1 cell, where `xray-core` reads v2 only, in the VLESS-over-QUIC cell, where `xray-core` has no QUIC transport at its pin, and in the WireGuard cells, whose pinned endpoint carries both roles. Every client the scenario's protocol and carrier admit is measured: `ferrox`, `xray-core`, `xray-core-rust`, `zeronet`, `sing-box`, and in the standard and full tiers `xray-rust` and `leaf`. `xray-core` is the reference wherever it participates; the standalone Hysteria v1 cell has no `xray-core` control and is left to its ratio row. The pinned `sing-box` serves every scenario except the `xhttp` and `kcp` carriers, VLESS over `hysteria`, and the `vless-encryption-*` arms, which are omitted from its cells rather than failed: it has no such transport and its VLESS has no `encryption` field. Each remaining sing-box cell reads the same client outbound translated by `scripts/xray-to-singbox.py`; the Hysteria v1 cell translates both the standalone client and the server, which sing-box carries at its pin. At its pin sing-box strips the X25519MLKEM768 key share from a REALITY handshake, which xray-core's REALITY server requires, so `scripts/patch-sing-box.py` restores it before the build and the cell measures the transport rather than a TLS refusal. The nightly standard run also builds and runs sing-box, so the translated client is exercised without a full dispatch.
 
-`leaf` joins where its pin has the protocol and carrier: VMess, Trojan, legacy
-Shadowsocks, and VLESS only with the Vision flow on raw TCP. It has no plain
-VLESS, `xhttp`, KCP, gRPC, HTTPUpgrade, Hysteria, VLESS encryption, or
-Shadowsocks 2022, and those cells name that in the bundle's skipped list.
-`scripts/xray-to-leaf.py` writes its TLS, REALITY and WebSocket layers as chain
-actors. `xray-rust` joins every standard and full cell its pin admits, except
-VLESS over Hysteria: its Hysteria outbound speaks Hysteria's own proxy protocol,
-not a transport that carries VLESS. `matrix_rust_client_config` removes the CA
-file and verify certificate it rejects while keeping the certificate pin.
+`leaf` joins where its pin has the protocol and carrier: VMess, Trojan, legacy Shadowsocks, and VLESS only with the Vision flow on raw TCP. It has no plain VLESS, `xhttp`, KCP, gRPC, HTTPUpgrade, Hysteria, VLESS encryption, or Shadowsocks 2022, and those cells name that in the bundle's skipped list. `scripts/xray-to-leaf.py` writes its TLS, REALITY and WebSocket layers as chain actors. `xray-rust` joins every standard and full cell its pin admits, except VLESS over Hysteria: its Hysteria outbound speaks Hysteria's own proxy protocol, not a transport that carries VLESS. `matrix_rust_client_config` removes the CA file and verify certificate it rejects while keeping the certificate pin.
 
-Each scenario that has both servers also runs the reference client against both,
-so `scripts/check-matrix-legs.py` can say which leg lost: a ferrox client below
-the xray-core client on the xray-core server is a client hole, and a ferrox
-server below the xray-core server under the xray-core client is a server hole.
-The standalone Hysteria v1 and VLESS-over-QUIC cells have no xray-core server
-control — xray-core reads only v2 Hysteria and has no QUIC transport at its
-pin — so that check leaves them to their ratio rows. The workload moves 128 MiB per flow, scaled down
-from the bytes a profile needs so a
-standard run finishes in minutes rather than hours; throughput, CPU and syscall
-ratios are unchanged by the size.
+Each scenario that has both servers also runs the reference client against both, so `scripts/check-matrix-legs.py` can say which leg lost: a ferrox client below the xray-core client on the xray-core server is a client hole, and a ferrox server below the xray-core server under the xray-core client is a server hole. The standalone Hysteria v1 and VLESS-over-QUIC cells have no xray-core server control — xray-core reads only v2 Hysteria and has no QUIC transport at its pin — so that check leaves them to their ratio rows. The workload moves 128 MiB per flow, scaled down from the bytes a profile needs so a standard run finishes in minutes rather than hours; throughput, CPU and syscall ratios are unchanged by the size.
 
-The tables are generated from `matrix-results.json` and the charts from the same
-cell bundles by `scripts/render-benchmark-charts.py`; CI commits the dated
-results and the latest charts here and opens a review PR. Do not edit between
-the markers by hand: a refresh replaces one runner block at a time.
+The tables are generated from `matrix-results.json` and the charts from the same cell bundles by `scripts/render-benchmark-charts.py`; CI commits the dated results and the latest charts here and opens a review PR. Do not edit between the markers by hand: a refresh replaces one runner block at a time.
 
-Each bundle carries one image per test, with every server for that test side by
-side; it never merges two tests. The panel shows throughput, CPU per GiB, peak
-RSS, peak threads, cold start, kernel asks per MiB, the throughput repeats and
-their spread, from the same cells, so a reader never matches one test's bar
-against another test's. The spread panel names a `split` when one repeat
-separated from the others, which is what a median alone hides. The coverage
-grid is a markdown table, so a missing cell and its reason survive both text
-review and the artifact browser. The README block and the bundle's `README.md`
-are generated from the same `matrix-results.json`; `distribution.csv` carries
-the repeat spread in tidy form beside `table.csv`. A scheduled refresh compares
-the new medians with the last published run and leaves the committed markdown
-and charts alone when no cell moved by more than 10%, the top of the shared
-runner's noise band.
+Each bundle carries one image per test, with every server for that test side by side; it never merges two tests. The panel shows throughput, CPU per GiB, peak RSS, peak threads, cold start, kernel asks per MiB, the throughput repeats and their spread, from the same cells, so a reader never matches one test's bar against another test's. The spread panel names a `split` when one repeat separated from the others, which is what a median alone hides. The coverage grid is a markdown table, so a missing cell and its reason survive both text review and the artifact browser. The README block and the bundle's `README.md` are generated from the same `matrix-results.json`; `distribution.csv` carries the repeat spread in tidy form beside `table.csv`. A scheduled refresh compares the new medians with the last published run and leaves the committed markdown and charts alone when no cell moved by more than 10%, the top of the shared runner's noise band.
 
 ## Known holes (2026-10-25, rechecked 2026-11-05, standard / ubuntu-latest)
 
-These are the gaps this tree still measures. `scripts/check-matrix-legs.py`
-reads the same list from `scripts/leg-gaps.txt`: a filed gap warns with its issue,
-while a new leg or one worse than its filed ratio by more than 0.10 fails the
-matrix. Remove a line only when a run proves the leg fixed, so the fix is a
-visible gate rather than a quiet baseline; a closed issue can still cover an
-open regression. `--gaps` (the workflow's `gaps` input) re-measures exactly the
-cells this file names, so a bug-fix slice checks whether any filed hole closed
-without paying for the whole grid; the refresh job never publishes that run.
-The 2026-10-27 recheck of the vmess, hysteria and gRPC rows
-is runs [40523513428](https://github.com/FerroxCo/ferrox/actions/runs/40523513428)
-and [40527294332](https://github.com/FerroxCo/ferrox/actions/runs/40527294332).
-The 2026-11-05 recheck of the two gRPC server legs is runs
-[41773748811](https://github.com/vpnguyishere/ferrox-plus/actions/runs/41773748811)
-(main, 0.99x and 1.07x) and
-[42095811948](https://github.com/vpnguyishere/ferrox-plus/actions/runs/42095811948)
-(five repeats, 1.05x and 1.11x): the ferrox server matches or beats the
-xray-core server with the xray-core client, so both rows are removed.
+These are the gaps this tree still measures. `scripts/check-matrix-legs.py` reads the same list from `scripts/leg-gaps.txt`: a filed gap warns with its issue, while a new leg or one worse than its filed ratio by more than 0.10 fails the matrix. Remove a line only when a run proves the leg fixed, so the fix is a visible gate rather than a quiet baseline; a closed issue can still cover an open regression. `--gaps` (the workflow's `gaps` input) re-measures exactly the cells this file names, so a bug-fix slice checks whether any filed hole closed without paying for the whole grid; the refresh job never publishes that run. The 2026-10-27 recheck of the vmess, hysteria and gRPC rows is runs [40523513428](https://github.com/FerroxCo/ferrox/actions/runs/40523513428) and [40527294332](https://github.com/FerroxCo/ferrox/actions/runs/40527294332). The 2026-11-05 recheck of the two gRPC server legs is runs [41773748811](https://github.com/vpnguyishere/ferrox-plus/actions/runs/41773748811) (main, 0.99x and 1.07x) and [42095811948](https://github.com/vpnguyishere/ferrox-plus/actions/runs/42095811948) (five repeats, 1.05x and 1.11x): the ferrox server matches or beats the xray-core server with the xray-core client, so both rows are removed.
 
 | leg | cell | measurement | issue |
 | --- | ---- | ----------- | ----- |
 | both | `vless-hysteria-down-8`, `vless-hysteria-up-1`, `vless-hysteria-duplex-8` | down server 32.8 vs 109.6 MiB/s and 1.82x CPU; upload/duplex below the gate | [#670](https://github.com/FerroxCo/ferrox/issues/670) |
 | both | `vless-reality-xhttp-down-8` | all engines 0 B on the ferrox server; ferrox client 0 B on xray-core | [#668](https://github.com/FerroxCo/ferrox/issues/668) |
 
-The coverage holes with no number — a client that cannot use a ferrox server at all — are tracked in [#480](https://github.com/FerroxCo/ferrox/issues/480):
-`shadowsocks2022-raw-down-8--srv-ferrox` drops xray-core-rust and zeronet, and
-xray-core-rust reads 0 in hysteria and reality-grpc on both servers. The
-remaining gaps — additional UDP cells, flows beyond 64 and carriers without a
-cell — stay in #384, #387 and #388 rather than being inferred from these rows. `sing-box` is absent as a client from the `xhttp`, `kcp`, `quic` and
-`vless-hysteria` cells and the three `vless-encryption-*` scenarios because its
-pinned dialect has no such transport and no VLESS `encryption` field. It also
-carries no stream layer on a Shadowsocks outbound, so the Shadowsocks and
-Shadowsocks 2022 cells with a transport are skipped rather than failed; the raw
-cells keep it. The MASQUE `h1` and `h2c` cells run the ferrox server only:
-xray-core's MASQUE inbound serves CONNECT-IP over h3/h2, and Aether dials only
-h3/h2. The `vless-xhttp-h2c` cell runs the ferrox server only, because
-xray-core's cleartext xhttp is HTTP/1.1, not h2c, on both roles.
+The coverage holes with no number — a client that cannot use a ferrox server at all — are tracked in [#480](https://github.com/FerroxCo/ferrox/issues/480): `shadowsocks2022-raw-down-8--srv-ferrox` drops xray-core-rust and zeronet, and xray-core-rust reads 0 in hysteria and reality-grpc on both servers. The remaining gaps — additional UDP cells, flows beyond 64 and carriers without a cell — stay in #384, #387 and #388 rather than being inferred from these rows. `sing-box` is absent as a client from the `xhttp`, `kcp`, `quic` and `vless-hysteria` cells and the three `vless-encryption-*` scenarios because its pinned dialect has no such transport and no VLESS `encryption` field. It also carries no stream layer on a Shadowsocks outbound, so the Shadowsocks and Shadowsocks 2022 cells with a transport are skipped rather than failed; the raw cells keep it. The MASQUE `h1` and `h2c` cells run the ferrox server only: xray-core's MASQUE inbound serves CONNECT-IP over h3/h2, and Aether dials only h3/h2. The `vless-xhttp-h2c` cell runs the ferrox server only, because xray-core's cleartext xhttp is HTTP/1.1, not h2c, on both roles.
 
-The same-key WARP readings live in `.github/workflows/warp-parity.yml`, not in a
-server row. That workflow registers one device with each engine, runs both
-engines against the local WARP server and Cloudflare's MASQUE edge with the same
-identity in both provenance directions, and reports startup, SOCKS setup,
-transfer rate and RSS. Its nested local leg runs the same fixed key through the
-matrix for `gool`, `gool-classic` and `mim`. The WARP cells below stay local,
-ferrox-server rows; the workflow is the cross-engine live check. Cloudflare's
-MASQUE data plane needs UDP egress; the lane fails when either server moves no
-bytes.
+The same-key WARP readings live in `.github/workflows/warp-parity.yml`, not in a server row. That workflow registers one device with each engine, runs both engines against the local WARP server and Cloudflare's MASQUE edge with the same identity in both provenance directions, and reports startup, SOCKS setup, transfer rate and RSS. Its nested local leg runs the same fixed key through the matrix for `gool`, `gool-classic` and `mim`. The WARP cells below stay local, ferrox-server rows; the workflow is the cross-engine live check. Cloudflare's MASQUE data plane needs UDP egress; the lane fails when either server moves no bytes.
 
 ## Every standard configuration
 
@@ -327,9 +239,7 @@ The standard tier measures these 207 configurations: one row per scenario and se
 
 ## Not measured yet
 
-These are the ways a config can name a method that no cell measures. A row here
-is a known gap in the harness, a feature this tree does not implement, or a
-peer-only protocol, not a claim that the method works.
+These are the ways a config can name a method that no cell measures. A row here is a known gap in the harness, a feature this tree does not implement, or a peer-only protocol, not a claim that the method works.
 
 | method | carrier or security | direction | status |
 | --- | --- | --- | --- |

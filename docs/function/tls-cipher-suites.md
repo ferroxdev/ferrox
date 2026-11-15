@@ -79,12 +79,7 @@ graph TD
 
 ## The reachable-set ceiling, and what was not removed
 
-The derivation is byte-identical to `crypto/tls` for every case the oracle reaches. Three lanes
-now carry the result, chosen in order: a shaped fingerprint profile shapes the hello; otherwise
-the stock shaped hello carries a mixed list (TLS 1.3 and TLS 1.2 ids) or a list naming an id
-neither backend carries; otherwise BoringSSL (already linked for ECH) carries a TLS 1.2-only
-list without ECH; otherwise `rustls` carries the list. Twenty of the reference's twenty-five
-ids are reachable.
+The derivation is byte-identical to `crypto/tls` for every case the oracle reaches. Three lanes now carry the result, chosen in order: a shaped fingerprint profile shapes the hello; otherwise the stock shaped hello carries a mixed list (TLS 1.3 and TLS 1.2 ids) or a list naming an id neither backend carries; otherwise BoringSSL (already linked for ECH) carries a TLS 1.2-only list without ECH; otherwise `rustls` carries the list. Twenty of the reference's twenty-five ids are reachable.
 
 - **Nine ids by ring.** `rustls` is built with `tls12`, so the provider is the TLS 1.3 trio
   `0x1301`/`0x1302`/`0x1303` plus ring's six TLS 1.2 AEAD suites `0xc02b`, `0xc02c`, `0xcca9`,
@@ -165,10 +160,7 @@ ids are reachable.
   BoringSSL's `P-256`/`P-384`/`X25519`, so the legacy hello keeps the named group order; the
   ML-KEM hybrid is shaped-lane only, so the stock lane never names it.
 
-Not done, deliberately and with the cost named: the five ids on the *dialer's* negotiated path
-when the peer offers TLS 1.3, ECH below a TLS 1.3 maximum, and resumption on the shaped lane.
-Each is a ceiling of the dispatch rule or a linked backend rather than a rewrite of this
-derivation.
+Not done, deliberately and with the cost named: the five ids on the *dialer's* negotiated path when the peer offers TLS 1.3, ECH below a TLS 1.3 maximum, and resumption on the shaped lane. Each is a ceiling of the dispatch rule or a linked backend rather than a rewrite of this derivation.
 
 ## What we removed
 
@@ -182,7 +174,7 @@ derivation.
   ECH slot is appended last before sealing; `an_ech_list_keeps_the_configured_ids_without_an_scsv`
   asserts the field and `an_ech_offer_rides_the_stock_shaped_hello` completes ECH against a
   BoringSSL listener. The cost that was *not* removed: an ECH config with a maximum below TLS 1.3
-  keeps the rustls lane, and the shaped lane still keeps no session cache.
+  is refused before a lane is built, and the shaped lane still keeps no session cache.
 - **The "CBC is unreachable" ceiling, without a new dependency.** The legacy lane adds no
   crate: `boring` was already linked for ECH, so the eleven CBC/static-RSA ids cost one context
   cache and one session wrapper rather than a second TLS implementation baked into the binary.
@@ -211,11 +203,7 @@ Against the references, no removal is claimed: xray-core hands the list to Go's 
 
 ## CI scope
 
-What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
-The pinned xray-rust conformance suite has no `cipherSuites` row (its TLS cases pin selected
-fingerprints only), so a `conformance.yml` leg cannot observe this field: the checkers above are
-the local capture and handshake tests, and the page names them rather than implying an external
-suite proves them.
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md). The pinned xray-rust conformance suite has no `cipherSuites` row (its TLS cases pin selected fingerprints only), so a `conformance.yml` leg cannot observe this field: the checkers above are the local capture and handshake tests, and the page names them rather than implying an external suite proves them.
 
 <!-- scope:begin -->
 - paths: -

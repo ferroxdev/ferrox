@@ -52,11 +52,14 @@ class Parser:
             value = self.disjunction()
             self.take(")")
             return value
-        if token.upper() == "WITH":
-            raise ValueError("WITH without a licence before it")
+        if token.upper() in ("WITH", "AND", "OR", ")"):
+            raise ValueError(f"expected a licence id, found {token}")
         if self.peek() is not None and self.peek().upper() == "WITH":
             self.take("WITH")
-            token = f"{token} WITH {self.take()}"
+            exception = self.take()
+            if exception.upper() in ("WITH", "AND", "OR", "(", ")"):
+                raise ValueError(f"expected an exception id, found {exception}")
+            token = f"{token} WITH {exception}"
         return token.lower() in allow
 
     def conjunction(self):
@@ -94,6 +97,10 @@ if selftest:
         ("(MIT OR Apache-2.0) AND BSD-3-Clause", True),
         ("Apache-2.0 WITH LLVM-exception", True),
         ("GPL-3.0-no! OR MIT", "error"),
+        ("MIT OR )", "error"),
+        ("MIT OR AND", "error"),
+        ("MIT WITH OR", "error"),
+        ("MIT$", "error"),
     ]
     failed = False
     for expression, want in cases:

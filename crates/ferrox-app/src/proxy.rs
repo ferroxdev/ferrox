@@ -4,7 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::IoSliceMut;
 use std::io::{IoSlice, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::thread;
@@ -3898,6 +3900,12 @@ pub(crate) struct FoxyOut {
     exit_probe_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Until when the probes are known to answer a country other than the pin: a sweep that reached an edge and agreed with none is the answer, and re-asking it per flow buys the same refusal again.
     exit_refuted_until: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The carrier each flow kind (TCP, UDP, CONNECT-IP) last opened, so `auto` can report the rung it actually used.
+    selected: std::sync::Arc<[AtomicU8; 3]>,
+}
+
+fn carrier_slots() -> std::sync::Arc<[AtomicU8; 3]> {
+    std::sync::Arc::new(std::array::from_fn(|_| AtomicU8::new(u8::MAX)))
 }
 
 impl FoxyOut {
@@ -3941,6 +3949,19 @@ impl FoxyOut {
     fn carrier_answered(&self, edge: &ferrox_core::foxy::Candidate, carrier: crate::foxy::Carrier) {
         if let Ok(mut cache) = self.carrier_dead.lock() {
             cache.clear(carrier.key(), &edge.host, edge.port);
+        }
+    }
+
+    /// Records the carrier a flow kind last opened, once per change, so `status` can name the rung `auto` chose.
+    fn note_carrier(&self, kind: &str, carrier: crate::foxy::Carrier) {
+        let slot = match kind {
+            "tcp" => 0,
+            "udp" => 1,
+            "ip" => 2,
+            _ => return,
+        };
+        if self.selected[slot].swap(carrier.key(), Ordering::Relaxed) != carrier.key() {
+            eprintln!("foxy: carrier {kind} {}", carrier.name());
         }
     }
 
@@ -25810,6 +25831,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                     foxy.carrier_answered(edge, carrier);
+                    foxy.note_carrier("tcp", carrier);
                     return FoxyOpen::Tunnel(Box::new(tunnel), (*edge).clone());
                 }
                 Err(failure) => {
@@ -28416,6 +28438,7 @@ fn open_foxy_ip_tunnel(
                     debug_lane(edge, carrier, || "connect-ip opened".to_owned());
                     clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                     foxy.carrier_answered(edge, carrier);
+                    foxy.note_carrier("ip", carrier);
                     let Some(granted) = assigned else {
                         debug_lane(edge, carrier, || {
                             "the edge granted no address, so the tunnel carries nothing".to_owned()
@@ -28508,6 +28531,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                             debug_lane(edge, carrier, || format!("udp opened for {dest}"));
                             clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                             foxy.carrier_answered(edge, carrier);
+                            foxy.note_carrier("udp", carrier);
                             return Some(crate::foxy::Datagram::H3(Box::new(lane)));
                         }
                         Err(failure) => failure,
@@ -28520,6 +28544,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                             debug_lane(edge, carrier, || format!("udp opened for {dest}"));
                             clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                             foxy.carrier_answered(edge, carrier);
+                            foxy.note_carrier("udp", carrier);
                             return Some(crate::foxy::Datagram::H1(Box::new(lane)));
                         }
                         Err(failure) => failure,
@@ -28531,6 +28556,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                         debug_lane(edge, carrier, || format!("udp opened for {dest}"));
                         clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                         foxy.carrier_answered(edge, carrier);
+                        foxy.note_carrier("udp", carrier);
                         return Some(crate::foxy::Datagram::H2(Box::new(lane)));
                     }
                     Err(failure) => failure,
@@ -39381,6 +39407,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             probe_unavailable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             exit_probe_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             exit_refuted_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            selected: carrier_slots(),
         });
     }
     None
@@ -59583,6 +59610,7 @@ mod tests {
             probe_unavailable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             exit_probe_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             exit_refuted_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            selected: carrier_slots(),
         }
     }
 
@@ -59630,6 +59658,19 @@ mod tests {
             city: String::new(),
         }];
         foxy
+    }
+
+    /// `auto` chooses per flow kind, so the lane keeps the last rung each kind opened for `status` to print.
+    #[test]
+    fn the_lane_remembers_the_carrier_each_flow_kind_opened() {
+        use crate::foxy::Carrier;
+        let foxy = foxy_without_edges();
+        foxy.note_carrier("tcp", Carrier::H1);
+        foxy.note_carrier("udp", Carrier::H3);
+        foxy.note_carrier("ip", Carrier::H2);
+        assert_eq!(foxy.selected[0].load(Ordering::Relaxed), Carrier::H1.key());
+        assert_eq!(foxy.selected[1].load(Ordering::Relaxed), Carrier::H3.key());
+        assert_eq!(foxy.selected[2].load(Ordering::Relaxed), Carrier::H2.key());
     }
 
     /// The per-flow walk of the ladder costs no heap: the order is held in a fixed array, the edge's name is shared, and the pins and the hop are shared. A flow that collected the order into a vector, and copied the edge's four strings per carrier, paid for a list that never changes.
@@ -74221,6 +74262,7 @@ mod tests {
             probe_unavailable: std::sync::Arc::new(AtomicBool::new(false)),
             exit_probe_running: std::sync::Arc::new(AtomicBool::new(false)),
             exit_refuted_until: std::sync::Arc::new(AtomicU64::new(0)),
+            selected: carrier_slots(),
         };
         let target = Destination::Name("target.test".to_owned(), 443);
 
@@ -74320,6 +74362,7 @@ mod tests {
             probe_unavailable: std::sync::Arc::new(AtomicBool::new(false)),
             exit_probe_running: std::sync::Arc::new(AtomicBool::new(false)),
             exit_refuted_until: std::sync::Arc::new(AtomicU64::new(0)),
+            selected: carrier_slots(),
         };
         // Both capsule carriers are known silent, and neither is to be knocked on again inside its window.
         for carrier in crate::foxy::Carrier::ip_order() {
