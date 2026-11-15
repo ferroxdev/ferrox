@@ -1776,17 +1776,17 @@ mod tests {
     fn a_header_block_past_the_cap_is_refused() {
         let (mut client, waited) = api_connection(Duration::from_millis(500));
         served_settings(&mut client);
-        let chunk = vec![0u8; 16 * 1024];
+        let block = vec![0u8; h2::HEAD_CAP];
         client
-            .write_all(&h2::frame_head(chunk.len(), h2::T_HEADERS, 0, 1))
+            .write_all(&h2::frame_head(block.len(), h2::T_HEADERS, 0, 1))
             .expect("writes the first block");
-        client.write_all(&chunk).expect("writes its bytes");
-        for _ in 0..=h2::HEAD_CAP / chunk.len() {
-            client
-                .write_all(&h2::frame_head(chunk.len(), h2::T_CONT, 0, 1))
-                .expect("writes a continuation");
-            client.write_all(&chunk).expect("writes its bytes");
-        }
+        client.write_all(&block).expect("writes its bytes");
+        client
+            .write_all(&h2::frame_head(1, h2::T_CONT, 0, 1))
+            .expect("writes the continuation head");
+        client
+            .write_all(&[0u8])
+            .expect("writes the byte that crosses the cap");
         assert_eq!(goaway_code(&mut client), h2::E_PROTOCOL);
         assert!(waited.recv_timeout(Duration::from_secs(2)).is_ok());
     }

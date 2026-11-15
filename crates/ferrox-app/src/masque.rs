@@ -233,6 +233,14 @@ impl MasqueOut {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn route_bound(&self) -> bool {
+        self.spec
+            .sockopt
+            .as_deref()
+            .is_some_and(|options| options.route().is_some())
+    }
+
     fn ensure(&self) -> Result<Arc<Inner>, String> {
         self.ensure_at(Instant::now(), || open(&self.spec))
     }

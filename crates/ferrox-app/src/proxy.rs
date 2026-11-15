@@ -2619,9 +2619,12 @@ impl RouteShared {
             return Err(format!("existing tag found: {tag}"));
         }
         dynamic.removed.remove(tag);
-        if let Outbound::Loopback(loopback) = &out {
-            if let Some(shared) = self.self_weak.get().and_then(Weak::upgrade) {
+        if let Some(shared) = self.self_weak.get().and_then(Weak::upgrade) {
+            if let Outbound::Loopback(loopback) = &out {
                 loopback.bind(&shared);
+            }
+            if let Outbound::Masque(masque) = &out {
+                masque.install_route(&shared);
             }
         }
         dynamic.added.insert(tag.to_owned(), Arc::new(out));
@@ -41387,6 +41390,34 @@ mod tests {
         shared.remove_outbound("nobody");
         shared.remove_outbound("default");
         assert!(matches!(&*plan.default_lane().0, Outbound::Block(_)));
+    }
+
+    /// A masque outbound the management API adds binds its retained options to the same table its
+    /// `dialerProxy` hop resolves in, just as a configured one does.
+    #[test]
+    fn a_dynamic_masque_outbound_binds_the_route_it_dials_through() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"default","protocol":"freedom"}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = crate::reverse::Portals::default();
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let outbound = crate::json::parse(
+            r#"{"protocol":"masque","settings":{"address":"127.0.0.1","port":443},
+                "streamSettings":{"network":"masque","security":"tls",
+                "tlsSettings":{"serverName":"edge.example","allowInsecure":true},
+                "sockopt":{"dialerProxy":"default"}}}"#,
+        )
+        .expect("parses");
+        let masque = Arc::new(crate::masque::MasqueOut::new(&outbound).expect("masque"));
+        assert!(!masque.route_bound());
+        shared
+            .add_outbound("dynamic", Outbound::Masque(Arc::clone(&masque)))
+            .expect("adds");
+        assert!(masque.route_bound());
     }
 
     #[test]
