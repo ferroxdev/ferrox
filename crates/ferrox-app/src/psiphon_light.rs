@@ -477,7 +477,10 @@ fn collect_subject_common_name(der: &[u8], out: &mut Option<String>) {
 
 /// Collect the DNS names in one `GeneralNames` sequence.
 fn collect_general_names(der: &[u8], at: usize, end: usize, out: &mut Vec<String>) {
-    let mut at = at;
+    let (mut at, end) = match element(der, at) {
+        Some((0x30, body, next)) => (body, next),
+        _ => (at, end),
+    };
     while at < end {
         let Some((tag, body, next)) = element(der, at) else {
             return;
@@ -1104,12 +1107,102 @@ mod tests {
         assert_eq!(value.get(12), Some(&Value::UInt(2)));
     }
 
+    /// Encode one short-or-long-form DER element for a certificate fixture.
+    fn der(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if body.len() < 128 {
+            out.push(body.len() as u8);
+        } else {
+            let bytes = body.len().to_be_bytes();
+            let first = bytes.iter().position(|byte| *byte != 0).expect("length");
+            out.push(0x80 | (bytes.len() - first) as u8);
+            out.extend_from_slice(&bytes[first..]);
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn der_parts(tag: u8, parts: &[Vec<u8>]) -> Vec<u8> {
+        der(tag, &parts.concat())
+    }
+
+    fn certificate_name(common_name: &str) -> Vec<u8> {
+        der_parts(
+            0x30,
+            &[der_parts(
+                0x31,
+                &[der_parts(
+                    0x30,
+                    &[
+                        der(0x06, &[0x55, 0x04, 0x03]),
+                        der(0x0c, common_name.as_bytes()),
+                    ],
+                )],
+            )],
+        )
+    }
+
+    /// Build a leaf whose issuer and subject CNs differ, with an optional SAN.
+    fn certificate_with_san(general_name: Option<Vec<u8>>) -> Vec<u8> {
+        let signature = der_parts(
+            0x30,
+            &[
+                der(
+                    0x06,
+                    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b],
+                ),
+                der(0x05, &[]),
+            ],
+        );
+        let mut tbs = vec![
+            der(0x02, &[1]),
+            signature.clone(),
+            certificate_name("Example CA"),
+            der_parts(
+                0x30,
+                &[der(0x17, b"240101000000Z"), der(0x17, b"250101000000Z")],
+            ),
+            certificate_name("edge.example"),
+        ];
+        if let Some(general_name) = general_name {
+            tbs.push(der(
+                0xa3,
+                &der_parts(
+                    0x30,
+                    &[der_parts(
+                        0x30,
+                        &[
+                            der(0x06, &[0x55, 0x1d, 0x11]),
+                            der(0x04, &der_parts(0x30, &[general_name])),
+                        ],
+                    )],
+                ),
+            ));
+        }
+        der_parts(
+            0x30,
+            &[der_parts(0x30, &tbs), signature, der(0x03, &[0, 1])],
+        )
+    }
+
     #[test]
     fn a_server_name_matches_san_and_cn_wildcards() {
         assert!(matches_name("edge.example", "edge.example"));
         assert!(matches_name("*.example", "edge.example"));
         assert!(!matches_name("*.example", "example"));
         assert!(!matches_name("*.example", "a.edge.example"));
+    }
+
+    #[test]
+    fn a_certificate_uses_its_subject_name_and_unwraps_san_sequences() {
+        let plain = certificate_with_san(None);
+        assert!(verify_name(&plain, "edge.example"));
+        assert!(!verify_name(&plain, "Example CA"));
+        let named = certificate_with_san(Some(der(0x82, b"edge.example")));
+        assert!(verify_name(&named, "edge.example"));
+        assert!(!verify_name(&named, "Example CA"));
+        let address = certificate_with_san(Some(der(0x87, &[192, 0, 2, 1])));
+        assert!(!verify_name(&address, "edge.example"));
     }
 
     #[test]

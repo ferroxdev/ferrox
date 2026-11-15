@@ -1215,10 +1215,26 @@ impl Read for WebRtcStream {
             }
             pending.0.clear();
             pending.1 = 0;
+            let input = lock(&self.input);
+            match input.try_recv() {
+                Ok(Ok(data)) => {
+                    pending.0 = data;
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    if let Some(error) = lock(&self.failure).as_ref().cloned() {
+                        return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
+                    }
+                    return Err(io::Error::from(ErrorKind::UnexpectedEof));
+                }
+            }
             if let Some(error) = lock(&self.failure).as_ref().cloned() {
                 return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
             }
-            let input = lock(&self.input);
             let timeout = *lock(&self.read_timeout);
             let received = match timeout {
                 Some(timeout) => input.recv_timeout(timeout),
@@ -1914,15 +1930,15 @@ impl Conduit {
             secret: offer_secret,
             traffic_shaping: shaping,
         };
-        let offer_remaining = deadline.saturating_duration_since(Instant::now());
-        if offer_remaining.is_zero() {
-            return Err((
-                "psiphon conduit: offer retry window expired".to_owned(),
-                false,
-            ));
-        }
         let offer = {
             let mut client = lock(&client);
+            let offer_remaining = deadline.saturating_duration_since(Instant::now());
+            if offer_remaining.is_zero() {
+                return Err((
+                    "psiphon conduit: offer retry window expired".to_owned(),
+                    false,
+                ));
+            }
             client.set_offer_timeouts(
                 offer_timeout.min(offer_remaining),
                 offer_personal_timeout.min(offer_remaining),
