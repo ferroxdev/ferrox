@@ -150,7 +150,7 @@ impl EarlyData {
 fn atoi(text: &str) -> i64 {
     let (negative, digits) = match text.strip_prefix('-') {
         Some(digits) => (true, digits),
-        None => (false, text.strip_prefix('+').unwrap_or(text)),
+        None => (false, text.trim_prefix('+')),
     };
     if digits.is_empty() {
         return 0;

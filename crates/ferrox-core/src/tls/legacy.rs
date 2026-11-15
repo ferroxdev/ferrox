@@ -475,11 +475,7 @@ impl<S: Stream> TlsProvider for Session<S> {
                     .peer_certificate()
                     .and_then(|cert| cert.to_der().ok())
                     .unwrap_or_default();
-                self.ocsp = done
-                    .ssl()
-                    .ocsp_status()
-                    .map(<[u8]>::to_vec)
-                    .unwrap_or_default();
+                self.ocsp = done.ssl().ocsp_status().map_or_default(<[u8]>::to_vec);
                 if let Some(key) = &self.resume {
                     if let Some(session) = done.ssl().session() {
                         keep_session(key, session.to_owned());

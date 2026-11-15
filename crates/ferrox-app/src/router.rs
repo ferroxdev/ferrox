@@ -261,7 +261,7 @@ impl ProcessSelector {
                 abs_paths.push(path);
                 continue;
             }
-            literal.push(path.strip_suffix(".exe").unwrap_or(&path).to_owned());
+            literal.push(path.trim_suffix(".exe").to_owned());
         }
         Self {
             names: literal,
@@ -2785,7 +2785,7 @@ impl IpMatcher {
 
     pub(crate) fn toggle_reverse(&mut self) {
         for (_, current) in &mut self.sets {
-            *current = !*current;
+            current.toggle();
         }
     }
 }
@@ -3265,7 +3265,7 @@ fn add_ip_rule(
     let mut reverse = false;
     while let Some(rest) = value.strip_prefix('!') {
         value = rest;
-        reverse = !reverse;
+        reverse.toggle();
     }
     if let Some(rest) = value.strip_prefix("geoip:") {
         if rest.eq_ignore_ascii_case("private") {
@@ -3379,7 +3379,7 @@ fn add_geoip(
     let mut reverse = reverse;
     while let Some(rest) = code.strip_prefix('!') {
         code = rest;
-        reverse = !reverse;
+        reverse.toggle();
     }
     if code.is_empty() {
         return Err(format!("ip rule `{file}:` names an empty code"));
@@ -3879,15 +3879,12 @@ pub(crate) fn resolve_ips_script(
 
 fn resolve_ips_system(host: &str, port: u16, v4: bool, v6: bool) -> (Vec<IpAddr>, u32) {
     use std::net::ToSocketAddrs;
-    let ips = (host, port)
-        .to_socket_addrs()
-        .map(|addrs| {
-            addrs
-                .map(|addr| addr.ip())
-                .filter(|ip| (v4 && ip.is_ipv4()) || (v6 && ip.is_ipv6()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let ips = (host, port).to_socket_addrs().map_or_default(|addrs| {
+        addrs
+            .map(|addr| addr.ip())
+            .filter(|ip| (v4 && ip.is_ipv4()) || (v6 && ip.is_ipv6()))
+            .collect()
+    });
     (ips, 0)
 }
 

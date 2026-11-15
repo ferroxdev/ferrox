@@ -5125,16 +5125,13 @@ fn transform_scopes(settings: Option<&Json>, field: &str) -> Vec<(String, Vec<St
         .map(|(scope, names)| {
             (
                 scope.clone(),
-                names
-                    .as_arr()
-                    .map(|names| {
-                        names
-                            .iter()
-                            .filter_map(Json::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                names.as_arr().map_or_default(|names| {
+                    names
+                        .iter()
+                        .filter_map(Json::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                }),
             )
         })
         .collect()
@@ -5729,8 +5726,7 @@ fn transfer_roots(items: &[Json], label: &str, global: &[(String, String)]) -> V
                 let local = fields
                     .iter()
                     .find(|(name, _)| name.eq_ignore_ascii_case("RequestHeaders"))
-                    .map(|(_, value)| header_fields(value))
-                    .unwrap_or_default();
+                    .map_or_default(|(_, value)| header_fields(value));
                 let mut headers = global.to_vec();
                 headers.retain(|(name, _)| {
                     !local
@@ -6563,9 +6559,7 @@ fn list_url(item: &str) -> String {
 }
 
 fn env_list(environment: &str) -> Vec<String> {
-    env(environment)
-        .map(|text| split_list(&text))
-        .unwrap_or_default()
+    env(environment).map_or_default(|text| split_list(&text))
 }
 
 fn split_list(text: &str) -> Vec<String> {
@@ -7696,7 +7690,7 @@ fn matches_shape(server: &Server, shape: Shape) -> bool {
 /// The protocol name without its CDN marker or OSSH suffix.
 fn protocol_base(protocol: &str) -> String {
     let base = protocol.replace("-CDN", "");
-    base.strip_suffix("-OSSH").unwrap_or(&base).to_owned()
+    base.trim_suffix("-OSSH").to_owned()
 }
 
 /// Whether a protocol names a meek transport.
@@ -7732,7 +7726,7 @@ fn inproxy_base(protocol: &str) -> &str {
         .strip_prefix("INPROXY-WEBRTC-")
         .or_else(|| protocol.strip_prefix("INPROXY-"))
         .unwrap_or(protocol);
-    base.strip_suffix("-OSSH").unwrap_or(base)
+    base.trim_suffix("-OSSH")
 }
 
 /// Whether a server is allowed by a limit that names no meek transport.
@@ -9187,14 +9181,13 @@ pub(crate) fn server_from_entry_json(
     let quic_versions = entry
         .get("limitQUICVersions")
         .and_then(Json::as_arr)
-        .map(|versions| {
+        .map_or_default(|versions| {
             versions
                 .iter()
                 .filter_map(Json::as_str)
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        });
     let tls_obfuscation_key = obfuscated_key.clone();
     let shadowsocks_key = entry
         .get("sshShadowsocksKey")
@@ -9449,7 +9442,7 @@ fn capability_name(name: &str) -> Cow<'_, str> {
         "FRONTED-MEEK-CDN-QUIC" => "FRONTED-MEEK-QUIC",
         other => other,
     };
-    Cow::Owned(base.strip_suffix("-OSSH").unwrap_or(base).to_owned())
+    Cow::Owned(base.trim_suffix("-OSSH").to_owned())
 }
 
 /// Whether one advertised capability satisfies a required one.
@@ -9549,7 +9542,7 @@ fn meek_hosts(entry: &Json, fallback: &str) -> (String, Vec<String>) {
     let hosts: Vec<String> = entry
         .get("meekFrontingHosts")
         .and_then(Json::as_arr)
-        .map(|hosts| {
+        .map_or_default(|hosts| {
             hosts
                 .iter()
                 .filter_map(Json::as_str)
@@ -9557,8 +9550,7 @@ fn meek_hosts(entry: &Json, fallback: &str) -> (String, Vec<String>) {
                 .filter(|host| !host.is_empty())
                 .map(str::to_owned)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let host = hosts
         .first()
         .cloned()
@@ -9640,7 +9632,7 @@ fn meek_entry(
     let addresses: Vec<String> = entry
         .get("meekFrontingAddresses")
         .and_then(Json::as_arr)
-        .map(|addresses| {
+        .map_or_default(|addresses| {
             addresses
                 .iter()
                 .filter_map(Json::as_str)
@@ -9648,8 +9640,7 @@ fn meek_entry(
                 .filter(|address| !address.is_empty())
                 .map(str::to_owned)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let default_port = if https { 443 } else { 80 };
     let raw = addresses
         .first()

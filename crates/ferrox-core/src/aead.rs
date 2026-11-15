@@ -172,7 +172,7 @@ mod tests {
             assert_eq!(got, want, "tag at length {len}");
             assert_eq!(dst, in_place, "ciphertext at length {len}");
             let mut uninit: Vec<std::mem::MaybeUninit<u8>> =
-                (0..len).map(|_| std::mem::MaybeUninit::uninit()).collect();
+                Vec::from_fn(len, |_| std::mem::MaybeUninit::uninit());
             let got = chacha20_poly1305_seal_from_uninit(&key, &nonce, aad, &plain, &mut uninit);
             assert_eq!(got, want, "uninit tag at length {len}");
             // SAFETY: seal_from_uninit wrote every byte of the destination.

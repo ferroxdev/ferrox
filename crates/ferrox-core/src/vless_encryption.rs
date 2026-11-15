@@ -411,7 +411,7 @@ impl ServerConfig {
             "random" => 2,
             other => return Err(format!("unknown VLESS decryption mode {other:?}")),
         };
-        let seconds = parts[2].strip_suffix('s').unwrap_or(parts[2]);
+        let seconds = parts[2].trim_suffix('s');
         let (seconds_from, seconds_to) = match seconds.split_once('-') {
             Some((from, to)) => (from, to),
             None => (seconds, "0"),

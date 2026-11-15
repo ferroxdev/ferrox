@@ -1472,10 +1472,7 @@ fn verify_edge(spec: &ClientSpec, conn: &quiche::Connection) -> Result<(), Strin
     }
     let chain: Vec<Vec<u8>> = match conn.peer_cert_chain() {
         Some(chain) => chain.iter().map(|cert| cert.to_vec()).collect(),
-        None => conn
-            .peer_cert()
-            .map(|cert| vec![cert.to_vec()])
-            .unwrap_or_default(),
+        None => conn.peer_cert().map_or_default(|cert| vec![cert.to_vec()]),
     };
     if ferrox_core::tls::verify_cert_pinned(&chain, &tls.cert_pins, &tls.server_name) {
         Ok(())
@@ -2274,7 +2271,7 @@ impl ServerSpec {
             .get("users")
             .or_else(|| settings.get("clients"))
             .and_then(Json::as_arr)
-            .map(|users| {
+            .map_or_default(|users| {
                 users
                     .iter()
                     .filter_map(|user| {
@@ -2288,8 +2285,7 @@ impl ServerSpec {
                         Some((email, password))
                     })
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         let warp = settings
             .get("warp")
             .and_then(Json::as_bool)

@@ -409,8 +409,7 @@ fn fallback_dest_text(node: Option<&Json>) -> String {
         Some(Json::Str(text)) => text.clone(),
         Some(Json::Num(_)) => node
             .and_then(Json::as_port)
-            .map(|port| port.to_string())
-            .unwrap_or_default(),
+            .map_or_default(|port| port.to_string()),
         _ => String::new(),
     }
 }
@@ -1023,14 +1022,13 @@ fn tls_verify_names(settings: Option<&Json>) -> std::sync::Arc<[String]> {
     settings
         .and_then(|s| s.get("verifyPeerCertByName"))
         .and_then(Json::as_str)
-        .map(|text| {
+        .map_or_default(|text| {
             text.split(',')
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default()
         .into()
 }
 
@@ -2597,7 +2595,7 @@ fn range_text(text: &str) -> Option<ferrox_core::finalmask::Range> {
         return Some(Range::ordered(0, 0));
     }
     let leading = text.starts_with('-');
-    let mut parts = text.strip_prefix('-').unwrap_or(text).splitn(2, '-');
+    let mut parts = text.trim_prefix('-').splitn(2, '-');
     let low = parts.next()?.parse::<i64>().ok()?;
     let high = parts.next()?.parse::<i64>().ok()?;
     Some(Range::ordered(if leading { -low } else { low }, high))
@@ -3050,15 +3048,13 @@ fn hysteria_realm(
     let id = field("realm_id", "realmId")
         .or_else(|| field("ID", "id"))
         .and_then(Json::as_str)
-        .map(str::to_owned)
-        .unwrap_or_default();
+        .map_or_default(str::to_owned);
     if !ferrox_core::realm::valid_realm_id(&id) {
         return Err("realm id is missing or malformed".to_owned());
     }
     let token = field("token", "token")
         .and_then(Json::as_str)
-        .map(str::to_owned)
-        .unwrap_or_default();
+        .map_or_default(str::to_owned);
     let mut stun_servers = Vec::new();
     if let Some(servers) = field("stun_servers", "stunServers") {
         if let Some(items) = servers.as_arr() {
@@ -4961,9 +4957,8 @@ mod tests {
             )
         };
         let client = |names: Option<&str>| {
-            let named = names
-                .map(|names| format!(r#""verifyPeerCertByName": "{names}","#))
-                .unwrap_or_default();
+            let named =
+                names.map_or_default(|names| format!(r#""verifyPeerCertByName": "{names}","#));
             crate::json::parse(&format!(
                 r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "b.test", {named} "certificates": [{{"certificate": {}}}]}}}}}}"#,
                 pem_json(&ca_pem)

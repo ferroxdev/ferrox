@@ -1991,8 +1991,7 @@ impl Account {
         let refused = self
             .auth
             .lock()
-            .map(|auth| auth.access_token.clone())
-            .unwrap_or_default();
+            .map_or_default(|auth| auth.access_token.clone());
         if let Ok(mut auth) = self.auth.lock() {
             *auth = Auth {
                 access_token: String::new(),
@@ -2490,9 +2489,7 @@ mod loopback {
 
     fn session_answer(method: Option<&str>) -> String {
         let verified = method.is_none();
-        let method = method
-            .map(|method| format!(r#","verificationMethod":"{method}""#))
-            .unwrap_or_default();
+        let method = method.map_or_default(|method| format!(r#","verificationMethod":"{method}""#));
         format!(r#"{{"sessionToken":"{SESSION}","verified":{verified}{method}}}"#)
     }
 

@@ -4317,7 +4317,7 @@ mod tests {
             .iter()
             .flat_map(|write| write.iter().copied())
             .collect();
-        let bytes = bytes.strip_prefix(MAGIC).unwrap_or(bytes.as_slice());
+        let bytes = bytes.trim_prefix(MAGIC);
         let body = data_body(bytes);
         assert_eq!(
             message_count(&body),

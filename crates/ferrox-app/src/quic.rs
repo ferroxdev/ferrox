@@ -1075,16 +1075,10 @@ struct BatchData {
 impl BatchData {
     fn new() -> Self {
         Self {
-            slots: (0..RECV_SLOTS).map(|_| Unfilled::new()).collect(),
-            peers: (0..RECV_SLOTS)
-                .map(|_| std::mem::MaybeUninit::uninit())
-                .collect(),
-            names: (0..RECV_SLOTS)
-                .map(|_| std::mem::MaybeUninit::uninit())
-                .collect(),
-            lens: (0..RECV_SLOTS)
-                .map(|_| std::mem::MaybeUninit::uninit())
-                .collect(),
+            slots: Vec::from_fn(RECV_SLOTS, |_| Unfilled::new()),
+            peers: Vec::from_fn(RECV_SLOTS, |_| std::mem::MaybeUninit::uninit()),
+            names: Vec::from_fn(RECV_SLOTS, |_| std::mem::MaybeUninit::uninit()),
+            lens: Vec::from_fn(RECV_SLOTS, |_| std::mem::MaybeUninit::uninit()),
             controls: vec![[0u8; CONTROL_ROOM]; RECV_SLOTS],
             segs: vec![0; RECV_SLOTS],
             starts: vec![0; RECV_SLOTS + 1],

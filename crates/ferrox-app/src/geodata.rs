@@ -542,7 +542,7 @@ fn parse_value(text: &str, bounds: Bounds) -> Result<u32, String> {
 }
 
 fn parse_uint(text: &str) -> Result<u32, String> {
-    let digits = text.strip_prefix('+').unwrap_or(text);
+    let digits = text.trim_prefix('+');
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(format!("failed to parse int from {text}"));
     }
@@ -555,7 +555,7 @@ fn parse_uint(text: &str) -> Result<u32, String> {
 /// and optional fractional numbers, with `0` as the one unitless form.
 #[allow(clippy::cast_precision_loss)]
 fn parse_duration(text: &str) -> Option<Duration> {
-    let text = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let text = text.trim_prefix(['+', '-']);
     if text == "0" {
         return Some(Duration::ZERO);
     }

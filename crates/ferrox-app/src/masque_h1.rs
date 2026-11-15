@@ -417,7 +417,7 @@ fn connect_edge(edge: SocketAddr) -> Result<TcpStream, String> {
     }
     Err(format!(
         "cannot reach {edge}: {}",
-        last.map(|error| error.to_string()).unwrap_or_default()
+        last.map_or_default(|error| error.to_string())
     ))
 }
 

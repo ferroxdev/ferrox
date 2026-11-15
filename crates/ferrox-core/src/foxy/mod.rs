@@ -295,14 +295,14 @@ pub fn head_field<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     let mut lines = head[..end].split(|byte| *byte == b'\n');
     lines.next()?;
     for line in lines {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = line.trim_suffix(b"\r");
         // A slice has no `split_once` on this toolchain, and the separator is one byte to find.
         let Some(at) = line.iter().position(|byte| *byte == b':') else {
             continue;
         };
         if line[..at].eq_ignore_ascii_case(name) {
             let value = &line[at + 1..];
-            return Some(value.strip_prefix(b" ").unwrap_or(value));
+            return Some(value.trim_prefix(b" "));
         }
     }
     None

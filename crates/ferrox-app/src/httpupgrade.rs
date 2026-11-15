@@ -224,9 +224,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 fn check_request<'a>(head: &'a [u8], path: &str, host: &str) -> Option<&'a str> {
     // One UTF-8 pass and one line scan answers the whole request; the fanout re-validated and rescanned for each field.
     let text = std::str::from_utf8(head).ok()?;
-    let mut lines = text
-        .split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line));
+    let mut lines = text.split('\n').map(|line| line.trim_suffix('\r'));
     let request_line = lines.next()?;
     let mut parts = request_line.split_whitespace();
     let _method = parts.next()?;
@@ -379,9 +377,7 @@ pub(crate) fn connect(
 fn check_response(head: &[u8]) -> Option<()> {
     // One UTF-8 pass and one line scan for status plus both upgrade headers; the fanout cost three of each.
     let text = std::str::from_utf8(head).ok()?;
-    let mut lines = text
-        .split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line));
+    let mut lines = text.split('\n').map(|line| line.trim_suffix('\r'));
     let status = lines.next()?;
     // xray and sing-box read only the version token and the three digits; a reason phrase is free text and may be absent.
     if !status.starts_with("HTTP/1.1 101")
@@ -1588,10 +1584,7 @@ mod tests {
             let mut wire = head.clone();
             wire.extend_from_slice(&tail);
             let outcome = accept_split(std::io::Cursor::new(wire), Vec::new(), &case.path, "");
-            let answer = outcome
-                .as_ref()
-                .map(|(_, write)| write.clone())
-                .unwrap_or_default();
+            let answer = outcome.as_ref().map_or_default(|(_, write)| write.clone());
             let reference_took = fields[0] == "accept";
             let mut measured = Served {
                 verdict_differs: 0,

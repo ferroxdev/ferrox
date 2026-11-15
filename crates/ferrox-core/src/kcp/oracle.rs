@@ -57,7 +57,7 @@ fn chain_specs(list: &str) -> Vec<Spec> {
                 domain: "www.baidu.com".to_owned(),
             },
             domain => Spec::HeaderDns {
-                domain: domain.strip_prefix("dns:").unwrap_or(domain).to_owned(),
+                domain: domain.trim_prefix("dns:").to_owned(),
             },
         })
         .collect::<Vec<_>>()

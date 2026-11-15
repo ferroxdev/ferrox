@@ -216,8 +216,7 @@ fn check_gates(prompt: &Prompt, root: &Path, verify_paths: bool, findings: &mut 
             // Case-insensitive: `CI.yml` and `ci.yml` are one workflow to the author, two strings to a byte compare.
             let extension = Path::new(name)
                 .extension()
-                .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
+                .map_or_default(|extension| extension.to_string_lossy().to_ascii_lowercase());
             let names_a_workflow =
                 matches!(extension.as_str(), "yml" | "yaml") && !name.contains('/');
             if names_a_workflow && !workflows.join(name).is_file() {

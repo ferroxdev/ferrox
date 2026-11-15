@@ -815,8 +815,7 @@ pub(crate) fn resolve_with(config: &Config, host: &str, port: u16) -> io::Result
         let scope = if prefer_alternate {
             servers
                 .first()
-                .map(|(server, _)| server.ip().to_string())
-                .unwrap_or_default()
+                .map_or_default(|(server, _)| server.ip().to_string())
         } else {
             String::new()
         };

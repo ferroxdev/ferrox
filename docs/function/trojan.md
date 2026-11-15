@@ -41,7 +41,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 1182 | scripts/count-ops.sh |
+| ops-retired-instructions | 1175 | scripts/count-ops.sh |
 | password-bytes-on-the-wire | 56 | ferrox-app-proxy::tests::trojan_key_is_sha224_hex |
 | framing-bytes-added-after-the-header | 0 | ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers |
 | udp-framing-bytes-per-datagram | 2 | ferrox-app-proxy::tests::trojan_udp_frames_carry |
@@ -64,7 +64,7 @@ graph TD
   proxy::tests::the_trojan_header_costs_two_reads_not_seven 'proxy::decode_trojan_request'
 ```
 
-The frame is `decode_trojan_request` over three fixed in-memory headers. The domain form carries the literal `127.0.0.1`, so the byte-level IPv4 reader returns the address directly and neither `resolve_name` nor `getaddrinfo` is entered; the count is the header parse alone and reproduces across runs. It is **1182** retired instructions, blessed in `scripts/expected-ops.txt`; the stats landing's indexed parser split added twelve when the wrapper the probe names began calling and destructuring `decode_trojan_request_index`, the domain arm's mux rendezvous comparison added three before that, three instructions on every domain header, and before that the frame read `1167`, before the literal arm and the word fold `80397` then `80812` across two runs of one binary because the resolver was inside it, and before the byte-level IPv4 reader `1315`. The wire bytes and the three-read domain parse are unchanged.
+The frame is `decode_trojan_request` over three fixed in-memory headers. The domain form carries the literal `127.0.0.1`, so the byte-level IPv4 reader returns the address directly and neither `resolve_name` nor `getaddrinfo` is entered; the count is the header parse alone and reproduces across runs. It is **1175** retired instructions, blessed in `scripts/expected-ops.txt`; the Rust 1.100.0 relink moved the frame seven instructions, and the reads and wire bytes are unchanged. Before that, the stats landing's indexed parser split added twelve when the wrapper the probe names began calling and destructuring `decode_trojan_request_index`, the domain arm's mux rendezvous comparison added three before that, three instructions on every domain header, and before that the frame read `1167`, before the literal arm and the word fold `80397` then `80812` across two runs of one binary because the resolver was inside it, and before the byte-level IPv4 reader `1315`. The wire bytes and the three-read domain parse are unchanged.
 
 ## Time
 

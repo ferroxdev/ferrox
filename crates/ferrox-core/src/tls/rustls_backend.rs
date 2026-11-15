@@ -1952,8 +1952,7 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
             let names = entry
                 .cert_chain
                 .first()
-                .map(|leaf| certificate_names(leaf))
-                .unwrap_or_default();
+                .map_or_default(|leaf| certificate_names(leaf));
             let key = key_of(&entry);
             let mut key = rustls::sign::CertifiedKey::from_der(
                 chain_of(entry.cert_chain),

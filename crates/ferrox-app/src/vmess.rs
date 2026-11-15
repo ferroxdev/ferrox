@@ -1802,7 +1802,7 @@ impl Users {
     }
 
     fn snapshot(&self) -> Vec<User> {
-        self.entries.lock().map(|e| e.clone()).unwrap_or_default()
+        self.entries.lock().map_or_default(|e| e.clone())
     }
 
     fn authenticate(&self, auth_id: &[u8; AUTH_LEN]) -> Option<([u8; 16], User)> {

@@ -213,9 +213,9 @@ impl ScriptRouter {
     ) -> Result<Option<String>, String> {
         let state = self.acquire()?;
         let context = ScriptContext {
-            source: flow.source.map(|ip| vec![ip]).unwrap_or_default(),
-            target: flow.ip.map(|ip| vec![ip]).unwrap_or_default(),
-            local: flow.local.map(|ip| vec![ip]).unwrap_or_default(),
+            source: flow.source.map_or_default(|ip| vec![ip]),
+            target: flow.ip.map_or_default(|ip| vec![ip]),
+            local: flow.local.map_or_default(|ip| vec![ip]),
             inbound: flow.inbound_tag.unwrap_or("").to_owned(),
             source_port: flow.source_port,
             target_port: flow.port.unwrap_or(0),
