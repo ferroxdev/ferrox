@@ -29,10 +29,34 @@ const MAX_FRAME_CONTENT: usize = 8192 - SHORTEST_FRAME;
 /// Padding never exceeds `BUFFER - SHORTEST_FRAME`, so one static zero run covers every trailer the framer writes.
 const ZERO: [u8; BUFFER] = [0u8; BUFFER];
 
+/// A paced writer's tail is at its bound: the lane parks with the same bytes owed until the peer
+/// drains it, rather than growing the buffer the peer will not read.
+#[derive(Debug)]
+pub(crate) struct TailParked;
+
+impl std::fmt::Display for TailParked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a paced writer's tail is full")
+    }
+}
+
+impl std::error::Error for TailParked {}
+
+pub(crate) fn tail_parked() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::WouldBlock, TailParked)
+}
+
+pub(crate) fn is_tail_parked(error: &std::io::Error) -> bool {
+    matches!(error.get_ref(), Some(inner) if inner.is::<TailParked>())
+}
+
 pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     session: S,
     raw: Option<Connection>,
     direct: Option<fn(&mut S)>,
+    /// The paced writer's room probe: a tail at its bound hands the lane back before the next
+    /// frame is sealed, so a peer that reads nothing costs the bound and not the process.
+    room: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     uuid: [u8; 16],
     /// The framing walks the stream in place: `[..dot)` is delivered and drains away on
     /// the next read, `[dot..)` is the walk's frontier, and the window is one record
@@ -387,6 +411,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             session,
             raw,
             direct: None,
+            room: None,
             uuid: *uuid,
             have: Vec::new(),
             have_init: 0,
@@ -427,6 +452,12 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         let mut link = Self::new(session, None, uuid);
         link.direct = Some(direct);
         link
+    }
+
+    /// Installs the paced writer's room probe; a refused offer leaves the caller's bytes unsealed
+    /// so the lane can park and offer them again.
+    pub(crate) fn paced(&mut self, room: Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.room = Some(room);
     }
 
     /// Hands the link a parked read's framed prefix as the walk's window, before the session.
@@ -470,6 +501,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             session,
             raw,
             direct: None,
+            room: None,
             uuid: *uuid,
             have: Vec::new(),
             have_init: 0,
@@ -1014,6 +1046,12 @@ impl Tls {
 
 impl<S: Read + Write + RecordAlignment> Write for Link<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // The whole buffer seals at once or not at all, so a retry never seals a frame twice.
+        if let Some(room) = &self.room {
+            if !room() {
+                return Err(tail_parked());
+            }
+        }
         if !self.write.padding {
             self.write_out(buf)?;
             return Ok(buf.len());
