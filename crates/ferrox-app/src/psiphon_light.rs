@@ -380,9 +380,10 @@ fn decode_entry(encoded: &[u8]) -> Result<ProxyEntry, String> {
 /// the leaf's SANs, then its CN; dates are not checked.
 fn verify_name(leaf: &[u8], expected: &str) -> bool {
     let mut names = Vec::new();
-    let mut common_name = None;
-    collect_names(leaf, 0, leaf.len(), 0, &mut names, &mut common_name);
+    collect_names(leaf, 0, leaf.len(), 0, &mut names);
     if names.is_empty() {
+        let mut common_name = None;
+        collect_subject_common_name(leaf, &mut common_name);
         common_name.is_some_and(|name| matches_name(&name, expected))
     } else {
         names.iter().any(|name| matches_name(name, expected))
@@ -390,14 +391,7 @@ fn verify_name(leaf: &[u8], expected: &str) -> bool {
 }
 
 /// Collect every DNS name in one certificate DER element.
-fn collect_names(
-    der: &[u8],
-    at: usize,
-    end: usize,
-    depth: usize,
-    out: &mut Vec<String>,
-    common_name: &mut Option<String>,
-) {
+fn collect_names(der: &[u8], at: usize, end: usize, depth: usize, out: &mut Vec<String>) {
     if depth > 32 {
         return;
     }
@@ -414,17 +408,58 @@ fn collect_names(
             if let Some((0x04, body, end)) = element(der, after) {
                 collect_general_names(der, body, end, out);
             }
-        } else if tag == 0x06 && der.get(body..body + 3) == Some(&[0x55, 0x04, 0x03][..]) {
-            if let Some((0x0c | 0x13 | 0x16, body, end)) = element(der, next) {
-                if common_name.is_none() {
-                    *common_name = Some(String::from_utf8_lossy(&der[body..end]).into_owned());
-                }
-            }
         }
         if tag & 0x20 != 0 {
-            collect_names(der, body, next, depth + 1, out, common_name);
+            collect_names(der, body, next, depth + 1, out);
         }
         at = next;
+    }
+}
+
+/// Read the common name from the certificate's subject, never its issuer.
+fn collect_subject_common_name(der: &[u8], out: &mut Option<String>) {
+    let Some((0x30, certificate, _)) = element(der, 0) else {
+        return;
+    };
+    let Some((0x30, tbs, _)) = element(der, certificate) else {
+        return;
+    };
+    let mut at = tbs;
+    let Some((tag, _, next)) = element(der, at) else {
+        return;
+    };
+    if tag == 0xa0 {
+        at = next;
+    }
+    for _ in 0..4 {
+        let Some((_, _, next)) = element(der, at) else {
+            return;
+        };
+        at = next;
+    }
+    let Some((0x30, subject, subject_end)) = element(der, at) else {
+        return;
+    };
+    let mut at = subject;
+    while at < subject_end {
+        let Some((0x31, set, set_end)) = element(der, at) else {
+            return;
+        };
+        let mut attribute = set;
+        while attribute < set_end {
+            let Some((0x30, pair, pair_end)) = element(der, attribute) else {
+                return;
+            };
+            if let Some((0x06, oid, oid_end)) = element(der, pair) {
+                if der.get(oid..oid_end) == Some(&[0x55, 0x04, 0x03][..]) {
+                    if let Some((0x0c | 0x13 | 0x16, body, end)) = element(der, oid_end) {
+                        *out = Some(String::from_utf8_lossy(&der[body..end]).into_owned());
+                    }
+                }
+            }
+            attribute = pair_end;
+        }
+        at = set_end;
     }
 }
 
@@ -1234,8 +1269,12 @@ mod tests {
         assert!(stream.read_padding_done);
         assert_eq!(&first, b"r");
         stream.write_all(b"hello").expect("write");
-        assert!(stream.write_padding_done);
+        assert!(!stream.write_padding_done);
         assert_ne!(stream.inner.get_ref(), b"hello");
+        stream
+            .write_all(&[0u8; PADDING_MAX])
+            .expect("stop padding");
+        assert!(stream.write_padding_done);
         let mut rest = [0u8; 3];
         stream.read_exact(&mut rest).expect("plain");
         assert_eq!(&rest, b"est");

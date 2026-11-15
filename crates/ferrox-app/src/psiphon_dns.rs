@@ -1371,7 +1371,6 @@ mod tests {
                 reply.extend_from_slice(&record.to_be_bytes());
                 reply.extend_from_slice(&[0, 1]);
                 reply.extend_from_slice(&ttl.to_be_bytes());
-                reply.extend_from_slice(&[0, 0]);
                 if record == 28 {
                     reply.extend_from_slice(&[0, 16]);
                     reply.extend_from_slice(&[
