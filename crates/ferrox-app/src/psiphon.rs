@@ -6948,14 +6948,17 @@ pub(crate) fn broker_offer(
                 webrtc.set_traffic_shaping(parameters.clone(), offer_secret);
             }
         }
+        let offer_settings = crate::psiphon_broker::OfferSettings {
+            secret: offer_secret,
+            traffic_shaping: shaping,
+        };
         match client.client_offer(
             destination,
             &compartments,
             &personal,
             &generated,
             &crate::psiphon_broker::Metrics::from_identity(&identity),
-            offer_secret,
-            shaping.as_ref(),
+            &offer_settings,
         ) {
             Ok(offer) => {
                 if let Some(webrtc) = webrtc.as_mut() {

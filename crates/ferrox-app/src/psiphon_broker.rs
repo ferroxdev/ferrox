@@ -464,6 +464,12 @@ struct Session {
     noise: snow::TransportState,
 }
 
+/// The per-offer values that must not be shared through the client.
+pub(crate) struct OfferSettings {
+    pub(crate) secret: [u8; 32],
+    pub(crate) traffic_shaping: Option<TrafficShapingParameters>,
+}
+
 /// A broker client with at most one live session.
 pub(crate) struct Client {
     broker: Broker,
@@ -565,8 +571,7 @@ impl Client {
         personal_compartments: &[[u8; 32]],
         sdp: &str,
         metrics: &Metrics,
-        offer_secret: [u8; 32],
-        traffic_shaping: Option<&TrafficShapingParameters>,
+        settings: &OfferSettings,
     ) -> Result<Offer, String> {
         if common_compartments.is_empty() && personal_compartments.is_empty() {
             return Err("psiphon broker: no compartments".to_owned());
@@ -581,8 +586,8 @@ impl Client {
             personal_compartments,
             sdp,
             &metrics,
-            offer_secret,
-            traffic_shaping,
+            settings.secret,
+            settings.traffic_shaping.as_ref(),
         );
         self.transport
             .set_timeout(if personal_compartments.is_empty() {
@@ -1963,8 +1968,10 @@ mod tests {
                 &[],
                 "v=0\r\n",
                 &Metrics::new(Value::Map(vec![])),
-                [3; 32],
-                None,
+                &OfferSettings {
+                    secret: [3; 32],
+                    traffic_shaping: None,
+                },
             )
             .unwrap();
         assert_eq!(offer.answer_sdp, "answer");

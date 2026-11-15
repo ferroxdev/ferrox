@@ -1,6 +1,6 @@
 //! A str0m WebRTC data channel between the client and an in-proxy destination.
 
-use crate::psiphon_broker::{Broker, Client, Destination, Front, Metrics};
+use crate::psiphon_broker::{Broker, Client, Destination, Front, Metrics, OfferSettings};
 use crate::psiphon_ssh::dial_random;
 use crate::psiphon_ssh::Identity;
 use hkdf::Hkdf;
@@ -1900,6 +1900,10 @@ impl Conduit {
         if let Some(parameters) = shaping.as_ref() {
             webrtc.set_traffic_shaping(parameters.clone(), offer_secret);
         }
+        let settings = OfferSettings {
+            secret: offer_secret,
+            traffic_shaping: shaping,
+        };
         let offer = lock(&client)
             .client_offer(
                 destination,
@@ -1907,8 +1911,7 @@ impl Conduit {
                 &self.personal,
                 &sdp,
                 metrics,
-                offer_secret,
-                shaping.as_ref(),
+                &settings,
             )
             .map_err(|error| (error, false))?;
         if offer.answer_sdp.is_empty() {
