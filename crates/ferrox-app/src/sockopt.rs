@@ -212,7 +212,12 @@ fn parse_with(node: Option<&Json>, dialer: &str) -> Result<Option<SocketOptions>
     let keep_alive = Some(keep_alive(node)?);
     let keep_alive_set = ["tcpKeepAliveIdle", "tcpKeepAliveInterval"]
         .into_iter()
-        .any(|key| int(node, key).ok().flatten().is_some_and(|value| value > 0));
+        .any(|key| {
+            int(node, key)
+                .ok()
+                .flatten()
+                .is_some_and(|value| value != 0)
+        });
     let address_port = address_port(node)?;
     let congestion = text(node, "tcpCongestion")?;
     let window_clamp = int(node, "tcpWindowClamp")?.filter(|value| *value > 0);
@@ -971,6 +976,16 @@ mod tests {
         assert!(
             refused(r#"{"tcpKeepAliveIdle":10,"tcpKeepAliveInterval":-1}"#).contains("disagree")
         );
+    }
+
+    /// The reference's listener applies keepalive only for a nonzero idle or interval: a positive
+    /// pair enables it and a negative one disables it, while an explicit zero stays the proto default.
+    #[test]
+    fn a_nonzero_keepalive_reaches_the_listener() {
+        assert!(parsed(r#"{"tcpKeepAliveIdle":11}"#).keep_alive_set);
+        assert!(parsed(r#"{"tcpKeepAliveIdle":-1}"#).keep_alive_set);
+        assert!(!parsed(r#"{"tcpKeepAliveIdle":0}"#).keep_alive_set);
+        assert!(!parsed("{}").keep_alive_set);
     }
 
     #[test]

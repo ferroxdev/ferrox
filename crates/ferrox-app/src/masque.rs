@@ -225,41 +225,62 @@ impl MasqueOut {
         crate::proxy::resolve_outbound(&self.spec.address, self.spec.port)
     }
 
+    /// Bind the retained outbound options to the route table, so a `dialerProxy` hop resolves
+    /// through the same handler every other carrier uses.
+    pub(crate) fn install_route(&self, route: &Arc<crate::proxy::RouteShared>) {
+        if let Some(options) = self.spec.sockopt.as_deref() {
+            options.install_route(route);
+        }
+    }
+
     fn ensure(&self) -> Result<Arc<Inner>, String> {
         self.ensure_at(Instant::now(), || open(&self.spec))
+    }
+
+    /// A lane plus the lease that keeps its stack and connection alive while a datagram
+    /// relay or fixed-target forwarder runs on it.
+    fn ensure_leased(&self) -> Result<(Arc<Inner>, crate::wg_stack::FlowLease), String> {
+        self.ensure_flow_at(Instant::now(), || open(&self.spec))
     }
 
     /// Drop every lane whose stack ended or whose reuse window closed, and roll the reconnect
     /// history forward only when nothing live remains to answer.
     fn prune(slot: &mut Slot, now: Instant) {
         let mut stable = false;
-        let mut removed = false;
+        let mut died = false;
+        let mut retired = false;
         slot.lanes.retain(|lane| {
+            let alive = lane.inner.alive.load(Ordering::Acquire);
             let expired = lane.expires.is_some_and(|at| now >= at);
-            if lane.inner.alive.load(Ordering::Acquire) && !expired {
+            if alive && !expired {
                 return true;
             }
-            removed = true;
-            stable |= lane.inner.stable.load(Ordering::Relaxed);
+            if alive {
+                retired = true;
+            } else {
+                died = true;
+                stable |= lane.inner.stable.load(Ordering::Relaxed);
+            }
             Self::end(lane);
             false
         });
-        if removed {
+        if died {
             if stable {
                 slot.reconnect.reset(now);
             } else {
                 slot.reconnect.advance(now);
             }
+        } else if retired {
+            slot.reconnect.reset(now);
         }
     }
 
     /// Take a lane out of the pool: an idle one stops now, a busy one stops when its
     /// last flow drops, so its stack thread and connection are never left behind.
     fn end(lane: &PoolLane) {
+        lane.inner.retire.store(true, Ordering::Release);
         if lane.active.load(Ordering::Acquire) == 0 {
             lane.inner.alive.store(false, Ordering::Release);
-        } else {
-            lane.inner.retire.store(true, Ordering::Release);
         }
     }
 
@@ -437,8 +458,8 @@ impl MasqueOut {
     }
 
     pub(crate) fn serve_udp(&self, relay: &UdpSocket, associate: Option<&Connection>) {
-        match self.ensure() {
-            Ok(inner) => {
+        match self.ensure_leased() {
+            Ok((inner, _lease)) => {
                 let remote = self.spec.remote_dns.as_slice();
                 wg_stack::client_udp(
                     relay,
@@ -499,7 +520,7 @@ impl MasqueOut {
                     Err(error) if crate::proxy::is_udp_gone(&error) => continue,
                     Err(_) => break,
                 }
-                let inner = match tunnel.ensure() {
+                let (inner, _lease) = match tunnel.ensure_leased() {
                     Ok(inner) => {
                         reported = false;
                         inner
@@ -583,6 +604,7 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
     };
     let net = quic::network_generation();
     sock.tune_buffers(MASQUE_BUFFER);
+    let sock = sock.with_options(spec.sockopt.clone());
     let sock = match spec.udp_mask.clone() {
         Some(mask) => sock.with_udp_mask(mask, Vec::new()),
         None => sock,
@@ -2606,6 +2628,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         Some(mask) => Datagram::masked(sock, mask.clone(), spec.udp_filters.clone()),
         None => Datagram::plain(sock),
     };
+    let sock = sock.with_options(spec.sockopt.clone());
     let sock = Arc::new(sock.with_gso(spec.quic.is_none_or(|params| !params.disable_gso)));
     let (packets, packets_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
@@ -3593,7 +3616,7 @@ fn service(
             }
         } else if !tunnel.rejected {
             let probed = tunnel.stream.map(|stream| probed_mtu(conn, stream));
-            let capsules = tunnel.udp_target.is_some() && probed.is_some_and(|mtu| mtu < MIN_MTU);
+            let capsules = tunnel.udp.is_some() && probed.is_some_and(|mtu| mtu < MIN_MTU);
             let (mtu, refused) = match (spec.mtu_named, probed) {
                 (true, _) | (false, None) => (spec.mtu, false),
                 (false, Some(_)) if capsules => (spec.mtu, false),
@@ -4545,6 +4568,62 @@ mod tests {
             retire: Arc::new(AtomicBool::new(false)),
             stable: Arc::new(AtomicBool::new(stable)),
         }
+    }
+
+    /// A lane that is still live carries its reuse window; `end` marks retirement first so a lease
+    /// dropping concurrently cannot miss it, and the last lease is what clears `alive`.
+    #[test]
+    fn a_retired_lane_clears_after_its_last_lease() {
+        let masque = MasqueOut::new(&outbound(0)).expect("outbound");
+        let mut inner = dead_lane(true);
+        inner.alive = Arc::new(AtomicBool::new(true));
+        masque.inner.lock().expect("slot").lanes.push(PoolLane {
+            inner: Arc::new(inner),
+            expires: None,
+            cap: u64::MAX,
+            requests: 0,
+            active: Arc::new(AtomicUsize::new(0)),
+        });
+        let (_, lease) = masque.ensure_leased().expect("the live lane is reused");
+        let slot = masque.inner.lock().expect("slot");
+        MasqueOut::end(&slot.lanes[0]);
+        assert!(slot.lanes[0].inner.retire.load(Ordering::Acquire));
+        assert!(
+            slot.lanes[0].inner.alive.load(Ordering::Acquire),
+            "a busy lane stays alive while its flow runs"
+        );
+        drop(lease);
+        assert!(!slot.lanes[0].inner.alive.load(Ordering::Acquire));
+    }
+
+    /// A live lane reaching its planned reuse window is a healthy retirement, not a failed dial:
+    /// the next flow dials at once instead of waiting out a reconnect backoff.
+    #[test]
+    fn a_planned_expiry_keeps_the_reconnect_history_clear() {
+        let masque = MasqueOut::new(&outbound(0)).expect("outbound");
+        let start = Instant::now();
+        let mut inner = dead_lane(false);
+        inner.alive = Arc::new(AtomicBool::new(true));
+        {
+            let mut slot = masque.inner.lock().expect("slot");
+            slot.reconnect.attempts = 3;
+            slot.reconnect.next_dial = start + RECONNECT_MAX;
+            slot.lanes.push(PoolLane {
+                inner: Arc::new(inner),
+                expires: Some(start),
+                cap: u64::MAX,
+                requests: 0,
+                active: Arc::new(AtomicUsize::new(0)),
+            });
+        }
+        let mut dials = 0;
+        masque
+            .ensure_at(start, || {
+                dials += 1;
+                Ok(dead_lane(false))
+            })
+            .expect("an expired healthy lane does not hold the backoff");
+        assert_eq!(dials, 1);
     }
 
     #[test]

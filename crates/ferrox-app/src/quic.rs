@@ -1944,7 +1944,8 @@ pub(crate) fn rebind_path(
     } else {
         bound
     };
-    let Some(source) = probe_source(peer, None) else {
+    let options = sock.options.as_deref();
+    let Some(source) = probe_source(peer, options) else {
         return Rebind::Retry;
     };
     let same = match (source, current) {
@@ -1969,6 +1970,12 @@ pub(crate) fn rebind_path(
     let Ok(fresh) = UdpSocket::bind(at) else {
         return Rebind::Retry;
     };
+    if let Some(options) = options {
+        if options.apply_to_udp(&fresh, peer).is_err() {
+            return Rebind::Retry;
+        }
+    }
+    set_gro(&fresh, sock.gso && sock.whole_datagrams());
     set_receive_buffer(&fresh, DATAGRAM_BUFFER);
     set_send_buffer(&fresh, DATAGRAM_BUFFER);
     if let Ok(mut slot) = sock.source.lock() {
@@ -2274,10 +2281,16 @@ impl UdpMask {
             if self.rejects(from) {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
+            let base = buf.as_ptr() as usize;
             let Some(plain) = self.mask.decode_in_place(&mut buf[..found]) else {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             };
-            return Ok((plain.len(), from));
+            let start = plain.as_ptr() as usize - base;
+            let len = plain.len();
+            if start != 0 {
+                buf.copy_within(start..start + len, 0);
+            }
+            return Ok((len, from));
         }
         let Ok(mut room) = self.room.lock() else {
             return Err(std::io::Error::other("the udp mask room is gone"));
@@ -2312,6 +2325,9 @@ pub(crate) struct Datagram {
     proxy_peer: Option<SocketAddr>,
     /// The shim's stop flag; dropping the lane wakes its loops.
     proxy_stop: Option<Arc<AtomicBool>>,
+    /// The `sockopt` this lane was dialled under, so a route move re-probes and
+    /// rebinds under the same mark or device.
+    options: Option<Arc<crate::sockopt::SocketOptions>>,
     /// A hopped client dial: the server port moves on a schedule and the socket
     /// with it, so a UDP flow keeps ending and a new one starting to a filter.
     /// Shared behind an `Arc` so a writer clone and a reader clone move together.
@@ -2934,6 +2950,7 @@ impl Datagram {
             gso: true,
             proxy_peer: None,
             proxy_stop: None,
+            options: None,
         }
     }
 
@@ -2961,6 +2978,7 @@ impl Datagram {
             gso: true,
             proxy_peer: None,
             proxy_stop: None,
+            options: None,
         }
     }
 
@@ -2983,6 +3001,7 @@ impl Datagram {
             gso: true,
             proxy_peer: Some(peer),
             proxy_stop: Some(stop),
+            options: None,
         }
     }
 
@@ -3002,6 +3021,16 @@ impl Datagram {
         set_receive_buffer(&self.sock, bytes);
         #[cfg(any(unix, windows))]
         set_send_buffer(&self.sock, bytes);
+    }
+
+    /// Keep the lane's `sockopt` for a later route move, which re-probes the source and rebinds
+    /// under the same mark or device.
+    pub(crate) fn with_options(
+        mut self,
+        options: Option<Arc<crate::sockopt::SocketOptions>>,
+    ) -> Self {
+        self.options = options;
+        self
     }
 
     /// Whether the platform may coalesce a burst into one GSO write.
@@ -3048,6 +3077,7 @@ impl Datagram {
             gso: true,
             proxy_peer: None,
             proxy_stop: None,
+            options: None,
         }
     }
 
@@ -3069,6 +3099,7 @@ impl Datagram {
             gso: true,
             proxy_peer: None,
             proxy_stop: None,
+            options: None,
         }
     }
 
@@ -3092,6 +3123,7 @@ impl Datagram {
             gso: true,
             proxy_peer: None,
             proxy_stop: None,
+            options: None,
         }
     }
 
@@ -3120,6 +3152,7 @@ impl Datagram {
             gso: true,
             proxy_peer: None,
             proxy_stop: None,
+            options: None,
         })
     }
 
@@ -3150,6 +3183,7 @@ impl Datagram {
             gso: true,
             proxy_peer: None,
             proxy_stop: None,
+            options: None,
         })
     }
 
@@ -3182,6 +3216,7 @@ impl Datagram {
             gso: true,
             proxy_peer: None,
             proxy_stop: None,
+            options: None,
         })
     }
 
@@ -3410,6 +3445,7 @@ impl Datagram {
             gso: self.gso,
             proxy_peer: self.proxy_peer,
             proxy_stop: self.proxy_stop.clone(),
+            options: self.options.clone(),
         })
     }
 
@@ -5181,6 +5217,35 @@ pub(crate) fn issue_spare_scids_len(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The masked reader hands back only plaintext: a header stage decodes to a subslice inside the
+    /// caller's buffer, so the bytes must move to offset zero whichever room the read landed in.
+    #[test]
+    fn a_masked_read_returns_plaintext_at_offset_zero() {
+        let mask = ferrox_core::kcp::Mask::from_spec(&[ferrox_core::kcp::Spec::Header(
+            ferrox_core::kcp::HeaderKind::Srtp,
+        )])
+        .expect("mask builds");
+        let mut encoder = ferrox_core::kcp::Encoder::new(&mask);
+        let plain = b"one masked datagram";
+        let wire = encoder.encode(plain).expect("encodes").to_vec();
+        let reader = UdpMask::new(mask, Vec::new());
+        let source: SocketAddr = "192.0.2.1:443".parse().expect("source");
+        for room in [MAX_DATAGRAM + reader.overhead(), 64] {
+            let mut buf = vec![0u8; room];
+            let (len, from) = reader
+                .recv(
+                    |out| {
+                        out[..wire.len()].copy_from_slice(&wire);
+                        Ok((wire.len(), source))
+                    },
+                    &mut buf,
+                )
+                .expect("masked read");
+            assert_eq!(&buf[..len], plain, "room {room} must land at offset zero");
+            assert_eq!(from, source);
+        }
+    }
 
     /// The resumption table keeps the newest edges and updates one in place, so many distinct
     /// dials cannot grow it without bound.

@@ -3748,6 +3748,15 @@ fn route_shared_with_api(
     if let Some(options) = &shared.default_sockopts {
         options.install_route(&shared);
     }
+    for outbound in shared
+        .tagged
+        .values()
+        .chain(std::iter::once(&shared.default))
+    {
+        if let Outbound::Masque(masque) = outbound {
+            masque.install_route(&shared);
+        }
+    }
     let _ = shared.self_weak.set(Arc::downgrade(&shared));
     shared.bind_loopbacks();
     Ok(shared)

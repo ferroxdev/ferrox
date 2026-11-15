@@ -705,9 +705,9 @@ impl Client {
         let (tcp, deadline) = handshake_stream(tcp);
         let mut tcp = tcp;
         tcp.set_read_timeout(Some(READ_WAIT));
+        let cap = handshake_cap(&deadline);
         tcp.write_all(h2::MAGIC)
             .map_err(|error| format!("preface: {error}"))?;
-        let cap = handshake_cap(&deadline);
         let answer = handshake(
             Box::new(tcp),
             deadline,
