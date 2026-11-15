@@ -1233,6 +1233,10 @@ impl Read for WebRtcStream {
                 }
             }
             if let Some(error) = lock(&self.failure).as_ref().cloned() {
+                if let Ok(Ok(data)) = input.try_recv() {
+                    pending.0 = data;
+                    continue;
+                }
                 return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
             }
             let timeout = *lock(&self.read_timeout);
