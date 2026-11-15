@@ -1422,6 +1422,7 @@ impl Handler {
 
     /// One queue of a multi-queue device: every queue passes the same `flows` and `legs`, so a flow
     /// is whole wherever the kernel hashes its next segment or datagram.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on(
         device: Device,
         relay: Relay,
@@ -1888,8 +1889,7 @@ impl Handler {
                         {
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
-                        Ok(false) => break false,
-                        Err(_) => break false,
+                        Ok(false) | Err(_) => break false,
                     }
                 }
             };
@@ -3389,7 +3389,7 @@ mod tests {
     #[cfg(unix)]
     fn recording_relay(results: Dials) -> Relay {
         Arc::new(
-            move |mut conn: Connection, dest: crate::proxy::Destination| {
+            move |mut conn: Connection, _lane, dest: crate::proxy::Destination| {
                 let mut payload = Vec::new();
                 let _ = conn.read_to_end(&mut payload);
                 let target = match dest {

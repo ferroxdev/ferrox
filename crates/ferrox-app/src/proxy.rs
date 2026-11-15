@@ -24566,14 +24566,12 @@ pub(crate) fn serve_device_flow(
     out: &Outbound,
     dest: &Destination,
 ) -> std::io::Result<()> {
-    match carried {
-        Some(lane) => serve_lane(client, dest, &lane.out, lane.tag.as_deref()),
-        None => {
-            let (dial, picked, tag) = sniff_lane(out, dest, &client, None, None);
-            let dest = dial.as_ref().unwrap_or(dest);
-            serve_lane(client, dest, &picked, tag.as_deref())
-        }
+    if let Some(lane) = carried {
+        return serve_lane(client, dest, &lane.out, lane.tag.as_deref());
     }
+    let (dial, picked, tag) = sniff_lane(out, dest, &client, None, None);
+    let dest = dial.as_ref().unwrap_or(dest);
+    serve_lane(client, dest, &picked, tag.as_deref())
 }
 
 fn serve_lane(
