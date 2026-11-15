@@ -604,7 +604,7 @@ pub(crate) fn tune_transport(config: &mut quiche::Config) {
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM);
 }
 
-/// The reference's `finalmask.quicParams` windows, idle bound and stream cap, a zero field taking the reference's default; the Brutal rate is `apply_hysteria_pacing`, the parrot's zero-length source ID is `hysteria_client_cid`, and `bbrProfile` and `disableGSO` are accepted but have no quiche knob.
+/// The reference's `finalmask.quicParams` windows, idle bound, stream cap, congestion and BBR profile, with `bbrProfile` reaching quiche behind `internal`; a zero field takes the reference's default, the Brutal rate is `apply_hysteria_pacing`, the parrot's zero-length source ID is `hysteria_client_cid`, and `brutal*` and `disableChromeParrot` have no knob here.
 pub(crate) fn apply_hysteria_quic(
     config: &mut quiche::Config,
     params: &ferrox_core::hysteria::QuicParams,
@@ -636,6 +636,30 @@ pub(crate) fn apply_hysteria_quic(
     }
     if params.no_path_mtu {
         config.discover_pmtu(false);
+    }
+    if let Some(cc) = params.cc {
+        let _ = config.set_cc_algorithm_name(cc.quiche_name());
+    }
+    if params.cc != Some(ferrox_core::hysteria::Congestion::Reno) {
+        let mut bbr = quiche::BbrParams::default();
+        match params.bbr_profile {
+            ferrox_core::hysteria::BbrProfile::Standard => {}
+            ferrox_core::hysteria::BbrProfile::Conservative => {
+                bbr.startup_pacing_gain = Some(2.25);
+                bbr.startup_cwnd_gain = Some(1.75);
+                bbr.drain_pacing_gain = Some(1.0 / 2.25);
+                bbr.startup_full_bw_rounds = Some(2);
+                bbr.enable_overestimate_avoidance = Some(true);
+            }
+            ferrox_core::hysteria::BbrProfile::Aggressive => {
+                bbr.startup_pacing_gain = Some(3.0);
+                bbr.startup_cwnd_gain = Some(2.25);
+                bbr.startup_full_bw_rounds = Some(4);
+            }
+        }
+        if params.bbr_profile != ferrox_core::hysteria::BbrProfile::Standard {
+            config.set_custom_bbr_params(bbr);
+        }
     }
 }
 
@@ -844,7 +868,7 @@ fn send_batch(
     let mut done = 0usize;
     while done < want {
         let n = (want - done).min(GSO_SEGMENTS);
-        if n >= 2 && can_gso(&lens[done..done + n], &tos[done..done + n]) {
+        if sock.gso() && n >= 2 && can_gso(&lens[done..done + n], &tos[done..done + n]) {
             match send_gso(sock, slots, lens, done, n, tos[done]) {
                 Gso::Sent => {
                     done += n;
@@ -1920,7 +1944,7 @@ pub(crate) fn rebind_path(
     } else {
         bound
     };
-    let Some(source) = probe_source(peer) else {
+    let Some(source) = probe_source(peer, None) else {
         return Rebind::Retry;
     };
     let same = match (source, current) {
@@ -1945,8 +1969,6 @@ pub(crate) fn rebind_path(
     let Ok(fresh) = UdpSocket::bind(at) else {
         return Rebind::Retry;
     };
-    #[cfg(target_os = "linux")]
-    set_gro(&fresh, true);
     set_receive_buffer(&fresh, DATAGRAM_BUFFER);
     set_send_buffer(&fresh, DATAGRAM_BUFFER);
     if let Ok(mut slot) = sock.source.lock() {
@@ -2204,11 +2226,92 @@ impl Mask {
     }
 }
 
+/// A `finalmask.udp` chain above the socket: one encoder per lane, because a
+/// header stage counts its own sequence, and the source filters the reference
+/// applies on the serving side.
+pub(crate) struct UdpMask {
+    mask: ferrox_core::kcp::Mask,
+    encoder: Mutex<ferrox_core::kcp::Encoder>,
+    room: Mutex<Vec<u8>>,
+    filters: Vec<ferrox_core::finalmask::SourceFilter>,
+}
+
+impl UdpMask {
+    pub(crate) fn new(
+        mask: ferrox_core::kcp::Mask,
+        filters: Vec<ferrox_core::finalmask::SourceFilter>,
+    ) -> Self {
+        let room = vec![0u8; MAX_DATAGRAM + mask.overhead()];
+        Self {
+            encoder: Mutex::new(ferrox_core::kcp::Encoder::new(&mask)),
+            room: Mutex::new(room),
+            mask,
+            filters,
+        }
+    }
+
+    pub(crate) fn overhead(&self) -> usize {
+        self.mask.overhead()
+    }
+
+    fn rejects(&self, source: SocketAddr) -> bool {
+        self.filters
+            .iter()
+            .any(|filter| filter.rejects(Some(source.ip())))
+    }
+
+    /// Read one whole masked frame, unmask it where it landed when the caller's
+    /// room holds the chain's overhead, and otherwise unmask in the lane's own
+    /// room before copying the plaintext back.
+    fn recv(
+        &self,
+        read: impl FnOnce(&mut [u8]) -> std::io::Result<(usize, SocketAddr)>,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, SocketAddr)> {
+        let needed = MAX_DATAGRAM + self.overhead();
+        if buf.len() >= needed {
+            let (found, from) = read(&mut buf[..needed])?;
+            if self.rejects(from) {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            let Some(plain) = self.mask.decode_in_place(&mut buf[..found]) else {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            };
+            return Ok((plain.len(), from));
+        }
+        let Ok(mut room) = self.room.lock() else {
+            return Err(std::io::Error::other("the udp mask room is gone"));
+        };
+        let (found, from) = read(&mut room[..needed])?;
+        if self.rejects(from) {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+        let Some(plain) = self.mask.decode_in_place(&mut room[..found]) else {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        };
+        let out = buf
+            .get_mut(..plain.len())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        out.copy_from_slice(plain);
+        Ok((plain.len(), from))
+    }
+}
+
 /// One datagram socket: a relay or an obfuscation below changes no handshake, frame or stream above, so the hops live here.
 pub(crate) struct Datagram {
     sock: UdpSocket,
     relay: Option<Relay>,
     obfs: Option<Mask>,
+    /// The `finalmask.udp` chain, above every other layer, encoded on send and
+    /// decoded where the wire bytes landed on receive.
+    udp_mask: Option<Arc<UdpMask>>,
+    /// Whether the platform may coalesce a burst into one GSO write.
+    gso: bool,
+    /// The destination a `dialerProxy` shim answers for: the socket is connected
+    /// to the shim, so sends ignore their target and reads are relabelled.
+    proxy_peer: Option<SocketAddr>,
+    /// The shim's stop flag; dropping the lane wakes its loops.
+    proxy_stop: Option<Arc<AtomicBool>>,
     /// A hopped client dial: the server port moves on a schedule and the socket
     /// with it, so a UDP flow keeps ending and a new one starting to a filter.
     /// Shared behind an `Arc` so a writer clone and a reader clone move together.
@@ -2233,6 +2336,14 @@ pub(crate) struct Datagram {
     /// socket so a later route event compares against that source rather than the
     /// unspecified address the socket was bound to.
     source: Arc<Mutex<Option<SocketAddr>>>,
+}
+
+impl Drop for Datagram {
+    fn drop(&mut self) {
+        if let Some(stop) = self.proxy_stop.as_ref() {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The datagrams the kernel refused that a later sweep retries, in the order quiche
@@ -2819,13 +2930,100 @@ impl Datagram {
             moved: Arc::default(),
             rebound: Arc::default(),
             source: Arc::default(),
+            udp_mask: None,
+            gso: true,
+            proxy_peer: None,
+            proxy_stop: None,
         }
+    }
+
+    /// A socket whose every datagram passes a `finalmask.udp` chain, with the
+    /// reference's source filters on the serving side. GRO stays off: a
+    /// coalesced burst would be handed to the decoder as one frame.
+    pub(crate) fn masked(
+        sock: UdpSocket,
+        mask: ferrox_core::kcp::Mask,
+        filters: Vec<ferrox_core::finalmask::SourceFilter>,
+    ) -> Self {
+        clear_gro(&sock);
+        Self {
+            sock,
+            relay: None,
+            obfs: None,
+            hop: None,
+            gecko: None,
+            armed: Arc::default(),
+            held: Arc::default(),
+            moved: Arc::default(),
+            rebound: Arc::default(),
+            source: Arc::default(),
+            udp_mask: Some(Arc::new(UdpMask::new(mask, filters))),
+            gso: true,
+            proxy_peer: None,
+            proxy_stop: None,
+        }
+    }
+
+    /// A socket connected to a `dialerProxy` shim: every send reaches the shim,
+    /// and every reply is relabelled as the peer the shim dialled.
+    pub(crate) fn proxied(sock: UdpSocket, peer: SocketAddr, stop: Arc<AtomicBool>) -> Self {
+        clear_gro(&sock);
+        Self {
+            sock,
+            relay: None,
+            obfs: None,
+            hop: None,
+            gecko: None,
+            armed: Arc::default(),
+            held: Arc::default(),
+            moved: Arc::default(),
+            rebound: Arc::default(),
+            source: Arc::default(),
+            udp_mask: None,
+            gso: true,
+            proxy_peer: Some(peer),
+            proxy_stop: Some(stop),
+        }
+    }
+
+    /// Put a `finalmask.udp` chain above whatever layer this lane already has.
+    pub(crate) fn with_udp_mask(
+        mut self,
+        mask: ferrox_core::kcp::Mask,
+        filters: Vec<ferrox_core::finalmask::SourceFilter>,
+    ) -> Self {
+        clear_gro(&self.sock);
+        self.udp_mask = Some(Arc::new(UdpMask::new(mask, filters)));
+        self
+    }
+
+    /// Size both kernel queues for a burst the carrier already accepted.
+    pub(crate) fn tune_buffers(&self, bytes: i32) {
+        set_receive_buffer(&self.sock, bytes);
+        #[cfg(any(unix, windows))]
+        set_send_buffer(&self.sock, bytes);
+    }
+
+    /// Whether the platform may coalesce a burst into one GSO write.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn gso(&self) -> bool {
+        self.gso
+    }
+
+    /// Stop coalescing writes when the config names `disableGSO`; a lane that no longer takes the
+    /// batched read also stops GRO, so one wire datagram stays one read.
+    pub(crate) fn with_gso(mut self, gso: bool) -> Self {
+        if !gso {
+            clear_gro(&self.sock);
+        }
+        self.gso = gso;
+        self
     }
 
     /// Record the source the kernel picks for `peer` without binding it, for a
     /// lane whose wildcard socket must keep receiving the peer's replies.
     pub(crate) fn remember_source(&self, peer: SocketAddr) -> Option<SocketAddr> {
-        let source = probe_source(peer)?;
+        let source = probe_source(peer, None)?;
         if let Ok(mut slot) = self.source.lock() {
             *slot = Some(source);
         }
@@ -2846,6 +3044,10 @@ impl Datagram {
             moved: Arc::default(),
             rebound: Arc::default(),
             source: Arc::default(),
+            udp_mask: None,
+            gso: true,
+            proxy_peer: None,
+            proxy_stop: None,
         }
     }
 
@@ -2863,6 +3065,10 @@ impl Datagram {
             moved: Arc::default(),
             rebound: Arc::default(),
             source: Arc::default(),
+            udp_mask: None,
+            gso: true,
+            proxy_peer: None,
+            proxy_stop: None,
         }
     }
 
@@ -2882,6 +3088,10 @@ impl Datagram {
             moved: Arc::default(),
             rebound: Arc::default(),
             source: Arc::default(),
+            udp_mask: None,
+            gso: true,
+            proxy_peer: None,
+            proxy_stop: None,
         }
     }
 
@@ -2906,6 +3116,10 @@ impl Datagram {
             moved: Arc::default(),
             rebound: Arc::default(),
             source: Arc::default(),
+            udp_mask: None,
+            gso: true,
+            proxy_peer: None,
+            proxy_stop: None,
         })
     }
 
@@ -2932,6 +3146,10 @@ impl Datagram {
             moved: Arc::default(),
             rebound: Arc::default(),
             source: Arc::default(),
+            udp_mask: None,
+            gso: true,
+            proxy_peer: None,
+            proxy_stop: None,
         })
     }
 
@@ -2960,13 +3178,29 @@ impl Datagram {
             moved: Arc::default(),
             rebound: Arc::default(),
             source: Arc::default(),
+            udp_mask: None,
+            gso: true,
+            proxy_peer: None,
+            proxy_stop: None,
         })
     }
 
-    /// A lane the kernel can speak to in batches: no gecko fragment, no hop, no obfuscation and no relay frame, so the datagram quiche wrote is the datagram on the wire, and Linux is where the batched call exists.
+    /// Whether one read is one wire datagram: no connected proxy shim, no mask, gecko fragment, hop,
+    /// obfuscation or relay frame rewrites the bytes or their destination.
+    fn whole_datagrams(&self) -> bool {
+        self.proxy_peer.is_none()
+            && self.udp_mask.is_none()
+            && self.gecko.is_none()
+            && self.hop.is_none()
+            && self.obfs.is_none()
+            && self.relay.is_none()
+    }
+
+    /// A lane the kernel can speak to in batches: the datagram quiche wrote is the datagram on the
+    /// wire, and Linux is where the batched call exists.
     #[cfg(target_os = "linux")]
     fn batchable(&self) -> bool {
-        self.gecko.is_none() && self.hop.is_none() && self.obfs.is_none() && self.relay.is_none()
+        self.gso && self.whole_datagrams()
     }
 
     /// Send one datagram, or hold it when the kernel refused it for a reason that
@@ -3017,7 +3251,10 @@ impl Datagram {
     /// descriptors they write through, so their schedule is the move, and a relayed
     /// lane is addressed to a proxy association a new source would break.
     pub(crate) fn rebindable(&self) -> bool {
-        self.hop.is_none() && self.gecko.is_none() && self.relay.is_none()
+        self.proxy_peer.is_none()
+            && self.hop.is_none()
+            && self.gecko.is_none()
+            && self.relay.is_none()
     }
 
     /// The socket a move installed, cloned under the lock so a blocking read never
@@ -3033,8 +3270,7 @@ impl Datagram {
     /// new path: the old descriptor stays for a reply already in flight, and the
     /// flag keeps a lane that never roams on the direct path.
     pub(crate) fn rebind(&self, sock: UdpSocket) -> std::io::Result<()> {
-        #[cfg(target_os = "linux")]
-        set_gro(&sock, true);
+        set_gro(&sock, self.gso && self.whole_datagrams());
         if let Ok(armed) = self.armed.lock() {
             if let Some(Some(timeout)) = *armed {
                 sock.set_read_timeout(Some(timeout))?;
@@ -3050,6 +3286,9 @@ impl Datagram {
     }
 
     fn send_on(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        if self.proxy_peer.is_some() {
+            return self.sock.send(buf);
+        }
         if let Some(sock) = self.rebound() {
             return sock.send_to(buf, to);
         }
@@ -3057,13 +3296,28 @@ impl Datagram {
     }
 
     fn recv_on(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-        if let Some(sock) = self.rebound() {
-            return sock.recv_from(buf);
-        }
-        self.sock.recv_from(buf)
+        let (found, from) = if let Some(sock) = self.rebound() {
+            sock.recv_from(buf)?
+        } else {
+            self.sock.recv_from(buf)?
+        };
+        Ok((found, self.proxy_peer.unwrap_or(from)))
     }
 
     pub(crate) fn send_to(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        let Some(mask) = self.udp_mask.as_ref() else {
+            return self.send_layered(buf, to);
+        };
+        let Ok(mut encoder) = mask.encoder.lock() else {
+            return Err(std::io::Error::other("the udp mask encoder is gone"));
+        };
+        let Some(wire) = encoder.encode(buf) else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        };
+        self.send_layered(wire, to)
+    }
+
+    fn send_layered(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
         if let Some(gecko) = self.gecko.as_ref() {
             return gecko.send(buf, to);
         }
@@ -3094,6 +3348,13 @@ impl Datagram {
     }
 
     pub(crate) fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        let Some(mask) = self.udp_mask.as_ref() else {
+            return self.recv_layered(buf);
+        };
+        mask.recv(|room| self.recv_layered(room), buf)
+    }
+
+    fn recv_layered(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         if let Some(gecko) = self.gecko.as_ref() {
             return gecko.recv(buf);
         }
@@ -3145,6 +3406,10 @@ impl Datagram {
             moved: Arc::clone(&self.moved),
             rebound: Arc::clone(&self.rebound),
             source: Arc::clone(&self.source),
+            udp_mask: self.udp_mask.clone(),
+            gso: self.gso,
+            proxy_peer: self.proxy_peer,
+            proxy_stop: self.proxy_stop.clone(),
         })
     }
 
@@ -3308,20 +3573,41 @@ pub(crate) fn udp_to_server(
     address: &str,
     port: u16,
 ) -> Option<(UdpSocket, SocketAddr, SocketAddr)> {
-    let peer = crate::proxy::resolve_outbound(address, port)?;
-    let (sock, local) = datagram_to(peer)?;
+    udp_to_server_with(address, port, None)
+}
+
+/// The same dial with the stream's `sockopt` applied to the socket before the
+/// first QUIC packet, so mark, interface and the rest reach the kernel.
+pub(crate) fn udp_to_server_with(
+    address: &str,
+    port: u16,
+    options: Option<&crate::sockopt::SocketOptions>,
+) -> Option<(UdpSocket, SocketAddr, SocketAddr)> {
+    let peer = match options {
+        Some(options) => options.resolve_addr(address, port)?,
+        None => crate::proxy::resolve_outbound(address, port)?,
+    };
+    let (sock, local) = datagram_to_with(peer, options)?;
     Some((sock, peer, local))
 }
 
 /// Bind a datagram socket to the source the kernel picks for `peer`, so a later route
 /// event can compare that source with a fresh probe instead of a wildcard.
+#[cfg(test)]
 pub(crate) fn datagram_to(peer: SocketAddr) -> Option<(UdpSocket, SocketAddr)> {
+    datagram_to_with(peer, None)
+}
+
+fn datagram_to_with(
+    peer: SocketAddr,
+    options: Option<&crate::sockopt::SocketOptions>,
+) -> Option<(UdpSocket, SocketAddr)> {
     let bind = if peer.is_ipv6() {
         "[::]:0"
     } else {
         "0.0.0.0:0"
     };
-    let source = probe_source(peer)?;
+    let source = probe_source(peer, options)?;
     let at = match source {
         SocketAddr::V4(addr) => SocketAddr::new(IpAddr::V4(*addr.ip()), 0),
         SocketAddr::V6(addr) => SocketAddr::V6(std::net::SocketAddrV6::new(
@@ -3332,17 +3618,28 @@ pub(crate) fn datagram_to(peer: SocketAddr) -> Option<(UdpSocket, SocketAddr)> {
         )),
     };
     let sock = bind_datagram_at(at).or_else(|_| bind_datagram(bind)).ok()?;
+    if let Some(options) = options {
+        options.apply_to_udp(&sock, peer).ok()?;
+    }
     let local = sock.local_addr().ok()?;
     Some((sock, local))
 }
 
-fn probe_source(peer: SocketAddr) -> Option<SocketAddr> {
+/// Pick the source under the config's interface and mark, so a policy route or a
+/// bound device chooses it, then keep the same options on the socket that sends.
+fn probe_source(
+    peer: SocketAddr,
+    options: Option<&crate::sockopt::SocketOptions>,
+) -> Option<SocketAddr> {
     let bind = if peer.is_ipv6() {
         "[::]:0"
     } else {
         "0.0.0.0:0"
     };
     let probe = UdpSocket::bind(bind).ok()?;
+    if let Some(options) = options {
+        options.apply_to_udp(&probe, peer).ok()?;
+    }
     probe.connect(peer).ok()?;
     probe.local_addr().ok()
 }
@@ -4916,6 +5213,20 @@ mod tests {
         remember(&mut entries, &key(RESUMPTION_CAP as u16 + 1), vec![0]);
         assert!(!entries.iter().any(|(k, _)| k == &key(1)));
         assert!(entries.iter().any(|(k, _)| k == &key(2)));
+    }
+
+    /// A connected shim answers for one peer, so a batched send addressed to the tunnel's peer would
+    /// miss the shim and a batched read would relabel nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_proxied_lane_is_never_batched() {
+        let sock = bind_datagram("127.0.0.1:0").expect("binds");
+        let lane = Datagram::proxied(
+            sock,
+            "127.0.0.1:9".parse().expect("a peer"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(!lane.batchable());
     }
 
     /// A returned buffer is the next one handed out, so the pool never zeroes a datagram twice.

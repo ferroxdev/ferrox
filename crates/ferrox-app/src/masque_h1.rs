@@ -4,6 +4,7 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -197,21 +198,28 @@ pub(crate) struct Client {
 
 impl Client {
     /// Dial the edge, upgrade to connect-ip, and ask for addresses.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dial(
         tls_config: &TlsConfig,
         edge: SocketAddr,
         authority: &str,
         path: &str,
         headers: &[(String, String)],
+        mask: Option<&ferrox_core::finalmask::Chain>,
+        sockopt: Option<&crate::sockopt::SocketOptions>,
     ) -> Result<Self, String> {
-        let tcp = connect_edge(edge)?;
+        let tcp = connect_edge(edge, sockopt)?;
         let _ = tcp.set_read_timeout(Some(HANDSHAKE));
         let _ = tcp.set_write_timeout(Some(HANDSHAKE));
+        let tcp = crate::conn::Connection::from(tcp)
+            .with_mask_role(mask, ferrox_core::finalmask::MaskRole::Client);
         let (tcp, deadline) = crate::masque_h2::handshake_stream(tcp);
+        let cap = crate::masque_h2::handshake_cap(&deadline);
         let mut tls =
             ferrox_core::tls::connect(tls_config, tcp).map_err(|error| format!("tls: {error}"))?;
         tls.handshake()
             .map_err(|error| format!("tls handshake: {error}"))?;
+        drop(cap);
         if tls.alpn() != Some(b"http/1.1") {
             return Err("the edge did not negotiate http/1.1".to_owned());
         }
@@ -296,6 +304,7 @@ impl Client {
         from_tunnel: &Receiver<Vec<u8>>,
         to_stack: &Sender<Packet>,
         routes: &UdpRoutes,
+        alive: &AtomicBool,
     ) {
         self.to_stack = Some(to_stack.clone());
         self.routes = Some(routes.clone());
@@ -304,7 +313,7 @@ impl Client {
         }
         self.early_bytes = 0;
         let mut capsule = Vec::new();
-        while !self.wire.closed && !self.end {
+        while !self.wire.closed && !self.end && alive.load(Ordering::Relaxed) {
             self.pump();
             if self.wire.closed || self.end {
                 break;
@@ -407,12 +416,22 @@ impl Client {
 }
 
 /// Connect with three quick attempts so a just-bound listener is reached.
-fn connect_edge(edge: SocketAddr) -> Result<TcpStream, String> {
+fn connect_edge(
+    edge: SocketAddr,
+    sockopt: Option<&crate::sockopt::SocketOptions>,
+) -> Result<TcpStream, String> {
     let mut last = None;
     for _ in 0..3 {
-        match TcpStream::connect(edge) {
+        let dialed = match sockopt {
+            Some(options) => options.connect_edge(edge, HANDSHAKE),
+            None => TcpStream::connect_timeout(&edge, HANDSHAKE),
+        };
+        match dialed {
             Ok(stream) => return Ok(stream),
-            Err(error) => last = Some(error),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                last = Some(error);
+            }
+            Err(error) => return Err(format!("cannot reach {edge}: {error}")),
         }
     }
     Err(format!(

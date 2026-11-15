@@ -181,6 +181,7 @@ pub enum BbrProfile {
 }
 
 /// The `finalmask.quicParams` block: a zero field is the reference's "unset" spelling and takes that field's default once the block is present.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct QuicParams {
     /// The profile itself; `None` keeps the congestion the stream named.
@@ -189,6 +190,8 @@ pub struct QuicParams {
     pub brutal_up: u64,
     /// Sent as the `hysteria-cc-rx` hint; the peer caps its Brutal rate at this.
     pub brutal_down: u64,
+    /// The reference's `brutalDisableLossCompensation`; quiche has no Brutal sender, so the parse is carried and the knob waits on one.
+    pub brutal_disable_loss_compensation: bool,
     pub init_stream_window: u64,
     pub max_stream_window: u64,
     pub init_connection_window: u64,
@@ -198,6 +201,8 @@ pub struct QuicParams {
     /// Seconds; 0 disables the keep-alive.
     pub keep_alive: u64,
     pub no_path_mtu: bool,
+    /// The reference's `disableGSO`; a lane that names it writes one datagram per send.
+    pub disable_gso: bool,
     pub max_incoming_streams: u64,
     /// The reference's `disableStatelessReset`; absent or false advertises a per-connection token.
     pub disable_stateless_reset: bool,
