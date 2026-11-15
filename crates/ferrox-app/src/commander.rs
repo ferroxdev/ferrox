@@ -152,6 +152,8 @@ pub(crate) struct Api {
     start: std::time::Instant,
     runtime: std::sync::OnceLock<Arc<crate::proxy::Runtime>>,
     observatory: std::sync::OnceLock<Option<Arc<crate::observatory::Observatory>>>,
+    #[cfg(test)]
+    cap_reached: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl std::fmt::Debug for Api {
@@ -166,7 +168,7 @@ impl std::fmt::Debug for Api {
             .field("start", &self.start)
             .field("runtime", &self.runtime.get().is_some())
             .field("observatory", &self.observatory.get().is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -201,7 +203,32 @@ impl Api {
             start: std::time::Instant::now(),
             runtime: std::sync::OnceLock::new(),
             observatory: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            cap_reached: Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    fn watch_header_cap(&self, sender: std::sync::mpsc::Sender<()>) {
+        *self
+            .cap_reached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
+    }
+
+    #[cfg(test)]
+    fn header_cap_reached(&self, headers: usize) {
+        if headers != h2::HEAD_CAP {
+            return;
+        }
+        if let Some(sender) = self
+            .cap_reached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = sender.send(());
+        }
     }
 
     pub(crate) fn tag(&self) -> &str {
@@ -418,6 +445,8 @@ impl Api {
                     }
                     let call = calls.entry(id).or_default();
                     call.headers.extend_from_slice(block);
+                    #[cfg(test)]
+                    self.header_cap_reached(call.headers.len());
                     call.end_headers = flags & h2::F_END_HEADERS != 0;
                     if call.end_headers {
                         call.read_path(&mut decoder);
@@ -433,6 +462,8 @@ impl Api {
                             return;
                         }
                         call.headers.extend_from_slice(&body);
+                        #[cfg(test)]
+                        self.header_cap_reached(call.headers.len());
                         if flags & h2::F_END_HEADERS != 0 {
                             call.end_headers = true;
                             call.read_path(&mut decoder);
@@ -1703,6 +1734,29 @@ mod tests {
         (client, waited)
     }
 
+    type HeaderCapConnection = (
+        Connection,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+
+    fn api_connection_watching_header_cap(idle: Duration) -> HeaderCapConnection {
+        let api = Api::new(ApiConfig::default());
+        let (cap, cap_reached) = std::sync::mpsc::channel();
+        api.watch_header_cap(cap);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("addr");
+        let (done, waited) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            api.serve_stream_with_idle(Connection::from(stream), idle);
+            done.send(()).expect("reports");
+        });
+        let mut client = Connection::connect(address).expect("connects");
+        client.write_all(h2::MAGIC).expect("writes the preface");
+        (client, waited, cap_reached)
+    }
+
     fn served_settings(client: &mut Connection) -> Vec<u8> {
         let (len, kind, flags, _) = h2::read_head(client).expect("settings");
         assert_eq!((kind, flags), (h2::T_SETTINGS, 0));
@@ -1774,7 +1828,8 @@ mod tests {
 
     #[test]
     fn a_header_block_past_the_cap_is_refused() {
-        let (mut client, waited) = api_connection(Duration::from_millis(500));
+        let (mut client, waited, cap_reached) =
+            api_connection_watching_header_cap(Duration::from_millis(500));
         served_settings(&mut client);
         let block = vec![0u8; h2::HEAD_CAP];
         for (index, chunk) in block.chunks(16 * 1024).enumerate() {
@@ -1788,15 +1843,9 @@ mod tests {
                 .expect("writes the frame head");
             client.write_all(chunk).expect("writes the frame bytes");
         }
-        client
-            .write_all(&h2::frame_head(8, h2::T_PING, 0, 0))
-            .expect("writes the ping");
-        client.write_all(b"12345678").expect("writes the ping body");
-        let (len, kind, flags, _) = h2::read_head(&mut client).expect("reads the ack");
-        assert_eq!((len, kind, flags), (8, h2::T_PING, h2::F_ACK));
-        let mut body = vec![0u8; len];
-        client.read_exact(&mut body).expect("reads the ping body");
-        assert_eq!(body, b"12345678");
+        cap_reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("accepts the exact-cap block");
         client
             .write_all(&h2::frame_head(1, h2::T_CONT, 0, 1))
             .expect("writes the continuation head");
