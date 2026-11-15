@@ -84,7 +84,7 @@ The row above is `UNBLESSED`: nobody has read a measured number for this symbol 
 
 ## Time
 
-**Not measured yet.** Wall clock for this method needs the same `ferrox-bench` cipher gate the AEAD rung uses, extended to the three 2022 methods at the same chunk lengths, run on a named CI runner. `benchmark-matrix.yml` is the named gate; until it carries a 2022 cell the time row stays unmeasured. No CI artefact has been read, so this page quotes no duration. Timing needs a named runner; a number from a laptop behind a VPN measures the tunnel.
+**Not measured yet.** Wall clock for this method needs the same `ferrox-bench` cipher gate the AEAD rung uses, extended to the three 2022 methods at the same chunk lengths, run on a named CI runner. `benchmark-matrix.yml` already times `shadowsocks2022-raw-*` end to end, but that is the lane's throughput, not the codec's per-cipher clock; until the matrix carries a per-cipher 2022 timing cell the time row stays unmeasured. No CI artefact has been read, so this page quotes no duration. Timing needs a named runner; a number from a laptop behind a VPN measures the tunnel.
 
 ## What we removed
 

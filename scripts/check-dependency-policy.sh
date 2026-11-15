@@ -23,16 +23,13 @@ else
   metadata=""
 fi
 
-if [[ -n "$metadata" ]]; then
-  policy_check="$(mktemp "${TMPDIR:-/tmp}/ferrox-licences.XXXXXX")"
-  trap 'rm -f "$policy_check"' EXIT
-  cat >"$policy_check" <<'PY'
+policy_check="$(mktemp "${TMPDIR:-/tmp}/ferrox-licences.XXXXXX")"
+trap 'rm -f "$policy_check"' EXIT
+cat >"$policy_check" <<'PY'
 import json, re, sys
 
-allow = {line.strip().lower() for line in sys.argv[1].splitlines() if line.strip()}
-graph = json.load(sys.stdin)
-expressions = sorted({p["license"] for p in graph["packages"] if p.get("license")})
-failed = False
+selftest = sys.argv[1:2] == ["--selftest"]
+allow = {line.strip().lower() for line in sys.argv[2 if selftest else 1].splitlines() if line.strip()}
 
 class Parser:
     def __init__(self, tokens):
@@ -76,13 +73,48 @@ class Parser:
             value = self.conjunction() or value
         return value
 
+def allowed(expression):
+    source = expression.replace("/", " OR ")
+    tokens = re.findall(r"\(|\)|[A-Za-z0-9.+-]+", source)
+    leftover = re.sub(r"\(|\)|[A-Za-z0-9.+-]+", " ", source)
+    if leftover.strip():
+        raise ValueError(f"unsupported token `{leftover.strip()}`")
+    parser = Parser(tokens)
+    value = parser.disjunction()
+    if parser.peek() is not None:
+        raise ValueError(f"trailing token {parser.peek()}")
+    return value
+
+if selftest:
+    cases = [
+        ("MIT", True),
+        ("LGPL-2.1-or-later", False),
+        ("MIT OR LGPL-2.1-or-later", True),
+        ("MIT AND LGPL-2.1-or-later", False),
+        ("(MIT OR Apache-2.0) AND BSD-3-Clause", True),
+        ("Apache-2.0 WITH LLVM-exception", True),
+        ("GPL-3.0-no! OR MIT", "error"),
+    ]
+    failed = False
+    for expression, want in cases:
+        try:
+            passed = allowed(expression)
+        except ValueError:
+            passed = "error"
+        if passed != want:
+            print(f"::error::selftest: `{expression}` returned {passed}, wanted {want}")
+            failed = True
+    if failed:
+        sys.exit(1)
+    print("check-dependency-policy: selftest ok")
+    sys.exit(0)
+
+graph = json.load(sys.stdin)
+expressions = sorted({p["license"] for p in graph["packages"] if p.get("license")})
+failed = False
 for expression in expressions:
     try:
-        tokens = re.findall(r"\(|\)|[A-Za-z0-9.+-]+", expression.replace("/", " OR "))
-        parser = Parser(tokens)
-        passed = parser.disjunction()
-        if parser.peek() is not None:
-            raise ValueError(f"trailing token {parser.peek()}")
+        passed = allowed(expression)
     except ValueError as error:
         print(f"::error::could not read licence expression `{expression}`: {error}")
         failed = True
@@ -93,6 +125,8 @@ for expression in expressions:
 
 sys.exit(1 if failed else 0)
 PY
+python3 "$policy_check" --selftest "$allow_list" || status=1
+if [[ "${1:-}" != "--selftest" && -n "$metadata" ]]; then
   if ! printf '%s' "$metadata" | python3 "$policy_check" "$allow_list"; then
     status=1
   fi

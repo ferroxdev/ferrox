@@ -127,6 +127,15 @@ front_port() {
 
 lane_pid_file() { printf '%s/lane.pid' "$CONF_DIR"; }
 
+lane_pid_matches() {
+  local pid="$1" command
+  command="$(ps -p "$pid" -ww -o command= 2>/dev/null)" || return 1
+  case "$command" in
+    *"${BIN##*/}"*"$CONF_DIR"/foxy-*.json*) return 0 ;;
+  esac
+  return 1
+}
+
 lane_running() {
   local pid_file pid
   pid_file="$(lane_pid_file)"
@@ -140,7 +149,9 @@ stop_lane() {
   pid_file="$(lane_pid_file)"
   if [ -f "$pid_file" ]; then
     pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && ! lane_pid_matches "$pid"; then
+      rm -f "$pid_file"
+    elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
       for i in $(seq 1 50); do
         kill -0 "$pid" 2>/dev/null || break
@@ -207,7 +218,18 @@ proxy_restore_kind() {
   server="$(proxy_field "$line" Server)"
   port="$(proxy_field "$line" Port)"
   case "$server" in 127.*|localhost|::1) ;; *) return 0 ;; esac
-  [ "$port" = "$ours" ] || return 0
+  if [ "$port" != "$ours" ]; then
+    if [ -n "$prior_srv" ] && [ "$prior_srv" != - ] &&
+      [ -n "$prior_port" ] && [ "$prior_port" != - ] &&
+      [ "$server" = "$prior_srv" ] && [ "$port" = "$prior_port" ]; then
+      if [ "$prior_on" = yes ]; then
+        networksetup "$set" "$svc" on 2>/dev/null || return 1
+      else
+        networksetup "$set" "$svc" off 2>/dev/null || return 1
+      fi
+    fi
+    return 0
+  fi
   if [ -n "$prior_srv" ] && [ "$prior_srv" != - ] &&
     [ -n "$prior_port" ] && [ "$prior_port" != - ]; then
     networksetup "$setter" "$svc" "$prior_srv" "$prior_port" 2>/dev/null || return 1

@@ -893,10 +893,11 @@ for inbound in document.get("inbounds", []):
         continue
     checked.add(name)
     listen = inbound.get("listen")
-    reachable = listen in (None, "", "127.0.0.1", "localhost")
+    reachable = listen in ("127.0.0.1", "localhost")
     if not reachable:
+        where = listen if isinstance(listen, str) and listen else "all interfaces"
         sys.exit(
-            f"inbound `{name}` listens on {listen}, not loopback; this launcher"
+            f"inbound `{name}` listens on {where}, not loopback; this launcher"
             " reaches a front on 127.0.0.1, so use 127.0.0.1 or localhost"
         )
 print(",".join(order))
@@ -2108,14 +2109,20 @@ stale_proxy_endpoint() {
   return 1
 }
 
-lane_running_in() {
-  local dir="$1" pidfile pid
-  for pidfile in "$dir"/lane*.pid; do
-    [ -f "$pidfile" ] || continue
-    pid="$(cat "$pidfile" 2>/dev/null || true)"
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
-  done
+lane_pid_runs() {
+  local pid="$1" cfg="$2" command
+  command="$(ps -p "$pid" -ww -o command= 2>/dev/null)" || return 1
+  case "$command" in
+    *"${BIN##*/}"*"${cfg##*/}"*) return 0 ;;
+  esac
   return 1
+}
+
+lane_running_in() {
+  local dir="$1" pidfile="$1/lane.pid" pid
+  [ -f "$pidfile" ] || return 1
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
 reconcile_stale_proxy() {
@@ -2386,11 +2393,15 @@ supervise_lane() {
 }
 
 stop_lane() {
-  local clear="${1:-1}" supervisor waited=0
+  local clear="${1:-1}" supervisor waited=0 pid
+  load_lane_meta || true
   if lane_running; then
-    kill "$(lane_pid)" 2>/dev/null || true
-    sleep 1
-    lane_running && kill -9 "$(lane_pid)" 2>/dev/null || true
+    pid="$(lane_pid)"
+    if lane_pid_runs "$pid" "$CFG"; then
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      lane_running && lane_pid_runs "$pid" "$CFG" && kill -9 "$pid" 2>/dev/null || true
+    fi
   fi
   if [ "$clear" = 1 ]; then
     supervisor="$(cat "$SUPERVISOR_PID_FILE" 2>/dev/null || true)"
