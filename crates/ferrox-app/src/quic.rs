@@ -53,6 +53,8 @@ pub(crate) struct QuicDial {
     pub(crate) roots: Option<ferrox_core::tls::Anchors>,
     /// The sealed client hello a server can open; it belongs to the connection, so a lane that offered one is never lent to a dial that did not.
     pub(crate) ech_config_list: Option<std::sync::Arc<[u8]>>,
+    /// The controller this lane dials with when it names none: the Foxy service takes the reference's BBR, the raw QUIC transports keep quiche's CUBIC as the reference's do.
+    pub(crate) default_cc: Option<ferrox_core::hysteria::Congestion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -63,6 +65,7 @@ pub(crate) struct QuicServer {
     upstream: Option<crate::foxy::UpstreamProxy>,
     roots: Option<ferrox_core::tls::Anchors>,
     ech_config_list: Option<std::sync::Arc<[u8]>>,
+    default_cc: Option<ferrox_core::hysteria::Congestion>,
 }
 
 impl QuicServer {
@@ -75,6 +78,7 @@ impl QuicServer {
             upstream: dial.upstream.clone(),
             roots: dial.roots.clone(),
             ech_config_list: dial.ech_config_list.clone(),
+            default_cc: dial.default_cc,
         }
     }
 }
@@ -803,33 +807,41 @@ pub(crate) fn quiche_config_alpn(
     config
 }
 
-/// The built configs, keyed by the trust bundle they were staged from.
-type BuiltConfigs = Mutex<HashMap<Vec<Vec<u8>>, Arc<Mutex<quiche::Config>>>>;
+/// The built configs, keyed by the controller choice and the trust bundle they were staged from.
+type BuiltConfigs = Mutex<
+    HashMap<
+        Option<ferrox_core::hysteria::Congestion>,
+        HashMap<Vec<Vec<u8>>, Arc<Mutex<quiche::Config>>>,
+    >,
+>;
 
-/// One built config per trust bundle: quiche documents a `Config` as shared between connections, and building one writes every anchor out as PEM, parses it back off the filesystem and deletes the file.
+/// One built config per choice and trust bundle: quiche documents a `Config` as shared between connections, and building one writes every anchor out as PEM, parses it back off the filesystem and deletes the file.
 static CONFIGS: OnceLock<BuiltConfigs> = OnceLock::new();
 
 /// Dial through the config this trust bundle was built into: the first dial of a bundle pays the staged file, a later one is handed the built config with no copy of the anchors. A bundle that will not build is not cached, so it names itself per dial as it always did.
 pub(crate) fn with_config<T>(
     roots: &[Vec<u8>],
+    default_cc: Option<ferrox_core::hysteria::Congestion>,
     dial: impl FnOnce(&mut quiche::Config) -> Option<T>,
 ) -> Option<T> {
     let cell = {
         let mut configs = CONFIGS.get_or_init(Default::default).lock().ok()?;
-        if let Some(cell) = configs.get(roots) {
+        let by_roots = configs.entry(default_cc).or_default();
+        if let Some(cell) = by_roots.get(roots) {
             Arc::clone(cell)
         } else {
             let staged = crate::foxy::debug_on().then(Instant::now);
             let mut config = quiche_config(roots, None)?;
-            // An h3 service lane with no `quicParams` runs the reference's BBR, never quiche's CUBIC default.
-            apply_congestion(
-                &mut config,
-                Some(ferrox_core::hysteria::Congestion::Bbr),
-                ferrox_core::hysteria::BbrProfile::Standard,
-            )?;
+            if let Some(cc) = default_cc {
+                apply_congestion(
+                    &mut config,
+                    Some(cc),
+                    ferrox_core::hysteria::BbrProfile::Standard,
+                )?;
+            }
             debug_staged(staged);
             let cell = Arc::new(Mutex::new(config));
-            configs.insert(roots.to_vec(), Arc::clone(&cell));
+            by_roots.insert(roots.to_vec(), Arc::clone(&cell));
             cell
         }
     };
@@ -3804,13 +3816,14 @@ pub(crate) fn handshake_within(
     server_name: &str,
     roots: &[Vec<u8>],
     ech_config_list: Option<&[u8]>,
+    default_cc: Option<ferrox_core::hysteria::Congestion>,
     budget: Duration,
     resume: Option<&QuicServer>,
 ) -> Option<(quiche::Connection, bool)> {
     let mut scid = [0u8; SCID_LEN];
     getrandom::fill(&mut scid).ok()?;
     let cid = quiche::ConnectionId::from_ref(&scid);
-    let mut conn = with_config(roots, |config| {
+    let mut conn = with_config(roots, default_cc, |config| {
         quiche::connect(Some(server_name), &cid, local, peer, config).ok()
     })?;
     if let Some(list) = ech_config_list {
@@ -4420,6 +4433,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             &dial.host,
             roots,
             dial.ech_config_list.as_deref(),
+            dial.default_cc,
             budget,
             Some(&QuicServer::of(dial)),
         ) else {
@@ -5141,6 +5155,7 @@ pub(crate) fn direct_stream_on(
         host,
         roots,
         None,
+        None,
         HANDSHAKE_TIMEOUT,
         None,
     )?;
@@ -5310,6 +5325,7 @@ mod tests {
             upstream: None,
             roots: None,
             ech_config_list: None,
+            default_cc: None,
         };
         let mut entries = ResumptionCache::new();
         for port in 0..=RESUMPTION_CAP as u16 {
@@ -6208,7 +6224,7 @@ mod tests {
         let other = rcgen::generate_simple_self_signed(vec!["other-config.test".to_owned()])
             .expect("mints");
         let built = |roots: &[Vec<u8>]| {
-            with_config(roots, |config| Some(std::ptr::from_ref(config))).expect("builds")
+            with_config(roots, None, |config| Some(std::ptr::from_ref(config))).expect("builds")
         };
         let (first, again) = (built(&roots), built(&roots));
         assert!(
@@ -6220,8 +6236,45 @@ mod tests {
             "a second bundle rode the first one's config"
         );
         assert!(
-            with_config(&[], |_| Some(())).is_none(),
+            !std::ptr::eq(
+                first,
+                with_config(
+                    &roots,
+                    Some(ferrox_core::hysteria::Congestion::Bbr),
+                    |config| Some(std::ptr::from_ref(config))
+                )
+                .expect("builds")
+            ),
+            "a second controller rode the first one's config"
+        );
+        assert!(
+            with_config(&[], None, |_| Some(())).is_none(),
             "a bundle that would not build was cached as one that did"
+        );
+    }
+
+    #[test]
+    fn a_controller_choice_is_part_of_the_lane_identity() {
+        let dial = |default_cc| QuicDial {
+            id: [0; 16],
+            host: std::sync::Arc::from("edge.test"),
+            address: std::sync::Arc::from("127.0.0.1"),
+            port: 443,
+            upstream: None,
+            roots: None,
+            ech_config_list: None,
+            default_cc,
+        };
+        let bbr = Some(ferrox_core::hysteria::Congestion::Bbr);
+        assert_eq!(
+            QuicServer::of(&dial(bbr)),
+            QuicServer::of(&dial(bbr)),
+            "the same choice shares its lane"
+        );
+        assert_ne!(
+            QuicServer::of(&dial(bbr)),
+            QuicServer::of(&dial(None)),
+            "and a lane that chose no controller is not that lane"
         );
     }
 
@@ -6248,7 +6301,7 @@ mod tests {
         let roots = system_roots();
         for (params, want) in [(parrot, 0usize), (masked, SCID_LEN)] {
             let cid = hysteria_client_cid(Some(&params)).expect("cid");
-            let mut conn = with_config(&roots, |config| {
+            let mut conn = with_config(&roots, None, |config| {
                 quiche::connect(Some("held.test"), &cid, local, peer, config).ok()
             })
             .expect("connects");
@@ -6300,10 +6353,10 @@ mod tests {
     #[test]
     fn a_warm_config_lookup_allocates_nothing() {
         let roots = system_roots();
-        with_config(&roots, |_| Some(())).expect("builds");
+        with_config(&roots, None, |_| Some(())).expect("builds");
         let ((), counts) = ferrox_core::alloc_count::measure(|| {
             for _ in 0..4096 {
-                with_config(&roots, |_| Some(())).expect("warms");
+                with_config(&roots, None, |_| Some(())).expect("warms");
             }
         });
         assert_eq!(
@@ -7516,6 +7569,7 @@ mod tests {
             upstream: None,
             roots: None,
             ech_config_list: None,
+            default_cc: None,
         };
         let roots = identity.certs[0].cert_chain.clone();
         let client_one = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
@@ -7526,6 +7580,7 @@ mod tests {
             local_one,
             "quic.test",
             &roots,
+            None,
             None,
             Duration::from_secs(5),
             Some(&key),
@@ -7541,6 +7596,7 @@ mod tests {
             local_two,
             "quic.test",
             &roots,
+            None,
             None,
             Duration::from_secs(5),
             Some(&key),
@@ -7577,6 +7633,7 @@ mod tests {
             "quic.test",
             &identity.certs[0].cert_chain,
             Some(&list),
+            None,
             Duration::from_secs(5),
             None,
         )
