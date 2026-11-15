@@ -21153,6 +21153,7 @@ fn reality_xmux(
             public_key: reality.public_key,
             short_id: reality.short_id,
             fingerprint: reality.fingerprint.clone(),
+            mldsa65_verify: reality.mldsa65_verify,
         },
         log_sink: reality.key_log.as_ref().map(|log| log.path().to_owned()),
     };

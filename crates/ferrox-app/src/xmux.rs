@@ -27,6 +27,7 @@ pub(crate) struct Key {
 
 /// The client a pooled connection authenticated as. REALITY names its material, and TLS pins the
 /// config by address; the manager holds that config so a retired address is never handed out again.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub(crate) enum Identity {
     Reality {
@@ -34,6 +35,7 @@ pub(crate) enum Identity {
         public_key: [u8; 32],
         short_id: [u8; 8],
         fingerprint: String,
+        mldsa65_verify: Option<[u8; 1952]>,
     },
     Tls(usize),
 }
@@ -47,18 +49,21 @@ impl PartialEq for Identity {
                     public_key,
                     short_id,
                     fingerprint,
+                    mldsa65_verify,
                 },
                 Self::Reality {
                     server_name: other_name,
                     public_key: other_key,
                     short_id: other_id,
                     fingerprint: other_fingerprint,
+                    mldsa65_verify: other_verify,
                 },
             ) => {
                 server_name == other_name
                     && public_key == other_key
                     && short_id == other_id
                     && fingerprint == other_fingerprint
+                    && mldsa65_verify == other_verify
             }
             (Self::Tls(config), Self::Tls(other)) => config == other,
             _ => false,
@@ -76,12 +81,14 @@ impl std::hash::Hash for Identity {
                 public_key,
                 short_id,
                 fingerprint,
+                mldsa65_verify,
             } => {
                 0u8.hash(state);
                 server_name.hash(state);
                 public_key.hash(state);
                 short_id.hash(state);
                 fingerprint.hash(state);
+                mldsa65_verify.hash(state);
             }
             Self::Tls(config) => {
                 1u8.hash(state);
@@ -342,6 +349,31 @@ mod tests {
     }
 
     #[test]
+    fn reality_managers_partition_by_their_required_binding() {
+        let key = |verify| Key {
+            server: "127.0.0.1:443".parse().expect("an address"),
+            host: "binding.example".to_owned(),
+            path: "/binding".to_owned(),
+            query: String::new(),
+            h2: true,
+            identity: Identity::Reality {
+                server_name: "binding.example".to_owned(),
+                public_key: [1; 32],
+                short_id: [2; 8],
+                fingerprint: "chrome".to_owned(),
+                mldsa65_verify: verify,
+            },
+            log_sink: None,
+        };
+        let plain = manager(key(None), None, None);
+        let verified = manager(key(Some([3; 1952])), None, None);
+        assert!(
+            !Arc::ptr_eq(&plain, &verified),
+            "an outbound that requires the binding reused a pool without it"
+        );
+    }
+
+    #[test]
     fn managers_partition_by_their_effective_bounds() {
         let key = Key {
             server: "127.0.0.1:443".parse().expect("an address"),
@@ -354,6 +386,7 @@ mod tests {
                 public_key: [1; 32],
                 short_id: [2; 8],
                 fingerprint: "chrome".to_owned(),
+                mldsa65_verify: None,
             },
             log_sink: None,
         };
@@ -411,6 +444,7 @@ mod tests {
                 public_key: [0; 32],
                 short_id: [0; 8],
                 fingerprint: String::new(),
+                mldsa65_verify: None,
             }),
             None,
             None,

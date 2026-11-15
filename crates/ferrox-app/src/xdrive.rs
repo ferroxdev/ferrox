@@ -5913,6 +5913,9 @@ fn share_key(settings: &Settings, front: Option<(&str, u16)>) -> String {
         joined.push(ferrox_core::foxy::account::hex_encode(&reality.public_key));
         joined.push(ferrox_core::foxy::account::hex_encode(&reality.short_id));
         joined.push(reality.fingerprint.clone());
+        if let Some(verify) = &reality.mldsa65_verify {
+            joined.push(ferrox_core::foxy::account::hex_encode(verify));
+        }
         joined.push(if settings.reality_named {
             "named".to_owned()
         } else {
@@ -7808,6 +7811,7 @@ mod tests {
     }
 
     /// One store per service and folder, shared by every session that names it, and a refusal by name for what this tree does not build.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn a_store_is_shared_by_the_settings_that_name_it() {
         let settings = templated(SIDES, 9);
@@ -7863,6 +7867,20 @@ mod tests {
             share_key(&reality, None),
             share_key(&other_name, None),
             "and so is a named decoy"
+        );
+        let mut verified = reality.clone();
+        verified.reality = Some(Arc::new(RealityClientConfig {
+            server_name: "a.example".to_owned(),
+            public_key: [1; 32],
+            short_id: [0; 8],
+            fingerprint: "chrome".to_owned(),
+            key_log: None,
+            mldsa65_verify: Some([3; 1952]),
+        }));
+        assert_ne!(
+            share_key(&reality, None),
+            share_key(&verified, None),
+            "and a store that requires the ML-DSA-65 binding"
         );
         let mut disk = settings.clone();
         disk.service = "local".to_owned();

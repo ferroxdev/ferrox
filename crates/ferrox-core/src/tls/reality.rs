@@ -2034,6 +2034,7 @@ impl<S: Stream> Session13<S> {
                         continue;
                     }
                     Err(error) if TlsError::is_timeout(&error) => return Err(TlsError::Timeout),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(error) => return Err(TlsError::from(error)),
                 }
             }
@@ -2050,6 +2051,7 @@ impl<S: Stream> Session13<S> {
                 Ok(0) => return Err(TlsError::Closed),
                 Ok(n) => self.inbuf.extend_from_slice(&buf[..n]),
                 Err(error) if TlsError::is_timeout(&error) => return Err(TlsError::Timeout),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(TlsError::from(error)),
             }
         }
@@ -2057,7 +2059,7 @@ impl<S: Stream> Session13<S> {
 
     fn read_finished(&mut self) -> Result<bool, TlsError> {
         loop {
-            let Some((header, len)) = record_head(&self.inbuf) else {
+            let Some((header, len)) = record_head(&self.inbuf)? else {
                 return Ok(false);
             };
             if self.inbuf.len() < 5 + len {
@@ -2067,10 +2069,7 @@ impl<S: Stream> Session13<S> {
             self.inbuf.drain(..5 + len);
             match header[0] {
                 0x14 => continue,
-                0x15 => {
-                    self.eof = true;
-                    return Err(TlsError::Closed);
-                }
+                0x15 => return Err(TlsError::Closed),
                 0x17 => {}
                 _ => {
                     return Err(TlsError::Other(
@@ -2104,6 +2103,7 @@ impl<S: Stream> Session13<S> {
                         }
                         self.phase = Phase::Done;
                         self.client_hs = None;
+                        self.process_post_handshake()?;
                         return Ok(true);
                     }
                 }
@@ -2133,7 +2133,7 @@ impl<S: Stream> Session13<S> {
     }
 
     fn process_record(&mut self) -> Result<bool, TlsError> {
-        let Some((header, len)) = record_head(&self.inbuf) else {
+        let Some((header, len)) = record_head(&self.inbuf)? else {
             return Ok(false);
         };
         if self.inbuf.len() < 5 + len {
@@ -2144,12 +2144,10 @@ impl<S: Stream> Session13<S> {
         if header[0] == 0x14 {
             return Ok(true);
         }
-        if header[0] == 0x15 {
-            self.eof = true;
-            return Ok(false);
-        }
         if header[0] != 0x17 {
-            return Ok(true);
+            return Err(TlsError::Other(
+                "reality: plaintext record after the handshake".to_owned(),
+            ));
         }
         let keys = self
             .read_key
@@ -2164,6 +2162,7 @@ impl<S: Stream> Session13<S> {
                 self.plain_end = plen;
             }
             22 => {
+                let mut reply = false;
                 let mut at = 0;
                 while at + 4 <= plen {
                     let len = u24(&body[at + 1..at + 4]).unwrap_or(usize::MAX);
@@ -2171,17 +2170,63 @@ impl<S: Stream> Session13<S> {
                         break;
                     }
                     if body[at] == 24 {
+                        reply |= body.get(at + 4) == Some(&1);
                         if let Some(keys) = self.read_key.as_mut() {
                             keys.update();
                         }
                     }
                     at += 4 + len;
                 }
+                if reply {
+                    self.send_key_update()?;
+                }
             }
             21 => self.eof = true,
             _ => {}
         }
         Ok(true)
+    }
+
+    fn process_post_handshake(&mut self) -> Result<(), TlsError> {
+        let mut reply = false;
+        loop {
+            if self.hs.len() < 4 {
+                break;
+            }
+            let len = u24(&self.hs[1..4]).unwrap_or(usize::MAX);
+            if len > MAX_HELLO {
+                return Err(TlsError::Other(
+                    "reality: oversized post-handshake message".to_owned(),
+                ));
+            }
+            let end = 4 + len;
+            if self.hs.len() < end {
+                break;
+            }
+            if self.hs[0] == 24 {
+                reply |= self.hs.get(4) == Some(&1);
+                if let Some(keys) = self.read_key.as_mut() {
+                    keys.update();
+                }
+            }
+            self.hs.drain(..end);
+        }
+        if reply {
+            self.send_key_update()?;
+        }
+        Ok(())
+    }
+
+    fn send_key_update(&mut self) -> Result<(), TlsError> {
+        let keys = self
+            .write_key
+            .as_mut()
+            .ok_or_else(|| TlsError::Other("reality: no write keys".to_owned()))?;
+        let mut out = Vec::with_capacity(32);
+        crate::tls::shaped::record::seal13(keys, 22, &[24, 0], &mut out)?;
+        self.io.write_all(&out).map_err(TlsError::from)?;
+        keys.update();
+        Ok(())
     }
 
     fn handshake_io(&mut self) -> std::io::Result<()> {
@@ -2203,10 +2248,15 @@ impl<S: Stream> Session13<S> {
     }
 }
 
-fn record_head(bytes: &[u8]) -> Option<([u8; 5], usize)> {
-    let head = bytes.get(..5)?;
+fn record_head(bytes: &[u8]) -> Result<Option<([u8; 5], usize)>, TlsError> {
+    let Some(head) = bytes.get(..5) else {
+        return Ok(None);
+    };
     let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
-    (len <= MAX_RECORD).then(|| ([head[0], head[1], head[2], head[3], head[4]], len))
+    if len > MAX_RECORD {
+        return Err(TlsError::Other("reality: oversized record".to_owned()));
+    }
+    Ok(Some(([head[0], head[1], head[2], head[3], head[4]], len)))
 }
 
 fn io_error(error: TlsError) -> std::io::Error {
@@ -2254,10 +2304,10 @@ impl<S: Stream> Read for Session13<S> {
             let mut chunk = [0u8; 16_384];
             match self.io.read(&mut chunk) {
                 Ok(0) => {
-                    self.eof = true;
-                    return Ok(0);
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
                 }
                 Ok(n) => self.inbuf.extend_from_slice(&chunk[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
         }
@@ -2426,6 +2476,11 @@ mod tests {
         let len = u32::try_from(body.len() - 4).unwrap();
         body[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
         body
+    }
+
+    #[test]
+    fn an_oversized_record_is_refused_instead_of_waited_for() {
+        assert!(record_head(&[23, 3, 3, 0xff, 0xff]).is_err());
     }
 
     #[test]

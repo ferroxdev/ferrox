@@ -316,16 +316,27 @@ impl<S: Stream> Session<S> {
     /// The `ClientHello` and `ServerHello` as they crossed the wire, each with its
     /// four-byte handshake header, which is what REALITY's binding signs.
     pub(crate) fn handshake_hellos(&self) -> Option<(&[u8], &[u8])> {
-        fn one(bytes: &[u8]) -> Option<(usize, &[u8])> {
-            let body = bytes.get(1..4)?;
-            let len =
-                4 + usize::try_from(u32::from_be_bytes([0, body[0], body[1], body[2]])).ok()?;
-            Some((len, bytes.get(..len)?))
+        let mut client = None;
+        let mut server = None;
+        let mut at = 0;
+        while at + 4 <= self.transcript.len() {
+            let len = usize::try_from(u32::from_be_bytes([
+                0,
+                self.transcript[at + 1],
+                self.transcript[at + 2],
+                self.transcript[at + 3],
+            ]))
+            .ok()?;
+            let end = at.checked_add(4 + len)?;
+            let message = self.transcript.get(at..end)?;
+            match message[0] {
+                1 => client = Some(message),
+                2 => server = Some(message),
+                _ => {}
+            }
+            at = end;
         }
-        let (client_len, client) = one(&self.transcript)?;
-        let rest = self.transcript.get(client_len..)?;
-        let (_, server) = one(rest)?;
-        Some((client, server))
+        Some((client?, server?))
     }
 
     /// The REALITY binding check runs over the certificate the server just sent,
@@ -642,6 +653,11 @@ impl<S: Stream> Session<S> {
             .filter(|ticket| !ticket.tls13)
             .map(|ticket| ticket.secret)
         {
+            if self.binding.is_some() {
+                return Err(TlsError::Other(
+                    "reality: a resumed TLS 1.2 session has no certificate to bind".to_owned(),
+                ));
+            }
             let directions =
                 super::tls12::directions(suite, &secret, &self.client_random, &sh.random);
             self.client12 = Some(directions.client);
@@ -690,6 +706,9 @@ impl<S: Stream> Session<S> {
             next = self.next_handshake()?;
         }
         self.verify_chain(&chain, &ocsp)?;
+        if let Some(leaf) = chain.first() {
+            self.verify_binding(leaf)?;
+        }
 
         // A static-RSA suite has no ServerKeyExchange: the leaf's own key carries the pre-master.
         let share = if suite.is_rsa() {
@@ -2417,6 +2436,37 @@ mod tests {
             kernel_tx: false,
             kernel_rx: false,
         }
+    }
+
+    /// A retried handshake's transcript opens with a synthetic `message_hash` and a
+    /// `HelloRetryRequest`, so the binding must read the second hello pair.
+    #[test]
+    fn a_retried_handshake_binds_the_second_hello_pair() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [9u8; 32];
+        let mut session = session(
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+        let frame = |kind: u8, body: &[u8]| {
+            let mut out = vec![kind];
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+            out.extend_from_slice(body);
+            out
+        };
+        let first = frame(1, b"first");
+        let retry = frame(2, b"retry");
+        let second = frame(1, b"second");
+        let answer = frame(2, b"answer");
+        session.transcript = message_hash(Hash::Sha256, &first);
+        session.transcript.extend_from_slice(&retry);
+        session.transcript.extend_from_slice(&second);
+        session.transcript.extend_from_slice(&answer);
+        let (client, server) = session.handshake_hellos().expect("both hellos");
+        assert_eq!(client, second.as_slice());
+        assert_eq!(server, answer.as_slice());
     }
 
     /// A close already read with the data is reported as the end, not hidden behind a
