@@ -60,6 +60,11 @@ pub(crate) fn inbound_reality_config(
             .and_then(|n| u8::try_from(n).ok())
             .unwrap_or(0),
         show: reality.get("show").and_then(Json::as_bool).unwrap_or(false),
+        mldsa65_seed: reality
+            .get("mldsa65Seed")
+            .and_then(Json::as_str)
+            .filter(|seed| !seed.is_empty())
+            .and_then(key_n::<32>),
     })
 }
 
@@ -557,11 +562,18 @@ const B64URL: [u8; 256] = {
 };
 
 fn key32(text: &str) -> Option<[u8; 32]> {
+    key_n(text)
+}
+
+fn key_n<const N: usize>(text: &str) -> Option<[u8; N]> {
     let mut word = 0u32;
     let mut bits = 0;
-    let mut out = [0u8; 32];
+    let mut out = [0u8; N];
     let mut at = 0;
     for byte in text.bytes() {
+        if byte == b'\r' || byte == b'\n' {
+            continue;
+        }
         let value = B64URL[byte as usize];
         if value == 0xff {
             return None;
@@ -574,7 +586,7 @@ fn key32(text: &str) -> Option<[u8; 32]> {
             at += 1;
         }
     }
-    (at == 32).then_some(out)
+    (at == N).then_some(out)
 }
 
 /// The byte count an unpadded urlsafe-base64 string decodes to: the two characters that leave one byte
@@ -599,7 +611,7 @@ fn b64url_len(text: &str) -> Option<usize> {
 }
 
 /// The ML-DSA-65 field a REALITY side names, checked as the reference's build checks it: the seed must differ
-/// from `privateKey` and decode to 32 bytes, the verify key to 1952. The signature itself is not carried yet.
+/// from `privateKey` and decode to 32 bytes, the verify key to 1952.
 pub(crate) fn reality_mldsa(node: &Json, server: bool) -> Result<bool, String> {
     let Some(reality) = node
         .get("streamSettings")
@@ -641,9 +653,6 @@ pub(crate) fn reality_mldsa(node: &Json, server: bool) -> Result<bool, String> {
             r#"invalid "{field}": it does not decode to {length} bytes"#
         ));
     }
-    eprintln!(
-        r#"reality: "{field}" is checked, and the ML-DSA-65 binding it names is not carried"#
-    );
     Ok(true)
 }
 
@@ -1402,6 +1411,11 @@ pub(crate) fn stream_reality(
             .unwrap_or("chrome")
             .to_owned(),
         key_log: tls_master_key_log(Some(reality)),
+        mldsa65_verify: reality
+            .get("mldsa65Verify")
+            .and_then(Json::as_str)
+            .filter(|key| !key.is_empty())
+            .and_then(key_n::<1952>),
     }))
 }
 

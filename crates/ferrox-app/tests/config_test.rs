@@ -230,9 +230,9 @@ fn test_refuses_a_reality_seed_that_names_the_private_key() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A seed the reference signs with is still a config this tree runs, so it starts with one line saying the binding is absent.
+/// A seed the reference signs with is a config this tree now carries through the whole handshake.
 #[test]
-fn test_accepts_a_reality_seed_it_does_not_carry_the_binding_for() {
+fn test_accepts_a_reality_seed_and_carries_the_binding() {
     let path = config_path(
         "reality-seed",
         &reality_config("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"),
@@ -251,10 +251,9 @@ fn test_accepts_a_reality_seed_it_does_not_carry_the_binding_for() {
         "`-test` reports xray's verdict: {stdout}"
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains(
-            r#""mldsa65Seed" is checked, and the ML-DSA-65 binding it names is not carried"#
-        ),
-        "the absent binding is named instead of silent"
+        !String::from_utf8_lossy(&output.stderr)
+            .contains("the ML-DSA-65 binding it names is not carried"),
+        "a carried binding is not reported absent"
     );
     let _ = std::fs::remove_file(&path);
 }

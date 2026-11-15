@@ -21153,6 +21153,7 @@ fn reality_xmux(
             public_key: reality.public_key,
             short_id: reality.short_id,
             fingerprint: reality.fingerprint.clone(),
+            mldsa65_verify: reality.mldsa65_verify,
         },
         log_sink: reality.key_log.as_ref().map(|log| log.path().to_owned()),
     };
@@ -53989,6 +53990,7 @@ mod tests {
             short_id: [1, 35, 69, 103, 137, 171, 205, 239],
             fingerprint: "chrome".to_owned(),
             key_log: None,
+            mldsa65_verify: None,
         })
     }
 
@@ -67232,6 +67234,7 @@ mod tests {
             short_id: [1, 35, 69, 103, 137, 171, 205, 239],
             fingerprint: "chrome".to_owned(),
             key_log: None,
+            mldsa65_verify: None,
         });
         let id = uuid_bytes(REALITY_TEST_ID).expect("id");
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");

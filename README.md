@@ -347,7 +347,7 @@ Today exactly one method dials per hop. The chaining engine builds stacks as an 
 | --- | --- | --- | --- | --- |
 | 161 | PROXY protocol v1+v2 parsed on an inbound (`acceptProxyProtocol`) | planned — high priority | — | ZeroNet `proxy_protocol.rs`. Tree only writes the header into a REALITY `dest` |
 | 162 | freedom `proxyProtocol: 1\|2` send + fallback `xver` parity | planned — high priority | — | ZeroNet freedom; xray `proxy/freedom` |
-| 163 | REALITY `mldsa65Seed`/`mldsa65Verify` (post-quantum binding) | partial — high priority; fields validated, ML-DSA-65 signature not generated or checked | — | ZeroNet `xray_json.rs`; the oracle row waits on it |
+| 163 | REALITY `mldsa65Seed`/`mldsa65Verify` (post-quantum binding) | partial — high priority; both roles generate and check the 3309-byte ML-DSA-65 signature the leaf carries in its first extension; the ZeroNet oracle row is not wired yet | — | ZeroNet `xray_json.rs`; the oracle row waits on it |
 | 164 | `customSockopt` raw setsockopt escape hatch | planned — high priority | — | ZeroNet `custom_sockopt.rs`; xray `sockopt` |
 | 165 | Tunable dial params (`tcpCongestion`, `tcpUserTimeout`, `tcpFastOpen`, `dialerProxy`, `mark`, Happy-Eyeballs…) | planned — high priority | — | ZeroNet `parse_sockopt`; xray-core-rust `sockopt`; Outline SDK `transport/happyeyeballs.go` — the dual-stack race dial (not pinned). `tcpFastOpen` is xray's own sockopt: a stored kernel cookie lets the next SYN carry the ClientHello, one RTT back on every reconnect. Row 169 is the runtime-configurable *wait* surface |
 | 166 | Tide down/up traffic-ratio shaping | planned | — | ZeroNet `tide/shape.rs`. Read as a superset rung beside row 146 |
