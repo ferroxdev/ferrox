@@ -15804,6 +15804,7 @@ fn serve_tun_inbound(
     };
     let flows = crate::tun::Flows::default();
     let legs = crate::tun::Legs::default();
+    let dial = device_dial(out);
     for device in devices {
         let outbound = out.clone();
         let relay: crate::tun::Relay =
@@ -15812,8 +15813,15 @@ fn serve_tun_inbound(
         // The device's association is the protocol's own: the front reads the greeting and the `UDP ASSOCIATE` request and answers with the relay's address.
         let associate: crate::tun::Associate =
             std::sync::Arc::new(move |conn| serve_socks(conn, &datagram, &no_accounts()));
-        let mut handler =
-            crate::tun::Handler::on(device, relay, associate, flows.clone(), legs.clone(), spec);
+        let mut handler = crate::tun::Handler::on(
+            device,
+            relay,
+            associate,
+            dial.clone(),
+            flows.clone(),
+            legs.clone(),
+            spec,
+        );
         thread::spawn(move || {
             if let Err(e) = handler.serve() {
                 eprintln!("tun handler ended: {e}");
@@ -24568,6 +24576,47 @@ pub(crate) fn serve_device_flow(
     }
 }
 
+/// The device front's direct dial: a lane whose destination is its whole request hands the handler
+/// the connected stream, so the flow owes no loopback pair and no relay thread. Every other lane
+/// reports `Fallback` and keeps the front's own `serve_connect`.
+pub(crate) fn device_dial(out: &Outbound) -> Option<crate::tun::Dial> {
+    let out = out.clone();
+    Some(std::sync::Arc::new(move |dest: &Destination| {
+        let (lane, tag) = out.resolved_lane_with_protocol(
+            dest,
+            crate::router::Network::Tcp,
+            None,
+            FlowFacts::default(),
+        );
+        let Outbound::Socks(socks) = &*lane else {
+            return crate::tun::DialOutcome::Fallback;
+        };
+        if socks.tls.is_some() {
+            return crate::tun::DialOutcome::Fallback;
+        }
+        let tag = tag
+            .map(|tag| tag.into_owned())
+            .or_else(default_outbound_tag);
+        let _outbound = OutboundTag::enter(tag.as_deref());
+        let _source = SendThroughGuard::enter(SEND_THROUGH.with(std::cell::Cell::take));
+        let _sockopts =
+            DialSockoptsGuard::enter(DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take()));
+        let _target = TargetStrategyGuard::enter(TARGET_STRATEGY.with(std::cell::Cell::take));
+        let Some(server) = lane.edge() else {
+            return crate::tun::DialOutcome::Refused;
+        };
+        match connect_socks(
+            &server,
+            &socks.credential,
+            socks.version,
+            &socks_destination(dest),
+        ) {
+            Some(tunnel) => crate::tun::DialOutcome::Direct(tunnel),
+            None => crate::tun::DialOutcome::Refused,
+        }
+    }))
+}
+
 /// One mux `New` target for a flow the portal carries.
 fn mux_destination(
     asked: &Destination,
@@ -25326,6 +25375,23 @@ fn socks_destination(target: &Destination) -> crate::socks::Destination<'_> {
     }
 }
 
+/// The SOCKS5 exchange over a fresh dial: the tunnel a lane carries, or `None` when the edge refuses the target.
+fn connect_socks(
+    server: &SocketAddr,
+    credential: &crate::socks::Credential,
+    version: crate::socks::Version,
+    destination: &crate::socks::Destination<'_>,
+) -> Option<Connection> {
+    let upstream = dial_or_report(server)?;
+    let read = upstream.read_timeout().ok().flatten();
+    let _ = upstream.set_read_timeout(Some(budgets::SESSION_POLL));
+    let _ = upstream.set_write_timeout(Some(budgets::handshake()));
+    let tunnel = crate::socks::connect(upstream, credential, destination, version)?;
+    let _ = tunnel.set_read_timeout(read);
+    let _ = tunnel.set_write_timeout(None);
+    Some(tunnel)
+}
+
 fn dial_socks_client(
     client: &Connection,
     server: &SocketAddr,
@@ -25333,17 +25399,9 @@ fn dial_socks_client(
     version: crate::socks::Version,
     destination: &crate::socks::Destination<'_>,
 ) {
-    let Some(upstream) = dial_or_report(server) else {
+    let Some(tunnel) = connect_socks(server, credential, version, destination) else {
         return;
     };
-    let read = upstream.read_timeout().ok().flatten();
-    let _ = upstream.set_read_timeout(Some(budgets::SESSION_POLL));
-    let _ = upstream.set_write_timeout(Some(budgets::handshake()));
-    let Some(tunnel) = crate::socks::connect(upstream, credential, destination, version) else {
-        return;
-    };
-    let _ = tunnel.set_read_timeout(read);
-    let _ = tunnel.set_write_timeout(None);
     relay_handoff(client, &tunnel);
 }
 

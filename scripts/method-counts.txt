@@ -786,6 +786,7 @@ front-tun gso-frames-per-large-response-read 1 ferrox-app-tun::tests::a_large_re
 front-tun emit-packet-reallocations-per-render 0 ferrox-app-tun::tests::an_emitted_packet_reuses_its_render_buffer
 front-tun response-payload-copies-per-read 0 ferrox-app-tun::tests::a_response_is_rendered_where_the_relay_read_landed
 front-tun flows-served-off-the-queue-that-opened-them 1 ferrox-app-tun::tests::a_flow_opened_on_one_queue_is_served_from_another
+front-tun direct-lane-flows-without-a-pair 1 ferrox-app-tun::tests::a_direct_lane_carries_the_flow_without_the_pair
 front-tun time-tcp-up-10 ferrox=34.6Gbit/s,zeptun=36.1Gbit/s,ratio=0.96 tun-bench.yml
 front-tun time-tcp-down-10 ferrox=33.9Gbit/s,zeptun=38.9Gbit/s,ratio=0.87 tun-bench.yml
 front-tun time-rr-8x1k ferrox=70041tps,zeptun=107728tps,ratio=0.65 tun-bench.yml
