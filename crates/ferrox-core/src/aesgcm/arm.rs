@@ -1159,7 +1159,7 @@ mod tests {
     #[test]
     fn the_counter_pass_wraps_at_the_block_limit() {
         for start in [u32::MAX - 3, u32::MAX] {
-            let template = vdupq_n_u8(0);
+            let template = unsafe { vdupq_n_u8(0) };
             let blocks = ctr8v_p(template, start);
             let mut lanes = [0u8; 128];
             for (i, block) in blocks.iter().flatten().enumerate() {
