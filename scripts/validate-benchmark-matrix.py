@@ -324,7 +324,7 @@ def check_charts(charts_dir, results, cells):
     ]
     priced_cells = [
         cells[scenario["id"]] for scenario in priced
-        if scenario["id"] in cells
+        if cells.get(scenario["id"]) is not None
     ]
     if "ceiling.png" in wanted and not any(
         cell.get("harness_ceilings_mib_s")
@@ -516,6 +516,18 @@ def selftest():
         }}
         failures = []
         check_charts(root, results, cells)
+        assert not failures, failures
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "scenarios").mkdir()
+        for name in ("memory-rss.png", "threads.png", "startup.png",
+                     "binary-size.png"):
+            (root / name).write_bytes(b"png")
+        results = {"scenarios": [{
+            "id": "x", "base": "x", "workload": {"traffic": "upload"},
+        }]}
+        failures = []
+        check_charts(root, results, {"x": None})
         assert not failures, failures
     failures = []
     check_manifest({"manifest": ["engine xray-core: /x sha256="]},
