@@ -65,19 +65,24 @@ done
 rm -rf "$selftest"
 
 tally_floor() {
-  local ran="$1" filtered="$2"
+  local ran="$1" filtered="$2" matched="$3"
+  if [[ -n "$filtered" && "$matched" -eq 0 ]]; then
+    echo "::error::upstream suites: --only $filtered matched no pin, so a green job would prove nothing"
+    return 1
+  fi
   if [[ -z "$filtered" && "$ran" -eq 0 ]]; then
     echo "::error::upstream suites: none ran green against a Ferrox binary, so a green job would prove nothing"
     return 1
   fi
 }
 
-for shape in zero-full:refuse some-full:accept zero-filtered:accept; do
+for shape in zero-full:refuse some-full:accept zero-filtered:accept zero-miss:refuse; do
   verdict=0
   case "${shape%%:*}" in
-    zero-full) tally_floor 0 "" >/dev/null || verdict=$? ;;
-    some-full) tally_floor 2 "" >/dev/null || verdict=$? ;;
-    zero-filtered) tally_floor 0 "one-pin" >/dev/null || verdict=$? ;;
+    zero-full) tally_floor 0 "" 0 >/dev/null || verdict=$? ;;
+    some-full) tally_floor 2 "" 0 >/dev/null || verdict=$? ;;
+    zero-filtered) tally_floor 0 "one-pin" 1 >/dev/null || verdict=$? ;;
+    zero-miss) tally_floor 0 "no-pin" 0 >/dev/null || verdict=$? ;;
   esac
   if [[ "$verdict" -eq 0 && "${shape##*:}" == refuse ]] || [[ "$verdict" -ne 0 && "${shape##*:}" == accept ]]; then
     echo "::error::self-test: tally ${shape%%:*} is answered $verdict; it must be ${shape##*:}"
@@ -114,6 +119,7 @@ parse_pins() {
 }
 
 workspace="$PWD"
+filter_matched=0
 while IFS=$'\t' read -r name repo rev enabled suite binary seam path harness; do
   [[ "$suite" == "-" ]] && suite=""
   [[ "$binary" == "-" ]] && binary=""
@@ -121,8 +127,9 @@ while IFS=$'\t' read -r name repo rev enabled suite binary seam path harness; do
   [[ "$path" == "-" ]] && path=""
   [[ "$harness" == "-" ]] && harness=""
   [[ -n "$name" ]] || continue
-  if [[ -n "$name_filter" && "$name" != "$name_filter" ]]; then
-    continue
+  if [[ -n "$name_filter" ]]; then
+    [[ "$name" == "$name_filter" ]] || continue
+    filter_matched=1
   fi
   if [[ -n "${path:-}" ]]; then
     scratch="$(mktemp -d)"
@@ -235,7 +242,7 @@ while IFS=$'\t' read -r name repo rev enabled suite binary seam path harness; do
 done < <(parse_pins)
 
 echo "upstream suites: $ran ran green against Ferrox binaries (the rest skipped with reasons above)"
-if ! tally_floor "$ran" "$name_filter"; then
+if ! tally_floor "$ran" "$name_filter" "$filter_matched"; then
   status=1
 fi
 exit "$status"

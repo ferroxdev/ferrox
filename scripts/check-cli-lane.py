@@ -338,6 +338,22 @@ if ride:
             ride = False
         elif arg.startswith("--noproxy=") and arg.split("=", 1)[1]:
             ride = False
+require = os.environ.get("FERROX_FAKE_PROXY_REQUIRE") == "1" and proxy and target
+if require:
+    for at, arg in enumerate(args):
+        if arg == "--noproxy" and at + 1 < len(args) and args[at + 1]:
+            require = False
+        elif arg.startswith("--noproxy=") and arg.split("=", 1)[1]:
+            require = False
+if require:
+    _, _, rest = proxy.partition("://")
+    host, _, port = rest.rpartition(":")
+    try:
+        with socket.create_connection((host, int(port)), timeout=5):
+            pass
+    except OSError as error:
+        print(f"curl: the proxy is not reachable: {error}", file=sys.stderr)
+        sys.exit(7)
 if ride:
     # A real ride: the CONNECT through the named proxy is the flow the check asserts.
     scheme, _, rest = proxy.partition("://")
@@ -1851,7 +1867,7 @@ def check_vpn_proxy_readback(state: pathlib.Path) -> int:
 
     try:
         fresh()
-        arm = up()
+        arm = up({"FERROX_FAKE_PROXY_REQUIRE": "1"})
         output = arm.stdout + arm.stderr
         if (
             arm.returncode != 0
