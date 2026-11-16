@@ -1386,9 +1386,17 @@ impl Flows {
     }
 }
 
+/// One leg in the shared datagram table: its id, the socket that frames its datagrams, and the
+/// direct relay it was opened for, so a dead control drops only the legs that rode that relay.
+struct Leg {
+    id: u64,
+    socket: Arc<UdpSocket>,
+    relay: Option<SocketAddr>,
+}
+
 /// The datagram table every queue reads: one leg per tuple, so a client's packets that hash to
 /// different queues still ride the one socket the association opened.
-type LegTable = HashMap<UdpKey, (u64, Arc<UdpSocket>)>;
+type LegTable = HashMap<UdpKey, Leg>;
 
 #[derive(Clone, Default)]
 pub(crate) struct Legs {
@@ -1410,6 +1418,11 @@ impl Legs {
     #[cfg(all(test, unix))]
     fn len(&self) -> usize {
         self.table().len()
+    }
+
+    #[cfg(all(test, unix))]
+    fn relay_of(&self, key: &UdpKey) -> Option<SocketAddr> {
+        self.table().get(key).and_then(|leg| leg.relay)
     }
 }
 
@@ -1541,7 +1554,7 @@ impl Handler {
                 }
                 Ended::Datagram(key, id) => {
                     let mut table = self.legs.table();
-                    if table.get(&key).is_some_and(|leg| leg.0 == id) {
+                    if table.get(&key).is_some_and(|leg| leg.id == id) {
                         table.remove(&key);
                     }
                 }
@@ -1564,9 +1577,12 @@ impl Handler {
             return Ok(());
         };
         if self.direct_dead.swap(false, Relaxed) {
-            // The control closed, so the relay address the legs frame at is gone: drop them and let the retry budget gate a fresh lane while the front's association carries the datagrams.
-            self.direct_datagram = None;
-            self.legs.table().clear();
+            // The control closed, so the relay address its legs frame at is gone: drop only those, and let the retry budget gate a fresh lane while the front's association carries the datagrams.
+            if let Some(dead) = self.direct_datagram.take() {
+                self.legs
+                    .table()
+                    .retain(|_, leg| leg.relay != Some(dead.relay));
+            }
             self.datagram_retry = Some(std::time::Instant::now() + budgets::handshake());
         }
         self.poll_datagram_lane();
@@ -1580,9 +1596,9 @@ impl Handler {
                 self.association = Some(association);
             }
         }
-        let relay = match (&self.direct_datagram, &self.association) {
-            (Some(direct), _) => direct.relay,
-            (None, Some(association)) => association.relay,
+        let (relay, direct_relay) = match (&self.direct_datagram, &self.association) {
+            (Some(direct), _) => (direct.relay, Some(direct.relay)),
+            (None, Some(association)) => (association.relay, None),
             (None, None) => return Ok(()),
         };
         let target = SocketAddr::new(ip.destination, udp.destination_port);
@@ -1612,12 +1628,12 @@ impl Handler {
             let mut table = self.legs.table();
             match table.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
-                    let (id, leg) = &*entry.into_mut();
-                    (*id, Arc::clone(leg))
+                    let leg = entry.into_mut();
+                    (leg.id, Arc::clone(&leg.socket))
                 }
                 std::collections::hash_map::Entry::Vacant(vacant) => {
                     let id = self.legs.next_id();
-                    let leg = Arc::new(open_leg(
+                    let socket = Arc::new(open_leg(
                         &self.device,
                         relay,
                         pinned,
@@ -1627,8 +1643,12 @@ impl Handler {
                         id,
                         &self.ended_tx,
                     )?);
-                    vacant.insert((id, Arc::clone(&leg)));
-                    (id, leg)
+                    vacant.insert(Leg {
+                        id,
+                        socket: Arc::clone(&socket),
+                        relay: direct_relay,
+                    });
+                    (id, socket)
                 }
             }
         };
@@ -1638,7 +1658,7 @@ impl Handler {
         self.frame = frame;
         if sent.is_err() {
             let mut table = self.legs.table();
-            if table.get(&key).is_some_and(|leg| leg.0 == id) {
+            if table.get(&key).is_some_and(|leg| leg.id == id) {
                 table.remove(&key);
             }
         }
@@ -3749,6 +3769,90 @@ mod tests {
         assert_eq!(late_ack.seq, end.seq.wrapping_add(1));
     }
 
+    /// One queue's dead direct control drops only the legs that rode its relay: a second queue
+    /// sharing the table keeps its own leg and socket.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_control_drops_only_its_own_legs() {
+        use std::io::Write;
+        let legs = Legs::default();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let queue = |relay: std::net::UdpSocket| {
+            let relay_addr = relay.local_addr().unwrap();
+            relay.set_nonblocking(true).unwrap();
+            let (ctl, ctl_peer) = UnixStream::pair().unwrap();
+            let (a, peer) = peer_with_deadline().unwrap();
+            let open: Datagram = Arc::new(move || {
+                Some(crate::proxy::DirectDatagram {
+                    relay: relay_addr,
+                    control: Connection::from(ctl.try_clone().unwrap()),
+                })
+            });
+            let relay_fn: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+            let handler = Handler::on(
+                Device::from_handle(a, DEFAULT_MTU),
+                relay_fn,
+                echo_associate(frames.clone()),
+                None,
+                Some(open),
+                Flows::default(),
+                legs.clone(),
+                &Spec::new(None, None),
+            );
+            (handler, peer, ctl_peer, relay)
+        };
+        let (mut one, mut one_peer, one_ctl, one_relay) =
+            queue(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        let (mut two, mut two_peer, _two_ctl, two_relay) =
+            queue(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        let key_one = UdpKey {
+            source: IpAddr::from(SCRIPT_CLIENT),
+            source_port: 51510,
+            destination: IpAddr::from([198, 51, 100, 10]),
+            destination_port: 53,
+        };
+        let key_two = UdpKey {
+            source_port: 51511,
+            ..key_one
+        };
+        let query_one = datagram(SCRIPT_CLIENT, [198, 51, 100, 10], 51510, 53, b"one");
+        let query_two = datagram(SCRIPT_CLIENT, [198, 51, 100, 10], 51511, 53, b"two");
+        assert!(
+            pump_datagram(&mut one, &mut one_peer, &one_relay, &query_one),
+            "the first queue frames at its own relay"
+        );
+        assert!(
+            pump_datagram(&mut two, &mut two_peer, &two_relay, &query_two),
+            "the second queue frames at its own relay"
+        );
+        let dead = one_relay.local_addr().unwrap();
+        let healthy = two_relay.local_addr().unwrap();
+        assert_eq!(legs.relay_of(&key_one), Some(dead));
+        assert_eq!(legs.relay_of(&key_two), Some(healthy));
+        drop(one_ctl);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        for _ in 0..2_500 {
+            if legs.relay_of(&key_one) != Some(dead) {
+                break;
+            }
+            one_peer.write_all(&query_one).unwrap();
+            let mut buf = vec![0u8; DEFAULT_MTU + 64];
+            let n = one.device.read_packet(&mut buf).unwrap();
+            one.dispatch(&buf[..n]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_ne!(
+            legs.relay_of(&key_one),
+            Some(dead),
+            "the dead lane's leg is gone"
+        );
+        assert_eq!(
+            legs.relay_of(&key_two),
+            Some(healthy),
+            "the other queue's leg keeps its socket"
+        );
+    }
+
     /// A direct datagram lane whose control closes is dropped: the legs on its dead relay are
     /// cleared and the datagrams fall back to the front's association until the retry budget.
     #[cfg(unix)]
@@ -3862,6 +3966,29 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Pump one queue with a datagram until the fake relay receives a frame, so a test can wait
+    /// for the asynchronously opened lane without a fixed sleep.
+    #[cfg(unix)]
+    fn pump_datagram(
+        handler: &mut Handler,
+        peer: &mut std::fs::File,
+        relay: &std::net::UdpSocket,
+        packet: &[u8],
+    ) -> bool {
+        use std::io::Write;
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        for _ in 0..2_500 {
+            peer.write_all(packet).unwrap();
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+            if relay.recv(&mut buf[..]).is_ok() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        false
+    }
+
     fn wait_for_frames(frames: &Frames, count: usize) {
         for _ in 0..2_500 {
             if frames.lock().unwrap().len() >= count {
