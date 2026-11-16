@@ -190,7 +190,7 @@ culprit() {
       --test-threads=*) test_threads="${arg#*=}" ;;
       --skip) next=skip ;;
       --skip=*) skip_filters+=("${arg#*=}") ;;
-      --color|--format|--logfile|--shuffle-seed) test_args+=("$arg"); next="$arg" ;;
+      --color|--format|--logfile|--shuffle-seed) next="$arg" ;;
       --color=*|--format=*|--logfile=*|--shuffle-seed=*) test_args+=("$arg") ;;
       -*) test_args+=("$arg") ;;
       *) test_filters+=("$arg") ;;
@@ -318,8 +318,8 @@ EOF
   [[ "$want" == "hangs::forever" ]] || { echo "selftest: named '$want', want hangs::forever" >&2; return 1; }
   grep -qx 'hangs::forever' "$probes" || { echo "selftest: the hung test was never probed alone" >&2; return 1; }
   grep -qx -- '--ignored' "$probes" || { echo "selftest: the probe dropped the suite's libtest flags" >&2; return 1; }
-  grep -qx -- '--color' "$probes" || { echo "selftest: the probe dropped a value-taking option" >&2; return 1; }
-  grep -qx 'never' "$probes" || { echo "selftest: the probe dropped a value-taking option's value" >&2; return 1; }
+  [[ "$(tr '\n' ' ' <"$probes")" == "hangs::forever --ignored --color never --test-threads=1 " ]] \
+    || { echo "selftest: probe arguments were not forwarded exactly once" >&2; return 1; }
   grep -qx -- '--exact' "$probes" && { echo "selftest: the probe forwarded a duplicate --exact" >&2; return 1; }
   grep -qx -- '--test-threads=8' "$probes" && { echo "selftest: the probe kept the suite's thread count" >&2; return 1; }
   [[ "$(grep -c '^hangs::forever$' "$probes" || true)" == 1 ]] \
