@@ -2986,6 +2986,11 @@ pub(crate) fn hysteria_v1_config(
 ) -> Result<ferrox_core::hysteria::Config, String> {
     use ferrox_core::hysteria::{Config, Congestion};
     let hy = stream.and_then(|s| s.get("hysteriaSettings"));
+    let insecure = stream
+        .and_then(|s| s.get("tlsSettings"))
+        .and_then(|t| t.get("allowInsecure"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
     let quic = hysteria_quic_params(stream)?;
     let mut cc = Congestion::parse(
         hy.and_then(|h| h.get("congestion"))
@@ -3009,6 +3014,7 @@ pub(crate) fn hysteria_v1_config(
         udp_idle: hysteria_udp_idle(hy)?,
         quic,
         realm: hysteria_realm(stream, hy)?.map(Box::new),
+        insecure,
     })
 }
 
