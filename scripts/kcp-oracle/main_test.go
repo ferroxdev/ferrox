@@ -8,7 +8,7 @@ import (
 )
 
 func TestScriptScannerReportsAnOversizedLine(t *testing.T) {
-	sc := scriptScanner(strings.NewReader(strings.Repeat("a", scriptLimit+1)))
+	sc := scriptScanner(strings.NewReader(strings.Repeat("a", scriptLimit+1) + "\n"))
 	if sc.Scan() {
 		t.Fatal("scanned an oversized line")
 	}
@@ -17,11 +17,11 @@ func TestScriptScannerReportsAnOversizedLine(t *testing.T) {
 	}
 }
 
-func TestScriptScannerReadsALineBelowTheLimit(t *testing.T) {
-	line := strings.Repeat("a", scriptLimit-1)
-	sc := scriptScanner(strings.NewReader(line))
+func TestScriptScannerReadsALineAtTheLimit(t *testing.T) {
+	line := strings.Repeat("a", scriptLimit)
+	sc := scriptScanner(strings.NewReader(line + "\n"))
 	if !sc.Scan() {
-		t.Fatalf("a line below the limit failed: %v", sc.Err())
+		t.Fatalf("a line at the limit failed: %v", sc.Err())
 	}
 	if sc.Text() != line {
 		t.Fatal("the line changed")

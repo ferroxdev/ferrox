@@ -158,8 +158,9 @@ func hdrToken(id int, domain string) string {
 const scriptLimit = 1 << 20
 
 func scriptScanner(r io.Reader) *bufio.Scanner {
+	// A token of scriptLimit bytes still needs one byte for its delimiter.
 	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, scriptLimit), scriptLimit)
+	sc.Buffer(make([]byte, 0, scriptLimit+1), scriptLimit+1)
 	return sc
 }
 
