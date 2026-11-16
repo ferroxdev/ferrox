@@ -610,7 +610,11 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         peer = crate::hysteria_realm::dial_peer(&sock, realm)?;
     }
     let cid = crate::quic::hysteria_client_cid(dial.config.quic.as_ref())?;
-    let mut config = crate::quic::quiche_config(roots, None)?;
+    let mut config = if dial.config.insecure {
+        crate::quic::quiche_config_insecure(None)?
+    } else {
+        crate::quic::quiche_config(roots, None)?
+    };
     crate::quic::apply_lane_congestion(
         &mut config,
         Some(dial.config.cc),
@@ -1081,6 +1085,7 @@ struct Server {
     /// rendezvous, so a dial through another may not ride it.
     realm: Option<Box<ferrox_core::realm::Config>>,
     roots: Option<ferrox_core::tls::Anchors>,
+    insecure: bool,
 }
 
 /// How long an unused connection may sit before a dial pays a fresh handshake: half of quiche's idle timeout, so a reuse always lands before either side closes it.
@@ -1103,6 +1108,7 @@ fn server_of(dial: &Dial) -> Server {
         quic: dial.config.quic,
         realm: dial.config.realm.clone(),
         roots: dial.roots.clone(),
+        insecure: dial.config.insecure,
     }
 }
 

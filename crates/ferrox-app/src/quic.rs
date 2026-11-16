@@ -772,6 +772,11 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quich
     quiche_config_alpn(roots, cc, &[ALPN])
 }
 
+/// A dial that accepts the presented chain, as `allowInsecure` names: no anchor is read, so no staged bundle is needed.
+pub(crate) fn quiche_config_insecure(cc: Option<&str>) -> Option<quiche::Config> {
+    build_quiche_config(&[], cc, &[ALPN], false)
+}
+
 /// The same staged trust bundle and tuning under another ALPN, for a client
 /// whose protocol is not this tree's own transport (`doq` is DNS-over-QUIC).
 pub(crate) fn quiche_config_alpn(
@@ -779,7 +784,16 @@ pub(crate) fn quiche_config_alpn(
     cc: Option<&str>,
     alpn: &[&[u8]],
 ) -> Option<quiche::Config> {
-    if roots.is_empty() {
+    build_quiche_config(roots, cc, alpn, true)
+}
+
+fn build_quiche_config(
+    roots: &[Vec<u8>],
+    cc: Option<&str>,
+    alpn: &[&[u8]],
+    verify: bool,
+) -> Option<quiche::Config> {
+    if verify && roots.is_empty() {
         return None;
     }
     let mut bundle = Vec::with_capacity(
@@ -791,20 +805,28 @@ pub(crate) fn quiche_config_alpn(
     for root in roots {
         append_pem(&mut bundle, root, "CERTIFICATE");
     }
-    let (path, path_text) = stage_trust_file(&bundle)?;
+    let staged = if verify {
+        Some(stage_trust_file(&bundle)?)
+    } else {
+        None
+    };
     let config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .ok()
         .and_then(|mut config| {
-            config.verify_peer(true);
+            config.verify_peer(verify);
             config.set_application_protos(alpn).ok()?;
             if let Some(name) = cc {
                 config.set_cc_algorithm_name(name).ok()?;
             }
             tune_transport(&mut config);
-            config.load_verify_locations_from_file(&path_text).ok()?;
+            if let Some((_, path_text)) = &staged {
+                config.load_verify_locations_from_file(path_text).ok()?;
+            }
             Some(config)
         });
-    let _ = std::fs::remove_file(&path);
+    if let Some((path, _)) = staged {
+        let _ = std::fs::remove_file(&path);
+    }
     config
 }
 

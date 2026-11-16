@@ -260,6 +260,8 @@ pub struct Config {
     /// The realm rendezvous this dial knocks through STUN and punch first, or
     /// `None` for a direct dial to the configured address.
     pub realm: Option<Box<crate::realm::Config>>,
+    /// `tlsSettings.allowInsecure`: accept the presented chain without verifying it.
+    pub insecure: bool,
 }
 
 impl Default for Config {
@@ -274,6 +276,7 @@ impl Default for Config {
             udp_idle: 60,
             quic: None,
             realm: None,
+            insecure: false,
         }
     }
 }

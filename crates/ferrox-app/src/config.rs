@@ -2881,6 +2881,11 @@ fn hysteria_carrier_with_version(
 ) -> Carrier {
     use ferrox_core::hysteria::{Config, Congestion};
     let hy = settings.and_then(|s| s.get("hysteriaSettings"));
+    let insecure = settings
+        .and_then(|s| s.get("tlsSettings"))
+        .and_then(|t| t.get("allowInsecure"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
     let version =
         forced.unwrap_or_else(|| hysteria_version(hy.and_then(|h| h.get("version"))).unwrap_or(2));
     if version != 1 && version != 2 {
@@ -2942,6 +2947,7 @@ fn hysteria_carrier_with_version(
             udp_idle,
             quic,
             realm: realm.map(Box::new),
+            insecure,
         });
     }
     // Salamander and its gecko fragmentation variant are the datagram obfuscations carried; any other named one, or one whose password is too short to mask with, is refused rather than silently sent in the clear.
@@ -2970,6 +2976,7 @@ fn hysteria_carrier_with_version(
         udp_idle,
         quic,
         realm: realm.map(Box::new),
+        insecure,
     })
 }
 
@@ -4107,7 +4114,7 @@ mod tests {
             )
         };
         let Carrier::Hysteria(config) = carrier(
-            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": 5}, "finalmask": {"quicParams": {"congestion": "brutal", "brutalUp": "10 mbps", "brutalDown": "10 mbps", "initStreamReceiveWindow": 65536, "maxIdleTimeout": 10, "keepAlivePeriod": 5, "maxIncomingStreams": 32, "disableChromeParrot": true, "disableGSO": true}}}}"#,
+            r#"{"streamSettings": {"network": "hysteria", "security": "tls", "tlsSettings": {"allowInsecure": true}, "hysteriaSettings": {"version": 2, "udpIdleTimeout": 5}, "finalmask": {"quicParams": {"congestion": "brutal", "brutalUp": "10 mbps", "brutalDown": "10 mbps", "initStreamReceiveWindow": 65536, "maxIdleTimeout": 10, "keepAlivePeriod": 5, "maxIncomingStreams": 32, "disableChromeParrot": true, "disableGSO": true}}}}"#,
         ) else {
             panic!("a tuned hysteria carrier");
         };
@@ -4129,6 +4136,10 @@ mod tests {
             "the mask is the block's, not a field the tree drops"
         );
         assert!(params.disable_gso, "the switch reaches the datagram lane");
+        assert!(
+            config.insecure,
+            "the TLS verdict reaches the QUIC handshake"
+        );
         assert_eq!(
             QuicParams::stream_window(0, false),
             8 * 1024 * 1024,
