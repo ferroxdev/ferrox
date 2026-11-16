@@ -825,7 +825,8 @@ fn flush_drive<W: Write>(stages: &mut [Stage], raw: &mut W) -> io::Result<()> {
         return raw.flush();
     };
     if rest.is_empty() {
-        return first.flush(raw);
+        first.flush(raw)?;
+        return raw.flush();
     }
     {
         let mut pipe = Pipe {

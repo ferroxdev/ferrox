@@ -241,7 +241,10 @@ impl<R, W: Write> PacketStream<R, W> {
         flush_frame(&mut *writer, &mut frame)
             .map_err(|error| io::Error::new(error.kind(), format!("flush frame: {error}")))?;
         write_packet(&mut *writer, KEEPALIVE_PACKET, &id.to_be_bytes())
-            .map_err(|error| io::Error::other(format!("write minecraft keep-alive: {error}")))
+            .map_err(|error| io::Error::other(format!("write minecraft keep-alive: {error}")))?;
+        writer
+            .flush()
+            .map_err(|error| io::Error::other(format!("flush minecraft keep-alive: {error}")))
     }
 
     #[cfg(test)]
@@ -490,6 +493,9 @@ fn spawn_keepalive<W: Write + Send + 'static>(
             }
             let value = id.fetch_add(1, Ordering::Relaxed) + 1;
             if write_packet(&mut *writer, KEEPALIVE_PACKET, &value.to_be_bytes()).is_err() {
+                return;
+            }
+            if writer.flush().is_err() {
                 return;
             }
         }

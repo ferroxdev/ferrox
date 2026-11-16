@@ -220,8 +220,9 @@ impl<R: ReadClock> std::io::Read for DeadlineReader<R> {
     }
 }
 
-impl std::io::Write for XmcWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+impl XmcWriter {
+    /// The same absolute handshake deadline bounds every flush, so a retained drain cannot outlive it.
+    fn arm(&self) -> io::Result<()> {
         if let Some(at) = *self.deadline.gate() {
             let left = at.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
@@ -233,6 +234,13 @@ impl std::io::Write for XmcWriter {
             self.stream
                 .set_write_timeout(Some(left.max(Duration::from_millis(1))))?;
         }
+        Ok(())
+    }
+}
+
+impl std::io::Write for XmcWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.arm()?;
         let Ok(mut chain) = self.chain.lock() else {
             return Err(io::Error::other("the mask chain is gone"));
         };
@@ -240,8 +248,9 @@ impl std::io::Write for XmcWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        self.arm()?;
         let Ok(mut chain) = self.chain.lock() else {
-            return Err(std::io::Error::other("the mask chain is gone"));
+            return Err(io::Error::other("the mask chain is gone"));
         };
         chain.flush(&mut &self.stream)?;
         (&self.stream).flush()

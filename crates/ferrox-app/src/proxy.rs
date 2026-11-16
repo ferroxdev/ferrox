@@ -30799,6 +30799,7 @@ impl TcpCopy {
         }
         self.ended = true;
         self.stalled = None;
+        let _ = self.dst.flush();
         let _ = self.dst.shutdown(Shutdown::Write);
     }
 
@@ -30806,6 +30807,7 @@ impl TcpCopy {
         self.ended = true;
         self.stalled = None;
         let _ = self.src.shutdown(Shutdown::Both);
+        let _ = self.dst.flush();
         let _ = self.dst.shutdown(Shutdown::Both);
     }
 }
@@ -30884,6 +30886,12 @@ fn relay_vectored_direct(
 /// Copy one direction with eight pooled windows: the kernel fills them in order and drains them in
 /// order, so a partial send resumes at the first byte it did not take.
 #[cfg(windows)]
+fn finish_vectored(dst: &mut Connection) {
+    let _ = dst.flush();
+    let _ = dst.shutdown(Shutdown::Write);
+}
+
+#[cfg(windows)]
 fn vectored_copy(mut src: Connection, mut dst: Connection, flow: &RelayFinish) {
     const SMALL_WINDOWS: usize = 8;
     const LARGE_WINDOWS: usize = 16;
@@ -30909,20 +30917,20 @@ fn vectored_copy(mut src: Connection, mut dst: Connection, flow: &RelayFinish) {
             .collect();
         let n = match src.read_vectored(&mut slices) {
             Ok(0) => {
-                let _ = dst.shutdown(Shutdown::Write);
+                finish_vectored(&mut dst);
                 break;
             }
             Ok(n) => n,
             // An idle read waits while the sibling lives, and the response grace decides once it ends.
             Err(error) if is_timeout(&error) => {
                 if flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
-                    let _ = dst.shutdown(Shutdown::Write);
+                    finish_vectored(&mut dst);
                     break;
                 }
                 continue;
             }
             Err(_) => {
-                let _ = dst.shutdown(Shutdown::Write);
+                finish_vectored(&mut dst);
                 break;
             }
         };
@@ -30948,12 +30956,12 @@ fn vectored_copy(mut src: Connection, mut dst: Connection, flow: &RelayFinish) {
             }
             match dst.write_vectored(&slices) {
                 Ok(0) => {
-                    let _ = dst.shutdown(Shutdown::Write);
+                    finish_vectored(&mut dst);
                     break 'copy;
                 }
                 Ok(written) => off += written,
                 Err(_) => {
-                    let _ = dst.shutdown(Shutdown::Write);
+                    finish_vectored(&mut dst);
                     break 'copy;
                 }
             }
