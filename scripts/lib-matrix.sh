@@ -619,7 +619,7 @@ tls_xhttp_client_settings() {
   dir="$(matrix_tls_dir)"
   pin="$(matrix_tls_pin "$dir/cert.pem")"
   if [[ "$xmux" == xmux ]]; then
-    extra=', "xmux": {"maxConnections": 4, "maxConcurrency": 16, "cMaxReuseTimes": 64, "hMaxRequestTimes": 600, "hMaxReusableSecs": 1800}'
+    extra=', "xmux": {"maxConnections": 4, "cMaxReuseTimes": 64, "hMaxRequestTimes": 600, "hMaxReusableSecs": 1800}'
   fi
   echo "\"streamSettings\": {\"network\": \"xhttp\", \"xhttpSettings\": {\"path\": \"/share\", \"mode\": \"$mode\"$extra}, \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"$alpn\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
 }
