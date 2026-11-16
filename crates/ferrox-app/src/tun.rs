@@ -3683,7 +3683,7 @@ mod tests {
 
         // The stream closed only its write half: a pause lets a full close shut the pipe first, so this gate fails against the old behaviour.
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let late = build_tcp_packet(
+        let upload = build_tcp_packet(
             client,
             endpoint,
             6,
@@ -3692,7 +3692,7 @@ mod tests {
             65535,
             b"late",
         );
-        peer.write_all(&late).unwrap();
+        peer.write_all(&upload).unwrap();
         let n = handler.device.read_packet(&mut buf).unwrap();
         handler.dispatch(&buf[..n]).unwrap();
         let mut got = [0u8; 4];
