@@ -897,19 +897,20 @@ mod tests {
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
         }
-        let start = u32::MAX - 3;
-        let zero = unsafe { _mm256_setzero_si256() };
-        let blocks = ctr8v(zero, start);
-        let mut lanes = [0u8; 128];
-        for (i, block) in blocks.iter().enumerate() {
-            unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().add(i * 32).cast(), *block) };
-        }
-        for (i, at) in [12usize, 28, 44, 60, 76, 92, 108, 124]
-            .into_iter()
-            .enumerate()
-        {
-            let want = start.wrapping_add(i as u32).to_be_bytes();
-            assert_eq!(&lanes[at..at + 4], &want[..], "block {i}");
+        for start in [u32::MAX - 3, u32::MAX] {
+            let zero = unsafe { _mm256_setzero_si256() };
+            let blocks = ctr8v(zero, start);
+            let mut lanes = [0u8; 128];
+            for (i, block) in blocks.iter().enumerate() {
+                unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().add(i * 32).cast(), *block) };
+            }
+            for (i, at) in [12usize, 28, 44, 60, 76, 92, 108, 124]
+                .into_iter()
+                .enumerate()
+            {
+                let want = start.wrapping_add(i as u32).to_be_bytes();
+                assert_eq!(&lanes[at..at + 4], &want[..], "block {i}");
+            }
         }
     }
 }

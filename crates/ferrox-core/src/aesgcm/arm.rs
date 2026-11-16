@@ -1158,19 +1158,20 @@ mod tests {
 
     #[test]
     fn the_counter_pass_wraps_at_the_block_limit() {
-        let start = u32::MAX - 3;
-        let template = vdupq_n_u8(0);
-        let blocks = ctr8v_p(template, start);
-        let mut lanes = [0u8; 128];
-        for (i, block) in blocks.iter().flatten().enumerate() {
-            unsafe { vst1q_u8(lanes.as_mut_ptr().add(i * 16), *block) };
-        }
-        for (i, at) in [12usize, 28, 44, 60, 76, 92, 108, 124]
-            .into_iter()
-            .enumerate()
-        {
-            let want = start.wrapping_add(i as u32).to_be_bytes();
-            assert_eq!(&lanes[at..at + 4], &want[..], "block {i}");
+        for start in [u32::MAX - 3, u32::MAX] {
+            let template = vdupq_n_u8(0);
+            let blocks = ctr8v_p(template, start);
+            let mut lanes = [0u8; 128];
+            for (i, block) in blocks.iter().flatten().enumerate() {
+                unsafe { vst1q_u8(lanes.as_mut_ptr().add(i * 16), *block) };
+            }
+            for (i, at) in [12usize, 28, 44, 60, 76, 92, 108, 124]
+                .into_iter()
+                .enumerate()
+            {
+                let want = start.wrapping_add(i as u32).to_be_bytes();
+                assert_eq!(&lanes[at..at + 4], &want[..], "block {i}");
+            }
         }
     }
 }
