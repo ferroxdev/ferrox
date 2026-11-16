@@ -35,7 +35,6 @@ pub struct PacketStream<R, W> {
 struct WriteBuffer {
     bytes: Vec<u8>,
     pos: usize,
-    plain: usize,
 }
 
 struct ReadState<R> {
@@ -317,16 +316,13 @@ impl<R, W: Write> Write for &PacketStream<R, W> {
             .write_buffer
             .lock()
             .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
-        if frame.plain > 0 {
+        if frame.pos < frame.bytes.len() {
             flush_frame(&mut *writer, &mut frame).map_err(|error| {
                 io::Error::new(
                     error.kind(),
                     format!("write minecraft custom payload: {error}"),
                 )
             })?;
-            let written = frame.plain.min(input.len());
-            frame.plain = 0;
-            return Ok(written);
         }
         let mut written = 0;
         while written < input.len() {
@@ -341,14 +337,9 @@ impl<R, W: Write> Write for &PacketStream<R, W> {
             write_varint(&mut frame.bytes, id)?;
             write_string(&mut frame.bytes, CHANNEL)?;
             frame.bytes.extend_from_slice(&input[written..end]);
-            frame.plain = end;
-            flush_frame(&mut *writer, &mut frame).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("write minecraft custom payload: {error}"),
-                )
-            })?;
-            frame.plain = 0;
+            if flush_frame(&mut *writer, &mut frame).is_err() {
+                return Ok(end);
+            }
             written = end;
         }
         Ok(written)
@@ -463,7 +454,15 @@ fn spawn_keepalive<W: Write + Send + 'static>(
             let Ok(mut frame) = frame.lock() else {
                 return;
             };
-            if flush_frame(&mut *writer, &mut frame).is_err() {
+            if let Err(error) = flush_frame(&mut *writer, &mut frame) {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) {
+                    continue;
+                }
                 return;
             }
             let value = id.fetch_add(1, Ordering::Relaxed) + 1;

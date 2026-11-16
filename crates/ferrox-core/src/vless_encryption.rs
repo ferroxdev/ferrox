@@ -1453,7 +1453,6 @@ struct WriteSide {
     pre_write: Vec<u8>,
     out: Vec<u8>,
     out_pos: usize,
-    pending_plain: usize,
     direct: bool,
     #[cfg(test)]
     last_slices: Vec<(*const u8, usize)>,
@@ -1514,9 +1513,6 @@ impl WriteSide {
         }
         if self.out_pos < self.out.len() {
             self.flush_out(inner)?;
-            let take = self.pending_plain.min(buf.len());
-            self.pending_plain = 0;
-            return Ok(take);
         }
         let take = buf.len().min(MAX_BATCH_PLAINTEXT);
         self.out.clear();
@@ -1524,9 +1520,7 @@ impl WriteSide {
         if self.direct {
             self.out.extend_from_slice(&buf[..take]);
             self.out_mask.apply(&mut self.out, true);
-            self.pending_plain = take;
-            self.flush_out(inner)?;
-            self.pending_plain = 0;
+            let _ = self.flush_out(inner);
             return Ok(take);
         }
         self.out.append(&mut self.pre_write);
@@ -1548,9 +1542,7 @@ impl WriteSide {
             at += n;
         }
         self.out_mask.apply(&mut self.out, true);
-        self.pending_plain = take;
-        self.flush_out(inner)?;
-        self.pending_plain = 0;
+        let _ = self.flush_out(inner);
         Ok(take)
     }
 
@@ -1567,8 +1559,6 @@ impl WriteSide {
         let mut at = 0;
         if self.out_pos < self.out.len() {
             self.flush_out(inner)?;
-            at = self.pending_plain.min(total);
-            self.pending_plain = 0;
         }
         while at < total {
             let take = (total - at).min(MAX_BATCH_PLAINTEXT);
@@ -1578,9 +1568,7 @@ impl WriteSide {
                 copy_from_parts(parts, at, take, &mut self.out);
                 debug_assert_eq!(self.out.len(), take);
                 self.out_mask.apply(&mut self.out, true);
-                self.pending_plain = at + take;
                 self.flush_out(inner)?;
-                self.pending_plain = 0;
                 at += take;
                 continue;
             }
@@ -1616,9 +1604,7 @@ impl WriteSide {
                 done += n;
             }
             self.out_mask.apply(&mut self.out, true);
-            self.pending_plain = at + take;
             self.flush_out(inner)?;
-            self.pending_plain = 0;
             at += take;
         }
         Ok(())
@@ -1674,7 +1660,6 @@ impl<S> EncryptedStream<S> {
                 pre_write: Vec::new(),
                 out: Vec::new(),
                 out_pos: 0,
-                pending_plain: 0,
                 direct: false,
                 #[cfg(test)]
                 last_slices: Vec::new(),
@@ -1738,6 +1723,7 @@ impl<S: Write> Write for EncryptedStream<S> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.write.flush_out(&mut self.inner)?;
         self.inner.flush()
     }
 }
@@ -1842,6 +1828,7 @@ impl<W: Write> Write for EncryptedWriter<W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.side.flush_out(&mut self.inner)?;
         self.inner.flush()
     }
 }
@@ -2789,6 +2776,9 @@ mod tests {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => panic!("write: {error}"),
             }
+        }
+        while let Err(error) = stream.flush() {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         }
         assert_eq!(
             stream.inner.bytes, expected,

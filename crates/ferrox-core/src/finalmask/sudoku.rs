@@ -880,12 +880,14 @@ impl Sudoku {
                 "sudoku stage is not open for writing",
             ));
         };
+        if p.is_empty() {
+            return Ok(0);
+        }
         if writer.written < writer.out.len() {
             writer.flush(raw)?;
-            return Ok(p.len());
         }
         writer.encode(p)?;
-        writer.flush(raw)?;
+        let _ = writer.flush(raw);
         Ok(p.len())
     }
 
@@ -1208,15 +1210,18 @@ mod tests {
             calls: 0,
             limit: 3,
         };
-        assert!(writer.write(&mut sink, &plain).is_err(), "the sink blocks");
         assert_eq!(
-            writer.write(&mut sink, &plain).expect("resumes"),
+            writer.write(&mut sink, &plain).expect("accepts"),
             plain.len()
         );
+        let first = writer.writer.as_ref().expect("encoder").out.clone();
+        let next = vec![0x33u8; 16];
+        assert_eq!(writer.write(&mut sink, &next).expect("resumes"), next.len());
+        let second = writer.writer.as_ref().expect("encoder").out.clone();
         assert_eq!(
             sink.bytes,
-            writer.writer.as_ref().expect("encoder").out,
-            "the retry finishes the frame instead of encoding a second one"
+            [first, second].concat(),
+            "the retry finishes the first frame before encoding the next"
         );
     }
 

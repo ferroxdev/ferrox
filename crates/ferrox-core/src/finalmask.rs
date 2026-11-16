@@ -147,10 +147,6 @@ pub struct Fragment {
 struct Gathered {
     bytes: Vec<u8>,
     at: usize,
-    from: usize,
-    segment: usize,
-    record_len: usize,
-    bound: usize,
 }
 
 impl Fragment {
@@ -185,10 +181,14 @@ impl Fragment {
 
     /// The write the chain hands this stage, answered with how much of it reached the wire.
     pub fn write<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
-        if let Some(gathered) = self.gathered.as_ref() {
-            let (record_len, bound) = (gathered.record_len, gathered.bound);
-            self.write_gathered(raw, p, record_len, bound)?;
-            return Self::finish_hello(raw, p, record_len);
+        if let Some(mut gathered) = self.gathered.take() {
+            if let Err(error) = flush_gathered(raw, &mut gathered) {
+                self.gathered = Some(gathered);
+                return Err(error);
+            }
+            if p.is_empty() {
+                return Ok(0);
+            }
         }
         self.count += 1;
         if self.packets_from == 0 && self.packets_to == 1 {
@@ -252,6 +252,9 @@ impl Fragment {
         let merged = self.delays.len() == 1 && self.delays[0].high == 0;
         if merged {
             self.write_gathered(raw, p, record_len, bound)?;
+            if self.gathered.is_some() {
+                return Ok(p.len());
+            }
         } else {
             let mut from = HEADER;
             let mut segment = 0usize;
@@ -268,12 +271,17 @@ impl Fragment {
                 segment += 1;
             }
         }
-        Self::finish_hello(raw, p, record_len)
+        self.finish_hello(raw, p, record_len)
     }
 
     /// A record that rode in behind the hello keeps its own write, whole or partial; a sink that
     /// refuses it still reports the hello it already took, so the caller retries only the tail.
-    fn finish_hello<W: Write>(raw: &mut W, p: &[u8], record_len: usize) -> io::Result<usize> {
+    fn finish_hello<W: Write>(
+        &mut self,
+        raw: &mut W,
+        p: &[u8],
+        record_len: usize,
+    ) -> io::Result<usize> {
         if p.len() == record_len {
             return Ok(p.len());
         }
@@ -287,9 +295,45 @@ impl Fragment {
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    return Ok(record_len);
+                    self.gathered = Some(Gathered {
+                        bytes: p[record_len..].to_vec(),
+                        at: 0,
+                    });
+                    return Ok(p.len());
                 }
                 Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn gather_remaining(
+        &mut self,
+        p: &[u8],
+        mut from: usize,
+        mut segment: usize,
+        record_len: usize,
+        bound: usize,
+        out: &mut Vec<u8>,
+    ) {
+        while from < record_len {
+            let origin = from;
+            let mut heads = [0u8; GATHERED_RECORDS * HEADER];
+            let mut count = 0usize;
+            while count < GATHERED_RECORDS && from < record_len {
+                let to = self
+                    .cut(segment, from, record_len, bound)
+                    .unwrap_or(record_len);
+                heads[count * HEADER..][..HEADER].copy_from_slice(&head_of(p, to - from));
+                from = to;
+                segment += 1;
+                count += 1;
+            }
+            let mut at = origin;
+            for head in heads[..count * HEADER].as_chunks::<HEADER>().0 {
+                let width = usize::from(u16::from_be_bytes([head[3], head[4]]));
+                out.extend_from_slice(head);
+                out.extend_from_slice(&p[at..at + width]);
+                at += width;
             }
         }
     }
@@ -306,12 +350,6 @@ impl Fragment {
     ) -> io::Result<()> {
         let mut from = HEADER;
         let mut segment = 0usize;
-        if let Some(gathered) = self.gathered.as_mut() {
-            flush_gathered(raw, gathered)?;
-            from = gathered.from;
-            segment = gathered.segment;
-            self.gathered = None;
-        }
         loop {
             if from >= record_len {
                 return Ok(());
@@ -346,20 +384,15 @@ impl Fragment {
             let mut parts = &mut parts[..count * 2];
             match write_iovecs(raw, &mut parts) {
                 Ok(()) => {}
-                Err(error) => {
+                Err(_) => {
                     let mut bytes = Vec::new();
                     for part in parts.iter() {
                         bytes.extend_from_slice(part);
                     }
-                    self.gathered = Some(Gathered {
-                        bytes,
-                        at: 0,
-                        from,
-                        segment,
-                        record_len,
-                        bound,
-                    });
-                    return Err(error);
+                    self.gather_remaining(p, from, segment, record_len, bound, &mut bytes);
+                    bytes.extend_from_slice(&p[record_len..]);
+                    self.gathered = Some(Gathered { bytes, at: 0 });
+                    return Ok(());
                 }
             }
         }
@@ -1117,14 +1150,15 @@ mod tests {
             bytes: Vec::new(),
             blocked: false,
         };
-        assert!(
-            mask.write(&mut sink, &whole).is_err(),
-            "the sink refuses the rest of the burst"
+        assert_eq!(
+            mask.write(&mut sink, &whole).expect("accepts the hello"),
+            whole.len(),
+            "a blocked burst is retained, not dropped"
         );
         assert_eq!(
-            mask.write(&mut sink, &whole).expect("resumes"),
-            whole.len(),
-            "the retry answers the whole hello"
+            mask.write(&mut sink, &[]).expect("drains the empty retry"),
+            0,
+            "an empty retry only drains the retained output"
         );
         assert_eq!(
             sink.bytes, expected.bytes,

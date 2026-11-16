@@ -328,7 +328,6 @@ struct Handshake<R, W> {
     write_cipher: Option<Cfb8>,
     buffer: Vec<u8>,
     pending: usize,
-    pending_plain: usize,
 }
 
 impl<R, W> Handshake<R, W> {
@@ -340,7 +339,6 @@ impl<R, W> Handshake<R, W> {
             write_cipher: None,
             buffer: Vec::new(),
             pending: 0,
-            pending_plain: 0,
         }
     }
 
@@ -366,7 +364,6 @@ impl<R, W> Handshake<R, W> {
                 cipher: write_cipher,
                 buffer: Vec::new(),
                 pending: 0,
-                pending_plain: 0,
             },
         ))
     }
@@ -388,23 +385,22 @@ impl<R, W: Write> Write for Handshake<R, W> {
             self.writer.write_all(input)?;
             return Ok(input.len());
         };
-        if self.pending_plain > 0 {
+        if input.is_empty() {
+            return Ok(0);
+        }
+        if self.pending < self.buffer.len() {
             flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
-            let written = self.pending_plain.min(input.len());
-            self.pending_plain = 0;
-            return Ok(written);
         }
         self.buffer.clear();
         self.buffer.extend_from_slice(input);
         cipher.apply(&mut self.buffer);
         self.pending = 0;
-        self.pending_plain = input.len();
-        flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
-        self.pending_plain = 0;
+        let _ = flush_cipher(&mut self.writer, &self.buffer, &mut self.pending);
         Ok(input.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
         self.writer.flush()
     }
 }
@@ -439,28 +435,26 @@ struct CipherWriter<W> {
     cipher: Cfb8,
     buffer: Vec<u8>,
     pending: usize,
-    pending_plain: usize,
 }
 
 impl<W: Write> Write for CipherWriter<W> {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-        if self.pending_plain > 0 {
+        if input.is_empty() {
+            return Ok(0);
+        }
+        if self.pending < self.buffer.len() {
             flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
-            let written = self.pending_plain.min(input.len());
-            self.pending_plain = 0;
-            return Ok(written);
         }
         self.buffer.clear();
         self.buffer.extend_from_slice(input);
         self.cipher.apply(&mut self.buffer);
         self.pending = 0;
-        self.pending_plain = input.len();
-        flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
-        self.pending_plain = 0;
+        let _ = flush_cipher(&mut self.writer, &self.buffer, &mut self.pending);
         Ok(input.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
         self.writer.flush()
     }
 }

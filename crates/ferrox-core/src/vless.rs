@@ -560,7 +560,7 @@ fn flow_of(body: &[u8]) -> Flow {
         let (field, wire) = (tag >> 3, tag & 0x07);
         match wire {
             0 => {
-                if read_varint(body, &mut at).is_none() {
+                if skip_varint64(body, &mut at).is_none() {
                     return Flow::None;
                 }
             }
@@ -609,6 +609,20 @@ fn read_varint(body: &[u8], at: &mut usize) -> Option<u32> {
         word |= u32::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Some(word);
+        }
+    }
+    None
+}
+
+fn skip_varint64(body: &[u8], at: &mut usize) -> Option<()> {
+    for index in 0..10 {
+        let byte = *body.get(*at)?;
+        *at += 1;
+        if index == 9 && byte & 0xfe != 0 {
+            return None;
+        }
+        if byte & 0x80 == 0 {
+            return Some(());
         }
     }
     None
@@ -1804,7 +1818,7 @@ mod tests {
     /// The add-ons name a flow; the parse says which without building a string for it.
     #[test]
     fn the_flow_is_named_without_building_a_string() {
-        let cases: [(&[u8], Flow); 7] = [
+        let cases: [(&[u8], Flow); 8] = [
             (&[], Flow::None),
             (&b"\x0a\x00"[..], Flow::None),
             (&b"\x0a\x10xtls-rprx-vision"[..], Flow::Vision),
@@ -1812,6 +1826,10 @@ mod tests {
             (&b"\x0a\x04none"[..], Flow::Other),
             (&b"\x18\x01\x0a\x10xtls-rprx-vision"[..], Flow::Vision),
             (&b"\x08\x01\x0a\x10xtls-rprx-vision"[..], Flow::Vision),
+            (
+                &b"\x18\x80\x80\x80\x80\x80\x01\x0a\x10xtls-rprx-vision"[..],
+                Flow::Vision,
+            ),
         ];
         for (addons, want) in cases {
             assert_eq!(flow_of(addons), want, "{addons:?}");
