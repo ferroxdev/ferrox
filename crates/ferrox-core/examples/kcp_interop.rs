@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use ferrox_core::kcp::{dial, Config, Listener};
 
 fn usage() -> ! {
-    eprintln!("usage: kcp_interop <server|client> <port|peer> [payload]");
+    eprintln!("usage: kcp_interop server <port> | kcp_interop client <peer> <payload>");
     std::process::exit(2);
 }
 

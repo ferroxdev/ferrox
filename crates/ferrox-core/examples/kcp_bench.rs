@@ -7,11 +7,20 @@ use std::time::{Duration, Instant};
 
 use ferrox_core::kcp::{read_segment, Config, ConnError, ConnMetadata, Connection};
 
-fn main() {
-    let megabytes: usize = std::env::args()
+fn payload_megabytes() -> usize {
+    let megabytes = std::env::args()
         .nth(1)
         .and_then(|a| a.parse().ok())
         .unwrap_or(64);
+    if megabytes == 0 {
+        eprintln!("usage: kcp_bench <megabytes >= 1>");
+        std::process::exit(2);
+    }
+    megabytes
+}
+
+fn main() {
+    let megabytes = payload_megabytes();
 
     let ssock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let slocal = ssock.local_addr().unwrap();

@@ -122,6 +122,11 @@ fn local_tag_open<'a>(xml: &'a str, tag: &str) -> Option<(&'a str, usize)> {
     while let Some(relative) = xml[from..].find('<') {
         let at = from + relative;
         let rest = &xml[at + 1..];
+        if let Some(comment) = rest.strip_prefix("!--") {
+            let end = comment.find("-->")?;
+            from = at + 1 + 3 + end + 3;
+            continue;
+        }
         let name_end = rest.find(|c: char| c == '>' || c.is_ascii_whitespace())?;
         let name = &rest[..name_end];
         if name.rsplit(':').next().unwrap_or(name) == tag {
@@ -138,6 +143,14 @@ fn element_between<'a>(after_open: &'a str, tag: &str) -> Option<(&'a str, usize
     let mut from = 0;
     while let Some(relative) = after_open[from..].find("</") {
         let at = from + relative;
+        if let Some(comment) = after_open[from..].find("<!--") {
+            let comment = from + comment;
+            if comment < at {
+                let end = after_open[comment + 4..].find("-->")?;
+                from = comment + 4 + end + 3;
+                continue;
+            }
+        }
         let rest = &after_open[at + 2..];
         let name_end = rest.find('>')?;
         let name = &rest[..name_end];
@@ -402,6 +415,16 @@ mod tests {
             "http://192.168.1.1/ctl"
         );
         assert!(parse_root_desc("<root></root>").is_none());
+    }
+
+    /// A service a description comments out is not a service it advertises.
+    #[test]
+    fn a_commented_service_is_not_the_control_url() {
+        let xml = r"<root><serviceList><!-- <service><serviceType>urn:schemas-upnp-org:service:WANPPPConnection:1</serviceType><controlURL>/ctl/fake</controlURL></service> --><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><controlURL>/ctl/real</controlURL></service></serviceList></root>";
+        let (_, service) = parse_root_desc(xml).expect("the real service");
+        assert_eq!(service.control_url, "/ctl/real");
+        let only_comment = r"<root><!-- <service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><controlURL>/ctl/fake</controlURL></service> --></root>";
+        assert!(parse_root_desc(only_comment).is_none());
     }
 
     /// The mapping envelope is the bytes the gateway reads: the action the header names, `UDP` as
