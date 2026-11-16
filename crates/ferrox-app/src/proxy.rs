@@ -12968,11 +12968,12 @@ fn serve_hysteria_flow(mut flow: crate::hysteria::Flow, freedom: bool) {
 /// The `hysteria` inbound: v2 over the hysteria transport, users' passwords as auths; v1 over the binary control stream; other versions refused.
 fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &str) -> bool {
     let settings = inbound.get("settings");
-    let version = crate::config::hysteria_version(settings.and_then(|node| node.get("version")));
-    if version == Some(1) {
+    let version =
+        crate::config::hysteria_version(settings.and_then(|node| node.get("version"))).unwrap_or(2);
+    if version == 1 {
         return serve_hysteria_v1_inbound(address, inbound, freedom, path);
     }
-    if version != Some(2) {
+    if version != 2 {
         eprintln!("hysteria inbound in {path} is not version 1 or 2: serves nothing");
         return false;
     }
@@ -13206,6 +13207,31 @@ fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], free
         return;
     }
     crate::hysteria::relay(&uplink, &io);
+}
+
+/// A standalone v2 flow opens with `0x401`, the target authority and 64..512 bytes of padding, then reads the server's status before any payload; v1 keeps its binary control stream.
+fn dial_hysteria_v2(client: &Connection, dial: &crate::hysteria::Dial, target: &Destination) {
+    let mut raw = [0u8; 2050];
+    let padding = crate::hysteria::hysteria_padding(64, 512, &mut raw);
+    let mut request = Vec::with_capacity(3 + target.authority_len() + 2 + padding.len());
+    ferrox_core::hysteria::encode_tcp_request(
+        &target.authority(),
+        padding.as_bytes(),
+        &mut request,
+    );
+    let Some(mut flow) = crate::hysteria::open(dial, &request, 0) else {
+        return;
+    };
+    let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
+    let Some((ok, _message)) = crate::hysteria::read_tcp_response(&mut flow, deadline) else {
+        flow.close();
+        return;
+    };
+    if !ok {
+        flow.close();
+        return;
+    }
+    crate::hysteria::relay(client, &flow);
 }
 
 fn hysteria_dial_session(vless: &VlessOut) -> Option<crate::hysteria::Dial> {
@@ -26012,7 +26038,14 @@ fn dial_socks_outbound(
                 dial_shadowsocks(client, server, shadowsocks, target, ladder);
             }
         }
-        Outbound::Hysteria(hy) => crate::hysteria_v1::dial(client, &hy.dial(), target),
+        Outbound::Hysteria(hy) => {
+            let dial = hy.dial();
+            if dial.config.version == 1 {
+                crate::hysteria_v1::dial(client, &dial, target);
+            } else {
+                dial_hysteria_v2(client, &dial, target);
+            }
+        }
         Outbound::Tuic(tuic) => tuic.dial(client, target),
         Outbound::Http(http) => {
             dial_http_outbound(client, server, http, target, ladder);
@@ -27750,7 +27783,14 @@ fn serve_udp_lane_with(
         Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw(_)) => {
             serve_socks_udp_shadowsocks(relay, ss);
         }
-        Outbound::Hysteria(hy) => crate::hysteria_v1::serve_udp(relay, &hy.dial()),
+        Outbound::Hysteria(hy) => {
+            let dial = hy.dial();
+            if dial.config.version == 1 {
+                crate::hysteria_v1::serve_udp(relay, &dial);
+            } else {
+                crate::hysteria::serve_udp(relay, &dial);
+            }
+        }
         Outbound::Tuic(tuic) => tuic.serve_udp(relay, associate),
         Outbound::Foxy(foxy) => match foxy.carrier {
             // One tunnel for all destinations: later ones ride the first one opened.
@@ -38430,16 +38470,17 @@ fn ss_outbound_refusal(outbound: &Json, server: &Json) -> Option<String> {
 
 fn hysteria_outbound_refusal(outbound: &Json) -> Option<String> {
     let settings = outbound.get("settings");
-    let version =
-        crate::config::hysteria_version(settings.and_then(|s| s.get("version"))).or_else(|| {
+    let version = crate::config::hysteria_version(settings.and_then(|s| s.get("version")))
+        .or_else(|| {
             outbound
                 .get("streamSettings")
                 .and_then(|s| s.get("hysteriaSettings"))
                 .and_then(|h| h.get("version"))
                 .and_then(|version| crate::config::hysteria_version(Some(version)))
-        });
-    if version != Some(1) {
-        return Some("only the version 1 outbound is carried".to_owned());
+        })
+        .unwrap_or(2);
+    if version != 1 && version != 2 {
+        return Some(format!("hysteria version {version} is not carried"));
     }
     if lane_server(settings, "servers").is_none()
         && settings.and_then(|s| s.get("address")).is_none()
@@ -40664,14 +40705,16 @@ fn find_hysteria_outbound(root: &Json) -> Option<HysteriaOut> {
         let Some(settings) = outbound.get("settings") else {
             continue;
         };
-        let version = crate::config::hysteria_version(settings.get("version")).or_else(|| {
-            outbound
-                .get("streamSettings")
-                .and_then(|s| s.get("hysteriaSettings"))
-                .and_then(|h| h.get("version"))
-                .and_then(|version| crate::config::hysteria_version(Some(version)))
-        });
-        if version != Some(1) {
+        let version = crate::config::hysteria_version(settings.get("version"))
+            .or_else(|| {
+                outbound
+                    .get("streamSettings")
+                    .and_then(|s| s.get("hysteriaSettings"))
+                    .and_then(|h| h.get("version"))
+                    .and_then(|version| crate::config::hysteria_version(Some(version)))
+            })
+            .unwrap_or(2);
+        if version != 1 && version != 2 {
             continue;
         }
         let server = settings
@@ -40690,18 +40733,10 @@ fn find_hysteria_outbound(root: &Json) -> Option<HysteriaOut> {
             continue;
         };
         let stream = outbound.get("streamSettings");
-        if stream
-            .and_then(|s| s.get("hysteriaSettings"))
-            .and_then(|h| h.get("version"))
-            .and_then(|version| crate::config::hysteria_version(Some(version)))
-            .is_some_and(|version| version != 1)
-        {
-            continue;
-        }
-        let mut config = match crate::config::hysteria_v1_config(stream) {
+        let mut config = match crate::config::hysteria_outbound_config(stream, version) {
             Ok(config) => config,
             Err(why) => {
-                eprintln!("hysteria v1 outbound: {why}; it is not used");
+                eprintln!("hysteria outbound: {why}; it is not used");
                 continue;
             }
         };
@@ -68807,7 +68842,7 @@ mod tests {
     }
 
     #[test]
-    fn hysteria_v1_outbound_reads_its_server_and_stream() {
+    fn hysteria_outbound_reads_both_versions() {
         let root = crate::json::parse(
             r#"{"outbounds":[{"protocol":"hysteria","settings":{"version":1,"address":"127.0.0.1","port":443,"auth":"pw"},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"serverName":"example.com","obfs":"key"}}}]}"#,
         )
@@ -68820,16 +68855,25 @@ mod tests {
         assert_eq!(out.config.auth, "pw");
         assert_eq!(out.config.obfs_password, "key");
         let v2 = crate::json::parse(
-            r#"{"outbounds":[{"protocol":"hysteria","settings":{"version":2,"address":"127.0.0.1","port":443}}]}"#,
+            r#"{"outbounds":[{"protocol":"hysteria","settings":{"version":2,"address":"127.0.0.1","port":443,"auth":"pw2"},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"serverName":"v2.example"}}}]}"#,
         )
         .expect("parses");
-        assert!(find_hysteria_outbound(&v2).is_none());
+        let out = find_hysteria_outbound(&v2).expect("v2 outbound");
+        assert_eq!(out.host, "v2.example");
+        assert_eq!(out.config.version, 2);
+        assert_eq!(out.config.auth, "pw2");
         let first = v2
             .get("outbounds")
             .and_then(Json::as_arr)
             .and_then(|outbounds| outbounds.first())
             .expect("outbound");
-        assert!(outbound_refusal(first, "hysteria").is_some());
+        assert!(outbound_refusal(first, "hysteria").is_none());
+        let unversioned = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"hysteria","settings":{"address":"127.0.0.1","port":443,"auth":"pw2"}}]}"#,
+        )
+        .expect("parses");
+        let out = find_hysteria_outbound(&unversioned).expect("v2 by default");
+        assert_eq!(out.config.version, 2);
     }
 
     fn hysteria_loop_with(auth: &str, id: [u8; 16], obfs: &str) -> (u16, Vec<Vec<u8>>) {

@@ -2871,9 +2871,18 @@ pub(crate) fn hysteria_quic_params(
 }
 
 fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
+    hysteria_carrier_with_version(settings, network, None)
+}
+
+fn hysteria_carrier_with_version(
+    settings: Option<&Json>,
+    network: &str,
+    forced: Option<u32>,
+) -> Carrier {
     use ferrox_core::hysteria::{Config, Congestion};
     let hy = settings.and_then(|s| s.get("hysteriaSettings"));
-    let version = hysteria_version(hy.and_then(|h| h.get("version"))).unwrap_or(2);
+    let version =
+        forced.unwrap_or_else(|| hysteria_version(hy.and_then(|h| h.get("version"))).unwrap_or(2));
     if version != 1 && version != 2 {
         return Carrier::Unknown {
             network: network.to_owned(),
@@ -2994,6 +3003,20 @@ pub(crate) fn hysteria_v1_config(
         quic,
         realm: hysteria_realm(stream, hy)?.map(Box::new),
     })
+}
+
+/// The direct outbound config for the version its `settings.version` names, reusing the carrier's v2 assembly and its v1 config.
+pub(crate) fn hysteria_outbound_config(
+    stream: Option<&Json>,
+    version: u32,
+) -> Result<ferrox_core::hysteria::Config, String> {
+    if version == 1 {
+        return hysteria_v1_config(stream);
+    }
+    match hysteria_carrier_with_version(stream, "hysteria", Some(version)) {
+        Carrier::Hysteria(config) => Ok(config),
+        _ => Err("the hysteria transport settings are unreadable".to_owned()),
+    }
 }
 
 /// The xplus password a Hysteria v1 transport names: `tlsSettings.obfs` itself is the key.
@@ -4084,7 +4107,7 @@ mod tests {
             )
         };
         let Carrier::Hysteria(config) = carrier(
-            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": 5}, "finalmask": {"quicParams": {"congestion": "brutal", "brutalUp": "10 mbps", "brutalDown": "10 mbps", "initStreamReceiveWindow": 65536, "maxIdleTimeout": 10, "keepAlivePeriod": 5, "maxIncomingStreams": 32, "disableChromeParrot": true}}}}"#,
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": 5}, "finalmask": {"quicParams": {"congestion": "brutal", "brutalUp": "10 mbps", "brutalDown": "10 mbps", "initStreamReceiveWindow": 65536, "maxIdleTimeout": 10, "keepAlivePeriod": 5, "maxIncomingStreams": 32, "disableChromeParrot": true, "disableGSO": true}}}}"#,
         ) else {
             panic!("a tuned hysteria carrier");
         };
@@ -4105,6 +4128,7 @@ mod tests {
             params.disable_chrome_parrot,
             "the mask is the block's, not a field the tree drops"
         );
+        assert!(params.disable_gso, "the switch reaches the datagram lane");
         assert_eq!(
             QuicParams::stream_window(0, false),
             8 * 1024 * 1024,

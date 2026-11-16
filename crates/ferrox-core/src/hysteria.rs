@@ -343,6 +343,18 @@ pub fn encode_tcp_request(address: &str, padding: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(padding);
 }
 
+/// The server's answer to a standalone request: a status byte, a varint-string message and a varint-skip of padding, the shape `proxy/hysteria`'s `ReadTCPResponse` consumes. Only status zero is `ok`; the message is a refusal's reason.
+pub fn decode_tcp_response(packet: &[u8]) -> Result<(bool, &str, usize), RequestError> {
+    let Some((&status, rest)) = packet.split_first() else {
+        return Err(RequestError::Incomplete);
+    };
+    let mut at = 0usize;
+    let raw = bounded(rest, &mut at, MAX_MESSAGE_LENGTH)?;
+    let message = std::str::from_utf8(raw).map_err(|_| RequestError::Invalid)?;
+    bounded(rest, &mut at, MAX_PADDING_LENGTH)?;
+    Ok((status == 0, message, 1 + at))
+}
+
 /// Status byte, then varint-framed message and padding; `ok` is the only status a client continues on, matching `WriteTCPResponse(w, true, "")`.
 pub fn encode_tcp_response(ok: bool, message: &[u8], padding: &[u8], out: &mut Vec<u8>) {
     out.push(u8::from(!ok));
@@ -1327,6 +1339,24 @@ mod tests {
         assert_eq!(refused[0], 1);
         assert_eq!(&refused[2..10], b"no route");
         assert_eq!(&refused[10..], [2, 7, 7]);
+        assert_eq!(decode_tcp_response(&out), Ok((true, "", 3)));
+        assert_eq!(
+            decode_tcp_response(&refused),
+            Ok((false, "no route", refused.len()))
+        );
+        assert_eq!(decode_tcp_response(&[]), Err(RequestError::Incomplete));
+        assert_eq!(decode_tcp_response(&[0]), Err(RequestError::Incomplete));
+        assert_eq!(
+            decode_tcp_response(&[0, 8, b'n']),
+            Err(RequestError::Incomplete)
+        );
+        assert_eq!(
+            decode_tcp_response(&[1, 0, 5, b'x']),
+            Err(RequestError::Incomplete)
+        );
+        let mut too_long = vec![0];
+        too_long.extend_from_slice(&[0xff; 8]);
+        assert_eq!(decode_tcp_response(&too_long), Err(RequestError::Invalid));
     }
 
     #[test]

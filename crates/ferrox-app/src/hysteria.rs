@@ -351,6 +351,11 @@ fn rebind_if_moved(session: &Session) -> bool {
     true
 }
 
+#[cfg(test)]
+thread_local! {
+    static TAIL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling. A full batch earns a tail read because the queue may still be loaded; a short one does not, because the kernel drained it.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
@@ -442,6 +447,8 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
             let _ = conn.recv(bytes, info);
         }
         if batch.slots() == crate::quic::RECV_SLOTS {
+            #[cfg(test)]
+            TAIL_READS.with(|reads| reads.set(reads.get() + 1));
             take_queued(&mut conn, session);
         }
         crate::quic::flush_egress(&mut conn, &session.sock);
@@ -661,6 +668,12 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
             (None, _) => crate::quic::Datagram::plain(sock),
         },
     };
+    let sock = sock.with_gso(
+        dial.config
+            .quic
+            .as_ref()
+            .is_none_or(|params| !params.disable_gso),
+    );
     let net = crate::quic::network_generation();
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
     let keep_alive = dial
@@ -1006,6 +1019,33 @@ pub(crate) fn read_request(flow: &mut Flow, deadline: Instant) -> Option<String>
             Err(hysteria::RequestError::Invalid) => return None,
             Err(hysteria::RequestError::Incomplete) => {
                 if head.len().saturating_sub(prefix) >= HEAD_CAP || Instant::now() >= deadline {
+                    return None;
+                }
+                let n = flow.read(room.as_mut()).ok()?;
+                if n == 0 {
+                    return None;
+                }
+                head.extend_from_slice(&room.as_mut()[..n]);
+            }
+        }
+    }
+}
+
+/// Reads the standalone server's answer before its payload, leaving any bytes after the status, message and padding in the backlog for the relay.
+pub(crate) fn read_tcp_response(flow: &mut Flow, deadline: Instant) -> Option<(bool, String)> {
+    let mut head = std::mem::take(&mut flow.backlog);
+    let mut room = Unfilled::<4096>::new();
+    loop {
+        match hysteria::decode_tcp_response(&head) {
+            Ok((ok, message, used)) => {
+                let message = message.to_owned();
+                flow.backlog = head;
+                flow.at = used;
+                return Some((ok, message));
+            }
+            Err(hysteria::RequestError::Invalid) => return None,
+            Err(hysteria::RequestError::Incomplete) => {
+                if head.len() >= HEAD_CAP || Instant::now() >= deadline {
                     return None;
                 }
                 let n = flow.read(room.as_mut()).ok()?;
@@ -2667,6 +2707,7 @@ pub(crate) fn prepare(
         Some(obfs) => crate::quic::Datagram::obfuscated(sock, obfs),
         None => crate::quic::Datagram::plain(sock),
     };
+    let sock = sock.with_gso(quic.is_none_or(|params| !params.disable_gso));
     Some(Prepared {
         sock,
         local,
@@ -3760,6 +3801,32 @@ mod tests {
             left += 1;
         }
         assert_eq!(left, 0, "a turn left {left} queued datagrams unread");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_short_batch_skips_the_tail_and_a_full_one_takes_it() {
+        let session = idle_session();
+        let to = session.sock.local_addr().expect("addr");
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
+        peer.send_to(&[0u8; 64], to).expect("sends");
+        TAIL_READS.with(|reads| reads.set(0));
+        assert!(drive_once(&session, Duration::from_millis(50)));
+        assert_eq!(
+            TAIL_READS.with(|reads| reads.get()),
+            0,
+            "a short batch is already drained"
+        );
+        for _ in 0..crate::quic::RECV_SLOTS {
+            peer.send_to(&[0u8; 64], to).expect("sends");
+        }
+        TAIL_READS.with(|reads| reads.set(0));
+        assert!(drive_once(&session, Duration::from_millis(50)));
+        assert_eq!(
+            TAIL_READS.with(|reads| reads.get()),
+            1,
+            "a full batch takes the tail"
+        );
     }
 
     fn lane_with(association: Association, source: SocketAddr) -> Lane {
