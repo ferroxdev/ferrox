@@ -23,6 +23,7 @@ const PKCS8_ED25519_SEED_HEADER: [u8; 16] = [
 const SIGNATURE_LEN: usize = 64;
 const MAX_RECORD: usize = 16_384 + 2_048;
 const MAX_HELLO: usize = 1 << 16;
+const WAIT_LIMIT: usize = 4096;
 
 const ED25519_SEED: [u8; 32] = [
     0x64, 0x6f, 0x76, 0x65, 0x74, 0x61, 0x69, 0x6c, 0x2d, 0x72, 0x65, 0x61, 0x6c, 0x69, 0x74, 0x79,
@@ -763,11 +764,20 @@ type Refused = (TlsError, Vec<u8>);
 
 pub(crate) fn read_to_fill<R: Read>(io: &mut R, buf: &mut [u8]) -> usize {
     let mut at = 0;
+    let mut waits = 0;
     while at < buf.len() {
         match io.read(&mut buf[at..]) {
             Ok(0) => break,
             Ok(n) => at += n,
-            Err(error) if waiting(&error) => {}
+            Err(error) if waiting(&error) => {
+                waits += 1;
+                if waits > WAIT_LIMIT {
+                    break;
+                }
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
             Err(_) => break,
         }
     }

@@ -77,7 +77,7 @@ impl Share {
                 let mut out = Vec::with_capacity(64);
                 if draft {
                     out.extend_from_slice(&x);
-                    out.extend_from_slice(&draft_shared(kyber.as_ref(), peer));
+                    out.extend_from_slice(&draft_shared(kyber.as_ref(), &ct));
                 } else {
                     out.extend_from_slice(kyber.as_ref());
                     out.extend_from_slice(&x);

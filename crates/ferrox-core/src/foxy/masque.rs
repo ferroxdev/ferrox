@@ -206,7 +206,7 @@ pub fn datagram_split(buf: &[u8]) -> Option<(usize, &[u8])> {
     let mut at = 0usize;
     while at < buf.len() {
         let capsule = quic_read(buf, &mut at)?;
-        let length = quic_read(buf, &mut at)? as usize;
+        let length = usize::try_from(quic_read(buf, &mut at)?).ok()?;
         let end = at.checked_add(length)?;
         let value = buf.get(at..end)?;
         if capsule == 0 {
@@ -214,9 +214,6 @@ pub fn datagram_split(buf: &[u8]) -> Option<(usize, &[u8])> {
             if quic_read(value, &mut context_at) == Some(0) {
                 return Some((end, &value[context_at..]));
             }
-        }
-        if end == at {
-            return None;
         }
         at = end;
     }

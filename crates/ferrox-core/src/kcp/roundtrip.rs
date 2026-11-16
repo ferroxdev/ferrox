@@ -38,9 +38,9 @@ impl RoundTripInfo {
             let delta = self.srtt.abs_diff(rtt);
             self.variation = (3u32.wrapping_mul(self.variation).wrapping_add(delta)) / 4;
             self.srtt = (7u32.wrapping_mul(self.srtt).wrapping_add(rtt)) / 8;
-            if self.srtt < self.min_rtt {
-                self.srtt = self.min_rtt;
-            }
+        }
+        if self.srtt < self.min_rtt {
+            self.srtt = self.min_rtt;
         }
         let rto = if self.min_rtt < 4 * self.variation {
             self.srtt.wrapping_add(4u32.wrapping_mul(self.variation))

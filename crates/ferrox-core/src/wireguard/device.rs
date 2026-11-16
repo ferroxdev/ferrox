@@ -364,9 +364,12 @@ impl Tunnel {
             self.receive(now, src, &mut packet, out);
             return Some(packet);
         }
-        let Some(len) = self.transport_open(now, src, &mut packet) else {
+        let Some((len, promoted)) = self.transport_open(now, src, &mut packet) else {
             return Some(packet);
         };
+        if promoted {
+            self.flush(now, out);
+        }
         if len == 0 {
             return Some(packet);
         }
@@ -448,15 +451,24 @@ impl Tunnel {
 
     /// Open a transport record and copy its payload into a new event.
     fn transport(&mut self, now: u64, src: SocketAddr, packet: &mut [u8], out: &mut Vec<Event>) {
-        if let Some(len) = self.transport_open(now, src, packet) {
+        if let Some((len, promoted)) = self.transport_open(now, src, packet) {
+            if promoted {
+                self.flush(now, out);
+            }
             if len > 0 {
                 out.push(Event::Data(packet[HEADER_SIZE..HEADER_SIZE + len].to_vec()));
             }
         }
     }
 
-    /// Authenticate and decrypt a transport record in place, returning its payload length.
-    fn transport_open(&mut self, now: u64, src: SocketAddr, packet: &mut [u8]) -> Option<usize> {
+    /// Authenticate and decrypt a transport record in place, returning its payload length and
+    /// whether this packet promoted the next session.
+    fn transport_open(
+        &mut self,
+        now: u64,
+        src: SocketAddr,
+        packet: &mut [u8],
+    ) -> Option<(usize, bool)> {
         if packet.len() < transport::MIN_SIZE {
             return None;
         }
@@ -520,7 +532,7 @@ impl Tunnel {
         }
         self.endpoint = src;
         self.last_recv = now;
-        Some(len)
+        Some((len, promote))
     }
 
     /// Consume an initiation with this device's static key, recovering the
@@ -682,9 +694,9 @@ impl Tunnel {
             session
                 .counter
                 .advance()
-                .map(|counter| (counter, session.send, session.remote_index))
+                .map(|counter| (counter, session.remote_index))
         });
-        let Some((counter, key, receiver)) = next else {
+        let Some((counter, receiver)) = next else {
             self.session = None;
             self.initiate(now, out);
             return;
@@ -694,7 +706,17 @@ impl Tunnel {
         if headroom == 0 {
             payload.copy_within(0..len, HEADER_SIZE);
         }
-        transport::seal(&key, self.reserved, receiver, counter, len, &mut payload);
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        transport::seal(
+            &session.send,
+            self.reserved,
+            receiver,
+            counter,
+            len,
+            &mut payload,
+        );
         self.last_send = now;
         out.push(Event::Send {
             endpoint: self.endpoint,

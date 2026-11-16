@@ -460,6 +460,9 @@ impl Connection {
             if seg.conversation() != self.ctx.meta.conversation {
                 break;
             }
+            if matches!(&seg, Segment::CmdOnly(c) if c.kind().is_none()) {
+                continue;
+            }
             if seg.option().is_close() {
                 drop(receiving.take());
                 self.on_peer_closed();
@@ -609,22 +612,29 @@ impl Connection {
     }
 
     pub fn close(&self) {
-        self.data_input.signal();
-        self.data_output.signal();
         match self.state() {
             State::ReadyToClose | State::Terminating | State::Terminated => {}
             State::Active => self.set_state(State::ReadyToClose),
             State::PeerClosed => self.set_state(State::Terminating),
             State::PeerTerminating => self.set_state(State::Terminated),
         }
+        self.data_input.signal();
+        self.data_output.signal();
         if matches!(self.state(), State::ReadyToClose | State::Terminating) {
             self.flush();
         }
     }
 
     pub fn terminate(&self) {
+        self.ctx
+            .state
+            .store(State::Terminated as i32, Ordering::SeqCst);
+        self.receiving.lock().unwrap().close_read();
+        self.sending.lock().unwrap().close_write();
         self.data_input.signal();
         self.data_output.signal();
+        self.terminated.store(true, Ordering::SeqCst);
+        Self::wake_update();
         if let Some(closer) = self.closer.lock().unwrap().take() {
             closer();
         }
@@ -697,8 +707,9 @@ impl Connection {
             let n = (b.len() - offset).min(self.mss as usize);
             if !self.sending.lock().unwrap().push(&b[offset..offset + n]) {
                 if pushed {
+                    self.write_pending.store(true, Ordering::SeqCst);
                     Self::wake_update();
-                    pushed = false;
+                    return Ok(offset);
                 }
                 self.wait_for_data_output(snap)?;
                 continue;
@@ -769,7 +780,7 @@ mod tests {
 
     use super::{
         ping_due, CmdOnlySegment, Command, Config, ConnMetadata, Connection, Segment,
-        PING_INTERVAL_MS, WRITE_ATTEMPTS,
+        SegmentOption, State, PING_INTERVAL_MS, WRITE_ATTEMPTS,
     };
 
     struct Recorder {
@@ -895,6 +906,29 @@ mod tests {
         command.conv = 4;
         conn.input(&mut vec![Segment::CmdOnly(command)]);
         assert_eq!(*events.lock().unwrap(), ["receiving", "sending"]);
+    }
+
+    #[test]
+    fn an_unknown_command_cannot_close_or_move_the_windows() {
+        let (recorder, conn) = recording_connection(0);
+        let mut command = CmdOnlySegment::new();
+        command.conv = 4;
+        command.cmd = 250;
+        command.option = SegmentOption::CLOSE;
+        command.sending_next = u32::MAX;
+        command.receiving_next = u32::MAX;
+        command.peer_rto = 1;
+        conn.input(&mut vec![Segment::CmdOnly(command)]);
+        assert_eq!(
+            conn.state(),
+            State::Active,
+            "the close bit was not acted on"
+        );
+        assert_eq!(
+            recorder.attempts.load(Ordering::SeqCst),
+            0,
+            "and no reply went out"
+        );
     }
 
     #[test]

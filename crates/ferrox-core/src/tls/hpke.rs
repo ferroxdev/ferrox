@@ -261,6 +261,14 @@ fn dh(sk: &[u8; 32], pk: &[u8; 32]) -> [u8; 32] {
         .to_bytes()
 }
 
+fn checked_dh(sk: &[u8; 32], pk: &[u8; 32]) -> Result<[u8; 32], rustls::Error> {
+    let shared = dh(sk, pk);
+    if shared == [0u8; 32] {
+        return Err(general("hpke: X25519 shared secret was all zero"));
+    }
+    Ok(shared)
+}
+
 #[derive(Debug)]
 struct Context {
     aead: Aead,
@@ -347,7 +355,7 @@ fn encapsulate(pk_r: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), rustls::Error> {
     let mut kem_context = [0u8; 64];
     kem_context[..32].copy_from_slice(&enc);
     kem_context[32..].copy_from_slice(pk_r);
-    let secret = extract_and_expand(&dh(&raw, pk_r), &kem_context);
+    let secret = extract_and_expand(&checked_dh(&raw, pk_r)?, &kem_context);
     Ok((enc, secret))
 }
 
@@ -359,7 +367,7 @@ fn decapsulate(enc: &[u8], sk_r: &[u8; 32]) -> Result<[u8; 32], rustls::Error> {
     let mut kem_context = [0u8; 64];
     kem_context[..32].copy_from_slice(&enc);
     kem_context[32..].copy_from_slice(&pk_r);
-    Ok(extract_and_expand(&dh(sk_r, &enc), &kem_context))
+    Ok(extract_and_expand(&checked_dh(sk_r, &enc)?, &kem_context))
 }
 
 fn public_key(bytes: &HpkePublicKey) -> Result<[u8; 32], rustls::Error> {
@@ -549,6 +557,12 @@ mod tests {
 
     fn array(text: &str) -> [u8; 32] {
         hex(text).try_into().unwrap()
+    }
+
+    #[test]
+    fn an_all_zero_shared_secret_is_refused() {
+        let secret = [7u8; 32];
+        assert!(checked_dh(&secret, &[0u8; 32]).is_err());
     }
 
     #[test]

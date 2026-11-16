@@ -1,6 +1,7 @@
 // The shaped TLS 1.2 listener: the suites a stock Go server would pick, with the flight and the record layer it builds itself.
 use super::client::{
-    message, seal_chunks, Reader, APPLICATION, CCS, HANDSHAKE, MAX_HANDSHAKE, MAX_RECORD,
+    message, seal_chunks, Reader, APPLICATION, CCS, HANDSHAKE, MAX_HANDSHAKE, MAX_PLAINTEXT,
+    MAX_RECORD,
 };
 use super::keys;
 use super::record::{self, Direction, Suite};
@@ -15,7 +16,7 @@ use std::io::{Read, Write};
 
 /// The curve preference a stock Go server walks for an ECDHE key exchange; the hybrid group is
 /// TLS 1.3 only and cannot fill a TLS 1.2 point.
-const CURVES: [u16; 4] = [0x001d, 0x0017, 0x0018, 0x0019];
+const CURVES: [u16; 3] = [0x001d, 0x0017, 0x0018];
 
 /// The group a listener picks: its configured order restricted to the TLS 1.2 curves this engine
 /// carries and to what the hello offered, or the stock order when the config names none it carries.
@@ -232,6 +233,7 @@ pub(crate) struct Server<S: Stream> {
     plain_at: usize,
     plain_end: usize,
     out: Vec<u8>,
+    out_at: usize,
     pending: Vec<u8>,
     pending_at: usize,
     eof: bool,
@@ -265,6 +267,7 @@ impl<S: Stream> Server<S> {
             plain_at: 0,
             plain_end: 0,
             out: Vec::new(),
+            out_at: 0,
             pending: Vec::new(),
             pending_at: 0,
             eof: false,
@@ -353,6 +356,11 @@ impl<S: Stream> Server<S> {
         self.key = Some(key);
         self.suite = Some(suite_id);
         self.alpn = pick_alpn(&self.cfg.alpn, &hello.alpn);
+        if self.alpn.is_none() && !self.cfg.alpn.is_empty() && !hello.alpn.is_empty() {
+            return Err(TlsError::Other(
+                "server and client offer no common ALPN protocol".to_owned(),
+            ));
+        }
 
         let mut random = [0u8; 32];
         SystemRandom::new()
@@ -744,11 +752,13 @@ impl<S: Stream> Server<S> {
     }
 
     fn queue_plain(&mut self, kind: u8, body: &[u8]) {
-        self.pending.push(kind);
-        self.pending.extend_from_slice(&[0x03, 0x03]);
-        self.pending
-            .extend_from_slice(&(body.len() as u16).to_be_bytes());
-        self.pending.extend_from_slice(body);
+        for chunk in body.chunks(MAX_PLAINTEXT) {
+            self.pending.push(kind);
+            self.pending.extend_from_slice(&[0x03, 0x03]);
+            self.pending
+                .extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+            self.pending.extend_from_slice(chunk);
+        }
     }
 
     fn queue_encrypted(&mut self, kind: u8, body: &[u8]) -> Result<(), TlsError> {
@@ -784,21 +794,39 @@ impl<S: Stream> Server<S> {
 
     fn seal(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         self.handshake().map_err(std::io::Error::other)?;
+        if self.out_at < self.out.len() {
+            self.flush_out()?;
+        }
         let mut out = std::mem::take(&mut self.out);
         out.clear();
-        let sealed = {
+        self.out_at = 0;
+        {
             let keys = self
                 .write
                 .as_mut()
                 .ok_or_else(|| TlsError::Other("no write keys".to_owned()))?;
-            seal_parts(keys, parts, &mut out)
-        };
-        let sent = sealed
-            .map_err(std::io::Error::other)
-            .and_then(|()| self.io.write_all(&out))
-            .and_then(|()| self.io.flush());
+            seal_parts(keys, parts, &mut out).map_err(std::io::Error::other)?;
+        }
         self.out = out;
-        sent
+        match self.flush_out() {
+            Ok(()) => Ok(()),
+            Err(error) if TlsError::is_timeout(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn flush_out(&mut self) -> std::io::Result<()> {
+        while self.out_at < self.out.len() {
+            match self.io.write(&self.out[self.out_at..]) {
+                Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+                Ok(written) => self.out_at += written,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.out.clear();
+        self.out_at = 0;
+        Ok(())
     }
 
     pub(crate) fn suites(&self) -> Vec<String> {
@@ -867,6 +895,7 @@ impl<S: Stream> Read for Server<S> {
             return Ok(0);
         }
         self.handshake().map_err(std::io::Error::other)?;
+        self.flush_out()?;
         loop {
             if self.plain_at < self.plain_end {
                 let n = (self.plain_end - self.plain_at).min(buf.len());
@@ -923,6 +952,7 @@ impl<S: Stream> Write for Server<S> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_out()?;
         self.io.flush()
     }
 }
@@ -966,6 +996,12 @@ fn pick_sigalg(key: &PKey<Private>, offered: &[u16]) -> Option<u16> {
             521 => &[0x0603, 0x0503, 0x0403, 0x0203],
             _ => &[0x0403, 0x0503, 0x0603, 0x0203],
         }
+    };
+    let default = [0x0201u16, 0x0203];
+    let offered = if offered.is_empty() {
+        &default[..]
+    } else {
+        offered
     };
     want.iter().copied().find(|id| offered.contains(id))
 }

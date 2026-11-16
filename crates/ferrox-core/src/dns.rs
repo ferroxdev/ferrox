@@ -95,6 +95,7 @@ pub fn parse_query(msg: &[u8]) -> Option<Question> {
     let mut name = [0u8; NAME_MAX];
     let mut len = 0usize;
     let mut at = HEADER;
+    let mut after = None;
     let mut pointers = 0u32;
     loop {
         let start = *msg.get(at)?;
@@ -104,6 +105,7 @@ pub fn parse_query(msg: &[u8]) -> Option<Question> {
             if pointers > POINTERS_MAX {
                 return None;
             }
+            after.get_or_insert(at + 2);
             let target = (((start & 0x3F) as usize) << 8) | usize::from(next);
             if target >= msg.len() {
                 return None;
@@ -116,7 +118,7 @@ pub fn parse_query(msg: &[u8]) -> Option<Question> {
         }
         let span = usize::from(start);
         if span == 0 {
-            at += 1;
+            at = after.unwrap_or(at + 1);
             break;
         }
         let end = at.checked_add(span + 1)?;
@@ -697,6 +699,15 @@ mod tests {
 
         // A pointer aimed at the buffer's own length: past the last byte.
         assert!(parse_query(&unhex("000101000001000000000000c0ff00010001")).is_none());
+    }
+
+    #[test]
+    fn a_compressed_question_reads_its_type_after_the_pointer() {
+        // The question's type and class follow its two-byte pointer, not the name it points at.
+        let query = unhex("000101000001000000000000c01200010001076578616d706c6503636f6d00");
+        let question = parse_query(&query).expect("a compressed question parses");
+        assert_eq!(question.qtype, 1);
+        assert_eq!(&question.name[..question.len], b"example.com.");
     }
 
     /// A pointer that aims at itself: the cap the reference carries is ten

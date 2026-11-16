@@ -288,20 +288,19 @@ pub fn escape_json_into(value: &str, out: &mut String) {
 }
 
 fn escape_into(value: &str, out: &mut String) {
-    for byte in value.bytes() {
-        match byte {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
-            0x00..=0x1f => {
-                out.push('\\');
-                out.push('u');
-                out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
-                out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{00}'..='\u{1f}' => {
+                out.push_str("\\u00");
+                out.push(char::from_digit(ch as u32 >> 4, 16).unwrap_or('0'));
+                out.push(char::from_digit(ch as u32 & 0x0f, 16).unwrap_or('0'));
             }
-            _ => out.push(byte as char),
+            _ => out.push(ch),
         }
     }
 }
@@ -476,6 +475,14 @@ mod tests {
         assert_eq!(
             String::from_utf8(body(&[("k", "a\"b\\c\nd"), ("e", "")])).expect("ascii"),
             r#"{"k":"a\"b\\c\nd"}"#
+        );
+    }
+
+    #[test]
+    fn a_body_keeps_a_non_ascii_value_whole() {
+        assert_eq!(
+            String::from_utf8(body(&[("email", "ï@example.com")])).expect("utf-8"),
+            "{\"email\":\"ï@example.com\"}"
         );
     }
 
