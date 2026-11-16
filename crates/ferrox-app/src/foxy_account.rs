@@ -513,10 +513,13 @@ pub(crate) fn read_body<S: BufRead>(
             io.read_exact(&mut tail).map_err(|_| Failure::Stream)?;
         }
     }
+    let close = header("connection").is_some_and(|value| value.eq_ignore_ascii_case("close"));
     let Some(len) = header("content-length").and_then(|value| value.trim().parse::<usize>().ok())
     else {
         let mut body = Vec::new();
-        read_to_eof(io, &mut body, chunk, max_body)?;
+        if close {
+            read_to_eof(io, &mut body, chunk, max_body)?;
+        }
         return Ok(body);
     };
     if len > max_body {
@@ -568,9 +571,14 @@ pub(crate) fn read_body_to<S: BufRead, W: Write + ?Sized>(
             io.read_exact(&mut tail).map_err(|_| Failure::Stream)?;
         }
     }
+    let close = header("connection").is_some_and(|value| value.eq_ignore_ascii_case("close"));
     let Some(len) = header("content-length").and_then(|value| value.trim().parse::<usize>().ok())
     else {
-        return read_to_eof(io, sink, chunk, max_body);
+        return if close {
+            read_to_eof(io, sink, chunk, max_body)
+        } else {
+            Ok(())
+        };
     };
     if len > max_body {
         return Err(Failure::Frame);
