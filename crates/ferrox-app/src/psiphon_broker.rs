@@ -439,6 +439,8 @@ pub(crate) trait Transport: Send {
     fn round_trip(&mut self, body: &[u8]) -> Result<Vec<u8>, String>;
 
     fn set_timeout(&mut self, timeout: Duration);
+
+    fn set_deadline(&mut self, _deadline: Option<Instant>) {}
 }
 
 /// A fronted plaintext broker transport that reuses one HTTP stream.
@@ -453,6 +455,10 @@ impl Transport for MeekTransport {
 
     fn set_timeout(&mut self, timeout: Duration) {
         self.http.set_timeout(timeout);
+    }
+
+    fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.http.set_deadline(deadline);
     }
 }
 
@@ -624,19 +630,19 @@ impl Client {
             Ok(parse_offer(&response.value))
         })();
         self.offer_deadline = None;
+        self.transport.set_deadline(None);
         result
     }
 
-    /// Narrow the transport timeout to the offer's remaining absolute budget.
+    /// Apply the offer's absolute deadline to the transport.
     fn refresh_offer_timeout(&mut self) -> Result<(), String> {
         let Some(deadline) = self.offer_deadline else {
             return Ok(());
         };
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
             return Err("psiphon broker: offer deadline expired".to_owned());
         }
-        self.transport.set_timeout(self.offer_budget.min(remaining));
+        self.transport.set_deadline(Some(deadline));
         Ok(())
     }
 

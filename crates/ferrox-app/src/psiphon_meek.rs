@@ -888,6 +888,7 @@ pub(crate) struct MeekHttp {
     meek: Meek,
     proxy: Option<Proxy>,
     timeout: Duration,
+    deadline: Option<Instant>,
     path: &'static str,
     stream: Option<MeekStream>,
     cookie: Option<(String, String)>,
@@ -944,6 +945,7 @@ impl MeekHttp {
             meek,
             proxy,
             timeout,
+            deadline: None,
             path,
             stream: None,
             cookie,
@@ -964,6 +966,23 @@ impl MeekHttp {
     /// Apply a per-request timeout to the next round trip and every later dial.
     pub(crate) fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
+    }
+
+    /// Bound every later dial and round trip by one absolute deadline.
+    pub(crate) fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+    }
+
+    /// The timeout for the next operation, capped by the absolute deadline.
+    fn budget(&self) -> Result<Duration, String> {
+        let Some(deadline) = self.deadline else {
+            return Ok(self.timeout);
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("psiphon meek request deadline".to_owned());
+        }
+        Ok(self.timeout.min(left))
     }
 
     /// Build a cookieless HTTP client for a plaintext broker endpoint.
@@ -987,6 +1006,7 @@ impl MeekHttp {
             meek,
             proxy,
             timeout,
+            deadline: None,
             path,
             stream: None,
             cookie: None,
@@ -1040,6 +1060,7 @@ impl MeekHttp {
             meek,
             proxy: None,
             timeout,
+            deadline: None,
             path,
             stream: Some(stream),
             cookie,
@@ -1132,12 +1153,13 @@ impl MeekHttp {
         if self.preconnected {
             return Err("psiphon meek connection is gone".to_owned());
         }
-        let deadline = request_deadline(self.timeout);
+        let timeout = self.budget()?;
+        let deadline = request_deadline(timeout);
         let mut last = "psiphon meek: no front to dial".to_owned();
         let fronts = self.meek.fronts.len().max(1);
         for _ in 0..fronts {
             self.rotate_front();
-            if Self::remaining(deadline, self.timeout).is_none() {
+            if Self::remaining(deadline, timeout).is_none() {
                 break;
             }
             let addresses = match self.resolved_addresses() {
@@ -1148,10 +1170,10 @@ impl MeekHttp {
                 }
             };
             for address in addresses {
-                let Some(timeout) = Self::remaining(deadline, self.timeout) else {
+                if Self::remaining(deadline, timeout).is_none() {
                     break;
-                };
-                match self.open_once(address, timeout) {
+                }
+                match self.open_once(address, deadline) {
                     Ok(()) => {
                         if self.meek.fronted {
                             self.dns.verify_cache_extension(&self.meek.dial);
@@ -1183,13 +1205,15 @@ impl MeekHttp {
 
     /// Dial one address and start a TLS session when the front requires one.
     #[allow(clippy::too_many_lines)]
-    fn open_once(&mut self, address: SocketAddr, timeout: Duration) -> Result<(), String> {
+    fn open_once(&mut self, address: SocketAddr, deadline: Instant) -> Result<(), String> {
         if self.meek.quic && self.proxy.is_none() {
             let sni = if self.meek.disable_sni {
                 String::new()
             } else {
                 self.meek.sni.clone()
             };
+            let timeout = Self::remaining(deadline, Duration::MAX)
+                .ok_or_else(|| "psiphon meek connect deadline".to_owned())?;
             // A silent UDP front gets a capped handshake so the next front still runs.
             let handshake = timeout.min(MAX_HANDSHAKE_ATTEMPT);
             let h3 = crate::psiphon_h3::H3::connect_address(
@@ -1197,11 +1221,13 @@ impl MeekHttp {
                 &self.meek.dial,
                 &sni,
                 handshake,
-                self.timeout,
+                timeout,
             )?;
             self.stream = Some(MeekStream::H3(Box::new(h3)));
             return Ok(());
         }
+        let timeout = Self::remaining(deadline, Duration::MAX)
+            .ok_or_else(|| "psiphon meek connect deadline".to_owned())?;
         // A stalled direct connect is one candidate; the proxy leg keeps its full handshake budget.
         let connect = timeout.min(MAX_CONNECT_ATTEMPT);
         let stream = match &self.proxy {
@@ -1209,16 +1235,10 @@ impl MeekHttp {
             None => TcpStream::connect_timeout(&address, connect)
                 .map_err(|error| format!("psiphon meek connect {}: {error}", self.meek.dial))?,
         };
-        // A plain stream has no handshake, so it goes straight to the full timeout.
+        let timeout = Self::remaining(deadline, Duration::MAX)
+            .ok_or_else(|| "psiphon meek connect deadline".to_owned())?;
         let fragment = self.meek.shape.may_fragment(self.meek.protocol);
-        Self::set_timeouts(
-            &stream,
-            if self.meek.https {
-                timeout
-            } else {
-                self.timeout
-            },
-        )?;
+        Self::set_timeouts(&stream, timeout)?;
         if !self.meek.https {
             self.stream = Some(if fragment {
                 MeekStream::Fragment(crate::psiphon_fragment::FragmentStream::new(
@@ -1301,7 +1321,7 @@ impl MeekHttp {
                 tls.handshake().map_err(|error| {
                     format!("psiphon meek handshake {}: {error}", self.meek.sni)
                 })?;
-                Self::set_timeouts(tls.get_ref().inner(), self.timeout)?;
+                Self::set_timeouts(tls.get_ref().inner(), timeout)?;
                 self.stream = Some(MeekStream::Tls(tls));
             }
             FragmentOrTcp::Fragment(stream) => {
@@ -1311,7 +1331,7 @@ impl MeekHttp {
                 tls.handshake().map_err(|error| {
                     format!("psiphon meek handshake {}: {error}", self.meek.sni)
                 })?;
-                Self::set_timeouts(tls.get_ref().inner().get_ref(), self.timeout)?;
+                Self::set_timeouts(tls.get_ref().inner().get_ref(), timeout)?;
                 self.stream = Some(MeekStream::TlsFragment(tls));
             }
         }
@@ -1402,6 +1422,7 @@ impl MeekHttp {
                 headers.push(("Cookie", cookie));
             }
         }
+        let timeout = self.budget()?;
         if let Some(MeekStream::H3(h3)) = self.stream.as_mut() {
             let headers: Vec<(&str, &str)> = headers
                 .iter()
@@ -1413,7 +1434,7 @@ impl MeekHttp {
                 self.path,
                 &headers,
                 body,
-                self.timeout,
+                timeout,
                 h3_read_chunk(self.limit_buffer_sizes),
             )?;
             if reply.status != 200 {
@@ -1432,7 +1453,7 @@ impl MeekHttp {
             head = crate::psiphon_dns::apply_bytes_transform(transform, &head)
                 .map_err(|error| format!("psiphon meek transform: {error}"))?;
         }
-        let deadline = request_deadline(self.timeout);
+        let deadline = request_deadline(timeout);
         let stream = self
             .stream
             .as_mut()
@@ -1655,6 +1676,16 @@ mod tests {
         assert!(why.contains("psiphon meek connect"), "{why}");
         assert!(http.stream.is_none());
         assert_eq!(http.front_index, 2);
+    }
+
+    /// An absolute deadline caps the next operation and expires before a later one.
+    #[test]
+    fn an_absolute_deadline_caps_the_operation_budget() {
+        let mut http = MeekHttp::new_plain(entry(), None, Duration::from_secs(8), "/");
+        http.set_deadline(Some(Instant::now() + Duration::from_secs(1)));
+        assert!(http.budget().expect("budget") <= Duration::from_secs(1));
+        http.set_deadline(Some(Instant::now()));
+        assert!(http.budget().is_err());
     }
 
     #[test]
