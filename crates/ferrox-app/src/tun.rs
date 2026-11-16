@@ -299,7 +299,7 @@ struct TcpHead<'a> {
     options: &'a [u8],
 }
 
-/// The shift a SYN's window-scale option asks for (RFC 7323), or `None` when it carries none; a shift past fourteen is refused as the RFC requires.
+/// The shift a SYN's window-scale option asks for (RFC 7323), or `None` when it carries none; a shift past fourteen is taken as fourteen, because that is the largest scale the option can carry.
 fn window_shift(options: &[u8]) -> Option<u8> {
     const END: u8 = 0;
     const NOP: u8 = 1;
@@ -319,8 +319,7 @@ fn window_shift(options: &[u8]) -> Option<u8> {
                     return None;
                 }
                 if kind == WINDOW_SCALE && len == 3 {
-                    let shift = options[at + 2];
-                    return (shift <= 14).then_some(shift);
+                    return Some(options[at + 2].min(14));
                 }
                 at = end;
             }
@@ -2018,13 +2017,13 @@ impl Handler {
             let initial = (mss.load(Relaxed) as usize).max(1);
             let head = ip_header_len(local_ip, remote_ip).unwrap_or(IPV6_HEADER);
             let body = head + 20;
+            let (syn_options, syn_len) = syn_ack_options(mss.load(Relaxed), peer_shift.is_some());
             let payload_cap = if gso_capable {
                 MAX_PACKET - body
             } else {
-                initial
+                initial.max(syn_len)
             };
             let mut pkt = vec![0u8; body + payload_cap];
-            let (syn_options, syn_len) = syn_ack_options(mss.load(Relaxed), peer_shift.is_some());
             let (direct, lane, refused) = match dial.map(|dial| dial(&destination)) {
                 Some(DialOutcome::Direct(stream)) => (Some(stream), None, false),
                 Some(DialOutcome::Fallback(lane)) => (None, Some(lane), false),
@@ -2523,8 +2522,8 @@ mod tests {
         );
         assert_eq!(
             window_shift(&[1, 3, 3, 15]),
-            None,
-            "a shift past fourteen is refused"
+            Some(14),
+            "a shift past fourteen is taken as fourteen"
         );
         assert_eq!(window_shift(&[3]), None, "a truncated option is refused");
         assert_eq!(window_shift(&[3, 3]), None, "a missing shift is refused");
@@ -3351,6 +3350,51 @@ mod tests {
             "a SYN without options still learns the MSS, and no scale"
         );
         assert_eq!(window_shift(rtcp.options), None, "no scale was offered");
+    }
+
+    /// A device whose MSS is smaller than the SYN-ACK's own options still answers the handshake: the buffer is sized for the larger of the two, where before the header slice ran past it.
+    #[cfg(unix)]
+    #[test]
+    fn a_tiny_mtu_still_answers_the_syn_with_options() {
+        for (mtu, options, expected) in [
+            (41, &[][..], &[2, 4, 0, 1][..]),
+            (48, &[1, 3, 3, 7][..], &[2, 4, 0, 8, 1, 3, 3, 5][..]),
+        ] {
+            let (a, b) = unix_socketpair().unwrap();
+            let device = Device::from_handle(a, mtu);
+            let mut peer = b;
+
+            let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+            let mut handler = Handler::new(device, relay, no_associate());
+
+            let syn = build_tcp_packet_options(
+                ([10, 0, 0, 2], 44444),
+                ([10, 0, 0, 1], 8080),
+                1000,
+                0,
+                FLAG_SYN,
+                65535,
+                options,
+                &[],
+            );
+            peer.write_all(&syn).unwrap();
+
+            let mut buf = vec![0u8; DEFAULT_MTU + 64];
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+
+            let mut reply = vec![0u8; 128];
+            let rn = peer.read(&mut reply).unwrap();
+            let (_ip, body) = ipv4_head(&reply[..rn]).unwrap();
+            let (rtcp, carried) = tcp_head(body).unwrap();
+            assert_eq!(rtcp.flags, FLAG_SYN | FLAG_ACK, "an MTU of {mtu}");
+            assert_eq!(rtcp.options, expected, "an MTU of {mtu}");
+            assert!(carried.is_empty());
+            assert_eq!(
+                tcp_checksum(&[10, 0, 0, 1], &[10, 0, 0, 2], &reply[IPV4_HEADER..rn]),
+                0
+            );
+        }
     }
 
     /// A SYN that offers a window scale is answered with the device's MSS and our scale, so both directions leave the sixty-four-kilobyte ceiling; the options sit inside the checksummed header.
