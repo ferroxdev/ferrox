@@ -239,8 +239,8 @@ mod tests {
     #[test]
     fn the_draft_group_agrees_on_the_mixed_secret() {
         use ml_kem::kem::Key as KemKey;
-        let mut shares = generate(&[X25519_MLKEM768_DRAFT], false).expect("a draft share");
-        let client = shares.pop().expect("one share");
+        let mut draft = generate(&[X25519_MLKEM768_DRAFT], false).expect("a draft share");
+        let client = draft.pop().expect("one share");
         let encoded = KemKey::<ml_kem::EncapsulationKey<MlKem768>>::try_from(&client.data[32..])
             .expect("the encapsulation key");
         let key = ml_kem::EncapsulationKey::<MlKem768>::new(&encoded).expect("a valid key");
