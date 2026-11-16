@@ -30,7 +30,7 @@ record-layer backends-a-differential-test-cannot-lie-to 6 ferrox-bench-gate-1
 # --- TUIC v5 ----------------------------------------------------------------
 tuic ops-retired-instructions UNBLESSED scripts/count-ops.sh
 tuic syscalls-per-connect UNBLESSED scripts/count-ops.sh
-tuic single-fragment-payload-copies-per-packet 1 ferrox-app-tuic::tests::a_single_fragment_packet_payload_is_copied_once
+tuic single-fragment-payload-copies-per-packet 0 ferrox-app-tuic::tests::a_single_fragment_packet_payload_is_not_copied
 tuic nanoseconds-per-packet UNBLESSED .github/workflows/bench.yml
 tuic address-families 3 ferrox-core-tuic::tests::the_three_address_families_match_the_wire
 tuic outbound-spellings-parsed 1 ferrox-app-tuic::tests::a_tuic_outbound_reads_the_reference_spellings

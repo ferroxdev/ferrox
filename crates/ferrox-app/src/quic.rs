@@ -343,7 +343,7 @@ impl<const N: usize> Drop for Unfilled<N> {
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A handshake that has processed no packet at all for this long is on a path that drops datagrams: quiche retransmits the Initial several times inside it, and a peer that answers at all answers before.
-const SILENT_HANDSHAKE: Duration = Duration::from_secs(5);
+pub(crate) const SILENT_HANDSHAKE: Duration = Duration::from_secs(5);
 
 pub(crate) const IDLE_TIMEOUT_MS: u64 = 300_000;
 
