@@ -155,6 +155,10 @@ func hdrToken(id int, domain string) string {
 }
 
 func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: oracle <script>")
+		os.Exit(2)
+	}
 	f, err := os.Open(os.Args[1])
 	if err != nil {
 		panic(err)
@@ -240,12 +244,15 @@ func main() {
 				fmt.Printf("ORIG_OPEN %s\n", hex.EncodeToString(out))
 			}
 		case "hdr_size":
-			id, _ := strconv.Atoi(parts[1])
+			id := mustInt(parts[1])
 			c := mkcpConn(hdrToken(id, parts[2]))
 			fmt.Printf("HDR_SIZE %d\n", c.(sizer).Size())
 		case "hdr_frame":
-			id, _ := strconv.Atoi(parts[1])
-			count, _ := strconv.Atoi(parts[4])
+			id := mustInt(parts[1])
+			count := mustInt(parts[4])
+			if count < 0 {
+				panic("negative frame count")
+			}
 			payload := mustHex(parts[3])
 			c := mkcpConn(hdrToken(id, parts[2]))
 			size := c.(sizer).Size()
@@ -305,6 +312,14 @@ func main() {
 	if err := sc.Err(); err != nil {
 		panic(err)
 	}
+}
+
+func mustInt(field string) int {
+	value, err := strconv.Atoi(field)
+	if err != nil {
+		panic(err)
+	}
+	return value
 }
 
 func mustHex(field string) []byte {

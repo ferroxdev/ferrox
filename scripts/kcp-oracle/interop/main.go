@@ -54,7 +54,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usage: interop server <port>")
 			os.Exit(2)
 		}
-		port, _ := strconv.Atoi(os.Args[2])
+		port, err := strconv.Atoi(os.Args[2])
+		if err != nil || port < 1 || port > 65535 {
+			fmt.Fprintln(os.Stderr, "invalid port:", os.Args[2])
+			os.Exit(2)
+		}
 		sock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
 		if err != nil {
 			panic(err)
@@ -87,7 +91,7 @@ func main() {
 			}
 		}
 	case "client":
-		if len(os.Args) != 4 {
+		if len(os.Args) != 4 || os.Args[3] == "" {
 			fmt.Fprintln(os.Stderr, "usage: interop client <addr> <message>")
 			os.Exit(2)
 		}
