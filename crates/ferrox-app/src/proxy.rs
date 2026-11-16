@@ -7939,7 +7939,7 @@ fn tunnel_stream_with(
                     &dest,
                     front,
                     &[],
-                    None,
+                    tag.as_deref(),
                     FlowFacts::default(),
                 );
             }
@@ -75565,6 +75565,52 @@ mod tests {
         let seen = recorded
             .recv_timeout(Duration::from_secs(5))
             .expect("the detour carried the dial");
+        assert_eq!(seen.port(), echo_port);
+    }
+
+    /// A probe target keeps its own tag even when its detour is the default, so the hop's loop
+    /// check compares the two names rather than refusing the probe as a dial to itself.
+    #[test]
+    fn a_probe_target_keeps_its_own_tag_when_its_hop_is_the_default() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_probe_target_keeps_its_own_tag_when_its_hop_is_the_default",
+        ) {
+            return;
+        }
+        let echo_port = echo_loop();
+        let (hop_port, recorded) = fake_http_proxy_recording();
+        let config = format!(
+            r#"{{"outbounds":[
+                {{"tag":"default","protocol":"http","settings":{{"servers":[{{"address":"127.0.0.1","port":{hop_port}}}]}}}},
+                {{"tag":"probe","protocol":"freedom","detour":"default"}}
+            ],"routing":{{}}}}"#
+        );
+        let root = crate::json::parse(&config).expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let config = root
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")
+            .iter()
+            .find(|outbound| outbound.get("tag").and_then(Json::as_str) == Some("probe"))
+            .expect("the tag");
+        let out = build_outbound(config, "probe").expect("builds");
+        let target = shared.probe_target_with("probe", out);
+        let mut client = target
+            .probe_stream(
+                &Destination::Address(SocketAddr::from(([127, 0, 0, 1], echo_port))),
+                Duration::from_secs(5),
+            )
+            .expect("the probe dials");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        let seen = recorded
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the default hop carried the probe");
         assert_eq!(seen.port(), echo_port);
     }
 
