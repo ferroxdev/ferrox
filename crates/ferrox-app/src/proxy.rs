@@ -68888,6 +68888,11 @@ mod tests {
         hysteria_loop_masq(auth, id, obfs, ferrox_core::hysteria::Masquerade::NotFound)
     }
 
+    fn hysteria_v2_loop(auth: &str) -> (u16, Vec<Vec<u8>>) {
+        let serve: crate::hysteria::Serve = Arc::new(|flow| serve_hysteria_flow(flow, true));
+        hysteria_loop_serve(auth, "", ferrox_core::hysteria::Masquerade::NotFound, serve)
+    }
+
     /// A certificate and the roots that trust it, minted for a loopback server.
     fn minted_tls_identity(name: &str) -> (Arc<ferrox_core::tls::TlsServerConfig>, Vec<Vec<u8>>) {
         let minted = rcgen::generate_simple_self_signed(vec![name.to_owned()]).expect("mints");
@@ -71493,8 +71498,7 @@ mod tests {
     fn hysteria_v2_carries_a_tcp_echo_over_loopback() {
         let _serial = quic_serial();
         let echo_port = echo_loop();
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let (port, roots) = hysteria_loop_with("v2-auth", id, "");
+        let (port, roots) = hysteria_v2_loop("v2-auth");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -71534,8 +71538,7 @@ mod tests {
     fn hysteria_v2_accepts_an_untrusted_chain_when_insecure() {
         let _serial = quic_serial();
         let echo_port = echo_loop();
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let (port, _roots) = hysteria_loop_with("insecure-auth", id, "");
+        let (port, _roots) = hysteria_v2_loop("insecure-auth");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
