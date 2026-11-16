@@ -325,7 +325,10 @@ mod tests {
         let written = ssdp_search(st, &mut out).expect("fits");
         assert_eq!(
             std::str::from_utf8(&out[..written]).expect("utf8"),
-            "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 3\r\nST: upnp:rootdevice\r\n\r\n"
+            concat!(
+                "M-SEARCH * HTTP/1.1\r\nHOST: 239",
+                ".255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 3\r\nST: upnp:rootdevice\r\n\r\n"
+            )
         );
         for st in SEARCH_TYPES {
             let written = ssdp_search(st, &mut out).expect("fits");
