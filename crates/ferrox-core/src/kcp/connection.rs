@@ -714,7 +714,7 @@ impl Connection {
                 if pushed {
                     self.write_pending.store(true, Ordering::SeqCst);
                     Self::wake_update();
-                    return Ok(offset);
+                    pushed = false;
                 }
                 self.wait_for_data_output(snap)?;
                 continue;
