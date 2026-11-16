@@ -2602,28 +2602,37 @@ impl RouteShared {
     /// The probe target a health check reaches by tag, with the same source, options and target
     /// strategy the route gives a flow; the chain tag resolves to its exit lane.
     pub(crate) fn probe_target(&self, tag: &str) -> Option<ProbeTarget> {
-        let (out, source, sockopts, strategy) = if self.default_tag.as_deref() == Some(tag) {
+        let out = if self.default_tag.as_deref() == Some(tag) {
+            self.default.clone()
+        } else {
+            self.tagged.get(tag)?.clone()
+        };
+        Some(self.probe_target_with(tag, out))
+    }
+
+    /// A target for a configured tag no rule selected: the route never built it, but its dial
+    /// settings are still in the table, so a probe reads the same hop a flow would.
+    pub(crate) fn probe_target_with(&self, tag: &str, out: Outbound) -> ProbeTarget {
+        let (source, sockopts, strategy) = if self.default_tag.as_deref() == Some(tag) {
             (
-                self.default.clone(),
                 self.default_source,
                 self.default_sockopts.clone(),
                 self.default_strategy,
             )
         } else {
             (
-                self.tagged.get(tag)?.clone(),
                 self.sources.get(tag).copied(),
                 self.sockopts.get(tag).cloned(),
                 self.strategies.get(tag).copied(),
             )
         };
-        Some(ProbeTarget {
+        ProbeTarget {
             out,
             source,
             sockopts,
             strategy,
             tag: Some(tag.to_owned()),
-        })
+        }
     }
 
     /// The outbound a `geodata.outbound` tag names, or the default when the tag is empty, which is
@@ -3702,7 +3711,10 @@ fn chain_hop_can_dial_through(out: &Outbound) -> bool {
         Outbound::Vless(vless) => vless.carrier.tcp_stream(),
         Outbound::Vmess(vmess) => vmess.carrier.tcp_stream(),
         Outbound::Trojan(trojan) => trojan.carrier.tcp_stream(),
-        Outbound::Shadowsocks(shadowsocks) => shadowsocks.carrier.tcp_stream(),
+        // A raw Shadowsocks datagram lane opens its own socket, so a hop above it would be lost.
+        Outbound::Shadowsocks(shadowsocks) => {
+            shadowsocks.carrier.tcp_stream() && shadowsocks.mux.udp_manager().is_some()
+        }
         Outbound::Socks(_)
         | Outbound::Http(_)
         | Outbound::Psiphon(_)
@@ -75774,6 +75786,24 @@ mod tests {
         let error = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
             .expect_err("a self-socket hop after the first is refused");
         assert!(error.contains("cannot dial through"), "{error}");
+
+        let datagram = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"chain","type":"chain","outbounds":["first","exit"]},
+                {"tag":"first","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"exit","protocol":"shadowsocks","settings":{"servers":[{"address":"127.0.0.1","port":1,"method":"aes-128-gcm","password":"pw"}]}}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&datagram).expect("parses").expect("a plan");
+        let error = route_shared(
+            &datagram,
+            routing,
+            &crate::reverse::Portals::default(),
+            None,
+        )
+        .expect_err("a raw Shadowsocks hop would lose the hop above it");
+        assert!(error.contains("cannot dial through"), "{error}");
     }
 
     /// A chain tag's health target is its exit lane with the hop's options, and a direct-only
@@ -75804,6 +75834,40 @@ mod tests {
             Some(lane.as_str())
         );
         assert!(!direct_tag(&shared, "chain"));
+    }
+
+    /// A probe target for a tag no rule selected keeps the hop that tag's config names.
+    #[test]
+    fn a_probe_target_keeps_the_detour_of_an_unselected_tag() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"default","protocol":"freedom"},
+                {"tag":"hop","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"unselected","protocol":"freedom","detour":"hop"}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        assert!(!shared.tagged.contains_key("unselected"));
+        let config = root
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")
+            .iter()
+            .find(|outbound| outbound.get("tag").and_then(Json::as_str) == Some("unselected"))
+            .expect("the tag");
+        let out = build_outbound(config, "unselected").expect("builds");
+        let target = shared.probe_target_with("unselected", out);
+        assert_eq!(target.tag.as_deref(), Some("unselected"));
+        assert_eq!(
+            target
+                .sockopts
+                .as_deref()
+                .and_then(|options| options.dialer_proxy()),
+            Some("hop")
+        );
     }
 
     /// The socket options an outbound's `streamSettings.sockopt` names are the ones the socket its

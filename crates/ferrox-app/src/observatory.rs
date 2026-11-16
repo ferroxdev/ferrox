@@ -333,7 +333,13 @@ fn targets(
                 return Some((tag, target));
             }
             match crate::proxy::build_outbound(config, &tag) {
-                Ok(outbound) => Some((tag, ProbeTarget::plain(outbound))),
+                Ok(outbound) => {
+                    let target = match route {
+                        Some(route) => route.probe_target_with(&tag, outbound),
+                        None => ProbeTarget::plain(outbound),
+                    };
+                    Some((tag, target))
+                }
                 Err(reason) => {
                     eprintln!("observatory: {reason}; the tag is not probed");
                     None

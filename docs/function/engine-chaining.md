@@ -47,6 +47,8 @@ metrics lane or the API, is refused before the exit when it appears in an interm
 hop whose carrier binds its own socket — `wireguard`, `warp`, `hysteria`, `foxy`, `veepn`, or a
 QUIC/KCP/hysteria carrier — is refused after the first position rather than reaching its peer
 from this machine; MASQUE takes the hop in its own spec because its carrier reads no thread-local.
+A raw Shadowsocks hop without mux is refused after the first position too: its datagram lane opens
+its own socket, so a hop above it would be silently lost.
 
 ## TCP and UDP
 
