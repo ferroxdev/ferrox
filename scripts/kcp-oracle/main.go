@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -154,6 +155,24 @@ func hdrToken(id int, domain string) string {
 	return names[id]
 }
 
+const scriptLimit = 1 << 20
+
+func splitScript(data []byte, atEOF bool) (int, []byte, error) {
+	advance, token, err := bufio.ScanLines(data, atEOF)
+	if err == nil && len(token) > scriptLimit {
+		return 0, nil, bufio.ErrTooLong
+	}
+	return advance, token, err
+}
+
+func scriptScanner(r io.Reader) *bufio.Scanner {
+	// A scriptLimit-byte line plus CRLF needs two delimiter bytes; splitScript caps the token.
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, scriptLimit+2), scriptLimit+2)
+	sc.Split(splitScript)
+	return sc
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: oracle <script>")
@@ -169,8 +188,7 @@ func main() {
 	var al *kcp.AckList
 	var rtt kcp.RoundTripInfo
 
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
+	sc := scriptScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
