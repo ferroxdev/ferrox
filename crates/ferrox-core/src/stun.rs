@@ -111,14 +111,15 @@ pub fn decode_binding_attributes(
     {
         return None;
     }
+    let body = &packet[..HEADER_LEN + length];
     let mut mapped_xor = None;
     let mut mapped_plain = None;
     let mut other_address = None;
     let mut offset = HEADER_LEN;
-    while offset + 4 <= HEADER_LEN + length {
-        let attribute = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
-        let size = usize::from(u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]));
-        let Some(value) = packet.get(offset + 4..offset + 4 + size) else {
+    while offset + 4 <= body.len() {
+        let attribute = u16::from_be_bytes([body[offset], body[offset + 1]]);
+        let size = usize::from(u16::from_be_bytes([body[offset + 2], body[offset + 3]]));
+        let Some(value) = body.get(offset + 4..offset + 4 + size) else {
             break;
         };
         match attribute {
@@ -160,12 +161,13 @@ pub fn decode_binding_response(
     {
         return None;
     }
+    let body = &packet[..HEADER_LEN + length];
     let mut plain = None;
     let mut offset = HEADER_LEN;
-    while offset + 4 <= HEADER_LEN + length {
-        let attribute = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
-        let size = usize::from(u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]));
-        let Some(value) = packet.get(offset + 4..offset + 4 + size) else {
+    while offset + 4 <= body.len() {
+        let attribute = u16::from_be_bytes([body[offset], body[offset + 1]]);
+        let size = usize::from(u16::from_be_bytes([body[offset + 2], body[offset + 3]]));
+        let Some(value) = body.get(offset + 4..offset + 4 + size) else {
             break;
         };
         match attribute {
@@ -253,6 +255,37 @@ mod tests {
         reply.extend_from_slice(transaction);
         fill(&mut reply);
         reply
+    }
+
+    /// A message declaring only the attribute header cannot borrow bytes past its body as the
+    /// mapped address, however complete they look behind the declared length.
+    #[test]
+    fn trailing_bytes_after_the_declared_body_cannot_supply_an_address() {
+        let transaction = [5u8; TRANSACTION_SIZE];
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        packet.extend_from_slice(&4u16.to_be_bytes());
+        packet.extend_from_slice(&COOKIE.to_be_bytes());
+        packet.extend_from_slice(&transaction);
+        packet.extend_from_slice(&XOR_MAPPED_ADDRESS.to_be_bytes());
+        packet.extend_from_slice(&8u16.to_be_bytes());
+        let mut value = Vec::with_capacity(8);
+        value.push(0);
+        value.push(0x01);
+        value.extend_from_slice(&(0x1f40u16 ^ 0x2112).to_be_bytes());
+        let mut octets = [203, 0, 113, 7];
+        for (octet, cookie) in octets.iter_mut().zip(COOKIE.to_be_bytes()) {
+            *octet ^= cookie;
+        }
+        value.extend_from_slice(&octets);
+        packet.extend_from_slice(&value);
+        assert!(decode_binding_response(&packet, &transaction).is_none());
+        assert_eq!(
+            decode_binding_attributes(&packet, &transaction)
+                .expect("the message itself frames")
+                .mapped,
+            None
+        );
     }
 
     /// The request is twenty bytes with the right type, cookie and transaction, and the response the

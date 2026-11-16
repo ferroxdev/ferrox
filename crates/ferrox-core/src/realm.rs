@@ -184,7 +184,7 @@ pub fn decode_metadata_hex(nonce_hex: &str, obfs_hex: &str) -> Option<Metadata> 
 
 /// The rendezvous of one realm: the HTTP origin it is reached on, the bearer token both ends
 /// present, the slot both ends agree, and the STUN servers that name the publics.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Config {
     /// `http` or `https`: the scheme the origin is dialled on.
     pub scheme: String,
@@ -202,6 +202,21 @@ pub struct Config {
     pub family: Family,
     /// Port-mapping request, when the config names one.
     pub port_mapping: Option<PortMapping>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("scheme", &self.scheme)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("token", &"<redacted>")
+            .field("id", &self.id)
+            .field("stun_servers", &self.stun_servers)
+            .field("family", &self.family)
+            .field("port_mapping", &self.port_mapping)
+            .finish()
+    }
 }
 
 /// A gateway port-mapping request: the lease the gateway holds and how long the search for it may run.
@@ -462,9 +477,9 @@ pub fn expand_symmetric(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
             continue;
         }
         let ip = addr.ip();
-        match hosts.iter_mut().find(|(held, _)| *held == ip) {
-            Some((_, ports)) => ports.push(addr.port()),
-            None => hosts.push((ip, vec![addr.port()])),
+        match hosts.last_mut() {
+            Some((held, ports)) if *held == ip => ports.push(addr.port()),
+            _ => hosts.push((ip, vec![addr.port()])),
         }
     }
     let mut added_candidates: Vec<SocketAddr> = Vec::new();
@@ -524,6 +539,24 @@ mod tests {
             nonce: NONCE,
             obfs: OBFS,
         }
+    }
+
+    /// A diagnostic `{:?}` of the realm config never prints the bearer token it carries.
+    #[test]
+    fn config_debug_redacts_the_token() {
+        let config = Config {
+            scheme: "https".to_owned(),
+            host: "relay.example".to_owned(),
+            port: 443,
+            token: "secret-bearer-token".to_owned(),
+            id: "slot-1".to_owned(),
+            stun_servers: vec!["stun.example:3478".to_owned()],
+            family: Family::Dual,
+            port_mapping: None,
+        };
+        let text = format!("{config:?}");
+        assert!(!text.contains("secret-bearer-token"), "{text}");
+        assert!(text.contains("relay.example") && text.contains("<redacted>"));
     }
 
     /// The exact wire bytes the reference emits: `salt || magic || type || nonce || padding` `XORed`

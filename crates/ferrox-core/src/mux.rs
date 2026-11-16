@@ -9,7 +9,7 @@ pub const FIXED: usize = 4;
 
 pub const GLOBAL_ID: usize = 8;
 
-pub const META_MAX: usize = FIXED + 3 * (1 + 2 + 1 + addr::MAX_DOMAIN);
+pub const META_MAX: usize = FIXED + 3 * (1 + 2 + 1 + 1 + addr::MAX_DOMAIN);
 
 pub const CHUNK_MAX: usize = 8192;
 
@@ -265,6 +265,7 @@ impl Outgoing<'_> {
     /// Rewrites the payload length `encode_header_into` left at zero.
     pub fn patch_payload_len(&self, out: &mut [u8], at: usize, len: usize) {
         debug_assert!(self.has_data(), "only a frame with a payload has a length");
+        assert!(len <= CHUNK_MAX, "mux chunk longer than a length field");
         out[at..at + 2].copy_from_slice(&(len as u16).to_be_bytes());
     }
 
@@ -421,7 +422,7 @@ pub fn decode(buf: &[u8], tail: NewTail) -> Result<(Incoming<'_>, usize), Error>
         match tail {
             NewTail::Reverse => reflection = read_reflection(&meta_rest[at..])?,
             NewTail::Forward => {
-                if options & DATA != 0 && target.is_some_and(|t| t.network == Network::Udp) {
+                if target.is_some_and(|t| t.network == Network::Udp) {
                     let after_target = &meta_rest[at..];
                     if after_target.len() >= GLOBAL_ID {
                         let mut identity = [0u8; GLOBAL_ID];
@@ -470,10 +471,11 @@ fn read_reflection(rest: &[u8]) -> Result<Option<Reflection<'_>>, Error> {
         return Ok(None);
     }
     let (source, used) = Target::take(rest)?;
-    let local = match Target::take(&rest[used..]) {
-        Ok((found, _)) => Some(found),
-        Err(Error::Network(0) | Error::Truncated) => None,
-        Err(other) => return Err(other),
+    let tail = &rest[used..];
+    let local = if tail.is_empty() || tail[0] == 0 {
+        None
+    } else {
+        Some(Target::take(tail)?.0)
     };
     Ok(Some(Reflection { source, local }))
 }
@@ -819,6 +821,16 @@ mod tests {
         }
     }
 
+    /// A payload one byte past the length field is refused before it can wrap to zero.
+    #[test]
+    #[should_panic(expected = "mux chunk longer than a length field")]
+    fn patching_an_oversized_payload_is_refused() {
+        let out = Outgoing::bare(1, Status::Keep, DATA);
+        let mut header = Vec::new();
+        let at = out.encode_header_into(&mut header);
+        out.patch_payload_len(&mut header, at, CHUNK_MAX + 1);
+    }
+
     #[test]
     fn a_new_frame_is_the_bytes_the_fields_add_up_to() {
         let out = Outgoing {
@@ -978,6 +990,47 @@ mod tests {
             .0;
         assert_eq!(frame.global_id, Some(identity));
         assert_eq!(frame.data, Some(&b"q"[..]));
+    }
+
+    /// Opening a UDP session before its first datagram keeps the NAT identity the encoder wrote,
+    /// even with no `DATA` bit to carry a chunk.
+    #[test]
+    fn a_new_udp_frame_without_data_still_round_trips_its_identity() {
+        let identity = [0x5au8; GLOBAL_ID];
+        let out = Outgoing {
+            id: 4,
+            status: Status::New,
+            options: 0,
+            target: Some(Target::of(Network::Udp, "example.com", 53)),
+            global_id: Some(identity),
+        };
+        let mut buf = [0u8; 64];
+        let n = out.encode_into(None, &mut buf);
+        let frame = decode(&buf[..n], NewTail::Forward).expect("decodes").0;
+        assert_eq!(frame.global_id, Some(identity));
+        assert_eq!(frame.data, None);
+        assert_eq!(frame.to_outgoing(), Some(out));
+    }
+
+    /// A partial local target after a reflection source is a malformed frame, not "no local".
+    #[test]
+    fn a_truncated_reflection_local_is_refused() {
+        let target = Target::of(Network::Tcp, "192.0.2.53", 443);
+        let source = Target::of(Network::Tcp, "192.0.2.1", 443);
+        let mut buf = [0u8; 64];
+        let mut at = 6;
+        at += target.encode_into(&mut buf[at..]);
+        at += source.encode_into(&mut buf[at..]);
+        buf[at] = Network::Tcp.byte();
+        at += 1;
+        let meta_len = 4 + at - 6;
+        buf[..2].copy_from_slice(&(meta_len as u16).to_be_bytes());
+        buf[2..4].copy_from_slice(&[0, 1]);
+        buf[4] = Status::New.byte();
+        assert_eq!(
+            decode(&buf[..2 + meta_len], NewTail::Reverse),
+            Err(Error::Truncated)
+        );
     }
 
     #[test]
@@ -1294,7 +1347,7 @@ mod tests {
         assert_eq!(
             decode(&over.to_be_bytes(), NewTail::Forward),
             Err(Error::MetaLen(over)),
-            "781 is the whole format's ceiling and 782 is not"
+            "784 is the whole format's ceiling and 785 is not"
         );
         let mut buf = vec![0u8; 2 + META_MAX];
         buf[..2].copy_from_slice(&(META_MAX as u16).to_be_bytes());
@@ -1304,7 +1357,7 @@ mod tests {
         buf[7..9].copy_from_slice(&443u16.to_be_bytes());
         buf[9] = crate::addr::IPV4;
         buf[10..14].copy_from_slice(&[192, 0, 2, 1]);
-        let frame = decode(&buf, NewTail::Forward).expect("781 is accepted");
+        let frame = decode(&buf, NewTail::Forward).expect("784 is accepted");
         assert_eq!(frame.1, 2 + META_MAX);
         assert_eq!(
             frame.0.target,
@@ -1314,6 +1367,34 @@ mod tests {
             frame.0.global_id, None,
             "options are clear, so no identity is read"
         );
+    }
+
+    /// Three maximum-size domain targets are exactly what a reverse frame's metadata holds, so the
+    /// ceiling accepts them and one byte more is refused.
+    #[test]
+    fn a_reverse_frame_with_three_maximal_domains_fits_meta_max() {
+        let domain = "d".repeat(addr::MAX_DOMAIN);
+        let target = Target::of(Network::Tcp, &domain, 443);
+        assert_eq!(target.wire_len(), 260);
+        let meta_len = 4 + 3 * target.wire_len();
+        assert_eq!(meta_len, META_MAX, "three targets fill the ceiling");
+        let mut buf = vec![0u8; 2 + meta_len];
+        buf[..2].copy_from_slice(&(meta_len as u16).to_be_bytes());
+        buf[2..4].copy_from_slice(&[0, 1]);
+        buf[4] = Status::New.byte();
+        let mut at = 6;
+        for _ in 0..3 {
+            at += target.encode_into(&mut buf[at..]);
+        }
+        assert_eq!(at, buf.len());
+        let frame = decode(&buf, NewTail::Reverse).expect("three maximal domains decode");
+        assert_eq!(frame.1, buf.len());
+        let reflection = frame
+            .0
+            .reflection
+            .expect("the reverse tail carries two targets");
+        assert_eq!(reflection.source, target);
+        assert_eq!(reflection.local, Some(target));
     }
 
     #[test]

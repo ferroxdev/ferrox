@@ -37,7 +37,7 @@ pub const WAN_PPP_SERVICE: &str = "urn:schemas-upnp-org:service:WANPPPConnection
 #[must_use]
 pub fn ssdp_search(st: &str, out: &mut [u8]) -> Option<usize> {
     let head = "M-SEARCH * HTTP/1.1\r\nHOST: 239";
-    let middle = ".255.255.250:1900\r\n\"MAN\": \"noseek\"; ns=01\r\nMX: 3\r\nST: ";
+    let middle = ".255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 3\r\nST: ";
     let tail = "\r\n\r\n";
     let total = head.len() + middle.len() + st.len() + tail.len();
     let room = out.get_mut(..total)?;
@@ -86,43 +86,68 @@ pub struct Service {
 #[must_use]
 pub fn parse_root_desc(xml: &str) -> Option<(Option<String>, Service)> {
     let url_base = xml_tag(xml, "URLBase").map(str::to_owned);
-    let block = xml_between(xml, "<serviceList>")?;
-    let services: Vec<&str> = block.split("<service>").collect();
-    for part in services {
-        let Some(service_type) = xml_tag(part, "serviceType") else {
-            continue;
-        };
-        if service_type != WAN_IP_SERVICE && service_type != WAN_PPP_SERVICE {
-            continue;
+    let mut rest = xml;
+    while let Some((after_open, _)) = local_tag_open(rest, "service") {
+        let (block, consumed) = element_between(after_open, "service")?;
+        if let Some(service) = service_in(block) {
+            return Some((url_base, service));
         }
-        let control_url = xml_tag(part, "controlURL")?;
-        return Some((
-            url_base,
-            Service {
-                service_type: service_type.to_owned(),
-                control_url: control_url.to_owned(),
-            },
-        ));
+        rest = &after_open[consumed..];
     }
     None
 }
 
-/// Read one tag's contents exactly as the description writes them.
-fn xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
-    let at = xml.find(&open)?;
-    let rest = &xml[at + open.len()..];
-    let close = format!("</{tag}>");
-    let end = rest.find(&close)?;
-    Some(&rest[..end])
+fn service_in(block: &str) -> Option<Service> {
+    let service_type = xml_tag(block, "serviceType")?;
+    if service_type != WAN_IP_SERVICE && service_type != WAN_PPP_SERVICE {
+        return None;
+    }
+    let control_url = xml_tag(block, "controlURL")?;
+    Some(Service {
+        service_type: service_type.to_owned(),
+        control_url: control_url.to_owned(),
+    })
 }
 
-/// Read the bytes of one `<service>` block's list, or `None` when the description lists no service.
-fn xml_between<'a>(xml: &'a str, open: &str) -> Option<&'a str> {
-    let at = xml.find(open)?;
-    let rest = &xml[at + open.len()..];
-    let end = rest.find("</serviceList>")?;
-    Some(&rest[..end])
+/// Read one tag's contents exactly as the description writes them, accepting a namespace prefix.
+fn xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let (after_open, _) = local_tag_open(xml, tag)?;
+    let (body, _) = element_between(after_open, tag)?;
+    Some(body)
+}
+
+/// Find `<tag>` or `<prefix:tag>` and return the bytes after the opening tag plus its offset.
+fn local_tag_open<'a>(xml: &'a str, tag: &str) -> Option<(&'a str, usize)> {
+    let mut from = 0;
+    while let Some(relative) = xml[from..].find('<') {
+        let at = from + relative;
+        let rest = &xml[at + 1..];
+        let name_end = rest.find(|c: char| c == '>' || c.is_ascii_whitespace())?;
+        let name = &rest[..name_end];
+        if name.rsplit(':').next().unwrap_or(name) == tag {
+            let close = rest.find('>')?;
+            return Some((&rest[close + 1..], at));
+        }
+        from = at + 1;
+    }
+    None
+}
+
+/// Return the contents of the first matching closing `</tag>` and the bytes it consumes.
+fn element_between<'a>(after_open: &'a str, tag: &str) -> Option<(&'a str, usize)> {
+    let mut from = 0;
+    while let Some(relative) = after_open[from..].find("</") {
+        let at = from + relative;
+        let rest = &after_open[at + 2..];
+        let name_end = rest.find('>')?;
+        let name = &rest[..name_end];
+        if name.rsplit(':').next().unwrap_or(name) == tag {
+            let consumed = at + 2 + name_end + 1;
+            return Some((&after_open[..at], consumed));
+        }
+        from = at + 2;
+    }
+    None
 }
 
 /// Build the SOAP envelope for `AddPortMapping`: the bytes gateways accept, `Call` and `RemoteHost`
@@ -132,6 +157,7 @@ fn xml_between<'a>(xml: &'a str, open: &str) -> Option<&'a str> {
 #[must_use]
 pub fn add_mapping_body(
     service_type: &str,
+    internal_client: IpAddr,
     internal_port: u16,
     description: &str,
     lease: u32,
@@ -144,8 +170,9 @@ pub fn add_mapping_body(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?><s:Envelope s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\" xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:AddPortMapping xmlns:u=\"{service_type}\">"
     );
     let tail = "</u:AddPortMapping></s:Body></s:Envelope>";
+    let description = xml_escape(description);
     let args = format!(
-        "<NewRemotePort>{internal_port}</NewRemotePort><NewProtocol>UDP</NewProtocol><NewInternalPort>{internal_port}</NewInternalPort><NewInternalClient>127.0.0.1</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>{description}</NewPortMappingDescription><NewLeaseDuration>{lease}</NewLeaseDuration>"
+        "<NewRemoteHost></NewRemoteHost><NewExternalPort>{internal_port}</NewExternalPort><NewProtocol>UDP</NewProtocol><NewInternalPort>{internal_port}</NewInternalPort><NewInternalClient>{internal_client}</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>{description}</NewPortMappingDescription><NewLeaseDuration>{lease}</NewLeaseDuration>"
     );
     let total = envelope.len() + args.len() + tail.len();
     let room = out.get_mut(..total)?;
@@ -153,6 +180,20 @@ pub fn add_mapping_body(
     room[envelope.len()..envelope.len() + args.len()].copy_from_slice(args.as_bytes());
     room[envelope.len() + args.len()..].copy_from_slice(tail.as_bytes());
     Some(total)
+}
+
+/// Escape XML character data so a description cannot close an element or start markup.
+fn xml_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Build the SOAP envelope for `GetExternalIPAddress`: the address a mapping is reachable at, read
@@ -186,22 +227,57 @@ pub fn join_control(url_base: Option<&str>, control: &str) -> String {
     if control.starts_with("http://") || control.starts_with("https://") {
         return control.to_owned();
     }
-    if let Some(base) = url_base {
-        let base = base.trim_end_matches('/');
-        if control.starts_with('/') {
-            if let Some(scheme_end) = base.find("://") {
-                if let Some(host_end) = base[scheme_end + 3..]
-                    .find('/')
-                    .map(|at| at + scheme_end + 3)
-                {
-                    return format!("{}{control}", &base[..host_end]);
-                }
-                return format!("{base}{control}");
-            }
-        }
-        return format!("{base}/{control}");
+    let Some(base) = url_base else {
+        return control.to_owned();
+    };
+    let Some(scheme_end) = base.find("://") else {
+        return control.to_owned();
+    };
+    let authority_end = base[scheme_end + 3..]
+        .find('/')
+        .map(|at| at + scheme_end + 3);
+    let origin = authority_end.map_or(base, |at| &base[..at]);
+    if control.starts_with('/') {
+        return format!("{origin}{control}");
     }
-    control.to_owned()
+    let directory = authority_end.map_or("/", |at| {
+        let path = &base[at..];
+        path.rfind('/').map_or("/", |slash| &path[..=slash])
+    });
+    resolve_dot_segments(&format!("{origin}{directory}{control}"))
+}
+
+/// Remove `.` and `..` path segments from an absolute URL, keeping its origin intact.
+fn resolve_dot_segments(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_owned();
+    };
+    let Some(path_start) = url[scheme_end + 3..]
+        .find('/')
+        .map(|at| at + scheme_end + 3)
+    else {
+        return url.to_owned();
+    };
+    let origin = &url[..path_start];
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in url[path_start..].split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    let mut out = String::from(origin);
+    for segment in &segments {
+        out.push('/');
+        out.push_str(segment);
+    }
+    if url.ends_with('/') && !segments.is_empty() {
+        out.push('/');
+    }
+    out
 }
 
 /// Split a `LOCATION` or control URL into the host, port and path a dial travels to. `None` when
@@ -240,12 +316,17 @@ pub fn split_url(url: &str) -> Option<(String, u16, String)> {
 mod tests {
     use super::*;
 
-    /// The search is twenty `M-SEARCH` lines and nothing beside: the multicast group, the noseek
-    /// manifest, the search window and the four advertised `ST` values, which the fake server reads
-    /// back as the exact bytes the router answers.
+    /// The search is the exact `M-SEARCH` a gateway answers: the multicast group, the required
+    /// `ssdp:discover` manifest, the search window and the advertised `ST` the caller names.
     #[test]
     fn an_m_search_names_every_advertised_search() {
         let mut out = [0u8; 512];
+        let st = "upnp:rootdevice";
+        let written = ssdp_search(st, &mut out).expect("fits");
+        assert_eq!(
+            std::str::from_utf8(&out[..written]).expect("utf8"),
+            "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 3\r\nST: upnp:rootdevice\r\n\r\n"
+        );
         for st in SEARCH_TYPES {
             let written = ssdp_search(st, &mut out).expect("fits");
             let text = std::str::from_utf8(&out[..written]).expect("utf8");
@@ -275,12 +356,13 @@ mod tests {
         );
     }
 
-    /// The control the mapper walks is the first IGD service the description lists, joined onto the
-    /// base it roots itself at; a description listing no IGD service names no control.
+    /// The control the mapper walks is the first IGD service anywhere in the device tree, including
+    /// a nested `WANConnectionDevice` whose namespace prefix the tag carries; a description listing
+    /// no IGD service names no control.
     #[test]
     fn a_root_description_names_its_control_url() {
-        let xml = r"<root><URLBase>http://192.168.1.1:5000</URLBase><serviceList><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><controlURL>/ctl/WANIPConnection1</controlURL></service></serviceList></root>";
-        let (base, service) = parse_root_desc(xml).expect("a service");
+        let xml = r"<root><URLBase>http://192.168.1.1:5000</URLBase><serviceList><service><serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType><controlURL>/ctl/L3F</controlURL></service></serviceList><deviceList><device><serviceList><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><controlURL>/ctl/WANIPConnection1</controlURL></service></serviceList></device></deviceList></root>";
+        let (base, service) = parse_root_desc(xml).expect("a nested service");
         assert_eq!(base.as_deref(), Some("http://192.168.1.1:5000"));
         assert_eq!(service.service_type, WAN_IP_SERVICE);
         assert_eq!(service.control_url, "/ctl/WANIPConnection1");
@@ -288,9 +370,33 @@ mod tests {
             join_control(base.as_deref(), &service.control_url),
             "http://192.168.1.1:5000/ctl/WANIPConnection1"
         );
+        let namespaced = r"<u:root><u:serviceList><u:service><u:serviceType>urn:schemas-upnp-org:service:WANPPPConnection:1</u:serviceType><u:controlURL>ctl/ppp</u:controlURL></u:service></u:serviceList></u:root>";
+        let (_, service) = parse_root_desc(namespaced).expect("a prefixed service");
+        assert_eq!(service.service_type, WAN_PPP_SERVICE);
+        assert_eq!(service.control_url, "ctl/ppp");
         assert_eq!(
             join_control(None, "http://192.168.1.2:80/c"),
             "http://192.168.1.2:80/c"
+        );
+        assert_eq!(
+            join_control(Some("http://192.168.1.1/igd/root.xml"), "ctl"),
+            "http://192.168.1.1/igd/ctl"
+        );
+        assert_eq!(
+            join_control(Some("http://192.168.1.1/igd/"), "ctl"),
+            "http://192.168.1.1/igd/ctl"
+        );
+        assert_eq!(
+            join_control(Some("http://192.168.1.1"), "ctl"),
+            "http://192.168.1.1/ctl"
+        );
+        assert_eq!(
+            join_control(Some("http://192.168.1.1/igd/root.xml"), "/ctl"),
+            "http://192.168.1.1/ctl"
+        );
+        assert_eq!(
+            join_control(Some("http://192.168.1.1/igd/root.xml"), "../ctl"),
+            "http://192.168.1.1/ctl"
         );
         assert!(parse_root_desc("<root></root>").is_none());
     }
@@ -301,8 +407,16 @@ mod tests {
     #[test]
     fn a_mapping_and_external_ip_body_carry_the_reference_action() {
         let mut out = [0u8; 2048];
-        let written =
-            add_mapping_body(WAN_IP_SERVICE, 4000, "hysteria-realm", 600, &mut out).expect("fits");
+        let client = IpAddr::V4([192, 168, 1, 20].into());
+        let written = add_mapping_body(
+            WAN_IP_SERVICE,
+            client,
+            4000,
+            "hysteria-realm",
+            600,
+            &mut out,
+        )
+        .expect("fits");
         let xml = std::str::from_utf8(&out[..written]).expect("utf8");
         assert!(xml.contains("AddPortMapping"), "the action");
         assert!(
@@ -310,14 +424,33 @@ mod tests {
             "the protocol"
         );
         assert!(
+            xml.contains("<NewRemoteHost></NewRemoteHost><NewExternalPort>4000</NewExternalPort>"),
+            "the required remote host and external port"
+        );
+        assert!(
             xml.contains("<NewInternalPort>4000</NewInternalPort>"),
             "the internal port"
+        );
+        assert!(
+            xml.contains("<NewInternalClient>192.168.1.20</NewInternalClient>"),
+            "the LAN client"
         );
         assert!(
             xml.contains("<NewLeaseDuration>600</NewLeaseDuration>"),
             "the lease"
         );
-        assert!(add_mapping_body(WAN_IP_SERVICE, 4000, "hysteria-realm", 0, &mut out).is_none());
+        let escaped = add_mapping_body(WAN_IP_SERVICE, client, 4000, "A&B <realm>", 600, &mut out)
+            .expect("fits");
+        let xml = std::str::from_utf8(&out[..escaped]).expect("utf8");
+        assert!(
+            xml.contains(
+                "<NewPortMappingDescription>A&amp;B &lt;realm&gt;</NewPortMappingDescription>"
+            ),
+            "the description is character data"
+        );
+        assert!(
+            add_mapping_body(WAN_IP_SERVICE, client, 4000, "hysteria-realm", 0, &mut out).is_none()
+        );
         let mut ext = [0u8; 512];
         let written = external_ip_body(WAN_IP_SERVICE, &mut ext).expect("fits");
         let xml = std::str::from_utf8(&ext[..written]).expect("utf8");

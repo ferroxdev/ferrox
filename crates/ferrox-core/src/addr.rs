@@ -75,6 +75,10 @@ impl<'a> Addr<'a> {
                 17
             }
             Self::Name(bytes) => {
+                assert!(
+                    bytes.len() <= MAX_DOMAIN,
+                    "domain longer than its length field"
+                );
                 out[0] = DOMAIN;
                 out[1] = bytes.len() as u8;
                 out[2..2 + bytes.len()].copy_from_slice(bytes);
@@ -203,6 +207,15 @@ mod tests {
         ] {
             assert_eq!(Addr::of(host), oracle(host), "{host:?}");
         }
+    }
+
+    /// A name built directly past the length byte is refused rather than wrapped.
+    #[test]
+    #[should_panic(expected = "domain longer than its length field")]
+    fn a_directly_built_overlong_name_is_refused() {
+        let bytes = vec![b'd'; MAX_DOMAIN + 1];
+        let mut buf = [0u8; MAX_DOMAIN + 3];
+        let _ = Addr::Name(&bytes).encode_into(&mut buf);
     }
 
     #[test]

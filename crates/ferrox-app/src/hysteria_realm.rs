@@ -948,14 +948,19 @@ pub(crate) fn port_mapping_external(
     let local = local?;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(1));
     let location = ssdp_discover(deadline)?;
-    map_via_gateway(&location, local.port(), lifetime_secs)
+    map_via_gateway(&location, local.ip(), local.port(), lifetime_secs)
 }
 
 /// Map `internal_port` through the gateway a device description at `location` names: fetch its
 /// description, `AddPortMapping` on the `WAN` service it lists, then `GetExternalIPAddress` for the
 /// address the mapping is reachable at. `None` answers when any hop refuses; the caller continues
 /// with its STUN address instead.
-fn map_via_gateway(location: &str, internal_port: u16, lifetime_secs: u64) -> Option<SocketAddr> {
+fn map_via_gateway(
+    location: &str,
+    internal_client: std::net::IpAddr,
+    internal_port: u16,
+    lifetime_secs: u64,
+) -> Option<SocketAddr> {
     let (gateway_host, gateway_port, root_path) = ferrox_core::portmap::split_url(location)?;
     let root = http_get(&gateway_host, gateway_port, &root_path)?;
     let (url_base, service) = ferrox_core::portmap::parse_root_desc(&root)?;
@@ -965,6 +970,7 @@ fn map_via_gateway(location: &str, internal_port: u16, lifetime_secs: u64) -> Op
     let lease = u32::try_from(lifetime_secs).unwrap_or(u32::MAX);
     let written = ferrox_core::portmap::add_mapping_body(
         &service.service_type,
+        internal_client,
         internal_port,
         "hysteria-realm",
         lease,
@@ -1222,8 +1228,8 @@ mod tests {
             }
         });
         let location = format!("http://127.0.0.1:{port}/rootDesc.xml");
-        let mapped =
-            map_via_gateway(&location, 4000, 600).expect("a mapping and its external address");
+        let mapped = map_via_gateway(&location, [127, 0, 0, 1].into(), 4000, 600)
+            .expect("a mapping and its external address");
         assert_eq!(
             mapped.to_string(),
             "203.0.113.7:4100",

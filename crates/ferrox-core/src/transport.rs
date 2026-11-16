@@ -353,16 +353,25 @@ fn ends_ignore_ascii(h: &str, suffix: &str) -> bool {
 }
 
 fn is_public_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
+    let h = host.trim_end_matches('.');
+    if h.eq_ignore_ascii_case("localhost") {
         return false;
     }
-    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
-        return !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_multicast());
+    if let Ok(v4) = h.parse::<std::net::Ipv4Addr>() {
+        return !(v4.is_loopback()
+            || v4.is_private()
+            || v4.is_link_local()
+            || v4.is_multicast()
+            || v4.is_unspecified()
+            || v4.is_broadcast());
     }
-    if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
-        return !(v6.is_loopback() || v6.is_multicast());
+    if let Ok(v6) = h.parse::<std::net::Ipv6Addr>() {
+        return !(v6.is_loopback()
+            || v6.is_multicast()
+            || v6.is_unique_local()
+            || v6.is_unicast_link_local()
+            || v6.is_unspecified());
     }
-    let h = host.trim_end_matches('.');
     if ["example.com", "example.org", "example.net"]
         .iter()
         .any(|name| h.eq_ignore_ascii_case(name))
@@ -423,9 +432,15 @@ mod tests {
             ("notexample.com", true),
             ("a.localhost", false),
             ("LOCALHOST", false),
+            ("localhost.", false),
             ("192.0.2.1", true),
             ("10.10.10.10", false),
-            ("fe80::1", true),
+            ("0.0.0.0", false),
+            ("255.255.255.255", false),
+            ("fe80::1", false),
+            ("fc00::1", false),
+            ("fd12:3456::1", false),
+            ("::", false),
             ("ff02::1", false),
         ] {
             let (verdict, counts) = crate::alloc_count::measure(|| is_public_host(host));

@@ -3,11 +3,18 @@ use std::time::{Duration, Instant};
 
 use ferrox_core::kcp::{dial, Config, Listener};
 
+fn usage() -> ! {
+    eprintln!("usage: kcp_interop <server|client> <port|peer> [payload]");
+    std::process::exit(2);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() < 3 {
+        usage();
+    }
     let mode = &args[1];
     let peer_arg = &args[2];
-    let payload: Option<&str> = args.get(3).map(String::as_str);
 
     match mode.as_str() {
         "server" => {
@@ -30,19 +37,33 @@ fn main() {
             }
         }
         "client" => {
+            let Some(payload) = args.get(3) else {
+                usage();
+            };
             let peer: SocketAddr = peer_arg.parse().unwrap();
             let conn = dial(peer, Config::default(), 7).expect("dial");
-            let payload = payload.unwrap();
             conn.write(payload.as_bytes()).unwrap();
             conn.set_read_deadline(Instant::now() + Duration::from_secs(10));
             let mut buf = vec![0u8; 65536];
-            let n = conn.read(&mut buf).unwrap();
-            println!("echo: {}", String::from_utf8_lossy(&buf[..n]));
+            let mut received = Vec::with_capacity(payload.len());
+            while received.len() < payload.len() {
+                let n = conn.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+            }
+            if received.as_slice() != payload.as_bytes() {
+                eprintln!(
+                    "echo mismatch: sent {} bytes, received {}",
+                    payload.len(),
+                    received.len()
+                );
+                std::process::exit(1);
+            }
+            println!("echo: {}", String::from_utf8_lossy(&received));
             conn.close();
         }
-        _ => {
-            eprintln!("usage: kcp_interop <server|client> <port|peer> [payload]");
-            std::process::exit(2);
-        }
+        _ => usage(),
     }
 }
