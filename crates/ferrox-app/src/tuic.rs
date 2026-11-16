@@ -669,7 +669,7 @@ fn pinned_config(pins: Arc<[[u8; 32]]>, name: String) -> Option<quiche::Config> 
             return Err(SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE));
         };
         let mut chain_der = Vec::with_capacity(chain.len());
-        for cert in chain.iter() {
+        for cert in chain {
             let Ok(der) = cert.to_der() else {
                 return Err(SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE));
             };
