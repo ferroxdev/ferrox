@@ -106,10 +106,25 @@ impl SlokStore {
             use std::os::unix::fs::PermissionsExt as _;
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
+        if let Err(error) = file.sync_all() {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("sync state file: {error}"));
+        }
         drop(file);
         if let Err(error) = std::fs::rename(&temporary, path) {
             let _ = std::fs::remove_file(&temporary);
             return Err(format!("replace state file: {error}"));
+        }
+        #[cfg(unix)]
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            let directory = std::fs::File::open(parent)
+                .map_err(|error| format!("open state directory: {error}"))?;
+            directory
+                .sync_all()
+                .map_err(|error| format!("sync state directory: {error}"))?;
         }
         self.dirty.store(false, Ordering::Release);
         Ok(())

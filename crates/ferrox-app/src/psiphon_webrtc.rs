@@ -1166,7 +1166,7 @@ impl Shaping {
 pub(crate) struct WebRtcStream {
     out: SyncSender<Vec<u8>>,
     input: InputChannel,
-    terminal: Arc<Mutex<Vec<u8>>>,
+    terminal: Arc<Mutex<VecDeque<Vec<u8>>>>,
     pending: Arc<Mutex<(Vec<u8>, usize)>>,
     stop: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
@@ -1216,7 +1216,7 @@ impl WebRtcStream {
         let write_timeout = Arc::new(Mutex::new(Some(timeout)));
         let thread_write_timeout = Arc::clone(&write_timeout);
         let driver_shaping = shaping.as_ref().map(Arc::clone);
-        let terminal = Arc::new(Mutex::new(Vec::new()));
+        let terminal = Arc::new(Mutex::new(VecDeque::new()));
         let thread_terminal = Arc::clone(&terminal);
         webrtc.stop = Some(Arc::clone(&stop));
         thread::Builder::new()
@@ -1293,14 +1293,11 @@ impl Read for WebRtcStream {
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
             }
-            let mut terminal = lock(&self.terminal);
-            if !terminal.is_empty() {
-                let taken = terminal.len().min(buf.len());
-                buf[..taken].copy_from_slice(&terminal[..taken]);
-                terminal.drain(..taken);
-                return Ok(taken);
+            if let Some(data) = lock(&self.terminal).pop_front() {
+                pending.0 = data;
+                pending.1 = 0;
+                continue;
             }
-            drop(terminal);
             if let Some(error) = lock(&self.failure).as_ref().cloned() {
                 if let Ok(Ok(data)) = input.try_recv() {
                     pending.0 = data;
@@ -1324,6 +1321,11 @@ impl Read for WebRtcStream {
                     return Err(io::Error::from(ErrorKind::TimedOut));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
+                    if let Some(data) = lock(&self.terminal).pop_front() {
+                        pending.0 = data;
+                        pending.1 = 0;
+                        continue;
+                    }
                     if let Some(error) = lock(&self.failure).as_ref().cloned() {
                         return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
                     }
@@ -1436,7 +1438,7 @@ fn drive(
     raw: bool,
     shaping: Option<Arc<Mutex<Shaping>>>,
     write_timeout: Arc<Mutex<Option<Duration>>>,
-    terminal: Arc<Mutex<Vec<u8>>>,
+    terminal: Arc<Mutex<VecDeque<Vec<u8>>>>,
 ) {
     let mut peer_padding_done = false;
     let mut backlog: VecDeque<Result<Vec<u8>, String>> = VecDeque::new();
@@ -1457,7 +1459,7 @@ fn drive(
                         webrtc.take_received(raw, &mut peer_padding_done, &mut backlog);
                         let mut buffered = lock(&terminal);
                         for data in backlog.drain(..).flatten() {
-                            buffered.extend_from_slice(&data);
+                            buffered.push_back(data);
                         }
                         drop(buffered);
                         *lock(&failure) = Some(error);
