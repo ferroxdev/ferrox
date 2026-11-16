@@ -596,6 +596,10 @@ fn post_auth(session: &Session, auth: &str, cc_rx: u64) -> Option<bool> {
 pub(crate) static HANDSHAKES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+fn gso(sock: crate::quic::Datagram, quic: Option<&hysteria::QuicParams>) -> crate::quic::Datagram {
+    sock.with_gso(quic.is_none_or(|params| !params.disable_gso))
+}
+
 /// Dial the configured lane, wrap its socket in the mask or hop it names, and finish the QUIC handshake and auth.
 pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     #[cfg(test)]
@@ -668,12 +672,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
             (None, _) => crate::quic::Datagram::plain(sock),
         },
     };
-    let sock = sock.with_gso(
-        dial.config
-            .quic
-            .as_ref()
-            .is_none_or(|params| !params.disable_gso),
-    );
+    let sock = gso(sock, dial.config.quic.as_ref());
     let net = crate::quic::network_generation();
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
     let keep_alive = dial
@@ -2710,7 +2709,7 @@ pub(crate) fn prepare(
         Some(obfs) => crate::quic::Datagram::obfuscated(sock, obfs),
         None => crate::quic::Datagram::plain(sock),
     };
-    let sock = sock.with_gso(quic.is_none_or(|params| !params.disable_gso));
+    let sock = gso(sock, quic);
     Some(Prepared {
         sock,
         local,
@@ -3816,7 +3815,7 @@ mod tests {
         TAIL_READS.with(|reads| reads.set(0));
         assert!(drive_once(&session, Duration::from_millis(50)));
         assert_eq!(
-            TAIL_READS.with(|reads| reads.get()),
+            TAIL_READS.with(std::cell::Cell::get),
             0,
             "a short batch is already drained"
         );
@@ -3826,7 +3825,7 @@ mod tests {
         TAIL_READS.with(|reads| reads.set(0));
         assert!(drive_once(&session, Duration::from_millis(50)));
         assert_eq!(
-            TAIL_READS.with(|reads| reads.get()),
+            TAIL_READS.with(std::cell::Cell::get),
             1,
             "a full batch takes the tail"
         );
