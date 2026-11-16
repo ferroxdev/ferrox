@@ -114,8 +114,8 @@ fn build_tcp_packet(
     payload: &[u8],
 ) -> Vec<u8> {
     let tcp_len = 20 + payload.len();
-    assert!(tcp_len <= usize::from(u16::MAX), "TCP segment too large");
     let ip_len = 20 + tcp_len;
+    assert!(ip_len <= usize::from(u16::MAX), "IPv4 TCP packet too large");
     let mut pkt = vec![0u8; ip_len];
     pkt[0] = 0x45;
     pkt[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
@@ -161,8 +161,8 @@ fn build_udp_packet(
     payload: &[u8],
 ) -> Vec<u8> {
     let udp_len = 8 + payload.len();
-    assert!(udp_len <= usize::from(u16::MAX), "UDP datagram too large");
     let ip_len = 20 + udp_len;
+    assert!(ip_len <= usize::from(u16::MAX), "IPv4 UDP packet too large");
     let mut pkt = vec![0u8; ip_len];
     pkt[0] = 0x45;
     pkt[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());

@@ -1929,15 +1929,21 @@ mod tests {
             if fields[0] == "CH" {
                 assert_eq!(hex(body), fields[2], "{name} ({id})");
             } else {
-                let fixed: Vec<usize> = exts
+                let fixed: Vec<(usize, u16)> = exts
                     .iter()
                     .enumerate()
                     .filter(|(_, ext)| invariant(kind(ext)))
-                    .map(|(at, _)| at)
+                    .map(|(at, ext)| (at, kind(ext)))
                     .collect();
-                let want_fixed: Vec<usize> = fields[3]
+                let want_fixed: Vec<(usize, u16)> = fields[3]
                     .split(',')
-                    .map(|at| at.parse().expect("an index"))
+                    .map(|entry| {
+                        let (at, kind) = entry.split_once(':').expect("an index:kind");
+                        (
+                            at.parse().expect("an index"),
+                            u16::from_str_radix(kind, 16).expect("a kind"),
+                        )
+                    })
                     .collect();
                 assert_eq!(fixed, want_fixed, "{name} invariant positions");
                 let tail: usize = exts.iter().map(|ext| ext.len()).sum();
