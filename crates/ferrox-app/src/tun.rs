@@ -537,6 +537,9 @@ fn read_limit(gso: bool, mss: usize, room: usize) -> usize {
     }
 }
 
+/// The upload size a ping-pong keeps under: a request that fits one small segment is a conversation the answer follows, where a bulk upload's segment is not.
+const PING_PONG_BYTES: usize = 1024;
+
 /// How long a queue waits for an answer that follows its own upload: an echo replies in microseconds, and past this the response thread's read is the cheaper waiter.
 const PING_PONG_SPIN: std::time::Duration = std::time::Duration::from_micros(100);
 
@@ -1449,8 +1452,6 @@ struct Flow {
     send: Arc<SendWindow>,
     /// One close packet — `FIN` or `RST` — leaves per flow, whichever thread sees the end first.
     signaled: Arc<AtomicBool>,
-    /// A request-and-reply is due: a flow starts armed so an echo inserts itself in the first exchange, and one answer that misses disarms it so a bulk upload pays one non-blocking read per segment and never waits.
-    spin: AtomicBool,
     /// Held across one dequeue and the sequence it publishes, by whichever thread reads: the queue serving an answer and the response thread waiting on the same stream would otherwise number the two segments out of stream order.
     read_gate: Mutex<()>,
     /// The device's `FIN` reached the upload half, so a response thread waiting on a direct lane
@@ -1965,7 +1966,7 @@ impl Handler {
                     end = rcv.wrapping_add(sent as u32);
                     flow.rcv_nxt.store(end, Relaxed);
                     if sent > 0 && !fin {
-                        answered = self.serve_inline(half, &flow);
+                        answered = self.serve_inline(half, &flow, payload.len() <= PING_PONG_BYTES);
                     }
                 }
                 if fin && tcp.seq.wrapping_add(len) == flow.rcv_nxt.load(Relaxed) {
@@ -2009,8 +2010,8 @@ impl Handler {
         Ok(())
     }
 
-    /// Take an answer the peer has already readied, on the queue thread that still holds the flow, so a request-and-reply costs no response-thread wake. A non-blocking read never waits and the stream hands each byte to exactly one reader, so a flow thread parked in its own read keeps what this leaves. The window stays closed until one answer arrives: a bulk upload pays one `recv` per segment and never spins.
-    fn serve_inline(&mut self, half: &mut Connection, flow: &Flow) -> bool {
+    /// Take the answer a request-and-reply earns, on the queue thread that still holds the flow, so the transaction costs no response-thread wake. A non-blocking read never waits and the stream hands each byte to exactly one reader, so a flow thread parked in its own read keeps what this leaves. `wait` is the caller's verdict on whether an answer is due: a ping-pong waits one exchange window, a bulk upload takes one non-blocking read and moves on.
+    fn serve_inline(&mut self, half: &mut Connection, flow: &Flow, wait: bool) -> bool {
         // A host whose descriptor has no per-call non-blocking read keeps the answer on the response thread rather than blocking a queue behind it.
         if cfg!(not(unix)) || flow.signaled.load(Relaxed) {
             return false;
@@ -2030,8 +2031,12 @@ impl Handler {
         if self.served.len() < body + limit {
             self.served.resize(body + limit, 0);
         }
-        let armed = flow.spin.load(Relaxed);
-        let deadline = std::time::Instant::now() + PING_PONG_SPIN;
+        let deadline = std::time::Instant::now()
+            + if wait {
+                PING_PONG_SPIN
+            } else {
+                std::time::Duration::ZERO
+            };
         let mut served = false;
         loop {
             let gated = match flow.read_gate.try_lock() {
@@ -2060,7 +2065,7 @@ impl Handler {
                     break;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if !armed || std::time::Instant::now() >= deadline {
+                    if !wait || std::time::Instant::now() >= deadline {
                         break;
                     }
                     std::hint::spin_loop();
@@ -2069,7 +2074,6 @@ impl Handler {
                 Err(_) => break,
             }
         }
-        flow.spin.store(served, Relaxed);
         served
     }
 
@@ -2166,7 +2170,6 @@ impl Handler {
             mss: Arc::clone(&mss),
             send: Arc::clone(&send),
             signaled: Arc::clone(&signaled),
-            spin: AtomicBool::new(true),
             read_gate: Mutex::new(()),
             upload_finished: UploadFinished::default(),
         });
@@ -3528,7 +3531,7 @@ mod tests {
         assert_eq!(window_shift(rtcp.options), None, "no scale was offered");
     }
 
-    /// The queue takes the answer its own upload earned: bytes already sitting in the lane leave as one segment that carries the request's ack, the cursor moves by what it carried, and the arm that let it wait survives.
+    /// The queue takes the answer its own upload earned: bytes already sitting in the lane leave as one segment that carries the request's ack and the cursor moves by what it carried, and a caller that expects no answer is handed nothing rather than waited on.
     #[cfg(unix)]
     #[test]
     fn an_armed_flow_serves_the_answer_the_lane_already_holds() {
@@ -3552,12 +3555,11 @@ mod tests {
             mss: Arc::new(AtomicU32::new(1460)),
             send: Arc::new(SendWindow::new(2_000, 65535)),
             signaled: Arc::new(AtomicBool::new(false)),
-            spin: AtomicBool::new(true),
             read_gate: Mutex::new(()),
             upload_finished: UploadFinished::default(),
         };
         assert!(
-            handler.serve_inline(&mut lane, &flow),
+            handler.serve_inline(&mut lane, &flow, true),
             "the answer the lane already holds is served on this thread"
         );
         let mut out = vec![0u8; DEFAULT_MTU + 64];
@@ -3569,12 +3571,10 @@ mod tests {
         assert_eq!(tcp.seq, 2_000);
         assert_eq!(tcp.ack_num, 5_000, "the request's ack rides the answer");
         assert_eq!(flow.snd_nxt.load(Relaxed), 2_006);
-        assert!(flow.spin.load(Relaxed), "an answer keeps the arm");
         assert!(
-            !handler.serve_inline(&mut lane, &flow),
-            "a silent lane is not waited on twice"
+            !handler.serve_inline(&mut lane, &flow, false),
+            "a lane with nothing queued is not waited on when no answer is due"
         );
-        assert!(!flow.spin.load(Relaxed), "a miss disarms the flow");
     }
 
     /// The cursor a ready segment takes is the one the segment before it left, so the gate that keeps a queue and the response thread apart cannot number the stream out of order.
