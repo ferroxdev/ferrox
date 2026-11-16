@@ -335,6 +335,8 @@ pub(crate) struct Server {
     /// Whether the protocol limit that selected this entry lets it take CDN
     /// scan candidates; a bare limit keeps the advertised fronting host.
     pub(crate) scan_cdn: bool,
+    /// The CDN fronted-meek protocols this entry's capabilities support.
+    pub(crate) cdn_protocols: u8,
     pub(crate) ssh_api: bool,
     pub(crate) direct: bool,
     pub(crate) tls: bool,

@@ -66,6 +66,9 @@ const CDN_FRONTING_PROTOCOLS: &[&str] = &[
     "FRONTED-MEEK-CDN-HTTP-OSSH",
     "FRONTED-MEEK-CDN-QUIC-OSSH",
 ];
+const CDN_PROTOCOL_OSSH: u8 = 1;
+const CDN_PROTOCOL_HTTP: u8 = 2;
+const CDN_PROTOCOL_QUIC: u8 = 4;
 const DIRECT_PROTOCOLS: &[&str] = &[
     "SSH",
     "OSSH",
@@ -7798,13 +7801,14 @@ fn entry_allowed(server: &Server, protocols: &[String], fronted: bool) -> bool {
             return false;
         }
     }
+    let cdn_supported = supports_cdn_limit(server, protocols);
     normal.is_none_or(|filter| {
         matches_limit(
             server,
             filter,
             protocols.iter().any(|protocol| is_meek_protocol(protocol)),
             protocols,
-        )
+        ) || (cdn_supported && matches_shape(server, filter))
     })
 }
 
@@ -7842,13 +7846,17 @@ fn matches_meek_protocol(server: &Server, protocols: &[String]) -> bool {
         });
     };
     let base = protocol_base(meek.protocol);
+    let server_cdn = uses_fronted_meek_cdn(meek.protocol);
     let plain = base.strip_suffix("-QUIC").map(str::to_owned);
     protocols.iter().any(|protocol| {
         if !is_meek_protocol(protocol) {
             return false;
         }
+        if uses_fronted_meek_cdn(protocol) != server_cdn {
+            return false;
+        }
         let named = protocol_base(protocol);
-        named == base || plain.as_deref() == Some(named.as_str())
+        named == base || (!server_cdn && plain.as_deref() == Some(named.as_str()))
     })
 }
 
@@ -7934,6 +7942,78 @@ fn uses_fronted_meek_cdn(protocol: &str) -> bool {
     protocol.starts_with("FRONTED-MEEK") && protocol.contains("-CDN")
 }
 
+/// Whether an entry's capabilities name one of the CDN protocols in the limit.
+fn supports_cdn_limit(server: &Server, protocols: &[String]) -> bool {
+    if !server.meek.as_ref().is_some_and(|meek| meek.fronted) {
+        return false;
+    }
+    protocols.iter().any(|protocol| {
+        if !uses_fronted_meek_cdn(protocol) {
+            return false;
+        }
+        let bit = match protocol_base(protocol).as_str() {
+            "FRONTED-MEEK" => CDN_PROTOCOL_OSSH,
+            "FRONTED-MEEK-HTTP" => CDN_PROTOCOL_HTTP,
+            "FRONTED-MEEK-QUIC" => CDN_PROTOCOL_QUIC,
+            _ => 0,
+        };
+        server.cdn_protocols & bit != 0
+    })
+}
+
+/// The CDN protocol siblings an entry's capabilities support, in the
+/// reference's protocol order.
+fn cdn_variants(server: &Server) -> Vec<Server> {
+    if server.cdn_protocols == 0 {
+        return Vec::new();
+    }
+    let Some(meek) = server.meek.as_ref().filter(|meek| meek.fronted) else {
+        return Vec::new();
+    };
+    let mut variants = Vec::new();
+    for (bit, protocol, https, quic, port) in [
+        (CDN_PROTOCOL_OSSH, "FRONTED-MEEK-CDN-OSSH", true, false, 443),
+        (
+            CDN_PROTOCOL_HTTP,
+            "FRONTED-MEEK-CDN-HTTP-OSSH",
+            false,
+            false,
+            80,
+        ),
+        (
+            CDN_PROTOCOL_QUIC,
+            "FRONTED-MEEK-CDN-QUIC-OSSH",
+            true,
+            true,
+            443,
+        ),
+    ] {
+        if server.cdn_protocols & bit == 0 || meek.protocol == protocol {
+            continue;
+        }
+        let mut variant = server.clone();
+        variant.cdn_protocols = 0;
+        let meek = variant.meek.as_mut().expect("fronted");
+        meek.protocol = protocol;
+        meek.https = https;
+        meek.quic = quic;
+        meek.port = port;
+        if !quic {
+            meek.alpn.clear();
+        }
+        if meek.disable_sni || !https {
+            meek.sni.clear();
+        } else {
+            meek.dial.clone_into(&mut meek.sni);
+        }
+        for (_, front_port) in &mut meek.fronts {
+            *front_port = port;
+        }
+        variants.push(variant);
+    }
+    variants
+}
+
 /// Whether the limit that selected this entry lets it take CDN scan candidates.
 /// An empty limit (no restriction) does; a bare `FRONTED-MEEK-QUIC-OSSH`
 /// limit keeps the fronting host its entry advertised.
@@ -7984,6 +8064,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
         FRONTED_VARIANTS
     };
     let mut groups: Vec<Vec<Server>> = Vec::with_capacity(servers.len());
+    let mut scan_start = 0usize;
     for server in servers.drain(..) {
         let Some(meek) = front.of(&server) else {
             groups.push(vec![server]);
@@ -8012,6 +8093,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 &mut group,
                 &mut variants,
                 scan_cap,
+                scan_start,
             );
             let mut overrides = Vec::new();
             let mut override_variants = 0;
@@ -8036,13 +8118,16 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 &mut builtin,
                 &mut builtin_variants,
                 scan_cap,
+                scan_start,
             );
             interleave_fronted(&mut group, builtin, overrides);
             group.truncate(scan_cap);
             if group.is_empty() {
                 group.push(server);
             }
+            let emitted = group.len();
             groups.push(group);
+            scan_start = scan_start.saturating_add(emitted.min(CDN_SCAN_STRIDE));
             continue;
         }
         let mut group = Vec::with_capacity(FRONTED_VARIANTS.min(16));
@@ -8160,6 +8245,7 @@ fn push_scan_candidates(
     expanded: &mut Vec<Server>,
     variants: &mut usize,
     cap: usize,
+    start: usize,
 ) {
     for candidate in preferred {
         if !push_scan_variant(server, candidate, front, expanded, variants, cap) {
@@ -8169,18 +8255,24 @@ fn push_scan_candidates(
     let Some(spec) = settings.cdn_scan_user.as_ref() else {
         return;
     };
-    let mut number = 0;
-    while number < spec.candidate_count() {
-        if *variants >= cap {
-            return;
-        }
+    let count = spec.candidate_count();
+    if count == 0 {
+        return;
+    }
+    let mut number = u64::try_from(start).unwrap_or(u64::MAX) % count;
+    let mut emitted = 0;
+    while emitted < count && *variants < cap {
         let Some((candidate, next)) = spec.select_probe(number, skipped, shuffle_key) else {
             return;
         };
         if !push_scan_variant(server, &candidate, front, expanded, variants, cap) {
             return;
         }
+        emitted += 1;
         number = next.max(number.saturating_add(1));
+        if number >= count {
+            number = 0;
+        }
     }
 }
 
@@ -8197,6 +8289,7 @@ fn push_scan_builtin_candidates(
     expanded: &mut Vec<Server>,
     variants: &mut usize,
     cap: usize,
+    start: usize,
 ) {
     let sets = &settings.cdn_scan_builtin;
     for (index, spec) in sets.iter().enumerate() {
@@ -8205,10 +8298,14 @@ fn push_scan_builtin_candidates(
         let slots = u64::try_from(remaining / left)
             .unwrap_or(0)
             .max(u64::from(remaining > 0));
-        let count = spec.candidate_count().min(slots);
-        let mut number = 0;
+        let total = spec.candidate_count();
+        if total == 0 {
+            continue;
+        }
+        let want = total.min(slots);
+        let mut number = u64::try_from(start).unwrap_or(u64::MAX) % total;
         let mut emitted = 0;
-        while emitted < count && number < spec.candidate_count() {
+        while emitted < want && *variants < cap {
             let Some((candidate, next)) = spec.select_probe(number, skipped, shuffle_key) else {
                 break;
             };
@@ -8217,6 +8314,9 @@ fn push_scan_builtin_candidates(
             }
             emitted += 1;
             number = next.max(number.saturating_add(1));
+            if number >= total {
+                number = 0;
+            }
         }
     }
 }
@@ -8688,6 +8788,19 @@ fn select_protocols_with(
             }
             fronted_fallback && server.meek.as_ref().is_some_and(|meek| meek.fronted)
         });
+    }
+    if protocols
+        .iter()
+        .chain(initial_protocols)
+        .any(|protocol| uses_fronted_meek_cdn(protocol))
+    {
+        let mut expanded = Vec::with_capacity(servers.len());
+        for server in servers {
+            let variants = cdn_variants(&server);
+            expanded.push(server);
+            expanded.extend(variants);
+        }
+        servers = expanded;
     }
     if quic_named {
         let variants: Vec<Server> = servers.iter().filter_map(Server::quic_variant).collect();
@@ -9452,6 +9565,7 @@ pub(crate) fn server_from_entry_json(
         web_server_certificate,
         configuration_version,
         scan_cdn: true,
+        cdn_protocols: cdn_protocol_bits(entry),
         ssh_api,
         direct,
         tls,
@@ -9601,6 +9715,32 @@ pub(crate) fn fronted_quic_supported(entry: &Json) -> bool {
         .iter()
         .filter_map(Json::as_str)
         .any(|version| matches!(version, "QUICv1" | "RANDOMIZED-QUICv1"))
+}
+
+/// The CDN fronted-meek protocols the entry's capabilities support.
+fn cdn_protocol_bits(entry: &Json) -> u8 {
+    let mut bits = 0;
+    if capability_protocol(entry, &[("FRONTED-MEEK", "FRONTED-MEEK-CDN-OSSH")]).is_some() {
+        bits |= CDN_PROTOCOL_OSSH;
+    }
+    if capability_protocol(
+        entry,
+        &[("FRONTED-MEEK-HTTP", "FRONTED-MEEK-CDN-HTTP-OSSH")],
+    )
+    .is_some()
+    {
+        bits |= CDN_PROTOCOL_HTTP;
+    }
+    if fronted_quic_supported(entry)
+        && capability_protocol(
+            entry,
+            &[("FRONTED-MEEK-QUIC", "FRONTED-MEEK-CDN-QUIC-OSSH")],
+        )
+        .is_some()
+    {
+        bits |= CDN_PROTOCOL_QUIC;
+    }
+    bits
 }
 
 /// The unfronted meek capability an entry also offers.
@@ -12450,6 +12590,17 @@ mod tests {
     }
 
     #[test]
+    fn a_fronted_entry_records_every_cdn_protocol_its_capabilities_support() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK","FRONTED-MEEK-HTTP","FRONTED-MEEK-QUIC"],"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example"],"meekFrontingHosts":["cdn.example"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("entry");
+        assert_eq!(
+            server.cdn_protocols,
+            CDN_PROTOCOL_OSSH | CDN_PROTOCOL_HTTP | CDN_PROTOCOL_QUIC
+        );
+    }
+
+    #[test]
     fn a_fronted_quic_capability_selects_http3() {
         let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK","FRONTED-MEEK-QUIC"],"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example"],"meekFrontingHosts":["cdn.example"]}"#;
         let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
@@ -12977,6 +13128,103 @@ mod tests {
                 .count();
             assert!(count > 100, "server {index} got {count} variants");
         }
+    }
+
+    #[test]
+    fn a_cdn_limit_expands_every_supported_cdn_protocol() {
+        let mut server = scan_test_server();
+        server.cdn_protocols = CDN_PROTOCOL_OSSH | CDN_PROTOCOL_HTTP | CDN_PROTOCOL_QUIC;
+        let protocols: Vec<String> = CDN_FRONTING_PROTOCOLS
+            .iter()
+            .map(|protocol| (*protocol).to_owned())
+            .collect();
+        let selected = select_protocols_with(vec![server], &protocols, &[], 0, true, false, None);
+        let meeks: Vec<_> = selected
+            .iter()
+            .filter_map(|server| server.meek.as_ref())
+            .collect();
+        assert_eq!(
+            meeks.iter().map(|meek| meek.protocol).collect::<Vec<_>>(),
+            vec![
+                "FRONTED-MEEK-CDN-OSSH",
+                "FRONTED-MEEK-CDN-HTTP-OSSH",
+                "FRONTED-MEEK-CDN-QUIC-OSSH"
+            ]
+        );
+        assert_eq!(
+            meeks.iter().map(|meek| meek.port).collect::<Vec<_>>(),
+            vec![443, 80, 443]
+        );
+        assert_eq!(
+            meeks.iter().map(|meek| meek.https).collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
+        assert_eq!(
+            meeks.iter().map(|meek| meek.quic).collect::<Vec<_>>(),
+            vec![false, false, true]
+        );
+    }
+
+    #[test]
+    fn cdn_fanout_starts_each_group_at_a_different_candidate() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"protocolSelection":"cdn_fronting"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        let server = scan_test_server();
+        let skipped = HashSet::new();
+        let shuffle_key = lock(&settings.cdn_scan_state).hints().2;
+        let mut first = Vec::new();
+        let mut first_count = 0;
+        push_scan_builtin_candidates(
+            &server,
+            Front::Tunnel,
+            &settings,
+            &skipped,
+            &shuffle_key,
+            &mut first,
+            &mut first_count,
+            8,
+            0,
+        );
+        let mut next = Vec::new();
+        let mut next_count = 0;
+        push_scan_builtin_candidates(
+            &server,
+            Front::Tunnel,
+            &settings,
+            &skipped,
+            &shuffle_key,
+            &mut next,
+            &mut next_count,
+            8,
+            8,
+        );
+        let keys = |servers: &[Server]| {
+            servers
+                .iter()
+                .filter_map(|server| server.meek.as_ref())
+                .map(|meek| format!("{}|{}", meek.dial, meek.sni))
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            keys(&first),
+            keys(&next),
+            "every group restarts the same candidates"
+        );
+    }
+
+    #[test]
+    fn a_cdn_limit_does_not_keep_the_bare_protocol_sibling() {
+        let mut server = scan_test_server();
+        server.cdn_protocols = CDN_PROTOCOL_OSSH;
+        let limit = vec!["FRONTED-MEEK-CDN-OSSH".to_owned()];
+        let selected = select_protocols_with(vec![server], &limit, &[], 0, true, false, None);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].meek.as_ref().expect("fronted").protocol,
+            "FRONTED-MEEK-CDN-OSSH"
+        );
     }
 
     /// The reference reaches the built-in sets once a server's overrides run
@@ -13655,6 +13903,7 @@ mod tests {
         );
         let mut server = test_server(true);
         server.meek = Some(scan_front());
+        server.cdn_protocols = CDN_PROTOCOL_QUIC;
         let mut servers = select_protocols_with(
             vec![server],
             &settings.protocols,
@@ -15264,6 +15513,7 @@ mod tests {
             web_server_certificate: String::new(),
             configuration_version: 0,
             scan_cdn: true,
+            cdn_protocols: 0,
             ssh_api: true,
             direct: true,
             tls: false,
@@ -17071,6 +17321,7 @@ mod tests {
                 web_server_certificate: String::new(),
                 configuration_version: 0,
                 scan_cdn: true,
+                cdn_protocols: 0,
                 ssh_api: true,
                 direct: true,
                 tls: false,
@@ -17137,6 +17388,7 @@ mod tests {
                 web_server_certificate: String::new(),
                 configuration_version: 0,
                 scan_cdn: true,
+                cdn_protocols: 0,
                 ssh_api: true,
                 direct: true,
                 tls: false,
