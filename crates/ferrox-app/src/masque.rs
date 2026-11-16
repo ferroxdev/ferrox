@@ -1848,9 +1848,8 @@ fn send_version_bait(sock: &Datagram, peer: SocketAddr, wait: Duration, tries: u
         }
         let _ = sock.set_read_timeout(Some(wait));
         match sock.recv_from(&mut answer) {
-            Ok(_) => return,
             Err(error) if crate::proxy::is_timeout(&error) => {}
-            Err(_) => return,
+            _ => return,
         }
     }
 }

@@ -3141,9 +3141,11 @@ pub(crate) fn one_tap(
     if peers.no_profile_retry {
         settings.push(("noProfileRetry", crate::json::Json::Bool(true)));
     }
-    if peers.no_quic_v2 {
-        settings.push(("quicV2", crate::json::Json::Bool(false)));
-    }
+    settings.extend(
+        peers
+            .no_quic_v2
+            .then_some(("quicV2", crate::json::Json::Bool(false))),
+    );
     Ok(config_text(settings))
 }
 
