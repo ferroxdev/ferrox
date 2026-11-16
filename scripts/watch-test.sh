@@ -179,6 +179,7 @@ culprit() {
       case "$next" in
         thread) test_threads="$arg" ;;
         skip) skip_filters+=("$arg") ;;
+        logfile) : ;;
         *) test_args+=("$next" "$arg") ;;
       esac
       next=""
@@ -190,8 +191,10 @@ culprit() {
       --test-threads=*) test_threads="${arg#*=}" ;;
       --skip) next=skip ;;
       --skip=*) skip_filters+=("${arg#*=}") ;;
-      --color|--format|--logfile|--shuffle-seed) next="$arg" ;;
-      --color=*|--format=*|--logfile=*|--shuffle-seed=*) test_args+=("$arg") ;;
+      --logfile) next=logfile ;;
+      --logfile=*) : ;;
+      --color|--format|--shuffle-seed) next="$arg" ;;
+      --color=*|--format=*|--shuffle-seed=*) test_args+=("$arg") ;;
       -*) test_args+=("$arg") ;;
       *) test_filters+=("$arg") ;;
     esac
@@ -312,7 +315,7 @@ EOF
   # The stalled log printed `test early::done ... ok`, so culprit must NOT re-run it: the
   # hang is the one name still missing, and only that name is worth a process of its own.
   : >"$probes"; export FAKE_PROBE="$PWD/$probes"
-  want="$(culprit "$fake" --exact --ignored --test-threads=8 --color never hangs::forever)" \
+  want="$(culprit "$fake" --exact --ignored --test-threads=8 --color never --logfile results.log hangs::forever)" \
     || { echo "selftest: the stalled test was not named" >&2; return 1; }
   unset FAKE_PROBE
   [[ "$want" == "hangs::forever" ]] || { echo "selftest: named '$want', want hangs::forever" >&2; return 1; }
