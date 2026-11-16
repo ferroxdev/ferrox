@@ -115,6 +115,54 @@ struct Lane {
     pending: Mutex<Vec<Pending>>,
     session: Arc<Mutex<Option<Vec<u8>>>>,
     heartbeat: thread::Thread,
+    auth: Auth,
+    authed: AtomicBool,
+}
+
+struct Auth {
+    uuid: [u8; 16],
+    password: String,
+    host: String,
+    pins: Arc<[[u8; 32]]>,
+}
+
+impl Lane {
+    /// Finish the handshake once: pins first, then the exporter token, then resumption. An early
+    /// lane calls this from its driver after the flight lands; a cold lane calls it before it is
+    /// returned, so a caller never writes into a connection whose trust is still unread.
+    fn finish_handshake(&self) -> bool {
+        if self.authed.load(Ordering::Relaxed) {
+            return true;
+        }
+        let Ok(mut conn) = self.conn.lock() else {
+            return false;
+        };
+        if !conn.is_established() {
+            return !conn.is_closed();
+        }
+        if !self.auth.pins.is_empty() && !edge_pinned(&conn, &self.auth.pins, &self.auth.host) {
+            let _ = conn.close(false, 0, b"pinned certificate");
+            quic::flush_egress(&mut conn, &self.sock);
+            return false;
+        }
+        let Some(token) = export_token(&mut conn, &self.auth.uuid, self.auth.password.as_bytes())
+        else {
+            let _ = conn.close(false, 0, b"authentication");
+            quic::flush_egress(&mut conn, &self.sock);
+            return false;
+        };
+        let mut auth = Vec::with_capacity(wire::AUTH_LEN);
+        wire::encode_auth(&self.auth.uuid, &token, &mut auth);
+        if !send_frame(&mut conn, 2, &auth, true) {
+            let _ = conn.close(false, 0, b"authentication");
+            quic::flush_egress(&mut conn, &self.sock);
+            return false;
+        }
+        quic::flush_egress(&mut conn, &self.sock);
+        remember_session(&conn, &self.session);
+        self.authed.store(true, Ordering::Relaxed);
+        true
+    }
 }
 
 struct UdpSink {
@@ -241,10 +289,7 @@ impl TuicOut {
         let mut held = self.lane.lock().ok()?;
         if let Some(lane) = held.as_ref() {
             let live = !lane.stop.load(Ordering::Relaxed)
-                && lane
-                    .conn
-                    .lock()
-                    .is_ok_and(|conn| !conn.is_closed() && conn.is_established());
+                && lane.conn.lock().is_ok_and(|conn| !conn.is_closed());
             if live {
                 return Some(Arc::clone(lane));
             }
@@ -285,18 +330,11 @@ impl TuicOut {
                 }
             }
         }
-        quic::drive_handshake(&mut conn, &socket, local)?;
-        if !self.cert_pins.is_empty() && !edge_pinned(&conn, &self.cert_pins, &self.host) {
-            return None;
-        }
-        let token = export_token(&mut conn, &self.uuid, self.password.as_bytes())?;
-        let mut auth = Vec::with_capacity(wire::AUTH_LEN);
-        wire::encode_auth(&self.uuid, &token, &mut auth);
-        if !send_frame(&mut conn, 2, &auth, true) {
-            return None;
-        }
         quic::flush_egress(&mut conn, &socket);
-        remember_session(&conn, &self.session);
+        let early = self.zero_rtt && conn.is_in_early_data();
+        if !early {
+            quic::drive_handshake(&mut conn, &socket, local)?;
+        }
         let socket = Arc::new(socket);
         let conn = Arc::new(Mutex::new(conn));
         let stop = Arc::new(AtomicBool::new(false));
@@ -313,7 +351,17 @@ impl TuicOut {
             pending: Mutex::new(Vec::new()),
             session: Arc::clone(&self.session),
             heartbeat,
+            auth: Auth {
+                uuid: self.uuid,
+                password: self.password.clone(),
+                host: self.host.clone(),
+                pins: Arc::clone(&self.cert_pins),
+            },
+            authed: AtomicBool::new(false),
         });
+        if !early && !lane.finish_handshake() {
+            return None;
+        }
         thread::spawn({
             let lane = Arc::downgrade(&lane);
             move || drive_client(&lane)
@@ -823,16 +871,24 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
         }
         match lane.sock.recv_from(&mut buf) {
             Ok((n, from)) => {
+                {
+                    let Ok(mut conn) = lane.conn.lock() else {
+                        break;
+                    };
+                    let _ = conn.recv(
+                        &mut buf[..n],
+                        quiche::RecvInfo {
+                            from,
+                            to: lane.local,
+                        },
+                    );
+                }
+                if !lane.finish_handshake() {
+                    break;
+                }
                 let Ok(mut conn) = lane.conn.lock() else {
                     break;
                 };
-                let _ = conn.recv(
-                    &mut buf[..n],
-                    quiche::RecvInfo {
-                        from,
-                        to: lane.local,
-                    },
-                );
                 remember_session(&conn, &lane.session);
                 while let Ok(data) = conn.dgram_recv_buf() {
                     let _ = replies.try_send(data);
@@ -882,6 +938,9 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                 }
             }
             Err(error) if is_wait(&error) => {
+                if !lane.finish_handshake() {
+                    break;
+                }
                 let Ok(mut conn) = lane.conn.lock() else {
                     break;
                 };
@@ -2408,6 +2467,153 @@ fn poll_udp(conn: &mut quiche::Connection, inner: &mut Inner, sock: &Arc<Datagra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_identity() -> (ferrox_core::tls::TlsServerConfig, Vec<Vec<u8>>) {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["tuic.test".to_owned()]).expect("mints");
+        let roots = quic::parse_ca_pem(minted.cert.pem().as_bytes());
+        assert_ne!(roots, Vec::<Vec<u8>>::new());
+        let identity = ferrox_core::tls::TlsServerConfig {
+            certs: vec![ferrox_core::tls::CertEntry {
+                cert_chain: roots.clone(),
+                key_der: minted.signing_key.serialize_der(),
+                key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+                reload: None,
+                ocsp: None,
+            }],
+            alpn: Vec::new(),
+            min_version: None,
+            max_version: None,
+            cipher_suites: Vec::new(),
+            curves: Vec::new(),
+            send_tickets: true,
+            reject_unknown_sni: false,
+            server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
+            master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
+        };
+        (identity, roots)
+    }
+
+    fn test_out(address: SocketAddr, roots: Vec<Vec<u8>>) -> TuicOut {
+        TuicOut {
+            address: "127.0.0.1".to_owned(),
+            port: address.port(),
+            host: "tuic.test".to_owned(),
+            uuid: [0x11; 16],
+            password: "secret".to_owned(),
+            mode: RelayMode::Quic,
+            zero_rtt: true,
+            cc: None,
+            roots: Some(Arc::from(roots)),
+            cert_pins: Arc::new([]),
+            insecure: false,
+            heartbeat: Duration::from_secs(30),
+            lane: Mutex::new(None),
+            session: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn a_resumed_lane_carries_application_data_before_the_handshake() {
+        let (identity, roots) = test_identity();
+        let mut config = quic::serve_config(&identity).expect("the server builds");
+        config.enable_early_data();
+        let server = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let address = server.local_addr().expect("address");
+        let (early, observed) = std::sync::mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let sock = Datagram::plain(server);
+            let mut buf = vec![0u8; 65535];
+            let mut out = vec![0u8; 65535];
+            let mut first = quic::server_accept(&sock, address, &mut config);
+            for _ in 0..20 {
+                quic::server_idle(&mut first, &sock, &mut out);
+                thread::sleep(Duration::from_millis(10));
+            }
+            drop(first);
+            thread::sleep(Duration::from_millis(100));
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (n, from) = loop {
+                assert!(Instant::now() < deadline, "no second Initial arrived");
+                let Some((n, from)) = quic::server_poll(&sock, &mut buf) else {
+                    continue;
+                };
+                if quiche::Header::from_slice(&mut buf[..n], 20)
+                    .is_ok_and(|header| header.ty == quiche::Type::Initial)
+                {
+                    break (n, from);
+                }
+            };
+            let mut scid = [0u8; 16];
+            getrandom::fill(&mut scid).expect("random");
+            let cid = quiche::ConnectionId::from_ref(&scid);
+            let mut second =
+                quiche::accept(&cid, None, address, from, &mut config).expect("accepts");
+            second
+                .recv(&mut buf[..n], quiche::RecvInfo { from, to: address })
+                .expect("drives");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let mut data = [0u8; 64];
+                if let Ok((read, _)) = second.stream_recv(0, &mut data) {
+                    if read > 0 {
+                        assert!(
+                            !second.is_established(),
+                            "the server read early data only after the handshake"
+                        );
+                        early.send(data[..read].to_vec()).expect("reports");
+                        break;
+                    }
+                }
+                while let Ok((written, info)) = second.send(&mut out) {
+                    let _ = sock.send_to(&out[..written], info.to);
+                }
+                if let Some((n, from)) = quic::server_poll(&sock, &mut buf) {
+                    second
+                        .recv(&mut buf[..n], quiche::RecvInfo { from, to: address })
+                        .expect("drives");
+                }
+            }
+        });
+
+        let out = test_out(address, roots);
+        let first = out.lane().expect("the first lane");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "no session ticket was delivered");
+            if out.session.lock().expect("the session lock").is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        first.stop.store(true, Ordering::Relaxed);
+        let lane = out.lane().expect("the resumed lane");
+        let (established, in_early) = {
+            let conn = lane.conn.lock().expect("the lane lock");
+            (conn.is_established(), conn.is_in_early_data())
+        };
+        assert!(in_early, "the lane is not in early data");
+        assert!(!established, "the lane waited for the handshake");
+        let mut conn = lane.conn.lock().expect("the lane lock");
+        assert_eq!(
+            conn.stream_send(0, b"early connect", false)
+                .expect("queues"),
+            13
+        );
+        quic::flush_egress(&mut conn, &lane.sock);
+        drop(conn);
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the server reads early data before the handshake"),
+            b"early connect"
+        );
+        server_thread.join().expect("the server thread");
+    }
 
     fn empty_inner() -> (Inner, Sender<ResolveDone>) {
         let (done, resolved) = std::sync::mpsc::channel();

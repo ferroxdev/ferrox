@@ -302,7 +302,7 @@ Today exactly one method dials per hop. The chaining engine builds stacks as an 
 | 130 | ShadowTLS | planned | — | sing-box `protocol/shadowtls/` |
 | 131 | Snell | planned | — | sing-box `protocol/snell/` |
 | 132 | SSH outbound | planned | — | sing-box `protocol/ssh/`; LxBox `ssh://` |
-| 133 | TUIC v5 over QUIC | partial — both roles, CONNECT, native and QUIC UDP relay | 0-RTT resumption is enabled but auth still follows the handshake, so no application data rides 0-RTT; certificate pins are checked after the handshake and are supported as the only trust anchor. | sing-box `protocol/tuic/`; ZeroNet `tuic.rs`; [page](docs/function/tuic.md). LxBox `tuic://` |
+| 133 | TUIC v5 over QUIC | implemented — both roles, CONNECT, native and QUIC UDP relay, 0-RTT application data | A resumed lane returns before the handshake and CONNECT/PACKET traffic rides 0-RTT; authentication follows the handshake because the exporter key does not exist until then, as in sing-quic. Certificate pins are checked after the handshake and are supported as the only trust anchor. | sing-box `protocol/tuic/`; ZeroNet `tuic.rs`; [page](docs/function/tuic.md). LxBox `tuic://` |
 | 134 | Tailscale endpoint (tsnet, MagicDNS, exit nodes) | planned | — | sing-box `protocol/tailscale/`; LxBox feature 030 |
 | 135 | OpenConnect / OpenVPN endpoints | planned | — | sing-box `protocol/openconnect/`, `openvpn/` |
 | 136 | cloudflared (Argo) inbound | planned | — | sing-box `protocol/cloudflare/` |
