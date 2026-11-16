@@ -1408,6 +1408,11 @@ impl<S: Stream> Session<S> {
     }
 
     fn seal_parts(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> Result<(), TlsError> {
+        if self.out_at < self.out.len() {
+            out.extend_from_slice(&self.out[self.out_at..]);
+            self.out.clear();
+            self.out_at = 0;
+        }
         if self.reply_at < self.reply.len() {
             out.extend_from_slice(&self.reply[self.reply_at..]);
         }
@@ -1692,9 +1697,6 @@ impl<S: Stream> TlsProvider for Session<S> {
         if let Some(layer) = &mut self.ktls {
             return layer.seal_into(&[plaintext], out);
         }
-        if self.out_at < self.out.len() {
-            self.flush_out()?;
-        }
         self.seal_parts(&[plaintext], out)
             .map_err(std::io::Error::other)?;
         Ok(plaintext.len())
@@ -1707,9 +1709,6 @@ impl<S: Stream> TlsProvider for Session<S> {
         if let Some(layer) = &mut self.ktls {
             layer.seal_into(parts, out)?;
             return Ok(());
-        }
-        if self.out_at < self.out.len() {
-            self.flush_out()?;
         }
         self.seal_parts(parts, out).map_err(std::io::Error::other)
     }
@@ -2646,8 +2645,9 @@ mod tests {
         subject.out = b"old".to_vec();
         let mut fresh = Vec::new();
         subject.seal_into(b"new", &mut fresh).expect("seals");
-        assert_eq!(subject.io.wire, b"old");
-        assert_ne!(fresh.len(), 0);
+        assert!(subject.io.wire.is_empty());
+        assert!(fresh.starts_with(b"old"));
+        assert_ne!(fresh.len(), b"old".len());
         assert_eq!(subject.out_at, subject.out.len());
     }
 
