@@ -61,7 +61,7 @@ while [ "\$n" -gt 0 ]; do
   case "\$arg" in
     -nologo) ;;
     -out:*) out="\${arg#-out:}" ;;
-    c*) ;;   # cq and cr: the letters, which llvm-ar wants without the q.
+    cq|cr) ;;   # the archive command letters, which llvm-ar wants without the create flag.
     *)
       if [ "\$seen_archive" = 0 ] && [ -z "\$out" ]; then
         out="\$arg"
