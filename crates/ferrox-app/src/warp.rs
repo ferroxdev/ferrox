@@ -3036,6 +3036,7 @@ fn forced_edges(peers: &ForcedPeers<'_>) -> Result<ForcedEdges, String> {
 /// One-tap registration: create a device, enroll its MASQUE key, enable it,
 /// save the identity where only the user can read it, and return the outbound
 /// config that references the saved file.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn one_tap(
     path: &str,
     mode: &str,
@@ -3141,11 +3142,9 @@ pub(crate) fn one_tap(
     if peers.no_profile_retry {
         settings.push(("noProfileRetry", crate::json::Json::Bool(true)));
     }
-    settings.extend(
-        peers
-            .no_quic_v2
-            .then_some(("quicV2", crate::json::Json::Bool(false))),
-    );
+    if peers.no_quic_v2 {
+        settings.push(("quicV2", crate::json::Json::Bool(false)));
+    }
     Ok(config_text(settings))
 }
 
