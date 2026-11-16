@@ -1162,7 +1162,7 @@ impl MeekHttp {
             if Self::remaining(deadline, timeout).is_none() {
                 break;
             }
-            let addresses = match self.resolved_addresses() {
+            let addresses = match self.resolved_addresses(deadline) {
                 Ok(addresses) => addresses,
                 Err(why) => {
                     last = why;
@@ -1189,7 +1189,7 @@ impl MeekHttp {
 
     /// The candidate addresses for the current front. Tests name them directly
     /// so the resolved-IP rotation does not need a live resolver.
-    fn resolved_addresses(&self) -> Result<Vec<SocketAddr>, String> {
+    fn resolved_addresses(&self, deadline: Instant) -> Result<Vec<SocketAddr>, String> {
         #[cfg(test)]
         if let Some(addresses) = &self.injected_addresses {
             return Ok(addresses.clone());
@@ -1199,6 +1199,7 @@ impl MeekHttp {
             self.meek.provider_id.as_deref(),
             &self.meek.dial,
             self.meek.port,
+            Some(deadline),
         )
         .map_err(|error| format!("psiphon meek resolve {}: {error}", self.meek.dial))
     }
@@ -1318,6 +1319,7 @@ impl MeekHttp {
                 let stream = crate::psiphon_fragment::TlsHelloFragmentor::new(stream, fragment);
                 let mut tls = ferrox_core::tls::connect(&config, stream)
                     .map_err(|error| format!("psiphon meek tls {}: {error}", self.meek.sni))?;
+                tls.set_handshake_deadline(deadline);
                 tls.handshake().map_err(|error| {
                     format!("psiphon meek handshake {}: {error}", self.meek.sni)
                 })?;
@@ -1328,6 +1330,7 @@ impl MeekHttp {
                 let stream = crate::psiphon_fragment::TlsHelloFragmentor::new(stream, fragment);
                 let mut tls = ferrox_core::tls::connect(&config, stream)
                     .map_err(|error| format!("psiphon meek tls {}: {error}", self.meek.sni))?;
+                tls.set_handshake_deadline(deadline);
                 tls.handshake().map_err(|error| {
                     format!("psiphon meek handshake {}: {error}", self.meek.sni)
                 })?;

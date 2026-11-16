@@ -842,6 +842,13 @@ impl<S: Stream> ClientSession<S> {
         }
     }
 
+    /// Bound a shaped handshake by an absolute deadline; the other lanes use socket timeouts.
+    pub fn set_handshake_deadline(&mut self, deadline: std::time::Instant) {
+        if let Self::Shaped(session) = self {
+            session.set_handshake_deadline(Some(deadline));
+        }
+    }
+
     /// Whether a relay may read this session's transport itself and hand it only the ciphertext.
     /// The `BoringSSL` path owns its transport, so it stays on the shared shape.
     pub fn separates_ciphertext(&self) -> bool {

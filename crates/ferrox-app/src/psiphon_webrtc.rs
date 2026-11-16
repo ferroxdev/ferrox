@@ -1299,6 +1299,11 @@ impl Read for WebRtcStream {
                 continue;
             }
             if let Some(error) = lock(&self.failure).as_ref().cloned() {
+                if let Some(data) = lock(&self.terminal).pop_front() {
+                    pending.0 = data;
+                    pending.1 = 0;
+                    continue;
+                }
                 if let Ok(Ok(data)) = input.try_recv() {
                     pending.0 = data;
                     continue;

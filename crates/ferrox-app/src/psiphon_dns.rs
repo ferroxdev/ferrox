@@ -791,8 +791,18 @@ impl Config {
 }
 
 /// Resolve with an explicit config, used by the lane's settings and by tests.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn resolve_with(config: &Config, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    resolve_with_deadline(config, host, port, None)
+}
+
+/// Resolve with an optional absolute deadline shared by every query attempt.
+#[allow(clippy::too_many_lines)]
+fn resolve_with_deadline(
+    config: &Config,
+    host: &str,
+    port: u16,
+    deadline: Option<Instant>,
+) -> io::Result<Vec<SocketAddr>> {
     if let Ok(address) = host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(address, port)]);
     }
@@ -853,6 +863,7 @@ pub(crate) fn resolve_with(config: &Config, host: &str, port: u16) -> io::Result
                 config,
                 use_transform,
                 question_match,
+                deadline,
             ) {
                 Ok((addresses, ttl)) if !addresses.is_empty() => {
                     let sockets = with_port(&addresses, port);
@@ -886,6 +897,7 @@ pub(crate) fn resolve_fronting(
     provider: Option<&str>,
     host: &str,
     port: u16,
+    deadline: Option<Instant>,
 ) -> io::Result<Vec<SocketAddr>> {
     if let Some(address) = provider.and_then(|provider| config.steering_get(provider)) {
         return Ok(vec![SocketAddr::new(address, port)]);
@@ -900,7 +912,7 @@ pub(crate) fn resolve_fronting(
         }
     }
     if addresses.is_empty() {
-        resolve_with(config, host, port)
+        resolve_with_deadline(config, host, port, deadline)
     } else {
         Ok(with_port(&addresses, port))
     }
@@ -1015,6 +1027,21 @@ fn merge_reply(
     }
 }
 
+/// A capped timeout for one DNS step, or an error once the absolute deadline passed.
+fn deadline_timeout(deadline: Option<Instant>, cap: Duration) -> io::Result<Duration> {
+    let Some(deadline) = deadline else {
+        return Ok(cap);
+    };
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "psiphon DNS deadline expired",
+        ));
+    }
+    Ok(cap.min(left))
+}
+
 /// Ask one server for A and AAAA in parallel, returning the addresses and the smallest TTL.
 fn query(
     host: &str,
@@ -1022,7 +1049,9 @@ fn query(
     config: &Config,
     transform: Option<&Arc<Vec<Transform>>>,
     question_match: QuestionMatch,
+    deadline: Option<Instant>,
 ) -> io::Result<(Vec<IpAddr>, Duration)> {
+    let timeout = deadline_timeout(deadline, config.request_timeout)?;
     let (sender, receiver) = mpsc::channel();
     for record in [1u16, 28] {
         let sender = sender.clone();
@@ -1041,6 +1070,7 @@ fn query(
                         &config,
                         transform.as_deref().map(Vec::as_slice),
                         question_match,
+                        timeout,
                     ),
                 ));
             })
@@ -1053,11 +1083,10 @@ fn query(
     let mut answered = false;
     for _ in 0..2 {
         let reply = if answered {
-            receiver.recv_timeout(config.await_timeout)
+            let timeout = deadline_timeout(deadline, config.await_timeout)?;
+            receiver.recv_timeout(timeout)
         } else {
-            receiver
-                .recv()
-                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+            receiver.recv_timeout(timeout)
         };
         let Ok((record, result)) = reply else {
             break;
@@ -1082,6 +1111,7 @@ fn query_one(
     config: &Config,
     transform: Option<&[Transform]>,
     question_match: QuestionMatch,
+    timeout: Duration,
 ) -> io::Result<(Vec<IpAddr>, Duration)> {
     let bind = if server.is_ipv4() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
@@ -1090,7 +1120,7 @@ fn query_one(
     };
     let socket = UdpSocket::bind(bind)?;
     socket.connect(server)?;
-    socket.set_read_timeout(Some(config.request_timeout))?;
+    socket.set_read_timeout(Some(timeout))?;
     let id = crate::psiphon_ssh::random::<2>();
     let edns0 = coin(config.edns0_probability);
     let casing = coin(config.qname_casing_probability);
@@ -1501,7 +1531,8 @@ mod tests {
         config.preresolved_labels =
             HashMap::from([(String::new(), Config::cidrs(&["203.0.113.0/24".to_owned()]))]);
         config.preresolved_probability = 1.0;
-        let addresses = resolve_fronting(&config, None, "psiphon.test", 443).expect("preresolved");
+        let addresses =
+            resolve_fronting(&config, None, "psiphon.test", 443, None).expect("preresolved");
         assert_eq!(addresses.len(), 1);
         match addresses[0].ip() {
             IpAddr::V4(address) => assert_eq!(address.octets()[..3], [203, 0, 113]),
@@ -1641,8 +1672,9 @@ mod tests {
     fn a_steering_ip_answers_a_fronting_dial() {
         let config = Config::from_servers(&[]);
         config.remember_steering("provider", "192.0.2.10".parse().expect("address"));
-        let addresses = super::resolve_fronting(&config, Some("provider"), "front.example", 443)
-            .expect("resolve");
+        let addresses =
+            super::resolve_fronting(&config, Some("provider"), "front.example", 443, None)
+                .expect("resolve");
         assert_eq!(addresses, vec!["192.0.2.10:443".parse().expect("address")]);
     }
 
