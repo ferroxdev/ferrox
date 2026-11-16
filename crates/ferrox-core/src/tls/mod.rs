@@ -158,9 +158,10 @@ impl MasterKeyLog {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            if file
-                .set_permissions(std::fs::Permissions::from_mode(0o600))
-                .is_err()
+            if file.metadata().is_ok_and(|meta| meta.is_file())
+                && file
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .is_err()
             {
                 return None;
             }
@@ -1120,4 +1121,25 @@ pub fn accept<S: Stream + Send>(
 
 pub fn active_backends() -> &'static [&'static str] {
     &["rustls", "boring"]
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::MasterKeyLog;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn a_special_key_log_destination_keeps_its_permissions() {
+        let path = "/dev/null";
+        let mode = || {
+            std::fs::metadata(path)
+                .expect("the device exists")
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        let before = mode();
+        let _log = MasterKeyLog::open(path).expect("opens the device");
+        assert_eq!(before, mode());
+    }
 }
