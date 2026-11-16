@@ -57,6 +57,9 @@ const SPLIT_TUNNEL_CLASSIFICATION_TTL: Duration = Duration::from_hours(24);
 const SPLIT_TUNNEL_CLASSIFICATION_MAX: usize = 65_536;
 const FRONTED_VARIANTS: usize = 256;
 const FRONTED_SERVERS: usize = 512;
+/// The reference's aggressive queue: three fronted CDN protocols at an
+/// eight-way fanout per server entry before the next entry.
+const CDN_SCAN_STRIDE: usize = 24;
 
 const CDN_FRONTING_PROTOCOLS: &[&str] = &[
     "FRONTED-MEEK-CDN-OSSH",
@@ -8078,18 +8081,22 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
     let mut expanded = Vec::new();
     let mut fronted = 0;
     let depth = groups.iter().map(Vec::len).max().unwrap_or(0);
-    for index in 0..depth {
+    let stride = if scan.is_some() { CDN_SCAN_STRIDE } else { 1 };
+    for base in (0..depth).step_by(stride) {
         for group in &groups {
-            let Some(server) = group.get(index) else {
+            let end = base.saturating_add(stride).min(group.len());
+            if base >= end {
                 continue;
-            };
-            if front.present(server) {
-                if fronted >= FRONTED_SERVERS {
-                    continue;
-                }
-                fronted += 1;
             }
-            expanded.push(server.clone());
+            for server in &group[base..end] {
+                if front.present(server) {
+                    if fronted >= FRONTED_SERVERS {
+                        continue;
+                    }
+                    fronted += 1;
+                }
+                expanded.push(server.clone());
+            }
         }
     }
     *servers = expanded;
@@ -12867,6 +12874,48 @@ mod tests {
                 .count();
             assert!(count > 100, "server {index} got {count} variants");
         }
+    }
+
+    /// The reference reaches the built-in sets once a server's overrides run
+    /// out; draining the native list in server round-robin spends every opening
+    /// dial on the fixed edge overrides instead.
+    #[test]
+    fn a_builtin_scan_candidate_survives_the_dial_budget() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"protocolSelection":"cdn_fronting"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        let mut servers = Vec::new();
+        for index in 0..8 {
+            let mut server = scan_test_server();
+            let meek = server.meek.as_mut().expect("fronted");
+            meek.host = format!("cdn{index}.example");
+            meek.hosts = vec![format!("cdn{index}.example")];
+            servers.push(server);
+        }
+        apply_fronting_overrides(&mut servers, &settings);
+        let opening: Vec<_> = servers
+            .iter()
+            .take(DIAL_ATTEMPTS)
+            .filter_map(|server| server.meek.as_ref())
+            .collect();
+        assert!(
+            opening.iter().any(|meek| {
+                let Ok(address) = meek.dial.parse::<Ipv4Addr>() else {
+                    return false;
+                };
+                let address = u32::from(address);
+                !meek.disable_sni
+                    && crate::psiphon_cdn::CDN_SETS.iter().any(|set| {
+                        set.snis.iter().any(|sni| meek.sni == *sni)
+                            && set
+                                .ranges
+                                .iter()
+                                .any(|range| (range.first..=range.last).contains(&address))
+                    })
+            }),
+            "the built-in scan lost the dial budget to the fixed overrides"
+        );
     }
 
     #[test]
