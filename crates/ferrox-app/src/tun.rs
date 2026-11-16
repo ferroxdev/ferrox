@@ -3965,7 +3965,6 @@ mod tests {
         })
     }
 
-    #[cfg(unix)]
     /// Pump one queue with a datagram until the fake relay receives a frame, so a test can wait
     /// for the asynchronously opened lane without a fixed sleep.
     #[cfg(unix)]
@@ -3989,6 +3988,7 @@ mod tests {
         false
     }
 
+    #[cfg(unix)]
     fn wait_for_frames(frames: &Frames, count: usize) {
         for _ in 0..2_500 {
             if frames.lock().unwrap().len() >= count {
