@@ -155,8 +155,26 @@ if grep -E '^source = "git\+' Cargo.lock >/dev/null; then
   status=1
 fi
 
-bad_registry="$(grep -E '^source = "registry\+' Cargo.lock \
-  | grep -vE 'crates\.io-index|index\.crates\.io' || true)"
+allowed_registry="$(sed -n '/^\[sources\]/,/^\[/p' deny.toml \
+  | sed -n 's/^allow-registry[[:space:]]*=[[:space:]]*\[\(.*\)\][[:space:]]*$/\1/p' \
+  | tr ',' '\n' \
+  | sed -n 's/^[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p')"
+if [[ -z "$allowed_registry" ]]; then
+  note "deny.toml's [sources].allow-registry is empty or unreadable, so every registry source is rejected"
+fi
+bad_registry="$(awk -v allowed="$allowed_registry" '
+  function norm(value) { sub(/\/$/, "", value); return value }
+  BEGIN {
+    count = split(allowed, line, "\n")
+    for (i = 1; i <= count; i++) if (line[i] != "") ok[norm(line[i])] = 1
+  }
+  /^source = "(registry|sparse)\+/ {
+    source = $0
+    sub(/^source = "(registry|sparse)\+/, "", source)
+    sub(/"$/, "", source)
+    if (!(norm(source) in ok)) print $0
+  }
+' Cargo.lock)"
 if [[ -n "$bad_registry" ]]; then
   printf '%s\n' "$bad_registry" | sort -u | while read -r line; do
     note "$line is not the crates.io registry; deny.toml's [sources] allows no other"
@@ -165,7 +183,7 @@ if [[ -n "$bad_registry" ]]; then
 fi
 
 for banned in sing-box v2ray-rust; do
-  hits="$(grep -rnE "^[[:space:]]*(${banned}[[:space:]]*=|\[[^]]*dependencies\.${banned}\]|package[[:space:]]*=[[:space:]]*\"${banned}\")" --include='Cargo.toml' crates Cargo.toml 2>/dev/null || true)"
+  hits="$(grep -rnE "^[[:space:]]*\"?(${banned})\"?[[:space:]]*=|\[[^]]*dependencies\.\"?${banned}\"?\]|package[[:space:]]*=[[:space:]]*\"${banned}\"" --include='Cargo.toml' crates Cargo.toml 2>/dev/null || true)"
   if [[ -n "$hits" ]]; then
     note "\`${banned}\` is a comparator, read at its pin under upstream/ and never a dependency"
     printf '%s\n' "$hits"

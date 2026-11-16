@@ -56,7 +56,7 @@ fi
 check_one() {
   local name="$1" repo="$2" rev="$3" branch="$4"
   local out verdict
-  if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  if [[ ! "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
     echo "::error::source name '$name' is not a safe directory name" >&2
     return
   fi

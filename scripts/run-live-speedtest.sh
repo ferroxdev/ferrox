@@ -73,7 +73,7 @@ main() {
   if [[ -z "$cores_list" ]]; then
     cores_list="$ALL_CORES"
   fi
-  IFS=, read -r -a wanted <<<"$cores_list"
+  read -r -a wanted <<<"${cores_list//,/ }"
 
   note "building the harness driver"
   cargo build --locked --release -p ferrox-bench -p ferrox-app 2>&1 | tail -2 >&2

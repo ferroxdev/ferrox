@@ -172,7 +172,10 @@ def load_baseline(path, strict=False):
             if strict:
                 raise ValueError(f"{path}:{number}: ratio {ratio!r} is not finite")
             continue
-        known[(base, leg)] = (value, issue, basis)
+        key = (base, leg)
+        if strict and key in known:
+            raise ValueError(f"{path}:{number}: duplicate baseline for {base} / {leg}")
+        known[key] = (value, issue, basis)
     return known
 
 
@@ -536,6 +539,15 @@ def selftest():
         proc = run_self(cells, baseline)
         if proc.returncode == 0:
             return "a non-finite baseline ratio blessed a hole"
+
+        # A repeated row must not let a later, more permissive ratio overwrite the first.
+        baseline.write_text(
+            "selftest-vless-raw-down-8|server|0.70|1\n"
+            "selftest-vless-raw-down-8|server|0.50|1\n"
+        )
+        proc = run_self(cells, baseline)
+        if proc.returncode == 0 or "duplicate baseline" not in proc.stderr:
+            return f"a duplicate baseline row was accepted: {proc.stderr}"
 
     for leg, ratio, filed, want in (
         ("client", 0.50, 0.56, True),
