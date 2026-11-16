@@ -191,12 +191,18 @@ def check_spread(results, cells):
                 if stats is not None:
                     expected[engine] = stats
         reported = scenario.get("spread", {})
+        if not isinstance(reported, dict):
+            fail(f"{scenario['id']}/spread is not an object")
+            continue
         for engine, stats in expected.items():
             if engine not in reported:
                 fail(
                     f"{scenario['id']}/{engine}/spread is missing but its "
                     "throughput samples re-derive one"
                 )
+                continue
+            if not isinstance(reported[engine], dict):
+                fail(f"{scenario['id']}/{engine}/spread is not an object")
                 continue
             for key in keys:
                 check(
@@ -238,15 +244,22 @@ def check_medians(results, cells):
     for scenario in results.get("scenarios", []):
         cell = cells.get(scenario["id"])
         reported = scenario.get("medians", {})
+        if not isinstance(reported, dict):
+            fail(f"{scenario['id']}/medians is not an object")
+            continue
         expected = expected_medians(cell)
         for engine, values in expected.items():
+            entry = reported.get(engine)
+            if not isinstance(entry, dict):
+                fail(f"{scenario['id']}/{engine}: medians are missing")
+                continue
             for metric, median in values.items():
                 check(
-                    reported.get(engine, {}).get(metric) == median,
+                    entry.get(metric) == median,
                     f"{scenario['id']}/{engine}/{metric}: median "
-                    f"{reported.get(engine, {}).get(metric)} re-derives to {median}",
+                    f"{entry.get(metric)} re-derives to {median}",
                 )
-            extra = set(reported.get(engine, {})) - set(values)
+            extra = set(entry) - set(values)
             check(
                 not extra,
                 f"{scenario['id']}/{engine}: reported medians {sorted(extra)} "

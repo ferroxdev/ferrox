@@ -20,13 +20,15 @@ if [[ "$(git rev-parse --git-dir)" == "$(git rev-parse --git-common-dir)" ]]; th
   # then writes a real target. Adopt that tree as the seed instead of leaving
   # the main checkout with a private one every clone has to bypass.
   if [[ -d "$PWD/target" && ! -L "$PWD/target" ]]; then
-    echo "claim: adopting the main checkout's target as the seed" >&2
     ferrox_lock_acquire "$shared" || exit 1
     trap 'ferrox_lock_release "$shared"' EXIT
-    chmod -R u+w "$shared" 2>/dev/null || true
-    rm -rf "$shared"
-    mv "$PWD/target" "$shared"
-    ln -s "$shared" "$PWD/target"
+    if [[ -d "$PWD/target" && ! -L "$PWD/target" ]]; then
+      echo "claim: adopting the main checkout's target as the seed" >&2
+      chmod -R u+w "$shared" 2>/dev/null || true
+      rm -rf "$shared"
+      mv "$PWD/target" "$shared"
+      ln -s "$shared" "$PWD/target"
+    fi
     ferrox_lock_release "$shared"
     trap - EXIT
   fi

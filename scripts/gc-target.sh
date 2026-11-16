@@ -195,7 +195,7 @@ reset_idle_targets() {
       continue
     fi
     ferrox_target_in_use "$path/target" && continue
-    recent="$(find "$path/target" -type f -mmin "-$age" -print -quit 2>/dev/null)"
+    recent="$(find "$path/target" -type f -mmin "-$age" ! -name .cargo-lock ! -name .cargo-build-lock -print -quit 2>/dev/null)"
     if [[ -z "$recent" ]]; then
       reclaim_locked "$path/target" "$path/target"
     fi
@@ -214,7 +214,7 @@ lean_worktrees() {
     ferrox_target_in_use "$path/target" && continue
     for part in release doc debug/incremental; do
       [[ -d "$path/target/$part" ]] || continue
-      recent="$(find "$path/target/$part" -type f -mmin "-$age" -print -quit 2>/dev/null)"
+      recent="$(find "$path/target/$part" -type f -mmin "-$age" ! -name .cargo-lock ! -name .cargo-build-lock -print -quit 2>/dev/null)"
       [[ -n "$recent" ]] && continue
       reclaim_locked "$path/target" "$path/target/$part"
       if [[ $ensure_free -gt 0 ]] && (( $(free_kib "$top") >= ensure_free * 1048576 )); then
