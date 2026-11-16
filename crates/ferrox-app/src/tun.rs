@@ -3528,6 +3528,87 @@ mod tests {
         assert_eq!(window_shift(rtcp.options), None, "no scale was offered");
     }
 
+    /// The queue takes the answer its own upload earned: bytes already sitting in the lane leave as one segment that carries the request's ack, the cursor moves by what it carried, and the arm that let it wait survives.
+    #[cfg(unix)]
+    #[test]
+    fn an_armed_flow_serves_the_answer_the_lane_already_holds() {
+        let (device_end, mut peer) = unix_socketpair().unwrap();
+        let device = Device::from_handle(device_end, DEFAULT_MTU);
+        let mut handler = Handler::new(device, Arc::new(|_, _, _| Ok(())), no_associate());
+        let (lane, mut far) = UnixStream::pair().unwrap();
+        let mut lane = Connection::from(lane);
+        far.write_all(b"answer").unwrap();
+        let flow = Flow {
+            id: 1,
+            isn: 999,
+            peer_shift: 0,
+            write_half: Mutex::new(None),
+            rcv_nxt: Arc::new(AtomicU32::new(5_000)),
+            snd_nxt: Arc::new(AtomicU32::new(2_000)),
+            busy: Arc::new(AtomicBool::new(false)),
+            last_acked: AtomicU32::new(5_000),
+            local: (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 8080),
+            remote: (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 44444),
+            mss: Arc::new(AtomicU32::new(1460)),
+            send: Arc::new(SendWindow::new(2_000, 65535)),
+            signaled: Arc::new(AtomicBool::new(false)),
+            spin: AtomicBool::new(true),
+            read_gate: Mutex::new(()),
+            upload_finished: UploadFinished::default(),
+        };
+        assert!(
+            handler.serve_inline(&mut lane, &flow),
+            "the answer the lane already holds is served on this thread"
+        );
+        let mut out = vec![0u8; DEFAULT_MTU + 64];
+        let n = peer.read(&mut out).unwrap();
+        let (_ip, body) = ipv4_head(&out[..n]).unwrap();
+        let (tcp, payload) = tcp_head(body).unwrap();
+        assert_eq!(payload, b"answer", "the bytes the lane held");
+        assert_eq!(tcp.flags, FLAG_PSH | FLAG_ACK);
+        assert_eq!(tcp.seq, 2_000);
+        assert_eq!(tcp.ack_num, 5_000, "the request's ack rides the answer");
+        assert_eq!(flow.snd_nxt.load(Relaxed), 2_006);
+        assert!(flow.spin.load(Relaxed), "an answer keeps the arm");
+        assert!(
+            !handler.serve_inline(&mut lane, &flow),
+            "a silent lane is not waited on twice"
+        );
+        assert!(!flow.spin.load(Relaxed), "a miss disarms the flow");
+    }
+
+    /// The cursor a ready segment takes is the one the segment before it left, so the gate that keeps a queue and the response thread apart cannot number the stream out of order.
+    #[cfg(unix)]
+    #[test]
+    fn each_ready_segment_takes_the_cursor_the_one_before_it_left() {
+        let (lane, mut far) = UnixStream::pair().unwrap();
+        let mut lane = Connection::from(lane);
+        let gate = Mutex::new(());
+        let snd = AtomicU32::new(1_000);
+        let mut buf = [0u8; 16];
+        far.write_all(b"abc").unwrap();
+        let (n, seq) = read_upstream(
+            &gate,
+            &mut lane,
+            &mut buf,
+            std::time::Duration::from_millis(10),
+            &snd,
+        )
+        .unwrap();
+        assert_eq!((n, seq, &buf[..n]), (3, 1_000, &b"abc"[..]));
+        far.write_all(b"def").unwrap();
+        let (n, seq) = read_upstream(
+            &gate,
+            &mut lane,
+            &mut buf,
+            std::time::Duration::from_millis(10),
+            &snd,
+        )
+        .unwrap();
+        assert_eq!((n, seq, &buf[..n]), (3, 1_003, &b"def"[..]));
+        assert_eq!(snd.load(Relaxed), 1_006);
+    }
+
     /// A device whose MSS is smaller than the SYN-ACK's own options still answers the handshake: the buffer is sized for the larger of the two, where before the header slice ran past it.
     #[cfg(unix)]
     #[test]
