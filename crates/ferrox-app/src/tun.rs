@@ -3676,6 +3676,7 @@ mod tests {
         let mut lane = Connection::from(lane);
         far.write_all(b"answer").unwrap();
         let flow = test_flow(5_000, 2_000);
+        flow.misses.store(PING_PONG_MISSES, Relaxed);
         drop(peer);
         assert_eq!(
             handler.serve_inline(&mut lane, &flow),
