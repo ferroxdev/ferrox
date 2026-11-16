@@ -603,14 +603,22 @@ type Wide = portable::U4;
 pub fn backend() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
-        let wide =
-            std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx2");
-        match (GROUP_STATES, GROUP_STATES * <avx2::A8 as Lanes>::CHUNKS, wide) {
-            (4, 8, true) => {
+        let avx2 = std::is_x86_feature_detected!("avx2");
+        let wide = avx2 && std::is_x86_feature_detected!("avx512f");
+        match (
+            GROUP_STATES,
+            GROUP_STATES * <avx2::A8 as Lanes>::CHUNKS,
+            wide,
+            avx2,
+        ) {
+            (4, 8, true, _) => {
                 "4-lane core: AVX-512, one word per register, 16 blocks a pass, the eight-block pass below a pass, at runtime-detected width"
             }
-            (4, 8, false) => {
+            (4, 8, false, true) => {
                 "4-lane core: AVX2, 4 states in flight, 8 blocks per iteration, at runtime-detected width"
+            }
+            (4, _, false, false) => {
+                "4-lane core: portable, 4 states in flight, 4 blocks per iteration"
             }
             _ => "x86_64: a width this build does not have",
         }

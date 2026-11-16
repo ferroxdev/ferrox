@@ -37,7 +37,9 @@ pub struct Counts {
 
 /// Counts what the closure allocates on this thread, and only that.
 pub fn measure<R>(f: impl FnOnce() -> R) -> (R, Counts) {
-    let one_at_a_time = BUSY.lock().expect("the window is not poisoned");
+    let one_at_a_time = BUSY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let window = Window;
     ALLOCS.store(0, Ordering::Relaxed);
     BYTES.store(0, Ordering::Relaxed);
@@ -145,21 +147,11 @@ mod tests {
         assert_eq!(filled.allocs, 1, "one buffer, allocated once");
     }
 
-    /// Relay-buffer shape: capacity plus `set_len` asks for the bytes without the zero fill `vec![0u8; n]` pays for.
+    /// Relay-buffer shape: capacity asks for the bytes without the zero fill `vec![0u8; n]` pays for.
     #[test]
     fn an_uninitialised_tail_is_allocated_but_not_filled() {
-        #[allow(
-            clippy::uninit_vec,
-            reason = "the window never reads through the buffer, only at it"
-        )]
-        fn capacity_and_len(len: usize) -> Vec<u8> {
-            let mut buf = Vec::with_capacity(len);
-            // SAFETY: nothing reads the bytes this leaves uninitialised, so no uninitialised value is observed.
-            unsafe { buf.set_len(len) };
-            buf
-        }
         let ((), bare) = measure(|| {
-            let buf = capacity_and_len(16_384);
+            let buf = Vec::<u8>::with_capacity(16_384);
             std::hint::black_box(&buf);
         });
         let ((), zeroed) = measure(|| {
@@ -176,5 +168,18 @@ mod tests {
             (1, 16_384),
             "`vec![0u8; n]` is one zero-filled allocation"
         );
+    }
+
+    #[test]
+    fn a_measured_panic_does_not_poison_later_windows() {
+        let failed = std::panic::catch_unwind(|| {
+            let _: ((), Counts) = measure(|| panic!("a measured closure panics"));
+        });
+        assert!(failed.is_err(), "the measured closure should panic");
+        let ((), counts) = measure(|| {
+            let buf = vec![0u8; 8];
+            std::hint::black_box(&buf);
+        });
+        assert_eq!(counts.zeroed, 1, "the next window still measures");
     }
 }

@@ -113,13 +113,22 @@ fn compress(h: &mut [u32; 8], block: &[u8; 64], counter: u64, last: bool) {
 }
 
 /// Incremental BLAKE2s: a full 64-byte buffer compresses only when a further byte arrives, so the last block is never absorbed early.
-#[derive(Debug)]
 pub struct Blake2s {
     h: [u32; 8],
     buffer: [u8; 64],
     filled: usize,
     counter: u64,
     output: usize,
+}
+
+impl core::fmt::Debug for Blake2s {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Blake2s")
+            .field("filled", &self.filled)
+            .field("counter", &self.counter)
+            .field("output", &self.output)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Blake2s {
@@ -275,5 +284,12 @@ mod tests {
             hex(&hash(&[])),
             "69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9"
         );
+    }
+
+    #[test]
+    fn debug_does_not_print_the_keyed_state() {
+        let text = format!("{:?}", Blake2s::new(&[0xabu8; 32], 32));
+        assert!(!text.contains("buffer"), "the key block is not printed");
+        assert!(!text.contains("h:"), "the chaining state is not printed");
     }
 }

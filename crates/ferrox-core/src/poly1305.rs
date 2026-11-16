@@ -29,10 +29,15 @@ const HIBIT26: u32 = 1 << 24;
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn reduce_split(mut low: u128, mut over: u64) -> (u128, u64) {
-    while over >= 4 || (over == 3 && low.overflowing_add(5).1) {
-        let (sum, carry) = low.overflowing_add(5);
-        low = sum;
-        over = over + u64::from(carry) - 4;
+    // Two fixed masked folds cover the callers, each folding only where the reference loop does.
+    for _ in 0..2 {
+        let (lifted, carry) = low.overflowing_add(5);
+        let fold = (u8::from(over >= 4) | (u8::from(over == 3) & u8::from(carry))) != 0;
+        let select = u128::from(fold).wrapping_neg();
+        let lifted_over = over.wrapping_add(u64::from(carry)).wrapping_sub(4);
+        let over_select = u64::from(fold).wrapping_neg();
+        low = (low & !select) | (lifted & select);
+        over = (over & !over_select) | (lifted_over & over_select);
     }
     (low, over)
 }
@@ -233,11 +238,7 @@ fn combine4(
     let t1 = field_mul(&lanes[1], r3);
     let t2 = field_mul(&lanes[2], r2);
     let t3 = field_mul(&lanes[3], r26);
-    let t4 = if h_in == [0; 3] {
-        [0u32; 5]
-    } else {
-        field_mul(&to_26(h_in), &field_pow(*r4, k))
-    };
+    let t4 = field_mul(&to_26(h_in), &field_pow(*r4, k));
     let joined = add_three_normalized(&add_three_normalized(&t0, &t1, &t2), &t3, &t4);
     from_26(joined)
 }
@@ -359,7 +360,6 @@ pub struct Poly1305 {
 impl core::fmt::Debug for Poly1305 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Poly1305")
-            .field("h", &self.h)
             .field("held", &self.held)
             .finish_non_exhaustive()
     }
@@ -1356,6 +1356,8 @@ mod tests {
         ];
         #[cfg(target_arch = "x86_64")]
         let thresholds: [usize; 2] = [STRIDE2_THRESHOLD_BYTES, AVX2_THRESHOLD_BYTES];
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let thresholds: [usize; 1] = [STRIDE2_THRESHOLD_BYTES];
         for threshold in thresholds {
             lengths.extend(
                 [
@@ -1796,5 +1798,43 @@ mod tests {
             }
         }
         assert!(checked > 3000, "the sweep should be dense, not a sample");
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn reduce_split_is_the_reference_fold_at_the_edges() {
+        fn reference(low: u128, over: u64) -> (u128, u64) {
+            let (mut low, mut over) = (low, over);
+            while over >= 4 || (over == 3 && low.overflowing_add(5).1) {
+                let (sum, carry) = low.overflowing_add(5);
+                low = sum;
+                over = over + u64::from(carry) - 4;
+            }
+            (low, over)
+        }
+        for over in 0..=8u64 {
+            for low in [
+                0,
+                1,
+                4,
+                5,
+                u128::MAX - 5,
+                u128::MAX - 4,
+                u128::MAX - 1,
+                u128::MAX,
+            ] {
+                assert_eq!(
+                    reduce_split(low, over),
+                    reference(low, over),
+                    "low {low:#x} over {over}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn debug_does_not_print_the_accumulator() {
+        let text = format!("{:?}", Poly1305::new(&[0xabu8; 32]));
+        assert!(!text.contains("h:"), "the keyed accumulator is not printed");
     }
 }

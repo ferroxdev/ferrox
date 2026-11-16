@@ -468,6 +468,9 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn the_eight_block_pass_is_the_ladder_at_every_length() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
         let key = [0x5bu8; 32];
         let nonce = [0xa7u8; 12];
         let mut lengths: Vec<usize> = (0..=(2 * PASS_BYTES + 8)).collect();
@@ -505,6 +508,9 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn the_pass_matches_the_ladder_without_a_head() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
         let key = [0x11u8; 32];
         let nonce = [0x22u8; 12];
         for len in [

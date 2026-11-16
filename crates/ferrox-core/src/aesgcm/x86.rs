@@ -268,7 +268,8 @@ impl Engine {
 fn sub_word256(w: u32) -> u32 {
     unsafe {
         let k = _mm_set_epi32(w.rotate_left(8).cast_signed(), 0, 0, 0);
-        _mm_extract_epi32::<3>(_mm_aeskeygenassist_si128::<0x00>(k)).cast_unsigned()
+        _mm_cvtsi128_si32(_mm_srli_si128::<12>(_mm_aeskeygenassist_si128::<0x00>(k)))
+            .cast_unsigned()
     }
 }
 
