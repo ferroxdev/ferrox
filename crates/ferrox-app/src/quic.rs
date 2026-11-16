@@ -1234,6 +1234,11 @@ impl Batch {
         self.data().map_or(0, |data| data.len)
     }
 
+    /// How many receive slots the last read filled: a full batch may have more queued, a short one is the kernel's drain.
+    pub(crate) fn slots(&self) -> usize {
+        self.data().map_or(0, |data| data.used)
+    }
+
     /// The slot holding packet `at`, found through the prefix sums `recv_batch` wrote; a read the kernel did not coalesce has one packet per slot.
     fn slot_of(&self, at: usize) -> Option<usize> {
         let data = self.data()?;

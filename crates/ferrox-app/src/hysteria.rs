@@ -351,7 +351,7 @@ fn rebind_if_moved(session: &Session) -> bool {
     true
 }
 
-/// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling. The queue already behind the datagram the turn waited for is taken in the same turn, so a reader fed back-to-back packets pays one lock and one egress sweep for up to a batch of them rather than one of each per packet.
+/// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling. A full batch earns a tail read because the queue may still be loaded; a short one does not, because the kernel drained it.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
     if !rebind_if_moved(session) {
@@ -441,7 +441,9 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
             let info = quiche::RecvInfo { from, to: local };
             let _ = conn.recv(bytes, info);
         }
-        take_queued(&mut conn, session);
+        if batch.slots() == crate::quic::RECV_SLOTS {
+            take_queued(&mut conn, session);
+        }
         crate::quic::flush_egress(&mut conn, &session.sock);
         if session.migrated.load(Ordering::Acquire) && crate::quic::path_failed(&mut conn, local) {
             let _ = conn.close(false, 0, b"rebind");
@@ -546,9 +548,30 @@ fn control_settings(session: &Session) -> bool {
     send_all(session, 2, &settings, true)
 }
 
+const PADDING_CHARS: &[u8; 62] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+const AUTH_REQUEST_ROOM: usize = 160;
+const AUTH_RESPONSE_ROOM: usize = 96;
+
+/// The cover value the reference's auth headers carry: a random alphanumeric run whose length is uniform over `min..max`, drawn from one getrandom fill into the caller's stack room.
+pub(crate) fn hysteria_padding(min: usize, max: usize, raw: &mut [u8; 2050]) -> &str {
+    if getrandom::fill(raw).is_err() {
+        raw[2..2 + min].fill(b'a');
+        return std::str::from_utf8(&raw[2..2 + min]).expect("alphanumeric");
+    }
+    let span = max.saturating_sub(min).max(1);
+    let length = min + (usize::from(u16::from_le_bytes([raw[0], raw[1]])) % span);
+    for byte in &mut raw[2..2 + length] {
+        *byte = PADDING_CHARS[usize::from(*byte) % PADDING_CHARS.len()];
+    }
+    std::str::from_utf8(&raw[2..2 + length]).expect("alphanumeric")
+}
+
 fn post_auth(session: &Session, auth: &str, cc_rx: u64) -> Option<bool> {
-    let mut block = Vec::with_capacity(64 + auth.len());
-    hysteria::build_auth_request(auth, cc_rx, &mut block);
+    let mut raw = [0u8; 2050];
+    let padding = hysteria_padding(256, 2048, &mut raw);
+    let mut block = Vec::with_capacity(AUTH_REQUEST_ROOM + auth.len() + padding.len());
+    hysteria::build_auth_request(auth, cc_rx, padding, &mut block);
     let mut frame = Vec::with_capacity(16 + block.len());
     frames::quic_varint(&mut frame, frames::H3_HEADERS);
     frames::quic_varint(&mut frame, block.len() as u64);
@@ -1348,9 +1371,11 @@ struct UdpFlow {
 }
 
 fn answer_auth(conn: &mut quiche::Connection, ok: bool, cc_rx: u64) -> bool {
-    let mut block = Vec::with_capacity(32);
-    if ok {
-        hysteria::build_auth_response(true, cc_rx, &mut block);
+    let mut raw = [0u8; 2050];
+    let padding = ok.then(|| hysteria_padding(256, 2048, &mut raw));
+    let mut block = Vec::with_capacity(AUTH_RESPONSE_ROOM + padding.map_or(0, str::len));
+    if let Some(padding) = padding {
+        hysteria::build_auth_response(true, cc_rx, padding, &mut block);
     } else {
         ferrox_core::foxy::hpack::qpack_literal_many(&[(":status", "404")], &mut block);
     }
@@ -2765,6 +2790,33 @@ pub(crate) fn serve_prepared(
 mod tests {
     use super::*;
     use crate::quic::MAX_DATAGRAM;
+
+    #[test]
+    fn a_padded_auth_block_fits_the_handshakes_buffer() {
+        let padding = "a".repeat(2048);
+        let mut block = Vec::with_capacity(AUTH_REQUEST_ROOM + 6 + padding.len());
+        let counts = ferrox_core::alloc_count::measure(|| {
+            hysteria::build_auth_request("s3cret", 1_310_720, &padding, &mut block);
+        })
+        .1;
+        assert_eq!((counts.allocs, counts.bytes, counts.zeroed), (0, 0, 0));
+        let mut response = Vec::with_capacity(AUTH_RESPONSE_ROOM + padding.len());
+        let counts = ferrox_core::alloc_count::measure(|| {
+            hysteria::build_auth_response(true, 65_536, &padding, &mut response);
+        })
+        .1;
+        assert_eq!((counts.allocs, counts.bytes, counts.zeroed), (0, 0, 0));
+    }
+
+    #[test]
+    fn an_auth_padding_is_alphanumeric_inside_the_reference_range() {
+        let mut raw = [0u8; 2050];
+        for _ in 0..512 {
+            let padding = hysteria_padding(256, 2048, &mut raw);
+            assert!((256..2048).contains(&padding.len()), "{}", padding.len());
+            assert!(padding.bytes().all(|byte| PADDING_CHARS.contains(&byte)));
+        }
+    }
 
     /// The buffer form the decode had, kept as the bytes every path has to still reach.
     fn the_buffer_decode(input: &str) -> Option<String> {

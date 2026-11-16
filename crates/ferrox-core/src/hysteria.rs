@@ -16,6 +16,8 @@ pub const CC_RX_HEADER: &str = "hysteria-cc-rx";
 
 pub const UDP_HEADER: &str = "hysteria-udp";
 
+pub const PADDING_HEADER: &str = "hysteria-padding";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Congestion {
     Reno,
@@ -857,33 +859,45 @@ fn rate_hint(value: u64, buf: &mut [u8; 20]) -> &str {
     std::str::from_utf8(&buf[at..]).expect("decimal digits")
 }
 
-/// `cc_rx` is the receiving side's `brutalDown`, the rate hint the peer reads before choosing Brutal; 0 is "no cap".
-pub fn build_auth_request(auth: &str, cc_rx: u64, out: &mut Vec<u8>) {
+/// `cc_rx` is the receiving side's `brutalDown`, the rate hint the peer reads before choosing Brutal; 0 is "no cap". `padding` is the cover header's value, omitted when empty.
+pub fn build_auth_request(auth: &str, cc_rx: u64, padding: &str, out: &mut Vec<u8>) {
     let mut digits = [0u8; 20];
     let cc_rx = rate_hint(cc_rx, &mut digits);
+    let fields = [
+        (":method", "POST"),
+        (":scheme", "https"),
+        (":authority", AUTH_AUTHORITY),
+        (":path", AUTH_PATH),
+        (AUTH_HEADER, auth),
+        (CC_RX_HEADER, cc_rx),
+        (PADDING_HEADER, padding),
+    ];
     hpack::qpack_literal_many(
-        &[
-            (":method", "POST"),
-            (":scheme", "https"),
-            (":authority", AUTH_AUTHORITY),
-            (":path", AUTH_PATH),
-            (AUTH_HEADER, auth),
-            (CC_RX_HEADER, cc_rx),
-        ],
+        if padding.is_empty() {
+            &fields[..6]
+        } else {
+            &fields[..]
+        },
         out,
     );
 }
 
-/// `cc_rx` is this server's `brutalDown`, the rate hint the client reads before choosing Brutal; 0 is "no cap".
-pub fn build_auth_response(udp: bool, cc_rx: u64, out: &mut Vec<u8>) {
+/// `cc_rx` is this server's `brutalDown`, the rate hint the client reads before choosing Brutal; 0 is "no cap". `padding` is the cover header's value, omitted when empty.
+pub fn build_auth_response(udp: bool, cc_rx: u64, padding: &str, out: &mut Vec<u8>) {
     let mut digits = [0u8; 20];
     let cc_rx = rate_hint(cc_rx, &mut digits);
+    let fields = [
+        (":status", "233"),
+        (UDP_HEADER, if udp { "true" } else { "false" }),
+        (CC_RX_HEADER, cc_rx),
+        (PADDING_HEADER, padding),
+    ];
     hpack::qpack_literal_many(
-        &[
-            (":status", "233"),
-            (UDP_HEADER, if udp { "true" } else { "false" }),
-            (CC_RX_HEADER, cc_rx),
-        ],
+        if padding.is_empty() {
+            &fields[..3]
+        } else {
+            &fields[..]
+        },
         out,
     );
 }
@@ -1603,7 +1617,7 @@ mod tests {
     #[test]
     fn an_auth_request_carries_post_auth_and_the_brutal_hint() {
         let mut block = Vec::new();
-        build_auth_request("s3cret", 0, &mut block);
+        build_auth_request("s3cret", 0, "", &mut block);
         assert!(verify_auth_request(&block, "s3cret"));
         assert!(!verify_auth_request(&block, "wrong"));
         assert!(!verify_auth_request(&block, ""));
@@ -1613,9 +1627,14 @@ mod tests {
         assert!(fields.contains(&(b":authority".to_vec(), b"hysteria".to_vec())));
         assert!(fields.contains(&(b":path".to_vec(), b"/auth".to_vec())));
         assert!(fields.contains(&(b"hysteria-cc-rx".to_vec(), b"0".to_vec())));
+        let mut padded = Vec::new();
+        build_auth_request("s3cret", 0, "cover", &mut padded);
+        let fields = hpack::qpack_fields(&padded).expect("reads");
+        assert_eq!(fields.len(), 7);
+        assert_eq!(find(&fields, PADDING_HEADER), Some(b"cover".as_slice()));
         // A configured `brutalDown` is the hint the peer reads before choosing Brutal.
         let mut hinted = Vec::new();
-        build_auth_request("s3cret", 1_310_720, &mut hinted);
+        build_auth_request("s3cret", 1_310_720, "", &mut hinted);
         let fields = hpack::qpack_fields(&hinted).expect("reads");
         assert_eq!(find(&fields, CC_RX_HEADER), Some(b"1310720".as_slice()));
         // The digits land in a stack buffer, so a block built into a roomy buffer costs the heap nothing.
@@ -1624,7 +1643,7 @@ mod tests {
         let counts = crate::alloc_count::measure(|| {
             for _ in 0..4096 {
                 out.clear();
-                build_auth_request("s3cret", 1_310_720, &mut out);
+                build_auth_request("s3cret", 1_310_720, "", &mut out);
             }
         })
         .1;
@@ -1637,6 +1656,27 @@ mod tests {
             out.capacity(),
             capacity,
             "the block stays inside the caller's buffer"
+        );
+        // The cover header is a borrowed slice too; a roomy caller's buffer holds it without growth.
+        let padding = "a".repeat(2048);
+        let mut out = Vec::with_capacity(4096);
+        let capacity = out.capacity();
+        let counts = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                out.clear();
+                build_auth_request("s3cret", 1_310_720, &padding, &mut out);
+            }
+        })
+        .1;
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "the cover costs no heap"
+        );
+        assert_eq!(
+            out.capacity(),
+            capacity,
+            "the padded block stays inside the caller's buffer"
         );
     }
 
@@ -1668,16 +1708,22 @@ mod tests {
     #[test]
     fn an_auth_response_is_status_233_and_advertises_the_udp_lane() {
         let mut block = Vec::new();
-        build_auth_response(true, 0, &mut block);
+        build_auth_response(true, 0, "", &mut block);
         assert!(verify_auth_response(&block));
         let fields = hpack::qpack_fields(&block).expect("reads");
+        assert_eq!(fields.len(), 3);
         assert_eq!(find(&fields, UDP_HEADER), Some(b"true".as_slice()));
+        let mut padded = Vec::new();
+        build_auth_response(true, 0, "cover", &mut padded);
+        let fields = hpack::qpack_fields(&padded).expect("reads");
+        assert_eq!(fields.len(), 4);
+        assert_eq!(find(&fields, PADDING_HEADER), Some(b"cover".as_slice()));
         let mut off = Vec::new();
-        build_auth_response(false, 0, &mut off);
+        build_auth_response(false, 0, "", &mut off);
         let fields = hpack::qpack_fields(&off).expect("reads");
         assert_eq!(find(&fields, UDP_HEADER), Some(b"false".as_slice()));
         let mut hinted = Vec::new();
-        build_auth_response(true, 65_536, &mut hinted);
+        build_auth_response(true, 65_536, "", &mut hinted);
         let fields = hpack::qpack_fields(&hinted).expect("reads");
         assert_eq!(find(&fields, CC_RX_HEADER), Some(b"65536".as_slice()));
         let mut block = Vec::new();

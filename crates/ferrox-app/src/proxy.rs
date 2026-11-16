@@ -12947,8 +12947,10 @@ fn serve_hysteria_flow(mut flow: crate::hysteria::Flow, freedom: bool) {
     let Some(address) = crate::hysteria::read_request(&mut flow, deadline) else {
         return;
     };
-    let mut ok = Vec::with_capacity(3);
-    ferrox_core::hysteria::encode_tcp_response(true, &[], &[], &mut ok);
+    let mut raw = [0u8; 2050];
+    let padding = crate::hysteria::hysteria_padding(128, 1024, &mut raw);
+    let mut ok = Vec::with_capacity(4 + padding.len());
+    ferrox_core::hysteria::encode_tcp_response(true, &[], padding.as_bytes(), &mut ok);
     if flow.write_all(&ok).is_err() {
         return;
     }
@@ -70049,7 +70051,7 @@ mod tests {
                 "auth verifies"
             );
             let mut block = Vec::new();
-            ferrox_core::hysteria::build_auth_response(true, 0, &mut block);
+            ferrox_core::hysteria::build_auth_response(true, 0, "", &mut block);
             let mut frame = Vec::new();
             ferrox_core::foxy::frames::quic_varint(
                 &mut frame,
@@ -70241,7 +70243,7 @@ mod tests {
             &mut conn, &sock, 2, &settings, true, horizon
         ));
         let mut block = Vec::new();
-        ferrox_core::hysteria::build_auth_request(auth, 0, &mut block);
+        ferrox_core::hysteria::build_auth_request(auth, 0, "", &mut block);
         let mut frame = Vec::new();
         h3::quic_varint(&mut frame, h3::H3_HEADERS);
         h3::quic_varint(&mut frame, block.len() as u64);
@@ -70708,7 +70710,7 @@ mod tests {
             &mut conn, &sock, 2, &settings, true, horizon
         ));
         let mut block = Vec::new();
-        ferrox_core::hysteria::build_auth_request("bisect2-auth", 0, &mut block);
+        ferrox_core::hysteria::build_auth_request("bisect2-auth", 0, "", &mut block);
         let mut frame = Vec::new();
         h3::quic_varint(&mut frame, h3::H3_HEADERS);
         h3::quic_varint(&mut frame, block.len() as u64);
@@ -70781,7 +70783,7 @@ mod tests {
         let horizon = std::time::Instant::now() + Duration::from_secs(15);
         // The right handshake shape — a POST to the auth path — but the wrong password must still refuse and close, never quietly serve the cover page.
         let mut block = Vec::new();
-        ferrox_core::hysteria::build_auth_request("wrong-auth", 0, &mut block);
+        ferrox_core::hysteria::build_auth_request("wrong-auth", 0, "", &mut block);
         let mut frame = Vec::new();
         h3::quic_varint(&mut frame, h3::H3_HEADERS);
         h3::quic_varint(&mut frame, block.len() as u64);
@@ -70849,7 +70851,7 @@ mod tests {
             &mut conn, &sock, 2, &settings, true, horizon
         ));
         let mut block = Vec::new();
-        ferrox_core::hysteria::build_auth_request("udp-auth", 0, &mut block);
+        ferrox_core::hysteria::build_auth_request("udp-auth", 0, "", &mut block);
         let mut frame = Vec::new();
         h3::quic_varint(&mut frame, h3::H3_HEADERS);
         h3::quic_varint(&mut frame, block.len() as u64);
