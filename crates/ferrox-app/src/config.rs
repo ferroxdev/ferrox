@@ -4145,10 +4145,6 @@ mod tests {
             "the mask is the block's, not a field the tree drops"
         );
         assert!(params.disable_gso, "the switch reaches the datagram lane");
-        assert!(
-            config.insecure,
-            "the TLS verdict reaches the QUIC handshake"
-        );
         assert_eq!(
             QuicParams::stream_window(0, false),
             8 * 1024 * 1024,
@@ -4222,6 +4218,21 @@ mod tests {
                 "{text} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn a_hysteria_carrier_reads_allow_insecure() {
+        let stream = crate::json::parse(
+            r#"{"streamSettings": {"network": "hysteria", "security": "tls", "tlsSettings": {"allowInsecure": true}, "hysteriaSettings": {"version": 2, "auth": "a"}}}"#,
+        )
+        .expect("parses");
+        let Carrier::Hysteria(config) = stream_carrier(stream.get("streamSettings")) else {
+            panic!("a hysteria carrier");
+        };
+        assert!(
+            config.insecure,
+            "the TLS verdict reaches the QUIC handshake"
+        );
     }
 
     #[test]
