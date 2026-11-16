@@ -5181,7 +5181,7 @@ mod tests {
         let spec = ClientSpec::from(&outbound(port)).expect("spec");
         let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port).expect("resolve");
         let sock = Datagram::plain(sock);
-        let mut lane = establish(&spec, &sock, peer, local).expect("lane");
+        let mut lane = establish(&spec, &sock, peer, local, false).expect("lane");
         let packet = ipv4_packet([10, 14, 0, 2], [192, 0, 2, 1]);
         let mut warm = Vec::with_capacity(3 + packet.len());
         connectip::datagram_prefix(lane.stream, &mut warm);
@@ -5980,7 +5980,7 @@ mod tests {
         let spec = ClientSpec::from(&outbound(port)).expect("spec");
         let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port).expect("resolve");
         let sock = Datagram::plain(sock);
-        let mut lane = establish(&spec, &sock, peer, local).expect("lane");
+        let mut lane = establish(&spec, &sock, peer, local, false).expect("lane");
         let mut packet = vec![0u8; 1400];
         packet[0] = 0x45;
         packet[2..4].copy_from_slice(&1400u16.to_be_bytes());
@@ -6035,7 +6035,7 @@ mod tests {
         let spec = ClientSpec::from(&outbound(port)).expect("spec");
         let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port).expect("resolve");
         let sock = Datagram::plain(sock);
-        let mut lane = establish(&spec, &sock, peer, local).expect("lane");
+        let mut lane = establish(&spec, &sock, peer, local, false).expect("lane");
         let mut packet = vec![0u8; 64];
         packet[0] = 0x45;
         packet[2..4].copy_from_slice(&64u16.to_be_bytes());
