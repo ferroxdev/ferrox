@@ -314,7 +314,10 @@ ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::t
 # Re-blessed 47621538 by p2-kcp-mkcp: the KCP receive path and its witness tests
 # link into the same ferrox-app bin, moving its thin-LTO layout;
 # psiphon_shadowsocks.rs is untouched. ops.yml run 43603010310.
-ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621526 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+# Re-blessed 47810162 by the KCP sockopt and ack-batch tests: the added code
+# links into the same ferrox-app bin, moving its thin-LTO layout;
+# psiphon_shadowsocks.rs is untouched. ops.yml run 43968877918.
+ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47810162 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
 # The fused size-line walk: 256 turns over a twelve-byte line, the first digit
 # changed each turn so the call is not hoisted. The hex run is parsed in place
 # and only a non-closing terminator pays a second, CRLF-only pass; the line is
@@ -339,8 +342,12 @@ ferrox_core::socks::request 889 socks::tests::the_client_writes_the_bytes_the_pi
 # The sealed record write: 256 turns over a four-part Vision frame (uuid, five-byte
 # head, seven 8 KiB payload records, trailer) through an AES engine and a discard
 # sink. A record wholly inside the payload part is sealed from that part, so only
-# the two records that cross a part boundary are copied; 50871336 is 198716.2 per turn.
-ferrox_core::vless_encryption::tests::sealed_write_probe 50871336 vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
+# the two records that cross a part boundary are copied; 50871314 is 198715.3 per turn.
+# Re-blessed from 50871336 by the KCP sockopt and ack-batch tests: the added code
+# links into the same ferrox-core test binary, moving its thin-LTO layout;
+# vless_encryption.rs is untouched and the seal still copies only the two
+# crossing records. ops.yml run 43968877918.
+ferrox_core::vless_encryption::tests::sealed_write_probe 50871314 vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
 # The mux decode probe: 4096 decodes of one fixed New/domain frame, so the row
 # prices the frame walk and nothing else. The probe branch built from origin/main
 # read 634880 (155 a call); splitting the frame once, fusing the status with the
