@@ -382,18 +382,15 @@ impl Fragment {
                 at += width;
             }
             let mut parts = &mut parts[..count * 2];
-            match write_iovecs(raw, &mut parts) {
-                Ok(()) => {}
-                Err(_) => {
-                    let mut bytes = Vec::new();
-                    for part in parts.iter() {
-                        bytes.extend_from_slice(part);
-                    }
-                    self.gather_remaining(p, from, segment, record_len, bound, &mut bytes);
-                    bytes.extend_from_slice(&p[record_len..]);
-                    self.gathered = Some(Gathered { bytes, at: 0 });
-                    return Ok(());
+            if write_iovecs(raw, &mut parts).is_err() {
+                let mut bytes = Vec::new();
+                for part in parts.iter() {
+                    bytes.extend_from_slice(part);
                 }
+                self.gather_remaining(p, from, segment, record_len, bound, &mut bytes);
+                bytes.extend_from_slice(&p[record_len..]);
+                self.gathered = Some(Gathered { bytes, at: 0 });
+                return Ok(());
             }
         }
     }
