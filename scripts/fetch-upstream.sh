@@ -229,8 +229,12 @@ run_all() {
     fetch_one "$name" "$repo" "$rev" "$fallback" &
     running=$((running + 1))
     if [[ "$running" -ge "$cores" ]]; then
-      $reclaim 2>/dev/null || wait
-      running=$((running - 1))
+      if [[ "$reclaim" == "wait -n" ]] && $reclaim 2>/dev/null; then
+        running=$((running - 1))
+      else
+        wait
+        running=0
+      fi
     fi
   done <<<"$plan"
   wait
@@ -243,16 +247,13 @@ run_all() {
       continue
     fi
     [[ "$name" != "$primary" ]] || continue
-    if [[ ! -d "upstream/$primary/.git" ]] ||
-      [[ "$(git -C "upstream/$primary" rev-parse HEAD 2>/dev/null)" != "$rev" ]]; then
-      case " $selected " in
-        *" $primary "*) ;;
-        *)
-          selected="$selected $primary"
-          fetch_one "$primary" "$repo" "$rev" "$(primary_fallback "$primary")"
-          ;;
-      esac
-    fi
+    case " $selected " in
+      *" $primary "*) ;;
+      *)
+        selected="$selected $primary"
+        fetch_one "$primary" "$repo" "$rev" "$(primary_fallback "$primary")" || true
+        ;;
+    esac
     link_one "$name" "$repo" "$rev" "$primary"
   done <<<"$plan"
 

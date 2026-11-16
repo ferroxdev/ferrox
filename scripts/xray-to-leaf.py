@@ -52,6 +52,7 @@ def _tls_layer(stream):
             "tag": "reality",
             "settings": {
                 "serverName": settings.get("serverName", ""),
+                "fingerprint": settings.get("fingerprint") or "chrome",
                 "publicKey": settings.get("publicKey", ""),
                 "shortId": settings.get("shortId", ""),
             },

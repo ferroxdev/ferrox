@@ -19,7 +19,9 @@ case "${1:-}" in
   --check) check_only=1 ;;
   *) echo "usage: scripts/link-shared-target.sh [--all|--check]" >&2; exit 2 ;;
 esac
-ferrox_require_shared_writable "$shared"
+if [[ $check_only == 0 ]]; then
+  ferrox_require_shared_writable "$shared"
+fi
 
 top="$(git rev-parse --show-toplevel)"
 here="$(cd "$top" && pwd -P)"

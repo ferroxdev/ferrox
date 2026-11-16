@@ -15,6 +15,7 @@ MEEK_PROTOCOLS = {
     "UNFRONTED-MEEK-OSSH": "UNFRONTED-MEEK",
 }
 DIRECT_PROTOCOLS = ("SSH", "OSSH")
+UNSUPPORTED_PROTOCOLS = {"QUIC-OSSH"}
 
 
 def chosen(log_path):
@@ -25,7 +26,11 @@ def chosen(log_path):
         return set()
     seen = set()
     for found, protocol in re.findall(r"tunnel up via (\S+) (\S+)", text):
-        if protocol not in DIRECT_PROTOCOLS and protocol not in MEEK_PROTOCOLS:
+        if (
+            protocol not in DIRECT_PROTOCOLS
+            and protocol not in MEEK_PROTOCOLS
+            and protocol not in UNSUPPORTED_PROTOCOLS
+        ):
             continue
         host, port = found.rsplit(":", 1)
         if host.startswith("[") and host.endswith("]"):
@@ -113,14 +118,16 @@ def entry(state, host, selected_port, protocol):
                 if meek_port == 0:
                     continue
             return line, protocol
-        if not reference_port(server.get("sshPort")) or not reference_port(
-            server.get("sshObfuscatedPort")
-        ):
+        if not reference_port(server.get("sshPort")):
+            continue
+        if not reference_port(server.get("sshObfuscatedPort")):
             continue
         obfuscated = port(server.get("sshObfuscatedPort"))
         plain = port(server.get("sshPort"))
         key = server.get("sshObfuscatedKey")
-        if obfuscated > 0 and isinstance(key, str) and key:
+        if protocol == "SSH" and plain > 0:
+            effective = (plain, "SSH")
+        elif obfuscated > 0 and isinstance(key, str) and key:
             effective = (obfuscated, "OSSH")
         elif plain > 0:
             effective = (plain, "SSH")
@@ -231,6 +238,12 @@ def selftest():
             "capabilities": ["FRONTED-MEEK-QUIC"],
             "meekFrontingDomain": "front.example",
         },
+        {
+            "ipAddress": "192.0.2.18",
+            "sshPort": 22,
+            "sshObfuscatedPort": None,
+            "sshObfuscatedKey": "k",
+        },
     ]
     assert port(443) == 443
     assert port(443.0) == 0
@@ -246,7 +259,9 @@ def selftest():
                 line = ("0 0 0 0 " + json.dumps(server)).encode().hex()
                 handle.write(line + "\n")
         assert entry(state, "192.0.2.1", 22, "SSH") is None
+        assert entry(state, "192.0.2.1", 443, "OSSH") is None
         assert entry(state, "192.0.2.2", 22, "SSH") is None
+        assert entry(state, "192.0.2.2", 443, "OSSH") is None
         assert entry(state, "192.0.2.3", 443, "OSSH") is None
         assert entry(state, "192.0.2.4", 443, "OSSH") is not None
         assert entry(state, "192.0.2.5", 443, "OSSH") is None
@@ -267,6 +282,7 @@ def selftest():
         assert entry(state, "192.0.2.14", 443, "FRONTED-MEEK-OSSH") is None
         assert entry(state, "192.0.2.15", 8443, "UNFRONTED-MEEK-HTTPS-OSSH") is None
         assert entry(state, "192.0.2.16", 443, "FRONTED-MEEK-OSSH") is None
+        assert entry(state, "192.0.2.18", 22, "SSH") is not None
 
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
         handle.write(
@@ -275,6 +291,7 @@ def selftest():
             "psiphon: tunnel up via 192.0.2.2:22 SSH\n"
             "psiphon: tunnel up via 192.0.2.8:443 FRONTED-MEEK-OSSH\n"
             "psiphon: tunnel up via 192.0.2.17:443 FRONTED-MEEK-QUIC-OSSH\n"
+            "psiphon: tunnel up via 192.0.2.18:443 QUIC-OSSH\n"
         )
         log = handle.name
     try:
@@ -284,6 +301,7 @@ def selftest():
             ("192.0.2.2", 22, "SSH"),
             ("192.0.2.8", 443, "FRONTED-MEEK-OSSH"),
             ("192.0.2.17", 443, "FRONTED-MEEK-QUIC-OSSH"),
+            ("192.0.2.18", 443, "QUIC-OSSH"),
         }
     finally:
         os.unlink(log)
@@ -310,6 +328,13 @@ def main():
         )
         return 1
     picked = next(iter(picked))
+    if picked[2] in UNSUPPORTED_PROTOCOLS:
+        print(
+            f"psiphon-target: the native lane selected {picked[2]}, "
+            "which the verified cache cannot pin",
+            file=sys.stderr,
+        )
+        return 1
     target = entry(args.state, *picked)
     if target is None:
         print("psiphon-target: the selected server is not in the verified cache", file=sys.stderr)

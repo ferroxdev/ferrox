@@ -122,9 +122,219 @@ ferrox_adopt_seed_inputs() {
   printf 'seed: workspace artefacts reused (%s dep-info file(s) repointed)\n' "$rewritten"
 }
 
+# Adoption failed, so the clone's fingerprints are newer than the worktree's
+# checkout. Age every workspace input past them or Cargo may reuse the seed's
+# objects for source this worktree does not have.
+ferrox_invalidate_seed_inputs() {
+  local dest="$1" rel
+  while IFS= read -r rel; do
+    ferrox_touch_path "$dest" "$rel" ""
+  done < <(ferrox_reuse_paths)
+  ferrox_touch_path "$dest" crates/ferrox-prompt ""
+  ferrox_touch_path "$dest" crates/ferrox-bench ""
+}
+
 # Probe before pointing anything at it: a root-owned seed (one sudo'd build is
 # enough) fails every cargo call, and the private dir that follows looks like a
 # choice rather than a write failure.
+# One writer at a time across worktrees: claiming and reclaiming both move
+# directories under the shared tree, and two of them interleaving can delete a
+# clone another process just created.
+# The lock lives beside the seed, not inside it: adopting a main-checkout target
+# replaces the seed directory, and a lock in there would disappear with it.
+ferrox_lock_path() {
+  printf '%s.lock\n' "$1"
+}
+
+# A process holding an flock on the lock file is the lock. The kernel releases
+# it on exit, and the holder exits when its parent disappears, so stale-lock
+# recovery needs no PID file and no remove.
+ferrox_lock_acquire() {
+  local shared="$1" lock ready status waited=0
+  lock="$(ferrox_lock_path "$shared")"
+  mkdir -p "$(dirname "$lock")" || return 1
+  ready="$(mktemp "${TMPDIR:-/tmp}/ferrox-lock.XXXXXX")" || return 1
+  python3 - "$lock" "$ready" <<'PY' >/dev/null 2>&1 &
+import fcntl
+import os
+import sys
+import time
+
+path, ready = sys.argv[1], sys.argv[2]
+parent = os.getppid()
+
+
+def report(value):
+    with open(ready, "w", encoding="utf-8") as handle:
+        handle.write(value)
+
+
+try:
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    deadline = time.monotonic() + 300
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if os.getppid() != parent:
+                os._exit(1)
+            if time.monotonic() >= deadline:
+                report("timeout")
+                os._exit(1)
+            time.sleep(0.1)
+    report("ok")
+    while os.getppid() == parent:
+        time.sleep(0.2)
+    os.close(fd)
+except OSError:
+    report("error")
+    os._exit(1)
+PY
+  _FERROX_LOCK_PID=$!
+  while [[ ! -s "$ready" ]]; do
+    if ! kill -0 "$_FERROX_LOCK_PID" 2>/dev/null; then
+      rm -f "$ready"
+      _FERROX_LOCK_PID=""
+      echo "::error::could not acquire $lock" >&2
+      return 1
+    fi
+    sleep 0.05
+    waited=$((waited + 1))
+    if (( waited >= 6000 )); then
+      kill "$_FERROX_LOCK_PID" 2>/dev/null || true
+      wait "$_FERROX_LOCK_PID" 2>/dev/null || true
+      rm -f "$ready"
+      _FERROX_LOCK_PID=""
+      echo "::error::timed out waiting for $lock" >&2
+      return 1
+    fi
+  done
+  status="$(cat "$ready")"
+  rm -f "$ready"
+  if [[ "$status" != ok ]]; then
+    kill "$_FERROX_LOCK_PID" 2>/dev/null || true
+    wait "$_FERROX_LOCK_PID" 2>/dev/null || true
+    _FERROX_LOCK_PID=""
+    echo "::error::could not acquire $lock ($status)" >&2
+    return 1
+  fi
+}
+
+ferrox_lock_release() {
+  local pid="${_FERROX_LOCK_PID:-}"
+  [[ -n "$pid" ]] || return 0
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  _FERROX_LOCK_PID=""
+}
+
+# Cargo holds its per-target lock for the whole build, so an open descriptor is
+# the witness that a target is live even when no file changed in the age window.
+# Without lsof or fuser, 2 says "unknown": cleanup must skip, not assume idle.
+ferrox_target_in_use() {
+  local target="$1" profile
+  [[ -d "$target" ]] || return 1
+  local -a locks=()
+  for profile in debug release doc; do
+    locks+=("$target/$profile/.cargo-lock" "$target/$profile/.cargo-build-lock")
+  done
+  locks+=("$target/.cargo-lock")
+  if command -v lsof >/dev/null; then
+    lsof -t "${locks[@]}" >/dev/null 2>&1
+    return
+  fi
+  if command -v fuser >/dev/null; then
+    fuser -s "${locks[@]}" >/dev/null 2>&1
+    return
+  fi
+  return 2
+}
+
+# Reserve Cargo's own locks before a reclaimer moves a target aside. The holder
+# is a process, so a build starting after the probe either waits on these locks
+# or finds the target gone; the inode a build waits on stays inside the moved
+# tree while it is deleted.
+ferrox_target_reserve() {
+  local target="$1" ready status waited=0
+  [[ -d "$target" ]] || return 1
+  ready="$(mktemp "${TMPDIR:-/tmp}/ferrox-reserve.XXXXXX")" || return 1
+  python3 - "$target" "$ready" <<'PY' >/dev/null 2>&1 &
+import fcntl
+import os
+import sys
+import time
+
+target, ready = sys.argv[1], sys.argv[2]
+
+
+def report(value):
+    with open(ready, "w", encoding="utf-8") as handle:
+        handle.write(value)
+
+
+fds = []
+try:
+    for part in ("", "debug", "release", "doc"):
+        directory = os.path.join(target, part) if part else target
+        os.makedirs(directory, exist_ok=True)
+        for name in (".cargo-lock", ".cargo-build-lock"):
+            fd = os.open(os.path.join(directory, name), os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fds.append(fd)
+except OSError:
+    for fd in fds:
+        os.close(fd)
+    report("busy")
+    os._exit(1)
+report("ok")
+parent = os.getppid()
+while os.getppid() == parent:
+    time.sleep(0.2)
+for fd in fds:
+    os.close(fd)
+PY
+  _FERROX_RESERVE_PID=$!
+  while [[ ! -s "$ready" ]]; do
+    if ! kill -0 "$_FERROX_RESERVE_PID" 2>/dev/null; then
+      rm -f "$ready"
+      _FERROX_RESERVE_PID=""
+      return 1
+    fi
+    sleep 0.05
+    waited=$((waited + 1))
+    if (( waited >= 200 )); then
+      kill "$_FERROX_RESERVE_PID" 2>/dev/null || true
+      wait "$_FERROX_RESERVE_PID" 2>/dev/null || true
+      rm -f "$ready"
+      _FERROX_RESERVE_PID=""
+      return 1
+    fi
+  done
+  status="$(cat "$ready")"
+  rm -f "$ready"
+  if [[ "$status" != ok ]]; then
+    kill "$_FERROX_RESERVE_PID" 2>/dev/null || true
+    wait "$_FERROX_RESERVE_PID" 2>/dev/null || true
+    _FERROX_RESERVE_PID=""
+    return 1
+  fi
+}
+
+ferrox_target_unreserve() {
+  local pid="${_FERROX_RESERVE_PID:-}"
+  [[ -n "$pid" ]] || return 0
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  _FERROX_RESERVE_PID=""
+}
+
+ferrox_claim_is_live() {
+  local staging="$1" owner
+  owner="$(awk 'NR == 1 {print $1}' "$staging/.ferrox-claim" 2>/dev/null)"
+  [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null
+}
+
 ferrox_require_shared_writable() {
   local shared="$1" probe
   probe="$shared/.write-probe"
@@ -212,9 +422,10 @@ ferrox_clone_dir() {
 # copy-on-write blocks every branch pays for. `FERROX_TARGET_PROFILES` widens it
 # for a branch that really does measure release locally.
 ferrox_target_profiles() {
-  local part
+  local part profiles="${FERROX_TARGET_PROFILES:-debug}"
   local -a parts
-  read -ra parts <<< "${FERROX_TARGET_PROFILES:-debug}"
+  profiles="${profiles//$'\n'/ }"
+  read -ra parts <<< "$profiles"
   for part in "${parts[@]}"; do
     case "$part" in
       debug|release|doc) printf '%s\n' "$part" ;;
@@ -229,6 +440,7 @@ ferrox_clone_target() {
   local profiles
   local -a parts
   profiles="$(ferrox_target_profiles)" || return 1
+  profiles="${profiles//$'\n'/ }"
   read -ra parts <<< "$profiles"
   rm -rf "$staging"
   mkdir -p "$staging"
@@ -244,7 +456,7 @@ ferrox_clone_target() {
   fi
   rm -rf "$staging/debug/incremental" "$staging/release/incremental"
   rm -f "$staging"/debug/.cargo-*lock "$staging"/release/.cargo-*lock
-  : > "$staging/.ferrox-claim"
+  printf '%s\n' "$$" > "$staging/.ferrox-claim"
   # A half-copied target must never read as claimed: replace `target` only once
   # the clone is complete.
   rm -rf "$dest/target"
@@ -280,6 +492,11 @@ ferrox_claim_target() {
   if ferrox_target_is_own "$dest"; then
     return 0
   fi
+  ferrox_lock_acquire "$shared" || return 1
+  if ferrox_target_is_own "$dest"; then
+    ferrox_lock_release "$shared"
+    return 0
+  fi
   # Refresh the seed before the clone, so the clone carries the fresh artefacts
   # rather than the ones the refresh would have replaced. Adoption is only safe
   # when the clone was taken after a successful refresh.
@@ -292,9 +509,10 @@ ferrox_claim_target() {
     fresh=1
   fi
   ferrox_clone_target "$dest" "$shared"
-  if [[ "$fresh" == 1 ]]; then
-    ferrox_adopt_seed_inputs "$dest" "$shared" || true
+  if [[ "$fresh" != 1 ]] || ! ferrox_adopt_seed_inputs "$dest" "$shared"; then
+    ferrox_invalidate_seed_inputs "$dest"
   fi
+  ferrox_lock_release "$shared"
 }
 
 ferrox_config_is_shared() {

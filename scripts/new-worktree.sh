@@ -20,12 +20,18 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib-shared-target.sh"
 # The seed is only read: each worktree gets a copy-on-write clone, so its build
 # holds a lock nobody else wants and shares the seed's blocks on disk.
 shared="$(ferrox_shared_target)"
+# `cargo clean` in the main checkout leaves a real target there; adopt it as the
+# seed before the clone, or every new worktree would start from a stale seed.
+if main="$(ferrox_main_worktree)"; then
+  (cd "$main" && bash scripts/claim-target.sh >/dev/null 2>&1) || true
+fi
 ferrox_require_shared_writable "$shared"
 
 if [[ -e "$dest" ]]; then
   # A retry, or a worktree another agent's session left behind: repair it rather
   # than refuse, because a stranded worktree is what grows a private target.
   if git -C "$top" worktree list --porcelain | sed -n 's/^worktree //p' | grep -Fxq "$dest"; then
+    ferrox_write_cargo_config "$top" "$shared"
     ferrox_link_worktree "$dest" "$top" "$shared" >/dev/null
     if command -v gt >/dev/null 2>&1; then (cd "$dest" && gt track --parent main --no-interactive >/dev/null 2>&1) && echo "graphite: branch $name tracked onto main" || true; fi
     echo "worktree: $dest (already exists, pointers and target repaired)"

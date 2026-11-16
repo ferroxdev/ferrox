@@ -14,6 +14,7 @@ import ipaddress
 import json
 import sys
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 DEFAULT_WIREGUARD_ADDRESSES = ("10.0.0.1", "fd59:7153:2388:b5fd::1")
 DEFAULT_WIREGUARD_ALLOWED = ("0.0.0.0/0", "::/0")
@@ -206,6 +207,29 @@ def _tls(stream):
     return tls
 
 
+def _early_data(path):
+    """Split Xray's `?ed=N` WebSocket marker from the path sing-box speaks."""
+    if not isinstance(path, str):
+        raise ValueError("`wsSettings.path` must be a string")
+    parsed = urlsplit(path)
+    kept = []
+    early = None
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key == "ed":
+            if early is None:
+                try:
+                    early = int(value)
+                except ValueError as error:
+                    raise ValueError(
+                        "`wsSettings.path` has a non-numeric `ed`"
+                    ) from error
+                if early < 0:
+                    raise ValueError("`wsSettings.path` has a negative `ed`")
+            continue
+        kept.append((key, value))
+    return urlunsplit(parsed._replace(query=urlencode(kept))), early
+
+
 def _transport(stream):
     network = stream.get("network", "tcp")
     if network in ("tcp", ""):
@@ -214,7 +238,11 @@ def _transport(stream):
         settings = stream.get("wsSettings") or {}
         transport = {"type": "ws"}
         if "path" in settings:
-            transport["path"] = settings["path"]
+            path, early = _early_data(settings["path"])
+            transport["path"] = path
+            if early is not None:
+                transport["max_early_data"] = early
+                transport["early_data_header_name"] = "Sec-WebSocket-Protocol"
         return transport
     if network == "grpc":
         settings = stream.get("grpcSettings") or {}
@@ -331,7 +359,37 @@ def _certificate(settings):
 
 
 def _server_tls(stream):
-    if stream.get("security") != "tls":
+    security = stream.get("security")
+    if security == "reality":
+        settings = stream.get("realitySettings") or {}
+        short_ids = settings.get("shortIds") or []
+        if not isinstance(short_ids, list):
+            raise ValueError("`realitySettings.shortIds` must be an array")
+        reality = {
+            "enabled": True,
+            "private_key": settings.get("privateKey", ""),
+            "short_id": short_ids,
+        }
+        tls = {"enabled": True, "reality": reality}
+        names = settings.get("serverNames")
+        if isinstance(names, list) and names:
+            tls["server_name"] = names[0]
+        dest = settings.get("dest")
+        if dest:
+            host, separator, port = str(dest).rpartition(":")
+            if not separator or not host:
+                raise ValueError("`realitySettings.dest` is not a host and port")
+            if host.startswith("[") and host.endswith("]"):
+                host = host[1:-1]
+            try:
+                port = int(port)
+            except ValueError as error:
+                raise ValueError("`realitySettings.dest` has no numeric port") from error
+            if not 0 < port < 65536:
+                raise ValueError("`realitySettings.dest` has a port outside 1...65535")
+            reality["handshake"] = {"server": host, "server_port": port}
+        return tls
+    if security != "tls":
         return None
     settings = stream.get("tlsSettings") or {}
     certificate, key = _certificate(settings)
