@@ -13,7 +13,7 @@ use flate2::read::ZlibDecoder;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::io::Read;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RECORD_VERSION: u8 = 1;
 const SESSION_PACKET: u8 = 1;
@@ -439,6 +439,8 @@ pub(crate) trait Transport: Send {
     fn round_trip(&mut self, body: &[u8]) -> Result<Vec<u8>, String>;
 
     fn set_timeout(&mut self, timeout: Duration);
+
+    fn set_deadline(&mut self, _deadline: Option<Instant>) {}
 }
 
 /// A fronted plaintext broker transport that reuses one HTTP stream.
@@ -454,6 +456,10 @@ impl Transport for MeekTransport {
     fn set_timeout(&mut self, timeout: Duration) {
         self.http.set_timeout(timeout);
     }
+
+    fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.http.set_deadline(deadline);
+    }
 }
 
 /// The Noise transport keys of one established session.
@@ -464,18 +470,24 @@ struct Session {
     noise: snow::TransportState,
 }
 
+/// The per-offer values that must not be shared through the client.
+pub(crate) struct OfferSettings {
+    pub(crate) secret: [u8; 32],
+    pub(crate) traffic_shaping: Option<TrafficShapingParameters>,
+}
+
 /// A broker client with at most one live session.
 pub(crate) struct Client {
     broker: Broker,
     static_secret: [u8; 32],
     root: [u8; 32],
-    offer_secret: [u8; 32],
     transport: Box<dyn Transport>,
     session: Option<Session>,
     offer_timeout: Duration,
     offer_personal_timeout: Duration,
+    offer_deadline: Option<Instant>,
+    offer_budget: Duration,
     relay_timeout: Duration,
-    traffic_shaping: Option<TrafficShapingParameters>,
     nat_type: u64,
 }
 
@@ -495,30 +507,32 @@ impl Client {
             broker,
             static_secret,
             root,
-            offer_secret: random::<32>(),
             transport,
             session: None,
             offer_timeout: DEFAULT_OFFER_TIMEOUT,
             offer_personal_timeout: DEFAULT_OFFER_PERSONAL_TIMEOUT,
+            offer_deadline: None,
+            offer_budget: Duration::ZERO,
             relay_timeout: DEFAULT_RELAY_TIMEOUT,
-            traffic_shaping: None,
             nat_type: 0,
         })
-    }
-
-    /// Set the data-channel traffic shaping the proxy should apply.
-    pub(crate) fn set_traffic_shaping(&mut self, parameters: TrafficShapingParameters) {
-        self.traffic_shaping = Some(parameters);
-    }
-
-    /// The root obfuscation secret this dial carries, which seeds both shaping PRNGs.
-    pub(crate) fn root_obfuscation_secret(&self) -> [u8; 32] {
-        self.offer_secret
     }
 
     /// Record the locally discovered NAT type on the offer.
     pub(crate) fn set_nat_type(&mut self, nat_type: u64) {
         self.nat_type = nat_type;
+    }
+
+    /// Apply this dial's offer budget and absolute deadline to a shared client.
+    pub(crate) fn set_offer_timeouts(
+        &mut self,
+        offer: Duration,
+        personal: Duration,
+        deadline: Instant,
+    ) {
+        self.offer_timeout = offer;
+        self.offer_personal_timeout = personal;
+        self.offer_deadline = Some(deadline);
     }
 
     /// Build a client from a broker spec and one paired front.
@@ -579,38 +593,57 @@ impl Client {
         personal_compartments: &[[u8; 32]],
         sdp: &str,
         metrics: &Metrics,
+        settings: &OfferSettings,
     ) -> Result<Offer, String> {
-        if common_compartments.is_empty() && personal_compartments.is_empty() {
-            return Err("psiphon broker: no compartments".to_owned());
-        }
-        let mut metrics = metrics.clone();
-        if self.nat_type != 0 {
-            metrics.nat_type = self.nat_type;
-        }
-        let request = client_offer_request(
-            destination,
-            common_compartments,
-            personal_compartments,
-            sdp,
-            &metrics,
-            self.offer_secret,
-            self.traffic_shaping.as_ref(),
-        );
-        self.transport
-            .set_timeout(if personal_compartments.is_empty() {
+        let result = (|| {
+            if common_compartments.is_empty() && personal_compartments.is_empty() {
+                return Err("psiphon broker: no compartments".to_owned());
+            }
+            let mut metrics = metrics.clone();
+            if self.nat_type != 0 {
+                metrics.nat_type = self.nat_type;
+            }
+            let request = client_offer_request(
+                destination,
+                common_compartments,
+                personal_compartments,
+                sdp,
+                &metrics,
+                settings.secret,
+                settings.traffic_shaping.as_ref(),
+            );
+            self.offer_budget = if personal_compartments.is_empty() {
                 self.offer_timeout
             } else {
                 self.offer_personal_timeout
-            });
-        let reply = self.session_request(&record(CLIENT_OFFER_REQUEST, &request)?)?;
-        let response = decode_record(&reply)?;
-        if response.kind != CLIENT_OFFER_RESPONSE {
-            return Err(format!(
-                "psiphon broker: offer response is record {}",
-                response.kind
-            ));
+            };
+            self.transport.set_timeout(self.offer_budget);
+            self.refresh_offer_timeout()?;
+            let reply = self.session_request(&record(CLIENT_OFFER_REQUEST, &request)?)?;
+            let response = decode_record(&reply)?;
+            if response.kind != CLIENT_OFFER_RESPONSE {
+                return Err(format!(
+                    "psiphon broker: offer response is record {}",
+                    response.kind
+                ));
+            }
+            Ok(parse_offer(&response.value))
+        })();
+        self.offer_deadline = None;
+        self.transport.set_deadline(None);
+        result
+    }
+
+    /// Apply the offer's absolute deadline to the transport.
+    fn refresh_offer_timeout(&mut self) -> Result<(), String> {
+        let Some(deadline) = self.offer_deadline else {
+            return Ok(());
+        };
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return Err("psiphon broker: offer deadline expired".to_owned());
         }
-        Ok(parse_offer(&response.value))
+        self.transport.set_deadline(Some(deadline));
+        Ok(())
     }
 
     /// Relay one server packet to the broker and return the broker's next
@@ -652,10 +685,24 @@ impl Client {
                 (Value::UInt(2), Value::Bytes(request.to_vec())),
             ]),
         )?;
+        let result = self.session_round_trip(&round_trip, round_trip_id);
+        if result.is_err() {
+            self.session = None;
+        }
+        result
+    }
+
+    /// Complete one session round trip, reusing the established session if there is one.
+    fn session_round_trip(
+        &mut self,
+        round_trip: &[u8],
+        round_trip_id: [u8; 32],
+    ) -> Result<Vec<u8>, String> {
         let plain = if self.session.is_none() {
-            self.handshake(&round_trip)?
+            self.handshake(round_trip)?
         } else {
-            let payload = self.send_packet(&round_trip)?;
+            let payload = self.send_packet(round_trip)?;
+            self.refresh_offer_timeout()?;
             let reply = self.transport.round_trip(&payload)?;
             self.receive_packet(&reply)?
         };
@@ -709,6 +756,7 @@ impl Client {
             .write_message(&[], &mut buffer)
             .map_err(|error| format!("psiphon broker: noise e: {error}"))?;
         let first = wrap_session_packet(session_id, 0, &buffer[..length], &send)?;
+        self.refresh_offer_timeout()?;
         let reply = self.transport.round_trip(&first)?;
         let packet = unwrap_session_packet(&reply, &receive, false)?;
         if packet.session_id != session_id || packet.nonce != 0 {
@@ -724,6 +772,7 @@ impl Client {
             .write_message(first_request, &mut buffer)
             .map_err(|error| format!("psiphon broker: noise s: {error}"))?;
         let third = wrap_session_packet(session_id, 0, &buffer[..length], &send)?;
+        self.refresh_offer_timeout()?;
         let reply = self.transport.round_trip(&third)?;
         let transport = noise
             .into_transport_mode()
@@ -971,7 +1020,6 @@ fn client_offer_request(
             Value::Array(vec![Value::UInt(1), Value::UInt(3), Value::UInt(4)]),
         ),
         (Value::UInt(6), Value::Bytes(offer_secret.to_vec())),
-        (Value::UInt(7), Value::Bool(true)),
         (
             Value::UInt(9),
             Value::Bytes(destination.packed_server_entry.clone()),
@@ -1963,6 +2011,10 @@ mod tests {
                 &[],
                 "v=0\r\n",
                 &Metrics::new(Value::Map(vec![])),
+                &OfferSettings {
+                    secret: [3; 32],
+                    traffic_shaping: None,
+                },
             )
             .unwrap();
         assert_eq!(offer.answer_sdp, "answer");

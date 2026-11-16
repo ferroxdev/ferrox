@@ -880,9 +880,6 @@ impl Read for QuicStream {
         }
         let mut state = lock(&self.shared.state);
         loop {
-            if let Some(error) = state.error.clone() {
-                return Err(io::Error::new(ErrorKind::BrokenPipe, error));
-            }
             if state.read_at < state.recv.len() {
                 let available = &state.recv[state.read_at..];
                 let count = buf.len().min(available.len());
@@ -897,6 +894,9 @@ impl Read for QuicStream {
                     state.read_at = 0;
                 }
                 return Ok(count);
+            }
+            if let Some(error) = state.error.clone() {
+                return Err(io::Error::new(ErrorKind::BrokenPipe, error));
             }
             if state.eof {
                 return Ok(0);
@@ -1515,6 +1515,9 @@ impl Engine {
     }
 
     fn apply_peer_params(&mut self, params: &[u8]) -> Result<(), String> {
+        self.data = 0;
+        self.stream = 0;
+        self.bidi = 0;
         let mut at = 0usize;
         while at < params.len() {
             let id = get_varint(params, &mut at)
@@ -1536,9 +1539,6 @@ impl Engine {
             at = end;
         }
         self.peer_params = true;
-        if self.stream == 0 {
-            self.stream = self.data;
-        }
         if self.bidi == 0 {
             return Err("psiphon quic: peer refuses a stream".to_owned());
         }
@@ -1923,7 +1923,7 @@ impl Engine {
 
     fn pad_initial(&self, payload: &mut Vec<u8>, _pn: u64) {
         let header = long_header_len(true, self.dcid.len(), self.scid.len(), 4);
-        let filled = header + 4 + payload.len() + 16;
+        let filled = header + payload.len() + 16;
         let target = self.max_datagram.min(MAX_PAYLOAD);
         if filled < target {
             payload.resize(payload.len() + (target - filled), 0);
@@ -2673,7 +2673,7 @@ fn drive(shared: &Arc<Shared>, mut udp: Udp, mut engine: Engine) {
         }
 
         if let Err(error) = engine.flush(&mut udp, now) {
-            fail(shared, error);
+            fail(shared, &mut engine, error);
             return;
         }
 
@@ -2684,14 +2684,18 @@ fn drive(shared: &Arc<Shared>, mut udp: Udp, mut engine: Engine) {
                 let now = Instant::now();
                 if let Err(error) = engine.receive(&mut datagram[..count], now) {
                     if !discardable(&error) {
-                        fail(shared, error);
+                        fail(shared, &mut engine, error);
                         return;
                     }
                 }
             }
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(error) => {
-                fail(shared, format!("psiphon quic receive failed: {error}"));
+                fail(
+                    shared,
+                    &mut engine,
+                    format!("psiphon quic receive failed: {error}"),
+                );
                 return;
             }
         }
@@ -2739,8 +2743,9 @@ impl Engine {
     }
 }
 
-fn fail(shared: &Shared, why: impl Into<String>) {
+fn fail(shared: &Shared, engine: &mut Engine, why: impl Into<String>) {
     let mut state = lock(&shared.state);
+    engine.pull_received(&mut state.recv, usize::MAX);
     state.fail(why);
     drop(state);
     shared.readable.notify_all();
@@ -3074,8 +3079,10 @@ mod tests {
     use rustls::client::ClientSessionMemoryCache;
     use rustls::crypto::SecureRandom as _;
     use rustls::pki_types::ServerName;
+    use std::collections::VecDeque;
+    use std::io::Read as _;
     use std::net::{SocketAddr, UdpSocket};
-    use std::sync::Arc;
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
     fn test_engine() -> Engine {
@@ -3447,6 +3454,17 @@ mod tests {
     }
 
     #[test]
+    fn a_direct_quic_initial_reaches_the_minimum_datagram_size() {
+        let mut engine = test_engine();
+        engine.packet_limit = MAX_PACKET_SIZE;
+        engine.max_datagram = 1200;
+        let mut payload = Vec::new();
+        engine.pad_initial(&mut payload, 0);
+        let packet = engine.seal(INITIAL, 0, &payload).expect("initial");
+        assert_eq!(packet.len(), 1200);
+    }
+
+    #[test]
     fn a_path_mtu_probe_commits_only_on_ack() {
         let mut engine = test_engine();
         engine.max_datagram = 1200;
@@ -3654,6 +3672,49 @@ mod tests {
             quic_server_name(remote, "key"),
             quic_server_name(remote, "other")
         );
+    }
+
+    #[test]
+    fn a_terminal_failure_keeps_the_received_window() {
+        let mut engine = test_engine();
+        engine.received.extend_from_slice(b"late");
+        let shared = Arc::new(super::Shared {
+            state: Mutex::new(super::State {
+                send: VecDeque::new(),
+                send_bytes: 0,
+                recv: Vec::new(),
+                read_at: 0,
+                error: None,
+                eof: false,
+                write_closed: false,
+                close_requested: false,
+                timeout: None,
+            }),
+            readable: Condvar::new(),
+            writable: Condvar::new(),
+        });
+        super::fail(&shared, &mut engine, "boom");
+        assert_eq!(engine.received.as_slice(), b"");
+        let mut stream = super::QuicStream { shared };
+        let mut out = [0u8; 8];
+        assert_eq!(stream.read(&mut out).expect("buffered"), 4);
+        assert_eq!(&out[..4], b"late");
+        assert!(stream.read(&mut out).is_err());
+    }
+
+    #[test]
+    fn omitted_fresh_grants_do_not_keep_remembered_credit() {
+        let mut engine = test_engine();
+        engine.data = 100;
+        engine.stream = 200;
+        engine.bidi = 300;
+        let mut params = Vec::new();
+        super::put_parameter(&mut params, 0x08, &super::varint_bytes(1));
+        let error = engine
+            .apply_peer_params(&params)
+            .expect_err("stream grant omitted");
+        assert!(error.contains("stream credit"));
+        assert_eq!((engine.data, engine.stream, engine.bidi), (0, 0, 1));
     }
 
     #[test]

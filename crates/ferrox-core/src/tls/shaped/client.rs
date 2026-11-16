@@ -367,6 +367,11 @@ impl<S: Stream> Session<S> {
         self.plain.capacity()
     }
 
+    /// Bound the handshake by a caller-supplied absolute deadline.
+    pub(crate) fn set_handshake_deadline(&mut self, deadline: Option<Instant>) {
+        self.handshake_deadline = deadline;
+    }
+
     /// Runs the shaped handshake, reading against one absolute deadline from the first call.
     fn run(&mut self) -> Result<(), TlsError> {
         if self.done {

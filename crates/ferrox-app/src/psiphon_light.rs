@@ -20,6 +20,7 @@ const PADDING_MAX: usize = 1400;
 const MAX_RECORD: usize = 16 * 1024;
 const POLL: Duration = Duration::from_millis(50);
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
+const DRAIN: Duration = Duration::from_secs(30);
 const BUFFER: usize = 16 * 1024;
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 
@@ -183,8 +184,7 @@ impl Client {
         let _ = session.get_ref().set_write_timeout(Some(IO_TIMEOUT));
 
         let header = self.header(connection, &destination, tcp_duration, tls_duration)?;
-        let shutdown = session.get_ref().try_clone().ok();
-        let stream = LightStream::new(session, header).with_shutdown(shutdown);
+        let stream = LightStream::new(session, header);
         let local = loopback(stream, self.config.dial_timeout)?;
         *lock(&self.replay) = Some(sni);
         let _ = ipv6;
@@ -380,12 +380,29 @@ fn decode_entry(encoded: &[u8]) -> Result<ProxyEntry, String> {
 /// the leaf's SANs, then its CN; dates are not checked.
 fn verify_name(leaf: &[u8], expected: &str) -> bool {
     let mut names = Vec::new();
-    collect_names(leaf, 0, leaf.len(), 0, &mut names);
-    names.iter().any(|name| matches_name(name, expected))
+    let mut san_present = false;
+    collect_names(leaf, 0, leaf.len(), 0, &mut san_present, &mut names);
+    if names.is_empty() {
+        if san_present {
+            return false;
+        }
+        let mut common_name = None;
+        collect_subject_common_name(leaf, &mut common_name);
+        common_name.is_some_and(|name| matches_name(&name, expected))
+    } else {
+        names.iter().any(|name| matches_name(name, expected))
+    }
 }
 
 /// Collect every DNS name in one certificate DER element.
-fn collect_names(der: &[u8], at: usize, end: usize, depth: usize, out: &mut Vec<String>) {
+fn collect_names(
+    der: &[u8],
+    at: usize,
+    end: usize,
+    depth: usize,
+    san_present: &mut bool,
+    out: &mut Vec<String>,
+) {
     if depth > 32 {
         return;
     }
@@ -395,6 +412,7 @@ fn collect_names(der: &[u8], at: usize, end: usize, depth: usize, out: &mut Vec<
             return;
         };
         if tag == 0x06 && der.get(body..body + 3) == Some(&[0x55, 0x1d, 0x11][..]) {
+            *san_present = true;
             let mut after = next;
             if let Some((0x01, _, after_bool)) = element(der, after) {
                 after = after_bool;
@@ -402,21 +420,67 @@ fn collect_names(der: &[u8], at: usize, end: usize, depth: usize, out: &mut Vec<
             if let Some((0x04, body, end)) = element(der, after) {
                 collect_general_names(der, body, end, out);
             }
-        } else if tag == 0x06 && der.get(body..body + 3) == Some(&[0x55, 0x04, 0x03][..]) {
-            if let Some((0x0c | 0x13 | 0x16, body, end)) = element(der, next) {
-                out.push(String::from_utf8_lossy(&der[body..end]).into_owned());
-            }
         }
         if tag & 0x20 != 0 {
-            collect_names(der, body, next, depth + 1, out);
+            collect_names(der, body, next, depth + 1, san_present, out);
         }
         at = next;
     }
 }
 
+/// Read the common name from the certificate's subject, never its issuer.
+fn collect_subject_common_name(der: &[u8], out: &mut Option<String>) {
+    let Some((0x30, certificate, _)) = element(der, 0) else {
+        return;
+    };
+    let Some((0x30, tbs, _)) = element(der, certificate) else {
+        return;
+    };
+    let mut at = tbs;
+    let Some((tag, _, next)) = element(der, at) else {
+        return;
+    };
+    if tag == 0xa0 {
+        at = next;
+    }
+    for _ in 0..4 {
+        let Some((_, _, next)) = element(der, at) else {
+            return;
+        };
+        at = next;
+    }
+    let Some((0x30, subject, subject_end)) = element(der, at) else {
+        return;
+    };
+    let mut at = subject;
+    while at < subject_end {
+        let Some((0x31, set, set_end)) = element(der, at) else {
+            return;
+        };
+        let mut attribute = set;
+        while attribute < set_end {
+            let Some((0x30, pair, pair_end)) = element(der, attribute) else {
+                return;
+            };
+            if let Some((0x06, oid, oid_end)) = element(der, pair) {
+                if der.get(oid..oid_end) == Some(&[0x55, 0x04, 0x03][..]) {
+                    if let Some((0x0c | 0x13 | 0x16, body, end)) = element(der, oid_end) {
+                        *out = Some(String::from_utf8_lossy(&der[body..end]).into_owned());
+                    }
+                }
+            }
+            attribute = pair_end;
+        }
+        at = set_end;
+    }
+}
+
 /// Collect the DNS names in one `GeneralNames` sequence.
 fn collect_general_names(der: &[u8], at: usize, end: usize, out: &mut Vec<String>) {
-    let mut at = at;
+    let (mut at, end) = match element(der, at) {
+        Some((0x30, body, next)) => (body, next),
+        _ => (at, end),
+    };
     while at < end {
         let Some((tag, body, next)) = element(der, at) else {
             return;
@@ -566,7 +630,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// The loopback side of a light connection: a local socket the direct relay
 /// already knows how to copy, so no new flow kind is needed.
-fn loopback<T: Read + Write + ShutdownWrite + Send + 'static>(
+fn loopback<T: Read + Write + Queued + Send + 'static>(
     stream: T,
     timeout: Duration,
 ) -> Result<TcpStream, String> {
@@ -599,30 +663,19 @@ fn loopback<T: Read + Write + ShutdownWrite + Send + 'static>(
     Ok(local)
 }
 
-/// A relay stream that can pass an upload EOF to the proxy without closing reads.
-trait ShutdownWrite {
-    /// Half-close the proxy-facing write side.
-    fn shutdown_write(&mut self);
-    /// The number of framed bytes not yet handed to the TLS writer.
+/// A relay stream that can report framed bytes not yet handed to the TLS writer.
+trait Queued {
     fn queued(&self) -> usize;
 }
 
-impl<T> ShutdownWrite for LightStream<T> {
-    /// Half-close the proxy-facing write side.
-    fn shutdown_write(&mut self) {
-        if let Some(shutdown) = self.shutdown.as_ref() {
-            let _ = shutdown.shutdown(std::net::Shutdown::Write);
-        }
-    }
-
-    /// The number of framed bytes not yet handed to the TLS writer.
+impl<T> Queued for LightStream<T> {
     fn queued(&self) -> usize {
         self.pending_len()
     }
 }
 
 /// Service both directions over one framed TLS stream, keeping partial writes.
-fn relay<T: Read + Write + ShutdownWrite>(mut stream: T, mut peer: TcpStream) {
+fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
     let _ = peer.set_nodelay(true);
     let _ = peer.set_read_timeout(Some(POLL));
     let _ = peer.set_write_timeout(Some(POLL));
@@ -631,13 +684,27 @@ fn relay<T: Read + Write + ShutdownWrite>(mut stream: T, mut peer: TcpStream) {
     let mut down_at = 0usize;
     let mut down_len = 0usize;
     let mut peer_eof = false;
-    let mut upload_eof = false;
     let mut stream_eof = false;
+    let mut last_down = Instant::now();
+    let mut last_upload = Instant::now();
+    let mut drained = Instant::now();
+    let mut draining = false;
     loop {
+        let queued = stream.queued();
+        if peer_eof && queued > 0 && last_upload.elapsed() >= DRAIN {
+            return;
+        }
+        if peer_eof && queued == 0 && draining && drained.elapsed() >= DRAIN {
+            return;
+        }
         if down_at < down_len {
             match peer.write(&down[down_at..down_len]) {
                 Ok(0) => return,
-                Ok(count) => down_at += count,
+                Ok(count) => {
+                    down_at += count;
+                    last_upload = Instant::now();
+                    drained = Instant::now();
+                }
                 Err(error) if idle(&error) => {}
                 Err(_) => return,
             }
@@ -651,32 +718,51 @@ fn relay<T: Read + Write + ShutdownWrite>(mut stream: T, mut peer: TcpStream) {
             Err(error) if idle(&error) => {}
             Err(_) => return,
         }
-        let upload_blocked = stream.queued() > 0;
-        if upload_eof && !upload_blocked {
-            stream.shutdown_write();
-            upload_eof = false;
+        if stream.queued() < queued {
+            last_upload = Instant::now();
         }
-        if !peer_eof && !upload_blocked && pending(&peer) {
+        let upload_blocked = stream.queued() > 0;
+        if peer_eof && !upload_blocked && !draining {
+            draining = true;
+            drained = Instant::now();
+        }
+        let Ok(mut peer_state) = peer_ready(peer_eof, &peer) else {
+            return;
+        };
+        peer_eof |= peer_state == Some(false);
+        if !upload_blocked && peer_state == Some(true) {
             match peer.read(&mut up) {
                 Ok(0) => {
                     peer_eof = true;
-                    upload_eof = true;
                 }
                 Ok(count) => {
                     if stream.write_all(&up[..count]).is_err() {
                         return;
                     }
+                    last_upload = Instant::now();
+                    let Ok(state) = peer_ready(peer_eof, &peer) else {
+                        return;
+                    };
+                    peer_state = state;
+                    peer_eof |= peer_state == Some(false);
                 }
                 Err(error) if idle(&error) => {}
                 Err(_) => return,
             }
         }
-        if down_at == down_len && !stream_eof && (upload_blocked || !pending(&peer)) {
+        let down_due = last_down.elapsed() >= IO_TIMEOUT;
+        if down_at == down_len
+            && !stream_eof
+            && (upload_blocked || peer_state != Some(true) || down_due)
+        {
+            last_down = Instant::now();
             match stream.read(&mut down) {
                 Ok(0) => stream_eof = true,
                 Ok(count) => {
                     down_len = count;
                     down_at = 0;
+                    last_upload = Instant::now();
+                    drained = Instant::now();
                 }
                 Err(error) if idle(&error) => {}
                 Err(_) => return,
@@ -688,12 +774,26 @@ fn relay<T: Read + Write + ShutdownWrite>(mut stream: T, mut peer: TcpStream) {
     }
 }
 
-/// Whether the loopback peer has bytes ready, without consuming them.
-fn pending(peer: &TcpStream) -> bool {
+/// Whether the loopback peer has bytes ready (`Some(true)`), reached EOF
+/// (`Some(false)`), or has nothing to report yet (`None`), without consuming.
+fn ready(peer: &TcpStream) -> io::Result<Option<bool>> {
     let _ = peer.set_nonblocking(true);
-    let ready = matches!(peer.peek(&mut [0u8; 1]), Ok(count) if count > 0);
+    let state = match peer.peek(&mut [0u8; 1]) {
+        Ok(0) => Ok(Some(false)),
+        Ok(_) => Ok(Some(true)),
+        Err(error) if idle(&error) => Ok(None),
+        Err(error) => Err(error),
+    };
     let _ = peer.set_nonblocking(false);
-    ready
+    state
+}
+
+/// Whether the loopback peer has bytes ready, reached EOF, or is unchanged.
+fn peer_ready(peer_eof: bool, peer: &TcpStream) -> io::Result<Option<bool>> {
+    if peer_eof {
+        return Ok(None);
+    }
+    ready(peer)
 }
 
 /// Whether a read timeout means the other direction should get a turn.
@@ -705,15 +805,14 @@ fn idle(error: &io::Error) -> bool {
 /// payload, then a stop sentinel and ordinary payload; reads mirror it.
 pub(crate) struct LightStream<T> {
     inner: T,
-    header: Vec<u8>,
-    header_sent: bool,
-    padding_done: bool,
+    header_left: usize,
+    read_padding_done: bool,
+    write_padding_done: bool,
     wire: Vec<u8>,
     wire_at: usize,
     payload: std::ops::Range<usize>,
     pending: Vec<u8>,
     pending_at: usize,
-    shutdown: Option<TcpStream>,
 }
 
 impl<T> LightStream<T> {
@@ -721,22 +820,15 @@ impl<T> LightStream<T> {
     fn new(inner: T, header: Vec<u8>) -> Self {
         Self {
             inner,
-            header,
-            header_sent: false,
-            padding_done: false,
+            header_left: header.len(),
+            read_padding_done: false,
+            write_padding_done: false,
             wire: Vec::with_capacity(BUFFER),
             wire_at: 0,
             payload: 0..0,
-            pending: Vec::new(),
+            pending: header,
             pending_at: 0,
-            shutdown: None,
         }
-    }
-
-    /// Keep a transport clone so an upload EOF can half-close the proxy socket.
-    fn with_shutdown(mut self, shutdown: Option<TcpStream>) -> Self {
-        self.shutdown = shutdown;
-        self
     }
 
     /// The number of framed bytes not yet handed to the TLS writer.
@@ -760,7 +852,7 @@ impl<T: Read> Read for LightStream<T> {
                 return Ok(count);
             }
             self.compact();
-            if self.padding_done {
+            if self.read_padding_done {
                 if self.wire_at == self.wire.len() {
                     return self.inner.read(out);
                 }
@@ -779,7 +871,7 @@ impl<T: Read> Read for LightStream<T> {
             let padding = u16::from_be_bytes([self.wire[at], self.wire[at + 1]]);
             if padding == STOP_PADDING {
                 self.wire_at += 2;
-                self.padding_done = true;
+                self.read_padding_done = true;
                 continue;
             }
             if self.wire.len() - at < 4 {
@@ -850,20 +942,16 @@ impl<T: Write> Write for LightStream<T> {
         if buf.is_empty() {
             return Ok(0);
         }
-        if self.padding_done {
+        if self.write_padding_done {
             self.pending.extend_from_slice(buf);
             self.drain()?;
             return Ok(buf.len());
         }
-        let mut frame = Vec::with_capacity(self.header.len() + buf.len() + 2 + 17);
-        if !self.header_sent {
-            frame.extend_from_slice(&self.header);
-            self.header_sent = true;
-        }
-        let mut size = frame.len() + buf.len() + 2 + 17;
+        let mut frame = Vec::with_capacity(buf.len() + 2 + 17);
+        let mut size = self.header_left + buf.len() + 2 + 17;
         if size > PADDING_MAX {
             frame.extend_from_slice(&STOP_PADDING.to_be_bytes());
-            self.padding_done = true;
+            self.write_padding_done = true;
         } else {
             size += 2;
             let min = PADDING_MIN.saturating_sub(size);
@@ -917,7 +1005,10 @@ impl<T: Write> LightStream<T> {
                         "psiphon light: TLS writer accepted no bytes",
                     ));
                 }
-                Ok(written) => self.pending_at += written,
+                Ok(written) => {
+                    self.header_left = self.header_left.saturating_sub(written);
+                    self.pending_at += written;
+                }
                 Err(error) if idle(&error) => return Ok(false),
                 Err(error) => return Err(error),
             }
@@ -1039,12 +1130,102 @@ mod tests {
         assert_eq!(value.get(12), Some(&Value::UInt(2)));
     }
 
+    /// Encode one short-or-long-form DER element for a certificate fixture.
+    fn der(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if body.len() < 128 {
+            out.push(body.len() as u8);
+        } else {
+            let bytes = body.len().to_be_bytes();
+            let first = bytes.iter().position(|byte| *byte != 0).expect("length");
+            out.push(0x80 | (bytes.len() - first) as u8);
+            out.extend_from_slice(&bytes[first..]);
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn der_parts(tag: u8, parts: &[Vec<u8>]) -> Vec<u8> {
+        der(tag, &parts.concat())
+    }
+
+    fn certificate_name(common_name: &str) -> Vec<u8> {
+        der_parts(
+            0x30,
+            &[der_parts(
+                0x31,
+                &[der_parts(
+                    0x30,
+                    &[
+                        der(0x06, &[0x55, 0x04, 0x03]),
+                        der(0x0c, common_name.as_bytes()),
+                    ],
+                )],
+            )],
+        )
+    }
+
+    /// Build a leaf whose issuer and subject CNs differ, with an optional SAN.
+    fn certificate_with_san(general_name: Option<Vec<u8>>) -> Vec<u8> {
+        let signature = der_parts(
+            0x30,
+            &[
+                der(
+                    0x06,
+                    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b],
+                ),
+                der(0x05, &[]),
+            ],
+        );
+        let mut tbs = vec![
+            der(0x02, &[1]),
+            signature.clone(),
+            certificate_name("Example CA"),
+            der_parts(
+                0x30,
+                &[der(0x17, b"240101000000Z"), der(0x17, b"250101000000Z")],
+            ),
+            certificate_name("edge.example"),
+        ];
+        if let Some(general_name) = general_name {
+            tbs.push(der(
+                0xa3,
+                &der_parts(
+                    0x30,
+                    &[der_parts(
+                        0x30,
+                        &[
+                            der(0x06, &[0x55, 0x1d, 0x11]),
+                            der(0x04, &der_parts(0x30, &[general_name])),
+                        ],
+                    )],
+                ),
+            ));
+        }
+        der_parts(
+            0x30,
+            &[der_parts(0x30, &tbs), signature, der(0x03, &[0, 1])],
+        )
+    }
+
     #[test]
     fn a_server_name_matches_san_and_cn_wildcards() {
         assert!(matches_name("edge.example", "edge.example"));
         assert!(matches_name("*.example", "edge.example"));
         assert!(!matches_name("*.example", "example"));
         assert!(!matches_name("*.example", "a.edge.example"));
+    }
+
+    #[test]
+    fn a_certificate_uses_its_subject_name_and_unwraps_san_sequences() {
+        let plain = certificate_with_san(None);
+        assert!(verify_name(&plain, "edge.example"));
+        assert!(!verify_name(&plain, "Example CA"));
+        let named = certificate_with_san(Some(der(0x82, b"edge.example")));
+        assert!(verify_name(&named, "edge.example"));
+        assert!(!verify_name(&named, "Example CA"));
+        let address = certificate_with_san(Some(der(0x87, &[192, 0, 2, 1])));
+        assert!(!verify_name(&address, "edge.example"));
     }
 
     #[test]
@@ -1186,6 +1367,59 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn the_header_is_sent_before_application_data() {
+        let mut stream = LightStream::new(Vec::new(), vec![0xaa, 0xbb]);
+        stream.flush().expect("header");
+        assert_eq!(stream.inner, vec![0xaa, 0xbb]);
+        stream.write_all(b"hello").expect("first");
+        assert_eq!(&stream.inner[..2], &[0xaa, 0xbb]);
+        assert!(stream.inner.windows(5).any(|window| window == b"hello"));
+    }
+
+    #[test]
+    fn a_flushed_header_is_not_counted_in_the_next_write_padding() {
+        let header = vec![0xaa; 100];
+        let mut stream = LightStream::new(Vec::new(), header.clone());
+        stream.flush().expect("header");
+        assert_eq!(stream.header_left, 0);
+        stream.write_all(&vec![0u8; 1300]).expect("first");
+        assert!(!stream.write_padding_done);
+        let wire = stream.inner;
+        assert_eq!(&wire[..header.len()], &header[..]);
+        let frame = &wire[header.len()..];
+        assert_ne!(u16::from_be_bytes([frame[0], frame[1]]), STOP_PADDING);
+        assert!(frame.len() + 17 >= PADDING_MIN);
+        assert!(frame.len() + 17 <= PADDING_MAX);
+    }
+
+    #[test]
+    fn reads_and_writes_stop_padding_independently() {
+        let mut stream = LightStream::new(io::Cursor::new(Vec::new()), Vec::new());
+        stream.wire.extend_from_slice(&1u16.to_be_bytes());
+        stream.wire.extend_from_slice(&2u16.to_be_bytes());
+        stream.wire.push(0);
+        stream.wire.extend_from_slice(b"hi");
+        stream.wire.extend_from_slice(&STOP_PADDING.to_be_bytes());
+        stream.wire.extend_from_slice(b"rest");
+        let mut out = [0u8; 2];
+        stream.read_exact(&mut out).expect("padded");
+        assert!(!stream.read_padding_done);
+        assert!(!stream.write_padding_done);
+        let mut first = [0u8; 1];
+        stream.read_exact(&mut first).expect("stop");
+        assert!(stream.read_padding_done);
+        assert_eq!(&first, b"r");
+        stream.write_all(b"hello").expect("write");
+        assert!(!stream.write_padding_done);
+        assert_ne!(stream.inner.get_ref(), b"hello");
+        stream.write_all(&[0u8; PADDING_MAX]).expect("stop padding");
+        assert!(stream.write_padding_done);
+        let mut rest = [0u8; 3];
+        stream.read_exact(&mut rest).expect("plain");
+        assert_eq!(&rest, b"est");
     }
 
     #[test]

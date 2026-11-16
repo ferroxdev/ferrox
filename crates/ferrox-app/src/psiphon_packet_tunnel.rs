@@ -61,6 +61,7 @@ struct View {
     destination: std::ops::Range<usize>,
     ip_checksum: Option<std::ops::Range<usize>>,
     transport_checksum: std::ops::Range<usize>,
+    checksum_optional: bool,
     source_port: u16,
     destination_port: u16,
 }
@@ -78,8 +79,11 @@ fn parse(packet: &[u8]) -> Option<View> {
             if packet[0] & 0x0f != 5 || packet.len() < 20 {
                 return None;
             }
+            if u16::from_be_bytes([packet[6], packet[7]]) & 0x3fff != 0 {
+                return None;
+            }
             let protocol = packet[9];
-            let transport_checksum = match protocol {
+            let (transport_checksum, checksum_optional) = match protocol {
                 TCP => {
                     if packet.len() < 38 {
                         return None;
@@ -88,13 +92,13 @@ fn parse(packet: &[u8]) -> Option<View> {
                     if packet.len() < offset {
                         return None;
                     }
-                    36..38
+                    (36..38, false)
                 }
                 UDP => {
                     if packet.len() < 28 {
                         return None;
                     }
-                    26..28
+                    (26..28, true)
                 }
                 _ => return None,
             };
@@ -104,6 +108,7 @@ fn parse(packet: &[u8]) -> Option<View> {
                 destination: 16..20,
                 ip_checksum: Some(10..12),
                 transport_checksum,
+                checksum_optional,
                 source_port: port(packet, 20),
                 destination_port: port(packet, 22),
             })
@@ -113,7 +118,7 @@ fn parse(packet: &[u8]) -> Option<View> {
                 return None;
             }
             let protocol = packet[6];
-            let transport_checksum = match protocol {
+            let (transport_checksum, checksum_optional) = match protocol {
                 TCP => {
                     if packet.len() < 58 {
                         return None;
@@ -122,13 +127,13 @@ fn parse(packet: &[u8]) -> Option<View> {
                     if packet.len() < offset {
                         return None;
                     }
-                    56..58
+                    (56..58, false)
                 }
                 UDP => {
                     if packet.len() < 48 {
                         return None;
                     }
-                    46..48
+                    (46..48, false)
                 }
                 _ => return None,
             };
@@ -138,6 +143,7 @@ fn parse(packet: &[u8]) -> Option<View> {
                 destination: 24..40,
                 ip_checksum: None,
                 transport_checksum,
+                checksum_optional,
                 source_port: port(packet, 40),
                 destination_port: port(packet, 42),
             })
@@ -231,7 +237,9 @@ fn rewrite(packet: &mut [u8], view: &View, source: Option<&[u8]>, destination: O
         checksum_adjust(&mut packet[field], accumulator);
     }
     let field = view.transport_checksum.clone();
-    checksum_adjust(&mut packet[field], accumulator);
+    if !view.checksum_optional || packet[field.clone()] != [0, 0] {
+        checksum_adjust(&mut packet[field], accumulator);
+    }
 }
 
 /// Validate and rewrite one packet from the device toward the tunnel.
@@ -468,6 +476,27 @@ mod tests {
         assert_eq!(&packet[12..16], &[192, 168, 0, 1]);
         assert!(ip_checksum_ok(&packet));
         assert!(udp4_checksum_ok(&packet));
+    }
+
+    #[test]
+    fn an_omitted_ipv4_udp_checksum_stays_omitted() {
+        let mut packet = udp4([192, 168, 0, 1], 53, 5555);
+        seal4(&mut packet);
+        packet[26..28].copy_from_slice(&[0, 0]);
+        assert!(upstream(&mut packet, &dns()));
+        assert_eq!(&packet[16..20], &RESOLVER_V4);
+        assert_eq!(&packet[26..28], &[0, 0]);
+        assert!(ip_checksum_ok(&packet));
+    }
+
+    #[test]
+    fn an_ipv4_fragment_is_refused_before_its_transport_header() {
+        let mut more_fragments = udp4([192, 168, 0, 1], 53, 5555);
+        more_fragments[6] = 0x20;
+        assert!(!upstream(&mut more_fragments, &dns()));
+        let mut offset = udp4([192, 168, 0, 1], 53, 5555);
+        offset[7] = 1;
+        assert!(!upstream(&mut offset, &dns()));
     }
 
     #[test]

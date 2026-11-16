@@ -105,7 +105,107 @@ impl DeadFront {
 enum Link {
     Udp(UdpSocket),
     WebRtc(WebRtcStream),
-    Quic(crate::psiphon_quic::QuicStream),
+    Quic(FramedQuic),
+}
+
+/// Carry one QUIC datagram per two-byte length-prefixed record on a reliable
+/// inner stream, so a byte-stream read cannot merge or split datagrams.
+struct FramedQuic {
+    stream: crate::psiphon_quic::QuicStream,
+    header: [u8; 2],
+    header_at: usize,
+    record: Vec<u8>,
+    record_at: usize,
+}
+
+impl FramedQuic {
+    fn new(stream: crate::psiphon_quic::QuicStream) -> Self {
+        Self {
+            stream,
+            header: [0; 2],
+            header_at: 0,
+            record: Vec::new(),
+            record_at: 0,
+        }
+    }
+
+    fn send(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let length = u16::try_from(buffer.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "psiphon h3 datagram too large")
+        })?;
+        let header = length.to_be_bytes();
+        let bufs = [
+            std::io::IoSlice::new(&header),
+            std::io::IoSlice::new(buffer),
+        ];
+        let expected = header.len() + buffer.len();
+        if self.stream.write_vectored(&bufs)? != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "psiphon h3 short datagram write",
+            ));
+        }
+        Ok(buffer.len())
+    }
+
+    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.record.is_empty() {
+            if self.header_at < self.header.len() {
+                match self.stream.read(&mut self.header[self.header_at..]) {
+                    Ok(0) if self.header_at == 0 => return Ok(0),
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "psiphon h3 truncated datagram header",
+                        ));
+                    }
+                    Ok(count) => self.header_at += count,
+                    Err(error) => return Err(error),
+                }
+            }
+            if self.header_at < self.header.len() {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            let length = usize::from(u16::from_be_bytes(self.header));
+            self.header_at = 0;
+            if length == 0 || length > buffer.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "psiphon h3 invalid datagram record",
+                ));
+            }
+            self.record.resize(length, 0);
+            self.record_at = 0;
+        }
+        match self.stream.read(&mut self.record[self.record_at..]) {
+            Ok(0) => {
+                self.record.clear();
+                self.record_at = 0;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "psiphon h3 truncated datagram record",
+                ));
+            }
+            Ok(count) => self.record_at += count,
+            Err(error) => return Err(error),
+        }
+        if self.record_at < self.record.len() {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        if self.record.len() > buffer.len() {
+            self.record.clear();
+            self.record_at = 0;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "psiphon h3 datagram record exceeds the buffer",
+            ));
+        }
+        buffer[..self.record.len()].copy_from_slice(&self.record);
+        let length = self.record.len();
+        self.record.clear();
+        self.record_at = 0;
+        Ok(length)
+    }
 }
 
 impl Link {
@@ -113,7 +213,7 @@ impl Link {
         match self {
             Self::Udp(socket) => socket.send(buffer),
             Self::WebRtc(stream) => stream.write(buffer),
-            Self::Quic(stream) => stream.write(buffer),
+            Self::Quic(stream) => stream.send(buffer),
         }
     }
 
@@ -121,7 +221,7 @@ impl Link {
         match self {
             Self::Udp(socket) => socket.recv(buffer),
             Self::WebRtc(stream) => stream.read(buffer),
-            Self::Quic(stream) => stream.read(buffer),
+            Self::Quic(stream) => stream.receive(buffer),
         }
     }
 
@@ -133,7 +233,7 @@ impl Link {
                 Ok(())
             }
             Self::Quic(stream) => {
-                stream.set_read_timeout(Some(wait));
+                stream.stream.set_read_timeout(Some(wait));
                 Ok(())
             }
         }
@@ -216,7 +316,13 @@ impl H3 {
         sni: &str,
         timeout: Duration,
     ) -> Result<Self, String> {
-        Self::connect_link(Link::Quic(stream), dial, sni, timeout, timeout)
+        Self::connect_link(
+            Link::Quic(FramedQuic::new(stream)),
+            dial,
+            sni,
+            timeout,
+            timeout,
+        )
     }
 
     /// Open HTTP/3 over one datagram path.

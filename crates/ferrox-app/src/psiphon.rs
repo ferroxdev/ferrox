@@ -6908,8 +6908,8 @@ pub(crate) fn broker_offer(
                 continue;
             }
         };
-        let media_secret =
-            coin(settings.inproxy_media_streams).then(|| client.root_obfuscation_secret());
+        let offer_secret = crate::psiphon_ssh::random::<32>();
+        let media_secret = coin(settings.inproxy_media_streams).then_some(offer_secret);
         let (mut webrtc, generated) = webrtc_offer(
             server.address,
             &inproxy_stun_servers(&settings, &tactics),
@@ -6936,32 +6936,29 @@ pub(crate) fn broker_offer(
                 client.set_nat_type(nat);
             }
         }
-        if media_secret.is_some() {
-            if coin(settings.inproxy_media_traffic_shaping) {
-                client
-                    .set_traffic_shaping(settings.inproxy_media_traffic_shaping_parameters.clone());
-                if let Some(webrtc) = webrtc.as_mut() {
-                    webrtc.set_traffic_shaping(
-                        settings.inproxy_media_traffic_shaping_parameters.clone(),
-                        client.root_obfuscation_secret(),
-                    );
-                }
-            }
-        } else if coin(settings.inproxy_traffic_shaping) {
-            client.set_traffic_shaping(settings.inproxy_traffic_shaping_parameters.clone());
+        let shaping = if media_secret.is_some() {
+            coin(settings.inproxy_media_traffic_shaping)
+                .then(|| settings.inproxy_media_traffic_shaping_parameters.clone())
+        } else {
+            coin(settings.inproxy_traffic_shaping)
+                .then(|| settings.inproxy_traffic_shaping_parameters.clone())
+        };
+        if let Some(parameters) = shaping.as_ref() {
             if let Some(webrtc) = webrtc.as_mut() {
-                webrtc.set_traffic_shaping(
-                    settings.inproxy_traffic_shaping_parameters.clone(),
-                    client.root_obfuscation_secret(),
-                );
+                webrtc.set_traffic_shaping(parameters.clone(), offer_secret);
             }
         }
+        let offer_settings = crate::psiphon_broker::OfferSettings {
+            secret: offer_secret,
+            traffic_shaping: shaping,
+        };
         match client.client_offer(
             destination,
             &compartments,
             &personal,
             &generated,
             &crate::psiphon_broker::Metrics::from_identity(&identity),
+            &offer_settings,
         ) {
             Ok(offer) => {
                 if let Some(webrtc) = webrtc.as_mut() {
@@ -8119,15 +8116,18 @@ fn push_scan_candidates(
     let Some(spec) = settings.cdn_scan_user.as_ref() else {
         return;
     };
-    for number in 0..spec.candidate_count() {
+    let mut number = 0;
+    while number < spec.candidate_count() {
         if *variants >= FRONTED_VARIANTS {
             return;
         }
-        if let Some(candidate) = spec.select(number, skipped, shuffle_key) {
-            if !push_scan_variant(server, &candidate, front, expanded, variants) {
-                return;
-            }
+        let Some((candidate, next)) = spec.select_probe(number, skipped, shuffle_key) else {
+            return;
+        };
+        if !push_scan_variant(server, &candidate, front, expanded, variants) {
+            return;
         }
+        number = next.max(number.saturating_add(1));
     }
 }
 
@@ -8148,12 +8148,17 @@ fn push_scan_builtin_candidates(
         let left = sets.len() - index;
         let slots = u64::try_from(remaining / left).unwrap_or(0);
         let count = spec.candidate_count().min(slots);
-        for number in 0..count {
-            if let Some(candidate) = spec.select(number, skipped, shuffle_key) {
-                if !push_scan_variant(server, &candidate, front, expanded, variants) {
-                    return;
-                }
+        let mut number = 0;
+        let mut emitted = 0;
+        while emitted < count && number < spec.candidate_count() {
+            let Some((candidate, next)) = spec.select_probe(number, skipped, shuffle_key) else {
+                break;
+            };
+            if !push_scan_variant(server, &candidate, front, expanded, variants) {
+                return;
             }
+            emitted += 1;
+            number = next.max(number.saturating_add(1));
         }
     }
 }

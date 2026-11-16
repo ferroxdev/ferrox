@@ -1,6 +1,6 @@
 //! A str0m WebRTC data channel between the client and an in-proxy destination.
 
-use crate::psiphon_broker::{Broker, Client, Destination, Front, Metrics};
+use crate::psiphon_broker::{Broker, Client, Destination, Front, Metrics, OfferSettings};
 use crate::psiphon_ssh::dial_random;
 use crate::psiphon_ssh::Identity;
 use hkdf::Hkdf;
@@ -24,6 +24,7 @@ const STUN_HEADER_LEN: usize = ferrox_core::stun::HEADER_LEN;
 const MAX_DATAGRAM: usize = 65_536;
 const PADDING_DONE: i64 = -1;
 const MESSAGE_TIMEOUT: Duration = Duration::from_millis(5);
+const STOP_POLL: Duration = Duration::from_millis(50);
 const STREAM_MESSAGE: usize = 16 * 1024;
 const NAT_DISCOVERY_ROUND_TRIP: Duration = Duration::from_secs(2);
 const NAT_MAPPING_UNKNOWN: u64 = 0;
@@ -125,6 +126,8 @@ pub(crate) struct WebRtc {
     debug: bool,
     shaping: Option<(TrafficShapingParameters, [u8; 32])>,
     media_shaping: Option<Shaping>,
+    send_timeout: Option<Duration>,
+    stop: Option<Arc<AtomicBool>>,
 }
 
 impl WebRtc {
@@ -228,6 +231,8 @@ impl WebRtc {
                 debug,
                 shaping: None,
                 media_shaping: None,
+                send_timeout: Some(Duration::from_secs(30)),
+                stop: None,
             },
             offer.to_sdp_string(),
         ))
@@ -287,7 +292,16 @@ impl WebRtc {
         let channel = self
             .channel
             .ok_or_else(|| "psiphon webrtc: data channel is closed".to_owned())?;
+        let deadline = self.send_timeout.map(|timeout| Instant::now() + timeout);
+        let tracked = self.stop.is_some();
         loop {
+            if self
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::Acquire))
+            {
+                return Err("psiphon webrtc: driver stopped".to_owned());
+            }
             let accepted = self
                 .rtc
                 .channel(channel)
@@ -300,7 +314,16 @@ impl WebRtc {
             if accepted {
                 return Ok(());
             }
-            self.wait(next)?;
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err("psiphon webrtc write timed out".to_owned());
+            }
+            let until = deadline.map_or(next, |deadline| next.min(deadline));
+            let until = if tracked {
+                until.min(Instant::now() + STOP_POLL)
+            } else {
+                until
+            };
+            self.wait(until)?;
         }
     }
 
@@ -414,6 +437,46 @@ impl WebRtc {
         }
     }
 
+    /// Move buffered channel data ahead of a terminal send failure.
+    fn take_received(
+        &mut self,
+        raw: bool,
+        padding_done: &mut bool,
+        backlog: &mut VecDeque<Result<Vec<u8>, String>>,
+    ) {
+        while let Some(event) = self.events.pop_front() {
+            match event {
+                Event::ChannelData(data)
+                    if self.channel.is_some_and(|channel| data.id == channel) =>
+                {
+                    if raw {
+                        if !data.data.is_empty() {
+                            backlog.push_back(Ok(data.data));
+                        }
+                    } else if let Ok(Some(payload)) = unframe(data.data, padding_done) {
+                        if !payload.is_empty() {
+                            backlog.push_back(Ok(payload));
+                        }
+                    }
+                }
+                Event::RtpPacket(packet) if self.media.is_some() => {
+                    let payload = packet.payload.as_ref();
+                    let Some(padding) = payload.first().map(|byte| usize::from(*byte)) else {
+                        continue;
+                    };
+                    if padding == 255 || payload.len() < 1 + padding {
+                        continue;
+                    }
+                    let data = payload[1 + padding..].to_vec();
+                    if !data.is_empty() {
+                        backlog.push_back(Ok(data));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// The address the last peer datagram came from.
     pub(crate) fn peer_ip(&self) -> Option<IpAddr> {
         self.peer
@@ -433,12 +496,17 @@ impl WebRtc {
     }
 
     /// Move the engine onto a driver thread and expose it as an `io` stream.
-    pub(crate) fn into_stream(self, timeout: Duration) -> Result<WebRtcStream, String> {
+    pub(crate) fn into_stream(mut self, timeout: Duration) -> Result<WebRtcStream, String> {
+        self.send_timeout = Some(timeout);
         WebRtcStream::spawn(self, timeout, false)
     }
 
     /// Move the engine onto a driver thread and preserve each write as one datagram.
-    pub(crate) fn into_datagram_stream(self, timeout: Duration) -> Result<WebRtcStream, String> {
+    pub(crate) fn into_datagram_stream(
+        mut self,
+        timeout: Duration,
+    ) -> Result<WebRtcStream, String> {
+        self.send_timeout = Some(timeout);
         WebRtcStream::spawn(self, timeout, true)
     }
 
@@ -1098,8 +1166,10 @@ impl Shaping {
 pub(crate) struct WebRtcStream {
     out: SyncSender<Vec<u8>>,
     input: InputChannel,
+    terminal: Arc<Mutex<VecDeque<Vec<u8>>>>,
     pending: Arc<Mutex<(Vec<u8>, usize)>>,
     stop: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<String>>>,
     padding_sent: Arc<AtomicBool>,
     shaping: Option<Arc<Mutex<Shaping>>>,
     media: bool,
@@ -1114,8 +1184,10 @@ impl Clone for WebRtcStream {
         Self {
             out: self.out.clone(),
             input: Arc::clone(&self.input),
+            terminal: Arc::clone(&self.terminal),
             pending: Arc::clone(&self.pending),
             stop: Arc::clone(&self.stop),
+            failure: Arc::clone(&self.failure),
             padding_sent: Arc::clone(&self.padding_sent),
             shaping: self.shaping.as_ref().map(Arc::clone),
             media: self.media,
@@ -1132,6 +1204,8 @@ impl WebRtcStream {
         let (input_tx, input) = mpsc::sync_channel(16);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let failure = Arc::new(Mutex::new(None));
+        let thread_failure = Arc::clone(&failure);
         let media = webrtc.media.is_some();
         let shaping = webrtc
             .shaping
@@ -1139,7 +1213,12 @@ impl WebRtcStream {
             .map(|(parameters, secret)| Arc::new(Mutex::new(Shaping::new(parameters, secret))));
         let unframed = raw && shaping.is_none();
         let padding_sent = Arc::new(AtomicBool::new(unframed));
+        let write_timeout = Arc::new(Mutex::new(Some(timeout)));
+        let thread_write_timeout = Arc::clone(&write_timeout);
         let driver_shaping = shaping.as_ref().map(Arc::clone);
+        let terminal = Arc::new(Mutex::new(VecDeque::new()));
+        let thread_terminal = Arc::clone(&terminal);
+        webrtc.stop = Some(Arc::clone(&stop));
         thread::Builder::new()
             .name("psiphon-webrtc".to_owned())
             .spawn(move || {
@@ -1148,21 +1227,26 @@ impl WebRtcStream {
                     out_rx,
                     input_tx,
                     thread_stop,
+                    thread_failure,
                     unframed,
                     driver_shaping,
+                    thread_write_timeout,
+                    thread_terminal,
                 );
             })
             .map_err(|error| format!("psiphon webrtc driver: {error}"))?;
         Ok(Self {
             out,
             input: Arc::new(Mutex::new(input)),
+            terminal,
             pending: Arc::new(Mutex::new((Vec::new(), 0))),
             stop,
+            failure,
             padding_sent,
             shaping,
             media,
             read_timeout: Arc::new(Mutex::new(Some(timeout))),
-            write_timeout: Arc::new(Mutex::new(Some(timeout))),
+            write_timeout,
         })
     }
 
@@ -1199,6 +1283,36 @@ impl Read for WebRtcStream {
             pending.0.clear();
             pending.1 = 0;
             let input = lock(&self.input);
+            match input.try_recv() {
+                Ok(Ok(data)) => {
+                    pending.0 = data;
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+            }
+            if let Some(error) = lock(&self.failure).as_ref().cloned() {
+                match input.try_recv() {
+                    Ok(Ok(data)) => {
+                        pending.0 = data;
+                        pending.1 = 0;
+                    }
+                    Ok(Err(error)) => {
+                        return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
+                    }
+                    Err(_) => {
+                        if let Some(data) = lock(&self.terminal).pop_front() {
+                            pending.0 = data;
+                            pending.1 = 0;
+                        } else {
+                            return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
+                        }
+                    }
+                }
+                continue;
+            }
             let timeout = *lock(&self.read_timeout);
             let received = match timeout {
                 Some(timeout) => input.recv_timeout(timeout),
@@ -1215,6 +1329,14 @@ impl Read for WebRtcStream {
                     return Err(io::Error::from(ErrorKind::TimedOut));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
+                    if let Some(data) = lock(&self.terminal).pop_front() {
+                        pending.0 = data;
+                        pending.1 = 0;
+                        continue;
+                    }
+                    if let Some(error) = lock(&self.failure).as_ref().cloned() {
+                        return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
+                    }
                     return Err(io::Error::from(ErrorKind::UnexpectedEof));
                 }
             }
@@ -1278,6 +1400,9 @@ impl WebRtcStream {
 
     /// Queue one framed message, respecting the current write timeout.
     fn send(&self, message: Vec<u8>) -> io::Result<()> {
+        if let Some(error) = lock(&self.failure).as_ref().cloned() {
+            return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
+        }
         let timeout = *lock(&self.write_timeout);
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         let mut message = message;
@@ -1311,14 +1436,17 @@ impl Write for WebRtcStream {
 }
 
 /// Move datagrams between the engine and the bounded stream queues.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn drive(
     mut webrtc: WebRtc,
     out: Receiver<Vec<u8>>,
     input: SyncSender<Result<Vec<u8>, String>>,
     stop: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<String>>>,
     raw: bool,
     shaping: Option<Arc<Mutex<Shaping>>>,
+    write_timeout: Arc<Mutex<Option<Duration>>>,
+    terminal: Arc<Mutex<VecDeque<Vec<u8>>>>,
 ) {
     let mut peer_padding_done = false;
     let mut backlog: VecDeque<Result<Vec<u8>, String>> = VecDeque::new();
@@ -1326,14 +1454,25 @@ fn drive(
         if stop.load(Ordering::Acquire) {
             return;
         }
+        webrtc.send_timeout = *lock(&write_timeout);
         let mut wrote = false;
         for _ in 0..16 {
             match out.try_recv() {
                 Ok(data) if data.is_empty() => {}
                 Ok(data) => {
                     if let Err(error) = webrtc.send(&data) {
-                        backlog.clear();
-                        backlog.push_back(Err(error));
+                        if stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        webrtc.take_received(raw, &mut peer_padding_done, &mut backlog);
+                        let mut buffered = lock(&terminal);
+                        for data in backlog.drain(..).flatten() {
+                            buffered.push_back(data);
+                        }
+                        drop(buffered);
+                        *lock(&failure) = Some(error);
+                        stop.store(true, Ordering::Release);
+                        return;
                     }
                     wrote = true;
                 }
@@ -1382,7 +1521,6 @@ fn drive(
                         let decoy = lock(shaping).decoy(MAX_DATAGRAM);
                         if let Some(message) = decoy {
                             if let Err(error) = webrtc.send(&message) {
-                                backlog.clear();
                                 backlog.push_back(Err(error));
                             }
                         }
@@ -1662,8 +1800,14 @@ impl Conduit {
             )?)));
         }
         let key = format!(
-            "{}|{}|{}|{}|{}",
-            broker.public_key, broker.root_secret, front.host, front.dial, front.port
+            "{}|{}|{}|{}|{}|{}|{}",
+            broker.public_key,
+            broker.root_secret,
+            front.host,
+            front.dial,
+            front.port,
+            front.disable_sni,
+            front.provider_id.as_deref().unwrap_or("")
         );
         if let Some((_, client)) = lock(&self.clients).iter().find(|(known, _)| known == &key) {
             return Ok(Arc::clone(client));
@@ -1848,16 +1992,10 @@ impl Conduit {
             self.offer_personal_timeout.min(max)
         });
         let client = self
-            .shared_client(
-                broker,
-                front,
-                budget,
-                offer_timeout.min(remaining),
-                offer_personal_timeout.min(remaining),
-            )
+            .shared_client(broker, front, budget, offer_timeout, offer_personal_timeout)
             .map_err(|error| (error, false))?;
-        let media_secret = weighted(self.media_streams, random_unit())
-            .then(|| lock(&client).root_obfuscation_secret());
+        let offer_secret = crate::psiphon_ssh::random::<32>();
+        let media_secret = weighted(self.media_streams, random_unit()).then_some(offer_secret);
         let (mut webrtc, sdp) = WebRtc::offer(
             address,
             &self.stun_servers,
@@ -1871,19 +2009,45 @@ impl Conduit {
             media_secret,
         )
         .map_err(|error| (error, false))?;
-        let secret = lock(&client).root_obfuscation_secret();
-        if media_secret.is_some() {
-            if weighted(self.media_traffic_shaping, random_unit()) {
-                lock(&client).set_traffic_shaping(self.media_traffic_shaping_parameters.clone());
-                webrtc.set_traffic_shaping(self.media_traffic_shaping_parameters.clone(), secret);
-            }
-        } else if weighted(self.traffic_shaping, random_unit()) {
-            lock(&client).set_traffic_shaping(self.traffic_shaping_parameters.clone());
-            webrtc.set_traffic_shaping(self.traffic_shaping_parameters.clone(), secret);
+        let shaping = if media_secret.is_some() {
+            weighted(self.media_traffic_shaping, random_unit())
+                .then(|| self.media_traffic_shaping_parameters.clone())
+        } else {
+            weighted(self.traffic_shaping, random_unit())
+                .then(|| self.traffic_shaping_parameters.clone())
+        };
+        if let Some(parameters) = shaping.as_ref() {
+            webrtc.set_traffic_shaping(parameters.clone(), offer_secret);
         }
-        let offer = lock(&client)
-            .client_offer(destination, &self.common, &self.personal, &sdp, metrics)
-            .map_err(|error| (error, false))?;
+        let settings = OfferSettings {
+            secret: offer_secret,
+            traffic_shaping: shaping,
+        };
+        let offer = {
+            let mut client = lock(&client);
+            let offer_remaining = deadline.saturating_duration_since(Instant::now());
+            if offer_remaining.is_zero() {
+                return Err((
+                    "psiphon conduit: offer retry window expired".to_owned(),
+                    false,
+                ));
+            }
+            client.set_offer_timeouts(
+                offer_timeout.min(offer_remaining),
+                offer_personal_timeout.min(offer_remaining),
+                deadline,
+            );
+            client
+                .client_offer(
+                    destination,
+                    &self.common,
+                    &self.personal,
+                    &sdp,
+                    metrics,
+                    &settings,
+                )
+                .map_err(|error| (error, false))?
+        };
         if offer.answer_sdp.is_empty() {
             return Err((
                 format!(
@@ -1935,7 +2099,7 @@ impl Conduit {
                     SocketAddr::new(address, 0),
                     self.timeout,
                     stream,
-                    secret,
+                    offer_secret,
                 )
                 .map_err(|error| (error, false))?,
             )
@@ -1986,6 +2150,34 @@ impl Relay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Input queued before a terminal failure is returned before the terminal datagram.
+    #[test]
+    fn terminal_data_waits_behind_queued_input() {
+        let (out, _out_rx) = mpsc::sync_channel(1);
+        let (input_tx, input) = mpsc::sync_channel(16);
+        input_tx.send(Ok(b"A".to_vec())).expect("queued input");
+        let mut stream = WebRtcStream {
+            out,
+            input: Arc::new(Mutex::new(input)),
+            terminal: Arc::new(Mutex::new(VecDeque::from([b"B".to_vec()]))),
+            pending: Arc::new(Mutex::new((Vec::new(), 0))),
+            stop: Arc::new(AtomicBool::new(false)),
+            failure: Arc::new(Mutex::new(Some("failed".to_owned()))),
+            padding_sent: Arc::new(AtomicBool::new(false)),
+            shaping: None,
+            media: false,
+            read_timeout: Arc::new(Mutex::new(Some(Duration::from_secs(1)))),
+            write_timeout: Arc::new(Mutex::new(Some(Duration::from_secs(1)))),
+        };
+        let mut byte = [0u8; 1];
+        assert_eq!(stream.read(&mut byte).expect("first"), 1);
+        assert_eq!(&byte, b"A");
+        assert_eq!(stream.read(&mut byte).expect("second"), 1);
+        assert_eq!(&byte, b"B");
+        assert!(stream.read(&mut byte).is_err());
+        drop(input_tx);
+    }
 
     #[test]
     fn a_weighted_coin_keeps_the_inclusive_endpoints() {
