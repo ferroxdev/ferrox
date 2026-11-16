@@ -91,7 +91,7 @@ link = re.compile(r"(?:vless|vmess|trojan|ss)://[^@#? ]+@([^/?# ]+)")
 vmess = re.compile(r"vmess://([A-Za-z0-9+/=_-]+)")
 ss = re.compile(r"ss://([A-Za-z0-9+/=_-]+)(?:@([^/\s#?]+))?")
 allowed = re.compile(
-    r"^(\[::1\]|::1|2001:db8:[0-9A-Fa-f:]*|(127|10)\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"^(\[::1\]|::1|\[2001:db8:[0-9A-Fa-f:]*\]|2001:db8:[0-9A-Fa-f:]*|(127|10)\.\d{1,3}\.\d{1,3}\.\d{1,3}"
     r"|192\.168\.\d{1,3}\.\d{1,3}"
     r"|172\.(1[6-9]|2[0-9]|3[01])\.\d{1,3}\.\d{1,3}"
     r"|(192\.0\.2|198\.51\.100|203\.0\.113)\.\d{1,3}"
@@ -142,6 +142,10 @@ if selftest:
             sys.exit(1)
     if allowed.match(public + ":"):
         print("::error::selftest: a public IPv4 address passed the allowlist", file=sys.stderr)
+        sys.exit(1)
+    match = link.search(f"{scheme}{encoded('aes-256-gcm:p')}@[2001:db8::1]:8388")
+    if not match or not allowed.match(match.group(1)):
+        print("::error::selftest: a bracketed documentation IPv6 authority was rejected", file=sys.stderr)
         sys.exit(1)
     print("check-fixture-safety: selftest ok")
     sys.exit(0)

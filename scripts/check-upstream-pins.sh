@@ -123,6 +123,11 @@ wait
 
 while IFS='|' read -r name _ _ _; do
   [[ -n "$name" ]] || continue
+  if [[ ! "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::source name '$name' is not a safe directory name"
+    status=1
+    continue
+  fi
   out="$tmp/$name.out"
   verdict_file="$tmp/$name.verdict"
   if [[ ! -f "$verdict_file" ]]; then

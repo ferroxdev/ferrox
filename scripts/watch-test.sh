@@ -170,44 +170,65 @@ watch() {
 # so a shared deadlock the co-run pass alone catches does not first cost the walk quiet.
 culprit() {
   local binary="$1"; shift
-  local keep="$out" names done missing name filter full exact=0 skip_threads=0 skip_arg=0
-  local test_threads=""
-  local -a filters=() test_args=() test_filters=() kept=() group_threads=()
+  local keep="$out" names done missing name filter skip selected skipped full
+  local exact=0 next="" test_threads=""
+  local -a filters=() test_args=() test_filters=() skip_filters=() kept=() group_threads=()
   [[ -x "$binary" ]] || return 1
   for arg in "$@"; do
-    if ((skip_arg)); then
-      test_args+=("$arg")
-      skip_arg=0
-      continue
-    fi
-    if ((skip_threads)); then
-      test_threads="$arg"
-      skip_threads=0
+    if [[ -n "$next" ]]; then
+      case "$next" in
+        thread) test_threads="$arg" ;;
+        skip) skip_filters+=("$arg") ;;
+        *) test_args+=("$next" "$arg") ;;
+      esac
+      next=""
       continue
     fi
     case "$arg" in
       --exact) exact=1 ;;
-      --test-threads) skip_threads=1 ;;
+      --test-threads) next=thread ;;
       --test-threads=*) test_threads="${arg#*=}" ;;
-      --skip) test_args+=("$arg"); skip_arg=1 ;;
+      --skip) next=skip ;;
+      --skip=*) skip_filters+=("${arg#*=}") ;;
+      --color|--format|--logfile|--shuffle-seed) test_args+=("$arg"); next="$arg" ;;
+      --color=*|--format=*|--logfile=*|--shuffle-seed=*) test_args+=("$arg") ;;
       -*) test_args+=("$arg") ;;
       *) test_filters+=("$arg") ;;
     esac
   done
   names=$("$binary" --list --format terse 2>/dev/null | sed -n 's/: test$//p')
   [[ -n "$names" ]] || return 1
-  if ((${#test_filters[@]})); then
+  if ((${#test_filters[@]} || ${#skip_filters[@]})); then
     while IFS= read -r name; do
       [[ -n "$name" ]] || continue
-      for filter in "${test_filters[@]}"; do
-        if ((exact)) && [[ "$name" == "$filter" ]]; then
-          kept+=("$name")
-          break
-        elif ((!exact)) && [[ "$name" == *"$filter"* ]]; then
-          kept+=("$name")
-          break
-        fi
-      done
+      selected=1
+      if ((${#test_filters[@]})); then
+        selected=0
+        for filter in "${test_filters[@]}"; do
+          if ((exact)) && [[ "$name" == "$filter" ]]; then
+            selected=1
+            break
+          elif ((!exact)) && [[ "$name" == *"$filter"* ]]; then
+            selected=1
+            break
+          fi
+        done
+      fi
+      ((selected)) || continue
+      skipped=0
+      if ((${#skip_filters[@]})); then
+        for skip in "${skip_filters[@]}"; do
+          if ((exact)) && [[ "$name" == "$skip" ]]; then
+            skipped=1
+            break
+          elif ((!exact)) && [[ "$name" == *"$skip"* ]]; then
+            skipped=1
+            break
+          fi
+        done
+      fi
+      ((skipped)) && continue
+      kept+=("$name")
     done <<<"$names"
     ((${#kept[@]})) || return 1
     names="$(printf '%s\n' "${kept[@]}")"
@@ -291,17 +312,29 @@ EOF
   # The stalled log printed `test early::done ... ok`, so culprit must NOT re-run it: the
   # hang is the one name still missing, and only that name is worth a process of its own.
   : >"$probes"; export FAKE_PROBE="$PWD/$probes"
-  want="$(culprit "$fake" --exact --ignored --test-threads=8 hangs::forever)" \
+  want="$(culprit "$fake" --exact --ignored --test-threads=8 --color never hangs::forever)" \
     || { echo "selftest: the stalled test was not named" >&2; return 1; }
   unset FAKE_PROBE
   [[ "$want" == "hangs::forever" ]] || { echo "selftest: named '$want', want hangs::forever" >&2; return 1; }
   grep -qx 'hangs::forever' "$probes" || { echo "selftest: the hung test was never probed alone" >&2; return 1; }
   grep -qx -- '--ignored' "$probes" || { echo "selftest: the probe dropped the suite's libtest flags" >&2; return 1; }
+  grep -qx -- '--color' "$probes" || { echo "selftest: the probe dropped a value-taking option" >&2; return 1; }
+  grep -qx 'never' "$probes" || { echo "selftest: the probe dropped a value-taking option's value" >&2; return 1; }
   grep -qx -- '--exact' "$probes" && { echo "selftest: the probe forwarded a duplicate --exact" >&2; return 1; }
   grep -qx -- '--test-threads=8' "$probes" && { echo "selftest: the probe kept the suite's thread count" >&2; return 1; }
   [[ "$(grep -c '^hangs::forever$' "$probes" || true)" == 1 ]] \
     || { echo "selftest: the probe forwarded the original test filter" >&2; return 1; }
   grep -qx 'early::done' "$probes" && { echo "selftest: culprit re-ran a test the log already saw finish" >&2; return 1; }
+  : >"$probes"; export FAKE_PROBE="$PWD/$probes"
+  if culprit "$fake" --ignored --skip shared --skip hangs >/dev/null; then
+    echo "selftest: a skipped test was still named" >&2
+    unset FAKE_PROBE
+    return 1
+  fi
+  unset FAKE_PROBE
+  grep -qx 'hangs::forever' "$probes" && { echo "selftest: a skipped test was probed" >&2; return 1; }
+  grep -qx 'shared::alpha' "$probes" && { echo "selftest: a skipped test was probed" >&2; return 1; }
+  grep -qx -- '--skip' "$probes" && { echo "selftest: the probe forwarded a skip filter" >&2; return 1; }
   echo "selftest: ok   a stall stops at the quiet limit, and only the test still missing from the log is run alone"
   # With nothing completed in the log to subtract, culprit falls back to the full list and
   # must reach every name -- here the finished one, which sorts before the hang, so it is

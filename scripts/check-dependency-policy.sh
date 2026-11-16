@@ -183,7 +183,7 @@ if [[ -n "$bad_registry" ]]; then
 fi
 
 for banned in sing-box v2ray-rust; do
-  hits="$(grep -rnE "^[[:space:]]*\"?(${banned})\"?[[:space:]]*=|\[[^]]*dependencies\.\"?${banned}\"?\]|package[[:space:]]*=[[:space:]]*\"${banned}\"" --include='Cargo.toml' crates Cargo.toml 2>/dev/null || true)"
+  hits="$(grep -rnE "^[[:space:]]*['\"]?(${banned})['\"]?[[:space:]]*=|\[[^]]*dependencies\.['\"]?${banned}['\"]?\]|package[[:space:]]*=[[:space:]]*['\"]${banned}['\"]" --include='Cargo.toml' crates Cargo.toml 2>/dev/null || true)"
   if [[ -n "$hits" ]]; then
     note "\`${banned}\` is a comparator, read at its pin under upstream/ and never a dependency"
     printf '%s\n' "$hits"
