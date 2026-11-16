@@ -155,6 +155,8 @@ struct Key {
     alpn: Arc<[Vec<u8>]>,
     client_cert: Option<Arc<super::CertEntry>>,
     master_key_log: Option<Arc<MasterKeyLog>>,
+    min_version: Option<u16>,
+    max_version: Option<u16>,
 }
 
 /// The same inputs a context is cached under, so a stored session is only offered to the context
@@ -166,6 +168,8 @@ fn key(cfg: &TlsConfig) -> Key {
         alpn: Arc::clone(&cfg.alpn),
         client_cert: cfg.client_cert.clone(),
         master_key_log: cfg.master_key_log.clone(),
+        min_version: cfg.min_version,
+        max_version: cfg.max_version,
     }
 }
 
@@ -174,6 +178,8 @@ impl PartialEq for Key {
         self.material == other.material
             && self.server_name == other.server_name
             && self.alpn == other.alpn
+            && self.min_version == other.min_version
+            && self.max_version == other.max_version
             && match (&self.client_cert, &other.client_cert) {
                 (None, None) => true,
                 (Some(ours), Some(theirs)) => Arc::ptr_eq(ours, theirs) || ours == theirs,
@@ -342,8 +348,20 @@ pub(crate) fn server_context(cfg: &TlsServerConfig) -> Result<Arc<SslContext>, T
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // A reload tick leaves the new identities in the cache, as the plain slot reads them.
     let served = guard.served.clone().unwrap_or_else(|| cfg.certs.clone());
+    let key = super::rustls_backend::LegacyServerKey {
+        served: served.clone(),
+        alpn: cfg.alpn.clone(),
+        min_version: cfg.min_version,
+        max_version: cfg.max_version,
+        cipher_suites: cfg.cipher_suites.clone(),
+        curves: cfg.curves.clone(),
+        send_tickets: cfg.send_tickets,
+        reject_unknown_sni: cfg.reject_unknown_sni,
+        ech_server_keys: cfg.ech_server_keys.clone(),
+        master_key_log: cfg.master_key_log.clone(),
+    };
     if let Some((built_for, ctx)) = guard.legacy.as_ref() {
-        if built_for == &served {
+        if built_for == &key {
             return Ok(Arc::clone(ctx));
         }
     }
@@ -364,7 +382,7 @@ pub(crate) fn server_context(cfg: &TlsServerConfig) -> Result<Arc<SslContext>, T
         .set_session_id_context(b"ferrox-legacy")
         .map_err(|e| error_stack(&e))?;
     let built = Arc::new(builder.build());
-    guard.legacy = Some((served, Arc::clone(&built)));
+    guard.legacy = Some((key, Arc::clone(&built)));
     Ok(built)
 }
 

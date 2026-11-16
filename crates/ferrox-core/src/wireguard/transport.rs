@@ -133,7 +133,7 @@ pub fn open(key: &[u8; 32], buf: &mut [u8], total: usize) -> Option<(u32, u64, u
 /// The sender's counter. It hands out each nonce exactly once and refuses once
 /// the next value would wrap, the point a `(key, nonce)` would repeat — the one
 /// thing the AEAD cannot survive.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct Counter {
     next: u64,
 }

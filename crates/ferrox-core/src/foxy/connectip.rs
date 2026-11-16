@@ -343,7 +343,7 @@ pub fn capsule_split(buf: &[u8]) -> Option<(usize, Capsule<'_>)> {
         return None;
     }
     let kind = quic_read(buf, &mut at)?;
-    let length = quic_read(buf, &mut at)? as usize;
+    let length = usize::try_from(quic_read(buf, &mut at)?).ok()?;
     let end = at.checked_add(length)?;
     let value = buf.get(at..end)?;
     Some((
@@ -375,7 +375,7 @@ pub fn capsule_split_bare(buf: &[u8]) -> Option<(usize, Capsule<'_>)> {
         return None;
     }
     let kind = quic_read(buf, &mut at)?;
-    let length = quic_read(buf, &mut at)? as usize;
+    let length = usize::try_from(quic_read(buf, &mut at)?).ok()?;
     let end = at.checked_add(length)?;
     let value = buf.get(at..end)?;
     Some((
@@ -1012,6 +1012,9 @@ pub fn udp_datagram(datagram: &UdpDatagram<'_>, out: &mut Vec<u8>) -> bool {
     }
     let payload = UDP_HEADER + datagram.payload.len();
     if datagram.source.len() == 4 {
+        if IPV4_HEADER + payload > u16::MAX as usize {
+            return false;
+        }
         let mut header = [0u8; IPV4_HEADER];
         header[0] = 0x45;
         header[2..4].copy_from_slice(&((IPV4_HEADER + payload) as u16).to_be_bytes());
@@ -1473,6 +1476,23 @@ mod tests {
             &mut out,
         )
         .expect_refused();
+        assert!(out.is_empty(), "and nothing was written");
+    }
+
+    #[test]
+    fn an_ipv4_datagram_past_its_total_length_is_refused() {
+        let long = vec![0u8; u16::MAX as usize - IPV4_HEADER - UDP_HEADER + 1];
+        let mut out = Vec::new();
+        assert!(!udp_datagram(
+            &UdpDatagram {
+                source: &[10, 0, 0, 1],
+                destination: &[10, 0, 0, 2],
+                source_port: 1,
+                destination_port: 2,
+                payload: &long,
+            },
+            &mut out,
+        ));
         assert!(out.is_empty(), "and nothing was written");
     }
 

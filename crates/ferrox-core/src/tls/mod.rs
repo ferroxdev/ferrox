@@ -155,6 +155,16 @@ impl MasterKeyLog {
             options.mode(0o600);
         }
         let file = options.open(path).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if file
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .is_err()
+            {
+                return None;
+            }
+        }
         // 193 bytes is the longest line: a 30-byte label, a 32-byte random and a 48-byte SHA-384 secret.
         Some(Self {
             path: std::fs::canonicalize(path).map_or_else(
@@ -635,23 +645,28 @@ impl TlsServerConfig {
         let mut changed = false;
         for (index, entry) in self.certs.iter().enumerate() {
             let mut entry = entry.clone();
+            let mut renewed = false;
             if let Some(reload) = &entry.reload {
                 let parsed = parse_pem_entry(
                     &(reload.read)(&reload.certificate)?,
                     &(reload.read)(&reload.key)?,
                 )
                 .ok()?;
-                changed |= served.get(index).is_none_or(|was| {
+                renewed = served.get(index).is_none_or(|was| {
                     was.cert_chain != parsed.cert_chain || was.key_der != parsed.key_der
                 });
+                changed |= renewed;
                 entry.cert_chain = parsed.cert_chain;
                 entry.key_der = parsed.key_der;
                 entry.key_kind = parsed.key_kind;
             }
             if let Some(ocsp) = &mut entry.ocsp {
                 let fetched = ocsp::staple_for(&entry.cert_chain);
-                // A failed fetch keeps the served response, not the startup one it would roll back to.
+                // A failed fetch keeps the served response only while the leaf it answered for is unchanged.
                 ocsp.response = fetched.or_else(|| {
+                    if renewed {
+                        return None;
+                    }
                     served
                         .get(index)
                         .and_then(|was| was.ocsp.as_ref())

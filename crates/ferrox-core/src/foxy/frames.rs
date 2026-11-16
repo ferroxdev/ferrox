@@ -471,9 +471,12 @@ pub fn h3_event(frame: H3Frame, payload: &[u8]) -> H3Event<'_> {
     match frame.kind {
         H3_HEADERS => H3Event::Headers {
             block: payload,
-            end: true,
+            end: false,
         },
-        H3_DATA => H3Event::Data { payload, end: true },
+        H3_DATA => H3Event::Data {
+            payload,
+            end: false,
+        },
         H3_RESET => H3Event::Reset {
             code: be64(payload),
         },
@@ -894,7 +897,7 @@ mod tests {
             h3_event(frame, &out[at..]),
             H3Event::Headers {
                 block: b"\x00\x00\x01\x07",
-                end: true
+                end: false
             }
         ));
     }
@@ -931,7 +934,7 @@ mod tests {
                 },
                 &[]
             ),
-            H3Event::Data { end: true, .. }
+            H3Event::Data { end: false, .. }
         ));
     }
 }

@@ -1804,6 +1804,39 @@ fn write_segments<W: Write + ?Sized>(
 }
 
 /// The rustls config an identity produces, so tests pin wire behavior here.
+#[derive(Debug, Default)]
+pub struct LegacyServerKey {
+    pub served: Vec<super::CertEntry>,
+    pub alpn: Vec<Vec<u8>>,
+    pub min_version: Option<u16>,
+    pub max_version: Option<u16>,
+    pub cipher_suites: Vec<u16>,
+    pub curves: Vec<u16>,
+    pub send_tickets: bool,
+    pub reject_unknown_sni: bool,
+    pub ech_server_keys: Option<std::sync::Arc<[u8]>>,
+    pub master_key_log: Option<std::sync::Arc<super::MasterKeyLog>>,
+}
+
+impl PartialEq for LegacyServerKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.served == other.served
+            && self.alpn == other.alpn
+            && self.min_version == other.min_version
+            && self.max_version == other.max_version
+            && self.cipher_suites == other.cipher_suites
+            && self.curves == other.curves
+            && self.send_tickets == other.send_tickets
+            && self.reject_unknown_sni == other.reject_unknown_sni
+            && self.ech_server_keys == other.ech_server_keys
+            && match (&self.master_key_log, &other.master_key_log) {
+                (None, None) => true,
+                (Some(ours), Some(theirs)) => std::sync::Arc::ptr_eq(ours, theirs),
+                _ => false,
+            }
+    }
+}
+
 #[derive(Default)]
 pub struct ServerConfigCacheInner {
     pub plain: Option<std::sync::Arc<rustls::ServerConfig>>,
@@ -1813,11 +1846,8 @@ pub struct ServerConfigCacheInner {
         Vec<super::CertEntry>,
         std::sync::Arc<boring::ssl::SslContext>,
     )>,
-    /// The legacy listener context, with the identities it was built for.
-    pub legacy: Option<(
-        Vec<super::CertEntry>,
-        std::sync::Arc<boring::ssl::SslContext>,
-    )>,
+    /// The legacy listener context, with every input it was built from.
+    pub legacy: Option<(LegacyServerKey, std::sync::Arc<boring::ssl::SslContext>)>,
     /// The identities the listener currently serves, so a re-read compares against them.
     pub served: Option<Vec<super::CertEntry>>,
 }

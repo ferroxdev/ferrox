@@ -69,7 +69,12 @@ fn client_for(remote: SocketAddr, config: &Config) -> io::Result<Arc<ClientSocke
         client.live.fetch_add(1, Ordering::SeqCst);
         return Ok(Arc::clone(client));
     }
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    let bind = if remote.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let sock = UdpSocket::bind(bind)?;
     sock.connect(remote)?;
     let local = sock.local_addr()?;
     sock.set_read_timeout(Some(Duration::from_millis(50)))?;
@@ -291,6 +296,9 @@ impl Listener {
                 match sock_r.recv_from(&mut buf) {
                     Ok((n, src)) => {
                         let Some(inner) = weak.upgrade() else { break };
+                        if inner.closed.load(Ordering::SeqCst) {
+                            break;
+                        }
                         if inner
                             .config
                             .filters
@@ -319,9 +327,6 @@ impl Listener {
                         if terminates {
                             continue;
                         }
-                        if inner.sessions.lock().unwrap().len() >= inner.config.max_sessions {
-                            continue;
-                        }
                         let Ok(sock_w) = sock_r.try_clone() else {
                             continue;
                         };
@@ -339,6 +344,9 @@ impl Listener {
                         let sessions_slot = Arc::downgrade(&inner);
                         let closer: Box<dyn FnOnce() + Send> = Box::new(move || {
                             if let Some(inner) = sessions_slot.upgrade() {
+                                inner.ready.lock().unwrap().retain(|conn| {
+                                    conn.remote_addr() != key.0 || conn.conversation() != key.1
+                                });
                                 inner.sessions.lock().unwrap().remove(&key);
                             }
                         });
@@ -353,18 +361,32 @@ impl Listener {
                             closer,
                             inner.config.clone(),
                         );
-                        inner
-                            .sessions
-                            .lock()
-                            .unwrap()
-                            .insert(key, Arc::clone(&session));
+                        {
+                            let mut sessions = inner.sessions.lock().unwrap();
+                            if inner.closed.load(Ordering::SeqCst)
+                                || sessions.len() >= inner.config.max_sessions
+                            {
+                                continue;
+                            }
+                            sessions.insert(key, Arc::clone(&session));
+                        }
                         parse_segments(framed, &mut segs, &|| session.take_payload());
                         if segs.is_empty() {
                             inner.sessions.lock().unwrap().remove(&key);
                             continue;
                         }
                         session.input(&mut segs);
-                        inner.ready.lock().unwrap().push_back(session);
+                        if session.state() == super::connection::State::Terminated {
+                            continue;
+                        }
+                        let mut ready = inner.ready.lock().unwrap();
+                        if inner.closed.load(Ordering::SeqCst) {
+                            drop(ready);
+                            inner.sessions.lock().unwrap().remove(&key);
+                            continue;
+                        }
+                        ready.push_back(session);
+                        drop(ready);
                         inner.ready_cv.notify_all();
                     }
                     Err(ref e)
@@ -387,11 +409,12 @@ impl Listener {
     pub fn accept(&self) -> io::Result<Arc<Connection>> {
         let mut ready = self.inner.ready.lock().unwrap();
         loop {
+            if self.inner.closed.load(Ordering::SeqCst) {
+                ready.clear();
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "listener closed"));
+            }
             if let Some(conn) = ready.pop_front() {
                 return Ok(conn);
-            }
-            if self.inner.closed.load(Ordering::SeqCst) {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "listener closed"));
             }
             ready = self.inner.ready_cv.wait(ready).unwrap();
         }
@@ -403,6 +426,7 @@ impl Listener {
         for (_, conn) in sessions {
             conn.terminate();
         }
+        self.inner.ready.lock().unwrap().clear();
         self.inner.ready_cv.notify_all();
     }
 }
@@ -463,6 +487,17 @@ mod tests {
         for conn in dials {
             conn.terminate();
         }
+    }
+
+    #[cfg_attr(miri, ignore = "binds a loopback UDP socket")]
+    #[test]
+    fn accept_after_close_is_an_error() {
+        let listener = Listener::bind(([127, 0, 0, 1], 0).into(), Config::default()).expect("bind");
+        listener.close();
+        let error = listener
+            .accept()
+            .expect_err("a closed listener accepts nothing");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[cfg_attr(miri, ignore = "binds a loopback UDP socket")]

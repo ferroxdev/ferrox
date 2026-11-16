@@ -17,7 +17,7 @@ pub(crate) const APPLICATION: u8 = 23;
 pub(crate) const MAX_RECORD: usize = 16384 + 256;
 const RECORD_READ: usize = 16384;
 pub(crate) const MAX_HANDSHAKE: usize = 1 << 20;
-const MAX_PLAINTEXT: usize = 16384;
+pub(crate) const MAX_PLAINTEXT: usize = 16384;
 /// How long a shaped handshake may spend waiting for its peer, matching the KCP path's read deadline.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -80,7 +80,9 @@ pub struct Session<S: Stream> {
     inbuf_init: usize,
     in_at: usize,
     reply: Vec<u8>,
+    reply_at: usize,
     out: Vec<u8>,
+    out_at: usize,
     close: Vec<u8>,
     close_at: usize,
     close_sent: bool,
@@ -193,9 +195,10 @@ impl<S: Stream> Session<S> {
         io: S,
         stock: bool,
     ) -> Result<Self, TlsError> {
+        let hello_name = if cfg.omit_sni { "" } else { &cfg.server_name };
         let mut hello = Hello::build(
             profile,
-            &cfg.server_name,
+            hello_name,
             if stock { &[] } else { &cfg.alpn },
             !stock && cfg.websocket,
             &cfg.curves,
@@ -289,7 +292,9 @@ impl<S: Stream> Session<S> {
             inbuf_init: 0,
             in_at: 0,
             reply: Vec::new(),
+            reply_at: 0,
             out: Vec::new(),
+            out_at: 0,
             close: Vec::new(),
             close_at: 0,
             close_sent: false,
@@ -1242,8 +1247,8 @@ impl<S: Stream> Session<S> {
             let write = write_key
                 .as_mut()
                 .ok_or_else(|| TlsError::Other("key update before keys".to_owned()))?;
-            write.update();
             record::seal13(write, HANDSHAKE, &update, reply)?;
+            write.update();
         }
         Ok(())
     }
@@ -1284,13 +1289,13 @@ impl<S: Stream> Session<S> {
                     }
                     Some(keys) if self.version == Some(Version::Tls13) => {
                         if header[0] == ALERT {
-                            buf[filled..filled + len].copy_from_slice(body);
-                            (ALERT, len)
+                            return Err(TlsError::Other(
+                                "plaintext alert after TLS 1.3 keys".to_owned(),
+                            ));
                         } else if header[0] != APPLICATION {
                             return Err(unexpected(header[0]));
-                        } else {
-                            record::open13_into(keys, header, body, &mut buf[filled..])?
                         }
+                        record::open13_into(keys, header, body, &mut buf[filled..])?
                     }
                     Some(keys) => (
                         header[0],
@@ -1403,9 +1408,16 @@ impl<S: Stream> Session<S> {
     }
 
     fn seal_parts(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> Result<(), TlsError> {
-        if !self.reply.is_empty() {
-            out.append(&mut self.reply);
+        if self.out_at < self.out.len() {
+            out.extend_from_slice(&self.out[self.out_at..]);
+            self.out.clear();
+            self.out_at = 0;
         }
+        if self.reply_at < self.reply.len() {
+            out.extend_from_slice(&self.reply[self.reply_at..]);
+        }
+        self.reply.clear();
+        self.reply_at = 0;
         let version = self.version;
         let keys = self
             .write_key
@@ -1428,11 +1440,10 @@ impl<S: Stream> Session<S> {
             ));
         }
         if self.close.is_empty() {
+            self.flush_reply()?;
+            self.flush_out()?;
             let version = self.version;
             let mut out = Vec::new();
-            if !self.reply.is_empty() {
-                out.append(&mut self.reply);
-            }
             let alert = [1u8, 0u8];
             let sealed = {
                 let keys = self
@@ -1476,24 +1487,49 @@ impl<S: Stream> Session<S> {
 
     /// Seals `parts` into the session's own write buffer and sends it, so a relay write after the first costs no allocation.
     fn seal_out(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        self.flush_reply()?;
         let mut out = std::mem::take(&mut self.out);
         out.clear();
-        let sent = self
-            .seal_parts(parts, &mut out)
-            .map_err(std::io::Error::other)
-            .and_then(|()| self.io.write_all(&out));
+        self.out_at = 0;
+        self.seal_parts(parts, &mut out)
+            .map_err(std::io::Error::other)?;
         self.out = out;
-        sent
+        match self.flush_out() {
+            Ok(()) => Ok(()),
+            Err(error) if TlsError::is_timeout(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn flush_out(&mut self) -> std::io::Result<()> {
+        while self.out_at < self.out.len() {
+            match self.io.write(&self.out[self.out_at..]) {
+                Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+                Ok(written) => self.out_at += written,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     fn flush_reply(&mut self) -> std::io::Result<()> {
+        if self.out_at < self.out.len() {
+            self.flush_out()?;
+        }
         if !self.close.is_empty() || self.close_sent {
             return Ok(());
         }
-        if !self.reply.is_empty() {
-            self.io.write_all(&self.reply)?;
-            self.reply.clear();
+        while self.reply_at < self.reply.len() {
+            match self.io.write(&self.reply[self.reply_at..]) {
+                Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+                Ok(written) => self.reply_at += written,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
         }
+        self.reply.clear();
+        self.reply_at = 0;
         Ok(())
     }
 }
@@ -1710,7 +1746,11 @@ impl<S: Stream> Read for Session<S> {
         if let Some(layer) = &mut self.ktls {
             return layer.read(&mut self.io, buf);
         }
-        self.flush_reply()?;
+        if let Err(error) = self.flush_reply() {
+            if !TlsError::is_timeout(&error) {
+                return Err(error);
+            }
+        }
         self.pump(buf).map_err(std::io::Error::other)
     }
 }
@@ -1731,7 +1771,9 @@ impl<S: Stream> Write for Session<S> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_reply()?;
         self.flush_close().map_err(std::io::Error::other)?;
+        self.flush_out()?;
         if let Some(layer) = &mut self.ktls {
             return layer.flush(&mut self.io);
         }
@@ -2267,7 +2309,9 @@ fn decrypt(
             .map(|(start, bytes)| (header[0], start, bytes));
     }
     if header[0] == ALERT {
-        return Ok((ALERT, 0, body.len()));
+        return Err(TlsError::Other(
+            "plaintext alert after TLS 1.3 keys".to_owned(),
+        ));
     }
     if header[0] != APPLICATION {
         return Err(unexpected(header[0]));
@@ -2505,7 +2549,9 @@ mod tests {
             inbuf_init: 0,
             in_at: 0,
             reply: Vec::new(),
+            reply_at: 0,
             out: Vec::new(),
+            out_at: 0,
             close: Vec::new(),
             close_at: 0,
             close_sent: false,
@@ -2582,6 +2628,27 @@ mod tests {
             Direction::tls13(Suite::Aes128GcmSha256, &[0u8; 32]),
             Direction::tls13(Suite::Aes128GcmSha256, &[0u8; 32]),
         )
+    }
+
+    #[test]
+    fn a_pending_record_precedes_a_queued_reply() {
+        let mut subject = tls13_session(Wire::default());
+        subject.out = b"record".to_vec();
+        subject.reply = b"reply".to_vec();
+        subject.flush_reply().expect("flushes");
+        assert_eq!(subject.io.wire, b"recordreply");
+    }
+
+    #[test]
+    fn a_seal_after_a_partial_write_sends_the_pending_record_first() {
+        let mut subject = tls13_session(Wire::default());
+        subject.out = b"old".to_vec();
+        let mut fresh = Vec::new();
+        subject.seal_into(b"new", &mut fresh).expect("seals");
+        assert_eq!(subject.io.wire.len(), 0);
+        assert!(fresh.starts_with(b"old"));
+        assert_ne!(fresh.len(), b"old".len());
+        assert_eq!(subject.out_at, subject.out.len());
     }
 
     #[test]
@@ -3533,6 +3600,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_plaintext_alert_after_tls13_keys_is_refused() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [17u8; 32];
+        let mut subject = session(
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+        let mut buf = [0u8; 16];
+        let record = [ALERT, 3, 3, 0, 2, 1, 0];
+        let error = subject
+            .process_direct(&record, &mut buf)
+            .expect_err("a plaintext alert cannot arrive under TLS 1.3 keys");
+        assert!(
+            matches!(&error, TlsError::Other(message) if message.contains("plaintext alert")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_write_that_stalls_with_a_partial_record_resumes_it() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [17u8; 32];
+        let mut subject = session_on(
+            StallOnce::default(),
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+        subject
+            .write_all_slices(&[b"first"])
+            .expect("the first record is accepted");
+        subject
+            .write_all_slices(&[b"second"])
+            .expect("the pending tail and the next record are accepted");
+
+        let mut expected = session_on(
+            Wire::default(),
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+        expected.write_all_slices(&[b"first"]).expect("seals");
+        expected.write_all_slices(&[b"second"]).expect("seals");
+        assert_eq!(
+            subject.io.wire, expected.io.wire,
+            "the stalled tail is sent once, in order"
+        );
+    }
+
     /// A relay write hands its record out of the session's own buffer, kept across writes: a fresh
     /// `Vec` per call is one allocation on every write and a different base each time.
     #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
@@ -3578,6 +3699,70 @@ mod tests {
         let (_, counts) =
             crate::alloc_count::measure(|| subject.write(&payload).expect("a single slice"));
         assert_eq!(counts.allocs, 0, "the single-slice write shares it");
+    }
+
+    #[derive(Default)]
+    struct StallOnce {
+        wire: Vec<u8>,
+        calls: usize,
+    }
+
+    impl Read for StallOnce {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl RecordAlignment for StallOnce {}
+
+    impl Write for StallOnce {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self.calls {
+                0 => {
+                    self.calls = 1;
+                    let n = buf.len().min(7);
+                    self.wire.extend_from_slice(&buf[..n]);
+                    Ok(n)
+                }
+                1 => {
+                    self.calls = 2;
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                }
+                _ => {
+                    self.calls += 1;
+                    self.wire.extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct Wire {
+        wire: Vec<u8>,
+    }
+
+    impl Read for Wire {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl RecordAlignment for Wire {}
+
+    impl Write for Wire {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.wire.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     struct Tap {

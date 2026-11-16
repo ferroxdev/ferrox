@@ -57,6 +57,7 @@ pub struct ConnMetadata {
 pub enum ConnError {
     IoTimeout,
     Closed,
+    MtuTooSmall,
 }
 
 impl std::fmt::Display for ConnError {
@@ -64,6 +65,7 @@ impl std::fmt::Display for ConnError {
         match self {
             Self::IoTimeout => write!(f, "read/write timeout"),
             Self::Closed => write!(f, "connection closed"),
+            Self::MtuTooSmall => write!(f, "mtu leaves no payload"),
         }
     }
 }
@@ -371,15 +373,14 @@ impl Connection {
         }
         let state = self.state();
         let draining = state == State::Terminating || state == State::PeerTerminating;
+        let written = self.write_pending.swap(false, Ordering::SeqCst);
         let necessary = self.sending.lock().unwrap().update_necessary();
         #[cfg(test)]
         self.pass_lock_gate("poll");
         let necessary = necessary || self.receiving.lock().unwrap().update_necessary();
         let last_flush = *self.last_flush.lock().unwrap();
         let last_uncond = *self.last_uncond.lock().unwrap();
-        let due = draining
-            || self.write_pending.swap(false, Ordering::SeqCst)
-            || now.saturating_duration_since(last_flush) >= tick;
+        let due = draining || written || now.saturating_duration_since(last_flush) >= tick;
         if due
             && (draining
                 || necessary
@@ -459,6 +460,9 @@ impl Connection {
         for seg in segments.drain(..) {
             if seg.conversation() != self.ctx.meta.conversation {
                 break;
+            }
+            if matches!(&seg, Segment::CmdOnly(c) if c.kind().is_none()) {
+                continue;
             }
             if seg.option().is_close() {
                 drop(receiving.take());
@@ -609,22 +613,29 @@ impl Connection {
     }
 
     pub fn close(&self) {
-        self.data_input.signal();
-        self.data_output.signal();
         match self.state() {
             State::ReadyToClose | State::Terminating | State::Terminated => {}
             State::Active => self.set_state(State::ReadyToClose),
             State::PeerClosed => self.set_state(State::Terminating),
             State::PeerTerminating => self.set_state(State::Terminated),
         }
+        self.data_input.signal();
+        self.data_output.signal();
         if matches!(self.state(), State::ReadyToClose | State::Terminating) {
             self.flush();
         }
     }
 
     pub fn terminate(&self) {
+        self.ctx
+            .state
+            .store(State::Terminated as i32, Ordering::SeqCst);
+        self.receiving.lock().unwrap().close_read();
+        self.sending.lock().unwrap().close_write();
         self.data_input.signal();
         self.data_output.signal();
+        self.terminated.store(true, Ordering::SeqCst);
+        Self::wake_update();
         if let Some(closer) = self.closer.lock().unwrap().take() {
             closer();
         }
@@ -687,6 +698,9 @@ impl Connection {
     }
 
     pub fn write(&self, b: &[u8]) -> Result<usize, ConnError> {
+        if !b.is_empty() && self.mss == 0 {
+            return Err(ConnError::MtuTooSmall);
+        }
         let mut offset = 0;
         let mut pushed = false;
         while offset < b.len() {
@@ -697,6 +711,7 @@ impl Connection {
             let n = (b.len() - offset).min(self.mss as usize);
             if !self.sending.lock().unwrap().push(&b[offset..offset + n]) {
                 if pushed {
+                    self.write_pending.store(true, Ordering::SeqCst);
                     Self::wake_update();
                     pushed = false;
                 }
@@ -769,7 +784,7 @@ mod tests {
 
     use super::{
         ping_due, CmdOnlySegment, Command, Config, ConnMetadata, Connection, Segment,
-        PING_INTERVAL_MS, WRITE_ATTEMPTS,
+        SegmentOption, State, PING_INTERVAL_MS, WRITE_ATTEMPTS,
     };
 
     struct Recorder {
@@ -895,6 +910,29 @@ mod tests {
         command.conv = 4;
         conn.input(&mut vec![Segment::CmdOnly(command)]);
         assert_eq!(*events.lock().unwrap(), ["receiving", "sending"]);
+    }
+
+    #[test]
+    fn an_unknown_command_cannot_close_or_move_the_windows() {
+        let (recorder, conn) = recording_connection(0);
+        let mut command = CmdOnlySegment::new();
+        command.conv = 4;
+        command.cmd = 250;
+        command.option = SegmentOption::CLOSE;
+        command.sending_next = u32::MAX;
+        command.receiving_next = u32::MAX;
+        command.peer_rto = 1;
+        conn.input(&mut vec![Segment::CmdOnly(command)]);
+        assert_eq!(
+            conn.state(),
+            State::Active,
+            "the close bit was not acted on"
+        );
+        assert_eq!(
+            recorder.attempts.load(Ordering::SeqCst),
+            0,
+            "and no reply went out"
+        );
     }
 
     #[test]
@@ -1028,6 +1066,26 @@ mod tests {
     fn read_once(conn: &Connection, b: &mut [u8]) -> Result<usize, super::ConnError> {
         conn.set_read_deadline(std::time::Instant::now() + Duration::from_millis(200));
         conn.read(b)
+    }
+
+    #[test]
+    fn a_tiny_mtu_refuses_a_write_instead_of_dropping_it() {
+        let local = ([127, 0, 0, 1], 1).into();
+        let conn = Connection::new(
+            ConnMetadata {
+                local,
+                remote: local,
+                conversation: 4,
+            },
+            Box::new(|_| Ok(())),
+            Box::new(|| {}),
+            Config {
+                mtu: 18,
+                ..Config::default()
+            },
+        );
+        assert_eq!(conn.write(b"x"), Err(super::ConnError::MtuTooSmall));
+        assert_eq!(conn.write(b""), Ok(0));
     }
 
     #[test]

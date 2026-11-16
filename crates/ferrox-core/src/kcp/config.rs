@@ -58,14 +58,22 @@ impl Config {
         size.max(8)
     }
 
+    fn mask_overhead(&self) -> u32 {
+        u32::try_from(self.mask.overhead()).unwrap_or(u32::MAX)
+    }
+
     #[must_use]
     pub fn payload_size(&self) -> u32 {
-        self.mtu.saturating_sub(DATA_SEGMENT_OVERHEAD)
+        self.mtu
+            .saturating_sub(DATA_SEGMENT_OVERHEAD.saturating_add(self.mask_overhead()))
     }
 
     #[must_use]
     pub fn ack_limit(&self) -> usize {
-        (self.mtu.saturating_sub(17) / 4) as usize
+        (self
+            .mtu
+            .saturating_sub(17u32.saturating_add(self.mask_overhead()))
+            / 4) as usize
     }
 }
 
@@ -93,6 +101,20 @@ mod tests {
         assert_eq!(c.receiving_in_flight_size(), 776);
         assert_eq!(c.payload_size(), 1350 - 18);
         assert_eq!(c.ack_limit(), ((1350 - 17) / 4) as usize);
+    }
+
+    #[test]
+    fn the_mask_overhead_is_inside_the_mtu() {
+        let mask = Mask::from_spec(&[super::super::mask::Spec::Aes {
+            password: "mask".to_owned(),
+        }])
+        .expect("mask builds");
+        let c = Config {
+            mask: mask.clone(),
+            ..Config::default()
+        };
+        assert_eq!(c.payload_size(), 1350 - 18 - mask.overhead() as u32);
+        assert!(c.payload_size() + 18 + mask.overhead() as u32 <= c.mtu);
     }
 
     #[test]

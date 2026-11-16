@@ -200,27 +200,33 @@ pub fn datagram_header(body: &[u8]) -> Option<(usize, usize)> {
     Some((at, length - context_len))
 }
 
-/// The first complete DATAGRAM capsule in a stream buffer: bytes consumed and the payload, or `None` while it is not whole; unknown types and nonzero contexts are skipped rather than refused, since neither carries bytes this lane reads.
+/// The first complete DATAGRAM capsule in a stream buffer: bytes consumed and the payload, or `None` while no capsule is whole; unknown types and nonzero contexts are skipped rather than refused, since neither carries bytes this lane reads. When every whole capsule was skipped, the consumed prefix is returned with an empty payload so padding cannot accumulate.
 #[must_use]
 pub fn datagram_split(buf: &[u8]) -> Option<(usize, &[u8])> {
     let mut at = 0usize;
     while at < buf.len() {
-        let capsule = quic_read(buf, &mut at)?;
-        let length = quic_read(buf, &mut at)? as usize;
-        let end = at.checked_add(length)?;
-        let value = buf.get(at..end)?;
+        let start = at;
+        let Some(capsule) = quic_read(buf, &mut at) else {
+            return (start > 0).then_some((start, &[][..]));
+        };
+        let Some(length) = quic_read(buf, &mut at).and_then(|n| usize::try_from(n).ok()) else {
+            return (start > 0).then_some((start, &[][..]));
+        };
+        let Some(end) = at.checked_add(length) else {
+            return (start > 0).then_some((start, &[][..]));
+        };
+        let Some(value) = buf.get(at..end) else {
+            return (start > 0).then_some((start, &[][..]));
+        };
         if capsule == 0 {
             let mut context_at = 0usize;
             if quic_read(value, &mut context_at) == Some(0) {
                 return Some((end, &value[context_at..]));
             }
         }
-        if end == at {
-            return None;
-        }
         at = end;
     }
-    None
+    (at > 0).then_some((at, &[][..]))
 }
 
 #[cfg(test)]
@@ -452,5 +458,19 @@ mod tests {
         let (used, back) = datagram_split(&buf).expect("skips to the datagram");
         assert_eq!((used, back.len()), (buf.len(), 2));
         assert_eq!(back, b"ok");
+    }
+
+    #[test]
+    fn empty_capsules_are_consumed_not_retained() {
+        let mut buf = Vec::new();
+        buf.push(0x00);
+        quic_varint(&mut buf, 0);
+        let pad = buf.len();
+        assert_eq!(datagram_split(&buf), Some((pad, &[][..])));
+        buf.push(0x00);
+        quic_varint(&mut buf, 0);
+        assert_eq!(datagram_split(&buf), Some((2 * pad, &[][..])));
+        buf.push(0x00);
+        assert_eq!(datagram_split(&buf), Some((2 * pad, &[][..])));
     }
 }

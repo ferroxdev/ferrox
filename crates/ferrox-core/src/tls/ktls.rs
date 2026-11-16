@@ -726,6 +726,10 @@ impl Layer {
             };
             match kind {
                 APPLICATION => {
+                    if len == 0 {
+                        self.inbuf.clear();
+                        continue;
+                    }
                     let n = len.min(buf.len());
                     let at = 5;
                     buf[..n].copy_from_slice(&self.inbuf[at..at + n]);
@@ -971,6 +975,22 @@ mod tests {
             read_account: None,
             eof: false,
         }
+    }
+
+    #[test]
+    fn an_empty_application_record_is_not_eof() {
+        let secret = [9u8; 32];
+        let mut tx = Direction::tls13_at(Suite::Aes128GcmSha256, &secret, 0);
+        let mut wire = Vec::new();
+        record::seal13(&mut tx, APPLICATION, b"", &mut wire).expect("seals");
+        record::seal13(&mut tx, APPLICATION, b"hello", &mut wire).expect("seals");
+        let mut layer = userspace(&secret);
+        let mut window = [0u8; 8];
+        assert_eq!(
+            layer.open(&wire, &mut window).expect("opens"),
+            (5, wire.len())
+        );
+        assert_eq!(&window[..5], b"hello");
     }
 
     #[test]

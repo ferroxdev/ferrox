@@ -1397,6 +1397,9 @@ fn ech_body(profile: &Profile, canonical: bool) -> Option<Vec<u8>> {
         }
     }
     let (suites, payloads) = spec?;
+    if suites.is_empty() || payloads.is_empty() {
+        return None;
+    }
     let (suite, config_id, enc, payload_len) = if canonical {
         (suites[0], 0u8, [0u8; 32], usize::from(payloads[0]) + 16)
     } else {

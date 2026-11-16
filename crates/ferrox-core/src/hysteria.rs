@@ -526,7 +526,15 @@ impl Defrag {
         if slot.is_some() {
             return Ok(None);
         }
-        self.size += message.payload.len();
+        let Some(size) = self
+            .size
+            .checked_add(message.payload.len())
+            .filter(|size| *size <= MAX_UDP_PAYLOAD)
+        else {
+            *self = Self::default();
+            return Err(RequestError::Invalid);
+        };
+        self.size = size;
         *slot = Some(message.payload.to_vec());
         self.have += 1;
         if self.have != self.slots.len() {

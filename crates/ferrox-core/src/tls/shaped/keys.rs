@@ -77,7 +77,7 @@ impl Share {
                 let mut out = Vec::with_capacity(64);
                 if draft {
                     out.extend_from_slice(&x);
-                    out.extend_from_slice(&draft_shared(kyber.as_ref(), peer));
+                    out.extend_from_slice(&draft_shared(kyber.as_ref(), &ct));
                 } else {
                     out.extend_from_slice(kyber.as_ref());
                     out.extend_from_slice(&x);
@@ -234,5 +234,24 @@ mod tests {
         assert_eq!(shares.len(), 1);
         assert_eq!(shares[0].data.len(), 32);
         assert_eq!(counts.allocs, 2, "the list and the share: {counts:?}");
+    }
+
+    #[test]
+    fn the_draft_group_agrees_on_the_mixed_secret() {
+        use ml_kem::kem::Key as KemKey;
+        let mut draft = generate(&[X25519_MLKEM768_DRAFT], false).expect("a draft share");
+        let client = draft.pop().expect("one share");
+        let encoded = KemKey::<ml_kem::EncapsulationKey<MlKem768>>::try_from(&client.data[32..])
+            .expect("the encapsulation key");
+        let key = ml_kem::EncapsulationKey::<MlKem768>::new(&encoded).expect("a valid key");
+        let (ciphertext, shared) = key.encapsulate_deterministic(&ml_kem::B32::from([7u8; 32]));
+        let server = StaticSecret::from([9u8; 32]);
+        let mut peer = PublicKey::from(&server).as_bytes().to_vec();
+        peer.extend_from_slice(ciphertext.as_ref());
+        let mut want =
+            x25519_dalek::x25519(server.to_bytes(), client.data[..32].try_into().expect("32"))
+                .to_vec();
+        want.extend_from_slice(&draft_shared(shared.as_ref(), ciphertext.as_ref()));
+        assert_eq!(client.agree(&peer).expect("agrees"), want);
     }
 }
