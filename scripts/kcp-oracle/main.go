@@ -157,10 +157,19 @@ func hdrToken(id int, domain string) string {
 
 const scriptLimit = 1 << 20
 
+func splitScript(data []byte, atEOF bool) (int, []byte, error) {
+	advance, token, err := bufio.ScanLines(data, atEOF)
+	if err == nil && len(token) > scriptLimit {
+		return 0, nil, bufio.ErrTooLong
+	}
+	return advance, token, err
+}
+
 func scriptScanner(r io.Reader) *bufio.Scanner {
-	// A token of scriptLimit bytes still needs one byte for its delimiter.
+	// A scriptLimit-byte line plus CRLF needs two delimiter bytes; splitScript caps the token.
 	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, scriptLimit+1), scriptLimit+1)
+	sc.Buffer(make([]byte, 0, scriptLimit+2), scriptLimit+2)
+	sc.Split(splitScript)
 	return sc
 }
 
