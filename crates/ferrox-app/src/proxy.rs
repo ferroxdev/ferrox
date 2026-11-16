@@ -356,6 +356,10 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         )
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
     });
+    if let Some(observatory) = &observatory {
+        crate::observatory::spawn(root, observatory, route.as_ref())
+            .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    }
     if let Some(api) = api.as_ref() {
         wire_api(
             api,
@@ -419,7 +423,7 @@ fn start_observatory(
     if test {
         crate::observatory::validate(root).map(|()| None)
     } else {
-        crate::observatory::start(root)
+        crate::observatory::configure(root)
     }
 }
 
@@ -1377,6 +1381,7 @@ fn dial_settings_present(root: &Json) -> Result<bool, String> {
     let outbounds = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
     let mut present = false;
     for outbound in outbounds {
+        present |= is_chain_config(outbound);
         present |= parse_send_through(outbound)?.is_some();
         present |= parse_outbound_sockopt(outbound)?.is_some();
         present |= parse_target_strategy(outbound)?.is_some();
@@ -1400,12 +1405,27 @@ fn parse_target_strategy(outbound: &Json) -> Result<Option<FreedomDomain>, Strin
 fn parse_outbound_sockopt(
     outbound: &Json,
 ) -> Result<Option<crate::sockopt::SocketOptions>, String> {
-    let Some(options) = crate::sockopt::parse_outbound(
+    let mut options = crate::sockopt::parse_outbound(
         outbound
             .get("streamSettings")
             .and_then(|s| s.get("sockopt")),
-    )?
-    else {
+    )?;
+    if let Some(tag) = detour_tag(outbound) {
+        if let Some(named) = options
+            .as_ref()
+            .and_then(crate::sockopt::SocketOptions::dialer_proxy)
+        {
+            if named != tag {
+                return Err(format!(
+                    "outbound names both dialerProxy `{named}` and detour `{tag}`"
+                ));
+            }
+        }
+        options
+            .get_or_insert_with(crate::sockopt::SocketOptions::default)
+            .set_dialer_proxy(Some(tag));
+    }
+    let Some(options) = options else {
         return Ok(None);
     };
     if options.address_port_strategy() != crate::sockopt::AddressPortStrategy::None
@@ -2603,6 +2623,48 @@ impl RouteShared {
         self.tagged.get(tag)
     }
 
+    /// The probe target a health check reaches by tag, with the same source, options and target
+    /// strategy the route gives a flow; the chain tag resolves to its exit lane.
+    pub(crate) fn probe_target(self: &Arc<Self>, tag: &str) -> Option<ProbeTarget> {
+        let out = if self.default_tag.as_deref() == Some(tag) {
+            self.default.clone()
+        } else {
+            self.tagged.get(tag)?.clone()
+        };
+        Some(self.probe_target_with(tag, out))
+    }
+
+    /// A target for a configured tag no rule selected: the route never built it, but its dial
+    /// settings are still in the table, so a probe reads the same hop a flow would.
+    pub(crate) fn probe_target_with(self: &Arc<Self>, tag: &str, out: Outbound) -> ProbeTarget {
+        if let Outbound::Loopback(loopback) = &out {
+            loopback.bind(self);
+        }
+        if let Outbound::Masque(masque) = &out {
+            masque.install_route(self);
+        }
+        let (source, sockopts, strategy) = if self.default_tag.as_deref() == Some(tag) {
+            (
+                self.default_source,
+                self.default_sockopts.clone(),
+                self.default_strategy,
+            )
+        } else {
+            (
+                self.sources.get(tag).copied(),
+                self.sockopts.get(tag).cloned(),
+                self.strategies.get(tag).copied(),
+            )
+        };
+        ProbeTarget {
+            out,
+            source,
+            sockopts,
+            strategy,
+            tag: Some(tag.to_owned()),
+        }
+    }
+
     /// The outbound a `geodata.outbound` tag names, or the default when the tag is empty, which is
     /// what the reference's forced-tag dispatch falls back to.
     pub(crate) fn outbound_for(&self, tag: &str) -> Option<Outbound> {
@@ -3391,6 +3453,11 @@ fn inbound_name(inbound: &Json) -> Option<String> {
 /// The outbound one configured entry names, with the reason when this tree cannot dial it: a tag a
 /// rule can reach is built at startup, so a missing or unbuildable one stops the process, not a flow.
 pub(crate) fn build_outbound(config: &Json, tag: &str) -> Result<Outbound, String> {
+    if is_chain_config(config) {
+        return Err(format!(
+            "outbound `{tag}` is a chain; add chains in the startup config"
+        ));
+    }
     let protocol = canonical_protocol(config.get("protocol").and_then(Json::as_str).unwrap_or(""));
     if protocol == "loopback" {
         // A management-API handler has no config root; its named tag is all the second pass needs.
@@ -3492,6 +3559,107 @@ fn dialer_proxy_tag(config: &Json) -> Option<&str> {
         .filter(|tag| !tag.is_empty())
 }
 
+/// The tag a sing-box-shaped outbound's top-level `detour` names.
+fn detour_tag(config: &Json) -> Option<&str> {
+    config
+        .get("detour")
+        .and_then(Json::as_str)
+        .filter(|tag| !tag.is_empty())
+}
+
+/// The one hop an outbound dials through. `dialerProxy` and `detour` are the same edge; naming
+/// both differently is a config error rather than a silent preference.
+fn next_hop_tag(config: &Json) -> Result<Option<&str>, String> {
+    match (dialer_proxy_tag(config), detour_tag(config)) {
+        (Some(dialer), Some(detour)) if dialer != detour => Err(format!(
+            "names both dialerProxy `{dialer}` and detour `{detour}`"
+        )),
+        (Some(tag), _) | (_, Some(tag)) => Ok(Some(tag)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The `LxBox` chain outbound: `type` or `protocol` is `chain`, and its `outbounds` are ordered
+/// from the client's first hop to the exit.
+fn is_chain_config(config: &Json) -> bool {
+    config
+        .get("protocol")
+        .and_then(Json::as_str)
+        .or_else(|| config.get("type").and_then(Json::as_str))
+        .is_some_and(|name| name.eq_ignore_ascii_case("chain"))
+}
+
+/// Ordered hop tags a chain entry names, from the top-level `LxBox` field or its `settings` twin.
+fn chain_hops(config: &Json) -> Result<Vec<String>, String> {
+    let listed = config
+        .get("outbounds")
+        .or_else(|| {
+            config
+                .get("settings")
+                .and_then(|settings| settings.get("outbounds"))
+        })
+        .ok_or_else(|| "chain has no outbounds list".to_owned())?
+        .as_arr()
+        .ok_or_else(|| "chain outbounds is not an array".to_owned())?;
+    let mut hops = Vec::with_capacity(listed.len());
+    for hop in listed {
+        let tag = hop
+            .as_str()
+            .filter(|tag| !tag.is_empty())
+            .ok_or_else(|| "chain outbounds carries a non-string or empty hop".to_owned())?;
+        hops.push(tag.to_owned());
+    }
+    Ok(hops)
+}
+
+/// Flatten a chain whose first position names another chain, which `LxBox` allows only there. The
+/// result is the ordered leaf hops; a nested chain anywhere else, a self-reference, a missing hop,
+/// a duplicate and a cycle are startup refusals.
+fn flatten_chain<'a>(
+    tag: &str,
+    configs: &HashMap<&'a str, &'a Json>,
+    visiting: &mut HashSet<String>,
+) -> Result<Vec<String>, String> {
+    if !visiting.insert(tag.to_owned()) {
+        return Err(format!("chain `{tag}` loops through itself"));
+    }
+    let config = configs
+        .get(tag)
+        .ok_or_else(|| format!("chain `{tag}` names no outbound"))?;
+    let mut flat = Vec::new();
+    for (index, hop) in chain_hops(config)?.into_iter().enumerate() {
+        let Some(hop_config) = configs.get(hop.as_str()).copied() else {
+            return Err(format!(
+                "chain `{tag}` names `{hop}`, which no outbound names"
+            ));
+        };
+        if is_chain_config(hop_config) {
+            if index != 0 {
+                return Err(format!(
+                    "chain `{tag}` nests chain `{hop}` at position {index}; only the first position may nest"
+                ));
+            }
+            flat.extend(flatten_chain(&hop, configs, visiting)?);
+        } else {
+            flat.push(hop);
+        }
+    }
+    visiting.remove(tag);
+    if flat.len() < 2 {
+        return Err(format!("chain `{tag}` has fewer than two hops"));
+    }
+    let mut seen = HashSet::new();
+    for hop in &flat {
+        if !seen.insert(hop.clone()) {
+            return Err(format!("chain `{tag}` names `{hop}` twice"));
+        }
+        if hop == tag {
+            return Err(format!("chain `{tag}` names itself"));
+        }
+    }
+    Ok(flat)
+}
+
 /// One outbound's chain: every named hop exists, none names itself, and the walk terminates. A
 /// missing handler, a self-reference and a cycle are startup refusals, as they are in xray.
 fn check_dialer_proxy<'a>(
@@ -3499,7 +3667,15 @@ fn check_dialer_proxy<'a>(
     label: &'a str,
     config: &'a Json,
 ) -> Result<(), String> {
-    let mut cursor = dialer_proxy_tag(config);
+    if is_chain_config(config) {
+        if let Some(hop) = next_hop_tag(config)? {
+            return Err(format!(
+                "chain `{label}` names detour `{hop}`; its outbounds list is its route"
+            ));
+        }
+        return Ok(());
+    }
+    let mut cursor = next_hop_tag(config)?;
     if cursor == Some(label) {
         return Err(format!("outbound `{label}` dialerProxy names itself"));
     }
@@ -3507,14 +3683,14 @@ fn check_dialer_proxy<'a>(
     seen.insert(label);
     while let Some(hop) = cursor {
         if !seen.insert(hop) {
-            return Err(format!("dialerProxy loop through `{hop}`"));
+            return Err(format!("dialerProxy/detour loop through `{hop}`"));
         }
         let Some(next) = configs.get(hop) else {
             return Err(format!(
-                "outbound `{label}` dialerProxy names `{hop}`, which no outbound names"
+                "outbound `{label}` dialerProxy/detour names `{hop}`, which no outbound names"
             ));
         };
-        cursor = dialer_proxy_tag(next);
+        cursor = next_hop_tag(next)?;
     }
     Ok(())
 }
@@ -3533,22 +3709,158 @@ fn check_dialer_proxies<'a>(
     Ok(())
 }
 
-/// Every hop a `dialerProxy` names is a route target the dial seam must reach, even when no rule
-/// names it directly.
+/// Every hop a `dialerProxy` or `detour` names is a route target the dial seam must reach, even
+/// when no rule names it directly.
 fn add_dialer_proxy_targets<'a>(
     configs: &HashMap<&'a str, &'a Json>,
     default_tag: Option<&str>,
     first: &'a Json,
     targets: &mut Vec<&'a str>,
-) {
+) -> Result<(), String> {
     let default = default_tag.is_none().then_some(first);
     for config in configs.values().copied().chain(default) {
-        let mut cursor = dialer_proxy_tag(config);
+        if is_chain_config(config) {
+            continue;
+        }
+        let mut cursor = next_hop_tag(config)?;
         while let Some(hop) = cursor {
             targets.push(hop);
-            cursor = configs.get(hop).and_then(|config| dialer_proxy_tag(config));
+            cursor = match configs.get(hop) {
+                Some(config) if !is_chain_config(config) => next_hop_tag(config)?,
+                _ => None,
+            };
         }
     }
+    Ok(())
+}
+
+/// Whether a hop's own dial seam reads the predecessor's `dialerProxy`; a carrier that binds its
+/// own socket instead would reach the peer from this machine and skip every earlier hop.
+fn chain_hop_can_dial_through(out: &Outbound) -> bool {
+    match out {
+        Outbound::Vless(vless) => vless.carrier.tcp_stream(),
+        Outbound::Vmess(vmess) => vmess.carrier.tcp_stream(),
+        Outbound::Trojan(trojan) => trojan.carrier.tcp_stream(),
+        // A raw Shadowsocks datagram lane opens its own socket, so a hop above it would be lost.
+        Outbound::Shadowsocks(shadowsocks) => {
+            shadowsocks.carrier.tcp_stream() && shadowsocks.mux.udp_manager().is_some()
+        }
+        Outbound::Socks(_)
+        | Outbound::Http(_)
+        | Outbound::Psiphon(_)
+        | Outbound::Freedom(_)
+        | Outbound::Masque(_) => true,
+        Outbound::WireGuard(_)
+        | Outbound::Warp(_)
+        | Outbound::Hysteria(_)
+        | Outbound::Foxy(_)
+        | Outbound::Veepn(_)
+        | Outbound::Loopback(_)
+        | Outbound::Route(_)
+        | Outbound::Block(_)
+        | Outbound::Dns(_)
+        | Outbound::ReversePortal(_)
+        | Outbound::Metrics { .. }
+        | Outbound::Api(_) => false,
+    }
+}
+
+/// One lane in a chain: the tag the dial seam reaches, the outbound built for it, and the dial
+/// settings that lane carries. The innermost lane is the chain's route entry.
+struct ChainLane {
+    tag: String,
+    out: Outbound,
+    source: Option<SendThrough>,
+    sockopts: Option<Arc<crate::sockopt::SocketOptions>>,
+    strategy: Option<FreedomDomain>,
+}
+
+fn chain_lane_tag(tag: &str, index: usize) -> String {
+    format!("\u{1}chain\u{1}{tag}\u{1}{index}")
+}
+
+/// Build the lanes an ordered chain names: the exit keeps the route entry's tag, every earlier
+/// hop gets a private tag, and each dials through the hop before it. The chain list is the route,
+/// so a hop's own `detour` is not carried inside it.
+fn build_chain_lanes(
+    root: &Json,
+    configs: &HashMap<&str, &Json>,
+    tag: &str,
+    hops: &[String],
+) -> Result<Vec<ChainLane>, String> {
+    let mut lanes = Vec::with_capacity(hops.len());
+    for (index, hop) in hops.iter().enumerate() {
+        let Some(config) = configs.get(hop.as_str()).copied() else {
+            return Err(format!(
+                "chain `{tag}` names `{hop}`, which no outbound names"
+            ));
+        };
+        if next_hop_tag(config)?.is_some() {
+            eprintln!(
+                "chain `{tag}` hop `{hop}` names its own detour; the chain position is used instead"
+            );
+        }
+        let lane_tag = chain_lane_tag(tag, index);
+        if configs.contains_key(lane_tag.as_str()) {
+            return Err(format!(
+                "chain `{tag}` needs private tag `{lane_tag}`, which an outbound already names"
+            ));
+        }
+        let mut out = routed_outbound(root, config, &lane_tag)?;
+        // MASQUE's spec owns its carrier hop; the first position clears any hop the config named.
+        let upstream = (index > 0).then(|| chain_lane_tag(tag, index - 1));
+        if let Outbound::Masque(masque) = &mut out {
+            let Some(masque) = Arc::get_mut(masque) else {
+                return Err(format!("chain `{tag}` hop `{hop}` MASQUE lane is shared"));
+            };
+            masque.set_dialer_proxy(upstream.as_deref());
+        }
+        if index > 0 && !chain_hop_can_dial_through(&out) {
+            return Err(format!(
+                "chain `{tag}` hop `{hop}` cannot dial through `{}`; only the first position dials the machine directly",
+                hops[index - 1]
+            ));
+        }
+        if index + 1 < hops.len()
+            && matches!(
+                out,
+                Outbound::Freedom(_)
+                    | Outbound::Block(_)
+                    | Outbound::Dns(_)
+                    | Outbound::Loopback(_)
+                    | Outbound::Route(_)
+                    | Outbound::Metrics { .. }
+                    | Outbound::Api(_)
+            )
+        {
+            return Err(format!(
+                "chain `{tag}` hop `{hop}` cannot relay to `{}`",
+                hops[index + 1]
+            ));
+        }
+        let source = parse_send_through(config)?;
+        let mut sockopts = parse_outbound_sockopt(config)?;
+        match index {
+            0 => {
+                if let Some(options) = sockopts.as_mut() {
+                    options.set_dialer_proxy(None);
+                }
+            }
+            _ => {
+                sockopts
+                    .get_or_insert_with(crate::sockopt::SocketOptions::default)
+                    .set_dialer_proxy(Some(&chain_lane_tag(tag, index - 1)));
+            }
+        }
+        lanes.push(ChainLane {
+            tag: lane_tag,
+            out,
+            source,
+            sockopts: sockopts.map(Arc::new),
+            strategy: parse_target_strategy(config)?,
+        });
+    }
+    Ok(lanes)
 }
 
 /// The same table with the commander's tag reachable: a rule naming it hands the flow to the
@@ -3567,7 +3879,6 @@ fn route_shared_with_api(
     let Some(first) = list.first() else {
         return Err("routing has no outbound to fall back to".into());
     };
-    let build = |config: &Json, tag: &str| routed_outbound(root, config, tag);
     let server_inbounds: Vec<Option<String>> = root
         .get("inbounds")
         .and_then(Json::as_arr)
@@ -3583,10 +3894,6 @@ fn route_shared_with_api(
         .and_then(Json::as_str)
         .filter(|tag| !tag.is_empty())
         .map(str::to_owned);
-    let default = match default {
-        Some(outbound) => outbound.clone(),
-        None => build(first, default_tag.as_deref().unwrap_or("<default>"))?,
-    };
     let mut configs: HashMap<&str, &Json> = HashMap::new();
     for outbound in list {
         let tag = outbound.get("tag").and_then(Json::as_str).unwrap_or("");
@@ -3598,26 +3905,108 @@ fn route_shared_with_api(
         }
     }
     check_dialer_proxies(&configs, default_tag.as_deref(), first)?;
-    let mut tagged = HashMap::new();
-    let default_source = parse_send_through(first)?;
+    let mut chain_specs: HashMap<String, Vec<String>> = HashMap::new();
+    for (&tag, &config) in &configs {
+        if is_chain_config(config) {
+            let hops = flatten_chain(tag, &configs, &mut HashSet::new())?;
+            chain_specs.insert(tag.to_owned(), hops);
+        }
+    }
+    let mut chain_lanes: HashMap<String, Vec<ChainLane>> = HashMap::new();
+    for (tag, hops) in &chain_specs {
+        chain_lanes.insert(tag.clone(), build_chain_lanes(root, &configs, tag, hops)?);
+    }
+    let build = |config: &Json, tag: &str| -> Result<Outbound, String> {
+        if is_chain_config(config) {
+            return chain_lanes
+                .get(tag)
+                .and_then(|lanes| lanes.last())
+                .map(|lane| lane.out.clone())
+                .ok_or_else(|| format!("chain `{tag}` has no built lanes"));
+        }
+        routed_outbound(root, config, tag)
+    };
+    let default = match default {
+        Some(outbound) => outbound.clone(),
+        None => {
+            if is_chain_config(first) {
+                let tag = default_tag
+                    .as_deref()
+                    .ok_or_else(|| "the default chain outbound needs a tag".to_owned())?;
+                build(first, tag)?
+            } else {
+                build(first, default_tag.as_deref().unwrap_or("<default>"))?
+            }
+        }
+    };
+    let default_lane = if is_chain_config(first) {
+        default_tag
+            .as_deref()
+            .and_then(|tag| chain_lanes.get(tag))
+            .and_then(|lanes| lanes.last())
+    } else {
+        None
+    };
+    let default_source = match default_lane {
+        Some(lane) => lane.source,
+        None => parse_send_through(first)?,
+    };
     let mut sources = HashMap::new();
-    for (tag, config) in &configs {
-        if let Some(source) = parse_send_through(config)? {
-            sources.insert((*tag).to_owned(), source);
+    for (&tag, &config) in &configs {
+        if !is_chain_config(config) {
+            if let Some(source) = parse_send_through(config)? {
+                sources.insert(tag.to_owned(), source);
+            }
         }
     }
-    let default_sockopts = parse_outbound_sockopt(first)?.map(Arc::new);
+    let default_sockopts = match default_lane {
+        Some(lane) => lane.sockopts.clone(),
+        None => parse_outbound_sockopt(first)?.map(Arc::new),
+    };
     let mut sockopts = HashMap::new();
-    for (tag, config) in &configs {
-        if let Some(options) = parse_outbound_sockopt(config)? {
-            sockopts.insert((*tag).to_owned(), Arc::new(options));
+    for (&tag, &config) in &configs {
+        if !is_chain_config(config) {
+            if let Some(options) = parse_outbound_sockopt(config)? {
+                sockopts.insert(tag.to_owned(), Arc::new(options));
+            }
         }
     }
-    let default_strategy = parse_target_strategy(first)?;
+    let default_strategy = match default_lane {
+        Some(lane) => lane.strategy,
+        None => parse_target_strategy(first)?,
+    };
     let mut strategies = HashMap::new();
-    for (tag, config) in &configs {
-        if let Some(strategy) = parse_target_strategy(config)? {
-            strategies.insert((*tag).to_owned(), strategy);
+    for (&tag, &config) in &configs {
+        if !is_chain_config(config) {
+            if let Some(strategy) = parse_target_strategy(config)? {
+                strategies.insert(tag.to_owned(), strategy);
+            }
+        }
+    }
+    let mut tagged = HashMap::new();
+    for (tag, lanes) in &chain_lanes {
+        for lane in lanes {
+            tagged.insert(lane.tag.clone(), lane.out.clone());
+            if let Some(source) = lane.source {
+                sources.insert(lane.tag.clone(), source);
+            }
+            if let Some(options) = &lane.sockopts {
+                sockopts.insert(lane.tag.clone(), Arc::clone(options));
+            }
+            if let Some(strategy) = lane.strategy {
+                strategies.insert(lane.tag.clone(), strategy);
+            }
+        }
+        let exit = lanes.last().expect("a chain has at least two lanes");
+        tagged.insert(tag.clone(), exit.out.clone());
+        if let Some(source) = exit.source {
+            sources.insert(tag.clone(), source);
+        }
+        if let Some(options) = &exit.sockopts {
+            sockopts.insert(tag.clone(), Arc::clone(options));
+        }
+        if let Some(strategy) = exit.strategy {
+            strategies.insert(tag.clone(), strategy);
         }
     }
     let has_dial_settings = default_source.is_some()
@@ -3642,7 +4031,7 @@ fn route_shared_with_api(
             targets.push(tag);
         }
     }
-    add_dialer_proxy_targets(&configs, default_tag.as_deref(), first, &mut targets);
+    add_dialer_proxy_targets(&configs, default_tag.as_deref(), first, &mut targets)?;
     for target in targets {
         if tagged.contains_key(target) {
             continue;
@@ -3884,6 +4273,15 @@ fn direct_tag(shared: &RouteShared, tag: &str) -> bool {
         if let Some(out) = dynamic.added.get(tag) {
             return matches!(out.as_ref(), Outbound::Freedom(_));
         }
+    }
+    // A direct-only inbound dials its own target, so a lane naming a hop is not a direct route.
+    let options = if Some(tag) == shared.default_tag.as_deref() {
+        shared.default_sockopts.as_deref()
+    } else {
+        shared.sockopts.get(tag).map(Arc::as_ref)
+    };
+    if options.is_some_and(|options| options.dialer_proxy().is_some()) {
+        return false;
     }
     (Some(tag) == shared.default_tag.as_deref() && matches!(&shared.default, Outbound::Freedom(_)))
         || matches!(shared.tagged.get(tag), Some(Outbound::Freedom(_)))
@@ -7524,6 +7922,17 @@ fn tunnel_stream(
     front: Front,
     name: &str,
 ) -> Option<Connection> {
+    tunnel_stream_with(out, dest, timeout, front, name, None)
+}
+
+fn tunnel_stream_with(
+    out: &Outbound,
+    dest: Destination,
+    timeout: Duration,
+    front: Front,
+    name: &str,
+    settings: Option<&ProbeTarget>,
+) -> Option<Connection> {
     let listener = std::net::TcpListener::bind(SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         0,
@@ -7539,14 +7948,22 @@ fn tunnel_stream(
         .name(name.to_owned())
         .spawn({
             let out = out.clone();
+            let source = settings.and_then(|settings| settings.source);
+            let sockopts = settings.and_then(|settings| settings.sockopts.clone());
+            let strategy = settings.and_then(|settings| settings.strategy);
+            let tag = settings.and_then(|settings| settings.tag.clone());
             move || {
+                let _source = SendThroughGuard::enter(source);
+                let _sockopts = DialSockoptsGuard::enter(sockopts);
+                let _strategy = TargetStrategyGuard::enter(strategy);
+                let _tag = OutboundTag::enter(tag.as_deref());
                 serve_connect(
                     Connection::Tcp(server),
                     &out,
                     &dest,
                     front,
                     &[],
-                    None,
+                    tag.as_deref(),
                     FlowFacts::default(),
                 );
             }
@@ -7555,12 +7972,46 @@ fn tunnel_stream(
     Some(Connection::Tcp(client))
 }
 
+/// One probe target: the lane, the source, socket options and target strategy its tag names, and
+/// the tag itself for the dial seam's own loop check.
+#[derive(Clone)]
+pub(crate) struct ProbeTarget {
+    out: Outbound,
+    source: Option<SendThrough>,
+    sockopts: Option<Arc<crate::sockopt::SocketOptions>>,
+    strategy: Option<FreedomDomain>,
+    tag: Option<String>,
+}
+
+impl ProbeTarget {
+    pub(crate) fn plain(out: Outbound) -> Self {
+        Self {
+            out,
+            source: None,
+            sockopts: None,
+            strategy: None,
+            tag: None,
+        }
+    }
+
+    pub(crate) fn probe_stream(&self, dest: &Destination, timeout: Duration) -> Option<Connection> {
+        tunnel_stream_with(
+            &self.out,
+            dest.clone(),
+            timeout,
+            Front::Probe,
+            "ferrox-probe",
+            Some(self),
+        )
+    }
+}
+
 pub(crate) fn probe_stream(
     out: &Outbound,
     dest: &Destination,
     timeout: Duration,
 ) -> Option<Connection> {
-    tunnel_stream(out, dest.clone(), timeout, Front::Probe, "ferrox-probe")
+    ProbeTarget::plain(out.clone()).probe_stream(dest, timeout)
 }
 
 /// One DNS datagram through the route's chosen outbound. The SOCKS UDP frame needs the
@@ -38020,6 +38471,9 @@ fn diagnose_outbounds(root: &Json) -> Vec<String> {
         .and_then(Json::as_arr)
         .unwrap_or(&empty)
     {
+        if is_chain_config(outbound) {
+            continue;
+        }
         let named = outbound
             .get("protocol")
             .and_then(Json::as_str)
@@ -75235,6 +75689,420 @@ mod tests {
             recorded.recv_timeout(Duration::from_millis(100)).is_err(),
             "one connection, one hop dial"
         );
+    }
+
+    /// A sing-box `detour` is the same edge as `dialerProxy`: the named HTTP proxy sees the
+    /// CONNECT the terminal freedom dial makes.
+    #[test]
+    fn a_detour_hop_carries_the_outbound_dial() {
+        if !crate::conn::in_a_quiet_process("proxy::tests::a_detour_hop_carries_the_outbound_dial")
+        {
+            return;
+        }
+        let echo_port = echo_loop();
+        let (hop_port, recorded) = fake_http_proxy_recording();
+        let config = format!(
+            r#"{{"outbounds":[
+                {{"tag":"proxy","protocol":"freedom","detour":"hop"}},
+                {{"tag":"hop","protocol":"http","settings":{{"servers":[{{"address":"127.0.0.1","port":{hop_port}}}]}}}}
+            ],"routing":{{}}}}"#
+        );
+        let front = socks_front_with(route_outbound(&config, Some("in"), true));
+        let mut client = socks_tcp_client(front, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        let seen = recorded
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the detour carried the dial");
+        assert_eq!(seen.port(), echo_port);
+    }
+
+    /// A probe target keeps its own tag even when its detour is the default, so the hop's loop
+    /// check compares the two names rather than refusing the probe as a dial to itself.
+    #[test]
+    fn a_probe_target_keeps_its_own_tag_when_its_hop_is_the_default() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_probe_target_keeps_its_own_tag_when_its_hop_is_the_default",
+        ) {
+            return;
+        }
+        let echo_port = echo_loop();
+        let (hop_port, recorded) = fake_http_proxy_recording();
+        let config = format!(
+            r#"{{"outbounds":[
+                {{"tag":"default","protocol":"http","settings":{{"servers":[{{"address":"127.0.0.1","port":{hop_port}}}]}}}},
+                {{"tag":"probe","protocol":"freedom","detour":"default"}}
+            ],"routing":{{}}}}"#
+        );
+        let root = crate::json::parse(&config).expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let config = root
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")
+            .iter()
+            .find(|outbound| outbound.get("tag").and_then(Json::as_str) == Some("probe"))
+            .expect("the tag");
+        let out = build_outbound(config, "probe").expect("builds");
+        let target = shared.probe_target_with("probe", out);
+        let mut client = target
+            .probe_stream(
+                &Destination::Address(SocketAddr::from(([127, 0, 0, 1], echo_port))),
+                Duration::from_secs(5),
+            )
+            .expect("the probe dials");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        let seen = recorded
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the default hop carried the probe");
+        assert_eq!(seen.port(), echo_port);
+    }
+
+    /// An ordered chain dials the exit through every earlier hop: the first proxy sees the second
+    /// proxy's edge, the second sees the echo, and the bytes come back through both.
+    #[test]
+    fn an_ordered_chain_carries_tcp_through_each_hop() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::an_ordered_chain_carries_tcp_through_each_hop",
+        ) {
+            return;
+        }
+        let echo_port = echo_loop();
+        let (first_port, first_seen) = fake_http_proxy_recording();
+        let (second_port, second_seen) = fake_http_proxy_recording();
+        let config = format!(
+            r#"{{"outbounds":[
+                {{"tag":"chain","type":"chain","outbounds":["first","second"]}},
+                {{"tag":"first","protocol":"http","settings":{{"servers":[{{"address":"127.0.0.1","port":{first_port}}}]}}}},
+                {{"tag":"second","protocol":"http","settings":{{"servers":[{{"address":"127.0.0.1","port":{second_port}}}]}}}}
+            ],"routing":{{}}}}"#
+        );
+        let front = socks_front_with(route_outbound(&config, Some("in"), true));
+        let mut client = socks_tcp_client(front, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        let first = first_seen
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first hop carried the second hop's edge");
+        assert_eq!(first.port(), second_port);
+        let second = second_seen
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the second hop carried the echo");
+        assert_eq!(second.port(), echo_port);
+    }
+
+    /// A chain's datagram lane reaches its named hop: the terminal freedom dials through the SOCKS
+    /// outbound before it, and the echo answers through both.
+    #[test]
+    fn an_ordered_chain_carries_udp_through_its_hop() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::an_ordered_chain_carries_udp_through_its_hop",
+        ) {
+            return;
+        }
+        let echo_port = udp_echo_loop();
+        let server_port = socks_front_with(freedom());
+        let config = format!(
+            r#"{{"outbounds":[
+                {{"tag":"chain","protocol":"chain","outbounds":["hop","exit"]}},
+                {{"tag":"hop","protocol":"socks","settings":{{"servers":[{{"address":"127.0.0.1","port":{server_port}}}]}}}},
+                {{"tag":"exit","protocol":"freedom"}}
+            ],"routing":{{}}}}"#
+        );
+        let root = crate::json::parse(&config).expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("shared");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let picked = plan.udp_out(&Association::Default).expect("a lane");
+        let out = Outbound::clone(&picked);
+        let lane =
+            spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None).expect("a udp lane");
+        let client = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut frame = Vec::new();
+        let target = SocketAddr::from(([127, 0, 0, 1], echo_port));
+        client
+            .send_to(socks_udp_frame(&mut frame, &target, b"ping"), lane.address)
+            .expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = client.recv_from(&mut back).expect("echoes");
+        let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
+        assert_eq!(payload, b"ping");
+    }
+
+    /// A chain refuses a missing, self, duplicate, one-hop or badly nested list, and its own
+    /// `detour` as well as a `detour`/`dialerProxy` disagreement.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_chain_refuses_missing_self_duplicate_and_badly_nested_hops() {
+        let build = |text: &str| {
+            let root = crate::json::parse(text).expect("parses");
+            let routing = routing_for(&root).expect("parses").expect("a plan");
+            route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+        };
+        let http = |tag: &str| {
+            format!(
+                r#"{{"tag":"{tag}","protocol":"http","settings":{{"servers":[{{"address":"127.0.0.1","port":1}}]}}}}"#
+            )
+        };
+        let missing = build(&format!(
+            r#"{{"outbounds":[{{"tag":"chain","type":"chain","outbounds":["nope","{}"]}},{}],"routing":{{}}}}"#,
+            "hop",
+            http("hop")
+        ))
+        .expect_err("a missing hop is refused");
+        assert!(missing.contains("nope"), "{missing}");
+
+        let itself = build(&format!(
+            r#"{{"outbounds":[{{"tag":"chain","type":"chain","outbounds":["chain","{}"]}},{}],"routing":{{}}}}"#,
+            "hop",
+            http("hop")
+        ))
+        .expect_err("a self hop is refused");
+        assert!(itself.contains("chain"), "{itself}");
+
+        let duplicate = build(&format!(
+            r#"{{"outbounds":[{{"tag":"chain","type":"chain","outbounds":["hop","hop"]}},{}],"routing":{{}}}}"#,
+            http("hop")
+        ))
+        .expect_err("a duplicate hop is refused");
+        assert!(duplicate.contains("twice"), "{duplicate}");
+
+        let one = build(&format!(
+            r#"{{"outbounds":[{{"tag":"chain","type":"chain","outbounds":["hop"]}},{}],"routing":{{}}}}"#,
+            http("hop")
+        ))
+        .expect_err("a one-hop chain is refused");
+        assert!(one.contains("fewer than two"), "{one}");
+
+        let nested = build(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"outer","type":"chain","outbounds":["first","inner"]}},
+                {{"tag":"inner","type":"chain","outbounds":["second","last"]}},
+                {}, {}, {}
+            ],"routing":{{}}}}"#,
+            http("first"),
+            http("second"),
+            http("last")
+        ))
+        .expect_err("a nested chain outside the first position is refused");
+        assert!(nested.contains("first position"), "{nested}");
+
+        let cyclic = build(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"a","type":"chain","outbounds":["b","c"]}},
+                {{"tag":"b","type":"chain","outbounds":["a","d"]}},
+                {}, {}
+            ],"routing":{{}}}}"#,
+            http("c"),
+            http("d")
+        ))
+        .expect_err("a chain cycle is refused");
+        assert!(cyclic.contains("loops"), "{cyclic}");
+
+        let own_detour = build(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"chain","type":"chain","detour":"hop","outbounds":["hop","last"]}},
+                {}, {}
+            ],"routing":{{}}}}"#,
+            http("hop"),
+            http("last")
+        ))
+        .expect_err("a chain cannot also name a detour");
+        assert!(own_detour.contains("outbounds list"), "{own_detour}");
+
+        let both = build(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"proxy","protocol":"freedom","detour":"a","streamSettings":{{"sockopt":{{"dialerProxy":"b"}}}}}},
+                {}, {}
+            ],"routing":{{}}}}"#,
+            http("a"),
+            http("b")
+        ))
+        .expect_err("two different edges are refused");
+        assert!(both.contains("both"), "{both}");
+
+        let detour_cycle = build(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom","detour":"b"},
+                {"tag":"b","protocol":"freedom","detour":"a"}
+            ],"routing":{}}"#,
+        )
+        .expect_err("a detour cycle is refused");
+        assert!(detour_cycle.contains("loop"), "{detour_cycle}");
+
+        let flattened = build(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"outer","type":"chain","outbounds":["inner","last"]}},
+                {{"tag":"inner","type":"chain","outbounds":["first","second"]}},
+                {}, {}, {}
+            ],"routing":{{}}}}"#,
+            http("first"),
+            http("second"),
+            http("last")
+        ))
+        .expect("a chain nested first flattens");
+        assert!(flattened.tagged.contains_key("outer"));
+
+        let no_routing = crate::json::parse(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"chain","type":"chain","outbounds":["first","last"]}},
+                {}, {}
+            ]}}"#,
+            http("first"),
+            http("last")
+        ))
+        .expect("parses");
+        assert!(
+            routing_for(&no_routing).expect("parses").is_some(),
+            "a chain needs the route table even when the config has no routing block"
+        );
+    }
+
+    /// A hop whose carrier binds its own socket cannot take the predecessor's local front, so the
+    /// chain refuses it instead of reaching the peer from this machine.
+    #[test]
+    fn a_chain_refuses_a_hop_that_binds_its_own_socket() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"chain","type":"chain","outbounds":["first","exit"]},
+                {"tag":"first","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"exit","protocol":"hysteria","settings":{"version":1,"address":"127.0.0.1","port":443,"auth":"pw"},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"serverName":"example.com","obfs":"key"}}}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let error = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect_err("a self-socket hop after the first is refused");
+        assert!(error.contains("cannot dial through"), "{error}");
+
+        let datagram = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"chain","type":"chain","outbounds":["first","exit"]},
+                {"tag":"first","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"exit","protocol":"shadowsocks","settings":{"servers":[{"address":"127.0.0.1","port":1,"method":"aes-128-gcm","password":"pw"}]}}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&datagram).expect("parses").expect("a plan");
+        let error = route_shared(
+            &datagram,
+            routing,
+            &crate::reverse::Portals::default(),
+            None,
+        )
+        .expect_err("a raw Shadowsocks hop would lose the hop above it");
+        assert!(error.contains("cannot dial through"), "{error}");
+    }
+
+    /// A chain tag's health target is its exit lane with the hop's options, and a direct-only
+    /// inbound does not accept it as a direct route.
+    #[test]
+    fn a_chain_probe_target_and_direct_proof_read_its_exit() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"chain","type":"chain","outbounds":["hop","exit"]},
+                {"tag":"hop","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"exit","protocol":"freedom"}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let target = shared
+            .probe_target("chain")
+            .expect("the chain has a target");
+        assert_eq!(target.tag.as_deref(), Some("chain"));
+        let lane = chain_lane_tag("chain", 0);
+        assert_eq!(
+            target
+                .sockopts
+                .as_deref()
+                .and_then(|options| options.dialer_proxy()),
+            Some(lane.as_str())
+        );
+        assert!(!direct_tag(&shared, "chain"));
+    }
+
+    /// A probe target for a tag no rule selected keeps the hop that tag's config names.
+    #[test]
+    fn a_probe_target_keeps_the_detour_of_an_unselected_tag() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"default","protocol":"freedom"},
+                {"tag":"hop","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"unselected","protocol":"freedom","detour":"hop"}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        assert!(!shared.tagged.contains_key("unselected"));
+        let config = root
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")
+            .iter()
+            .find(|outbound| outbound.get("tag").and_then(Json::as_str) == Some("unselected"))
+            .expect("the tag");
+        let out = build_outbound(config, "unselected").expect("builds");
+        let target = shared.probe_target_with("unselected", out);
+        assert_eq!(target.tag.as_deref(), Some("unselected"));
+        assert_eq!(
+            target
+                .sockopts
+                .as_deref()
+                .and_then(|options| options.dialer_proxy()),
+            Some("hop")
+        );
+    }
+
+    /// A probe target built outside the route still binds a carrier that reads its own spec.
+    #[test]
+    fn a_probe_target_binds_carrier_owned_options() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"default","protocol":"freedom"},
+                {"tag":"edge","protocol":"masque","settings":{"address":"127.0.0.1","port":443},
+                 "streamSettings":{"network":"masque","security":"tls",
+                 "tlsSettings":{"serverName":"edge.example","allowInsecure":true},
+                 "sockopt":{"dialerProxy":"default"}}}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        assert!(!shared.tagged.contains_key("edge"));
+        let config = root
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")
+            .iter()
+            .find(|outbound| outbound.get("tag").and_then(Json::as_str) == Some("edge"))
+            .expect("the tag");
+        let out = build_outbound(config, "edge").expect("builds");
+        let target = shared.probe_target_with("edge", out);
+        let Outbound::Masque(masque) = &target.out else {
+            panic!("the target is the masque carrier");
+        };
+        assert!(masque.route_bound());
     }
 
     /// The socket options an outbound's `streamSettings.sockopt` names are the ones the socket its

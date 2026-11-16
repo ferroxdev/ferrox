@@ -3,7 +3,7 @@
 
 use crate::conn::HttpUrl;
 use crate::json::Json;
-use crate::proxy::{Destination, Outbound};
+use crate::proxy::{Destination, Outbound, ProbeTarget, RouteShared};
 use crate::router::{HealthPing, Observed};
 use ferrox_core::tls::TlsProvider as _;
 use std::io::{Read, Write};
@@ -57,21 +57,29 @@ impl Observatory {
     }
 }
 
-/// Start the observatory a config names. The legacy app wins when both are configured, as the
+/// The observatory handle a config names. The legacy app wins when both are configured, as the
 /// reference's first-of-type feature lookup does, but both are parsed so neither can hide a
-/// malformed block.
-pub(crate) fn start(root: &Json) -> Result<Option<Arc<Observatory>>, String> {
-    let Some(mode) = parse(root)? else {
-        return Ok(None);
-    };
-    let observatory = Arc::new(Observatory {
-        snapshot: Mutex::new(Arc::from(Vec::new())),
-    });
-    match mode {
-        Mode::Legacy(config) => spawn_legacy(&observatory, root, config),
-        Mode::Burst(config) => spawn_burst(&observatory, root, config),
+/// malformed block. Probes start later, once the route table can resolve a chain tag.
+pub(crate) fn configure(root: &Json) -> Result<Option<Arc<Observatory>>, String> {
+    Ok(parse(root)?.map(|_| {
+        Arc::new(Observatory {
+            snapshot: Mutex::new(Arc::from(Vec::new())),
+        })
+    }))
+}
+
+/// Start the configured probe loop against the completed route table.
+pub(crate) fn spawn(
+    root: &Json,
+    observatory: &Arc<Observatory>,
+    route: Option<&Arc<RouteShared>>,
+) -> Result<(), String> {
+    match parse(root)? {
+        Some(Mode::Legacy(config)) => spawn_legacy(observatory, root, config, route),
+        Some(Mode::Burst(config)) => spawn_burst(observatory, root, config, route),
+        None => {}
     }
-    Ok(Some(observatory))
+    Ok(())
 }
 
 /// `-test` proves both blocks parse without starting either probe loop.
@@ -299,7 +307,11 @@ fn selectors_of(value: &Json, what: &str) -> Result<Vec<String>, String> {
     Ok(selectors)
 }
 
-fn targets(root: &Json, selectors: &[String]) -> Vec<(String, Outbound)> {
+fn targets(
+    root: &Json,
+    selectors: &[String],
+    route: Option<&Arc<RouteShared>>,
+) -> Vec<(String, ProbeTarget)> {
     if selectors.is_empty() {
         return Vec::new();
     }
@@ -316,20 +328,34 @@ fn targets(root: &Json, selectors: &[String]) -> Vec<(String, Outbound)> {
         .collect();
     tags.sort_by(|left, right| left.0.cmp(&right.0));
     tags.into_iter()
-        .filter_map(
-            |(tag, config)| match crate::proxy::build_outbound(config, &tag) {
-                Ok(outbound) => Some((tag, outbound)),
+        .filter_map(|(tag, config)| {
+            if let Some(target) = route.and_then(|route| route.probe_target(&tag)) {
+                return Some((tag, target));
+            }
+            match crate::proxy::build_outbound(config, &tag) {
+                Ok(outbound) => {
+                    let target = match route {
+                        Some(route) => route.probe_target_with(&tag, outbound),
+                        None => ProbeTarget::plain(outbound),
+                    };
+                    Some((tag, target))
+                }
                 Err(reason) => {
                     eprintln!("observatory: {reason}; the tag is not probed");
                     None
                 }
-            },
-        )
+            }
+        })
         .collect()
 }
 
-fn spawn_legacy(observatory: &Arc<Observatory>, root: &Json, config: Legacy) {
-    let targets = targets(root, &config.selectors);
+fn spawn_legacy(
+    observatory: &Arc<Observatory>,
+    root: &Json,
+    config: Legacy,
+    route: Option<&Arc<RouteShared>>,
+) {
+    let targets = targets(root, &config.selectors, route);
     let observatory = Arc::clone(observatory);
     std::thread::spawn(move || {
         let mut statuses: Vec<Observed> = Vec::new();
@@ -417,8 +443,13 @@ fn update_legacy_status(
     observatory.publish(statuses);
 }
 
-fn spawn_burst(observatory: &Arc<Observatory>, root: &Json, config: Burst) {
-    let targets = targets(root, &config.selectors);
+fn spawn_burst(
+    observatory: &Arc<Observatory>,
+    root: &Json,
+    config: Burst,
+    route: Option<&Arc<RouteShared>>,
+) {
+    let targets = targets(root, &config.selectors, route);
     let observatory = Arc::clone(observatory);
     std::thread::spawn(move || {
         let window = config
@@ -455,7 +486,7 @@ fn spawn_burst(observatory: &Arc<Observatory>, root: &Json, config: Burst) {
 
 fn burst_check(
     observatory: &Observatory,
-    targets: &[(String, Outbound)],
+    targets: &[(String, ProbeTarget)],
     settings: &BurstSettings,
     results: &mut Vec<(String, Ring)>,
     rounds: usize,
@@ -484,7 +515,7 @@ fn burst_check(
                     Ok(delay) => delay.as_nanos() as i64,
                     Err(_) if !connectivity.is_empty() => {
                         if probe(
-                            &Outbound::Freedom(Arc::default()),
+                            &ProbeTarget::plain(Outbound::Freedom(Arc::default())),
                             &connectivity,
                             &method,
                             timeout,
@@ -636,7 +667,7 @@ impl Ring {
 }
 
 fn probe(
-    outbound: &Outbound,
+    outbound: &ProbeTarget,
     target: &str,
     method: &str,
     timeout: Duration,
@@ -645,7 +676,8 @@ fn probe(
     let url = HttpUrl::parse(target)?;
     let started = Instant::now();
     let destination = Destination::Name(url.host.clone(), url.port);
-    let stream = crate::proxy::probe_stream(outbound, &destination, timeout)
+    let stream = outbound
+        .probe_stream(&destination, timeout)
         .ok_or_else(|| format!("cannot dial {target}"))?;
     if url.tls {
         let config = ferrox_core::tls::TlsConfig {
@@ -1004,7 +1036,10 @@ mod tests {
             ("httpMethod".to_owned(), Json::Str(" ".to_owned())),
         ]))
         .expect("parses");
-        let targets = vec![("proxy".to_owned(), Outbound::Freedom(Arc::default()))];
+        let targets = vec![(
+            "proxy".to_owned(),
+            ProbeTarget::plain(Outbound::Freedom(Arc::default())),
+        )];
         let observatory = Observatory {
             snapshot: Mutex::new(Arc::from(Vec::new())),
         };
@@ -1109,7 +1144,7 @@ mod tests {
         });
         let url = format!("http://127.0.0.1:{port}/generate_204");
         let delay = probe(
-            &Outbound::Freedom(Arc::default()),
+            &ProbeTarget::plain(Outbound::Freedom(Arc::default())),
             &url,
             "GET",
             Duration::from_secs(5),

@@ -225,6 +225,13 @@ impl MasqueOut {
         crate::proxy::resolve_outbound(&self.spec.address, self.spec.port)
     }
 
+    /// Name the hop this carrier opens through; the first chain position clears any configured hop.
+    pub(crate) fn set_dialer_proxy(&mut self, tag: Option<&str>) {
+        let mut options = self.spec.sockopt.as_deref().cloned().unwrap_or_default();
+        options.set_dialer_proxy(tag);
+        self.spec.sockopt = Some(Arc::new(options));
+    }
+
     /// Bind the retained outbound options to the route table, so a `dialerProxy` hop resolves
     /// through the same handler every other carrier uses.
     pub(crate) fn install_route(&self, route: &Arc<crate::proxy::RouteShared>) {

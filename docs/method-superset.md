@@ -124,7 +124,7 @@ The shared protocol in `crates/ferrox-prompt/prompts.md` states it as "a superse
 | engine-codecs | engine | not-scheduled | upstream/zeronet/crates/zero-protocol, upstream/xray-rust/crates/xray-proxy | their shared codec crates, read for technique; this tree keeps its codecs beside their carriers |
 | engine-scanner | engine | planned | upstream/zeronet/crates/zero-scanner | CDN clean-IP and edge scanning |
 | engine-discovery | engine | planned | upstream/zeronet/crates/zero-discovery | feeds, link sorting, WARP registration |
-| engine-chaining | engine | planned | upstream/zeronet/crates/zero-runtime, upstream/leaf/leaf/src/proxy/chain, README.md | detour graph and ordered hop chains |
+| engine-chaining | engine | implemented | upstream/zeronet/crates/zero-runtime, upstream/leaf/leaf/src/proxy/chain, docs/function/engine-chaining.md, README.md | sing-box `detour` and xray `dialerProxy` normalise to one cycle-checked hop graph; LxBox ordered `type: chain` lists flatten a leading nested chain, refuse missing, self, duplicate, cyclic and non-first nesting, and dial each TCP hop while UDP rides the named hop |
 | surface-cli | surface | implemented | upstream/xray-rust/crates/xray-cli, upstream/zeronet/crates/zray-cli | `run -c`, `check`, parser tooling |
 | surface-ffi | surface | planned | upstream/xray-rust/crates/xray-ffi, upstream/zeronet/crates/zray-mobile | C ABI and JNI with panic containment |
 | surface-bench | surface | implemented | upstream/xray-rust/crates/xray-bench, upstream/zeronet/bench/hotpath, crates/ferrox-bench | counting gates and comparators |

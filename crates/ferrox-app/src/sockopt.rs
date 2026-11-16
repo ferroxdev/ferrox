@@ -47,7 +47,7 @@ impl AddressPortStrategy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SocketOptions {
     mark: Option<i32>,
     tfo: Option<i32>,
@@ -105,8 +105,9 @@ enum KeepAlive {
     Disabled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum DomainStrategy {
+    #[default]
     AsIs,
     UseIp,
     UseIp4,
@@ -431,6 +432,11 @@ impl SocketOptions {
     /// The outbound a `streamSettings.sockopt.dialerProxy` names, or `None` for a direct dial.
     pub(crate) fn dialer_proxy(&self) -> Option<&str> {
         self.dialer_proxy.as_deref()
+    }
+
+    /// Replace the hop this outbound dials through, or clear it for a direct dial.
+    pub(crate) fn set_dialer_proxy(&mut self, tag: Option<&str>) {
+        self.dialer_proxy = tag.map(Arc::from);
     }
 
     /// Give this outbound's options the table that resolves its `dialerProxy` hop.
