@@ -501,14 +501,14 @@ def selftest():
                 "}\n"
             )
         fails, _ = run_check(root)
-        if not any("unclassified upstream field(s): D, E, G, H, K" in line
-                   for line in fails):
+        if not any(re.fullmatch(r"unclassified upstream field\(s\): D, E, G, H, K, Nested",
+                                line) for line in fails):
             print("check-psiphon-parity: self-test untagged field still passes")
             return 1
         if any("F" in line for line in fails):
             print("check-psiphon-parity: self-test json:\"-\" field is listed")
             return 1
-        if any("Inner" in line for line in fails):
+        if any("inner" in line for line in fails):
             print("check-psiphon-parity: self-test nested field is listed")
             return 1
         print("check-psiphon-parity: self-test passed (ten mutations refused)")

@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."
 status=0
 
 scripts=(
+  scripts/lib-engines.sh
   scripts/run-benchmark-matrix.sh
   scripts/run-parity.sh
   scripts/run-live-speedtest.sh
@@ -17,11 +18,13 @@ for script in "${scripts[@]}"; do
   [[ -f "$script" ]] || continue
   while IFS=: read -r lineno text; do
     [[ -n "$lineno" ]] || continue
-    [[ "$text" == *'built '* ]] && continue
+    if [[ "$text" =~ ^[[:space:]]*((local|export|readonly)[[:space:]]+)?(built[[:space:]]|[A-Za-z_][A-Za-z0-9_]*=\"?\$\(built[[:space:]]) ]]; then
+      continue
+    fi
     is_assignment=0
-    if [[ "$text" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)= ]]; then
+    if [[ "$text" =~ ^[[:space:]]*((local|export|readonly)[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)= ]]; then
       is_assignment=1
-      assigned="${BASH_REMATCH[1]}"
+      assigned="${BASH_REMATCH[3]}"
     fi
     if ((is_assignment)) && [[ "$text" =~ [[:space:]]-[xf][[:space:]] ]]; then
       printf '::error file=%s,line=%s::a bare -x/-f probe passes on MSYS for a \
@@ -58,21 +61,8 @@ chmod +x "$tmp/target/release/ferrox-app.exe"
 printf '#!/bin/sh\nexit 0\n' >"$tmp/target/release/ferrox-bench.exe"
 chmod +x "$tmp/target/release/ferrox-bench.exe"
 
-exe_suffix() {
-  case "${OS:-}" in
-    Windows_NT) printf '.exe' ;;
-    *) printf '' ;;
-  esac
-}
-built() {
-  if [[ -x "$1$(exe_suffix)" ]]; then
-    printf '%s\n' "$1$(exe_suffix)"
-  elif [[ -x "$1" ]]; then
-    printf '%s\n' "$1"
-  else
-    return 1
-  fi
-}
+# shellcheck source=scripts/lib-engines.sh
+source scripts/lib-engines.sh
 
 cd "$tmp"
 printf '#!/bin/sh\nexit 0\n' >"$tmp/target/release/ferrox-app"
@@ -97,6 +87,17 @@ expected the %s spelling\n' "$os" "$got" "$crate" "${want_suffix:-bare}" >&2
     fi
   done
 done
+
+printf '#!/bin/sh\nexit 0\n' >"$tmp/target/release/ferrox-mode"
+chmod 0644 "$tmp/target/release/ferrox-mode"
+got="$(OS=Linux built target/release/ferrox-mode)" || {
+  printf '::error::built refused a 0644 artifact instead of restoring its mode\n' >&2
+  status=1
+}
+if [[ -n "${got:-}" && ! -x "$got" ]]; then
+  printf '::error::built returned %s without making it executable\n' "$got" >&2
+  status=1
+fi
 
 if ((status)); then
   echo "windows binary-path check failed" >&2

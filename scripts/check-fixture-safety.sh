@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+export LC_ALL=C
+
 status=0
 
 python3 - <<'EOF'
@@ -62,8 +64,8 @@ def allowed(a, b, c, d, f):
 bad = 0
 for f in files:
     try:
-        text = open(f, encoding="utf-8", errors="strict").read()
-    except (UnicodeError, OSError):
+        text = open(f, encoding="utf-8", errors="replace").read()
+    except OSError:
         continue
     for n, line in enumerate(text.splitlines(), 1):
         for m in ip.finditer(line):
@@ -80,6 +82,7 @@ python3 - <<'EOF'
 import base64, json, re, subprocess, sys
 link = re.compile(r"(?:vless|vmess|trojan|ss)://[^@#? ]+@([^/?# ]+)")
 vmess = re.compile(r"vmess://([A-Za-z0-9+/=_-]+)")
+ss = re.compile(r"ss://([A-Za-z0-9+/=_-]+)(?=[\s#]|$)")
 allowed = re.compile(
     r"^(\[::1\]|::1|(127|10)\.\d{1,3}\.\d{1,3}\.\d{1,3}"
     r"|192\.168\.\d{1,3}\.\d{1,3}"
@@ -123,10 +126,33 @@ for line in vmess_result.stdout.splitlines():
         prefix = f"{where.group(1)}:{where.group(2)}" if where else "?"
         print(f"::error::{prefix}: vmess link with a non-documentation host — working configs arrive as masked CI input only")
         bad += 1
+ss_result = subprocess.run(
+    ["git", "grep", "-I", "-n", "-E", r"ss://[A-Za-z0-9+/=_-]+", "--", "."],
+    capture_output=True, text=True)
+if ss_result.returncode not in (0, 1):
+    sys.exit(ss_result.returncode)
+for line in ss_result.stdout.splitlines():
+    for match in ss.finditer(line):
+        token = match.group(1) + "=" * (-len(match.group(1)) % 4)
+        try:
+            decoded = base64.b64decode(
+                token, altchars=b"-_", validate=False
+            ).decode("utf-8", "replace")
+        except ValueError:
+            continue
+        if "@" not in decoded:
+            continue
+        host = decoded.rsplit("@", 1)[1].split(":")[0].strip("[]")
+        if not host or allowed.match(host + ":"):
+            continue
+        where = re.match(r"^(.*?):(\d+):", line)
+        prefix = f"{where.group(1)}:{where.group(2)}" if where else "?"
+        print(f"::error::{prefix}: ss link with a non-documentation host — working configs arrive as masked CI input only")
+        bad += 1
 sys.exit(1 if bad else 0)
 EOF
 
-if git grep -I -n -E -e '-----BEGIN .*PRIVATE KEY-----' -- . ':!scripts/check-fixture-safety.sh'; then
+if git grep -I -n -E -e '-----BEGIN .*PRIVATE KEY( BLOCK)?-----' -- . ':!scripts/check-fixture-safety.sh'; then
   echo "::error::private key block in the tree — test material is generated at runtime"
   status=1
 fi

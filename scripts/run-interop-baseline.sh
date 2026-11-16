@@ -124,6 +124,11 @@ for name in zeronet xray-rust; do
     tail -n 40 "$log" >&2 || true
     exit 1
   fi
+  if ((passed + failed == 0)); then
+    echo "::error::$name ran no tests (libtest running $ran); a baseline that executed nothing proves nothing"
+    tail -n 40 "$log" >&2 || true
+    exit 1
+  fi
   {
     echo "## $name @ \`${rev:0:7}\` (go exit $test_rc; libtest running $ran; $passed passed, $failed failed)"
     echo

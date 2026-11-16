@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       pattern:
-        description: "go test pattern (default ./... = all of xray-core)"
+        description: "go test pattern (blank = packages in scope; ./... = all of xray-core)"
         required: false
-        default: "./..."
+        default: ""
 
 concurrency:
   group: xray-baseline-${{ github.ref }}
@@ -84,7 +84,12 @@ jobs:
         shell: bash
         env:
           WANT_PATTERN: ${{ inputs.pattern }}
-        run: ./scripts/run-xray-baseline.sh "${WANT_PATTERN:-./...}"
+        run: |
+          if [ -n "$WANT_PATTERN" ]; then
+            ./scripts/run-xray-baseline.sh "$WANT_PATTERN"
+          else
+            ./scripts/run-xray-baseline.sh
+          fi
       - name: publish the totals
         if: always()
         shell: bash

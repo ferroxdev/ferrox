@@ -166,7 +166,8 @@ bounded() {
   elif command -v gtimeout >/dev/null 2>&1; then
     gtimeout -k 10s "${seconds}s" "$@"
   else
-    "$@"
+    echo "::error::$self: needs timeout or gtimeout to enforce the map budget" >&2
+    return 127
   fi
 }
 
@@ -290,6 +291,7 @@ while IFS= read -r spec; do
     while IFS= read -r n; do
       if [[ -n "$n" ]]; then absent=$((absent + 1)); fi
     done <<<"$names"
+    cut=$((cut + 1))
     continue
   fi
   status=0

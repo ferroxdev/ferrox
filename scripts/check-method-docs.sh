@@ -54,7 +54,12 @@ def load_doc(path):
         if not line.startswith("|"):
             continue
         cells = [cell.strip().strip("`") for cell in line.strip("|").split("|")]
-        if len(cells) != 3 or cells[0] in ("key", "---", ""):
+        if len(cells) != 3:
+            if cells[0] not in ("key", "---", "") and not cells[0].startswith("-"):
+                fails.append(f"{os.path.basename(path)}: expected 3 cells, "
+                             f"got {len(cells)}")
+            continue
+        if cells[0] in ("key", "---", ""):
             continue
         if set(cells[1]) == {"-"} or cells[0].startswith("-"):
             continue

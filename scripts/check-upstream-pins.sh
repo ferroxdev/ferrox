@@ -16,7 +16,7 @@ fi
 
 parsed="$(awk '
   /^\[sources\./ {
-    if (name != "") print name "\t" repo "\t" rev "\t" branch
+    if (name != "") print name "|" repo "|" rev "|" branch
     name = $0
     sub(/^\[sources\./, "", name)
     sub(/\]$/, "", name)
@@ -32,11 +32,7 @@ parsed="$(awk '
   /^default_branch[[:space:]]*=/ {
     branch = $0; sub(/^[^=]*=[[:space:]]*"/, "", branch); sub(/"[[:space:]]*$/, "", branch); next
   }
-  /^$/ {
-    if (name != "") print name "\t" repo "\t" rev "\t" branch
-    name = ""
-  }
-  END { if (name != "") print name "\t" repo "\t" rev "\t" branch }
+  END { if (name != "") print name "|" repo "|" rev "|" branch }
 ' "$pins_file")"
 
 if [[ -z "$parsed" ]]; then
@@ -59,7 +55,13 @@ fi
 
 check_one() {
   local name="$1" repo="$2" rev="$3" branch="$4"
-  local out="$tmp/$name.out" verdict="$tmp/$name.verdict"
+  local out verdict
+  if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "::error::source name '$name' is not a safe directory name" >&2
+    return
+  fi
+  out="$tmp/$name.out"
+  verdict="$tmp/$name.verdict"
   bad() { echo BAD >"$verdict"; return; }
   {
     if [[ -z "$repo" ]]; then
@@ -108,7 +110,7 @@ check_one() {
 }
 
 running=0
-while IFS=$'\t' read -r name repo rev branch; do
+while IFS='|' read -r name repo rev branch; do
   [[ -n "$name" ]] || continue
   check_one "$name" "$repo" "$rev" "$branch" &
   running=$((running + 1))
@@ -119,7 +121,7 @@ while IFS=$'\t' read -r name repo rev branch; do
 done <<<"$parsed"
 wait
 
-while IFS=$'\t' read -r name _ _ _; do
+while IFS='|' read -r name _ _ _; do
   [[ -n "$name" ]] || continue
   out="$tmp/$name.out"
   verdict_file="$tmp/$name.verdict"

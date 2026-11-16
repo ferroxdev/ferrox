@@ -155,8 +155,17 @@ if grep -E '^source = "git\+' Cargo.lock >/dev/null; then
   status=1
 fi
 
+bad_registry="$(grep -E '^source = "registry\+' Cargo.lock \
+  | grep -vE 'crates\.io-index|index\.crates\.io' || true)"
+if [[ -n "$bad_registry" ]]; then
+  printf '%s\n' "$bad_registry" | sort -u | while read -r line; do
+    note "$line is not the crates.io registry; deny.toml's [sources] allows no other"
+  done
+  status=1
+fi
+
 for banned in sing-box v2ray-rust; do
-  hits="$(grep -rnE "^[[:space:]]*${banned}[[:space:]]*=" --include='Cargo.toml' crates Cargo.toml 2>/dev/null || true)"
+  hits="$(grep -rnE "^[[:space:]]*(${banned}[[:space:]]*=|\[[^]]*dependencies\.${banned}\]|package[[:space:]]*=[[:space:]]*\"${banned}\")" --include='Cargo.toml' crates Cargo.toml 2>/dev/null || true)"
   if [[ -n "$hits" ]]; then
     note "\`${banned}\` is a comparator, read at its pin under upstream/ and never a dependency"
     printf '%s\n' "$hits"

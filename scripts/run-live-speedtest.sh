@@ -73,7 +73,7 @@ main() {
   if [[ -z "$cores_list" ]]; then
     cores_list="$ALL_CORES"
   fi
-  wanted=(${cores_list//,/ })
+  IFS=, read -r -a wanted <<<"$cores_list"
 
   note "building the harness driver"
   cargo build --locked --release -p ferrox-bench -p ferrox-app 2>&1 | tail -2 >&2
@@ -84,7 +84,7 @@ main() {
 
   declare -A bin_of=()
   declare -A skip_reason=()
-  for core in ${wanted[@]+"${wanted[@]}"}; do
+  for core in "${wanted[@]}"; do
     if [[ "$core" == "ferrox" ]]; then
       bin_of[$core]="$ferrox_bin"
       continue
@@ -104,7 +104,7 @@ main() {
     echo "target_md5: ${target_md5:-unverified}"
     echo "repeats: $repeats"
     echo "cores: ${wanted[*]}"
-    for core in ${wanted[@]+"${wanted[@]}"}; do
+    for core in "${wanted[@]}"; do
       if [[ -n "${bin_of[$core]:-}" ]]; then
         echo "engine $core: ${bin_of[$core]} sha256=$(sha256_of "${bin_of[$core]}")"
       else
@@ -127,7 +127,7 @@ main() {
       || fail "config #$index: unreadable link (not logged; check the paste)"
     label="$("$bench_bin" linkconfig --describe --index "$index" --link "$link" 2>/dev/null)" \
       || fail "config #$index: unreadable link (not logged; check the paste)"
-    for core in ${wanted[@]+"${wanted[@]}"}; do
+    for core in "${wanted[@]}"; do
       if [[ -z "${bin_of[$core]:-}" ]]; then
         record "$index" "$label" "$core" 0 "skipped" \
           "${skip_reason[$core]:-unknown}" "" "" "" "" "" "" ""
@@ -241,8 +241,14 @@ attempt() {
       "" "" "" "" "" "" ""
     return 1
   fi
-  local size total starttransfer
+  local size total starttransfer http_code
   size="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["size"]))' "$curl_json")"
+  http_code="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["http_code"]))' "$curl_json")"
+  if ((http_code < 200 || http_code >= 300 || size <= 0)); then
+    record "$index" "$label" "$core" "$repeat" "error" \
+      "http $http_code / empty body" "" "" "" "" "" "" ""
+    return 1
+  fi
   total="$(python3 -c 'import json,sys; print(float(json.load(open(sys.argv[1]))["total"]))' "$curl_json")"
   starttransfer="$(python3 -c 'import json,sys; print(float(json.load(open(sys.argv[1]))["starttransfer"]))' "$curl_json")"
   local window

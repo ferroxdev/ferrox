@@ -140,29 +140,37 @@ def attempted(cell, engine):
     return any(f.get("engine") == engine for f in cell.get("failures", []))
 
 
-def load_baseline(path):
+def load_baseline(path, strict=False):
     """(base, leg) -> (ratio, issue, basis) for holes already filed and owned."""
     known = {}
     try:
         lines = Path(path).read_text().splitlines()
     except OSError:
         return known
-    for line in lines:
+    for number, line in enumerate(lines, 1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         parts = [part.strip() for part in line.split("|")]
         if len(parts) not in (4, 5):
+            if strict:
+                raise ValueError(f"{path}:{number}: expected 4 or 5 fields")
             continue
         base, leg, ratio, issue = parts[:4]
         basis = parts[4] if len(parts) == 5 else "raw"
         if basis not in ("raw", "ceiling"):
+            if strict:
+                raise ValueError(f"{path}:{number}: basis {basis!r} is not raw or ceiling")
             continue
         try:
             value = float(ratio)
         except ValueError:
+            if strict:
+                raise ValueError(f"{path}:{number}: ratio {ratio!r} is not a number")
             continue
         if not math.isfinite(value):
+            if strict:
+                raise ValueError(f"{path}:{number}: ratio {ratio!r} is not finite")
             continue
         known[(base, leg)] = (value, issue, basis)
     return known
@@ -170,7 +178,12 @@ def load_baseline(path):
 
 def filed_gap_bases(path):
     """The unique scenario bases the baseline files, sorted for a stable replay."""
-    return sorted({base for base, _leg in load_baseline(path)})
+    try:
+        known = load_baseline(path, strict=True)
+    except ValueError as exc:
+        print(f"::error::{exc}", file=sys.stderr)
+        return None
+    return sorted({base for base, _leg in known})
 
 
 def filed_basis_ratio(hole, basis):
@@ -206,7 +219,15 @@ def check_grouped(grouped, threshold, cpu_threshold, threads_threshold):
         if reference is None:
             continue
         reference_mib_s = median_throughput(reference, REFERENCE)
-        if not reference_mib_s:
+        if reference_mib_s is None or reference_mib_s <= 0:
+            holes.append({
+                "base": base,
+                "leg": "reference",
+                "ratio": 0.0,
+                "unmeasured": True,
+                "text": f"{base}: the xray-core reference landed no throughput; "
+                        f"the control did not run, so the legs cannot be attributed",
+            })
             continue
         client_leg = median_throughput(reference, FERRORX)
         server_cell = grouped.get((base, FERRORX))
@@ -242,6 +263,7 @@ def check_grouped(grouped, threshold, cpu_threshold, threads_threshold):
                 "base": base,
                 "leg": "client",
                 "ratio": 0.0,
+                "unmeasured": True,
                 "text": f"{base}: ferrox client landed no number on the xray-core server: the client leg lost",
             })
         elif client_leg is not None and client_leg < reference_mib_s * threshold:
@@ -258,6 +280,7 @@ def check_grouped(grouped, threshold, cpu_threshold, threads_threshold):
                 "base": base,
                 "leg": "server",
                 "ratio": 0.0,
+                "unmeasured": True,
                 "text": f"{base}: xray-core client landed no number on the ferrox server: the server leg lost",
             })
         elif server_ratio is not None and server_ratio < threshold:
@@ -330,9 +353,19 @@ def server_cost_holes(base, reference, server_cell, cpu_threshold, threads_thres
             "text": f"{base}: server CPU was not sampled on both legs; "
                     f"the server cost has no measurement, so it cannot be gated",
         })
+    elif ref_cpu <= 0:
+        holes.append({
+            "base": base,
+            "leg": "server-cpu",
+            "ratio": 0.0,
+            "unmeasured": True,
+            "text": f"{base}: xray-core server CPU is 0 while ferrox reports "
+                    f"{fer_cpu:.1f} ms/GiB: no server CPU ratio, so the leg "
+                    f"cannot be gated",
+        })
     elif not priced:
         pass
-    elif ref_cpu > 0:
+    else:
         ratio = fer_cpu / ref_cpu
         if ratio > cpu_threshold:
             holes.append({
@@ -343,15 +376,6 @@ def server_cost_holes(base, reference, server_cell, cpu_threshold, threads_thres
                         f"{ref_cpu:.1f} ms/GiB (xray-core server), {ratio:.2f}x: "
                         f"the server spent more CPU",
             })
-    else:
-        holes.append({
-            "base": base,
-            "leg": "server-cpu",
-            "ratio": 0.0,
-            "text": f"{base}: xray-core server CPU is below the sampler's "
-                    f"resolution ({fer_cpu:.1f} ms/GiB for ferrox): no server "
-                    f"CPU ratio, so the leg cannot be gated",
-        })
     ref_threads = median_server_metric(reference, REFERENCE, "threads_peak")
     fer_threads = median_server_metric(server_cell, REFERENCE, "threads_peak")
     if ref_threads is None or fer_threads is None:
@@ -379,6 +403,7 @@ def server_cost_holes(base, reference, server_cell, cpu_threshold, threads_thres
             "base": base,
             "leg": "server-threads",
             "ratio": 0.0,
+            "unmeasured": True,
             "text": f"{base}: xray-core server threads are 0 while ferrox reports "
                     f"{fer_threads:.0f}: no ratio, so the leg cannot be gated",
         })
@@ -387,6 +412,13 @@ def server_cost_holes(base, reference, server_cell, cpu_threshold, threads_thres
 
 def selftest():
     """Prove the server CPU and thread gate fails a losing server and passes a winning one."""
+    with tempfile.TemporaryDirectory() as empty:
+        proc = run_self(Path(empty))
+        if proc.returncode == 0:
+            return "an empty cells directory passed the leg gate"
+        proc = run_self(Path(empty) / "missing")
+        if proc.returncode == 0:
+            return "a missing cells directory passed the leg gate"
     with tempfile.TemporaryDirectory() as tmp:
         cells = Path(tmp)
         for server, cpu, threads, throughput in (
@@ -601,12 +633,22 @@ def main():
     )
     args = parser.parse_args()
     if args.bases:
-        for base in filed_gap_bases(args.baseline):
+        bases = filed_gap_bases(args.baseline)
+        if bases is None:
+            return 1
+        for base in bases:
             print(base)
         return 0
     if not args.cells:
         parser.error("--cells is required")
-    baseline = {} if args.no_baseline else load_baseline(args.baseline)
+    if not Path(args.cells).is_dir():
+        print(f"::error::{args.cells} is not a cells directory", file=sys.stderr)
+        return 1
+    try:
+        baseline = {} if args.no_baseline else load_baseline(args.baseline, strict=True)
+    except ValueError as exc:
+        print(f"::error::{exc}", file=sys.stderr)
+        return 1
 
     grouped, errors = cells_by_scenario(args.cells)
     if errors:
@@ -622,6 +664,13 @@ def main():
         args.server_cpu_threshold,
         args.server_threads_threshold,
     )
+    if checked == 0:
+        print(
+            f"::error::{args.cells} held no xray-core reference cell, so the "
+            "leg attribution proved nothing",
+            file=sys.stderr,
+        )
+        return 1
 
     new, known, fixed = [], [], []
     for hole in holes:

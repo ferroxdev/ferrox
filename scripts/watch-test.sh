@@ -169,8 +169,9 @@ watch() {
 # in one process -- and name the whole group when that stalls. probe bounds each solo pass
 # so a shared deadlock the co-run pass alone catches does not first cost the walk quiet.
 culprit() {
-  local binary="$1" keep="$out" names done missing name full
-  local -a filters=()
+  local binary="$1"; shift
+  local keep="$out" names done missing name full
+  local -a filters=() test_args=("$@")
   [[ -x "$binary" ]] || return 1
   names=$("$binary" --list --format terse 2>/dev/null | sed -n 's/: test$//p')
   [[ -n "$names" ]] || return 1
@@ -186,7 +187,7 @@ culprit() {
   full="$quiet"
   quiet="$probe"
   for name in $missing; do
-    watch "$binary" --exact "$name" --test-threads=1 >/dev/null
+    watch "$binary" --exact "$name" ${test_args[@]+"${test_args[@]}"} --test-threads=1 >/dev/null
     if ((STALLED == 1)); then
       quiet="$full"
       cp "$out" "$keep.last" 2>/dev/null || true
@@ -198,7 +199,7 @@ culprit() {
   # None stalls alone, yet the parallel suite did: reproduce it the way the suite met it,
   # the still-missing names together in one process, so the shared deadlock names its group.
   for name in $missing; do filters+=("$name"); done
-  watch "$binary" --exact "${filters[@]}" >/dev/null
+  watch "$binary" --exact "${filters[@]}" ${test_args[@]+"${test_args[@]}"} >/dev/null
   quiet="$full"
   if ((STALLED == 1)); then
     cp "$out" "$keep.last" 2>/dev/null || true
@@ -252,10 +253,11 @@ EOF
   # The stalled log printed `test early::done ... ok`, so culprit must NOT re-run it: the
   # hang is the one name still missing, and only that name is worth a process of its own.
   : >"$probes"; export FAKE_PROBE="$PWD/$probes"
-  want="$(culprit "$fake")" || { echo "selftest: the stalled test was not named" >&2; return 1; }
+  want="$(culprit "$fake" --ignored)" || { echo "selftest: the stalled test was not named" >&2; return 1; }
   unset FAKE_PROBE
   [[ "$want" == "hangs::forever" ]] || { echo "selftest: named '$want', want hangs::forever" >&2; return 1; }
   grep -qx 'hangs::forever' "$probes" || { echo "selftest: the hung test was never probed alone" >&2; return 1; }
+  grep -qx -- '--ignored' "$probes" || { echo "selftest: the probe dropped the suite's libtest flags" >&2; return 1; }
   grep -qx 'early::done' "$probes" && { echo "selftest: culprit re-ran a test the log already saw finish" >&2; return 1; }
   echo "selftest: ok   a stall stops at the quiet limit, and only the test still missing from the log is run alone"
   # With nothing completed in the log to subtract, culprit falls back to the full list and
@@ -338,13 +340,23 @@ if ((selftest)); then
 fi
 [[ $# -gt 0 ]] || usage
 
+libtest_args=()
+seen_sep=0
+for arg in "$@"; do
+  if ((seen_sep)); then
+    libtest_args+=("$arg")
+  elif [[ "$arg" == "--" ]]; then
+    seen_sep=1
+  fi
+done
+
 mkdir -p "$(dirname "$out")"
 watch "$@"
 if ((STALLED == 1)); then
   echo "::error::$* stalled: nothing was written for $quiet s, so the log ends where it stopped"
   binary="$(last_binary "$out")"
   if [[ -n "$binary" ]]; then
-    name="$(culprit "$binary")"
+    name="$(culprit "$binary" ${libtest_args[@]+"${libtest_args[@]}"})"
     if [[ "$name" == *" "* ]]; then
       echo "STALLED IN the group run together: $name (each returns alone; the deadlock is in what they share)"
     elif [[ -n "$name" ]]; then

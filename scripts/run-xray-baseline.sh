@@ -3,12 +3,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-default_pattern="${1:-${BASELINE_PATTERN:-./...}}"
-# A plan file narrows the run to the packages of the reference that measure the
-# change; with none, every package is the answer, which is what a scheduled,
-# manual or local run wants.
+requested="${1:-${BASELINE_PATTERN:-}}"
+# An explicit pattern is the caller's whole answer; otherwise a plan file narrows
+# the run to the packages of the reference that measure the change, and with
+# neither every package is the answer.
 patterns=()
-if [[ -f .ferrox/ci-scope.json ]]; then
+if [[ -n "$requested" ]]; then
+  read -r -a patterns <<<"$requested"
+elif [[ -f .ferrox/ci-scope.json ]]; then
   if ! plan="$(python3 scripts/ci-scope.py go-packages)"; then
     echo "::error::ci-scope.py go-packages failed; refusing to read its silence as an empty plan" >&2
     exit 1
@@ -19,7 +21,11 @@ if [[ -f .ferrox/ci-scope.json ]]; then
     exit 0
   fi
 else
-  read -r -a patterns <<<"$default_pattern"
+  patterns=(./...)
+fi
+if [[ "${#patterns[@]}" -eq 0 ]]; then
+  echo "::error::xray-core baseline: an empty pattern selects nothing" >&2
+  exit 1
 fi
 pattern="${patterns[*]}"
 go_timeout="${GO_TEST_TIMEOUT:-20m}"

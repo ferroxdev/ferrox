@@ -56,10 +56,15 @@ CASES = [
 
 
 def main() -> int:
-    state = pathlib.Path(tempfile.mkdtemp(prefix="ferrox-cli-args-"))
-    atexit.register(shutil.rmtree, state, True)
+    root = pathlib.Path(tempfile.mkdtemp(prefix="ferrox-cli-args-"))
+    atexit.register(shutil.rmtree, root, True)
+    conf = root / "conf"
+    state = root / "state"
+    conf.mkdir()
+    state.mkdir()
     env = dict(os.environ)
-    env["FERROX_CONF_DIR"] = str(state)
+    env["FERROX_CONF_DIR"] = str(conf)
+    env["FERROX_STATE_DIR"] = str(state)
     env["FERROX_BIN"] = shutil.which("true") or "/bin/true"
     for label, args, want in CASES:
         try:
@@ -92,10 +97,14 @@ def main() -> int:
             )
             print(output, file=sys.stderr)
             return 1
-        if list(state.iterdir()):
+        left = sorted(
+            f"{path.name}/{item.name}"
+            for path in (conf, state)
+            for item in path.iterdir()
+        )
+        if left:
             print(
-                f"check-cli-args: {label}: a refusal left state behind:"
-                f" {sorted(p.name for p in state.iterdir())}",
+                f"check-cli-args: {label}: a refusal left state behind: {left}",
                 file=sys.stderr,
             )
             return 1
