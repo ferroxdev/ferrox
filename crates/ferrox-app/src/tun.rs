@@ -1164,7 +1164,7 @@ fn build_tcp_packet(
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(clippy::too_many_arguments)]
 fn build_tcp_packet_options(
     src: ([u8; 4], u16),
