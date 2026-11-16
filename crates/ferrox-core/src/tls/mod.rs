@@ -230,6 +230,12 @@ pub trait TlsProvider: std::io::Read + std::io::Write {
         false
     }
 
+    /// Send this side's close notification when the backend and protocol support a
+    /// half-close; a backend with no such signal sends nothing.
+    fn close_notify(&mut self) -> Result<(), TlsError> {
+        Ok(())
+    }
+
     /// The server name the front's hello named, once the handshake has read
     /// it: a fallback row that names its fronts is routed by it. A provider
     /// that heard no name, or one on the client side, answers `None`.
@@ -898,6 +904,14 @@ impl<S: Stream> TlsProvider for ClientSession<S> {
             Self::Stock(session) => session.closed(),
             Self::Shaped(session) => session.closed(),
             Self::Legacy(session) => session.closed(),
+        }
+    }
+
+    fn close_notify(&mut self) -> Result<(), TlsError> {
+        match self {
+            Self::Stock(session) => session.close_notify(),
+            Self::Shaped(session) => session.close_notify(),
+            Self::Legacy(session) => session.close_notify(),
         }
     }
 

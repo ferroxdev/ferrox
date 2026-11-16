@@ -81,6 +81,9 @@ pub struct Session<S: Stream> {
     in_at: usize,
     reply: Vec<u8>,
     out: Vec<u8>,
+    close: Vec<u8>,
+    close_at: usize,
+    close_sent: bool,
     key_log: Option<Arc<dyn rustls::KeyLog>>,
     client_cert: Option<ClientIdentity>,
     ktls: Option<ktls::Layer>,
@@ -287,6 +290,9 @@ impl<S: Stream> Session<S> {
             in_at: 0,
             reply: Vec::new(),
             out: Vec::new(),
+            close: Vec::new(),
+            close_at: 0,
+            close_sent: false,
             key_log: None,
             client_cert: None,
             ktls: None,
@@ -1411,6 +1417,63 @@ impl<S: Stream> Session<S> {
         })
     }
 
+    /// Send a close notification without closing the read direction.
+    pub(crate) fn close_notify(&mut self) -> Result<(), TlsError> {
+        if !self.done || self.close_sent || self.version != Some(Version::Tls13) {
+            return Ok(());
+        }
+        if self.ktls.is_some() {
+            return Err(TlsError::Other(
+                "close notification is unavailable under kTLS".to_owned(),
+            ));
+        }
+        if self.close.is_empty() {
+            let version = self.version;
+            let mut out = Vec::new();
+            if !self.reply.is_empty() {
+                out.append(&mut self.reply);
+            }
+            let alert = [1u8, 0u8];
+            let sealed = {
+                let keys = self
+                    .write_key
+                    .as_mut()
+                    .ok_or_else(|| TlsError::Other("no write keys".to_owned()))?;
+                match version {
+                    Some(Version::Tls12) => record::seal12_parts(keys, ALERT, &[&alert], &mut out),
+                    _ => record::seal13_parts(keys, ALERT, &[&alert], &mut out),
+                }
+            };
+            sealed?;
+            self.close = out;
+            self.close_at = 0;
+        }
+        self.flush_close()
+    }
+
+    /// Write the sealed close record from its last offset, so a timeout resumes instead of
+    /// sealing a second alert.
+    fn flush_close(&mut self) -> Result<(), TlsError> {
+        while self.close_at < self.close.len() {
+            match self.io.write(&self.close[self.close_at..]) {
+                Ok(0) => {
+                    return Err(TlsError::Other(
+                        "close notification accepted no bytes".to_owned(),
+                    ));
+                }
+                Ok(count) => self.close_at += count,
+                Err(error) => return Err(TlsError::from(error)),
+            }
+        }
+        if self.close_at > 0 {
+            self.close.clear();
+            self.close_at = 0;
+            self.close_sent = true;
+            self.reply.clear();
+        }
+        Ok(())
+    }
+
     /// Seals `parts` into the session's own write buffer and sends it, so a relay write after the first costs no allocation.
     fn seal_out(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         let mut out = std::mem::take(&mut self.out);
@@ -1424,6 +1487,9 @@ impl<S: Stream> Session<S> {
     }
 
     fn flush_reply(&mut self) -> std::io::Result<()> {
+        if !self.close.is_empty() || self.close_sent {
+            return Ok(());
+        }
         if !self.reply.is_empty() {
             self.io.write_all(&self.reply)?;
             self.reply.clear();
@@ -1498,6 +1564,10 @@ impl<S: Stream> TlsProvider for Session<S> {
 
     fn closed(&self) -> bool {
         self.eof
+    }
+
+    fn close_notify(&mut self) -> Result<(), TlsError> {
+        self.close_notify()
     }
 
     fn peer_leaf(&self) -> Option<&[u8]> {
@@ -1661,6 +1731,7 @@ impl<S: Stream> Write for Session<S> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_close().map_err(std::io::Error::other)?;
         if let Some(layer) = &mut self.ktls {
             return layer.flush(&mut self.io);
         }
@@ -2435,12 +2506,125 @@ mod tests {
             in_at: 0,
             reply: Vec::new(),
             out: Vec::new(),
+            close: Vec::new(),
+            close_at: 0,
+            close_sent: false,
             key_log: None,
             client_cert: None,
             ktls: None,
             kernel_tx: false,
             kernel_rx: false,
         }
+    }
+
+    /// A writer that records every byte it accepts.
+    #[derive(Default)]
+    struct CloseRecorder {
+        bytes: Vec<u8>,
+    }
+
+    impl Read for CloseRecorder {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for CloseRecorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer that accepts one short write, then reports one timeout.
+    struct StallingWriter {
+        bytes: Vec<u8>,
+        limit: usize,
+        stalled: bool,
+    }
+
+    impl Read for StallingWriter {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for StallingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.bytes.is_empty() {
+                let count = self.limit.min(buf.len());
+                self.bytes.extend_from_slice(&buf[..count]);
+                self.stalled = true;
+                return Ok(count);
+            }
+            if self.stalled {
+                self.stalled = false;
+                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "poll"));
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn tls13_session<S: Stream>(io: S) -> Session<S> {
+        session_on(
+            io,
+            Version::Tls13,
+            Suite::Aes128GcmSha256,
+            Direction::tls13(Suite::Aes128GcmSha256, &[0u8; 32]),
+            Direction::tls13(Suite::Aes128GcmSha256, &[0u8; 32]),
+        )
+    }
+
+    #[test]
+    fn a_close_notification_follows_a_queued_reply() {
+        let mut subject = tls13_session(CloseRecorder::default());
+        subject.reply = b"reply".to_vec();
+        subject.close_notify().expect("close");
+        assert!(subject.io.bytes.starts_with(b"reply"));
+        assert!(subject.close_sent);
+    }
+
+    #[test]
+    fn a_close_notification_resumes_its_record_after_a_timeout() {
+        let mut subject = tls13_session(StallingWriter {
+            bytes: Vec::new(),
+            limit: 5,
+            stalled: false,
+        });
+        let error = subject.close_notify().expect_err("the short write stalls");
+        assert!(matches!(error, TlsError::Timeout));
+        assert_eq!(subject.close_at, 5);
+        assert!(!subject.close_sent);
+        subject.flush().expect("the record resumes");
+        assert!(subject.close_sent);
+        assert_eq!(subject.close.len(), 0);
+        assert!(subject.io.bytes.len() > 5);
+    }
+
+    #[test]
+    fn a_reply_waits_for_a_pending_close_record() {
+        let mut subject = tls13_session(StallingWriter {
+            bytes: Vec::new(),
+            limit: 5,
+            stalled: false,
+        });
+        subject.reply = b"reply".to_vec();
+        let error = subject.close_notify().expect_err("the short write stalls");
+        assert!(matches!(error, TlsError::Timeout));
+        subject.flush_reply().expect("the reply waits");
+        assert_eq!(subject.io.bytes.len(), 5);
+        subject.flush().expect("the close resumes");
+        assert!(subject.io.bytes.starts_with(b"reply"));
+        assert!(subject.close_sent);
     }
 
     /// A retried handshake's transcript opens with a synthetic `message_hash` and a

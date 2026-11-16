@@ -1280,6 +1280,17 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
     fn closed(&self) -> bool {
         self.eof || self.ktls.as_ref().is_some_and(crate::tls::ktls::Layer::eof)
     }
+
+    fn close_notify(&mut self) -> Result<(), TlsError> {
+        if self.ktls.is_some()
+            || self.conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3)
+        {
+            return Ok(());
+        }
+        self.conn.send_close_notify();
+        self.send_pending()?;
+        Ok(())
+    }
 }
 
 impl<S: Stream> Read for RustlsProvider<S> {
