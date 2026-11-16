@@ -3345,10 +3345,12 @@ mod tests {
         assert_eq!(rtcp.source_port, 8080);
         assert_eq!(rtcp.destination_port, 44444);
         assert_eq!(rtcp.seq, 1001);
-        assert!(
-            rtcp.options.is_empty(),
-            "a SYN without options gets none back"
+        assert_eq!(
+            rtcp.options,
+            [2, 4, 0x05, 0xb4],
+            "a SYN without options still learns the MSS, and no scale"
         );
+        assert_eq!(window_shift(rtcp.options), None, "no scale was offered");
     }
 
     /// A SYN that offers a window scale is answered with the device's MSS and our scale, so both directions leave the sixty-four-kilobyte ceiling; the options sit inside the checksummed header.
