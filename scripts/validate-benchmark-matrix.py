@@ -301,6 +301,8 @@ def manifest_has_binary_sizes(results):
     for line in results.get("manifest", []):
         parts = line.split()
         if len(parts) > 1 and parts[0] == "engine":
+            if parts[1].rstrip(":") not in THROUGHPUT_ENGINES:
+                continue
             if any(part.startswith("mib=") and part.partition("=")[2]
                    for part in parts[2:]):
                 return True
@@ -308,11 +310,12 @@ def manifest_has_binary_sizes(results):
 
 
 def any_metric(cells, metric):
-    """True when any engine in any cell holds a sample the renderer can plot."""
+    """True when a renderer engine in any cell holds a sample it can plot."""
     return any(
         cell_samples(cell, engine.get("name"), metric)
         for cell in cells
         for engine in cell.get("engines", [])
+        if engine.get("name") in THROUGHPUT_ENGINES
     )
 
 
@@ -541,14 +544,26 @@ def selftest():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "scenarios").mkdir()
-        results = {"scenarios": [{
-            "id": "x", "base": "x", "workload": {"traffic": "upload"},
-            "ceilings_mib_s": [100], "medians": {},
-        }]}
+        results = {
+            "manifest": ["engine local-xray: /x mib=10"],
+            "scenarios": [{
+                "id": "x", "base": "x", "workload": {"traffic": "upload"},
+                "ceilings_mib_s": [100], "medians": {},
+            }],
+        }
         cells = {"x": {
             "scenario": "x", "workload": {"traffic": "upload"},
             "harness_ceilings_mib_s": [100],
-            "engines": [{"name": "ferrox", "runs": []}],
+            "engines": [
+                {"name": "ferrox", "runs": []},
+                {"name": "local-xray", "runs": [{
+                    "throughput_mib_s": 50,
+                    "cpu_millis_per_gib": 10,
+                    "rss_mib": 100,
+                    "threads_peak": 4,
+                    "startup_seconds": 0.1,
+                }]},
+            ],
         }}
         assert wanted_charts(results, cells) == []
         failures = []
