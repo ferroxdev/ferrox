@@ -314,7 +314,7 @@ fn main() {
     let mut handles = Vec::new();
     for flow in &flows {
         let mut socket = TcpSocket::new(
-            SocketBuffer::new(vec![0u8; 8192]),
+            SocketBuffer::new(vec![0u8; 65_535]),
             SocketBuffer::new(vec![0u8; 8192]),
         );
         socket
@@ -325,7 +325,7 @@ fn main() {
     let mut udp_handles = Vec::new();
     for flow in &dgram_flows {
         let mut socket = UdpSocket::new(
-            UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 8], vec![0u8; 8192]),
+            UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 8], vec![0u8; 65_507]),
             UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 8], vec![0u8; 512]),
         );
         socket

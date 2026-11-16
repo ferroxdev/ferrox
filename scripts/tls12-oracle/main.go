@@ -20,38 +20,50 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	_ "embed"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-// The CBC, GCM, 3DES and RC4 suites Go implements, each with the certificate its own
-// key agreement needs.
-var suites = []struct {
+//go:embed script.txt
+var suiteScript string
+
+// The certificate each suite's key agreement needs: the name carries the leaf
+// type, so the script stays the list of cases the oracle runs.
+type suite struct {
 	id  uint16
 	rsa bool
-}{
-	{0xc009, false}, // ECDHE-ECDSA-AES128-CBC-SHA
-	{0xc00a, false}, // ECDHE-ECDSA-AES256-CBC-SHA
-	{0xc023, false}, // ECDHE-ECDSA-AES128-CBC-SHA256
-	{0xc013, true},  // ECDHE-RSA-AES128-CBC-SHA
-	{0xc014, true},  // ECDHE-RSA-AES256-CBC-SHA
-	{0xc027, true},  // ECDHE-RSA-AES128-CBC-SHA256
-	{0x002f, true},  // RSA-AES128-CBC-SHA
-	{0x0035, true},  // RSA-AES256-CBC-SHA
-	{0x003c, true},  // RSA-AES128-CBC-SHA256
-	{0x009c, true},  // RSA-AES128-GCM-SHA256
-	{0x009d, true},  // RSA-AES256-GCM-SHA384
-	{0x000a, true},  // RSA-3DES-EDE-CBC-SHA
-	{0xc012, true},  // ECDHE-RSA-3DES-EDE-CBC-SHA
-	{0x0005, true},  // RSA-RC4-128-SHA
-	{0xc011, true},  // ECDHE-RSA-RC4-128-SHA
-	{0xc007, false}, // ECDHE-ECDSA-RC4-128-SHA
+}
+
+func suites() ([]suite, error) {
+	var out []suite
+	for _, line := range strings.Split(suiteScript, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "0x") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return nil, fmt.Errorf("malformed suite line %q", line)
+		}
+		id, err := strconv.ParseUint(fields[0][2:], 16, 16)
+		if err != nil {
+			return nil, fmt.Errorf("suite id %q: %w", fields[0], err)
+		}
+		out = append(out, suite{id: uint16(id), rsa: !strings.Contains(fields[1], "ECDSA")})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("script names no TLS 1.2 suites")
+	}
+	return out, nil
 }
 
 const (
@@ -94,7 +106,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	for _, s := range suites {
+	cases, err := suites()
+	if err != nil {
+		return err
+	}
+	for _, s := range cases {
 		cert := ecdsaCert
 		if s.rsa {
 			cert = rsaCert

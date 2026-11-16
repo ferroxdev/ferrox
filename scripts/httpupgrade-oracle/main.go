@@ -63,10 +63,11 @@ import (
 )
 
 const (
-	// The reference's own head bound: `bufio.NewReader(io.LimitReader(conn, 12288))`.
+	// Both scanners stop at the reference's 12288-octet head bound.
 	headLimit = 12288
-	// The tree's own head bound: `HEAD_LIMIT` in the carrier.
-	treeLimit = 65536
+	// The longest head the sweep names; it is past both scanners' bound, so
+	// those rows pin the refusal itself.
+	longLimit = 65536
 	// How long the client family waits for a payload before it answers.
 	rideWindow = 250 * time.Millisecond
 	// How long a serve family's handler waits for the octets that came with the head.
@@ -106,8 +107,8 @@ func main() {
 }
 
 // emitCases writes the script: the length sweep that moves the terminator
-// across every group boundary of both scanners, the tail sweep, the shapes the
-// two sides read differently, and the served and dialled families.
+// across every group boundary of both scanners, the tail sweep, the shared
+// parser shapes, and the served and dialled families.
 func emitCases(w io.Writer) {
 	// The head every length is a length of: a request line, a host, and a
 	// header whose value the pad fills.
@@ -118,13 +119,7 @@ func emitCases(w io.Writer) {
 	}
 	for _, total := range lengths() {
 		pad := total - len(base) - 4
-		// The reference's own head bound is 12288 octets and the tree's is
-		// 65536, so the two sides stop at different lengths.
-		expect := "same"
-		if total > headLimit && total <= treeLimit {
-			expect = "v+"
-		}
-		fmt.Fprintf(w, "frame len-%d %d 0 %s crlf %s\n", total, pad, expect, prefix)
+		fmt.Fprintf(w, "frame len-%d %d 0 same crlf %s\n", total, pad, prefix)
 	}
 	// The octets that arrive with the head: the reference reads them into a
 	// buffer it then drops, so the tail's length moves what the reference
@@ -132,15 +127,14 @@ func emitCases(w io.Writer) {
 	for _, tail := range []int{1, 2, 3, 7, 8, 15, 16, 63, 64, 255, 256, 4095, 4096, 4097} {
 		fmt.Fprintf(w, "frame tail-%d 0 %d same crlf %s\n", tail, tail, prefix)
 	}
-	// A head the two sides read differently: a bare line feed, a method the
-	// tree refuses, a path the reference decodes, a header the reference
-	// reads once and the tree reads twice.
-	fmt.Fprintf(w, "frame lf-1 0 0 v- none GET /tunnel HTTP/1.1\\nHost: oracle.example\\nX-Pad:\\s\\n\\n\n")
-	serve(w, "post-1", "/tunnel", "oracle.example", "-", "v-",
+	// Shapes both scanners accept even though their parsers differ: a bare
+	// line feed, any method, a percent-encoded path, and duplicate headers.
+	fmt.Fprintf(w, "frame lf-1 0 0 same none GET /tunnel HTTP/1.1\\nHost: oracle.example\\nX-Pad:\\s\\n\\n\n")
+	serve(w, "post-1", "/tunnel", "oracle.example", "-", "same",
 		`POST /tunnel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n`)
-	serve(w, "pct-1", "/tunnel", "oracle.example", "-", "v-",
+	serve(w, "pct-1", "/tunnel", "oracle.example", "-", "same",
 		`GET /tun%6Eel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n`)
-	serve(w, "dup-1", "/tunnel", "oracle.example", "-", "v-",
+	serve(w, "dup-1", "/tunnel", "oracle.example", "-", "same",
 		`GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nConnection: close\r\nUpgrade: websocket\r\n\r\n`)
 	// The served side: the head, the answer, and the octets that came with it.
 	serve(w, "ok-1", "/tunnel", "oracle.example", "-", "same",
@@ -187,8 +181,8 @@ func emitCases(w io.Writer) {
 
 // lengths is the head lengths the sweep covers: every length around every
 // group boundary of both scanners — the word the tree's scan reads, the round
-// it reads in, the buffer the reference reads in, and the bound each side
-// carries — and the bounds themselves.
+// it reads in, the buffer the reference reads in, and the 12288-octet bound
+// both sides carry — plus the longest head the sweep names.
 func lengths() []int {
 	var out []int
 	seen := map[int]bool{}
@@ -202,7 +196,7 @@ func lengths() []int {
 	for n := 55; n <= 70; n++ {
 		add(n)
 	}
-	for _, boundary := range []int{8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, headLimit, 16384, 32768, treeLimit} {
+	for _, boundary := range []int{8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, headLimit, 16384, 32768, longLimit} {
 		for n := boundary - 3; n <= boundary+3; n++ {
 			add(n)
 		}
@@ -372,42 +366,51 @@ func frame(head []byte) (string, string) {
 // writes when it accepts, and whether the octets that arrived with the head
 // survived it. The server is the pinned one, over a loopback socket.
 func serveCase(path, host string, head, tail []byte) (string, string, string, error) {
-	port, err := freePort()
-	if err != nil {
-		return "", "", "", err
-	}
 	seen := make(chan string, 1)
-	listener, err := httpupgrade.ListenHTTPUpgrade(
-		context.Background(),
-		xnet.LocalHostIP,
-		xnet.Port(port),
-		&internet.MemoryStreamConfig{
-			ProtocolName: "httpupgrade",
-			ProtocolSettings: &httpupgrade.Config{
-				Path: path,
-				Host: host,
+	var port int
+	var listener internet.Listener
+	var err error
+	// Retry the free-port handoff if another process claims it first.
+	for attempt := 0; ; attempt++ {
+		port, err = freePort()
+		if err != nil {
+			return "", "", "", err
+		}
+		listener, err = httpupgrade.ListenHTTPUpgrade(
+			context.Background(),
+			xnet.LocalHostIP,
+			xnet.Port(port),
+			&internet.MemoryStreamConfig{
+				ProtocolName: "httpupgrade",
+				ProtocolSettings: &httpupgrade.Config{
+					Path: path,
+					Host: host,
+				},
 			},
-		},
-		func(conn stat.Connection) {
-			// The handler reads what is left of the connection: the octets
-			// that came with the head are still there if the server kept
-			// them, and gone if the buffer that read them was dropped.
-			buffer := make([]byte, 4096)
-			conn.SetReadDeadline(time.Now().Add(tailWindow))
-			n, err := conn.Read(buffer)
-			switch {
-			case n > 0:
-				seen <- "kept"
-			case err == io.EOF:
-				seen <- "dropped"
-			default:
-				seen <- "none"
-			}
-			conn.Close()
-		},
-	)
-	if err != nil {
-		return "", "", "", err
+			func(conn stat.Connection) {
+				// The handler reads what is left of the connection: the octets
+				// that came with the head are still there if the server kept
+				// them, and gone if the buffer that read them was dropped.
+				buffer := make([]byte, 4096)
+				conn.SetReadDeadline(time.Now().Add(tailWindow))
+				n, err := conn.Read(buffer)
+				switch {
+				case n > 0:
+					seen <- "kept"
+				case err == io.EOF:
+					seen <- "dropped"
+				default:
+					seen <- "none"
+				}
+				conn.Close()
+			},
+		)
+		if err == nil {
+			break
+		}
+		if attempt == 4 {
+			return "", "", "", err
+		}
 	}
 	defer listener.Close()
 
