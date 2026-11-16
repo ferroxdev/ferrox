@@ -812,7 +812,7 @@ fn system_addresses(
         .spawn(move || {
             let result = (host.as_str(), port)
                 .to_socket_addrs()
-                .map(|addresses| addresses.collect::<Vec<_>>());
+                .map(Iterator::collect::<Vec<_>>);
             let _ = sender.send(result);
         })
         .map_err(|error| io::Error::other(format!("psiphon DNS resolver thread: {error}")))?;
