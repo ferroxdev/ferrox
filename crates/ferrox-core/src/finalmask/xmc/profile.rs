@@ -1,4 +1,6 @@
-use super::protocol::{read_boolean, read_string, read_uuid, read_varint, Packet};
+use super::protocol::{
+    read_boolean, read_string, read_uuid, read_varint, Packet, MAX_STRING_LENGTH,
+};
 use std::io;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +31,16 @@ pub fn profiles_from_config(configured: &[Profile]) -> io::Result<Vec<Profile>> 
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "incomplete profile textures",
+            ));
+        }
+        let limit = usize::try_from(MAX_STRING_LENGTH).unwrap_or(usize::MAX);
+        if profile.username.len() > limit
+            || profile.textures_value.len() > limit
+            || profile.textures_signature.len() > limit
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "profile field is longer than the protocol carries",
             ));
         }
         profiles.push(profile.clone());
@@ -108,6 +120,14 @@ mod tests {
         let mut entry = profile("SignedUser");
         entry.textures_signature.clear();
         let error = profiles_from_config(&[entry]).expect_err("incomplete");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn a_field_the_reader_would_refuse_is_rejected_before_dialing() {
+        let mut entry = profile("SignedUser");
+        entry.textures_value = "x".repeat(usize::try_from(MAX_STRING_LENGTH).expect("limit") + 1);
+        let error = profiles_from_config(&[entry]).expect_err("too long");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 

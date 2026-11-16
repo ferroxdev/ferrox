@@ -731,8 +731,19 @@ fn measure_expr(expr: &Expr, ctx: &Context) -> io::Result<usize> {
 }
 
 fn length_arg(arg: &ExprArg, ctx: &Context) -> io::Result<usize> {
+    if reads_metadata(arg) {
+        return Err(invalid("expression length depends on metadata"));
+    }
     usize::try_from(evaluate_arg(arg, ctx)?.u64()?)
         .map_err(|_| invalid("expression length too long"))
+}
+
+fn reads_metadata(arg: &ExprArg) -> bool {
+    match arg {
+        ExprArg::Metadata(_) => true,
+        ExprArg::Expr(expr) => expr.args.iter().any(reads_metadata),
+        ExprArg::Bytes(_) | ExprArg::U64(_) | ExprArg::Var(_) => false,
+    }
 }
 
 fn measure_arg(arg: &ExprArg, ctx: &Context) -> io::Result<usize> {
@@ -1053,6 +1064,27 @@ mod tests {
             ],
         };
         assert_eq!(measure_expr(&pad, &ctx).expect("measures"), 3);
+    }
+
+    #[test]
+    fn a_length_a_peer_could_measure_differently_is_refused() {
+        let ctx = Context::new(None, None, Vars::default());
+        let truncate = Expr {
+            op: "truncate".to_owned(),
+            args: vec![
+                ExprArg::Bytes(vec![1, 2, 3, 4]),
+                ExprArg::Expr(Expr {
+                    op: "add".to_owned(),
+                    args: vec![ExprArg::Metadata("local_port".to_owned()), ExprArg::U64(1)],
+                }),
+            ],
+        };
+        assert_eq!(
+            measure_expr(&truncate, &ctx)
+                .expect_err("metadata differs on each side")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

@@ -22,6 +22,13 @@ pub const KEEPALIVE_PERIOD: Duration = Duration::from_secs(15);
 const KEEPALIVE_POLL: Duration = Duration::from_millis(100);
 const KEEPALIVE_POLLS: usize = 150;
 
+fn retryable(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
+}
+
 pub struct PacketStream<R, W> {
     reader: Mutex<ReadState<R>>,
     writer: Arc<Mutex<W>>,
@@ -248,16 +255,7 @@ impl<R, W: Write> PacketStream<R, W> {
                     .map_err(|_| io::Error::other("packet stream keepalive poisoned"))? = None;
                 Ok(())
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) =>
-            {
-                Err(error)
-            }
+            Err(error) if retryable(error.kind()) => Err(error),
             Err(error) => {
                 *self
                     .pending_keepalive
@@ -279,11 +277,12 @@ impl<R, W: Write> PacketStream<R, W> {
             .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
         flush_frame(&mut *writer, &mut frame)
             .map_err(|error| io::Error::new(error.kind(), format!("flush frame: {error}")))?;
-        write_packet(&mut *writer, KEEPALIVE_PACKET, &id.to_be_bytes())
-            .map_err(|error| io::Error::other(format!("write minecraft keep-alive: {error}")))?;
-        writer
-            .flush()
-            .map_err(|error| io::Error::other(format!("flush minecraft keep-alive: {error}")))
+        write_packet(&mut *writer, KEEPALIVE_PACKET, &id.to_be_bytes()).map_err(|error| {
+            io::Error::new(error.kind(), format!("write minecraft keep-alive: {error}"))
+        })?;
+        writer.flush().map_err(|error| {
+            io::Error::new(error.kind(), format!("flush minecraft keep-alive: {error}"))
+        })
     }
 
     #[cfg(test)]
@@ -393,22 +392,13 @@ impl<R, W: Write> Write for &PacketStream<R, W> {
             write_varint(&mut frame.bytes, id)?;
             write_string(&mut frame.bytes, CHANNEL)?;
             frame.bytes.extend_from_slice(&input[written..end]);
-            let before = frame.pos;
             if let Err(error) = flush_frame(&mut *writer, &mut frame) {
-                if frame.pos == before
-                    && !matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    )
-                {
-                    frame.bytes.clear();
-                    frame.pos = 0;
-                    if written > 0 {
-                        return Ok(written);
-                    }
-                    return Err(error);
+                if retryable(error.kind()) {
+                    return Ok(end);
                 }
-                return Ok(end);
+                frame.bytes.clear();
+                frame.pos = 0;
+                return if written > 0 { Ok(written) } else { Err(error) };
             }
             written = end;
         }
@@ -531,21 +521,22 @@ fn spawn_keepalive<W: Write + Send + 'static>(
                 return;
             };
             if let Err(error) = flush_frame(&mut *writer, &mut frame) {
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) {
+                if retryable(error.kind()) {
                     continue;
                 }
                 return;
             }
             let value = id.fetch_add(1, Ordering::Relaxed) + 1;
-            if write_packet(&mut *writer, KEEPALIVE_PACKET, &value.to_be_bytes()).is_err() {
+            if let Err(error) = write_packet(&mut *writer, KEEPALIVE_PACKET, &value.to_be_bytes()) {
+                if retryable(error.kind()) {
+                    continue;
+                }
                 return;
             }
-            if writer.flush().is_err() {
+            if let Err(error) = writer.flush() {
+                if retryable(error.kind()) {
+                    continue;
+                }
                 return;
             }
         }
@@ -603,6 +594,30 @@ mod tests {
 
     fn frame(id: i32, data: &[u8]) -> Vec<u8> {
         encode_packet(id, data).expect("frame")
+    }
+
+    struct FlushTimesOut;
+
+    impl Write for FlushTimesOut {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::TimedOut.into())
+        }
+    }
+
+    #[test]
+    fn a_blocked_keepalive_keeps_its_retryable_kind() {
+        let stream = PacketStream::new(std::io::Cursor::new(Vec::<u8>::new()), FlushTimesOut, true);
+        assert_eq!(
+            stream
+                .send_keepalive(7)
+                .expect_err("flush timed out")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
     }
 
     #[test]
