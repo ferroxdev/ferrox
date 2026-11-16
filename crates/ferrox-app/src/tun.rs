@@ -537,8 +537,8 @@ fn read_limit(gso: bool, mss: usize, room: usize) -> usize {
     }
 }
 
-/// How long a queue parks on an answer that follows its own upload: an echo replies in microseconds, and past this the response thread's read is the cheaper waiter.
-const PING_PONG_SPIN: std::time::Duration = std::time::Duration::from_micros(50);
+/// How long a queue waits for an answer that follows its own upload: an echo replies in microseconds, and past this the response thread's read is the cheaper waiter.
+const PING_PONG_SPIN: std::time::Duration = std::time::Duration::from_micros(100);
 
 /// Emit one segment an upstream read already landed in `buf[body..body + n]` and whose sequence the reader reserved under its gate. The response thread and the queue's inline serve share it, so the GSO split and the bytes cannot drift apart.
 #[allow(clippy::too_many_arguments)]
@@ -1449,7 +1449,7 @@ struct Flow {
     send: Arc<SendWindow>,
     /// One close packet — `FIN` or `RST` — leaves per flow, whichever thread sees the end first.
     signaled: Arc<AtomicBool>,
-    /// The last upload's answer arrived inside the queue's spin: a ping-pong keeps the window, a bulk upload drops to one non-blocking read.
+    /// A request-and-reply is due: a flow starts armed so an echo inserts itself in the first exchange, and one answer that misses disarms it so a bulk upload pays one non-blocking read per segment and never waits.
     spin: AtomicBool,
     /// Held across one dequeue and the sequence it publishes, by whichever thread reads: the queue serving an answer and the response thread waiting on the same stream would otherwise number the two segments out of stream order.
     read_gate: Mutex<()>,
@@ -2166,7 +2166,7 @@ impl Handler {
             mss: Arc::clone(&mss),
             send: Arc::clone(&send),
             signaled: Arc::clone(&signaled),
-            spin: AtomicBool::new(false),
+            spin: AtomicBool::new(true),
             read_gate: Mutex::new(()),
             upload_finished: UploadFinished::default(),
         });
