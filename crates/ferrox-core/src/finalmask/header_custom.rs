@@ -1083,7 +1083,7 @@ mod tests {
             measure_expr(&truncate, &ctx)
                 .expect_err("metadata differs on each side")
                 .kind(),
-            io::ErrorKind::InvalidInput
+            io::ErrorKind::InvalidData
         );
     }
 
