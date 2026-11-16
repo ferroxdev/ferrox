@@ -3023,6 +3023,9 @@ pub(crate) fn hysteria_outbound_config(
     stream: Option<&Json>,
     version: u32,
 ) -> Result<ferrox_core::hysteria::Config, String> {
+    if has_tcp_mask(stream) {
+        return Err("the hysteria outbound cannot carry finalmask.tcp".to_owned());
+    }
     if version == 1 {
         return hysteria_v1_config(stream);
     }

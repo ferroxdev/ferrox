@@ -68874,6 +68874,14 @@ mod tests {
         .expect("parses");
         let out = find_hysteria_outbound(&unversioned).expect("v2 by default");
         assert_eq!(out.config.version, 2);
+        let masked = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"hysteria","settings":{"address":"127.0.0.1","port":443,"auth":"pw"},"streamSettings":{"network":"hysteria","finalmask":{"tcp":[{"type":"fragment"}]}}}]}"#,
+        )
+        .expect("parses");
+        assert!(
+            find_hysteria_outbound(&masked).is_none(),
+            "a TCP mask the direct outbound cannot carry is refused, not dialled unmasked"
+        );
     }
 
     fn hysteria_loop_with(auth: &str, id: [u8; 16], obfs: &str) -> (u16, Vec<Vec<u8>>) {
