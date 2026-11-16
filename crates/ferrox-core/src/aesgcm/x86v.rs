@@ -898,7 +898,8 @@ mod tests {
             return;
         }
         let start = u32::MAX - 3;
-        let blocks = ctr8v(_mm256_setzero_si256(), start);
+        let zero = unsafe { _mm256_setzero_si256() };
+        let blocks = ctr8v(zero, start);
         let mut lanes = [0u8; 128];
         for (i, block) in blocks.iter().enumerate() {
             unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().add(i * 32).cast(), *block) };
