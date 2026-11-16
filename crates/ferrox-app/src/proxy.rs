@@ -30786,11 +30786,10 @@ impl TcpCopy {
         }
         self.stalled = None;
         match self.dst.flush() {
-            Ok(()) => {}
             Err(error) if is_timeout(&error) || error.kind() == std::io::ErrorKind::Interrupted => {
                 return Next::Retry;
             }
-            Err(_) => {}
+            _ => {}
         }
         self.ended = true;
         let _ = self.dst.shutdown(Shutdown::Write);
