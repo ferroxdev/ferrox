@@ -62,12 +62,17 @@ func version(s string) uint16 {
 func readClientHello(cfg *tls.Config) []byte {
 	client, server := net.Pipe()
 	hs := tls.Client(client, cfg)
+	errc := make(chan error, 1)
 	go func() {
 		// Triggers the ClientHello write; the rest of the handshake never
-		// completes and the goroutine exits when the pipe is closed.
-		_, _ = hs.Write([]byte{0})
+		// completes. A failed write closes the pipe so the reader below is
+		// released with the generation error instead of blocking forever.
+		_, err := hs.Write([]byte{0})
+		if err != nil {
+			_ = client.Close()
+		}
+		errc <- err
 	}()
-	defer client.Close()
 
 	var buf []byte
 	chunk := make([]byte, 16*1024)
@@ -77,8 +82,11 @@ func readClientHello(cfg *tls.Config) []byte {
 			buf = append(buf, chunk[:n]...)
 		}
 		if err != nil {
-			if len(buf) >= 5 {
+			if len(buf) >= 5 && len(buf) >= 5+((int(buf[3])<<8)|int(buf[4])) {
 				break
+			}
+			if genErr := <-errc; genErr != nil {
+				panic(genErr)
 			}
 			panic(err)
 		}
@@ -89,6 +97,10 @@ func readClientHello(cfg *tls.Config) []byte {
 			}
 		}
 	}
+	// The hello is complete; closing the client end releases the handshake
+	// write that is still waiting for the server's reply.
+	_ = client.Close()
+	<-errc
 	// Handshake record -> body. Go sends the ClientHello in one record.
 	if buf[0] != 0x16 {
 		panic("first record is not a handshake")
@@ -123,12 +135,19 @@ func main() {
 			continue
 		}
 		parts := strings.Fields(line)
+		if len(parts) != 3 {
+			panic("bad case " + line)
+		}
 		// <colon-joined-names> <min> <max>
+		minVer, maxVer := version(parts[1]), version(parts[2])
+		if minVer > maxVer {
+			panic("min version above max: " + line)
+		}
 		cfg := &tls.Config{
 			ServerName:   "example.com",
 			CipherSuites: xrayMap(parts[0]),
-			MinVersion:   version(parts[1]),
-			MaxVersion:   version(parts[2]),
+			MinVersion:   minVer,
+			MaxVersion:   maxVer,
 		}
 		field := cipherSuitesField(readClientHello(cfg))
 		fmt.Printf("CS %s\n", hex.EncodeToString(field))

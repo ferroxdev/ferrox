@@ -207,6 +207,7 @@ func drive(fields []string) []byte {
 	kind := kindf
 	var config dnsd.Config
 	var client fakeClient
+	ttls := map[string]uint32{}
 	var dialer *fakeDialer
 	// Attributes are `key=value`; a `broken` line has none.
 	for _, attr := range fields[min(len(fields), 5):] {
@@ -270,15 +271,13 @@ func drive(fields []string) []byte {
 			if client == nil {
 				client = fakeClient{}
 			}
-			client[name] = c
+			client[strings.ToLower(name)] = c
 		case "ttl":
 			n, err := strconv.ParseUint(value, 10, 32)
 			if err != nil {
 				panic(err)
 			}
-			c := client[name]
-			c.ttl = uint32(n)
-			client[name] = c
+			ttls[strings.ToLower(name)] = uint32(n)
 		case "feed":
 			decoded, err := hex.DecodeString(value)
 			if err != nil {
@@ -299,6 +298,17 @@ func drive(fields []string) []byte {
 		default:
 			panic("unknown attr " + key)
 		}
+	}
+
+	// A record's TTL is independent of attribute order: apply it after the
+	// record the `ips` branch built, whichever attribute came first.
+	for name, ttl := range ttls {
+		c, ok := client[name]
+		if !ok {
+			continue
+		}
+		c.ttl = ttl
+		client[name] = c
 	}
 
 	var queryMsg []byte

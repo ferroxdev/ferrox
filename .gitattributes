@@ -17,6 +17,13 @@ scripts/socks5-oracle/script.txt -text
 scripts/blackhole-oracle/expected.txt -text
 scripts/blackhole-oracle/script.txt -text
 
+# Same reason, for the DNS and TLS-hello oracles: each golden is compared
+# byte for byte against the recorder's output.
+scripts/dns-oracle/expected.txt -text
+scripts/dns-oracle/script.txt -text
+scripts/hello-oracle/expected.txt -text
+scripts/hello-oracle/script.txt -text
+
 # The engine-cache key hashes this file on every runner; a converted checkout
 # would key a cache the build never wrote.
 upstream/pins.toml -text

@@ -14,6 +14,10 @@ reject  udp 6a08 www.formulate.dev.        000f
 hijack  udp 6a09 longer-formulated-name-for-a-case-well-past-the-shortest-names.example. 0001 ips=v4:203.0.113.8 ttl=3600
 // Root name: the question and both answer names pack as the root shortcut.
 hijack  udp 6a0b . 0001 ips=v4:203.0.113.8 ttl=3600
+// Attribute order and name case do not change the record: the resolver key is
+// folded and a TTL applies whether it is written before or after `ips`.
+hijack  udp 6a0c WWW.formulate.dev.        0001 ttl=120 ips=v4:203.0.113.9
+hijack  tcp 6a0d WWW.formulate.dev.        0001 ips=v4:203.0.113.9 ttl=120
 // Rules: qtype-scoped, substring and full domains, drop, tunnel rewrite.
 hijack  udp 6b01 www.formulate.dev.        0001 ips=v4:203.0.113.8 ttl=3600 rule=0001/full:www.formulate.dev/Hijack/-
 drop    udp 6b02 www.formulate.dev.        0001 rule=0001/formulate.dev/Drop/-

@@ -4,12 +4,12 @@ go 1.27
 
 require (
 	github.com/xtls/xray-core v0.0.0
-	golang.org/x/net v0.61.0
+	golang.org/x/net v0.62.0
 )
 
 require (
-	github.com/klauspost/cpuid/v2 v2.4.1 // indirect
-	github.com/pires/go-proxyproto v0.15.0 // indirect
+	github.com/klauspost/cpuid/v2 v2.4.2 // indirect
+	github.com/pires/go-proxyproto v0.16.0 // indirect
 	github.com/yuin/gopher-lua v1.1.2 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	golang.org/x/sync v0.24.0 // indirect

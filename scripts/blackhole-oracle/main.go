@@ -18,11 +18,14 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/proxy/blackhole"
 	"github.com/xtls/xray-core/transport"
@@ -81,19 +84,24 @@ func answer(config *blackhole.Config) []byte {
 	}
 	reader, writer := pipe.New(pipe.WithoutSizeLimit())
 	link := transport.Link{Reader: reader, Writer: writer}
-	ended := make(chan struct{})
+	ended := make(chan error, 1)
 	go func() {
 		// The reference's own test drives it the same way: the handler owns the
 		// link and the reader takes what it wrote.
-		_ = handler.Process(ctx, &link, nil)
-		close(ended)
+		ended <- handler.Process(ctx, &link, nil)
 	}()
 	mb, err := reader.ReadMultiBufferTimeout(wait)
 	var out []byte
 	if err == nil {
 		out = make([]byte, mb.Len())
 		mb.Copy(out)
+	} else if !errors.Is(err, buf.ErrReadTimeout) && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, io.EOF) {
+		// `none` and an empty `custom` answer write nothing and end the link;
+		// every other read error is a failed reference run, not an answer.
+		panic(err)
 	}
-	<-ended
+	if err := <-ended; err != nil {
+		panic(err)
+	}
 	return out
 }
