@@ -1030,7 +1030,10 @@ mod tests {
             ("httpMethod".to_owned(), Json::Str(" ".to_owned())),
         ]))
         .expect("parses");
-        let targets = vec![("proxy".to_owned(), Outbound::Freedom(Arc::default()))];
+        let targets = vec![(
+            "proxy".to_owned(),
+            ProbeTarget::plain(Outbound::Freedom(Arc::default())),
+        )];
         let observatory = Observatory {
             snapshot: Mutex::new(Arc::from(Vec::new())),
         };
@@ -1135,7 +1138,7 @@ mod tests {
         });
         let url = format!("http://127.0.0.1:{port}/generate_204");
         let delay = probe(
-            &Outbound::Freedom(Arc::default()),
+            &ProbeTarget::plain(Outbound::Freedom(Arc::default())),
             &url,
             "GET",
             Duration::from_secs(5),

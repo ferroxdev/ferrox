@@ -7889,7 +7889,7 @@ fn tunnel_stream_with(
     timeout: Duration,
     front: Front,
     name: &str,
-    settings: Option<ProbeTarget>,
+    settings: Option<&ProbeTarget>,
 ) -> Option<Connection> {
     let listener = std::net::TcpListener::bind(SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -7906,12 +7906,10 @@ fn tunnel_stream_with(
         .name(name.to_owned())
         .spawn({
             let out = out.clone();
-            let source = settings.as_ref().and_then(|settings| settings.source);
-            let sockopts = settings
-                .as_ref()
-                .and_then(|settings| settings.sockopts.clone());
-            let strategy = settings.as_ref().and_then(|settings| settings.strategy);
-            let tag = settings.as_ref().and_then(|settings| settings.tag.clone());
+            let source = settings.and_then(|settings| settings.source);
+            let sockopts = settings.and_then(|settings| settings.sockopts.clone());
+            let strategy = settings.and_then(|settings| settings.strategy);
+            let tag = settings.and_then(|settings| settings.tag.clone());
             move || {
                 let _source = SendThroughGuard::enter(source);
                 let _sockopts = DialSockoptsGuard::enter(sockopts);
@@ -7961,7 +7959,7 @@ impl ProbeTarget {
             timeout,
             Front::Probe,
             "ferrox-probe",
-            Some(self.clone()),
+            Some(self),
         )
     }
 }
