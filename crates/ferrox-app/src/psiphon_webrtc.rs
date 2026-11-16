@@ -1294,22 +1294,19 @@ impl Read for WebRtcStream {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
             }
             if let Some(error) = lock(&self.failure).as_ref().cloned() {
-                loop {
-                    match input.try_recv() {
-                        Ok(Ok(data)) => {
+                match input.try_recv() {
+                    Ok(Ok(data)) => {
+                        pending.0 = data;
+                        pending.1 = 0;
+                    }
+                    Ok(Err(error)) => {
+                        return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
+                    }
+                    Err(_) => {
+                        if let Some(data) = lock(&self.terminal).pop_front() {
                             pending.0 = data;
                             pending.1 = 0;
-                            break;
-                        }
-                        Ok(Err(error)) => {
-                            return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
-                        }
-                        Err(_) => {
-                            if let Some(data) = lock(&self.terminal).pop_front() {
-                                pending.0 = data;
-                                pending.1 = 0;
-                                break;
-                            }
+                        } else {
                             return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
                         }
                     }
