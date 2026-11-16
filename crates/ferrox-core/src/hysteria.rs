@@ -1315,8 +1315,8 @@ mod tests {
         let mut body = Vec::new();
         encode_tcp_request_body("127.0.0.1:8080", &[0xAB; 3], &mut body);
         assert_eq!(
-            body,
-            want[2..],
+            &body[..],
+            &want[2..],
             "a stream that carries its own frame type hands the body after it"
         );
         assert_eq!(decode_tcp_request(&out), Ok(("127.0.0.1:8080", out.len())));
