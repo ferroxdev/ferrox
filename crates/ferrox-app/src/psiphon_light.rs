@@ -183,8 +183,7 @@ impl Client {
         let _ = session.get_ref().set_write_timeout(Some(IO_TIMEOUT));
 
         let header = self.header(connection, &destination, tcp_duration, tls_duration)?;
-        let shutdown = session.get_ref().try_clone().ok();
-        let stream = LightStream::new(session, header).with_shutdown(shutdown);
+        let stream = LightStream::new(session, header);
         let local = loopback(stream, self.config.dial_timeout)?;
         *lock(&self.replay) = Some(sni);
         let _ = ipv6;
@@ -630,7 +629,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// The loopback side of a light connection: a local socket the direct relay
 /// already knows how to copy, so no new flow kind is needed.
-fn loopback<T: Read + Write + ShutdownWrite + Send + 'static>(
+fn loopback<T: Read + Write + Queued + Send + 'static>(
     stream: T,
     timeout: Duration,
 ) -> Result<TcpStream, String> {
@@ -663,30 +662,19 @@ fn loopback<T: Read + Write + ShutdownWrite + Send + 'static>(
     Ok(local)
 }
 
-/// A relay stream that can pass an upload EOF to the proxy without closing reads.
-trait ShutdownWrite {
-    /// Half-close the proxy-facing write side.
-    fn shutdown_write(&mut self);
-    /// The number of framed bytes not yet handed to the TLS writer.
+/// A relay stream that can report framed bytes not yet handed to the TLS writer.
+trait Queued {
     fn queued(&self) -> usize;
 }
 
-impl<T> ShutdownWrite for LightStream<T> {
-    /// Half-close the proxy-facing write side.
-    fn shutdown_write(&mut self) {
-        if let Some(shutdown) = self.shutdown.as_ref() {
-            let _ = shutdown.shutdown(std::net::Shutdown::Write);
-        }
-    }
-
-    /// The number of framed bytes not yet handed to the TLS writer.
+impl<T> Queued for LightStream<T> {
     fn queued(&self) -> usize {
         self.pending_len()
     }
 }
 
 /// Service both directions over one framed TLS stream, keeping partial writes.
-fn relay<T: Read + Write + ShutdownWrite>(mut stream: T, mut peer: TcpStream) {
+fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
     let _ = peer.set_nodelay(true);
     let _ = peer.set_read_timeout(Some(POLL));
     let _ = peer.set_write_timeout(Some(POLL));
@@ -695,7 +683,6 @@ fn relay<T: Read + Write + ShutdownWrite>(mut stream: T, mut peer: TcpStream) {
     let mut down_at = 0usize;
     let mut down_len = 0usize;
     let mut peer_eof = false;
-    let mut upload_eof = false;
     let mut stream_eof = false;
     loop {
         if down_at < down_len {
@@ -716,16 +703,11 @@ fn relay<T: Read + Write + ShutdownWrite>(mut stream: T, mut peer: TcpStream) {
             Err(_) => return,
         }
         let upload_blocked = stream.queued() > 0;
-        if upload_eof && !upload_blocked {
-            stream.shutdown_write();
-            upload_eof = false;
-        }
         let peer_state = if peer_eof { None } else { ready(&peer) };
         if !upload_blocked && peer_state.is_some() {
             match peer.read(&mut up) {
                 Ok(0) => {
                     peer_eof = true;
-                    upload_eof = true;
                 }
                 Ok(count) => {
                     if stream.write_all(&up[..count]).is_err() {
@@ -783,7 +765,6 @@ pub(crate) struct LightStream<T> {
     payload: std::ops::Range<usize>,
     pending: Vec<u8>,
     pending_at: usize,
-    shutdown: Option<TcpStream>,
 }
 
 impl<T> LightStream<T> {
@@ -799,14 +780,7 @@ impl<T> LightStream<T> {
             payload: 0..0,
             pending: header,
             pending_at: 0,
-            shutdown: None,
         }
-    }
-
-    /// Keep a transport clone so an upload EOF can half-close the proxy socket.
-    fn with_shutdown(mut self, shutdown: Option<TcpStream>) -> Self {
-        self.shutdown = shutdown;
-        self
     }
 
     /// The number of framed bytes not yet handed to the TLS writer.
