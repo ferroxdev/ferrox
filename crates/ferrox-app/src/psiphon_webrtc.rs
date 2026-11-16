@@ -1511,7 +1511,6 @@ fn drive(
                         let decoy = lock(shaping).decoy(MAX_DATAGRAM);
                         if let Some(message) = decoy {
                             if let Err(error) = webrtc.send(&message) {
-                                backlog.clear();
                                 backlog.push_back(Err(error));
                             }
                         }
