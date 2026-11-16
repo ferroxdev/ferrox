@@ -1680,12 +1680,24 @@ fn client_config(spec: &ClientSpec) -> Result<quiche::Config, String> {
     Ok(config)
 }
 
+/// The controller a MASQUE lane runs: the stream's choice, else the reference's BBR default.
+fn masque_controller(
+    params: Option<&ferrox_core::hysteria::QuicParams>,
+) -> Option<ferrox_core::hysteria::Congestion> {
+    quic::lane_controller(params.and_then(|params| params.cc), true)
+}
+
 /// The stream's `quicParams` when it names one; a `finalmask.udp` chain rides
 /// outside the QUIC payload, as the reference's wrapped packet conn does.
 fn apply_spec_quic(config: &mut quiche::Config, spec: &ClientSpec) {
     if let Some(params) = spec.quic {
         quic::apply_hysteria_quic(config, &params, false);
     }
+    let _ = quic::apply_lane_congestion(
+        config,
+        masque_controller(spec.quic.as_ref()),
+        spec.quic.as_ref(),
+    );
 }
 
 /// The WARP TLS handshake: the client presents the certificate minted from the
@@ -2596,6 +2608,11 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     if let Some(params) = spec.quic {
         quic::apply_hysteria_quic(&mut config, &params, true);
     }
+    let _ = quic::apply_lane_congestion(
+        &mut config,
+        masque_controller(spec.quic.as_ref()),
+        spec.quic.as_ref(),
+    );
     let tcp = identity
         .alpn
         .iter()
@@ -4303,6 +4320,19 @@ fn peer_key(addrs: &[IpAddr]) -> [u8; 32] {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn a_masque_lane_without_params_runs_the_references_bbr() {
+        use ferrox_core::hysteria::{Congestion, QuicParams};
+        assert_eq!(masque_controller(None), Some(Congestion::Bbr));
+        let empty = QuicParams::default();
+        assert_eq!(masque_controller(Some(&empty)), Some(Congestion::Bbr));
+        let reno = QuicParams {
+            cc: Some(Congestion::Reno),
+            ..QuicParams::default()
+        };
+        assert_eq!(masque_controller(Some(&reno)), Some(Congestion::Reno));
+    }
 
     #[test]
     fn the_tunnel_queue_is_bounded() {

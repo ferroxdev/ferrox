@@ -149,6 +149,7 @@ fn dial(
         upstream: None,
         roots: None,
         ech_config_list: None,
+        default_cc: Some(ferrox_core::hysteria::Congestion::Bbr),
     };
     (dial, quic_dial)
 }
@@ -525,6 +526,7 @@ fn the_quic_lane_reaches_the_edge_over_udp_or_says_why_not() {
         upstream: None,
         roots: None,
         ech_config_list: None,
+        default_cc: Some(ferrox_core::hysteria::Congestion::Bbr),
     };
     // The same authority over TCP, so a failure names the protocol, not the address.
     let peer = format!("{}:{}", edge.host, edge.port)

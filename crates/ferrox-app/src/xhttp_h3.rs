@@ -974,7 +974,7 @@ impl H3Client {
         server_name: &str,
         tls: &ferrox_core::tls::TlsConfig,
     ) -> Option<Arc<Self>> {
-        Self::connect_tuned(peer, server_name, tls, None, false)
+        Self::connect_tuned(peer, server_name, tls, None, true)
     }
 
     pub(crate) fn connect_tuned(
@@ -1001,12 +1001,8 @@ impl H3Client {
             }
             quic::apply_hysteria_quic(&mut config, params, false);
         }
-        let cc = quic_params
-            .and_then(|params| params.cc)
-            .or(default_bbr.then_some(ferrox_core::hysteria::Congestion::Bbr));
-        if let Some(cc) = cc {
-            config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
-        }
+        let cc = quic::lane_controller(quic_params.and_then(|params| params.cc), default_bbr);
+        quic::apply_lane_congestion(&mut config, cc, quic_params)?;
         let sock = if peer.is_ipv6() {
             UdpSocket::bind("[::]:0").ok()?
         } else {

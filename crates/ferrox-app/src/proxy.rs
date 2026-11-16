@@ -13530,6 +13530,7 @@ fn vmess_quic_dial(vmess: &VmessOut) -> crate::quic::QuicDial {
         upstream: None,
         roots: vmess.quic_roots.clone(),
         ech_config_list: vmess.quic_ech.clone(),
+        default_cc: None,
     }
 }
 
@@ -16438,6 +16439,7 @@ fn vless_quic_dial(vless: &VlessOut) -> crate::quic::QuicDial {
         upstream: None,
         roots: vless.quic_roots.clone(),
         ech_config_list: vless.quic_ech.clone(),
+        default_cc: None,
     }
 }
 
@@ -17342,6 +17344,7 @@ fn trojan_quic_dial(trojan: &TrojanOut) -> crate::quic::QuicDial {
         upstream: None,
         roots: trojan.quic_roots.clone(),
         ech_config_list: trojan.quic_ech.clone(),
+        default_cc: None,
     }
 }
 
@@ -30121,6 +30124,7 @@ fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate:
         upstream: foxy.upstream.clone(),
         roots: Some(foxy.roots.clone()),
         ech_config_list: None,
+        default_cc: Some(ferrox_core::hysteria::Congestion::Bbr),
     }
 }
 
@@ -65188,6 +65192,7 @@ mod tests {
             "localhost",
             roots,
             None,
+            None,
             QUIC_TEST_TIMEOUT,
             None,
         )
@@ -65225,6 +65230,7 @@ mod tests {
             local,
             "localhost",
             roots,
+            None,
             None,
             QUIC_TEST_TIMEOUT,
             None,
@@ -65336,6 +65342,7 @@ mod tests {
             "localhost",
             &roots,
             None,
+            None,
             QUIC_TEST_TIMEOUT,
             None,
         )
@@ -65401,6 +65408,7 @@ mod tests {
             local,
             "localhost",
             &roots,
+            None,
             None,
             QUIC_TEST_TIMEOUT,
             None,
@@ -65689,6 +65697,7 @@ mod tests {
             "localhost",
             &roots,
             None,
+            None,
             QUIC_TEST_TIMEOUT,
             None,
         )
@@ -65746,6 +65755,7 @@ mod tests {
             local,
             "localhost",
             &roots,
+            None,
             None,
             QUIC_TEST_TIMEOUT,
             None,
@@ -67613,6 +67623,7 @@ mod tests {
             upstream: None,
             roots: Some(roots.into()),
             ech_config_list: None,
+            default_cc: None,
         };
         let relay = thread::spawn({
             let dial = dial.clone();
@@ -67707,6 +67718,7 @@ mod tests {
             upstream: None,
             roots: Some(roots.into()),
             ech_config_list: None,
+            default_cc: None,
         };
         let front = Arc::new(crate::conn::test_bind("127.0.0.1:0").expect("binds"));
         let front_port = front.local_addr().expect("addr").port();

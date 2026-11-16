@@ -19,6 +19,7 @@ pub const UDP_HEADER: &str = "hysteria-udp";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Congestion {
     Reno,
+    Cubic,
     Bbr,
     Brutal,
 }
@@ -28,6 +29,7 @@ impl Congestion {
     pub fn parse(text: &str) -> Self {
         match text {
             "reno" => Self::Reno,
+            "cubic" => Self::Cubic,
             "brutal" | "force-brutal" => Self::Brutal,
             _ => Self::Bbr,
         }
@@ -37,6 +39,8 @@ impl Congestion {
     pub fn quiche_name(self) -> &'static str {
         match self {
             Self::Reno => "reno",
+            Self::Cubic => "cubic",
+            // quiche names its only BBR "bbr": it is the gcongestion BBR2, and the profile's knobs are its own.
             Self::Bbr | Self::Brutal => "bbr",
         }
     }
@@ -1739,12 +1743,14 @@ mod tests {
     #[test]
     fn congestion_spellings_map_to_the_paced_default() {
         assert_eq!(Congestion::parse("reno"), Congestion::Reno);
+        assert_eq!(Congestion::parse("cubic"), Congestion::Cubic);
         assert_eq!(Congestion::parse("bbr"), Congestion::Bbr);
         assert_eq!(Congestion::parse("brutal"), Congestion::Brutal);
         assert_eq!(Congestion::parse("force-brutal"), Congestion::Brutal);
         assert_eq!(Congestion::parse(""), Congestion::Bbr);
-        assert_eq!(Congestion::parse("cubic"), Congestion::Bbr);
+        assert_eq!(Congestion::parse("no-such-controller"), Congestion::Bbr);
         assert_eq!(Congestion::Reno.quiche_name(), "reno");
+        assert_eq!(Congestion::Cubic.quiche_name(), "cubic");
         assert_eq!(Congestion::Bbr.quiche_name(), "bbr");
         assert_eq!(Congestion::Brutal.quiche_name(), "bbr");
     }

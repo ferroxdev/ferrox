@@ -2744,6 +2744,7 @@ pub(crate) fn hysteria_quic_params(
     let cc = match congestion_text.as_str() {
         "" | "brutal" => Some(Congestion::Brutal),
         "reno" => Some(Congestion::Reno),
+        "cubic" => Some(Congestion::Cubic),
         "bbr" => Some(Congestion::Bbr),
         "force-brutal" => {
             if up == 0 {
@@ -2753,7 +2754,7 @@ pub(crate) fn hysteria_quic_params(
         }
         _ => {
             return Err(format!(
-                "unknown congestion control: {congestion_text}, valid values: reno, bbr, brutal, force-brutal"
+                "unknown congestion control: {congestion_text}, valid values: reno, cubic, bbr, brutal, force-brutal"
             ))
         }
     };

@@ -576,7 +576,12 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         peer = crate::hysteria_realm::dial_peer(&sock, realm)?;
     }
     let cid = crate::quic::hysteria_client_cid(dial.config.quic.as_ref())?;
-    let mut config = crate::quic::quiche_config(roots, Some(dial.config.cc.quiche_name()))?;
+    let mut config = crate::quic::quiche_config(roots, None)?;
+    crate::quic::apply_lane_congestion(
+        &mut config,
+        Some(dial.config.cc),
+        dial.config.quic.as_ref(),
+    )?;
     if let Some(params) = &dial.config.quic {
         crate::quic::apply_hysteria_quic(&mut config, params, false);
         crate::quic::apply_hysteria_pacing(&mut config, params);
@@ -1292,7 +1297,7 @@ pub(crate) fn server_config(
 ) -> Option<quiche::Config> {
     let mut config = crate::quic::tls_config(identity)?;
     config.set_application_protos(&[crate::quic::ALPN]).ok()?;
-    config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
+    crate::quic::apply_lane_congestion(&mut config, Some(cc), quic)?;
     // A bulk download starts at 400 packets: quiche's ten leaves the first window smaller than one flow's first read, and BBR then paces every ACK.
     config.set_initial_congestion_window_packets(400);
     // A served connection always carries an auth validator, and the reference enables the datagram lane exactly when one is present, so the lane is on unconditionally here; the depths are the peer's unsent-datagram queue, matching `udpMessageChanSize`.

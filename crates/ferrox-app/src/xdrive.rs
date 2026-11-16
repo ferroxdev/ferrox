@@ -674,6 +674,7 @@ fn quic_of(
     let cc = match text("congestion").as_str() {
         "" | "bbr" => Some(Congestion::Bbr),
         "reno" => Some(Congestion::Reno),
+        "cubic" => Some(Congestion::Cubic),
         "brutal" | "force-brutal" => Some(Congestion::Brutal),
         other => return Err(format!("unsupported congestion control over h3: {other}")),
     };
@@ -5935,6 +5936,8 @@ fn share_key(settings: &Settings, front: Option<(&str, u16)>) -> String {
         });
     }
     joined.push(settings.template_text());
+    // The controller and its profile are read per lane, so a store opened under one choice cannot serve another.
+    joined.push(format!("{:?}", settings.quic));
     let digest = sha2::Sha256::digest(joined.join("\0").as_bytes());
     let mut hex = String::with_capacity(64);
     for byte in digest {
@@ -7917,6 +7920,36 @@ mod tests {
             "and a template whose list names no capture group, because there would be nothing to read back"
         );
     }
+    /// A lane's controller and profile are part of the store's identity: two configs that differ only in `quicParams` may not share one.
+    #[test]
+    fn a_store_names_the_lane_controller_it_opened_under() {
+        let mut bbr = templated(SIDES, 9);
+        bbr.quic = Some(ferrox_core::hysteria::QuicParams {
+            cc: Some(ferrox_core::hysteria::Congestion::Bbr),
+            ..Default::default()
+        });
+        let mut cubic = bbr.clone();
+        cubic.quic = Some(ferrox_core::hysteria::QuicParams {
+            cc: Some(ferrox_core::hysteria::Congestion::Cubic),
+            ..Default::default()
+        });
+        assert_ne!(
+            share_key(&bbr, None),
+            share_key(&cubic, None),
+            "a different controller is a different store"
+        );
+        assert_ne!(
+            share_key(&bbr, None),
+            share_key(&templated(SIDES, 9), None),
+            "and so is a lane that named none"
+        );
+        assert_eq!(
+            share_key(&bbr, None),
+            share_key(&bbr.clone(), None),
+            "the same choice reuses itself"
+        );
+    }
+
     /// An S3 store aimed at the fake origin, with the two secrets the reference's minimum asks for.
     fn s3_over(fake: &Fake, bucket: &str) -> Settings {
         Settings {

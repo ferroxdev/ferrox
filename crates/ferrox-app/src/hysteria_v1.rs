@@ -72,8 +72,12 @@ fn connect(dial: &Dial) -> Option<Session> {
     let roots = dial.roots.as_deref().unwrap_or(&[]);
     let (sock, peer, local) = crate::quic::udp_to_server(&dial.address, dial.port)?;
     let cid = crate::quic::hysteria_client_cid(dial.config.quic.as_ref())?;
-    let mut config =
-        crate::quic::quiche_config_alpn(roots, Some(dial.config.cc.quiche_name()), &[wire::ALPN])?;
+    let mut config = crate::quic::quiche_config_alpn(roots, None, &[wire::ALPN])?;
+    crate::quic::apply_lane_congestion(
+        &mut config,
+        Some(dial.config.cc),
+        dial.config.quic.as_ref(),
+    )?;
     if let Some(params) = &dial.config.quic {
         crate::quic::apply_hysteria_quic(&mut config, params, false);
     }
@@ -220,6 +224,8 @@ struct Server {
     auth: String,
     obfs: String,
     hop: Option<ferrox_core::hysteria::Hop>,
+    /// A tuned QUIC lane is its own connection: its windows, controller profile and Brutal rates were negotiated, so a dial with another block may not ride it.
+    quic: Option<ferrox_core::hysteria::QuicParams>,
     roots: Option<ferrox_core::tls::Anchors>,
 }
 
@@ -240,6 +246,7 @@ fn server_of(dial: &Dial) -> Server {
         auth: dial.config.auth.clone(),
         obfs: dial.config.obfs_password.clone(),
         hop: dial.config.hop.clone(),
+        quic: dial.config.quic,
         roots: dial.roots.clone(),
     }
 }
@@ -535,7 +542,7 @@ fn server_config(
 ) -> Option<quiche::Config> {
     let mut config = crate::quic::tls_config(identity)?;
     config.set_application_protos(&[wire::ALPN]).ok()?;
-    config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
+    crate::quic::apply_lane_congestion(&mut config, Some(cc), quic)?;
     config.enable_dgram(true, 1024, 1024);
     config.set_max_idle_timeout(30_000);
     config.set_initial_max_data(20 * 1024 * 1024);
@@ -1216,6 +1223,46 @@ mod tests {
                 .0
                 .port,
             80
+        );
+    }
+
+    #[test]
+    fn a_v1_tuned_plan_is_its_own_pool_key() {
+        // A controller or profile chosen for one lane may not ride a connection negotiated under another.
+        let dial = |quic: Option<ferrox_core::hysteria::QuicParams>| Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port: 443,
+            config: ferrox_core::hysteria::Config {
+                version: 1,
+                auth: "a".to_owned(),
+                quic,
+                ..ferrox_core::hysteria::Config::default()
+            },
+            roots: None,
+        };
+        let bbr = ferrox_core::hysteria::QuicParams {
+            bbr_profile: ferrox_core::hysteria::BbrProfile::Aggressive,
+            ..ferrox_core::hysteria::QuicParams::default()
+        };
+        let cubic = ferrox_core::hysteria::QuicParams {
+            cc: Some(ferrox_core::hysteria::Congestion::Cubic),
+            ..ferrox_core::hysteria::QuicParams::default()
+        };
+        assert_eq!(
+            server_of(&dial(Some(bbr))),
+            server_of(&dial(Some(bbr))),
+            "a tuned lane reuses itself"
+        );
+        assert_ne!(
+            server_of(&dial(Some(bbr))),
+            server_of(&dial(Some(cubic))),
+            "a different profile or controller is a different lane"
+        );
+        assert_ne!(
+            server_of(&dial(None)),
+            server_of(&dial(Some(cubic))),
+            "a tuned lane never rides a plain connection"
         );
     }
 
