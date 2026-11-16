@@ -7,7 +7,7 @@
 # against 13 on duplex-8. Duplex-8's server CPU leg reads 1.11x and 1.13x on the cbb2f8a1 runs
 # against 0.58x on 83d7235f, the two cells landing on different hosts, so it is filed here rather
 # than as a reproducible cost gap.
-# Full-tier run 43959483247 (5fab2713) cleared up-1 (client 1.21x, server 1.02x), so its line is gone.
+# Full-tier run 43968769974 (59e18793) cleared up-1 (client 1.24x, server 1.03x), so its line is gone.
 masque-down-8|server|0.15|861
 # The WARP server leg's xray client is bimodal on arm: 69/74/74/75/192 MiB/s in run 43155796255 and
 # 74/189/190/192/194 in run 43127254767, against a ferrox server that held 208-213. The writer's own
