@@ -213,7 +213,7 @@ impl WireGuardOut {
         Self::with_dns_port(config, DNS_PORT)
     }
 
-    /// Build the outbound and shape its WireGuard handshake with `noise`.
+    /// Build the outbound and shape its `WireGuard` handshake with `noise`.
     pub(crate) fn with_noise(
         config: DeviceConfig,
         noise: crate::noize::WireGuardNoize,

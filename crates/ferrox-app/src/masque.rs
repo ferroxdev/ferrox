@@ -1202,6 +1202,7 @@ impl std::fmt::Debug for ClientSpec {
             .field("mtu", &self.mtu)
             .field("mtu_named", &self.mtu_named)
             .field("max_datagram", &self.max_datagram)
+            .field("noize", &self.noize)
             .finish()
     }
 }

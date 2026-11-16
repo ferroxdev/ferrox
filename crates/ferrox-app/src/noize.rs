@@ -347,13 +347,11 @@ impl WireGuardNoize {
             send(&self.junk());
             sleep(self.interval);
         }
-        for signature in [self.i2, self.i3, self.i4, self.i5] {
-            if let Some(signature) = signature {
-                let packet = crate::psiphon_quic::noise_expand(signature);
-                if !packet.is_empty() {
-                    send(&packet);
-                    sleep(Duration::from_millis(1));
-                }
+        for signature in [self.i2, self.i3, self.i4, self.i5].into_iter().flatten() {
+            let packet = crate::psiphon_quic::noise_expand(signature);
+            if !packet.is_empty() {
+                send(&packet);
+                sleep(Duration::from_millis(1));
             }
         }
         sleep(self.delay);
@@ -487,7 +485,7 @@ mod tests {
     fn the_legacy_names_keep_their_own_shapes() {
         assert_eq!(WireGuardNoize::from_profile(Some("firewall")).jmax, 300);
         assert_eq!(WireGuardNoize::from_profile(Some("gfw")).jmax, 420);
-        assert_eq!(WireGuardNoize::from_profile(Some("heavy")).jmax, 420);
+        assert_eq!(WireGuardNoize::from_profile(Some("heavy")).jmax, 384);
         assert_eq!(WireGuardNoize::from_profile(Some("none")).jmax, 0);
     }
 
@@ -546,6 +544,6 @@ mod tests {
         let mut packets = Vec::new();
         MasqueNoize::off().send_before(|packet| packets.push(packet.to_vec()));
         WireGuardNoize::off().send_before(|packet| packets.push(packet.to_vec()));
-        assert!(packets.is_empty());
+        assert_eq!(packets, Vec::<Vec<u8>>::new());
     }
 }

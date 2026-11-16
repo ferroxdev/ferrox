@@ -3219,6 +3219,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// The `warp-register` command: with `--register` make the identities a kind
 /// names and print where they are; without it, register once and print the
 /// outbound that references the saved combined identity.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage: fn() -> !) {
     let mut base = String::from("warp-identity.json");
     let mut mode = String::from("auto");
