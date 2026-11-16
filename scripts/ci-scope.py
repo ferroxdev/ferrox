@@ -72,13 +72,23 @@ PAGE_KEYED = ("scripts/method-counts.txt", "scripts/method-ops.txt")
 # segment is the item whose count is blessed, and a page claiming that item name
 # claims the row.
 SYMBOL_KEYED = ("scripts/expected-ops.txt",)
+ROOT_RUST_CONFIG = {
+    "Cargo.toml", "Cargo.lock", "rustfmt.toml", "clippy.toml",
+    "rust-toolchain.toml", "rust-toolchain", "build.rs",
+}
+SHARED_SUFFIXES = (".rs", ".toml", ".yml", ".yaml", ".json", ".sh", ".py")
 
 # The header of a Rust item, as far up as a hunk has to read to know what it
 # changed. `impl` is its own case: the name worth claiming is the type.
 ITEM_KIND = r"(?:const|static|async\s+fn|fn|struct|enum|trait|type|mod)"
 ITEM_HEAD = re.compile(rf"^(\s*)(?:pub(?:\([a-z]+\))?\s+)?(?:unsafe\s+)?{ITEM_KIND}\s+([A-Za-z0-9_]+)")
-IMPL_HEAD = re.compile(r"^(\s*)(?:pub(?:\([a-z]+\))?\s+)?(?:unsafe\s+)?impl"
-                       r"(?:\s*<[^<>]*>)?\s+([A-Za-z0-9_]+)")
+IMPL_HEAD = re.compile(
+    r"^(\s*)(?:pub(?:\([a-z]+\))?\s+)?(?:unsafe\s+)?impl"
+    r"(?:\s*<[^<>]*>)?\s+"
+    r"(?:(?:[A-Za-z_][A-Za-z0-9_:]*(?:\s*<[^<>]*>)?)\s+for\s+)?"
+    r"(?:&\s*(?:'\w+\s*)?)?(?:mut\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+)
 
 
 def item_at(lines: list[str], number: int) -> str | None:
@@ -376,9 +386,9 @@ def classify(changed: list[str], scopes: dict[str, dict[str, list[str]]],
         if path.startswith(("dist/", "crates/ferrox-app/")) \
                 or path == "scripts/check-share-links.py":
             links = True
-        if path.endswith((".rs", ".toml")) and path.startswith("crates/"):
-            rust = True
-        elif path in ("Cargo.toml", "Cargo.lock"):
+        if path.endswith(".rs") or path in ROOT_RUST_CONFIG \
+                or path.startswith(".cargo/") \
+                or (path.endswith(".toml") and path.startswith("crates/")):
             rust = True
         page = re.match(r"^docs/function/([A-Za-z0-9_.-]+)\.md$", path)
         if page and page.group(1) in scopes:
@@ -411,8 +421,9 @@ def classify(changed: list[str], scopes: dict[str, dict[str, list[str]]],
                     else f"{path} changes rows or items no method page claims")
             unclaimed.add(path)
             continue
-        if path.startswith(("scripts/", ".github/", "upstream/", "crates/")) \
-                or path in ("Cargo.toml", "Cargo.lock"):
+        if path.startswith(("scripts/", ".github/", "upstream/", "crates/", ".cargo/")) \
+                or path in ROOT_RUST_CONFIG \
+                or path.endswith(SHARED_SUFFIXES):
             shared = shared or f"{path} is shared infrastructure"
             continue
     wide = bool(unclaimed) or bool(shared)
@@ -524,12 +535,14 @@ def build_plan(root: str, changed: list[str], hunks: dict | None = None,
 
 def changed_from(root: str, base: str) -> tuple[list[str], dict, dict]:
     """The changed paths, hunks and changed lines between one base and HEAD."""
-    out = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"],
+    out = subprocess.run(["git", "-c", "core.quotePath=false", "diff",
+                          "--name-only", f"{base}...HEAD"],
                          capture_output=True, text=True, cwd=root)
     if out.returncode != 0:
         sys.exit(f"ci-scope: git diff against {base} failed: {out.stderr.strip()}")
     paths = [line for line in out.stdout.splitlines() if line.strip()]
-    detail = subprocess.run(["git", "diff", "-U0", "--no-color", f"{base}...HEAD"],
+    detail = subprocess.run(["git", "-c", "core.quotePath=false", "diff",
+                             "-U0", "--no-color", f"{base}...HEAD"],
                             capture_output=True, text=True, cwd=root)
     if detail.returncode != 0:
         sys.exit(f"ci-scope: git diff -U0 against {base} failed: "
@@ -850,6 +863,7 @@ FIXTURES = [
     ("nothing a page owns", ["crates/ferrox-app/src/proxy.rs"], True, None),
     ("shared infrastructure", ["scripts/count-ops.sh"], True, None),
     ("a dependency move", ["Cargo.lock"], True, None),
+    ("a root rust config", ["rustfmt.toml"], True, None),
     ("the prompt tool", ["crates/ferrox-prompt/src/check.rs"], False, []),
     ("the bench harness", ["crates/ferrox-bench/src/methods.rs"], False, []),
     ("an empty change list", [], True, None),
@@ -912,6 +926,9 @@ mod tests {
         assert_eq!(pump, 1);
     }
 }
+impl Read for Wire {
+    fn read(&mut self) {}
+}
 """
 
 
@@ -935,6 +952,11 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         ok = plan["rust"] is False and plan["wide"] is False
         failed += 0 if ok else 1
         print(f"selftest: {'ok  ' if ok else 'FAIL'} {label} -> rust={plan['rust']}")
+    plan = classify(["rustfmt.toml"], scopes)
+    ok = plan["rust"] is True and plan["wide"] is True
+    failed += 0 if ok else 1
+    print(f"selftest: {'ok  ' if ok else 'FAIL'} a root rust config owes the compiler "
+          f"-> rust={plan['rust']} wide={plan['wide']}")
     for label, changed, names, want_wide, want_methods in ATTRIBUTED:
         plan = classify(changed, scopes, names)
         ok = plan["wide"] == want_wide and (want_methods is None
@@ -949,6 +971,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         ("a hunk in a body names its item", 6, "dial_vmess_rung"),
         ("a hunk between two items names nothing", 3, None),
         ("a hunk on a mod line names the mod", 4, "tests"),
+        ("a hunk on an impl names the type", 10, "Wire"),
     ]:
         got = item_at(sides, number)
         ok = got == want

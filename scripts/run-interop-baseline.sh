@@ -116,11 +116,27 @@ for name in zeronet xray-rust; do
   set -e
   rm -rf "$dir"
   ran="$(sed -n 's/^running \([0-9][0-9]*\) tests\{0,1\}$/\1/p' "$log" | head -1)"; ran="${ran:-0}"
-  passed="$(grep -c '^test .* \.\.\. ok$' "$log" || true)"; passed="${passed:-0}"
-  failed="$(grep -c '^test .* \.\.\. FAILED$' "$log" || true)"; failed="${failed:-0}"
+  # The oracle can split a per-test `... ok`; the summary line is printed once and cannot split.
+  passed="$(sed -n 's/^test result:.* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | tail -1)"; passed="${passed:-0}"
+  failed="$(sed -n 's/^test result:.* \([0-9][0-9]*\) failed;.*/\1/p' "$log" | tail -1)"; failed="${failed:-0}"
   completed="$(grep -c '^test result:' "$log" || true)"; completed="${completed:-0}"
+  all_names="$(grep -E '^test .* \.\.\. ' "$log" | sed -E 's/^test (.*) \.\.\..*/\1/' | sort -u)"
+  failed_names="$(awk '
+    /^failures:$/ { section = 1; next }
+    /^---- / { section = 0; next }
+    section && /^    [^ ]/ { print $1; next }
+    /^test result:/ { section = 0 }
+  ' "$log" | sort -u)"
+  passed_names="$(comm -23 \
+    <(printf '%s\n' "$all_names" | sed '/^$/d') \
+    <(printf '%s\n' "$failed_names" | sed '/^$/d'))"
   if ((test_rc != 0)) && ((completed == 0)); then
     echo "::error::$name suite never reached a test result (exit $test_rc); a build or startup failure is not a recorded baseline"
+    tail -n 40 "$log" >&2 || true
+    exit 1
+  fi
+  if ((passed + failed == 0)); then
+    echo "::error::$name ran no tests (libtest running $ran); a baseline that executed nothing proves nothing"
     tail -n 40 "$log" >&2 || true
     exit 1
   fi
@@ -131,7 +147,7 @@ for name in zeronet xray-rust; do
       echo "### failed"
       echo
       echo '```'
-      grep '^test .* \.\.\. FAILED$' "$log" | sed 's/ \.\.\. FAILED$//' | sort -u || true
+      printf '%s\n' "$failed_names" | sed '/^$/d'
       echo '```'
       echo
       echo "### failure output (each block in full, or its head and tail when a harness floods the middle)"
@@ -161,7 +177,7 @@ for name in zeronet xray-rust; do
     echo "### passed"
     echo
     echo '```'
-    grep '^test .* \.\.\. ok$' "$log" | sed 's/ \.\.\. ok$//' | sort -u || true
+    printf '%s\n' "$passed_names" | sed '/^$/d'
     echo '```'
     echo
   } >>"$report"

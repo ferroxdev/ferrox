@@ -70,13 +70,17 @@ tally_floor() {
     echo "::error::upstream suites: --only $filtered matched no pin, so a green job would prove nothing"
     return 1
   fi
+  if [[ -n "$filtered" && "$ran" -eq 0 ]]; then
+    echo "::error::upstream suites: --only $filtered matched a pin but no suite ran, so a green job would prove nothing"
+    return 1
+  fi
   if [[ -z "$filtered" && "$ran" -eq 0 ]]; then
     echo "::error::upstream suites: none ran green against a Ferrox binary, so a green job would prove nothing"
     return 1
   fi
 }
 
-for shape in zero-full:refuse some-full:accept zero-filtered:accept zero-miss:refuse; do
+for shape in zero-full:refuse some-full:accept zero-filtered:refuse zero-miss:refuse; do
   verdict=0
   case "${shape%%:*}" in
     zero-full) tally_floor 0 "" 0 >/dev/null || verdict=$? ;;

@@ -78,6 +78,10 @@ def load_rows():
             fails.append(f"docs/method-superset.md:{number}: expected 5 cells, "
                          f"got {len(cells)}")
             continue
+        if cells[0] in rows:
+            fails.append(f"docs/method-superset.md:{number}: row {cells[0]!r} "
+                         "is declared twice")
+            continue
         rows[cells[0]] = {
             "layer": cells[1],
             "state": cells[2],
@@ -102,14 +106,18 @@ def check_rows():
         if not row["references"]:
             fails.append(f"{name}: no reference path, so the row proves nothing")
             continue
+        valid = 0
         for path in row["references"].split(","):
             path = path.strip()
             if not path or path.startswith("#"):
                 continue
+            valid += 1
             if os.environ.get("CHECK_SUPERSET_UPSTREAM") == "0" and path.startswith("upstream/"):
                 continue
             if not os.path.exists(os.path.join(root, path)):
                 fails.append(f"{name}: reference `{path}` does not exist")
+        if valid == 0:
+            fails.append(f"{name}: no reference path, so the row proves nothing")
 
 
 def check_in_flight():
@@ -155,7 +163,7 @@ def check_upstream(sources):
     if os.environ.get("CHECK_SUPERSET_UPSTREAM") == "0":
         print("note: CHECK_SUPERSET_UPSTREAM=0, the pinned methods were not "
               "verified")
-        return len(CATALOGUES) + len(EXTRAS)
+        return 0
     for catalogue in CATALOGUES:
         full = os.path.join(root, catalogue)
         if not os.path.isdir(full):
@@ -206,8 +214,11 @@ if fails:
           f"{checked} reference(s) agreed", file=sys.stderr)
     sys.exit(1)
 
+sources_label = ("0 pinned source(s) (not checked)"
+                 if os.environ.get("CHECK_SUPERSET_UPSTREAM") == "0"
+                 else "4 pinned source(s)")
 print(f"check-method-superset: {len(rows)} row(s) over {catalogues} catalogue(s) "
-      f"and 4 pinned source(s), {checked} reference path(s) agreed")
+      f"and {sources_label}, {checked} reference path(s) agreed")
 EOF
 
 # A rule that cannot fail is a rule that has not been written, so the gate

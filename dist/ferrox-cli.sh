@@ -2365,12 +2365,12 @@ start_lane() {
   local new_cfg new_fronts
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
-  touch "$LANES_FILE"
-  grep -Fxq "$CONF_DIR" "$LANES_FILE" || printf '%s\n' "$CONF_DIR" >> "$LANES_FILE"
   # Validate first: an invocation that cannot start must not stop a healthy lane,
   # and a bad link must not send the user to a build before saying what is wrong.
   build_config
   require_bin
+  touch "$LANES_FILE"
+  grep -Fxq "$CONF_DIR" "$LANES_FILE" || printf '%s\n' "$CONF_DIR" >> "$LANES_FILE"
   # stop_lane reads the old meta to name the process it must kill, so keep the
   # new lane's settings aside until that process is gone.
   new_cfg="$CFG"; new_fronts="$FRONTS"

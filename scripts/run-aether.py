@@ -213,7 +213,10 @@ def main():
     )
     if inbound is None:
         fail("the config has no SOCKS inbound")
-    bind = f"{inbound.get('listen', '127.0.0.1')}:{inbound['port']}"
+    inbound_port = inbound.get("port")
+    if not isinstance(inbound_port, int) or isinstance(inbound_port, bool):
+        fail("the SOCKS inbound has no port")
+    bind = f"{inbound.get('listen', '127.0.0.1')}:{inbound_port}"
     outbound = next(
         (item for item in doc.get("outbounds") or []
          if item.get("protocol") in ("masque", "wireguard", "warp")),
@@ -242,7 +245,10 @@ def main():
     mode = settings.get("mode") if protocol == "warp" else None
     if protocol == "warp" and mode == "gool":
         block = settings.get("masque") or {}
-        masque_peer = block.get("address") and f"{block['address']}:{block['port']}"
+        masque_peer = (
+            f"{block['address']}:{block['port']}"
+            if block.get("address") and block.get("port") else None
+        )
         if not masque_peer:
             fail("the WARP outbound names no MASQUE address and port")
         inner = settings.get("goolIdentity") or {}
@@ -301,7 +307,10 @@ def main():
         ]
     elif protocol == "warp":
         block = settings.get("masque") or {}
-        masque_peer = block.get("address") and f"{block['address']}:{block['port']}"
+        masque_peer = (
+            f"{block['address']}:{block['port']}"
+            if block.get("address") and block.get("port") else None
+        )
         if not masque_peer:
             fail("the WARP outbound names no MASQUE address and port")
         tls = stream.get("tlsSettings") or {}

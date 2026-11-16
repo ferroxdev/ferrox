@@ -627,8 +627,10 @@ def main():
         "AETHER_WG_NO_DATA_CHECK": "1",
         "AETHER_NOIZE": "off",
     })
-    edge_host, _, edge_port = args.edge.rpartition(":")
-    edge = (edge_host or args.edge, int(edge_port or "443"))
+    edge_host, edge_sep, edge_port = args.edge.rpartition(":")
+    if not edge_sep:
+        edge_host, edge_port = args.edge, "443"
+    edge = (edge_host, int(edge_port))
     target_url = args.target_url
     target_host = "speed.cloudflare.com"
     scheme = target_url.split("://", 1)[0].lower() if "://" in target_url else "https"

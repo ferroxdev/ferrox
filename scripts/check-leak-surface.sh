@@ -5,6 +5,11 @@ cd "$(dirname "$0")/.."
 
 status=0
 
+if [[ ! -d crates/ferrox-core/src ]]; then
+  echo "::error::crates/ferrox-core/src is missing, so the leak scan would pass on nothing"
+  exit 1
+fi
+
 if git grep -I -n -E 'to_socket_addrs|lookup_host|getaddrinfo|hickory|trust-dns' -- crates/ferrox-core/src; then
   echo "::error::ferrox-core must not resolve DNS — the parser decides without a resolver (see transport.rs)"
   status=1

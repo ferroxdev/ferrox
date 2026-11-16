@@ -49,13 +49,17 @@ def run_cli(state: pathlib.Path, args: list[str]) -> subprocess.CompletedProcess
     env["FERROX_CONF_DIR"] = str(state)
     env["FERROX_STATE_DIR"] = str(state)
     env["FERROX_BIN"] = str(snapshot_binary(state))
-    return subprocess.run(
-        [str(CLI), "up", "--fronts", "socks", "--socks", str(free_port()), *args],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=90,
-    )
+    for _ in range(5):
+        run = subprocess.run(
+            [str(CLI), "up", "--fronts", "socks", "--socks", str(free_port()), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=90,
+        )
+        if "address already in use" not in f"{run.stdout}\n{run.stderr}".lower():
+            return run
+    return run
 
 
 def outbound(case: dict, root: pathlib.Path) -> dict:
@@ -383,6 +387,9 @@ def main() -> int:
     if failed:
         print(f"check-share-links: {failed} case(s) failed", file=sys.stderr)
         return 1
+    if not APP:
+        print("check-share-links: FERROX_APP unset; ferrox-app -test pass skipped",
+              file=sys.stderr)
     print(f"check-share-links: {len(CASES)} case(s) passed")
     return 0
 
