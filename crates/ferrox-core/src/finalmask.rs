@@ -138,6 +138,19 @@ pub struct Fragment {
     pub max_split: Range,
     ent: Entropy,
     count: u64,
+    gathered: Option<Gathered>,
+}
+
+/// The part of a merged hello already built but not yet accepted by the sink, so a refused write
+/// resumes at that octet instead of replaying the cuts and the cipher's draw.
+#[derive(Debug, Clone)]
+struct Gathered {
+    bytes: Vec<u8>,
+    at: usize,
+    from: usize,
+    segment: usize,
+    record_len: usize,
+    bound: usize,
 }
 
 impl Fragment {
@@ -166,11 +179,17 @@ impl Fragment {
             max_split,
             ent: Entropy::new(),
             count: 0,
+            gathered: None,
         })
     }
 
     /// The write the chain hands this stage, answered with how much of it reached the wire.
     pub fn write<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
+        if let Some(gathered) = self.gathered.as_ref() {
+            let (record_len, bound) = (gathered.record_len, gathered.bound);
+            self.write_gathered(raw, p, record_len, bound)?;
+            return Self::finish_hello(raw, p, record_len);
+        }
         self.count += 1;
         if self.packets_from == 0 && self.packets_to == 1 {
             return self.write_hello(raw, p);
@@ -249,15 +268,35 @@ impl Fragment {
                 segment += 1;
             }
         }
+        Self::finish_hello(raw, p, record_len)
+    }
+
+    /// A record that rode in behind the hello keeps its own write, whole or partial; a sink that
+    /// refuses it still reports the hello it already took, so the caller retries only the tail.
+    fn finish_hello<W: Write>(raw: &mut W, p: &[u8], record_len: usize) -> io::Result<usize> {
         if p.len() == record_len {
             return Ok(p.len());
         }
-        // A record that rode in behind the hello keeps its own write, whole or partial.
-        Ok(record_len + raw.write(&p[record_len..])?)
+        loop {
+            match raw.write(&p[record_len..]) {
+                Ok(taken) => return Ok(record_len + taken),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(record_len);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// The merged hello: every record's header goes into a bounded stack scratch and each body is
-    /// the caller's own slice, so one `writev` puts the burst out without copying the hello.
+    /// the caller's own slice, so one `writev` puts the burst out without copying the hello. The
+    /// part a sink refuses is the one copy, kept only so a retry resumes instead of re-cutting.
     fn write_gathered<W: Write>(
         &mut self,
         raw: &mut W,
@@ -267,7 +306,16 @@ impl Fragment {
     ) -> io::Result<()> {
         let mut from = HEADER;
         let mut segment = 0usize;
+        if let Some(gathered) = self.gathered.as_mut() {
+            flush_gathered(raw, gathered)?;
+            from = gathered.from;
+            segment = gathered.segment;
+            self.gathered = None;
+        }
         loop {
+            if from >= record_len {
+                return Ok(());
+            }
             let origin = from;
             let mut heads = [0u8; GATHERED_RECORDS * HEADER];
             let mut count = 0usize;
@@ -295,9 +343,24 @@ impl Fragment {
                 parts[index * 2 + 1] = io::IoSlice::new(&p[at..at + width]);
                 at += width;
             }
-            write_iovecs(raw, &mut parts[..count * 2])?;
-            if from >= record_len {
-                return Ok(());
+            let mut parts = &mut parts[..count * 2];
+            match write_iovecs(raw, &mut parts) {
+                Ok(()) => {}
+                Err(error) => {
+                    let mut bytes = Vec::new();
+                    for part in parts.iter() {
+                        bytes.extend_from_slice(part);
+                    }
+                    self.gathered = Some(Gathered {
+                        bytes,
+                        at: 0,
+                        from,
+                        segment,
+                        record_len,
+                        bound,
+                    });
+                    return Err(error);
+                }
             }
         }
     }
@@ -392,16 +455,37 @@ fn head_of(p: &[u8], width: usize) -> [u8; HEADER] {
 /// A record's header and its body go out as one gathered write, so the body never lands in a buffer
 /// of its own the way the reference's scratch does.
 fn write_record<W: Write>(raw: &mut W, head: &[u8], body: &[u8]) -> io::Result<()> {
-    write_iovecs(raw, &mut [io::IoSlice::new(head), io::IoSlice::new(body)])
+    let mut parts = [io::IoSlice::new(head), io::IoSlice::new(body)];
+    let mut parts = &mut parts[..];
+    write_iovecs(raw, &mut parts)
+}
+
+fn flush_gathered<W: Write>(raw: &mut W, gathered: &mut Gathered) -> io::Result<()> {
+    while gathered.at < gathered.bytes.len() {
+        match raw.write(&gathered.bytes[gathered.at..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(taken) => gathered.at += taken,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    gathered.at = 0;
+    gathered.bytes.clear();
+    Ok(())
 }
 
 /// Hand the list to the sink in as few vectored calls as it takes, advancing the list on a short
-/// call so every part stays where the caller put it.
-fn write_iovecs<W: Write>(raw: &mut W, mut parts: &mut [io::IoSlice<'_>]) -> io::Result<()> {
+/// call so every part stays where the caller put it. A refused call leaves the list at the first
+/// octet the sink did not take.
+#[allow(
+    clippy::mut_mut,
+    reason = "the list is advanced in place so a refused call leaves the unsent parts for the retry"
+)]
+fn write_iovecs<W: Write>(raw: &mut W, parts: &mut &mut [io::IoSlice<'_>]) -> io::Result<()> {
     while !parts.is_empty() {
         match raw.write_vectored(parts) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(taken) => io::IoSlice::advance_slices(&mut parts, taken),
+            Ok(taken) => io::IoSlice::advance_slices(parts, taken),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
@@ -990,6 +1074,62 @@ mod tests {
             "the caller learns exactly what reached the sink"
         );
         assert_eq!(sink.bytes, whole[..6], "and only those octets were sent");
+    }
+
+    #[test]
+    fn a_blocked_hello_resumes_at_the_refused_octet() {
+        struct BlocksOnce {
+            bytes: Vec<u8>,
+            blocked: bool,
+        }
+
+        impl Write for BlocksOnce {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if !self.bytes.is_empty() && !self.blocked {
+                    self.blocked = true;
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let config = || {
+            Fragment::new(
+                0,
+                1,
+                vec![range(11, 11), range(37, 37)],
+                vec![range(0, 0)],
+                range(24, 24),
+            )
+            .expect("valid")
+        };
+        let whole = hello(60);
+        let mut expected = Wire::default();
+        config().write(&mut expected, &whole).expect("writes");
+
+        let mut mask = config();
+        let mut sink = BlocksOnce {
+            bytes: Vec::new(),
+            blocked: false,
+        };
+        assert!(
+            mask.write(&mut sink, &whole).is_err(),
+            "the sink refuses the rest of the burst"
+        );
+        assert_eq!(
+            mask.write(&mut sink, &whole).expect("resumes"),
+            whole.len(),
+            "the retry answers the whole hello"
+        );
+        assert_eq!(
+            sink.bytes, expected.bytes,
+            "the retry continues the burst instead of replaying its cuts"
+        );
     }
 
     #[test]

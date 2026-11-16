@@ -136,10 +136,12 @@ pub fn read_string<R: Read>(reader: &mut R) -> io::Result<String> {
 }
 
 pub fn write_string<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
-    write_varint(
-        writer,
-        Varint::try_from(value.len()).map_err(|_| invalid_input("string exceeds a varint"))?,
-    )?;
+    let length =
+        Varint::try_from(value.len()).map_err(|_| invalid_input("string exceeds a varint"))?;
+    if length > MAX_STRING_LENGTH {
+        return Err(invalid_input(format!("write string: bad length: {length}")));
+    }
+    write_varint(writer, length)?;
     writer.write_all(value.as_bytes())
 }
 
@@ -185,10 +187,12 @@ pub fn read_bytes<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
 }
 
 pub fn write_bytes<W: Write>(writer: &mut W, value: &[u8]) -> io::Result<()> {
-    write_varint(
-        writer,
-        Varint::try_from(value.len()).map_err(|_| invalid_input("string exceeds a varint"))?,
-    )?;
+    let length =
+        Varint::try_from(value.len()).map_err(|_| invalid_input("string exceeds a varint"))?;
+    if length >= MAX_BYTES_LENGTH {
+        return Err(invalid_input(format!("write bytes: bad length: {length}")));
+    }
+    write_varint(writer, length)?;
     writer.write_all(value)
 }
 
@@ -350,6 +354,20 @@ mod tests {
         let mut reader: &[u8] = &wire;
         let error = read_string(&mut reader).expect_err("too long");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_write_over_the_read_limit_is_refused_before_the_wire() {
+        let mut wire = Vec::new();
+        assert!(
+            write_string(&mut wire, &"x".repeat(4097)).is_err(),
+            "a string the reader refuses is not emitted"
+        );
+        assert!(
+            write_bytes(&mut wire, &vec![0u8; MAX_BYTES_LENGTH as usize]).is_err(),
+            "a byte array the reader refuses is not emitted"
+        );
+        assert!(wire.is_empty(), "nothing reached the wire");
     }
 
     #[test]

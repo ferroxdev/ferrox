@@ -329,13 +329,6 @@ impl Context {
         load_metadata(&mut metadata, "remote", remote);
         Self { vars, metadata }
     }
-
-    fn sizes(&self) -> HashMap<String, usize> {
-        self.vars
-            .iter()
-            .map(|(name, value)| (name.clone(), value.len()))
-            .collect()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -418,6 +411,7 @@ fn flush<W: Write>(raw: &mut W, merged: &mut Vec<u8>) -> io::Result<()> {
         return Ok(());
     }
     raw.write_all(merged)?;
+    raw.flush()?;
     merged.clear();
     Ok(())
 }
@@ -431,16 +425,16 @@ fn park(delay: (i64, i64)) {
 
 fn between(from: i64, to: i64) -> i64 {
     let (from, to) = if from > to { (to, from) } else { (from, to) };
-    let span = to - from;
-    if span == 0 || span == 1 {
+    let span = i128::from(to) - i128::from(from);
+    if span <= 1 {
         return from;
     }
     let mut raw = [0u8; 8];
     let Ok(()) = getrandom::fill(&mut raw) else {
         return from;
     };
-    let step = i64::try_from(u64::from_le_bytes(raw) % span as u64).unwrap_or(i64::MAX);
-    from.saturating_add(step)
+    let step = i128::from(u64::from_le_bytes(raw)) % span;
+    i64::try_from(i128::from(from) + step).unwrap_or(i64::MAX)
 }
 
 fn evaluate_item(item: &Item, ctx: &mut Context) -> io::Result<Vec<u8>> {
@@ -480,7 +474,7 @@ fn random_bytes(length: usize, low: u8, high: u8) -> io::Result<Vec<u8>> {
 
 fn read_sequence<R: Read>(raw: &mut R, sequence: &Sequence, ctx: &mut Context) -> io::Result<()> {
     for item in &sequence.items {
-        let length = measure_item(item, &ctx.sizes())?;
+        let length = measure_item(item, ctx)?;
         let mut buf = vec![0u8; length];
         raw.read_exact(&mut buf)?;
         if item.rand > 0 {
@@ -508,17 +502,18 @@ fn read_sequence<R: Read>(raw: &mut R, sequence: &Sequence, ctx: &mut Context) -
     Ok(())
 }
 
-fn measure_item(item: &Item, sizes: &HashMap<String, usize>) -> io::Result<usize> {
+fn measure_item(item: &Item, ctx: &Context) -> io::Result<usize> {
     let size = if item.rand > 0 {
         item.rand as usize
     } else if let Some(packet) = item.packet.as_ref().filter(|packet| !packet.is_empty()) {
         packet.len()
     } else if !item.reuse.is_empty() {
-        *sizes
+        ctx.vars
             .get(&item.reuse)
+            .map(Vec::len)
             .ok_or_else(|| invalid("unknown variable"))?
     } else if let Some(expr) = &item.transform {
-        measure_expr(expr, sizes)?
+        measure_expr(expr, ctx)?
     } else {
         0
     };
@@ -705,55 +700,52 @@ fn shift(
     op(value, shift).map(Value::U64)
 }
 
-fn measure_expr(expr: &Expr, sizes: &HashMap<String, usize>) -> io::Result<usize> {
+fn measure_expr(expr: &Expr, ctx: &Context) -> io::Result<usize> {
     match expr.op.as_str() {
         "concat" => {
             let mut total = 0usize;
             for arg in &expr.args {
                 total = total
-                    .checked_add(measure_arg(arg, sizes)?)
+                    .checked_add(measure_arg(arg, ctx)?)
                     .ok_or_else(|| invalid("expression too long"))?;
             }
             Ok(total)
         }
         "slice" => {
             let [_, _, length] = args::<3>(expr)?;
-            literal_u64(length)
+            length_arg(length, ctx)
         }
         "be16" | "le16" => Ok(2),
         "be32" | "le32" => Ok(4),
         "le64" => Ok(8),
         "pad" => {
             let [_, target, _] = args::<3>(expr)?;
-            literal_u64(target)
+            length_arg(target, ctx)
         }
         "truncate" => {
             let [_, length] = args::<2>(expr)?;
-            literal_u64(length)
+            length_arg(length, ctx)
         }
         other => Err(invalid(&format!("expr size is not bytes for op: {other}"))),
     }
 }
 
-fn literal_u64(arg: &ExprArg) -> io::Result<usize> {
-    match arg {
-        ExprArg::U64(value) => {
-            usize::try_from(*value).map_err(|_| invalid("expression length too long"))
-        }
-        _ => Err(invalid("expression length must be u64")),
-    }
+fn length_arg(arg: &ExprArg, ctx: &Context) -> io::Result<usize> {
+    usize::try_from(evaluate_arg(arg, ctx)?.u64()?)
+        .map_err(|_| invalid("expression length too long"))
 }
 
-fn measure_arg(arg: &ExprArg, sizes: &HashMap<String, usize>) -> io::Result<usize> {
+fn measure_arg(arg: &ExprArg, ctx: &Context) -> io::Result<usize> {
     match arg {
         ExprArg::Bytes(value) => Ok(value.len()),
         ExprArg::U64(_) => Err(invalid("u64 argument has no byte width")),
-        ExprArg::Var(name) => sizes
+        ExprArg::Var(name) => ctx
+            .vars
             .get(name)
-            .copied()
+            .map(Vec::len)
             .ok_or_else(|| invalid("unknown variable")),
         ExprArg::Metadata(_) => Err(invalid("metadata has no byte width")),
-        ExprArg::Expr(expr) => measure_expr(expr, sizes),
+        ExprArg::Expr(expr) => measure_expr(expr, ctx),
     }
 }
 #[cfg(test)]
@@ -1031,6 +1023,36 @@ mod tests {
                 .expect("bytes"),
             vec![2, 3]
         );
+    }
+
+    #[test]
+    fn measured_lengths_evaluate_the_same_arguments_the_sender_did() {
+        let ctx = Context::new(None, None, Vars::default());
+
+        let truncate = Expr {
+            op: "truncate".to_owned(),
+            args: vec![
+                ExprArg::Bytes(vec![1, 2, 3, 4]),
+                ExprArg::Expr(Expr {
+                    op: "add".to_owned(),
+                    args: vec![ExprArg::U64(1), ExprArg::U64(1)],
+                }),
+            ],
+        };
+        assert_eq!(measure_expr(&truncate, &ctx).expect("measures"), 2);
+
+        let pad = Expr {
+            op: "pad".to_owned(),
+            args: vec![
+                ExprArg::Bytes(vec![1]),
+                ExprArg::Expr(Expr {
+                    op: "add".to_owned(),
+                    args: vec![ExprArg::U64(1), ExprArg::U64(2)],
+                }),
+                ExprArg::Bytes(vec![0]),
+            ],
+        };
+        assert_eq!(measure_expr(&pad, &ctx).expect("measures"), 3);
     }
 
     #[test]

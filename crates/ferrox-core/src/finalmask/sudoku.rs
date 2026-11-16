@@ -417,6 +417,7 @@ struct Encoder {
     table_index: usize,
     group_index: usize,
     out: Vec<u8>,
+    written: usize,
 }
 
 impl Encoder {
@@ -431,11 +432,13 @@ impl Encoder {
             table_index: 0,
             group_index: 0,
             out: Vec::new(),
+            written: 0,
         }
     }
 
     fn encode(&mut self, p: &[u8]) -> io::Result<&[u8]> {
         self.out.clear();
+        self.written = 0;
         if p.is_empty() {
             return Ok(&self.out);
         }
@@ -444,6 +447,20 @@ impl Encoder {
             WriterKind::Packed => self.encode_packed(p)?,
         }
         Ok(&self.out)
+    }
+
+    /// Put the rest of the last encoding on the wire; a refused write keeps the position so the
+    /// cipher's table advance is not replayed on a retry.
+    fn flush<W: Write>(&mut self, raw: &mut W) -> io::Result<()> {
+        while self.written < self.out.len() {
+            match raw.write(&self.out[self.written..]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(taken) => self.written += taken,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     fn encode_pure(&mut self, p: &[u8]) -> io::Result<()> {
@@ -863,8 +880,12 @@ impl Sudoku {
                 "sudoku stage is not open for writing",
             ));
         };
-        let encoded = writer.encode(p)?;
-        write_wire(raw, encoded)?;
+        if writer.written < writer.out.len() {
+            writer.flush(raw)?;
+            return Ok(p.len());
+        }
+        writer.encode(p)?;
+        writer.flush(raw)?;
         Ok(p.len())
     }
 
@@ -927,18 +948,6 @@ fn push_pure_pad(rng: &mut SudokuRng, out: &mut Vec<u8>, layout: &Layout) -> io:
 
 fn push_packed_pad(rng: &mut SudokuRng, out: &mut Vec<u8>, layout: &Layout) -> io::Result<()> {
     out.push(layout.packed_padding(rng)?);
-    Ok(())
-}
-
-fn write_wire<W: Write>(raw: &mut W, mut p: &[u8]) -> io::Result<()> {
-    while !p.is_empty() {
-        match raw.write(p) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => p = &p[n..],
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
     Ok(())
 }
 
@@ -1159,6 +1168,56 @@ mod tests {
             got += n;
         }
         assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn a_blocked_frame_resumes_without_advancing_the_tables_again() {
+        struct Stalling {
+            bytes: Vec<u8>,
+            calls: usize,
+            limit: usize,
+        }
+
+        impl Write for Stalling {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                match self.calls {
+                    1 => {
+                        let take = buf.len().min(self.limit);
+                        self.bytes.extend_from_slice(&buf[..take]);
+                        Ok(take)
+                    }
+                    2 => Err(std::io::ErrorKind::WouldBlock.into()),
+                    _ => {
+                        self.bytes.extend_from_slice(buf);
+                        Ok(buf.len())
+                    }
+                }
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let config = stage("retry", "", &["", "xpxpvvvv"]);
+        let plain = vec![0x5au8; 64];
+        let mut writer = config.open_write(MaskRole::Client);
+        let mut sink = Stalling {
+            bytes: Vec::new(),
+            calls: 0,
+            limit: 3,
+        };
+        assert!(writer.write(&mut sink, &plain).is_err(), "the sink blocks");
+        assert_eq!(
+            writer.write(&mut sink, &plain).expect("resumes"),
+            plain.len()
+        );
+        assert_eq!(
+            sink.bytes,
+            writer.writer.as_ref().expect("encoder").out,
+            "the retry finishes the frame instead of encoding a second one"
+        );
     }
 
     #[test]
