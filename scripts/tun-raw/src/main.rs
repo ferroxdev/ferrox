@@ -51,8 +51,14 @@ fn open_tun(name: &str, offload: bool, multi_queue: bool) -> io::Result<File> {
         _pad: [0; 22],
     };
     let bytes = name.as_bytes();
-    let len = bytes.len().min(15);
-    req.ifr_name[..len].copy_from_slice(&bytes[..len]);
+    if bytes.len() > 15 {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("interface name {name:?} is longer than 15 bytes"),
+        ));
+    }
+    req.ifr_name[..bytes.len()].copy_from_slice(bytes);
 
     let flags = req.ifr_flags;
     let rc = unsafe { libc::ioctl(fd, TUNSETIFF, &raw mut req) };
@@ -65,17 +71,19 @@ fn open_tun(name: &str, offload: bool, multi_queue: bool) -> io::Result<File> {
         ));
     }
 
-    if offload {
-        let offloads: libc::c_int = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
-        let rc = unsafe { libc::ioctl(fd, TUNSETOFFLOAD, offloads as libc::c_ulong) };
-        if rc < 0 {
-            let error = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(io::Error::new(
-                error.kind(),
-                format!("TUNSETOFFLOAD {name}: {error}"),
-            ));
-        }
+    let offloads: libc::c_int = if offload {
+        TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6
+    } else {
+        0
+    };
+    let rc = unsafe { libc::ioctl(fd, TUNSETOFFLOAD, offloads as libc::c_ulong) };
+    if rc < 0 {
+        let error = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(io::Error::new(
+            error.kind(),
+            format!("TUNSETOFFLOAD {name}: {error}"),
+        ));
     }
 
     Ok(unsafe { File::from_raw_fd(fd) })
@@ -87,18 +95,18 @@ fn forward(mut source: File, mut sink: File) {
         match source.read(&mut frame) {
             Ok(0) => {
                 eprintln!("ferrox-tun-raw: read returned zero");
-                return;
+                std::process::exit(1);
             }
             Ok(n) => {
                 if let Err(error) = sink.write_all(&frame[..n]) {
                     eprintln!("ferrox-tun-raw: write failed: {error}");
-                    return;
+                    std::process::exit(1);
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => {
                 eprintln!("ferrox-tun-raw: read failed: {error}");
-                return;
+                std::process::exit(1);
             }
         }
     }
@@ -113,14 +121,32 @@ fn main() -> io::Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--iface1" => iface1 = args.next(),
-            "--iface2" => iface2 = args.next(),
+            "--iface1" => {
+                iface1 = Some(args.next().unwrap_or_else(|| {
+                    eprintln!("ferrox-tun-raw: --iface1 needs a name");
+                    std::process::exit(2);
+                }))
+            }
+            "--iface2" => {
+                iface2 = Some(args.next().unwrap_or_else(|| {
+                    eprintln!("ferrox-tun-raw: --iface2 needs a name");
+                    std::process::exit(2);
+                }))
+            }
             "--gso" => offload = true,
             "--queues" => {
-                queues = args
-                    .next()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(1);
+                let value = args.next().unwrap_or_else(|| {
+                    eprintln!("ferrox-tun-raw: --queues needs a count");
+                    std::process::exit(2);
+                });
+                queues = value.parse().unwrap_or_else(|_| {
+                    eprintln!("ferrox-tun-raw: --queues wants a number, got {value:?}");
+                    std::process::exit(2);
+                });
+                if queues == 0 {
+                    eprintln!("ferrox-tun-raw: --queues must be at least 1");
+                    std::process::exit(2);
+                }
             }
             other => {
                 eprintln!("ferrox-tun-raw: unknown argument {other}");
@@ -128,9 +154,14 @@ fn main() -> io::Result<()> {
             }
         }
     }
-    let iface1 = iface1.expect("--iface1 is required");
-    let iface2 = iface2.expect("--iface2 is required");
-    let queues = queues.max(1);
+    let iface1 = iface1.unwrap_or_else(|| {
+        eprintln!("ferrox-tun-raw: --iface1 is required");
+        std::process::exit(2);
+    });
+    let iface2 = iface2.unwrap_or_else(|| {
+        eprintln!("ferrox-tun-raw: --iface2 is required");
+        std::process::exit(2);
+    });
 
     let mut left = Vec::with_capacity(queues);
     let mut right = Vec::with_capacity(queues);
@@ -148,7 +179,10 @@ fn main() -> io::Result<()> {
         handles.push(thread::spawn(move || forward(r, l2)));
     }
     for handle in handles {
-        let _ = handle.join();
+        if handle.join().is_err() {
+            eprintln!("ferrox-tun-raw: a forwarding worker panicked");
+            std::process::exit(1);
+        }
     }
     Ok(())
 }

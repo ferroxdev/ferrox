@@ -464,6 +464,7 @@ func clientCase(ed uint32, path, host, key string, payload int, answer []byte) (
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
+			request <- nil
 			order <- "none"
 			ridden <- ""
 			return
@@ -481,6 +482,7 @@ func clientCase(ed uint32, path, host, key string, payload int, answer []byte) (
 		}
 		end := bytes.Index(got, []byte("\r\n\r\n"))
 		if end < 0 {
+			request <- append([]byte{}, got...)
 			order <- "none"
 			ridden <- ""
 			return
@@ -510,10 +512,8 @@ func clientCase(ed uint32, path, host, key string, payload int, answer []byte) (
 				break
 			}
 		}
-		if len(early) == 0 {
-			early = late
-		}
-		ridden <- hex.EncodeToString(early)
+		payload := append(append([]byte{}, early...), late...)
+		ridden <- hex.EncodeToString(payload)
 	}()
 
 	settings := &internet.MemoryStreamConfig{
@@ -537,6 +537,7 @@ func clientCase(ed uint32, path, host, key string, payload int, answer []byte) (
 	if err != nil {
 		// The reference wrote its request before it read the answer, so the
 		// request is on the wire even when the answer was refused.
+		listener.Close()
 		written := <-request
 		return "refuse", <-order, <-ridden, hex.EncodeToString(project(written, key)), nil
 	}

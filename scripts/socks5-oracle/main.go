@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/xtls/xray-core/common/net"
@@ -69,6 +70,9 @@ func main() {
 		switch parts[0] {
 		case "handshake":
 			// handshake <method> <atyp> <addr> <port> [<user> <pass>]
+			if len(parts) < 5 || (parts[1] == "user" && len(parts) < 7) {
+				panic("handshake wants <none|user> <ipv4|ipv6|name> <addr> <port> [<user> <pass>]")
+			}
 			method := parts[1]
 			atyp, addr, port := parts[2], parts[3], parts[4]
 			user, pass := "", ""
@@ -78,6 +82,9 @@ func main() {
 			record(out, method, user, pass, atyp, addr, port)
 		case "udp":
 			// udp <atyp> <addr> <port> <hex payload>
+			if len(parts) != 5 {
+				panic("udp wants <ipv4|ipv6|name> <addr> <port> <hex payload>")
+			}
 			recordUDP(out, parts[1], parts[2], parts[3], parts[4])
 		default:
 			panic("unknown script command " + parts[0])
@@ -96,24 +103,31 @@ func methodByte(name string) byte {
 	return 0
 }
 
-func record(out *bufio.Writer, method, user, pass, atyp, addr, port string) {
-	var address net.Address
+func address(atyp, addr string) net.Address {
 	switch atyp {
-	case "ipv4":
-		address = net.ParseAddress(addr)
-	case "ipv6":
-		address = net.ParseAddress(addr)
+	case "ipv4", "ipv6":
+		return net.ParseAddress(addr)
+	case "name":
+		return net.DomainAddress(addr)
 	default:
-		address = net.ParseAddress(addr)
+		panic("unknown address type " + atyp)
 	}
-	var p net.Port
-	fmt.Sscanf(port, "%d", &p)
+}
 
+func parsePort(field string) net.Port {
+	value, err := strconv.Atoi(field)
+	if err != nil || value < 0 || value > 65535 {
+		panic("port out of range: " + field)
+	}
+	return net.Port(value)
+}
+
+func record(out *bufio.Writer, method, user, pass, atyp, addr, port string) {
 	req := &protocol.RequestHeader{
 		Version: 5,
 		Command: protocol.RequestCommandTCP,
-		Address: address,
-		Port:    p,
+		Address: address(atyp, addr),
+		Port:    parsePort(port),
 	}
 	if method == "user" {
 		req.User = &protocol.MemoryUser{Account: &socks.Account{Username: user, Password: pass}}
@@ -137,16 +151,11 @@ func record(out *bufio.Writer, method, user, pass, atyp, addr, port string) {
 
 // The UDP datagram frame the reference's `EncodeUDPPacket` writes.
 func recordUDP(out *bufio.Writer, atyp, addr, port, payload string) {
-	var address net.Address
-	address = net.ParseAddress(addr)
-	var p net.Port
-	fmt.Sscanf(port, "%d", &p)
-
 	req := &protocol.RequestHeader{
 		Version: 5,
 		Command: protocol.RequestCommandUDP,
-		Address: address,
-		Port:    p,
+		Address: address(atyp, addr),
+		Port:    parsePort(port),
 	}
 	data, err := hex.DecodeString(payload)
 	if err != nil {

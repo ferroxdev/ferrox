@@ -4,10 +4,10 @@
 # `*_psk` rows go through `OmitEmptyPsk`, without which the pin drops the handshake.
 #
 # A preset whose extension order uTLS shuffles at spec creation is printed as
-# `SH <name> <sorted-extension-hex> <invariant-indices> <body-prefix-hex>`: the middle
+# `SH <name> <sorted-extension-hex> <position:kind,...> <body-prefix-hex>`: the middle
 # order is a fresh crypto/rand draw in uTLS, so what is comparable is the multiset of
-# extension bytes, the positions of the GREASE/padding/PSK entries, and the body ahead of
-# the extensions, which carries the cipher list. Every other preset prints
+# extension bytes, the position and kind of the GREASE/padding/PSK entries, and the body
+# ahead of the extensions, which carries the cipher list. Every other preset prints
 # `CH <name> <exact-body-hex>`, which gates the byte for byte.
 
 360 Hello360_7_5

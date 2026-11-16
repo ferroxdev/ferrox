@@ -105,7 +105,12 @@ func readHello(id utls.ClientHelloID) []byte {
 	if err := uconn.ApplyPreset(&spec); err != nil {
 		panic(err)
 	}
-	go func() { _ = uconn.Handshake() }()
+	handshake := make(chan error, 1)
+	go func() {
+		err := uconn.Handshake()
+		_ = client.Close()
+		handshake <- err
+	}()
 
 	var buf []byte
 	chunk := make([]byte, 16*1024)
@@ -121,6 +126,10 @@ func readHello(id utls.ClientHelloID) []byte {
 			}
 		}
 		if err != nil {
+			_ = client.Close()
+			if herr := <-handshake; herr != nil {
+				panic(herr)
+			}
 			panic(err)
 		}
 	}
@@ -281,10 +290,10 @@ func main() {
 			fmt.Printf("CH %s %s\n", parts[0], hex.EncodeToString(out))
 			continue
 		}
-		var fixed []int
+		var indices []string
 		for i, ext := range exts {
 			if invariant(ext.kind) {
-				fixed = append(fixed, i)
+				indices = append(indices, fmt.Sprintf("%d:%04x", i, ext.kind))
 			}
 		}
 		sort.Slice(exts, func(i, j int) bool {
@@ -293,10 +302,6 @@ func main() {
 		var sorted []byte
 		for _, ext := range exts {
 			sorted = append(sorted, ext.raw...)
-		}
-		var indices []string
-		for _, i := range fixed {
-			indices = append(indices, fmt.Sprint(i))
 		}
 		fmt.Printf("SH %s %s %s %s\n", parts[0], hex.EncodeToString(sorted), strings.Join(indices, ","), hex.EncodeToString(prefix))
 	}
