@@ -785,7 +785,15 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quich
 
 /// A dial that accepts the presented chain, as `allowInsecure` names: no anchor is read, so no staged bundle is needed.
 pub(crate) fn quiche_config_insecure(cc: Option<&str>) -> Option<quiche::Config> {
-    build_quiche_config(&[], cc, &[ALPN], false)
+    quiche_config_insecure_alpn(cc, &[ALPN])
+}
+
+/// The unverified dial under another ALPN: v1's `allowInsecure` presents its own protocol, not this tree's carrier.
+pub(crate) fn quiche_config_insecure_alpn(
+    cc: Option<&str>,
+    alpn: &[&[u8]],
+) -> Option<quiche::Config> {
+    build_quiche_config(&[], cc, alpn, false)
 }
 
 /// The same staged trust bundle and tuning under another ALPN, for a client
@@ -1737,18 +1745,22 @@ pub(crate) fn stream_send_all(
     sock: &Datagram,
     stream: u64,
     mut buf: &[u8],
-    fin: bool,
+    mut fin: bool,
     deadline: Instant,
 ) -> bool {
     while !buf.is_empty() || fin {
-        match conn.stream_send(stream, buf, fin && buf.is_empty()) {
+        let end = fin && buf.is_empty();
+        match conn.stream_send(stream, buf, end) {
             Ok(written) => {
                 buf = &buf[written..];
-                if buf.is_empty() {
+                if end {
+                    fin = false;
+                }
+                if buf.is_empty() && !fin {
                     flush_egress(conn, sock);
                     return true;
                 }
-                if written == 0 && !send_credit_wait(conn, sock, deadline) {
+                if written == 0 && !end && !send_credit_wait(conn, sock, deadline) {
                     return false;
                 }
             }
@@ -1784,7 +1796,7 @@ fn stream_send_all_parked(
     sock: &Datagram,
     stream: u64,
     mut buf: &[u8],
-    fin: bool,
+    mut fin: bool,
     deadline: Instant,
 ) -> bool {
     while !buf.is_empty() || fin {
@@ -1795,19 +1807,23 @@ fn stream_send_all_parked(
             if conn.is_closed() {
                 return false;
             }
-            match conn.stream_send(stream, buf, fin && buf.is_empty()) {
+            let end = fin && buf.is_empty();
+            match conn.stream_send(stream, buf, end) {
                 Ok(written) => {
                     flush_egress(&mut conn, sock);
-                    Some(written)
+                    Some((written, end))
                 }
                 Err(quiche::Error::Done) => None,
                 Err(_) => return false,
             }
         };
         match outcome {
-            Some(written) => {
+            Some((written, end)) => {
                 buf = &buf[written..];
-                if buf.is_empty() {
+                if end {
+                    fin = false;
+                }
+                if buf.is_empty() && !fin {
                     return true;
                 }
                 if written > 0 {
@@ -7804,6 +7820,43 @@ mod tests {
             pattern[..read],
             "the batch delivered the frame in order, whole"
         );
+    }
+
+    /// A finishing send puts the FIN on the wire after the last byte, not just the bytes: the peer reads the payload and the end in the same recv.
+    #[test]
+    fn a_finishing_send_marks_the_peer_stream_finished() {
+        let (mut client, mut server) = lane_pair();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(stream_send_all(
+            &mut server.conn,
+            &server.sock,
+            1,
+            b"fin",
+            true,
+            deadline
+        ));
+        let mut buf = [0u8; 8];
+        let mut seen = None;
+        for _ in 0..32 {
+            pass(
+                &mut server.conn,
+                &server.sock,
+                &mut client.conn,
+                &client.sock,
+                client.addr,
+            );
+            match client.conn.stream_recv(1, &mut buf) {
+                Ok((n, fin)) => {
+                    seen = Some((n, fin));
+                    if fin {
+                        break;
+                    }
+                }
+                Err(quiche::Error::Done) => {}
+                Err(error) => panic!("reads the finishing stream: {error:?}"),
+            }
+        }
+        assert_eq!(seen, Some((3, true)), "the last byte and the FIN arrived");
     }
 
     /// A waiter beside a pump must leave the pump's datagram on the socket: the queue is the witness, since a waiter that read it would empty the queue before the pump saw it.

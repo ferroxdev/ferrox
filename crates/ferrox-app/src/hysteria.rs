@@ -560,18 +560,19 @@ const PADDING_CHARS: &[u8; 62] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrs
 const AUTH_REQUEST_ROOM: usize = 160;
 const AUTH_RESPONSE_ROOM: usize = 96;
 
-/// The cover value the reference's auth headers carry: a random alphanumeric run whose length is uniform over `min..max`, drawn from one getrandom fill into the caller's stack room.
+/// The cover value the reference's auth headers carry: a random alphanumeric run whose length is drawn over `min..max`, drawn from one getrandom fill into the caller's stack room.
 pub(crate) fn hysteria_padding(min: usize, max: usize, raw: &mut [u8; 2050]) -> &str {
     if getrandom::fill(raw).is_err() {
-        raw[2..2 + min].fill(b'a');
-        return std::str::from_utf8(&raw[2..2 + min]).expect("alphanumeric");
+        raw[3..3 + min].fill(b'a');
+        return std::str::from_utf8(&raw[3..3 + min]).expect("alphanumeric");
     }
     let span = max.saturating_sub(min).max(1);
-    let length = min + (usize::from(u16::from_le_bytes([raw[0], raw[1]])) % span);
-    for byte in &mut raw[2..2 + length] {
+    let draw = u32::from_le_bytes([raw[0], raw[1], raw[2], 0]);
+    let length = min + (draw as usize % span);
+    for byte in &mut raw[3..3 + length] {
         *byte = PADDING_CHARS[usize::from(*byte) % PADDING_CHARS.len()];
     }
-    std::str::from_utf8(&raw[2..2 + length]).expect("alphanumeric")
+    std::str::from_utf8(&raw[3..3 + length]).expect("alphanumeric")
 }
 
 fn post_auth(session: &Session, auth: &str, cc_rx: u64) -> Option<bool> {

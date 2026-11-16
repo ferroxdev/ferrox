@@ -154,9 +154,9 @@ One more pair prices the outbound UDP fragment's check once per fragment, `the_c
 
 ## Time
 
-The matrix's `vless-hysteria` cells on `ubuntu-latest`, full tier. Down-8 and duplex-8 are three repeats on run `43692104987` at `1814b98a4`; up-1 is five repeats on run `43968769974` at `59e1879`. The client leg is ferrox's median against xray-core's as clients of the xray-core server; the server leg is the same xray-core client on the ferrox server against the xray-core server:
+The matrix's `vless-hysteria` cells on `ubuntu-latest`, full tier. Down-8 and duplex-8 are three repeats on run `43692104987` at `1814b98a4`; up-1 is five repeats on run `43968769974` at `59e1879`. The client leg is ferrox's median against xray-core's as clients of the xray-core server; the server leg is the same xray-core client on the ferrox server against the xray-core server, after dividing each side by its own cell's harness ceiling — the two server cells run on one host, so the raw 694/380 MiB/s (1.83×) includes a ceiling difference the normalized 1.03× removes:
 
-| cell | client leg | server leg |
+| cell | client leg | server leg (ceiling-normalized) |
 | --- | --- | --- |
 | `vless-hysteria-down-8` | 2.77× | 1.04× |
 | `vless-hysteria-duplex-8` | 1.25× | 1.14× |

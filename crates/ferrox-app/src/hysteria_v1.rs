@@ -68,11 +68,19 @@ fn read_until(session: &Session, stream: u64, want: impl Fn(&[u8]) -> bool) -> O
     }
 }
 
+fn client_config(dial: &Dial, roots: &[Vec<u8>]) -> Option<quiche::Config> {
+    if dial.config.insecure {
+        crate::quic::quiche_config_insecure_alpn(None, &[wire::ALPN])
+    } else {
+        crate::quic::quiche_config_alpn(roots, None, &[wire::ALPN])
+    }
+}
+
 fn connect(dial: &Dial) -> Option<Session> {
     let roots = dial.roots.as_deref().unwrap_or(&[]);
     let (sock, peer, local) = crate::quic::udp_to_server(&dial.address, dial.port)?;
     let cid = crate::quic::hysteria_client_cid(dial.config.quic.as_ref())?;
-    let mut config = crate::quic::quiche_config_alpn(roots, None, &[wire::ALPN])?;
+    let mut config = client_config(dial, roots)?;
     crate::quic::apply_lane_congestion(
         &mut config,
         Some(dial.config.cc),
@@ -1223,6 +1231,29 @@ mod tests {
                 .0
                 .port,
             80
+        );
+    }
+
+    #[test]
+    fn an_insecure_v1_dial_accepts_an_untrusted_chain() {
+        let dial = |insecure| Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port: 443,
+            config: ferrox_core::hysteria::Config {
+                version: 1,
+                insecure,
+                ..ferrox_core::hysteria::Config::default()
+            },
+            roots: None,
+        };
+        assert!(
+            client_config(&dial(true), &[]).is_some(),
+            "allowInsecure leaves no root to stage"
+        );
+        assert!(
+            client_config(&dial(false), &[]).is_none(),
+            "a verifying v1 dial still refuses an empty trust store"
         );
     }
 
