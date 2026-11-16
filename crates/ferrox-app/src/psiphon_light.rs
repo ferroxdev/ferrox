@@ -686,9 +686,15 @@ fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
     let mut peer_eof = false;
     let mut stream_eof = false;
     let mut last_down = Instant::now();
+    let mut last_upload = Instant::now();
     let mut drained = Instant::now();
+    let mut draining = false;
     loop {
-        if peer_eof && drained.elapsed() >= DRAIN {
+        let queued = stream.queued();
+        if peer_eof && queued > 0 && last_upload.elapsed() >= DRAIN {
+            return;
+        }
+        if peer_eof && queued == 0 && draining && drained.elapsed() >= DRAIN {
             return;
         }
         if down_at < down_len {
@@ -696,6 +702,7 @@ fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
                 Ok(0) => return,
                 Ok(count) => {
                     down_at += count;
+                    last_upload = Instant::now();
                     drained = Instant::now();
                 }
                 Err(error) if idle(&error) => {}
@@ -711,29 +718,33 @@ fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
             Err(error) if idle(&error) => {}
             Err(_) => return,
         }
+        if stream.queued() < queued {
+            last_upload = Instant::now();
+        }
         let upload_blocked = stream.queued() > 0;
+        if peer_eof && !upload_blocked && !draining {
+            draining = true;
+            drained = Instant::now();
+        }
         let mut peer_state = if peer_eof { None } else { ready(&peer) };
         if peer_state == Some(false) {
             peer_eof = true;
             peer_state = None;
-            drained = Instant::now();
         }
         if !upload_blocked && peer_state == Some(true) {
             match peer.read(&mut up) {
                 Ok(0) => {
                     peer_eof = true;
-                    drained = Instant::now();
                 }
                 Ok(count) => {
                     if stream.write_all(&up[..count]).is_err() {
                         return;
                     }
-                    drained = Instant::now();
+                    last_upload = Instant::now();
                     peer_state = if peer_eof { None } else { ready(&peer) };
                     if peer_state == Some(false) {
                         peer_eof = true;
                         peer_state = None;
-                        drained = Instant::now();
                     }
                 }
                 Err(error) if idle(&error) => {}
@@ -751,6 +762,7 @@ fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
                 Ok(count) => {
                     down_len = count;
                     down_at = 0;
+                    last_upload = Instant::now();
                     drained = Instant::now();
                 }
                 Err(error) if idle(&error) => {}

@@ -13,7 +13,7 @@ use flate2::read::ZlibDecoder;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::io::Read;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RECORD_VERSION: u8 = 1;
 const SESSION_PACKET: u8 = 1;
@@ -479,6 +479,8 @@ pub(crate) struct Client {
     session: Option<Session>,
     offer_timeout: Duration,
     offer_personal_timeout: Duration,
+    offer_deadline: Option<Instant>,
+    offer_budget: Duration,
     relay_timeout: Duration,
     nat_type: u64,
 }
@@ -503,6 +505,8 @@ impl Client {
             session: None,
             offer_timeout: DEFAULT_OFFER_TIMEOUT,
             offer_personal_timeout: DEFAULT_OFFER_PERSONAL_TIMEOUT,
+            offer_deadline: None,
+            offer_budget: Duration::ZERO,
             relay_timeout: DEFAULT_RELAY_TIMEOUT,
             nat_type: 0,
         })
@@ -513,10 +517,16 @@ impl Client {
         self.nat_type = nat_type;
     }
 
-    /// Apply this dial's remaining offer budget to a shared client.
-    pub(crate) fn set_offer_timeouts(&mut self, offer: Duration, personal: Duration) {
+    /// Apply this dial's offer budget and absolute deadline to a shared client.
+    pub(crate) fn set_offer_timeouts(
+        &mut self,
+        offer: Duration,
+        personal: Duration,
+        deadline: Instant,
+    ) {
         self.offer_timeout = offer;
         self.offer_personal_timeout = personal;
+        self.offer_deadline = Some(deadline);
     }
 
     /// Build a client from a broker spec and one paired front.
@@ -579,37 +589,55 @@ impl Client {
         metrics: &Metrics,
         settings: &OfferSettings,
     ) -> Result<Offer, String> {
-        if common_compartments.is_empty() && personal_compartments.is_empty() {
-            return Err("psiphon broker: no compartments".to_owned());
-        }
-        let mut metrics = metrics.clone();
-        if self.nat_type != 0 {
-            metrics.nat_type = self.nat_type;
-        }
-        let request = client_offer_request(
-            destination,
-            common_compartments,
-            personal_compartments,
-            sdp,
-            &metrics,
-            settings.secret,
-            settings.traffic_shaping.as_ref(),
-        );
-        self.transport
-            .set_timeout(if personal_compartments.is_empty() {
+        let result = (|| {
+            if common_compartments.is_empty() && personal_compartments.is_empty() {
+                return Err("psiphon broker: no compartments".to_owned());
+            }
+            let mut metrics = metrics.clone();
+            if self.nat_type != 0 {
+                metrics.nat_type = self.nat_type;
+            }
+            let request = client_offer_request(
+                destination,
+                common_compartments,
+                personal_compartments,
+                sdp,
+                &metrics,
+                settings.secret,
+                settings.traffic_shaping.as_ref(),
+            );
+            self.offer_budget = if personal_compartments.is_empty() {
                 self.offer_timeout
             } else {
                 self.offer_personal_timeout
-            });
-        let reply = self.session_request(&record(CLIENT_OFFER_REQUEST, &request)?)?;
-        let response = decode_record(&reply)?;
-        if response.kind != CLIENT_OFFER_RESPONSE {
-            return Err(format!(
-                "psiphon broker: offer response is record {}",
-                response.kind
-            ));
+            };
+            self.transport.set_timeout(self.offer_budget);
+            self.refresh_offer_timeout()?;
+            let reply = self.session_request(&record(CLIENT_OFFER_REQUEST, &request)?)?;
+            let response = decode_record(&reply)?;
+            if response.kind != CLIENT_OFFER_RESPONSE {
+                return Err(format!(
+                    "psiphon broker: offer response is record {}",
+                    response.kind
+                ));
+            }
+            Ok(parse_offer(&response.value))
+        })();
+        self.offer_deadline = None;
+        result
+    }
+
+    /// Narrow the transport timeout to the offer's remaining absolute budget.
+    fn refresh_offer_timeout(&mut self) -> Result<(), String> {
+        let Some(deadline) = self.offer_deadline else {
+            return Ok(());
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("psiphon broker: offer deadline expired".to_owned());
         }
-        Ok(parse_offer(&response.value))
+        self.transport.set_timeout(self.offer_budget.min(remaining));
+        Ok(())
     }
 
     /// Relay one server packet to the broker and return the broker's next
@@ -668,6 +696,7 @@ impl Client {
             self.handshake(round_trip)?
         } else {
             let payload = self.send_packet(round_trip)?;
+            self.refresh_offer_timeout()?;
             let reply = self.transport.round_trip(&payload)?;
             self.receive_packet(&reply)?
         };
@@ -721,6 +750,7 @@ impl Client {
             .write_message(&[], &mut buffer)
             .map_err(|error| format!("psiphon broker: noise e: {error}"))?;
         let first = wrap_session_packet(session_id, 0, &buffer[..length], &send)?;
+        self.refresh_offer_timeout()?;
         let reply = self.transport.round_trip(&first)?;
         let packet = unwrap_session_packet(&reply, &receive, false)?;
         if packet.session_id != session_id || packet.nonce != 0 {
@@ -736,6 +766,7 @@ impl Client {
             .write_message(first_request, &mut buffer)
             .map_err(|error| format!("psiphon broker: noise s: {error}"))?;
         let third = wrap_session_packet(session_id, 0, &buffer[..length], &send)?;
+        self.refresh_offer_timeout()?;
         let reply = self.transport.round_trip(&third)?;
         let transport = noise
             .into_transport_mode()

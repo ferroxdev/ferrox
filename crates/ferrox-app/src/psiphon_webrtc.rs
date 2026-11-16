@@ -420,6 +420,46 @@ impl WebRtc {
         }
     }
 
+    /// Move buffered channel data ahead of a terminal send failure.
+    fn take_received(
+        &mut self,
+        raw: bool,
+        padding_done: &mut bool,
+        backlog: &mut VecDeque<Result<Vec<u8>, String>>,
+    ) {
+        while let Some(event) = self.events.pop_front() {
+            match event {
+                Event::ChannelData(data)
+                    if self.channel.is_some_and(|channel| data.id == channel) =>
+                {
+                    if raw {
+                        if !data.data.is_empty() {
+                            backlog.push_back(Ok(data.data));
+                        }
+                    } else if let Ok(Some(payload)) = unframe(data.data, padding_done) {
+                        if !payload.is_empty() {
+                            backlog.push_back(Ok(payload));
+                        }
+                    }
+                }
+                Event::RtpPacket(packet) if self.media.is_some() => {
+                    let payload = packet.payload.as_ref();
+                    let Some(padding) = payload.first().map(|byte| usize::from(*byte)) else {
+                        continue;
+                    };
+                    if padding == 255 || payload.len() < 1 + padding {
+                        continue;
+                    }
+                    let data = payload[1 + padding..].to_vec();
+                    if !data.is_empty() {
+                        backlog.push_back(Ok(data));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// The address the last peer datagram came from.
     pub(crate) fn peer_ip(&self) -> Option<IpAddr> {
         self.peer
@@ -1384,8 +1424,13 @@ fn drive(
                 Ok(data) if data.is_empty() => {}
                 Ok(data) => {
                     if let Err(error) = webrtc.send(&data) {
+                        webrtc.take_received(raw, &mut peer_padding_done, &mut backlog);
+                        while let Some(message) = backlog.pop_front() {
+                            if input.send(message).is_err() {
+                                return;
+                            }
+                        }
                         *lock(&failure) = Some(error);
-                        backlog.clear();
                         stop.store(true, Ordering::Release);
                         return;
                     }
@@ -1951,6 +1996,7 @@ impl Conduit {
             client.set_offer_timeouts(
                 offer_timeout.min(offer_remaining),
                 offer_personal_timeout.min(offer_remaining),
+                deadline,
             );
             client
                 .client_offer(
