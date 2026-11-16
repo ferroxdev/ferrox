@@ -2606,7 +2606,7 @@ mod tests {
         assert!(!subject.close_sent);
         subject.flush().expect("the record resumes");
         assert!(subject.close_sent);
-        assert!(subject.close.is_empty());
+        assert_eq!(subject.close.len(), 0);
         assert!(subject.io.bytes.len() > 5);
     }
 
