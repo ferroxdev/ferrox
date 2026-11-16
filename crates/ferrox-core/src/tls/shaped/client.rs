@@ -2645,7 +2645,7 @@ mod tests {
         subject.out = b"old".to_vec();
         let mut fresh = Vec::new();
         subject.seal_into(b"new", &mut fresh).expect("seals");
-        assert!(subject.io.wire.is_empty());
+        assert_eq!(subject.io.wire.len(), 0);
         assert!(fresh.starts_with(b"old"));
         assert_ne!(fresh.len(), b"old".len());
         assert_eq!(subject.out_at, subject.out.len());
