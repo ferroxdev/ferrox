@@ -2519,17 +2519,17 @@ mod tests {
 
     /// A writer that records every byte it accepts.
     #[derive(Default)]
-    struct Recorder {
+    struct CloseRecorder {
         bytes: Vec<u8>,
     }
 
-    impl Read for Recorder {
+    impl Read for CloseRecorder {
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
             Ok(0)
         }
     }
 
-    impl Write for Recorder {
+    impl Write for CloseRecorder {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.bytes.extend_from_slice(buf);
             Ok(buf.len())
@@ -2586,7 +2586,7 @@ mod tests {
 
     #[test]
     fn a_close_notification_follows_a_queued_reply() {
-        let mut subject = tls13_session(Recorder::default());
+        let mut subject = tls13_session(CloseRecorder::default());
         subject.reply = b"reply".to_vec();
         subject.close_notify().expect("close");
         assert!(subject.io.bytes.starts_with(b"reply"));
