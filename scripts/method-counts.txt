@@ -1180,3 +1180,19 @@ security-ktls syscalls-per-offloaded-record UNBLESSED scripts/count-ops.sh
 security-ktls user-space-copies-per-offloaded-record UNBLESSED no copy checker yet
 security-ktls seconds-per-offloaded-record UNBLESSED CI bench.yml (no cell yet)
 security-ktls both-directions-carried-by-the-kernel 1 ferrox-core-tls::rustls_backend::tests::a_ktls_loopback_carries_both_directions
+
+# --- evasion: UDP noise and fake-SNI ---------------------------------------
+obfs-evasion fake-hello-octets 517 ferrox-core-evasion::tests::a_fake_hello_is_the_fixed_packet_and_carries_its_name
+obfs-evasion fake-sni-max-bytes 219 ferrox-core-evasion::tests::a_fake_name_outside_the_bound_is_refused
+obfs-evasion decoy-segment-checksums 2 ferrox-core-evasion::tests::a_decoy_packet_has_both_checksums_right
+obfs-evasion noise-packets-per-count 3 ferrox-app-proxy::tests::a_noise_count_sends_that_many_packets
+obfs-evasion noise-entry-kinds-parsed 5 ferrox-app-proxy::tests::a_freedom_noise_keeps_its_packet_and_family
+obfs-evasion noise-overlay-precedence 1 ferrox-app-proxy::tests::a_finalmask_noise_wins_over_the_legacy_list
+obfs-evasion record-header-version-bytes 2 ferrox-app-conn::tests::a_record_shape_rewrites_one_header
+obfs-evasion empty-record-octets 5 ferrox-app-conn::tests::an_empty_shape_precedes_one_record
+obfs-evasion noise-ops-retired-instructions UNBLESSED scripts/count-ops.sh
+obfs-evasion decoy-ops-retired-instructions UNBLESSED scripts/count-ops.sh
+obfs-evasion noise-syscalls-per-flow UNBLESSED scripts/count-ops.sh
+obfs-evasion decoy-syscalls-per-hello UNBLESSED scripts/count-ops.sh
+obfs-evasion noise-copies-per-packet UNBLESSED scripts/count-ops.sh
+obfs-evasion evasion-time UNBLESSED bench.yml

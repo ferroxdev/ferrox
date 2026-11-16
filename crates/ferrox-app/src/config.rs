@@ -1342,7 +1342,76 @@ pub(crate) fn outbound_tls(
         padding: None,
         kernel_tx: tls_kernel(tls, "kernel_tx"),
         kernel_rx: tls_kernel(tls, "kernel_rx"),
+        sni: outbound_sni_spoof(outbound)?,
         ..Default::default()
+    }))
+}
+
+/// The outbound's `evasion.sniSpoof`: how the first hello keeps its server name from a filter that
+/// reads it. Absent leaves the hello alone, which is the ordinary case.
+fn outbound_sni_spoof(outbound: &Json) -> Result<Option<ferrox_core::evasion::SniSpoof>, String> {
+    use ferrox_core::evasion::{DecoyFooling, SniMethod, SniSpoof};
+    let Some(value) = outbound
+        .get("evasion")
+        .and_then(|evasion| evasion.get("sniSpoof"))
+        .filter(|value| !matches!(value, Json::Null))
+    else {
+        return Ok(None);
+    };
+    let method = match value.get("method").and_then(Json::as_str) {
+        None | Some("auto") => SniMethod::Auto,
+        Some("decoy") => SniMethod::Decoy,
+        Some("urgent") => SniMethod::Urgent,
+        Some("fastopen" | "tfo") => SniMethod::FastOpen,
+        Some("record" | "recordversion") => SniMethod::Record,
+        Some("empty" | "emptyrecord") => SniMethod::EmptyRecord,
+        Some(other) => {
+            return Err(format!(
+                "evasion.sniSpoof.method must be auto, decoy, urgent, record, empty or fastopen, not {other:?}"
+            ));
+        }
+    };
+    let fake_sni = value
+        .get("fakeSni")
+        .or_else(|| value.get("fake_sni"))
+        .and_then(Json::as_str)
+        .unwrap_or("www.speedtest.net");
+    if fake_sni.is_empty() || fake_sni.len() > 219 || !fake_sni.bytes().all(|byte| byte > 0x20) {
+        return Err("evasion.sniSpoof.fakeSni must be 1..=219 visible bytes".to_owned());
+    }
+    let sequence = value
+        .get("sequence")
+        .and_then(Json::as_i64)
+        .map_or(0, |sequence| u32::try_from(sequence).unwrap_or(u32::MAX));
+    let fooling = match value.get("fooling").and_then(Json::as_str) {
+        None | Some("auto") => DecoyFooling::Auto,
+        Some("md5") => DecoyFooling::Md5,
+        Some("ttl") => DecoyFooling::Ttl,
+        Some(other) => {
+            return Err(format!(
+                "evasion.sniSpoof.fooling must be auto, md5 or ttl, not {other:?}"
+            ));
+        }
+    };
+    let ttl = match value.get("ttl") {
+        None | Some(Json::Null) => match fooling {
+            DecoyFooling::Ttl => 8,
+            _ => 0,
+        },
+        Some(ttl) => match ttl.as_i64() {
+            Some(ttl @ 0..=255) => ttl as u8,
+            _ => return Err("evasion.sniSpoof.ttl must be a hop count from 0 to 255".to_owned()),
+        },
+    };
+    if fooling == DecoyFooling::Ttl && ttl == 0 {
+        return Err("evasion.sniSpoof.ttl must be above zero for fooling \"ttl\"".to_owned());
+    }
+    Ok(Some(SniSpoof {
+        fake_sni: fake_sni.to_owned(),
+        sequence,
+        method,
+        fooling,
+        ttl,
     }))
 }
 
@@ -4798,6 +4867,47 @@ mod tests {
             "a key file the config names but cannot read refuses the build, as xray's does"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A TLS outbound's `evasion.sniSpoof` reaches the dial's config, and every field the
+    /// reference refuses is refused here too.
+    #[test]
+    fn a_sni_spoof_block_is_read_by_the_dial() {
+        use ferrox_core::evasion::{DecoyFooling, SniMethod};
+        let outbound = |evasion: &str| {
+            crate::json::parse(&format!(
+                r#"{{"evasion":{{{evasion}}},"streamSettings":{{"security":"tls","tlsSettings":{{"serverName":"tls.test","allowInsecure":true}}}}}}"#
+            ))
+            .expect("parses")
+        };
+        let tls = outbound_tls(
+            &outbound(
+                r#""sniSpoof":{"method":"decoy","fakeSni":"cdn.example","sequence":7,"fooling":"ttl","ttl":4}"#,
+            ),
+            "127.0.0.1",
+        )
+        .expect("builds");
+        let sni = tls.sni.as_ref().expect("an armed spoof");
+        assert_eq!(sni.method, SniMethod::Decoy);
+        assert_eq!(sni.fake_sni, "cdn.example");
+        assert_eq!(sni.sequence, 7);
+        assert_eq!(sni.fooling, DecoyFooling::Ttl);
+        assert_eq!(sni.ttl, 4);
+        assert!(outbound_tls(&outbound(""), "127.0.0.1")
+            .expect("builds")
+            .sni
+            .is_none());
+        for evasion in [
+            r#""sniSpoof":{"method":"nope"}"#,
+            r#""sniSpoof":{"method":"decoy","fakeSni":""}"#,
+            r#""sniSpoof":{"method":"record","fooling":"ttl","ttl":0}"#,
+            r#""sniSpoof":{"method":"record","ttl":300}"#,
+        ] {
+            assert!(
+                outbound_tls(&outbound(evasion), "127.0.0.1").is_err(),
+                "{evasion} is refused"
+            );
+        }
     }
 
     #[test]
