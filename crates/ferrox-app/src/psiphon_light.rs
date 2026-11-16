@@ -726,7 +726,14 @@ fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
             draining = true;
             drained = Instant::now();
         }
-        let mut peer_state = if peer_eof { None } else { ready(&peer) };
+        let mut peer_state = if peer_eof {
+            None
+        } else {
+            match ready(&peer) {
+                Ok(state) => state,
+                Err(_) => return,
+            }
+        };
         if peer_state == Some(false) {
             peer_eof = true;
             peer_state = None;
@@ -741,7 +748,14 @@ fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
                         return;
                     }
                     last_upload = Instant::now();
-                    peer_state = if peer_eof { None } else { ready(&peer) };
+                    peer_state = if peer_eof {
+                        None
+                    } else {
+                        match ready(&peer) {
+                            Ok(state) => state,
+                            Err(_) => return,
+                        }
+                    };
                     if peer_state == Some(false) {
                         peer_eof = true;
                         peer_state = None;
@@ -777,12 +791,13 @@ fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
 
 /// Whether the loopback peer has bytes ready (`Some(true)`), reached EOF
 /// (`Some(false)`), or has nothing to report yet (`None`), without consuming.
-fn ready(peer: &TcpStream) -> Option<bool> {
+fn ready(peer: &TcpStream) -> io::Result<Option<bool>> {
     let _ = peer.set_nonblocking(true);
     let state = match peer.peek(&mut [0u8; 1]) {
-        Ok(0) => Some(false),
-        Ok(_) => Some(true),
-        Err(_) => None,
+        Ok(0) => Ok(Some(false)),
+        Ok(_) => Ok(Some(true)),
+        Err(error) if idle(&error) => Ok(None),
+        Err(error) => Err(error),
     };
     let _ = peer.set_nonblocking(false);
     state

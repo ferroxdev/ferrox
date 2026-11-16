@@ -24,6 +24,7 @@ const STUN_HEADER_LEN: usize = ferrox_core::stun::HEADER_LEN;
 const MAX_DATAGRAM: usize = 65_536;
 const PADDING_DONE: i64 = -1;
 const MESSAGE_TIMEOUT: Duration = Duration::from_millis(5);
+const STOP_POLL: Duration = Duration::from_millis(50);
 const STREAM_MESSAGE: usize = 16 * 1024;
 const NAT_DISCOVERY_ROUND_TRIP: Duration = Duration::from_secs(2);
 const NAT_MAPPING_UNKNOWN: u64 = 0;
@@ -126,6 +127,7 @@ pub(crate) struct WebRtc {
     shaping: Option<(TrafficShapingParameters, [u8; 32])>,
     media_shaping: Option<Shaping>,
     send_timeout: Option<Duration>,
+    stop: Option<Arc<AtomicBool>>,
 }
 
 impl WebRtc {
@@ -230,6 +232,7 @@ impl WebRtc {
                 shaping: None,
                 media_shaping: None,
                 send_timeout: Some(Duration::from_secs(30)),
+                stop: None,
             },
             offer.to_sdp_string(),
         ))
@@ -290,7 +293,15 @@ impl WebRtc {
             .channel
             .ok_or_else(|| "psiphon webrtc: data channel is closed".to_owned())?;
         let deadline = self.send_timeout.map(|timeout| Instant::now() + timeout);
+        let tracked = self.stop.is_some();
         loop {
+            if self
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::Acquire))
+            {
+                return Err("psiphon webrtc: driver stopped".to_owned());
+            }
             let accepted = self
                 .rtc
                 .channel(channel)
@@ -306,7 +317,13 @@ impl WebRtc {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err("psiphon webrtc write timed out".to_owned());
             }
-            self.wait(deadline.map_or(next, |deadline| next.min(deadline)))?;
+            let until = deadline.map_or(next, |deadline| next.min(deadline));
+            let until = if tracked {
+                until.min(Instant::now() + STOP_POLL)
+            } else {
+                until
+            };
+            self.wait(until)?;
         }
     }
 
@@ -1149,6 +1166,7 @@ impl Shaping {
 pub(crate) struct WebRtcStream {
     out: SyncSender<Vec<u8>>,
     input: InputChannel,
+    terminal: Arc<Mutex<Vec<u8>>>,
     pending: Arc<Mutex<(Vec<u8>, usize)>>,
     stop: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
@@ -1166,6 +1184,7 @@ impl Clone for WebRtcStream {
         Self {
             out: self.out.clone(),
             input: Arc::clone(&self.input),
+            terminal: Arc::clone(&self.terminal),
             pending: Arc::clone(&self.pending),
             stop: Arc::clone(&self.stop),
             failure: Arc::clone(&self.failure),
@@ -1197,6 +1216,9 @@ impl WebRtcStream {
         let write_timeout = Arc::new(Mutex::new(Some(timeout)));
         let thread_write_timeout = Arc::clone(&write_timeout);
         let driver_shaping = shaping.as_ref().map(Arc::clone);
+        let terminal = Arc::new(Mutex::new(Vec::new()));
+        let thread_terminal = Arc::clone(&terminal);
+        webrtc.stop = Some(Arc::clone(&stop));
         thread::Builder::new()
             .name("psiphon-webrtc".to_owned())
             .spawn(move || {
@@ -1209,12 +1231,14 @@ impl WebRtcStream {
                     unframed,
                     driver_shaping,
                     thread_write_timeout,
+                    thread_terminal,
                 );
             })
             .map_err(|error| format!("psiphon webrtc driver: {error}"))?;
         Ok(Self {
             out,
             input: Arc::new(Mutex::new(input)),
+            terminal,
             pending: Arc::new(Mutex::new((Vec::new(), 0))),
             stop,
             failure,
@@ -1268,13 +1292,16 @@ impl Read for WebRtcStream {
                     return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
                 }
                 Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    if let Some(error) = lock(&self.failure).as_ref().cloned() {
-                        return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
-                    }
-                    return Err(io::Error::from(ErrorKind::UnexpectedEof));
-                }
+                Err(TryRecvError::Disconnected) => {}
             }
+            let mut terminal = lock(&self.terminal);
+            if !terminal.is_empty() {
+                let taken = terminal.len().min(buf.len());
+                buf[..taken].copy_from_slice(&terminal[..taken]);
+                terminal.drain(..taken);
+                return Ok(taken);
+            }
+            drop(terminal);
             if let Some(error) = lock(&self.failure).as_ref().cloned() {
                 if let Ok(Ok(data)) = input.try_recv() {
                     pending.0 = data;
@@ -1410,6 +1437,7 @@ fn drive(
     raw: bool,
     shaping: Option<Arc<Mutex<Shaping>>>,
     write_timeout: Arc<Mutex<Option<Duration>>>,
+    terminal: Arc<Mutex<Vec<u8>>>,
 ) {
     let mut peer_padding_done = false;
     let mut backlog: VecDeque<Result<Vec<u8>, String>> = VecDeque::new();
@@ -1424,12 +1452,17 @@ fn drive(
                 Ok(data) if data.is_empty() => {}
                 Ok(data) => {
                     if let Err(error) = webrtc.send(&data) {
+                        if stop.load(Ordering::Acquire) {
+                            return;
+                        }
                         webrtc.take_received(raw, &mut peer_padding_done, &mut backlog);
-                        while let Some(message) = backlog.pop_front() {
-                            if input.send(message).is_err() {
-                                return;
+                        let mut buffered = lock(&terminal);
+                        for message in backlog.drain(..) {
+                            if let Ok(data) = message {
+                                buffered.extend_from_slice(&data);
                             }
                         }
+                        drop(buffered);
                         *lock(&failure) = Some(error);
                         stop.store(true, Ordering::Release);
                         return;
