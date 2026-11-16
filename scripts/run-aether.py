@@ -79,6 +79,7 @@ def identity(path, fields):
         lines.append(f"{key} = {value}")
     path = pathlib.Path(path)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(descriptor, 0o600)
     with os.fdopen(descriptor, "w") as handle:
         handle.write("\n".join(lines) + "\n")
     path.chmod(0o600)
@@ -100,11 +101,14 @@ def masque_identity(cfg_path, stream, name="aether-identity.toml", v4="10.13.0.2
         except ValueError as error:
             fail(f"the inner MASQUE private key is not base64: {error}")
         descriptor = os.open(der_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
         der_path.chmod(0o600)
         try:
-            os.close(os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+            key_descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(key_descriptor, 0o600)
+            os.close(key_descriptor)
             subprocess.run(
                 ["openssl", "pkey", "-inform", "DER", "-in", str(der_path), "-out", str(key_path)],
                 check=True, stdin=subprocess.DEVNULL, capture_output=True,

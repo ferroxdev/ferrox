@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from urllib.parse import urlsplit
@@ -57,13 +58,22 @@ def run(cmd, *, env=None, timeout=180, cwd=None):
     )
 
 
+def precreate_owner_only(path):
+    """Create an empty owner-only file so a tool writing it cannot widen the mode."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(descriptor, 0o600)
+    os.close(descriptor)
+
+
 def openssl_der(pem_path, der_path):
     """Convert a PEM private key to PKCS #8 DER, the envelope ferrox reads."""
+    precreate_owner_only(der_path)
     run(["openssl", "pkey", "-in", str(pem_path), "-outform", "DER", "-out", str(der_path)])
 
 
 def openssl_pem(der_path, pem_path):
     """Convert a PKCS #8 DER private key to PEM."""
+    precreate_owner_only(pem_path)
     run(["openssl", "pkey", "-inform", "DER", "-in", str(der_path), "-out", str(pem_path)])
 
 
@@ -120,12 +130,24 @@ def read_json(path):
 
 
 def write_secret(path, data):
-    """Write a private key with owner-only permissions, tightening an existing file too."""
+    """Write a private key with owner-only permissions, replacing any existing file."""
     path = pathlib.Path(path)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "wb" if isinstance(data, bytes) else "w") as handle:
-        handle.write(data)
-    path.chmod(0o600)
+    descriptor, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb" if isinstance(data, bytes) else "w") as handle:
+            handle.write(data)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
 
 
 def write_json(path, value):

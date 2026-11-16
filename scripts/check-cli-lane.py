@@ -3344,11 +3344,13 @@ def main() -> int:
     running = {}
     states = []
     children = set()
+    children_lock = threading.Lock()
     real_popen = subprocess.Popen
 
     def tracked_popen(*args, **kwargs):
         proc = real_popen(*args, **kwargs)
-        children.add(proc)
+        with children_lock:
+            children.add(proc)
         return proc
 
     subprocess.Popen = tracked_popen
@@ -3382,17 +3384,18 @@ def main() -> int:
         unfinished = list(running.values())
         pool.shutdown(wait=False, cancel_futures=True)
         subprocess.Popen = real_popen
-        for proc in children:
-            if proc.poll() is None:
+        with children_lock:
+            snapshot = list(children)
+        for proc in snapshot:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
                 try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    try:
-                        proc.terminate()
-                    except ProcessLookupError:
-                        pass
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
         stop_by = time.monotonic() + 2
-        for proc in children:
+        for proc in snapshot:
             if proc.poll() is None:
                 try:
                     proc.wait(timeout=max(0.0, stop_by - time.monotonic()))

@@ -252,6 +252,15 @@ def selftest():
         if proc.returncode == 0 or "not finite" not in proc.stderr:
             return f"a non-finite baseline ratio was accepted: {proc.stderr}"
 
+        blank = Path(temp) / "blank"
+        (blank / "vless-raw-down-8--srv-ferrox").mkdir(parents=True)
+        (blank / "vless-raw-down-8--srv-ferrox" / "cell.json").write_text(
+            json.dumps({"scenario": "vless-raw-down-8--srv-ferrox", "rows": []})
+        )
+        proc = run_self(blank, None)
+        if proc.returncode == 0:
+            return "a cells directory whose cells carry no rows passed without --allow-empty"
+
         no_peer = Path(temp) / "no-peer"
         (no_peer / "vless-raw-down-8--srv-ferrox").mkdir(parents=True)
         (no_peer / "vless-raw-down-8--srv-ferrox" / "cell.json").write_text(
@@ -306,15 +315,21 @@ def main():
     baseline = {} if args.no_baseline else load_baseline(args.baseline)
     found, paired = deficits(args.cells)
     if not paired and not args.allow_empty:
-        if not any(Path(args.cells).glob("*/cell.json")):
+        carried = False
+        for path in Path(args.cells).glob("*/cell.json"):
+            cell = load(path)
+            if cell is not None and cell.get("rows"):
+                carried = True
+                break
+        if not carried:
             print(
-                "::error::no cell was rendered; the check would pass on nothing",
+                "::error::no cell carried a row; the check would pass on nothing",
                 file=sys.stderr,
             )
             return 1
         print(
-            "::warning::no per-comparator row was paired; the cells carry only "
-            "reference rows, so this run gates no peer",
+            "::warning::no per-comparator row was paired; every row in the cells "
+            "names no peer, so this run gates no comparator",
             file=sys.stderr,
         )
     return report(found, paired, baseline)
