@@ -163,6 +163,7 @@ struct Inner {
     self_ref: Mutex<Weak<Self>>,
     sessions: Mutex<Vec<Arc<Session>>>,
     next_session: AtomicUsize,
+    dial_window: AtomicUsize,
     affinity: Mutex<Option<(String, u16)>>,
     moved_to_front: Mutex<HashSet<String>>,
     dsl_placeholders: Arc<Mutex<Vec<DslPlaceholder>>>,
@@ -1014,6 +1015,7 @@ impl PsiphonOut {
             self_ref: Mutex::new(Weak::new()),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
+            dial_window: AtomicUsize::new(0),
             affinity: Mutex::new(affinity),
             moved_to_front: Mutex::new(HashSet::new()),
             dsl_placeholders: Arc::new(Mutex::new(Vec::new())),
@@ -1212,6 +1214,14 @@ impl Inner {
             }
             Arc::clone(&*guard)
         };
+        let window = if self.settings.cdn_scan_specs.is_empty() {
+            0
+        } else {
+            self.dial_window.load(Ordering::Acquire)
+        };
+        if window != 0 {
+            return (window % entries.len(), Duration::ZERO);
+        }
         let affinity = lock(&self.affinity);
         match affinity_index(&entries, affinity.as_ref()) {
             Some(base) => (base, self.settings.affinity_grace),
@@ -1221,6 +1231,9 @@ impl Inner {
 
     /// Record a live server: it becomes the affinity and, under the cap, the next first entry.
     fn remember(&self, host: &str, protocol: &str) {
+        if !self.settings.cdn_scan_specs.is_empty() {
+            self.dial_window.store(0, Ordering::Release);
+        }
         let affinity = host
             .rsplit_once(':')
             .and_then(|(name, port)| port.parse().ok().map(|port| (name, port)));
@@ -1600,6 +1613,12 @@ impl Inner {
                 }
                 Err(why) => last = why,
             }
+        }
+        if !self.settings.cdn_scan_specs.is_empty() {
+            self.dial_window.store(
+                next_dial_start(start, offset, entries.len()),
+                Ordering::Release,
+            );
         }
         Err(format!("psiphon: no server accepted the tunnel: {last}"))
     }
@@ -7946,6 +7965,24 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
     } else {
         Some(lock(&settings.cdn_scan_state).hints())
     };
+    let scan_groups = if scan.is_some() {
+        servers
+            .iter()
+            .filter(|server| {
+                front.of(server).is_some_and(|meek| meek.fronted)
+                    && (!matches!(front, Front::Tunnel) || server.scan_cdn)
+            })
+            .count()
+            .max(1)
+    } else {
+        1
+    };
+    // Every scan group keeps a slice of the native cap, so no group is dropped.
+    let scan_cap = if scan.is_some() {
+        (FRONTED_SERVERS / scan_groups).min(FRONTED_VARIANTS).max(1)
+    } else {
+        FRONTED_VARIANTS
+    };
     let mut groups: Vec<Vec<Server>> = Vec::with_capacity(servers.len());
     for server in servers.drain(..) {
         let Some(meek) = front.of(&server) else {
@@ -7963,7 +8000,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
             continue;
         }
         if let Some((preferred, skipped, shuffle_key)) = &scan {
-            let mut group = Vec::with_capacity(FRONTED_VARIANTS.min(16));
+            let mut group = Vec::with_capacity(scan_cap.min(16));
             let mut variants = 0;
             push_scan_candidates(
                 &server,
@@ -7974,26 +8011,34 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 shuffle_key,
                 &mut group,
                 &mut variants,
+                scan_cap,
             );
+            let mut overrides = Vec::new();
+            let mut override_variants = 0;
             push_override_candidates(
                 &server,
                 meek,
                 settings,
                 apply_overrides,
                 front,
-                0,
-                &mut group,
-                &mut variants,
+                FRONTED_VARIANTS.saturating_sub(scan_cap),
+                &mut overrides,
+                &mut override_variants,
             );
+            let mut builtin = Vec::new();
+            let mut builtin_variants = 0;
             push_scan_builtin_candidates(
                 &server,
                 front,
                 settings,
                 skipped,
                 shuffle_key,
-                &mut group,
-                &mut variants,
+                &mut builtin,
+                &mut builtin_variants,
+                scan_cap,
             );
+            interleave_fronted(&mut group, builtin, overrides);
+            group.truncate(scan_cap);
             if group.is_empty() {
                 group.push(server);
             }
@@ -8114,9 +8159,10 @@ fn push_scan_candidates(
     shuffle_key: &str,
     expanded: &mut Vec<Server>,
     variants: &mut usize,
+    cap: usize,
 ) {
     for candidate in preferred {
-        if !push_scan_variant(server, candidate, front, expanded, variants) {
+        if !push_scan_variant(server, candidate, front, expanded, variants, cap) {
             return;
         }
     }
@@ -8125,13 +8171,13 @@ fn push_scan_candidates(
     };
     let mut number = 0;
     while number < spec.candidate_count() {
-        if *variants >= FRONTED_VARIANTS {
+        if *variants >= cap {
             return;
         }
         let Some((candidate, next)) = spec.select_probe(number, skipped, shuffle_key) else {
             return;
         };
-        if !push_scan_variant(server, &candidate, front, expanded, variants) {
+        if !push_scan_variant(server, &candidate, front, expanded, variants, cap) {
             return;
         }
         number = next.max(number.saturating_add(1));
@@ -8139,7 +8185,9 @@ fn push_scan_candidates(
 }
 
 /// The reference's built-in sets follow the overrides, each keeping a share so
-/// the native variant cap does not starve a later set.
+/// the native variant cap does not starve a later set; the caller interleaves
+/// the two so a capped group still carries both.
+#[allow(clippy::too_many_arguments)]
 fn push_scan_builtin_candidates(
     server: &Server,
     front: Front,
@@ -8148,12 +8196,15 @@ fn push_scan_builtin_candidates(
     shuffle_key: &str,
     expanded: &mut Vec<Server>,
     variants: &mut usize,
+    cap: usize,
 ) {
     let sets = &settings.cdn_scan_builtin;
     for (index, spec) in sets.iter().enumerate() {
-        let remaining = FRONTED_VARIANTS.saturating_sub(*variants);
+        let remaining = cap.saturating_sub(*variants);
         let left = sets.len() - index;
-        let slots = u64::try_from(remaining / left).unwrap_or(0);
+        let slots = u64::try_from(remaining / left)
+            .unwrap_or(0)
+            .max(u64::from(remaining > 0));
         let count = spec.candidate_count().min(slots);
         let mut number = 0;
         let mut emitted = 0;
@@ -8161,11 +8212,32 @@ fn push_scan_builtin_candidates(
             let Some((candidate, next)) = spec.select_probe(number, skipped, shuffle_key) else {
                 break;
             };
-            if !push_scan_variant(server, &candidate, front, expanded, variants) {
+            if !push_scan_variant(server, &candidate, front, expanded, variants, cap) {
                 return;
             }
             emitted += 1;
             number = next.max(number.saturating_add(1));
+        }
+    }
+}
+
+/// Alternate the fixed overrides with the built-in sets, override first, so a
+/// capped group still carries both in the reference's order.
+fn interleave_fronted(group: &mut Vec<Server>, builtin: Vec<Server>, overrides: Vec<Server>) {
+    let mut builtin = builtin.into_iter();
+    let mut overrides = overrides.into_iter();
+    loop {
+        let mut pushed = false;
+        if let Some(server) = overrides.next() {
+            group.push(server);
+            pushed = true;
+        }
+        if let Some(server) = builtin.next() {
+            group.push(server);
+            pushed = true;
+        }
+        if !pushed {
+            return;
         }
     }
 }
@@ -8176,6 +8248,7 @@ fn push_scan_variant(
     front: Front,
     expanded: &mut Vec<Server>,
     variants: &mut usize,
+    cap: usize,
 ) -> bool {
     let (port, https) = front
         .of(server)
@@ -8197,7 +8270,7 @@ fn push_scan_variant(
         https,
         expanded,
         variants,
-        FRONTED_VARIANTS,
+        cap,
     )
 }
 
@@ -11293,6 +11366,14 @@ fn server_is_intensive(server: &Server, conduit: bool) -> bool {
         || (conduit && (server.inproxy.is_some() || server.tls_inproxy.is_some()))
 }
 
+/// The entry a retry starts from after a pass dialled `dialed` entries.
+fn next_dial_start(start: usize, dialed: usize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    start.wrapping_add(dialed) % count
+}
+
 /// Fill one batch, stopping before an intensive candidate over the limit so the next batch starts there.
 fn take_dial_batch(
     entries: &[Server],
@@ -12574,6 +12655,28 @@ mod tests {
         server
     }
 
+    fn is_builtin_scan_candidate(meek: &crate::psiphon_meek::Meek) -> bool {
+        let Ok(address) = meek.dial.parse::<Ipv4Addr>() else {
+            return false;
+        };
+        let address = u32::from(address);
+        !meek.disable_sni
+            && crate::psiphon_cdn::CDN_SETS.iter().any(|set| {
+                set.snis.iter().any(|sni| meek.sni == *sni)
+                    && set
+                        .ranges
+                        .iter()
+                        .any(|range| (range.first..=range.last).contains(&address))
+            })
+    }
+
+    fn is_override_candidate(meek: &crate::psiphon_meek::Meek) -> bool {
+        meek.dial == "pypi.org"
+            || CDN_EDGE_ADDRESSES
+                .iter()
+                .any(|(_, address)| meek.dial == *address)
+    }
+
     #[test]
     fn a_reference_scan_spec_leads_the_overrides() {
         let settings = Settings::from_json(Some(
@@ -12900,21 +13003,101 @@ mod tests {
             .filter_map(|server| server.meek.as_ref())
             .collect();
         assert!(
-            opening.iter().any(|meek| {
-                let Ok(address) = meek.dial.parse::<Ipv4Addr>() else {
-                    return false;
-                };
-                let address = u32::from(address);
-                !meek.disable_sni
-                    && crate::psiphon_cdn::CDN_SETS.iter().any(|set| {
-                        set.snis.iter().any(|sni| meek.sni == *sni)
-                            && set
-                                .ranges
-                                .iter()
-                                .any(|range| (range.first..=range.last).contains(&address))
-                    })
-            }),
+            opening.iter().any(|meek| is_builtin_scan_candidate(meek)),
             "the built-in scan lost the dial budget to the fixed overrides"
+        );
+        let hosts: HashSet<String> = servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref().map(|meek| meek.host.clone()))
+            .collect();
+        for index in 0..8 {
+            assert!(
+                hosts.contains(&format!("cdn{index}.example")),
+                "server {index} fell outside the cap"
+            );
+        }
+    }
+
+    /// A whole-span round robin spends the cap on the first entries, so the last
+    /// server groups never appear in the expanded list at all.
+    #[test]
+    fn every_scan_server_keeps_a_slice_of_the_cap() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"protocolSelection":"cdn_fronting"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        let mut servers = Vec::new();
+        for index in 0..23 {
+            let mut server = scan_test_server();
+            let meek = server.meek.as_mut().expect("fronted");
+            meek.host = format!("cdn{index}.example");
+            meek.hosts = vec![format!("cdn{index}.example")];
+            servers.push(server);
+        }
+        apply_fronting_overrides(&mut servers, &settings);
+        assert!(servers.len() <= FRONTED_SERVERS);
+        let hosts: HashSet<String> = servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref().map(|meek| meek.host.clone()))
+            .collect();
+        for index in 0..23 {
+            let host = format!("cdn{index}.example");
+            assert!(hosts.contains(&host), "server {index} fell outside the cap");
+            let group: Vec<_> = servers
+                .iter()
+                .filter_map(|server| server.meek.as_ref())
+                .filter(|meek| meek.host == host)
+                .collect();
+            assert!(
+                group.iter().any(|meek| is_override_candidate(meek)),
+                "server {index} lost its fixed overrides"
+            );
+            assert!(
+                group.iter().any(|meek| is_builtin_scan_candidate(meek)),
+                "server {index} lost the built-in scan"
+            );
+        }
+    }
+
+    /// The second pass starts where the first stopped, so the fourth server
+    /// entry is still reachable when three groups fill the dial budget.
+    #[test]
+    fn a_failed_cdn_pass_advances_the_dial_window() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"protocolSelection":"cdn_fronting"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        let mut servers = Vec::new();
+        for index in 0..23 {
+            let mut server = scan_test_server();
+            let meek = server.meek.as_mut().expect("fronted");
+            meek.host = format!("cdn{index}.example");
+            meek.hosts = vec![format!("cdn{index}.example")];
+            servers.push(server);
+        }
+        apply_fronting_overrides(&mut servers, &settings);
+        let (first, taken) =
+            take_dial_batch(&servers, 0, 0, DIAL_ATTEMPTS, DIAL_ATTEMPTS, 0, false);
+        let next = next_dial_start(0, taken, servers.len());
+        let (second, _) =
+            take_dial_batch(&servers, next, 0, DIAL_ATTEMPTS, DIAL_ATTEMPTS, 0, false);
+        let dialled: HashSet<&str> = first
+            .iter()
+            .filter_map(|server| server.meek.as_ref().map(|meek| meek.host.as_str()))
+            .collect();
+        assert!(
+            second.iter().any(|server| server
+                .meek
+                .as_ref()
+                .is_some_and(|meek| !dialled.contains(meek.host.as_str()))),
+            "the retry repeated the first pass"
+        );
+        assert!(
+            second.iter().any(|server| server
+                .meek
+                .as_ref()
+                .is_some_and(|meek| meek.host == "cdn3.example")),
+            "the retry did not reach the fourth server group"
         );
     }
 
@@ -16721,6 +16904,7 @@ mod tests {
             self_ref: Mutex::new(Weak::new()),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
+            dial_window: AtomicUsize::new(0),
             affinity: Mutex::new(None),
             moved_to_front: Mutex::new(HashSet::new()),
             dsl_placeholders: Arc::new(Mutex::new(Vec::new())),
@@ -16794,6 +16978,7 @@ mod tests {
             self_ref: Mutex::new(Weak::new()),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
+            dial_window: AtomicUsize::new(0),
             affinity: Mutex::new(None),
             moved_to_front: Mutex::new(HashSet::new()),
             dsl_placeholders: Arc::new(Mutex::new(Vec::new())),
@@ -17400,6 +17585,7 @@ mod tests {
             self_ref: Mutex::new(Weak::new()),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
+            dial_window: AtomicUsize::new(0),
             affinity: Mutex::new(None),
             moved_to_front: Mutex::new(HashSet::new()),
             dsl_placeholders: Arc::clone(&placeholders),
@@ -17461,6 +17647,7 @@ mod tests {
             self_ref: Mutex::new(Weak::new()),
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
+            dial_window: AtomicUsize::new(0),
             affinity: Mutex::new(Some(affinity.clone())),
             moved_to_front: Mutex::new(HashSet::new()),
             dsl_placeholders: Arc::new(Mutex::new(Vec::new())),
