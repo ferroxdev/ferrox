@@ -1144,6 +1144,15 @@ engine-tagged kcp-tagged-carrier-echoes 1 ferrox-app-proxy::tests::a_kcp_dial_ri
 engine-tagged kcp-dial-with-stops-on-close 1 ferrox-core-kcp::listener::tests::a_dial_with_rides_the_callers_socket_and_stops_on_close
 engine-tagged pb-dialer-proxy-fields-decoded 1 ferrox-app-xray_pb::tests::a_sender_socket_dialer_proxy_names_the_tagged_outbound
 
+# --- detour graph and ordered chains ---------------------------------------
+engine-chaining ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-chaining syscalls-per-detour-dial UNBLESSED scripts/count-ops.sh
+engine-chaining copies-per-detour-dial UNBLESSED scripts/count-ops.sh
+engine-chaining seconds-per-chain-dial UNBLESSED CI (no chain cell yet)
+engine-chaining detour-tcp-hops 1 ferrox-app-proxy::tests::a_detour_hop_carries_the_outbound_dial
+engine-chaining ordered-tcp-hops 2 ferrox-app-proxy::tests::an_ordered_chain_carries_tcp_through_each_hop
+engine-chaining ordered-udp-hops 1 ferrox-app-proxy::tests::an_ordered_chain_carries_udp_through_its_hop
+
 # --- kTLS ------------------------------------------------------------------
 security-ktls ops-retired-instructions UNBLESSED scripts/count-ops.sh
 security-ktls syscalls-per-offloaded-record UNBLESSED scripts/count-ops.sh
