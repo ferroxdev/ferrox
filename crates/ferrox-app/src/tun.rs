@@ -1288,8 +1288,8 @@ impl UploadFinished {
         self.wake.notify_all();
     }
 
-    /// Wait for the upload's `FIN`, or give up when the budget runs out.
-    fn wait(&self, budget: std::time::Duration) {
+    /// Wait for the upload's `FIN` up to `budget`, and answer whether it arrived.
+    fn wait(&self, budget: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + budget;
         let mut state = self
             .state
@@ -1298,7 +1298,7 @@ impl UploadFinished {
         while *state == UploadState::Live {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
-                return;
+                return false;
             }
             state = self
                 .wake
@@ -1306,6 +1306,7 @@ impl UploadFinished {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
+        true
     }
 }
 
@@ -1435,6 +1436,9 @@ pub(crate) struct Handler {
     /// The earliest moment a refused direct lane may be tried again, so a dead server costs one
     /// worker per budget instead of one per datagram.
     datagram_retry: Option<std::time::Instant>,
+    /// Set by the watcher parked on the direct lane's control: the relay ended the association, so
+    /// the lane and its legs are dropped before the next datagram frames at a dead address.
+    direct_dead: Arc<AtomicBool>,
     ended_tx: mpsc::Sender<Ended>,
     ended_rx: mpsc::Receiver<Ended>,
     udp_idle: std::time::Duration,
@@ -1504,6 +1508,7 @@ impl Handler {
             direct_datagram: None,
             opening: None,
             datagram_retry: None,
+            direct_dead: Arc::new(AtomicBool::new(false)),
             ended_tx,
             ended_rx,
             udp_idle: spec.udp_idle(),
@@ -1558,6 +1563,12 @@ impl Handler {
         let Some((udp, payload)) = udp_head(body) else {
             return Ok(());
         };
+        if self.direct_dead.swap(false, Relaxed) {
+            // The control closed, so the relay address the legs frame at is gone: drop them and let the retry budget gate a fresh lane while the front's association carries the datagrams.
+            self.direct_datagram = None;
+            self.legs.table().clear();
+            self.datagram_retry = Some(std::time::Instant::now() + budgets::handshake());
+        }
         self.poll_datagram_lane();
         if self.association.is_none() && self.direct_datagram.is_none() && self.opening.is_none() {
             let direct_due = self
@@ -1655,7 +1666,23 @@ impl Handler {
             return;
         };
         match rx.try_recv() {
-            Ok(Some(direct)) => self.direct_datagram = Some(direct),
+            Ok(Some(direct)) => {
+                // The relay ends the association with its control connection; a watcher parks on that socket so the next datagram can drop the lane instead of framing at a dead address.
+                if let Ok(mut control) = direct.control.try_clone() {
+                    let dead = Arc::clone(&self.direct_dead);
+                    std::thread::spawn(move || {
+                        let mut byte = [0u8; 1];
+                        loop {
+                            match control.read(&mut byte) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                        }
+                        dead.store(true, Relaxed);
+                    });
+                }
+                self.direct_datagram = Some(direct);
+            }
             Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
                 self.datagram_retry = Some(std::time::Instant::now() + budgets::handshake());
             }
@@ -2058,10 +2085,15 @@ impl Handler {
                 }
             };
             if !signaled.swap(true, Relaxed) {
+                // A FIN consumes one sequence number, so a half-closed flow's later ACKs name the sequence after it; reserve it before the write the way the data path does.
+                let seq = snd_nxt.load(Relaxed);
+                if end & FLAG_FIN != 0 {
+                    snd_nxt.store(seq.wrapping_add(1), Relaxed);
+                }
                 render_tcp_packet_ip(
                     (local_ip, local_port),
                     (remote_ip, remote_port),
-                    snd_nxt.load(Relaxed),
+                    seq,
                     rcv_nxt.load(Relaxed),
                     end,
                     65535,
@@ -2072,8 +2104,21 @@ impl Handler {
                 let _ = dev_writer.write_packet(&pkt);
             }
             if half_closed {
-                // The FIN above closed the download; the upload stays until the device's FIN or the stall budget, never reaped by a removal queued before it.
-                flow.upload_finished.wait(budgets::relay_stall());
+                // The FIN above closed the download; the upload stays until the device's FIN or a stall budget, never reaped by a removal queued before it. A segment that moves the receive window is progress, so an upload longer than one budget is not cut on the clock.
+                let mut seen = rcv_nxt.load(Relaxed);
+                let mut stalled = std::time::Duration::ZERO;
+                while !flow.upload_finished.wait(budgets::relay_quantum()) {
+                    let now = rcv_nxt.load(Relaxed);
+                    if now == seen {
+                        stalled += budgets::relay_quantum();
+                        if stalled >= budgets::relay_stall() {
+                            break;
+                        }
+                    } else {
+                        seen = now;
+                        stalled = std::time::Duration::ZERO;
+                    }
+                }
                 let _ = ended_tx.send(Ended::Stream(key, id));
                 return;
             }
@@ -3698,6 +3743,76 @@ mod tests {
         let mut got = [0u8; 4];
         lane.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"late", "the upload outlives the download's FIN");
+        // The FIN consumed one sequence number: the ACK for the late upload names the sequence after it, not the FIN's own.
+        let (late_ack, _) = next_tcp_packet(&mut peer, &mut buf);
+        assert_eq!(late_ack.flags, FLAG_ACK);
+        assert_eq!(late_ack.seq, end.seq.wrapping_add(1));
+    }
+
+    /// A direct datagram lane whose control closes is dropped: the legs on its dead relay are
+    /// cleared and the datagrams fall back to the front's association until the retry budget.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_direct_datagram_control_drops_the_lane() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        relay.set_nonblocking(true).unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let (ctl, ctl_peer) = UnixStream::pair().unwrap();
+        let opens = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&opens);
+        let open: Datagram = Arc::new(move || {
+            seen.fetch_add(1, Relaxed);
+            Some(crate::proxy::DirectDatagram {
+                relay: relay_addr,
+                control: Connection::from(ctl.try_clone().unwrap()),
+            })
+        });
+        let relay_fn: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+        let mut handler = Handler::on(
+            Device::from_handle(a, DEFAULT_MTU),
+            relay_fn,
+            echo_associate(frames.clone()),
+            None,
+            Some(open),
+            Flows::default(),
+            Legs::default(),
+            &Spec::new(None, None),
+        );
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let query = datagram(SCRIPT_CLIENT, [198, 51, 100, 9], 51501, 53, b"dead");
+        // A datagram rides the lane once the worker installs it.
+        let mut rode = false;
+        for _ in 0..2_500 {
+            peer.write_all(&query).unwrap();
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+            if relay.recv(&mut buf[..]).is_ok() {
+                rode = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(rode, "a datagram rides the direct lane's relay");
+        // The relay ends its control: the next datagram drops the lane and takes the front's association.
+        drop(ctl_peer);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        for _ in 0..2_500 {
+            if !frames.lock().unwrap().is_empty() {
+                break;
+            }
+            peer.write_all(&query).unwrap();
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        wait_for_frames(&frames, 1);
+        assert_eq!(
+            opens.load(Relaxed),
+            1,
+            "the retry budget gates a second lane"
+        );
     }
 
     #[cfg(unix)]
@@ -3749,7 +3864,7 @@ mod tests {
     #[cfg(unix)]
     fn wait_for_frames(frames: &Frames, count: usize) {
         for _ in 0..2_500 {
-            if frames.lock().unwrap().len() == count {
+            if frames.lock().unwrap().len() >= count {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
