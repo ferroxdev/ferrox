@@ -99,15 +99,15 @@ fn ctr8v_p(template: uint8x16_t, ctr: u32) -> [[uint8x16_t; 4]; 2] {
         [
             [
                 template.ctr_be(ctr),
-                template.ctr_be(ctr + 1),
-                template.ctr_be(ctr + 2),
-                template.ctr_be(ctr + 3),
+                template.ctr_be(ctr.wrapping_add(1)),
+                template.ctr_be(ctr.wrapping_add(2)),
+                template.ctr_be(ctr.wrapping_add(3)),
             ],
             [
-                template.ctr_be(ctr + 4),
-                template.ctr_be(ctr + 5),
-                template.ctr_be(ctr + 6),
-                template.ctr_be(ctr + 7),
+                template.ctr_be(ctr.wrapping_add(4)),
+                template.ctr_be(ctr.wrapping_add(5)),
+                template.ctr_be(ctr.wrapping_add(6)),
+                template.ctr_be(ctr.wrapping_add(7)),
             ],
         ]
     }
@@ -360,7 +360,7 @@ fn ctr_ghash8(
                 bswap_p(ct[3]),
             ],
         );
-        ctr += 8;
+        ctr = ctr.wrapping_add(8);
     }
     super::ctr_ghash(
         rk,
@@ -416,7 +416,7 @@ fn ctr_ghash8_from(
                 bswap_p(ct[3]),
             ],
         );
-        ctr += 8;
+        ctr = ctr.wrapping_add(8);
     }
     super::ctr_ghash_from(
         rk,
@@ -467,7 +467,7 @@ fn ctr_only8(rk: &[uint8x16_t; 11], template: uint8x16_t, buf: &mut [u8], mut ct
             pair.hi = <uint8x16_t as Lanes>::xor(pair.hi, ks[i / 2][i % 2 * 2 + 1]);
         }
         store_pairs(g, ct);
-        ctr += 8;
+        ctr = ctr.wrapping_add(8);
     }
     super::ctr_only(rk, template, &mut buf[done * 16..], ctr);
 }
@@ -524,7 +524,7 @@ fn ctr_ghash8_256(
                 bswap_p(ct[3]),
             ],
         );
-        ctr += 8;
+        ctr = ctr.wrapping_add(8);
     }
     super::ctr_ghash_256(
         rk,
@@ -582,7 +582,7 @@ fn ctr_ghash8_from_256(
                 bswap_p(ct[3]),
             ],
         );
-        ctr += 8;
+        ctr = ctr.wrapping_add(8);
     }
     super::ctr_ghash_from_256(
         rk,
@@ -645,7 +645,7 @@ unsafe fn ctr_ghash8_from_256_uninit(
                 bswap_p(ct[3]),
             ],
         );
-        ctr += 8;
+        ctr = ctr.wrapping_add(8);
     }
     // SAFETY: the tail starts after the full groups and stays inside the destination.
     unsafe {
@@ -711,7 +711,7 @@ unsafe fn ctr_ghash8_from_uninit(
                 bswap_p(ct[3]),
             ],
         );
-        ctr += 8;
+        ctr = ctr.wrapping_add(8);
     }
     // SAFETY: the tail starts after the full groups and stays inside the destination.
     unsafe {
@@ -744,7 +744,7 @@ fn ctr_only8_256(rk: &[uint8x16_t; 15], template: uint8x16_t, buf: &mut [u8], mu
             pair.hi = <uint8x16_t as Lanes>::xor(pair.hi, ks[i / 2][i % 2 * 2 + 1]);
         }
         store_pairs(g, ct);
-        ctr += 8;
+        ctr = ctr.wrapping_add(8);
     }
     super::ctr_only_256(rk, template, &mut buf[done * 16..], ctr);
 }
@@ -1148,5 +1148,29 @@ impl Engine256 {
         }
         ctr_only8_256(&self.rk, template, buf, 2);
         Some(buf.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ctr8v_p;
+    use core::arch::aarch64::*;
+
+    #[test]
+    fn the_counter_pass_wraps_at_the_block_limit() {
+        let start = u32::MAX - 3;
+        let template = vdupq_n_u8(0);
+        let blocks = ctr8v_p(template, start);
+        let mut lanes = [0u8; 128];
+        for (i, block) in blocks.iter().flatten().enumerate() {
+            unsafe { vst1q_u8(lanes.as_mut_ptr().add(i * 16), *block) };
+        }
+        for (i, at) in [12usize, 28, 44, 60, 76, 92, 108, 124]
+            .into_iter()
+            .enumerate()
+        {
+            let want = start.wrapping_add(i as u32).to_be_bytes();
+            assert_eq!(&lanes[at..at + 4], &want[..], "block {i}");
+        }
     }
 }
