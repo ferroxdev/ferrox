@@ -67,15 +67,15 @@ Read from the planner with the commands above. `ops rows` is the `scripts/method
 
 | change | wide | builds and tests | cells | ops rows | oracle names kept | go packages | comparators |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `crates/ferrox-app/src/vmess.rs` | no | yes | 1 | 2 of 31, 1 run | zeronet 2 | 2 | xray-core, zeronet |
+| `crates/ferrox-app/src/vmess.rs` | no | yes | 18 | 2 of 31, 1 run | zeronet 2 | 2 | xray-core, zeronet |
 | `crates/ferrox-app/src/ws.rs` | no | yes | 2 | 4 of 31, 3 runs | zeronet 3, xray-rust 3 | 1 | tier default |
-| `crates/ferrox-core/src/record.rs` | no | yes | 10 | 4 of 31, 3 runs | zeronet 4 | 1 | tier default |
+| `crates/ferrox-core/src/record.rs` | no | yes | 53 | 4 of 31, 3 runs | zeronet 4 | 1 | tier default |
 | `crates/ferrox-core/src/kcp/segment.rs` | no | yes | 0 | 3 of 31, 3 runs | none | 1 | tier default |
 | `crates/ferrox-core/src/tls/reality.rs` | no | yes | 0 | 0 of 31 | xray-rust 6 | 1 | tier default |
 | `crates/ferrox-prompt/prompts.md` | no | yes | 0 | 0 of 31 | none | 0 | tier default |
-| `docs/function/vmess.md` (any method page) | no | **no** | 1 | 2 of 31, 1 run | zeronet 2 | 2 | xray-core, zeronet |
+| `docs/function/vmess.md` (any method page) | no | **no** | 18 | 2 of 31, 1 run | zeronet 2 | 2 | xray-core, zeronet |
 | `README.md` | no | **no** | 0 | 0 of 31 | none | 0 | tier default |
-| VMess's batch: `vmess.rs` + `proxy.rs` rungs + `method-counts.txt` + page | no | yes | 1 | 2 of 31, 1 run | zeronet 2 | 2 | xray-core, zeronet |
+| VMess's batch: `vmess.rs` + `proxy.rs` rungs + `method-counts.txt` + page | no | yes | 18 | 2 of 31, 1 run | zeronet 2 | 2 | xray-core, zeronet |
 | VLESS header fold: `proxy.rs` in `decode_request` | **yes** | yes | tier default | 31 of 31, 24 runs | zeronet 9, xray-rust 23, hysteria 1 | `./...` | tier default |
 
 `cells` and `comparators` are the planner's answers for a manual matrix dispatch; the nightly runs the whole tier, and a pull request's diff never chooses a cell. `crates/ferrox-app` and `crates/ferrox-core` are where every method's code lives, and the 19 files no page owns hold 1 272 items, 388 of which some page claims by name: those are the rungs and per-method helpers, and a hunk that lands in one of them is that method's change. The other 884 — `read_exact`, `decode_request`, the budgets, the JSON and failure layers, the wireguard tree — are shared, and a hunk in one of them plans wide by design. `check-ci-scope.sh` prints that split, and a `symbols` pattern that names none of it is a gate failure.
