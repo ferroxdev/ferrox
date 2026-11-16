@@ -601,11 +601,15 @@ fn gso(sock: crate::quic::Datagram, quic: Option<&hysteria::QuicParams>) -> crat
 }
 
 fn client_config(dial: &Dial, roots: &[Vec<u8>]) -> Option<quiche::Config> {
-    if dial.config.insecure {
+    let mut config = if dial.config.insecure {
         crate::quic::quiche_config_insecure(None)
     } else {
         crate::quic::quiche_config(roots, None)
+    }?;
+    if dial.config.quic.is_none() {
+        crate::quic::apply_path_mtu(&mut config, false);
     }
+    Some(config)
 }
 
 /// Dial the configured lane, wrap its socket in the mask or hop it names, and finish the QUIC handshake and auth.
@@ -627,8 +631,6 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     if let Some(params) = &dial.config.quic {
         crate::quic::apply_hysteria_quic(&mut config, params, false);
         crate::quic::apply_hysteria_pacing(&mut config, params);
-    } else {
-        crate::quic::apply_path_mtu(&mut config, false);
     }
     // A bulk upload starts at 400 packets: quiche's ten leaves the first window smaller than the server's first read, and BBR then paces every ACK.
     config.set_initial_congestion_window_packets(400);
@@ -1384,18 +1386,15 @@ pub(crate) fn server_config(
     config.set_initial_congestion_window_packets(400);
     // A served connection always carries an auth validator, and the reference enables the datagram lane exactly when one is present, so the lane is on unconditionally here; the depths are the peer's unsent-datagram queue, matching `udpMessageChanSize`.
     config.enable_dgram(true, 1024, 1024);
-    match quic {
-        Some(params) => {
-            crate::quic::apply_hysteria_quic(&mut config, params, true);
-            crate::quic::apply_hysteria_pacing(&mut config, params);
-            config.set_max_send_udp_payload_size(crate::quic::MAX_DATAGRAM);
-            config.set_max_recv_udp_payload_size(crate::quic::MAX_DATAGRAM);
-        }
+    if let Some(params) = quic {
+        crate::quic::apply_hysteria_quic(&mut config, params, true);
+        crate::quic::apply_hysteria_pacing(&mut config, params);
+        config.set_max_send_udp_payload_size(crate::quic::MAX_DATAGRAM);
+        config.set_max_recv_udp_payload_size(crate::quic::MAX_DATAGRAM);
+    } else {
         // The served side carries the same ceilings as the dial: without them quiche's autotuner has no room above the initial window, and a peer's upload is paced by `window / rtt` for its whole life.
-        None => {
-            crate::quic::tune_transport(&mut config);
-            crate::quic::apply_path_mtu(&mut config, false);
-        }
+        crate::quic::tune_transport(&mut config);
+        crate::quic::apply_path_mtu(&mut config, false);
     }
     Some(config)
 }
