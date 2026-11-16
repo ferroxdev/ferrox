@@ -262,7 +262,7 @@ These are the ways a config can name a method that no cell measures. A row here 
 | method | carrier or security | direction | status |
 | --- | --- | --- | --- |
 | vless | xhttp `xmux` on H1 or split modes | down, up | no cell; only a stream-one H2 session is pooled, and H1, packet-up and stream-up keep their own connection |
-| any | TUN, TUN UDP, fake DNS, stale flows | down, request/response | no cell; `ferrox-app` serves no TUN device ([#619](https://github.com/Ferrocite/ferrox/issues/619)) |
+| any | TUN fake DNS, stale-flow eviction | down, request/response | no cell; the TUN device itself is measured by `tun-bench.yml` against zeptun, hev and sing-tun, but nothing drives fake DNS through it or counts a quiet flow's eviction |
 | sing-box | TUIC, AnyTLS, Hysteria2, Naive, ShadowTLS, Snell, SSH, OpenVPN, OpenConnect, Tor, Tailscale | down | no cell; sing-box-only protocols with no ferrox or xray-core client ([#603](https://github.com/Ferrocite/ferrox/issues/603), [#604](https://github.com/Ferrocite/ferrox/issues/604), P0 coverage issue) |
 | any | UDP DNS through the SOCKS front | request/response | no cell; UDP echo is measured, resolver replies are not |
 | any | IPv6 target | down | no cell |

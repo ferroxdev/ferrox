@@ -289,16 +289,62 @@ pub(crate) fn parse_address(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct TcpHead {
+struct TcpHead<'a> {
     source_port: u16,
     destination_port: u16,
     seq: u32,
     ack_num: u32,
     flags: u8,
     window: u16,
+    options: &'a [u8],
 }
 
-fn tcp_head(body: &[u8]) -> Option<(TcpHead, &[u8])> {
+/// The shift a SYN's window-scale option asks for (RFC 7323), or `None` when it carries none; a shift past fourteen is taken as fourteen, because that is the largest scale the option can carry.
+fn window_shift(options: &[u8]) -> Option<u8> {
+    const END: u8 = 0;
+    const NOP: u8 = 1;
+    const WINDOW_SCALE: u8 = 3;
+    let mut at = 0;
+    while at < options.len() {
+        match options[at] {
+            END => break,
+            NOP => at += 1,
+            kind => {
+                let len = usize::from(*options.get(at + 1)?);
+                if len < 2 {
+                    return None;
+                }
+                let end = at.checked_add(len)?;
+                if end > options.len() {
+                    return None;
+                }
+                if kind == WINDOW_SCALE && len == 3 {
+                    return Some(options[at + 2].min(14));
+                }
+                at = end;
+            }
+        }
+    }
+    None
+}
+
+/// The windows we advertise are scaled by this shift: five turns the sixteen-bit field into two mebibytes, past the band-delay product of the fastest link the bench drives and no further than the upstream socket holds.
+const OUR_WINDOW_SHIFT: u8 = 5;
+
+/// The SYN-ACK options: the MSS this device can receive, and — only when the peer's SYN carried a scale — the window scale that lifts both directions past sixty-four kilobytes.
+fn syn_ack_options(mss: u32, scale: bool) -> ([u8; 8], usize) {
+    let mut options = [0u8; 8];
+    options[0] = 2;
+    options[1] = 4;
+    options[2..4].copy_from_slice(&u16::try_from(mss).unwrap_or(u16::MAX).to_be_bytes());
+    if scale {
+        options[4..8].copy_from_slice(&[1, 3, 3, OUR_WINDOW_SHIFT]);
+    }
+    let len = if scale { 8 } else { 4 };
+    (options, len)
+}
+
+fn tcp_head(body: &[u8]) -> Option<(TcpHead<'_>, &[u8])> {
     if body.len() < 20 {
         return None;
     }
@@ -320,6 +366,7 @@ fn tcp_head(body: &[u8]) -> Option<(TcpHead, &[u8])> {
             ack_num,
             flags,
             window,
+            options: &body[20..data_offset],
         },
         &body[data_offset..],
     ))
@@ -967,6 +1014,7 @@ fn render_tcp_headers_ip(
     ack_num: u32,
     flags: u8,
     window: u16,
+    options: &[u8],
     payload_len: usize,
     partial: bool,
     out: &mut [u8],
@@ -976,7 +1024,11 @@ fn render_tcp_headers_ip(
     let Some(head) = ip_header_len(src_ip, dst_ip) else {
         return false;
     };
-    let tcp_len = 20 + payload_len;
+    // The data path carries no options and its payload already sits behind a twenty-byte header; the handshake pads its options to a word.
+    if !options.len().is_multiple_of(4) || options.len() > 40 {
+        return false;
+    }
+    let tcp_len = 20 + options.len() + payload_len;
     if out.len() < head + tcp_len {
         return false;
     }
@@ -1012,9 +1064,10 @@ fn render_tcp_headers_ip(
     tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
     tcp[4..8].copy_from_slice(&seq.to_be_bytes());
     tcp[8..12].copy_from_slice(&ack_num.to_be_bytes());
-    tcp[12] = 0x50;
+    tcp[12] = (((20 + options.len()) / 4) as u8) << 4;
     tcp[13] = flags;
     tcp[14..16].copy_from_slice(&window.to_be_bytes());
+    out[head + 20..head + 20 + options.len()].copy_from_slice(options);
     write_tcp_checksum(src_ip, dst_ip, partial, &mut out[..head + tcp_len]);
     true
 }
@@ -1028,6 +1081,7 @@ fn render_tcp_packet_ip(
     ack_num: u32,
     flags: u8,
     window: u16,
+    options: &[u8],
     payload: &[u8],
     partial: bool,
     out: &mut Vec<u8>,
@@ -1036,8 +1090,8 @@ fn render_tcp_packet_ip(
     let Some(head) = ip_header_len(src.0, dst.0) else {
         return;
     };
-    out.resize(head + 20 + payload.len(), 0);
-    out[head + 20..].copy_from_slice(payload);
+    out.resize(head + 20 + options.len() + payload.len(), 0);
+    out[head + 20 + options.len()..].copy_from_slice(payload);
     render_tcp_headers_ip(
         src,
         dst,
@@ -1045,6 +1099,7 @@ fn render_tcp_packet_ip(
         ack_num,
         flags,
         window,
+        options,
         payload.len(),
         partial,
         out,
@@ -1071,6 +1126,7 @@ fn render_tcp_packet(
         ack_num,
         flags,
         window,
+        &[],
         payload,
         false,
         out,
@@ -1107,6 +1163,34 @@ fn build_tcp_packet(
     out
 }
 
+#[cfg(all(test, unix))]
+#[allow(clippy::too_many_arguments)]
+fn build_tcp_packet_options(
+    src: ([u8; 4], u16),
+    dst: ([u8; 4], u16),
+    seq: u32,
+    ack_num: u32,
+    flags: u8,
+    window: u16,
+    options: &[u8],
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    render_tcp_packet_ip(
+        (IpAddr::from(src.0), src.1),
+        (IpAddr::from(dst.0), dst.1),
+        seq,
+        ack_num,
+        flags,
+        window,
+        options,
+        payload,
+        false,
+        &mut out,
+    );
+    out
+}
+
 #[cfg(test)]
 fn build_icmp_reply(src: [u8; 4], dst: [u8; 4], request: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -1126,14 +1210,23 @@ fn build_ipv6_tcp_packet(
 ) -> Vec<u8> {
     let mut out = Vec::new();
     render_tcp_packet_ip(
-        src, dst, seq, ack_num, flags, window, payload, false, &mut out,
+        src,
+        dst,
+        seq,
+        ack_num,
+        flags,
+        window,
+        &[],
+        payload,
+        false,
+        &mut out,
     );
     out
 }
 
 /// The peer's send window for one flow: the highest sequence it acknowledged and the room it advertises, so the response thread stalls instead of overrunning a receive buffer and losing segments this handler cannot retransmit. Both fields share one word, so a reader never pairs the cursor of one ACK with the window of another.
 struct SendWindow {
-    /// `una << 32 | window`.
+    /// `una << 32 | window`, the window in bytes after the peer's shift.
     state: AtomicU64,
     closed: AtomicBool,
     parked: AtomicBool,
@@ -1141,7 +1234,7 @@ struct SendWindow {
 }
 
 impl SendWindow {
-    fn new(una: u32, window: u16) -> Self {
+    fn new(una: u32, window: u32) -> Self {
         Self {
             state: AtomicU64::new((u64::from(una) << 32) | u64::from(window)),
             closed: AtomicBool::new(false),
@@ -1150,8 +1243,8 @@ impl SendWindow {
         }
     }
 
-    /// Fold one device ACK into the window; a stale number never moves the cursor, and a zero-window probe still opens the window.
-    fn acked(&self, ack: u32, window: u16, sent: u32) {
+    /// Fold one device ACK into the window, already scaled by the shift the peer offered; a stale number never moves the cursor, and a zero-window probe still opens the window.
+    fn acked(&self, ack: u32, window: u32, sent: u32) {
         let mut state = self.state.load(SeqCst);
         loop {
             let una = (state >> 32) as u32;
@@ -1243,6 +1336,8 @@ struct Flow {
     id: u64,
     /// The client's initial sequence, so a retransmitted SYN replays the handshake instead of minting a second flow.
     isn: u32,
+    /// The shift the peer offered for its own receive window in the SYN, so each ACK's window field is read in bytes.
+    peer_shift: u8,
     /// The upload half, installed once the lane is live: a direct dial or the loopback pair's device end. A retransmitted SYN waits for it instead of replaying a handshake no lane carries yet.
     write_half: Mutex<Option<Connection>>,
     rcv_nxt: Arc<AtomicU32>,
@@ -1734,7 +1829,8 @@ impl Handler {
         if let Some(flow) = flow {
             if tcp.flags & FLAG_ACK != 0 {
                 let sent = flow.snd_nxt.load(Relaxed);
-                flow.send.acked(tcp.ack_num, tcp.window, sent);
+                flow.send
+                    .acked(tcp.ack_num, u32::from(tcp.window) << flow.peer_shift, sent);
             }
             let fin = tcp.flags & FLAG_FIN != 0;
             let len = payload.len() as u32;
@@ -1790,6 +1886,7 @@ impl Handler {
                     FLAG_ACK,
                     65535,
                     &[],
+                    &[],
                     false,
                     &mut emit,
                 );
@@ -1821,7 +1918,8 @@ impl Handler {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn accept_flow(&mut self, ip: &IpHead, tcp: &TcpHead, key: FlowKey) -> io::Result<()> {
+    fn accept_flow(&mut self, ip: &IpHead, tcp: &TcpHead<'_>, key: FlowKey) -> io::Result<()> {
+        let peer_shift = window_shift(tcp.options);
         let existing = self.flows.table().get(&key).cloned();
         if let Some(flow) = existing {
             // A retransmitted SYN keeps its flow and only needs the SYN-ACK again; a new SYN on a live tuple ends the old flow first, so its threads and lane cannot outlive it.
@@ -1836,6 +1934,8 @@ impl Handler {
                     return Ok(());
                 }
                 let mut emit = std::mem::take(&mut self.emit);
+                let (options, len) =
+                    syn_ack_options(self.device.mss(flow.remote.0), peer_shift.is_some());
                 render_tcp_packet_ip(
                     flow.local,
                     flow.remote,
@@ -1843,6 +1943,7 @@ impl Handler {
                     flow.isn.wrapping_add(1),
                     FLAG_SYN | FLAG_ACK,
                     65535,
+                    &options[..len],
                     &[],
                     false,
                     &mut emit,
@@ -1871,11 +1972,15 @@ impl Handler {
         let snd_nxt = Arc::new(AtomicU32::new(syn_seq.wrapping_add(2)));
         let busy = Arc::new(AtomicBool::new(false));
         let signaled = Arc::new(AtomicBool::new(false));
-        let send = Arc::new(SendWindow::new(syn_seq.wrapping_add(2), tcp.window));
+        let send = Arc::new(SendWindow::new(
+            syn_seq.wrapping_add(2),
+            u32::from(tcp.window),
+        ));
         let id = self.flows.next_id();
         let flow = Arc::new(Flow {
             id,
             isn: syn_seq,
+            peer_shift: peer_shift.unwrap_or(0),
             write_half: Mutex::new(None),
             rcv_nxt: Arc::clone(&rcv_nxt),
             snd_nxt: Arc::clone(&snd_nxt),
@@ -1912,10 +2017,11 @@ impl Handler {
             let initial = (mss.load(Relaxed) as usize).max(1);
             let head = ip_header_len(local_ip, remote_ip).unwrap_or(IPV6_HEADER);
             let body = head + 20;
+            let (syn_options, syn_len) = syn_ack_options(mss.load(Relaxed), peer_shift.is_some());
             let payload_cap = if gso_capable {
                 MAX_PACKET - body
             } else {
-                initial
+                initial.max(syn_len)
             };
             let mut pkt = vec![0u8; body + payload_cap];
             let (direct, lane, refused) = match dial.map(|dial| dial(&destination)) {
@@ -2009,15 +2115,16 @@ impl Handler {
                 syn_seq.wrapping_add(1),
                 FLAG_SYN | FLAG_ACK,
                 65535,
+                &syn_options[..syn_len],
                 0,
                 false,
-                &mut pkt[..body],
+                &mut pkt[..body + syn_len],
             );
             // A device that dropped the SYN-ACK has not refused the lane: retry the same packet for one relay quantum before resetting, so a transient refusal cannot kill a connection the device will retransmit the SYN for.
             let handshake = rendered && {
                 let deadline = std::time::Instant::now() + budgets::relay_quantum();
                 loop {
-                    match dev_writer.write_packet(&pkt[..body]) {
+                    match dev_writer.write_packet(&pkt[..body + syn_len]) {
                         Ok(true) => break true,
                         Ok(false)
                             if std::time::Instant::now() < deadline
@@ -2073,6 +2180,7 @@ impl Handler {
                             rcv_nxt.load(Relaxed),
                             FLAG_PSH | FLAG_ACK,
                             65535,
+                            &[],
                             n,
                             gso,
                             &mut pkt[..body + n],
@@ -2117,6 +2225,7 @@ impl Handler {
                     rcv_nxt.load(Relaxed),
                     end,
                     65535,
+                    &[],
                     &[],
                     false,
                     &mut pkt,
@@ -2218,6 +2327,7 @@ impl Handler {
                     flags,
                     65535,
                     &[],
+                    &[],
                     false,
                     &mut emit,
                 );
@@ -2267,6 +2377,7 @@ fn refuse_flow(
             flow.rcv_nxt.load(Relaxed),
             FLAG_RST | FLAG_ACK,
             65535,
+            &[],
             &[],
             false,
             pkt,
@@ -2394,6 +2505,38 @@ mod tests {
         assert!(Spec::with(None, None, None, Some(0), None)
             .validate()
             .is_ok());
+    }
+
+    #[test]
+    fn a_window_scale_is_read_past_the_options_a_client_sends() {
+        assert_eq!(
+            window_shift(&[]),
+            None,
+            "a SYN without options scales nothing"
+        );
+        assert_eq!(window_shift(&[1, 3, 3, 7]), Some(7));
+        assert_eq!(
+            window_shift(&[4, 2, 1, 3, 3, 7]),
+            Some(7),
+            "SACK, a NOP, then the scale"
+        );
+        assert_eq!(
+            window_shift(&[1, 3, 3, 15]),
+            Some(14),
+            "a shift past fourteen is taken as fourteen"
+        );
+        assert_eq!(window_shift(&[3]), None, "a truncated option is refused");
+        assert_eq!(window_shift(&[3, 3]), None, "a missing shift is refused");
+    }
+
+    #[test]
+    fn a_scaled_peer_window_is_room_in_bytes() {
+        let window = SendWindow::new(1_000, 1_000);
+        window.acked(1_000, 65_535 << OUR_WINDOW_SHIFT, 1_000);
+        assert_eq!(
+            window.room(&AtomicU32::new(1_000)),
+            Some(65_535 << OUR_WINDOW_SHIFT)
+        );
     }
 
     #[test]
@@ -2591,6 +2734,7 @@ mod tests {
             7_003,
             FLAG_PSH | FLAG_ACK,
             65_535,
+            &[],
             payload.len(),
             false,
             &mut pkt,
@@ -2614,6 +2758,7 @@ mod tests {
             7_003,
             FLAG_PSH | FLAG_ACK,
             65_535,
+            &[],
             &payload,
             false,
             &mut copied,
@@ -3199,6 +3344,108 @@ mod tests {
         assert_eq!(rtcp.source_port, 8080);
         assert_eq!(rtcp.destination_port, 44444);
         assert_eq!(rtcp.seq, 1001);
+        assert_eq!(
+            rtcp.options,
+            [2, 4, 0x05, 0xb4],
+            "a SYN without options still learns the MSS, and no scale"
+        );
+        assert_eq!(window_shift(rtcp.options), None, "no scale was offered");
+    }
+
+    /// A device whose MSS is smaller than the SYN-ACK's own options still answers the handshake: the buffer is sized for the larger of the two, where before the header slice ran past it.
+    #[cfg(unix)]
+    #[test]
+    fn a_tiny_mtu_still_answers_the_syn_with_options() {
+        for (mtu, options, expected) in [
+            (41, &[][..], &[2, 4, 0, 1][..]),
+            (48, &[1, 3, 3, 7][..], &[2, 4, 0, 8, 1, 3, 3, 5][..]),
+        ] {
+            let (a, b) = unix_socketpair().unwrap();
+            let device = Device::from_handle(a, mtu);
+            let mut peer = b;
+
+            let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+            let mut handler = Handler::new(device, relay, no_associate());
+
+            let syn = build_tcp_packet_options(
+                ([10, 0, 0, 2], 44444),
+                ([10, 0, 0, 1], 8080),
+                1000,
+                0,
+                FLAG_SYN,
+                65535,
+                options,
+                &[],
+            );
+            peer.write_all(&syn).unwrap();
+
+            let mut buf = vec![0u8; DEFAULT_MTU + 64];
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+
+            let mut reply = vec![0u8; 128];
+            let rn = peer.read(&mut reply).unwrap();
+            let (_ip, body) = ipv4_head(&reply[..rn]).unwrap();
+            let (rtcp, carried) = tcp_head(body).unwrap();
+            assert_eq!(rtcp.flags, FLAG_SYN | FLAG_ACK, "an MTU of {mtu}");
+            assert_eq!(rtcp.options, expected, "an MTU of {mtu}");
+            assert_eq!(carried, [], "an MTU of {mtu}");
+            assert_eq!(
+                tcp_checksum(&[10, 0, 0, 1], &[10, 0, 0, 2], &reply[IPV4_HEADER..rn]),
+                0
+            );
+        }
+    }
+
+    /// A SYN that offers a window scale is answered with the device's MSS and our scale, so both directions leave the sixty-four-kilobyte ceiling; the options sit inside the checksummed header.
+    #[cfg(unix)]
+    #[test]
+    fn a_syn_that_offers_a_scale_is_answered_with_one() {
+        let (a, b) = unix_socketpair().unwrap();
+        let device = Device::from_handle(a, DEFAULT_MTU);
+        let mut peer = b;
+
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+        let mut handler = Handler::new(device, relay, no_associate());
+
+        // The option set a Linux client sends: MSS, SACK permitted, timestamps, a NOP and a scale of seven.
+        let options = [
+            2, 4, 0x05, 0xb4, 4, 2, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 3, 7,
+        ];
+        assert_eq!(window_shift(&options), Some(7));
+        let syn = build_tcp_packet_options(
+            ([10, 0, 0, 2], 44444),
+            ([10, 0, 0, 1], 8080),
+            1000,
+            0,
+            FLAG_SYN,
+            65535,
+            &options,
+            &[],
+        );
+        peer.write_all(&syn).unwrap();
+
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+
+        let mut reply = vec![0u8; 128];
+        let rn = peer.read(&mut reply).unwrap();
+        let (_ip, body) = ipv4_head(&reply[..rn]).unwrap();
+        let (rtcp, carried) = tcp_head(body).unwrap();
+        assert!(carried.is_empty(), "the SYN-ACK carries no payload");
+        assert_eq!(rtcp.flags, FLAG_SYN | FLAG_ACK);
+        assert_eq!(
+            &rtcp.options[..4],
+            &[2, 4, 0x05, 0xb4],
+            "an MSS of 1460 for a 1500-byte device"
+        );
+        assert_eq!(window_shift(rtcp.options), Some(OUR_WINDOW_SHIFT));
+        assert_eq!(
+            tcp_checksum(&[10, 0, 0, 1], &[10, 0, 0, 2], &reply[IPV4_HEADER..rn]),
+            0,
+            "the options are covered by the checksum"
+        );
     }
 
     #[test]
@@ -4437,10 +4684,34 @@ mod tests {
         assert_eq!(proxy_read.read(&mut rest).expect("eof"), 0);
     }
 
+    /// The header fields a test reads off a packet the handler wrote, owned because a parsed head borrows the read buffer.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    struct Written {
+        source_port: u16,
+        destination_port: u16,
+        seq: u32,
+        ack_num: u32,
+        flags: u8,
+    }
+
+    #[cfg(unix)]
+    impl Written {
+        fn of(tcp: &TcpHead<'_>) -> Self {
+            Self {
+                source_port: tcp.source_port,
+                destination_port: tcp.destination_port,
+                seq: tcp.seq,
+                ack_num: tcp.ack_num,
+                flags: tcp.flags,
+            }
+        }
+    }
+
     /// Read frames off the peer until the SYN-ACK: a flow that ran earlier leaves
     /// its delayed ACKs queued ahead of it on the shared descriptor.
     #[cfg(unix)]
-    fn next_syn_ack(peer: &mut std::fs::File) -> TcpHead {
+    fn next_syn_ack(peer: &mut std::fs::File) -> Written {
         let mut reply = [0u8; 64];
         for _ in 0..1_000 {
             match peer.read(&mut reply) {
@@ -4448,7 +4719,7 @@ mod tests {
                     if let Some((_ip, body)) = ipv4_head(&reply[..n]) {
                         if let Some((tcp, _)) = tcp_head(body) {
                             if tcp.flags == FLAG_SYN | FLAG_ACK {
-                                return tcp;
+                                return Written::of(&tcp);
                             }
                         }
                     }
@@ -4468,14 +4739,14 @@ mod tests {
     /// The next TCP packet the handler wrote to the device, waited for with a bound
     /// so a silent lane fails the test instead of parking it.
     #[cfg(unix)]
-    fn next_tcp_packet(peer: &mut std::fs::File, buf: &mut [u8]) -> (TcpHead, Vec<u8>) {
+    fn next_tcp_packet(peer: &mut std::fs::File, buf: &mut [u8]) -> (Written, Vec<u8>) {
         for _ in 0..2_500 {
             match peer.read(buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     if let Some((_ip, body)) = ipv4_head(&buf[..n]) {
                         if let Some((tcp, payload)) = tcp_head(body) {
-                            return (tcp, payload.to_vec());
+                            return (Written::of(&tcp), payload.to_vec());
                         }
                     }
                 }

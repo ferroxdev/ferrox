@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       engines:
-        description: Space-separated engines (`sing-tun-*` names the sing-box tun inbound, `hev` is the same engine as `hev-socks5-tunnel`)
+        description: Space-separated engines (`sing-tun-*` names the sing-box tun inbound, `hev` is the same engine as `hev-socks5-tunnel`; `tun2socks` is fetched and run only when named here)
         type: string
-        default: "ferrox ferrox-native zeptun-userspace zeptun-hybrid hev-socks5-tunnel tun2socks singbox-system singbox-gvisor"
+        default: "ferrox ferrox-native zeptun-userspace zeptun-hybrid hev-socks5-tunnel singbox-system singbox-gvisor"
       scenarios:
         description: Space-separated scenarios
         type: string
@@ -87,8 +87,8 @@ jobs:
           pinned=$(python3 -c "import tomllib; print(tomllib.load(open('upstream/pins.toml','rb'))['sources']['zeptun']['rev'])")
           test "$pinned" = "$ZEPTUN_REV"
 
-      - name: build ferrox
-        run: cargo build --locked --release -p ferrox-app
+      - name: build ferrox with symbols for the perf round
+        run: CARGO_PROFILE_RELEASE_STRIP=none cargo build --locked --release -p ferrox-app
 
       - name: build zeptun and its benchmark client
         run: |
@@ -118,10 +118,14 @@ jobs:
           sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 || true
           perf --version || echo "perf unavailable"
 
-      - name: fetch sing-box and tun2socks
+      - name: fetch sing-box
         run: |
           curl -sSL "https://github.com/SagerNet/sing-box/releases/download/v$SINGBOX_VERSION/sing-box-$SINGBOX_VERSION-linux-amd64.tar.gz" \
             | tar xz -C "$RUNNER_TEMP"
+
+      - name: fetch tun2socks
+        if: contains(inputs.engines, 'tun2socks')
+        run: |
           curl -sSL -o "$RUNNER_TEMP/t2s.zip" \
             "https://github.com/xjasonlyu/tun2socks/releases/download/v$TUN2SOCKS_VERSION/tun2socks-linux-amd64.zip"
           unzip -q -o "$RUNNER_TEMP/t2s.zip" -d "$RUNNER_TEMP/tun2socks"
