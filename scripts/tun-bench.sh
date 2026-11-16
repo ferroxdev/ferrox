@@ -32,7 +32,8 @@ MTU=${MTU:-1500}
 SETTLE=${SETTLE:-3}
 CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-$((DURATION + 20))}
 PROBE_SECONDS=${PROBE_SECONDS:-1}
-ENGINES=${ENGINES:-"ferrox ferrox-native zeptun-userspace zeptun-hybrid hev-socks5-tunnel tun2socks singbox-system singbox-gvisor"}
+ENGINES=${ENGINES:-"ferrox ferrox-native zeptun-userspace zeptun-hybrid hev-socks5-tunnel singbox-system singbox-gvisor"}
+RSS_START=0
 SCENARIOS=${SCENARIOS:-"tcp-up-1 tcp-up-10 tcp-down-1 tcp-down-10 rr rr-8x1k udp-100k"}
 
 VETH_CLIENT=192.168.77.1
@@ -394,8 +395,8 @@ run_scenario() {
     peak_pss=$3
     sleep "$SETTLE"
     set -- $(engine_memory)
-    printf '{"engine":"%s","scenario":"%s","rep":%s,"slot":%s,"value":"%s","unit":"%s","cpu_pct":%s,"rss_kb":%s,"pss_kb":%s,"rss_after_kb":%s,"pss_after_kb":%s,"settle_s":%s,"mtu":%s,"queues":%s}\n' \
-        "$engine" "$scenario" "$rep" "$slot" "$value" "$unit" "$cpu_pct" "$peak_rss" "$peak_pss" "$1" "$2" "$SETTLE" "$MTU" "$QUEUES" >> "$RESULTS"
+    printf '{"engine":"%s","scenario":"%s","rep":%s,"slot":%s,"value":"%s","unit":"%s","cpu_pct":%s,"rss_kb":%s,"pss_kb":%s,"rss_after_kb":%s,"pss_after_kb":%s,"rss_start_kb":%s,"settle_s":%s,"mtu":%s,"queues":%s}\n' \
+        "$engine" "$scenario" "$rep" "$slot" "$value" "$unit" "$cpu_pct" "$peak_rss" "$peak_pss" "$1" "$2" "$RSS_START" "$SETTLE" "$MTU" "$QUEUES" >> "$RESULTS"
     printf "  %-18s %-12s rep %s: %s %s cpu %s%% rss %s KB, %s KB after %ss idle\n" \
         "$engine" "$scenario" "$rep" "$value" "$unit" "$cpu_pct" "$peak_rss" "$1" "$SETTLE"
 }
@@ -466,6 +467,8 @@ while [ "$rep" -le "$REPEAT" ]; do
             stop_engine
             continue
         fi
+        set -- $(engine_memory)
+        RSS_START=$1
         for scenario in $SCENARIOS; do
             run_scenario "$engine" "$scenario" "$rep" "$slot"
         done
@@ -492,15 +495,16 @@ def first_number(value):
         return 0.0
 
 lines = [
-    "| engine | scenario | median | cpu % | max rss MB | rss after idle MB |",
-    "|---|---|---:|---:|---:|---:|",
+    "| engine | scenario | median | cpu % | max rss MB | rss after idle MB | rss above start MB |",
+    "|---|---|---:|---:|---:|---:|---:|",
 ]
 for (engine, scenario), group in groups.items():
     best = sorted(group, key=lambda row: first_number(row["value"]))[len(group) // 2]
     cpu = statistics.median(row["cpu_pct"] for row in group)
     rss = max(row["rss_kb"] for row in group) / 1024
     after = max(row.get("rss_after_kb", 0) for row in group) / 1024
-    lines.append(f"| {engine} | {scenario} | {best['value']} {best['unit']} | {cpu:.0f} | {rss:.1f} | {after:.1f} |")
+    above = max(row["rss_kb"] - row.get("rss_start_kb", 0) for row in group) / 1024
+    lines.append(f"| {engine} | {scenario} | {best['value']} {best['unit']} | {cpu:.0f} | {rss:.1f} | {after:.1f} | {above:.1f} |")
 open(sys.argv[2], "w").write("\n".join(lines) + "\n")
 print("\n".join(lines))
 PY
