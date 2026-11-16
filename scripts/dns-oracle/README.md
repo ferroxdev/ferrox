@@ -12,6 +12,13 @@ so the checkout has to exist first:
 ./scripts/fetch-upstream.sh --only xray-core
 ```
 
+`fetch-upstream.sh` accepts a checkout already at the pin even when its working
+tree has local edits. Confirm it is clean before recording bytes:
+
+```sh
+git -C ../../upstream/xray-core status --short
+```
+
 Then, from this directory:
 
 ```sh

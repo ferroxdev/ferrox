@@ -6,6 +6,10 @@ the field for each scripted config, so `crates/ferrox-core/src/tls/cipher_suites
 can be compared byte for byte.
 
 The oracle uses only the Go standard library, so no upstream checkout is needed.
+The golden was captured with Go 1.24.6 on an AES-capable host: `crypto/tls`
+re-orders the TLS 1.2 suites by AES hardware support, so regenerate on the same
+shape and treat a host-dependent diff as an environment difference.
+
 From this directory:
 
 ```sh
