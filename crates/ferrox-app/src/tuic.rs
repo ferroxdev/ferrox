@@ -2284,7 +2284,7 @@ fn read_uni(
     id: u64,
     freedom: bool,
 ) {
-    let mut room = UNI_ROOM.with(|held| held.borrow_mut().take());
+    let mut room = UNI_ROOM.with(|held| std::mem::take(&mut *held.borrow_mut()));
     room.resize(UDP_BUFFER, 0);
     read_uni_with(conn, inner, sock, id, freedom, &mut room);
     UNI_ROOM.with(|held| *held.borrow_mut() = room);
