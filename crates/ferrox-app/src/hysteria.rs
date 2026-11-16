@@ -2362,14 +2362,7 @@ fn auth_exchange(
         let peer = peer.to_string();
         let mut reply = Vec::new();
         masq_bytes(masq, &request, Some(&peer), &mut reply);
-        if !crate::quic::stream_send_all(
-            conn,
-            sock,
-            AUTH_STREAM,
-            &reply,
-            true,
-            Instant::now(),
-        ) {
+        if !crate::quic::stream_send_all(conn, sock, AUTH_STREAM, &reply, true, Instant::now()) {
             return None;
         }
         return Some(Auth::Cover);
