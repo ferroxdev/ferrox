@@ -1320,6 +1320,10 @@ impl MeekHttp {
                 let mut tls = ferrox_core::tls::connect(&config, stream)
                     .map_err(|error| format!("psiphon meek tls {}: {error}", self.meek.sni))?;
                 tls.set_handshake_deadline(deadline);
+                tls.get_ref()
+                    .inner()
+                    .set_read_timeout(Some(POLL))
+                    .map_err(|error| format!("psiphon meek handshake timeout: {error}"))?;
                 tls.handshake().map_err(|error| {
                     format!("psiphon meek handshake {}: {error}", self.meek.sni)
                 })?;
@@ -1331,6 +1335,11 @@ impl MeekHttp {
                 let mut tls = ferrox_core::tls::connect(&config, stream)
                     .map_err(|error| format!("psiphon meek tls {}: {error}", self.meek.sni))?;
                 tls.set_handshake_deadline(deadline);
+                tls.get_ref()
+                    .inner()
+                    .get_ref()
+                    .set_read_timeout(Some(POLL))
+                    .map_err(|error| format!("psiphon meek handshake timeout: {error}"))?;
                 tls.handshake().map_err(|error| {
                     format!("psiphon meek handshake {}: {error}", self.meek.sni)
                 })?;

@@ -795,6 +795,36 @@ pub(crate) fn resolve_with(config: &Config, host: &str, port: u16) -> io::Result
     resolve_with_deadline(config, host, port, None)
 }
 
+/// Ask the system resolver without letting a stalled lookup outlast the deadline.
+fn system_addresses(
+    host: &str,
+    port: u16,
+    deadline: Option<Instant>,
+) -> io::Result<Vec<SocketAddr>> {
+    let Some(deadline) = deadline else {
+        return Ok((host, port).to_socket_addrs()?.collect());
+    };
+    let timeout = deadline_timeout(Some(deadline), Duration::MAX)?;
+    let host = host.to_owned();
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("psiphon-dns-system".to_owned())
+        .spawn(move || {
+            let result = (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect::<Vec<_>>());
+            let _ = sender.send(result);
+        })
+        .map_err(|error| io::Error::other(format!("psiphon DNS resolver thread: {error}")))?;
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "psiphon DNS resolver deadline expired",
+        )),
+    }
+}
+
 /// Resolve with an optional absolute deadline shared by every query attempt.
 #[allow(clippy::too_many_lines)]
 fn resolve_with_deadline(
@@ -812,8 +842,7 @@ fn resolve_with_deadline(
     }
     let prefer_alternate = coin(config.prefer_alternate_probability);
     if !prefer_alternate {
-        if let Ok(addresses) = (host, port).to_socket_addrs() {
-            let addresses: Vec<SocketAddr> = addresses.collect();
+        if let Ok(addresses) = system_addresses(host, port, deadline) {
             if !addresses.is_empty() {
                 return Ok(addresses);
             }
@@ -881,8 +910,7 @@ fn resolve_with_deadline(
         }
     }
     if prefer_alternate {
-        if let Ok(addresses) = (host, port).to_socket_addrs() {
-            let addresses: Vec<SocketAddr> = addresses.collect();
+        if let Ok(addresses) = system_addresses(host, port, deadline) {
             if !addresses.is_empty() {
                 return Ok(addresses);
             }
@@ -1329,6 +1357,14 @@ mod tests {
         let addresses =
             resolve_with(&Config::from_servers(&[]), "192.0.2.7", 443).expect("literal");
         assert_eq!(addresses, [SocketAddr::from(([192, 0, 2, 7], 443))]);
+    }
+
+    /// A spent deadline rejects the system resolver before it starts a thread.
+    #[test]
+    fn an_expired_resolver_deadline_returns_immediately() {
+        let error = super::system_addresses("psiphon.test", 443, Some(std::time::Instant::now()))
+            .expect_err("expired deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     /// Preferred servers keep their order and duplicates; configured repeats are dropped.
