@@ -1026,7 +1026,7 @@ fn render_tcp_headers_ip(
         return false;
     };
     // The data path carries no options and its payload already sits behind a twenty-byte header; the handshake pads its options to a word.
-    if options.len() % 4 != 0 || options.len() > 40 {
+    if !options.len().is_multiple_of(4) || options.len() > 40 {
         return false;
     }
     let tcp_len = 20 + options.len() + payload_len;
@@ -4638,10 +4638,34 @@ mod tests {
         assert_eq!(proxy_read.read(&mut rest).expect("eof"), 0);
     }
 
+    /// The header fields a test reads off a packet the handler wrote, owned because a parsed head borrows the read buffer.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    struct Written {
+        source_port: u16,
+        destination_port: u16,
+        seq: u32,
+        ack_num: u32,
+        flags: u8,
+    }
+
+    #[cfg(unix)]
+    impl Written {
+        fn of(tcp: &TcpHead<'_>) -> Self {
+            Self {
+                source_port: tcp.source_port,
+                destination_port: tcp.destination_port,
+                seq: tcp.seq,
+                ack_num: tcp.ack_num,
+                flags: tcp.flags,
+            }
+        }
+    }
+
     /// Read frames off the peer until the SYN-ACK: a flow that ran earlier leaves
     /// its delayed ACKs queued ahead of it on the shared descriptor.
     #[cfg(unix)]
-    fn next_syn_ack(peer: &mut std::fs::File) -> TcpHead {
+    fn next_syn_ack(peer: &mut std::fs::File) -> Written {
         let mut reply = [0u8; 64];
         for _ in 0..1_000 {
             match peer.read(&mut reply) {
@@ -4649,7 +4673,7 @@ mod tests {
                     if let Some((_ip, body)) = ipv4_head(&reply[..n]) {
                         if let Some((tcp, _)) = tcp_head(body) {
                             if tcp.flags == FLAG_SYN | FLAG_ACK {
-                                return tcp;
+                                return Written::of(&tcp);
                             }
                         }
                     }
@@ -4669,14 +4693,14 @@ mod tests {
     /// The next TCP packet the handler wrote to the device, waited for with a bound
     /// so a silent lane fails the test instead of parking it.
     #[cfg(unix)]
-    fn next_tcp_packet(peer: &mut std::fs::File, buf: &mut [u8]) -> (TcpHead, Vec<u8>) {
+    fn next_tcp_packet(peer: &mut std::fs::File, buf: &mut [u8]) -> (Written, Vec<u8>) {
         for _ in 0..2_500 {
             match peer.read(buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     if let Some((_ip, body)) = ipv4_head(&buf[..n]) {
                         if let Some((tcp, payload)) = tcp_head(body) {
-                            return (tcp, payload.to_vec());
+                            return (Written::of(&tcp), payload.to_vec());
                         }
                     }
                 }
