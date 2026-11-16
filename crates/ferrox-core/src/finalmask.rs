@@ -401,7 +401,17 @@ impl Fragment {
                 at += width;
             }
             let mut parts = &mut parts[..count * 2];
-            if write_iovecs(raw, &mut parts).is_err() {
+            let before = parts.len();
+            if let Err(error) = write_iovecs(raw, &mut parts) {
+                let progressed = parts.len() < before;
+                if !progressed
+                    && !matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    )
+                {
+                    return Err(error);
+                }
                 let mut bytes = Vec::new();
                 for part in parts.iter() {
                     bytes.extend_from_slice(part);
@@ -1208,6 +1218,39 @@ mod tests {
         assert_eq!(
             sink.bytes, expected.bytes,
             "the retry continues the burst instead of replaying its cuts"
+        );
+    }
+
+    #[test]
+    fn a_permanent_hello_error_is_not_reported_as_sent() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+
+            fn write_vectored(&mut self, _: &[io::IoSlice<'_>]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut mask = Fragment::new(
+            0,
+            1,
+            vec![range(11, 11), range(37, 37)],
+            vec![range(0, 0)],
+            range(24, 24),
+        )
+        .expect("valid");
+        assert_eq!(
+            mask.write(&mut Broken, &hello(60))
+                .expect_err("a permanent error is not a send")
+                .kind(),
+            io::ErrorKind::BrokenPipe
         );
     }
 

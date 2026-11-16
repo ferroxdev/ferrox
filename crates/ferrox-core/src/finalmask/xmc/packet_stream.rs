@@ -305,7 +305,15 @@ impl<R: Read, W: Write> Read for PacketStream<R, W> {
 impl<R, W: Write> Write for &PacketStream<R, W> {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
         if input.is_empty() {
-            return Ok(0);
+            let mut writer = self
+                .writer
+                .lock()
+                .map_err(|_| io::Error::other("packet stream writer poisoned"))?;
+            let mut frame = self
+                .write_buffer
+                .lock()
+                .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
+            return flush_frame(&mut *writer, &mut frame).map(|()| 0);
         }
 
         let mut writer = self
@@ -337,7 +345,16 @@ impl<R, W: Write> Write for &PacketStream<R, W> {
             write_varint(&mut frame.bytes, id)?;
             write_string(&mut frame.bytes, CHANNEL)?;
             frame.bytes.extend_from_slice(&input[written..end]);
-            if flush_frame(&mut *writer, &mut frame).is_err() {
+            let before = frame.pos;
+            if let Err(error) = flush_frame(&mut *writer, &mut frame) {
+                if frame.pos == before
+                    && !matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    )
+                {
+                    return Err(error);
+                }
                 return Ok(end);
             }
             written = end;
@@ -346,10 +363,16 @@ impl<R, W: Write> Write for &PacketStream<R, W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.writer
+        let mut writer = self
+            .writer
             .lock()
-            .map_err(|_| io::Error::other("packet stream writer poisoned"))?
-            .flush()
+            .map_err(|_| io::Error::other("packet stream writer poisoned"))?;
+        let mut frame = self
+            .write_buffer
+            .lock()
+            .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
+        flush_frame(&mut *writer, &mut frame)?;
+        writer.flush()
     }
 }
 
