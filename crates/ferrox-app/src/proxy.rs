@@ -14269,7 +14269,7 @@ fn serve_kcp_bound(
         eprintln!("unreadable streamSettings.sockopt on {address}: refused, not served");
         return false;
     };
-    let Ok(sock) = crate::sockopt::bind_datagram_at(sockopt.as_deref(), server) else {
+    let Ok(sock) = crate::sockopt::bind_datagram_at(sockopt.as_ref(), server) else {
         return false;
     };
     let Ok(listener) = ferrox_core::kcp::Listener::with_socket(sock, config) else {
