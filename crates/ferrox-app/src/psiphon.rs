@@ -7469,6 +7469,14 @@ fn load_target_entry(
                 }
             }
             if !matches_limit(&server, shape, named_meek, limits) {
+                if let Some(variant) = cdn_variants(&server)
+                    .into_iter()
+                    .find(|variant| matches_limit(variant, shape, named_meek, limits))
+                {
+                    server = variant;
+                }
+            }
+            if !matches_limit(&server, shape, named_meek, limits) {
                 let protocol = server.meek.as_ref().map_or_else(
                     || {
                         if server.ss {
