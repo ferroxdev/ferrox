@@ -200,6 +200,7 @@ struct WarpSpec {
     last_edge: Option<PathBuf>,
     stale: Option<Duration>,
     cooldown: Duration,
+    noize: crate::noize::NoizeSettings,
     gool: GoolSettings,
     mim: MimSettings,
 }
@@ -472,6 +473,7 @@ impl WarpSpec {
         let (masque_address, masque_port, masque_server_name, masque_host, masque_path) =
             masque_settings(settings.get("masque"));
         let edge = EdgeSpec::from(settings)?;
+        let noize = crate::noize::NoizeSettings::from_settings(settings)?;
         let gool = gool_settings(settings)?;
         let mim = if mode == Mode::Mim {
             mim_settings(settings)?
@@ -506,6 +508,7 @@ impl WarpSpec {
             last_edge: edge.last_edge,
             stale: edge.stale,
             cooldown: edge.cooldown,
+            noize,
             gool,
             mim,
         })
@@ -681,6 +684,7 @@ impl WarpSpec {
             last_edge: None,
             stale: None,
             cooldown: Duration::from_secs(COOLDOWN_SECS),
+            noize: crate::noize::NoizeSettings::default(),
             gool: GoolSettings::default(),
             mim: MimSettings::default(),
         }
@@ -1679,8 +1683,9 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
                 masque.and_then(|handle| handle.join().ok().flatten()),
             )
         });
-        if let Some(edge) = found_wireguard {
+        if let Some((edge, profile)) = found_wireguard {
             wireguard = Some(edge);
+            spec.noize.select_wireguard(&profile);
             println!("[+] selected WireGuard endpoint {edge}");
         }
         if let Some(edge) = found_masque {
@@ -1830,10 +1835,31 @@ fn scan_wireguard(
     mode: ScanMode,
     timeout: Duration,
     excluded: &HashSet<SocketAddr>,
-) -> Option<SocketAddr> {
-    scan_wireguard_edges(identity, spec, mode, timeout, excluded, &HashSet::new(), 1)
+) -> Option<(SocketAddr, String)> {
+    let candidates = spec.noize.wireguard_candidates();
+    let many = candidates.len() > 1;
+    for profile in candidates {
+        let mut candidate = spec.clone();
+        candidate.noize.select_wireguard(&profile);
+        if let Some(edge) = scan_wireguard_edges(
+            identity,
+            &candidate,
+            mode,
+            timeout,
+            excluded,
+            &HashSet::new(),
+            1,
+        )
         .into_iter()
         .next()
+        {
+            return Some((edge, profile));
+        }
+        if many {
+            eprintln!("[-] WireGuard profile `{profile}` found no edge; trying the next");
+        }
+    }
+    None
 }
 
 fn scan_wireguard_edges(
@@ -1850,6 +1876,7 @@ fn scan_wireguard_edges(
         .into_iter()
         .filter(|edge| !avoid.contains(&edge.ip()))
         .collect();
+    let noise = spec.noize.wireguard();
     warp_scan::hunt(candidates, mode, excluded, |edge| {
         let local = identity
             .wireguard
@@ -1866,6 +1893,7 @@ fn scan_wireguard_edges(
             local,
             edge,
             timeout,
+            noise,
         )?;
         if ironclad && !http_check_wireguard(identity, spec, edge) {
             eprintln!("[-] edge {edge} opened a tunnel but carried no HTTP answer");
@@ -1904,7 +1932,7 @@ fn scan_masque(
     .map(|(edge, _)| *edge)
 }
 
-fn check_wireguard(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> bool {
+fn wireguard_answers(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> bool {
     let timeout = spec.stale.map_or_else(
         || warp_scan::scan_timeout(ScanMode::Balanced),
         |stale| stale.min(warp_scan::scan_timeout(ScanMode::Balanced)),
@@ -1920,16 +1948,20 @@ fn check_wireguard(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> bo
     else {
         return false;
     };
-    let answered = crate::wg::verify_endpoint(
+    crate::wg::verify_endpoint(
         identity.wireguard.private,
         identity.wireguard.peer,
         identity.wireguard.reserved,
         local,
         edge,
         timeout,
+        spec.noize.wireguard(),
     )
-    .is_some();
-    answered
+    .is_some()
+}
+
+fn check_wireguard(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> bool {
+    wireguard_answers(identity, spec, edge)
         && (spec.scan != Some(ScanMode::Ironclad) || http_check_wireguard(identity, spec, edge))
 }
 
@@ -2108,6 +2140,7 @@ fn masque_outbound(identity: &Identity, spec: &WarpSpec) -> Result<crate::json::
         ("warp", warp),
         ("host", string(&spec.masque_host)),
         ("path", string(&spec.masque_path)),
+        ("noize", string(spec.noize.masque_profile())),
     ]);
     let tls = obj_pairs(vec![
         ("serverName", string(&spec.masque_server_name)),
@@ -2508,7 +2541,7 @@ fn build_wireguard(
 ) -> Result<crate::wg::WireGuardOut, String> {
     let settings = wireguard_settings(identity, spec);
     let config = crate::wireguard::DeviceConfig::from_json(&settings)?;
-    crate::wg::WireGuardOut::new(config)
+    crate::wg::WireGuardOut::with_noise(config, spec.noize.wireguard())
 }
 
 fn build_masque(identity: &Identity, spec: &WarpSpec) -> Result<crate::masque::MasqueOut, String> {
@@ -2536,7 +2569,7 @@ impl GoolOut {
         let mtu = spec.mtu.min(GOOL_INNER_MTU);
         let settings = wireguard_settings_with_endpoint(inner_identity, spec, forwarder.local, mtu);
         let config = crate::wireguard::DeviceConfig::from_json(&settings)?;
-        let inner = crate::wg::WireGuardOut::new(config)?;
+        let inner = crate::wg::WireGuardOut::with_noise(config, spec.noize.wireguard())?;
         Ok(Self {
             outer,
             inner: Arc::new(inner),
@@ -2660,6 +2693,7 @@ fn mim_outbound(
         ("warp", warp),
         ("host", string(&spec.masque_host)),
         ("path", string(&spec.masque_path)),
+        ("noize", string(spec.noize.masque_profile())),
     ]);
     let tls = obj_pairs(vec![
         ("serverName", string(&spec.masque_server_name)),
@@ -2710,7 +2744,7 @@ impl GoolClassicOut {
         let mtu = classic_inner_mtu(spec.mtu, remote)?;
         let settings = wireguard_settings_with_endpoint(inner_identity, spec, forwarder.local, mtu);
         let config = crate::wireguard::DeviceConfig::from_json(&settings)?;
-        let inner = crate::wg::WireGuardOut::new(config)?;
+        let inner = crate::wg::WireGuardOut::with_noise(config, spec.noize.wireguard())?;
         Ok(Self {
             outer,
             inner: Arc::new(inner),
@@ -2946,6 +2980,8 @@ pub(crate) struct ForcedPeers<'a> {
     wiw_inner: Option<&'a str>,
     mim_outer: Option<&'a str>,
     mim_inner: Option<&'a str>,
+    noize: Option<&'a str>,
+    no_profile_retry: bool,
 }
 
 struct ForcedEdges {
@@ -3027,6 +3063,7 @@ pub(crate) fn one_tap(
         last_edge: None,
         stale: None,
         cooldown: Duration::from_secs(COOLDOWN_SECS),
+        noize: crate::noize::NoizeSettings::from_cli(peers.noize, peers.no_profile_retry),
         gool: GoolSettings {
             wiw_outer,
             wiw_inner,
@@ -3070,6 +3107,12 @@ pub(crate) fn one_tap(
     }
     if spec.scan.is_some() {
         settings.push(("scan", string("balanced")));
+    }
+    if let Some(profile) = peers.noize {
+        settings.push(("noize", string(profile)));
+    }
+    if peers.no_profile_retry {
+        settings.push(("noProfileRetry", crate::json::Json::Bool(true)));
     }
     Ok(config_text(settings))
 }
@@ -3188,6 +3231,8 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
     let mut wiw_inner = None;
     let mut mim_outer = None;
     let mut mim_inner = None;
+    let mut noize = None;
+    let mut no_profile_retry = false;
     while let Some(arg) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| usage());
         match arg.as_str() {
@@ -3198,6 +3243,8 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
             "--wiw-inner" => wiw_inner = Some(value()),
             "--mim-outer" => mim_outer = Some(value()),
             "--mim-inner" => mim_inner = Some(value()),
+            "--noize" => noize = Some(value()),
+            "--no-profile-retry" => no_profile_retry = true,
             "--api" => api = Some(value()),
             "--api-address" => api_address = Some(value()),
             "--wg-config" => wireguard = Some(value()),
@@ -3230,6 +3277,8 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
                     wiw_inner: wiw_inner.as_deref(),
                     mim_outer: mim_outer.as_deref(),
                     mim_inner: mim_inner.as_deref(),
+                    noize: noize.as_deref(),
+                    no_profile_retry,
                 },
             )
         }
@@ -3312,6 +3361,7 @@ mod tests {
             last_edge: None,
             stale: None,
             cooldown: Duration::from_secs(COOLDOWN_SECS),
+            noize: crate::noize::NoizeSettings::default(),
             gool: GoolSettings::default(),
             mim: MimSettings::default(),
         }
@@ -3406,6 +3456,7 @@ mod tests {
             last_edge: None,
             stale: None,
             cooldown: Duration::from_secs(COOLDOWN_SECS),
+            noize: crate::noize::NoizeSettings::default(),
             gool: GoolSettings::default(),
             mim: MimSettings::default(),
         };
@@ -3496,6 +3547,7 @@ mod tests {
             last_edge: None,
             stale: None,
             cooldown: Duration::from_secs(COOLDOWN_SECS),
+            noize: crate::noize::NoizeSettings::default(),
             gool: GoolSettings::default(),
             mim: MimSettings::default(),
         };

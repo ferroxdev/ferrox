@@ -161,7 +161,7 @@ impl QuicNoise {
     }
 }
 
-fn noise_expand(spec: &str) -> Vec<u8> {
+pub(crate) fn noise_expand(spec: &str) -> Vec<u8> {
     let mut out = Vec::new();
     let mut rest = spec;
     while let Some(open) = rest.find('<') {
@@ -223,7 +223,7 @@ fn noise_length(arg: &str) -> usize {
     length.min(NOISE_MAX_RANDOM)
 }
 
-fn noise_range(low: usize, high: usize) -> usize {
+pub(crate) fn noise_range(low: usize, high: usize) -> usize {
     if high <= low {
         return low;
     }
@@ -235,7 +235,7 @@ fn noise_range(low: usize, high: usize) -> usize {
     low + usize::try_from(u64::from_le_bytes(bytes) % span).unwrap_or(0)
 }
 
-fn noise_bytes(length: usize) -> Vec<u8> {
+pub(crate) fn noise_bytes(length: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; length];
     crate::psiphon_ssh::dial_fill(&mut bytes);
     bytes
