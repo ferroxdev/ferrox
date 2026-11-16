@@ -123,6 +123,9 @@ pub struct TlsConfig {
     pub kernel_tx: bool,
     /// Linux kernel TLS for the RX direction: the kernel decrypts after the handshake.
     pub kernel_rx: bool,
+    /// How the dial keeps its server name from a filter that reads the first `ClientHello`, as the
+    /// outbound's `evasion.sniSpoof` names it. `None` writes the hello as the backend does.
+    pub sni: Option<crate::evasion::SniSpoof>,
 }
 
 /// Whether a client build can offer a group a config named: the shaped hello draws its own key

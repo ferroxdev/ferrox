@@ -11,6 +11,7 @@ pub mod blake2s;
 pub(crate) mod chacha;
 pub mod core;
 pub mod dns;
+pub mod evasion;
 pub mod failure;
 pub mod finalmask;
 pub mod foxy;

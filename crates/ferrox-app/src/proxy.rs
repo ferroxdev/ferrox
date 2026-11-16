@@ -4627,15 +4627,11 @@ impl FreedomFinalRule {
 const UDP_NOISE_MAX_V4: u64 = 65_507;
 const UDP_NOISE_MAX_V6: u64 = 65_527;
 
-/// One `noises` entry: a fixed packet or one drawn at the configured length, sent before the
-/// first datagram of a UDP flow and followed by the configured wait.
+/// One `noises` entry: a fixed packet, a drawn one, or a QUIC-shaped one, sent before the first
+/// datagram of a UDP flow and followed by the configured wait.
 #[derive(Debug, Clone)]
 struct FreedomNoise {
-    length_min: u64,
-    length_max: u64,
-    packet: Option<Vec<u8>>,
-    delay_min: u64,
-    delay_max: u64,
+    noise: ferrox_core::evasion::Noise,
     apply_to: FreedomNoiseApply,
 }
 
@@ -4654,31 +4650,6 @@ impl FreedomNoise {
             FreedomNoiseApply::Ipv6 => ip.is_ipv6(),
         }
     }
-
-    fn generate(&self) -> Option<Vec<u8>> {
-        if let Some(packet) = &self.packet {
-            return Some(packet.clone());
-        }
-        let length = freedom_between(self.length_min, self.length_max);
-        let length = usize::try_from(length).ok()?;
-        let mut packet = vec![0u8; length];
-        getrandom::fill(&mut packet).ok()?;
-        Some(packet)
-    }
-
-    fn delay(&self) -> Duration {
-        Duration::from_millis(freedom_between(self.delay_min, self.delay_max))
-    }
-}
-
-/// `crypto.RandBetween`: the upper end is exclusive, and a span of one returns the lower end.
-fn freedom_between(from: u64, to: u64) -> u64 {
-    let (from, to) = if from <= to { (from, to) } else { (to, from) };
-    let span = to.saturating_sub(from);
-    if span <= 1 {
-        return from;
-    }
-    from.saturating_add(freedom_roll(span))
 }
 
 /// A uniform value in `[0, bound)`, drawn from the OS with rejection so no modulo bias remains.
@@ -19996,6 +19967,66 @@ fn tls_failure(error: &ferrox_core::tls::TlsError) -> Failure {
     }
 }
 
+/// Arm the outbound's `sniSpoof` on the leg that is about to write the hello: a raw decoy goes out
+/// ahead of it where the kernel allows one, and the first-record rewrite stands in where it does
+/// not, which is the same fallback the reference makes.
+fn arm_sni(cfg: &ferrox_core::tls::TlsConfig, uplink: Connection) -> Connection {
+    use ferrox_core::evasion::{SniMethod, SniShape};
+    let Some(sni) = cfg.sni.as_ref() else {
+        return uplink;
+    };
+    let fallback = match sni.method {
+        SniMethod::EmptyRecord => SniShape::EmptyRecord,
+        SniMethod::Record => SniShape::Record,
+        SniMethod::Auto | SniMethod::Decoy => match inject_sni_decoy(&uplink, sni) {
+            Ok(true) => return uplink,
+            Ok(false) => {
+                warn_sni(
+                    "the decoy needs a raw IPv4 socket this dial could not open; it rewrites the first record instead",
+                );
+                SniShape::Record
+            }
+            Err(error) => {
+                warn_sni(&error);
+                SniShape::Record
+            }
+        },
+        SniMethod::Urgent | SniMethod::FastOpen => {
+            warn_sni(
+                "the urgent-byte and fast-open methods are not implemented; this dial rewrites the first record instead",
+            );
+            SniShape::Record
+        }
+    };
+    uplink.with_sni_shape(fallback)
+}
+
+fn warn_sni(message: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| eprintln!("sniSpoof: {message}"));
+}
+
+#[cfg(target_os = "linux")]
+fn inject_sni_decoy(
+    uplink: &Connection,
+    sni: &ferrox_core::evasion::SniSpoof,
+) -> Result<bool, String> {
+    use std::os::fd::AsRawFd as _;
+    let (Ok(local), Ok(peer)) = (uplink.local_addr(), uplink.peer_addr()) else {
+        return Ok(false);
+    };
+    ferrox_core::evasion::inject_fake_client_hello(uplink.as_raw_fd(), local, peer, sni)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn inject_sni_decoy(
+    _uplink: &Connection,
+    _sni: &ferrox_core::evasion::SniSpoof,
+) -> Result<bool, String> {
+    Ok(false)
+}
+
 fn dial_tls_session(
     server: &SocketAddr,
     cfg: &ferrox_core::tls::TlsConfig,
@@ -20013,6 +20044,7 @@ fn dial_tls_session(
             }
         }
         .with_mask(mask);
+        let uplink = arm_sni(current, uplink);
         let Ok(mut session) = ferrox_core::tls::connect(current, uplink) else {
             note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
             return None;
@@ -23081,6 +23113,7 @@ fn tls_session_on(
     uplink: Connection,
     cfg: &ferrox_core::tls::TlsConfig,
 ) -> Option<ferrox_core::tls::ClientSession<Connection>> {
+    let uplink = arm_sni(cfg, uplink);
     let mut session = ferrox_core::tls::connect(cfg, uplink).ok()?;
     session.handshake().ok()?;
     if !settle_ktls(&mut session) {
@@ -25437,15 +25470,17 @@ fn send_freedom_noises(
         if !noise.applies_to(dest.ip()) {
             continue;
         }
-        let Some(packet) = noise.generate() else {
-            return false;
-        };
-        if socket.send(&packet).is_err() {
-            return false;
-        }
-        let delay = noise.delay();
-        if !delay.is_zero() {
-            thread::sleep(delay);
+        for _ in 0..noise.noise.count {
+            let Some(packet) = noise.noise.generate() else {
+                return false;
+            };
+            if socket.send(&packet).is_err() {
+                return false;
+            }
+            let delay = noise.noise.delay();
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
         }
     }
     true
@@ -38833,7 +38868,7 @@ pub(crate) fn find_freedom_outbound(root: &Json) -> Result<Option<FreedomOut>, S
         {
             return Err("freedom: `noise` is removed; use `noises`".to_owned());
         }
-        freedom.noises = parse_freedom_noises(settings)?;
+        freedom.noises = freedom_noise_list(outbound, settings)?;
         freedom.final_rules = parse_freedom_final_rules(settings)?;
         if !freedom.final_rules.is_empty() && dialer_proxy_tag(outbound).is_some() {
             eprintln!(
@@ -38859,103 +38894,262 @@ pub(crate) fn find_freedom_outbound(root: &Json) -> Result<Option<FreedomOut>, S
     Ok(None)
 }
 
-/// The reference's `noises`: each entry writes one datagram before a UDP flow's first payload.
+/// The reference's `noises`: each entry writes its count of datagrams before a UDP flow's first
+/// payload, and each kind the current schema names is read here.
 fn parse_freedom_noises(settings: &Json) -> Result<Vec<FreedomNoise>, String> {
-    let Some(value) = settings.get("noises") else {
+    parse_noise_list(settings.get("noises"), "freedom")
+}
+
+/// The decoys a `finalmask.udp` list names: one `noise` entry's `settings.noise` is a list of
+/// the same entries `settings.noises` holds.
+fn parse_finalmask_noises(settings: Option<&Json>) -> Result<Vec<FreedomNoise>, String> {
+    let Some(udp) = settings
+        .and_then(|settings| settings.get("finalmask"))
+        .and_then(|finalmask| finalmask.get("udp"))
+        .and_then(Json::as_arr)
+    else {
         return Ok(Vec::new());
     };
-    if matches!(value, Json::Null) {
-        return Ok(Vec::new());
+    let mut noises = Vec::new();
+    for entry in udp {
+        if entry.get("type").and_then(Json::as_str) != Some("noise") {
+            continue;
+        }
+        noises.extend(parse_noise_list(
+            entry
+                .get("settings")
+                .and_then(|settings| settings.get("noise")),
+            "finalmask.udp noise",
+        )?);
     }
+    Ok(noises)
+}
+
+/// The decoy list a freedom outbound dials: the outbound's `evasion.noises` overlay wins, then
+/// the `finalmask.udp` list, then the legacy `settings.noises`, with one warning where the legacy
+/// list and the finalmask list both name decoys.
+fn freedom_noise_list(outbound: &Json, settings: &Json) -> Result<Vec<FreedomNoise>, String> {
+    let legacy = parse_freedom_noises(settings)?;
+    let masked = parse_finalmask_noises(outbound.get("streamSettings"))?;
+    let overlay = parse_noise_list(
+        outbound
+            .get("evasion")
+            .and_then(|evasion| evasion.get("noises")),
+        "evasion",
+    )?;
+    if !legacy.is_empty() && !masked.is_empty() {
+        eprintln!(
+            "freedom: settings.noises and finalmask.udp noise both name decoys; the finalmask list wins"
+        );
+    }
+    Ok(if !overlay.is_empty() {
+        overlay
+    } else if !masked.is_empty() {
+        masked
+    } else {
+        legacy
+    })
+}
+
+fn parse_noise_list(value: Option<&Json>, label: &str) -> Result<Vec<FreedomNoise>, String> {
+    let Some(value) = value.filter(|value| !matches!(value, Json::Null)) else {
+        return Ok(Vec::new());
+    };
     let items = value
         .as_arr()
-        .ok_or_else(|| "freedom: noises is not a list".to_owned())?;
+        .ok_or_else(|| format!("{label}: noises is not a list"))?;
     let mut noises = Vec::with_capacity(items.len());
     for item in items {
-        let kind = item
-            .get("type")
-            .and_then(Json::as_str)
-            .ok_or_else(|| "freedom: a noise entry has no type".to_owned())?;
-        let text = item
-            .get("packet")
-            .and_then(Json::as_str)
-            .unwrap_or("")
-            .trim();
-        let (length_min, length_max, packet) = match kind {
-            "rand" => {
-                let (min, max) = freedom_range_text(text)
-                    .ok_or_else(|| format!("freedom: rand noise length `{text}` is not a range"))?;
-                if min <= 0 || max <= 0 {
-                    return Err("freedom: rand noise length must be positive".to_owned());
-                }
-                (min as u64, max as u64, None)
+        noises.push(parse_freedom_noise(item)?);
+    }
+    Ok(noises)
+}
+
+/// The kind a noise entry names, its drawn length range, and the spelling a ceiling refusal
+/// quotes back.
+fn freedom_noise_kind(
+    item: &Json,
+) -> Result<(ferrox_core::evasion::NoiseKind, u64, u64, String), String> {
+    use ferrox_core::evasion::NoiseKind;
+    let rand_spec = item.get("rand").and_then(Json::as_str);
+    let kind_name = item
+        .get("type")
+        .and_then(Json::as_str)
+        .or(rand_spec.map(|_| "rand"))
+        .unwrap_or("rand");
+    let raw = item.get("packet").and_then(Json::as_str).unwrap_or("");
+    let text = raw.trim();
+    let (kind, length_min, length_max, shown) = match kind_name {
+        "rand" => {
+            let spec = rand_spec.unwrap_or(text);
+            let (min, max) = freedom_range_text(spec)
+                .ok_or_else(|| format!("freedom: rand noise length `{spec}` is not a range"))?;
+            if min <= 0 || max <= 0 {
+                return Err("freedom: rand noise length must be positive".to_owned());
             }
-            "str" => (0, 0, Some(text.as_bytes().to_vec())),
-            "hex" => (0, 0, Some(freedom_hex(text)?)),
-            "base64" => {
-                let text = text.replace('+', "-").replace('/', "_").replace('=', "");
-                let bytes = if text.is_empty() {
-                    Vec::new()
-                } else {
-                    ferrox_core::b64::decode(text.as_bytes())
-                        .ok_or_else(|| "freedom: base64 noise is not decodable".to_owned())?
-                };
-                (0, 0, Some(bytes))
+            let bytes = match item.get("randRange").and_then(Json::as_str) {
+                Some(range) => freedom_byte_range(range)?,
+                None => (0, u8::MAX),
+            };
+            (
+                NoiseKind::Rand { bytes },
+                min as u64,
+                max as u64,
+                spec.to_owned(),
+            )
+        }
+        "quic" => {
+            let spec = if text.is_empty() { "5-10" } else { text };
+            let (min, max) = freedom_range_text(spec)
+                .ok_or_else(|| format!("freedom: quic noise length `{spec}` is not a range"))?;
+            if min <= 0 || max <= 0 {
+                return Err("freedom: quic noise length must be positive".to_owned());
             }
-            other => {
-                return Err(format!(
-                    "freedom: noise type `{other}` is not rand/str/hex/base64"
-                ));
+            (NoiseKind::Quic, min as u64, max as u64, spec.to_owned())
+        }
+        "str" => (
+            NoiseKind::Fixed(raw.as_bytes().to_vec()),
+            0,
+            0,
+            String::new(),
+        ),
+        "hex" => (NoiseKind::Fixed(freedom_hex(text)?), 0, 0, String::new()),
+        "base64" => (NoiseKind::Fixed(freedom_base64(text)?), 0, 0, String::new()),
+        "array" => (
+            NoiseKind::Fixed(freedom_array(item.get("packet"))?),
+            0,
+            0,
+            String::new(),
+        ),
+        other => {
+            return Err(format!(
+                "freedom: noise type `{other}` is not rand/str/hex/base64/array/quic"
+            ));
+        }
+    };
+    Ok((kind, length_min, length_max, shown))
+}
+
+fn parse_freedom_noise(item: &Json) -> Result<FreedomNoise, String> {
+    use ferrox_core::evasion::{Noise, NoiseKind};
+    let (kind, length_min, length_max, shown) = freedom_noise_kind(item)?;
+    let delay = match item.get("delay") {
+        None | Some(Json::Null) => (0, 0),
+        Some(value) => freedom_u64_range(value, "noise delay")?.unwrap_or((0, 0)),
+    };
+    let count = match item.get("count") {
+        None | Some(Json::Null) => 1,
+        Some(value) => match value.as_i64() {
+            Some(count) => u32::try_from(count).map_err(|_| {
+                "freedom: noise count is not a number between 0 and 4294967295".to_owned()
+            })?,
+            None => {
+                return Err(
+                    "freedom: noise count is not a number between 0 and 4294967295".to_owned(),
+                );
             }
-        };
-        let delay = match item.get("delay") {
-            None | Some(Json::Null) => (0, 0),
-            Some(value) => freedom_u64_range(value, "noise delay")?.unwrap_or((0, 0)),
-        };
-        let apply_to = match item
-            .get("applyTo")
-            .and_then(Json::as_str)
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "" | "ip" | "all" => FreedomNoiseApply::Ip,
-            "ipv4" => FreedomNoiseApply::Ipv4,
-            "ipv6" => FreedomNoiseApply::Ipv6,
-            other => {
-                return Err(format!(
-                    "freedom: noise applyTo `{other}` is not ip/ipv4/ipv6"
-                ));
-            }
-        };
-        if packet.is_none() {
+        },
+    };
+    let apply_to = match item
+        .get("applyTo")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "ip" | "all" => FreedomNoiseApply::Ip,
+        "ipv4" => FreedomNoiseApply::Ipv4,
+        "ipv6" => FreedomNoiseApply::Ipv6,
+        other => {
+            return Err(format!(
+                "freedom: noise applyTo `{other}` is not ip/ipv4/ipv6"
+            ));
+        }
+    };
+    let ceiling = if apply_to == FreedomNoiseApply::Ipv6 {
+        UDP_NOISE_MAX_V6
+    } else {
+        UDP_NOISE_MAX_V4
+    };
+    match &kind {
+        NoiseKind::Rand { .. } | NoiseKind::Quic => {
             let (low, high) = if length_min <= length_max {
                 (length_min, length_max)
             } else {
                 (length_max, length_min)
             };
             let largest = if low == high { high } else { high - 1 };
-            let ceiling = if apply_to == FreedomNoiseApply::Ipv6 {
-                UDP_NOISE_MAX_V6
-            } else {
-                UDP_NOISE_MAX_V4
-            };
             if largest > ceiling {
                 return Err(format!(
-                    "freedom: rand noise length `{text}` can exceed the UDP payload limit"
+                    "freedom: noise length `{shown}` can exceed the UDP payload limit"
                 ));
             }
         }
-        noises.push(FreedomNoise {
+        NoiseKind::Fixed(bytes) if bytes.len() as u64 > ceiling => {
+            return Err(format!(
+                "freedom: a noise packet of {} bytes exceeds the UDP payload limit",
+                bytes.len()
+            ));
+        }
+        NoiseKind::Fixed(_) => {}
+    }
+    Ok(FreedomNoise {
+        noise: Noise {
+            kind,
             length_min,
             length_max,
-            packet,
             delay_min: delay.0,
             delay_max: delay.1,
-            apply_to,
-        });
+            count,
+        },
+        apply_to,
+    })
+}
+
+fn freedom_base64(text: &str) -> Result<Vec<u8>, String> {
+    let text = text.replace('+', "-").replace('/', "_").replace('=', "");
+    if text.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(noises)
+    ferrox_core::b64::decode(text.as_bytes())
+        .ok_or_else(|| "freedom: base64 noise is not decodable".to_owned())
+}
+
+fn freedom_byte_range(text: &str) -> Result<(u8, u8), String> {
+    let parse = |part: &str| {
+        part.trim()
+            .parse::<u8>()
+            .map_err(|_| format!("freedom: randRange `{text}` is not a byte range"))
+    };
+    if let Some((low, high)) = text.split_once('-') {
+        return Ok((parse(low)?, parse(high)?));
+    }
+    let value = parse(text)?;
+    Ok((value, value))
+}
+
+fn freedom_array(packet: Option<&Json>) -> Result<Vec<u8>, String> {
+    match packet {
+        None | Some(Json::Null) => Ok(Vec::new()),
+        Some(Json::Arr(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_u32()
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or_else(|| "freedom: an array noise byte is not 0..=255".to_owned())
+            })
+            .collect(),
+        Some(Json::Str(text)) => text
+            .split(',')
+            .filter(|part| !part.trim().is_empty())
+            .map(|part| {
+                part.trim()
+                    .parse::<u8>()
+                    .map_err(|_| "freedom: an array noise byte is not 0..=255".to_owned())
+            })
+            .collect(),
+        Some(_) => Err("freedom: array noise packet is not a list or a string".to_owned()),
+    }
 }
 
 fn freedom_hex(text: &str) -> Result<Vec<u8>, String> {
@@ -61758,6 +61952,33 @@ mod tests {
         ss_mux_stream("ss2022", ss, echo);
     }
 
+    /// A `str` packet is the datagram's own bytes, so its spaces are content, and a `count` that
+    /// is present but not an integer is refused rather than silently sending one copy.
+    #[test]
+    fn a_str_noise_keeps_its_spaces_and_its_count_is_strict() {
+        use ferrox_core::evasion::NoiseKind;
+        let out = freedom_out(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"noises":[{"type":"str","packet":"  hi  "}]}}]}"#,
+        );
+        let Outbound::Freedom(freedom) = out else {
+            panic!("a freedom outbound");
+        };
+        assert_eq!(
+            freedom.noises[0].noise.kind,
+            NoiseKind::Fixed(b"  hi  ".to_vec())
+        );
+        for count in ["1.5", "\"2\"", "-1", "4294967296"] {
+            let root = crate::json::parse(&format!(
+                r#"{{"outbounds":[{{"protocol":"freedom","settings":{{"noises":[{{"type":"str","packet":"x","count":{count}}}]}}}}]}}"#
+            ))
+            .expect("parses");
+            assert!(
+                find_outbound(&root).is_err(),
+                "a count of {count} is refused"
+            );
+        }
+    }
+
     /// The datagram path selects the 2022 mux before the direct session, and one session carries the target.
     #[test]
     fn shadowsocks2022_mux_carries_a_datagram_through_one_session() {
@@ -72264,7 +72485,7 @@ mod tests {
         let Outbound::Freedom(freedom) = out else {
             panic!("a freedom outbound");
         };
-        assert_eq!(freedom.noises[0].length_max, 65_527);
+        assert_eq!(freedom.noises[0].noise.length_max, 65_527);
     }
 
     /// A reversed private selector is the built-in set, not a missing `geoip.dat`.
@@ -72313,26 +72534,50 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    /// The noise list keeps a fixed packet, a hex packet and its family filter; the removed
-    /// singular spelling is a startup refusal.
+    /// Every noise kind the schema names keeps its packet, drawn length and family filter; the
+    /// removed singular spelling is a startup refusal.
     #[test]
     fn a_freedom_noise_keeps_its_packet_and_family() {
+        use ferrox_core::evasion::NoiseKind;
         let out = freedom_out(
             r#"{"outbounds":[{"protocol":"freedom","settings":{"noises":[
                 {"type":"str","packet":"hello","applyTo":"ipv4"},
-                {"type":"hex","packet":"00ff","delay":"0-0"}]}}]}"#,
+                {"type":"hex","packet":"00ff","delay":"0-0"},
+                {"type":"rand","packet":"4-8","randRange":"16-32","count":3},
+                {"type":"quic"},
+                {"type":"array","packet":[1,2,255]}]}}]}"#,
         );
         let Outbound::Freedom(freedom) = out else {
             panic!("a freedom outbound");
         };
-        assert_eq!(freedom.noises.len(), 2);
+        assert_eq!(freedom.noises.len(), 5);
         assert_eq!(
-            freedom.noises[0].packet.as_deref(),
-            Some(b"hello".as_slice())
+            freedom.noises[0].noise.kind,
+            NoiseKind::Fixed(b"hello".to_vec())
         );
         assert!(freedom.noises[0].applies_to("127.0.0.1".parse().expect("v4")));
         assert!(!freedom.noises[0].applies_to("::1".parse().expect("v6")));
-        assert_eq!(freedom.noises[1].packet.as_deref(), Some(&[0, 0xff][..]));
+        assert_eq!(
+            freedom.noises[1].noise.kind,
+            NoiseKind::Fixed(vec![0, 0xff])
+        );
+        assert_eq!(
+            freedom.noises[2].noise.kind,
+            NoiseKind::Rand { bytes: (16, 32) }
+        );
+        assert_eq!(freedom.noises[2].noise.count, 3);
+        assert_eq!(freedom.noises[3].noise.kind, NoiseKind::Quic);
+        assert_eq!(
+            (
+                freedom.noises[3].noise.length_min,
+                freedom.noises[3].noise.length_max
+            ),
+            (5, 10)
+        );
+        assert_eq!(
+            freedom.noises[4].noise.kind,
+            NoiseKind::Fixed(vec![1, 2, 255])
+        );
 
         let root = crate::json::parse(
             r#"{"outbounds":[{"protocol":"freedom","settings":{"noise":{"type":"str"}}}]}"#,
@@ -72344,14 +72589,100 @@ mod tests {
         );
     }
 
-    /// `RandBetween`'s bounds are the reference's: a one-wide span returns the lower end, and a
-    /// two-wide span can return only those two ends.
+    /// One entry's `count` is the number of decoys the UDP lane puts on the wire before the
+    /// payload, not just a number the parser keeps.
     #[test]
-    fn a_freedom_range_keeps_the_reference_bounds() {
-        assert_eq!(freedom_between(5, 5), 5);
-        assert_eq!(freedom_between(5, 6), 5);
-        assert!((5..7).contains(&freedom_between(5, 7)));
-        assert!((5..7).contains(&freedom_between(7, 5)));
+    fn a_noise_count_sends_that_many_packets() {
+        use ferrox_core::evasion::{Noise, NoiseKind};
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("binds the receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("a timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("binds the sender");
+        let dest = receiver.local_addr().expect("an address");
+        sender.connect(dest).expect("connects the lane");
+        let noise = FreedomNoise {
+            noise: Noise {
+                kind: NoiseKind::Fixed(vec![7; 32]),
+                length_min: 0,
+                length_max: 0,
+                delay_min: 0,
+                delay_max: 0,
+                count: 3,
+            },
+            apply_to: FreedomNoiseApply::Ip,
+        };
+        assert!(send_freedom_noises(
+            std::slice::from_ref(&noise),
+            false,
+            &sender,
+            dest
+        ));
+        sender.send(b"payload").expect("sends the payload");
+        let mut buf = [0u8; 64];
+        for _ in 0..3 {
+            let (len, from) = receiver.recv_from(&mut buf).expect("a decoy");
+            assert_eq!(len, 32);
+            assert!(buf[..len].iter().all(|byte| *byte == 7));
+            assert_eq!(from.port(), sender.local_addr().expect("an address").port());
+        }
+        let (len, _) = receiver.recv_from(&mut buf).expect("the payload");
+        assert_eq!(&buf[..len], b"payload");
+    }
+
+    /// A fixed packet over the family's UDP payload limit is refused at parse, not left to fail
+    /// the first send and end the flow; the same packet is legal where the family allows it.
+    #[test]
+    fn an_oversized_fixed_noise_is_refused() {
+        let packet = "a".repeat(65_508);
+        let doc = |family: &str| {
+            crate::json::parse(&format!(
+                r#"{{"outbounds":[{{"protocol":"freedom","settings":{{"noises":[{{"type":"str","packet":"{packet}","applyTo":"{family}"}}]}}}}]}}"#
+            ))
+            .expect("parses")
+        };
+        assert!(
+            find_outbound(&doc("ipv4")).is_err(),
+            "a 65508-byte packet is over the IPv4 limit"
+        );
+        assert!(
+            find_outbound(&doc("ipv6")).is_ok(),
+            "the IPv6 limit leaves room for it"
+        );
+    }
+
+    /// A `finalmask.udp` noise list and an outbound `evasion.noises` overlay both reach the same
+    /// decoy list, and the overlay wins over the legacy `settings.noises`.
+    #[test]
+    fn a_finalmask_noise_wins_over_the_legacy_list() {
+        use ferrox_core::evasion::NoiseKind;
+        let out = freedom_out(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"noises":[
+                {"type":"str","packet":"legacy"}]},
+                "streamSettings":{"finalmask":{"udp":[
+                    {"type":"noise","settings":{"noise":[{"type":"str","packet":"mask"}]}}]}}}]}"#,
+        );
+        let Outbound::Freedom(freedom) = out else {
+            panic!("a freedom outbound");
+        };
+        assert_eq!(freedom.noises.len(), 1);
+        assert_eq!(
+            freedom.noises[0].noise.kind,
+            NoiseKind::Fixed(b"mask".to_vec())
+        );
+
+        let out = freedom_out(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"noises":[
+                {"type":"str","packet":"legacy"}]},"evasion":{"noises":[
+                {"type":"str","packet":"overlay"}]}}]}"#,
+        );
+        let Outbound::Freedom(freedom) = out else {
+            panic!("a freedom outbound");
+        };
+        assert_eq!(
+            freedom.noises[0].noise.kind,
+            NoiseKind::Fixed(b"overlay".to_vec())
+        );
     }
 
     /// An unknown strategy is refused by name rather than dialled as `AsIs`.
