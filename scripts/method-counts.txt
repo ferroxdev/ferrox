@@ -101,7 +101,7 @@ shadowsocks host-port-strings-per-datagram 0 ferrox-app-shadowsocks::tests::a_da
 
 # --- VLESS ------------------------------------------------------------------
 vless ops-retired-instructions UNBLESSED scripts/count-ops.sh
-vless syscalls-per-request UNBLESSED scripts/count-ops.sh
+vless syscalls-per-request UNBLESSED no syscall checker yet
 vless request-header-allocations 0 ferrox-bench-gate-2
 vless request-header-bytes-zero-filled 0 ferrox-bench-gate-2
 vless address-families-encoded 4 ferrox-core-vless::tests::header_address_families_encode_stably

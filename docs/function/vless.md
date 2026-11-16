@@ -33,7 +33,7 @@ Both directions ride the relay lanes, and one direction ending does not end the 
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
-| syscalls-per-request | UNBLESSED | scripts/count-ops.sh |
+| syscalls-per-request | UNBLESSED | no syscall checker yet |
 | request-header-allocations | 0 | ferrox-bench-gate-2 |
 | request-header-bytes-zero-filled | 0 | ferrox-bench-gate-2 |
 | address-families-encoded | 4 | ferrox-core-vless::tests::header_address_families_encode_stably |
