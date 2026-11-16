@@ -1,15 +1,9 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use super::{base, base_state, portable, xor_groups_impl, Wide};
 
-const LANES_PREFERRED: u8 = 1;
-
-const SCALAR_PREFERRED: u8 = 2;
-
-const UNCALIBRATED: u8 = 0;
-
-static ONE_BLOCK: AtomicU8 = AtomicU8::new(UNCALIBRATED);
+static ONE_BLOCK: OnceLock<bool> = OnceLock::new();
 
 const TIE: f64 = 0.95;
 
@@ -19,18 +13,7 @@ const BLOCKS: usize = 64;
 
 #[inline]
 pub(super) fn verdict() -> bool {
-    match ONE_BLOCK.load(Ordering::Relaxed) {
-        LANES_PREFERRED => return true,
-        SCALAR_PREFERRED => return false,
-        _ => {}
-    }
-    let winner = if measure() {
-        LANES_PREFERRED
-    } else {
-        SCALAR_PREFERRED
-    };
-    ONE_BLOCK.store(winner, Ordering::Relaxed);
-    winner == LANES_PREFERRED
+    *ONE_BLOCK.get_or_init(measure)
 }
 
 fn measure() -> bool {
@@ -49,6 +32,7 @@ fn measure() -> bool {
         for block in 0..BLOCKS {
             let mut out = [0u8; 64];
             xor_groups_impl::<Wide, 1, false>(&base::<Wide>(&state), ctr, &[], &mut out, None);
+            core::hint::black_box(&out);
             ctr = u32::from_le_bytes(out[..4].try_into().expect("four bytes"));
             lanes[block * 64..block * 64 + 64].copy_from_slice(&out);
         }
@@ -59,6 +43,7 @@ fn measure() -> bool {
         for block in 0..BLOCKS {
             let mut out = [0u8; 64];
             portable::xor_block(&state, ctr, &mut out);
+            core::hint::black_box(&out);
             ctr = u32::from_le_bytes(out[..4].try_into().expect("four bytes"));
             scalar[block * 64..block * 64 + 64].copy_from_slice(&out);
         }
@@ -74,28 +59,20 @@ fn measure() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        base, base_state, portable, verdict, xor_groups_impl, Wide, LANES_PREFERRED, ONE_BLOCK,
-        SCALAR_PREFERRED, UNCALIBRATED,
-    };
+    use super::{base, base_state, portable, verdict, xor_groups_impl, Wide, ONE_BLOCK};
     use crate::chacha::one_block_impl;
-    use std::sync::atomic::Ordering;
 
     #[test]
-    fn the_verdict_is_memoised_after_the_first_call() {
+    fn the_verdict_is_published_once_for_every_caller() {
         let first = verdict();
-        assert_eq!(
-            ONE_BLOCK.load(Ordering::Relaxed),
-            if first {
-                LANES_PREFERRED
-            } else {
-                SCALAR_PREFERRED
-            }
-        );
         for _ in 0..8 {
             assert_eq!(verdict(), first, "the verdict changed between calls");
         }
-        assert_ne!(ONE_BLOCK.load(Ordering::Relaxed), UNCALIBRATED);
+        assert_eq!(
+            ONE_BLOCK.get(),
+            Some(&first),
+            "the first winner was published"
+        );
     }
 
     #[test]

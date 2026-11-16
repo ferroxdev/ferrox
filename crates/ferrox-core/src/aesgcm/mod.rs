@@ -42,9 +42,9 @@ pub(crate) trait Lanes: Copy {
     fn ctr4(self, n: u32) -> [Self; 4] {
         [
             self.ctr_be(n),
-            self.ctr_be(n + 1),
-            self.ctr_be(n + 2),
-            self.ctr_be(n + 3),
+            self.ctr_be(n.wrapping_add(1)),
+            self.ctr_be(n.wrapping_add(2)),
+            self.ctr_be(n.wrapping_add(3)),
         ]
     }
     fn encrypt4(rk: &[Self; 11], s: &mut [Self; 4]);
@@ -206,9 +206,9 @@ pub(crate) fn ctr_ghash<V: Lanes>(
     } else {
         let mut ksv = [
             template.ctr_be(ctr),
-            template.ctr_be(ctr + 1),
-            template.ctr_be(ctr + 2),
-            template.ctr_be(ctr + 3),
+            template.ctr_be(ctr.wrapping_add(1)),
+            template.ctr_be(ctr.wrapping_add(2)),
+            template.ctr_be(ctr.wrapping_add(3)),
             mask,
         ];
         V::encrypt5(rk, &mut ksv);
@@ -245,14 +245,14 @@ pub(crate) fn ctr_ghash<V: Lanes>(
                 ct4[3].bswap(),
             ],
         );
-        ctr += 4;
+        ctr = ctr.wrapping_add(4);
     }
     for blk in rest {
         let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
         let ct1 = ks1.xor(V::load(blk));
         ct1.store(blk);
         tailq.push(ct1.bswap());
-        ctr += 1;
+        ctr = ctr.wrapping_add(1);
     }
     if !tail.is_empty() {
         let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
@@ -280,12 +280,12 @@ pub(crate) fn ctr_only<V: Lanes>(rk: &[V; 11], template: V, buf: &mut [u8], mut 
             let ct1 = ks.xor(V::load(gi));
             ct1.store(gi);
         }
-        ctr += 4;
+        ctr = ctr.wrapping_add(4);
     }
     for blk in rest {
         let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
         ks1.xor(V::load(blk)).store(blk);
-        ctr += 1;
+        ctr = ctr.wrapping_add(1);
     }
     if !tail.is_empty() {
         let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
@@ -389,9 +389,9 @@ pub(crate) fn ctr_ghash_from<V: Lanes>(
     } else {
         let mut ksv = [
             template.ctr_be(ctr),
-            template.ctr_be(ctr + 1),
-            template.ctr_be(ctr + 2),
-            template.ctr_be(ctr + 3),
+            template.ctr_be(ctr.wrapping_add(1)),
+            template.ctr_be(ctr.wrapping_add(2)),
+            template.ctr_be(ctr.wrapping_add(3)),
             mask,
         ];
         V::encrypt5(rk, &mut ksv);
@@ -428,14 +428,14 @@ pub(crate) fn ctr_ghash_from<V: Lanes>(
                 ct4[3].bswap(),
             ],
         );
-        ctr += 4;
+        ctr = ctr.wrapping_add(4);
     }
     for (sb, db) in srest.iter().zip(drest.iter_mut()) {
         let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
         let ct1 = ks1.xor(V::load(sb));
         ct1.store(db);
         tailq.push(ct1.bswap());
-        ctr += 1;
+        ctr = ctr.wrapping_add(1);
     }
     if !stail.is_empty() {
         let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
@@ -484,9 +484,9 @@ pub(crate) unsafe fn ctr_ghash_from_uninit<V: Lanes>(
     } else {
         let mut ksv = [
             template.ctr_be(ctr),
-            template.ctr_be(ctr + 1),
-            template.ctr_be(ctr + 2),
-            template.ctr_be(ctr + 3),
+            template.ctr_be(ctr.wrapping_add(1)),
+            template.ctr_be(ctr.wrapping_add(2)),
+            template.ctr_be(ctr.wrapping_add(3)),
             mask,
         ];
         V::encrypt5(rk, &mut ksv);
@@ -527,7 +527,7 @@ pub(crate) unsafe fn ctr_ghash_from_uninit<V: Lanes>(
                 ct4[3].bswap(),
             ],
         );
-        ctr += 4;
+        ctr = ctr.wrapping_add(4);
     }
     let mut at = sgroups.len() * 64;
     for sb in srest {
@@ -536,7 +536,7 @@ pub(crate) unsafe fn ctr_ghash_from_uninit<V: Lanes>(
         // SAFETY: `at` is inside the `src.len()`-byte destination.
         unsafe { V::store_ptr(ct1, dst.add(at)) };
         tailq.push(ct1.bswap());
-        ctr += 1;
+        ctr = ctr.wrapping_add(1);
         at += 16;
     }
     if !stail.is_empty() {
@@ -996,9 +996,9 @@ pub(crate) fn ctr_ghash_256<V: Lanes>(
     } else {
         let mut ksv = [
             template.ctr_be(ctr),
-            template.ctr_be(ctr + 1),
-            template.ctr_be(ctr + 2),
-            template.ctr_be(ctr + 3),
+            template.ctr_be(ctr.wrapping_add(1)),
+            template.ctr_be(ctr.wrapping_add(2)),
+            template.ctr_be(ctr.wrapping_add(3)),
             mask,
         ];
         V::encrypt5_256(rk, &mut ksv);
@@ -1035,14 +1035,14 @@ pub(crate) fn ctr_ghash_256<V: Lanes>(
                 ct4[3].bswap(),
             ],
         );
-        ctr += 4;
+        ctr = ctr.wrapping_add(4);
     }
     for blk in rest {
         let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
         let ct1 = ks1.xor(V::load(blk));
         ct1.store(blk);
         tailq.push(ct1.bswap());
-        ctr += 1;
+        ctr = ctr.wrapping_add(1);
     }
     if !tail.is_empty() {
         let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
@@ -1090,9 +1090,9 @@ pub(crate) fn ctr_ghash_from_256<V: Lanes>(
     } else {
         let mut ksv = [
             template.ctr_be(ctr),
-            template.ctr_be(ctr + 1),
-            template.ctr_be(ctr + 2),
-            template.ctr_be(ctr + 3),
+            template.ctr_be(ctr.wrapping_add(1)),
+            template.ctr_be(ctr.wrapping_add(2)),
+            template.ctr_be(ctr.wrapping_add(3)),
             mask,
         ];
         V::encrypt5_256(rk, &mut ksv);
@@ -1129,14 +1129,14 @@ pub(crate) fn ctr_ghash_from_256<V: Lanes>(
                 ct4[3].bswap(),
             ],
         );
-        ctr += 4;
+        ctr = ctr.wrapping_add(4);
     }
     for (sb, db) in srest.iter().zip(drest.iter_mut()) {
         let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
         let ct1 = ks1.xor(V::load(sb));
         ct1.store(db);
         tailq.push(ct1.bswap());
-        ctr += 1;
+        ctr = ctr.wrapping_add(1);
     }
     if !stail.is_empty() {
         let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
@@ -1185,9 +1185,9 @@ pub(crate) unsafe fn ctr_ghash_from_256_uninit<V: Lanes>(
     } else {
         let mut ksv = [
             template.ctr_be(ctr),
-            template.ctr_be(ctr + 1),
-            template.ctr_be(ctr + 2),
-            template.ctr_be(ctr + 3),
+            template.ctr_be(ctr.wrapping_add(1)),
+            template.ctr_be(ctr.wrapping_add(2)),
+            template.ctr_be(ctr.wrapping_add(3)),
             mask,
         ];
         V::encrypt5_256(rk, &mut ksv);
@@ -1228,7 +1228,7 @@ pub(crate) unsafe fn ctr_ghash_from_256_uninit<V: Lanes>(
                 ct4[3].bswap(),
             ],
         );
-        ctr += 4;
+        ctr = ctr.wrapping_add(4);
     }
     let mut at = sgroups.len() * 64;
     for sb in srest {
@@ -1237,7 +1237,7 @@ pub(crate) unsafe fn ctr_ghash_from_256_uninit<V: Lanes>(
         // SAFETY: `at` is inside the `src.len()`-byte destination.
         unsafe { V::store_ptr(ct1, dst.add(at)) };
         tailq.push(ct1.bswap());
-        ctr += 1;
+        ctr = ctr.wrapping_add(1);
         at += 16;
     }
     if !stail.is_empty() {
@@ -1272,12 +1272,12 @@ pub(crate) fn ctr_only_256<V: Lanes>(rk: &[V; 15], template: V, buf: &mut [u8], 
             let ct1 = ks.xor(V::load(gi));
             ct1.store(gi);
         }
-        ctr += 4;
+        ctr = ctr.wrapping_add(4);
     }
     for blk in rest {
         let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
         ks1.xor(V::load(blk)).store(blk);
-        ctr += 1;
+        ctr = ctr.wrapping_add(1);
     }
     if !tail.is_empty() {
         let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
