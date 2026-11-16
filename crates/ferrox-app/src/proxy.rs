@@ -12947,6 +12947,10 @@ fn serve_hysteria_flow(mut flow: crate::hysteria::Flow, freedom: bool) {
     let Some(address) = crate::hysteria::read_request(&mut flow, deadline) else {
         return;
     };
+    let Some(target) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+        flow.close();
+        return;
+    };
     let mut raw = [0u8; 2050];
     let padding = crate::hysteria::hysteria_padding(128, 1024, &mut raw);
     let mut ok = Vec::with_capacity(4 + padding.len());
@@ -12954,10 +12958,6 @@ fn serve_hysteria_flow(mut flow: crate::hysteria::Flow, freedom: bool) {
     if flow.write_all(&ok).is_err() {
         return;
     }
-    let Some(target) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
-        flow.close();
-        return;
-    };
     let Some(uplink) = dial_or_report(&target) else {
         flow.close();
         return;
