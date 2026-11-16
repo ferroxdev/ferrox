@@ -2492,6 +2492,23 @@ impl Picked<'_> {
 pub(crate) struct Lane {
     pub(crate) out: Arc<Outbound>,
     pub(crate) tag: Option<String>,
+    /// The dial settings routing left for this lane. The fallback relay runs on a thread a
+    /// `budgets::spawn` started, where the thread-locals `device_dial` set are not visible, so
+    /// they travel with the lane and are reinstalled before the dial.
+    source: Option<SendThrough>,
+    sockopts: Option<Arc<crate::sockopt::SocketOptions>>,
+    strategy: Option<FreedomDomain>,
+}
+
+impl Lane {
+    /// Reinstall the captured settings on the thread that dials this lane.
+    fn enter(&self) -> (SendThroughGuard, DialSockoptsGuard, TargetStrategyGuard) {
+        (
+            SendThroughGuard::enter(self.source),
+            DialSockoptsGuard::enter(self.sockopts.clone()),
+            TargetStrategyGuard::enter(self.strategy),
+        )
+    }
 }
 
 /// The outbounds the management API added or removed after startup. `changed` keeps the routing
@@ -24567,6 +24584,7 @@ pub(crate) fn serve_device_flow(
     dest: &Destination,
 ) -> std::io::Result<()> {
     if let Some(lane) = carried {
+        let _settings = lane.enter();
         return serve_lane(client, dest, &lane.out, lane.tag.as_deref());
     }
     let (dial, picked, tag) = sniff_lane(out, dest, &client, None, None);
@@ -24642,6 +24660,9 @@ pub(crate) fn device_dial(out: &Outbound) -> crate::tun::Dial {
         crate::tun::DialOutcome::Fallback(Lane {
             out: std::sync::Arc::new(lane),
             tag: tag.map(std::borrow::Cow::into_owned),
+            source: SEND_THROUGH.with(std::cell::Cell::take),
+            sockopts: DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take()),
+            strategy: TARGET_STRATEGY.with(std::cell::Cell::take),
         })
     })
 }
