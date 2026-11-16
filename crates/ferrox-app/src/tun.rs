@@ -537,8 +537,8 @@ fn read_limit(gso: bool, mss: usize, room: usize) -> usize {
     }
 }
 
-/// How long a queue waits for an answer that follows its own upload: an echo replies in microseconds, and past this the response thread's read is the cheaper waiter.
-const PING_PONG_SPIN: std::time::Duration = std::time::Duration::from_micros(100);
+/// How long a queue waits for an answer that follows its own upload: an echo replies inside this window on this bench's own p50, and past it the response thread's read is the cheaper waiter, so a queue that carries a second flow holds it for less.
+const PING_PONG_SPIN: std::time::Duration = std::time::Duration::from_micros(40);
 
 /// Answers in a row that may miss before a flow stops waiting: a conversation answers inside the window every time, where a bulk upload's peer never does, and paying the wait four times once costs a flow less than a millisecond.
 const PING_PONG_MISSES: u32 = 4;
