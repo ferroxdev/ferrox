@@ -345,6 +345,12 @@ for g in "${gated[@]}"; do
   fi
 done
 
+exit_status=0
+if ((pass + fail + skip == 0)); then
+  echo "::error::$self: no test in the map reported a verdict, so a green job would prove nothing" >&2
+  exit_status=1
+fi
+
 {
   echo "# xray-core scenario map @ \`${rev:0:7}\`"
   echo
@@ -376,4 +382,4 @@ done
 
 cat "$summary"
 echo "$self: $pass of $total_tests test(s) green against $binary_name at $rev; the gate's own verdict is unchanged by this map"
-exit 0
+exit "$exit_status"
