@@ -91,6 +91,7 @@ fn open_tun(name: &str, offload: bool, multi_queue: bool) -> io::Result<File> {
 
 fn forward(mut source: File, mut sink: File) {
     let mut frame = vec![0u8; MAX_FRAME];
+    let mut warned = false;
     loop {
         match source.read(&mut frame) {
             Ok(0) => {
@@ -98,9 +99,12 @@ fn forward(mut source: File, mut sink: File) {
                 std::process::exit(1);
             }
             Ok(n) => {
+                // The peer is down until the namespace script brings it up, and a write to it answers EIO; a forwarding bench drops that packet, as the device layer drops a refused one, instead of ending the run.
                 if let Err(error) = sink.write_all(&frame[..n]) {
-                    eprintln!("ferrox-tun-raw: write failed: {error}");
-                    std::process::exit(1);
+                    if !warned {
+                        eprintln!("ferrox-tun-raw: dropping a packet the peer refused: {error}");
+                        warned = true;
+                    }
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
