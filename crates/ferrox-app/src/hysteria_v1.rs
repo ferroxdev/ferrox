@@ -235,6 +235,8 @@ struct Server {
     /// A tuned QUIC lane is its own connection: its windows, controller profile and Brutal rates were negotiated, so a dial with another block may not ride it.
     quic: Option<ferrox_core::hysteria::QuicParams>,
     roots: Option<ferrox_core::tls::Anchors>,
+    /// A verifying dial may not ride a lane whose peer was accepted without the chain check.
+    insecure: bool,
 }
 
 const REUSE_WINDOW: Duration = Duration::from_millis(crate::quic::IDLE_TIMEOUT_MS / 2);
@@ -256,6 +258,7 @@ fn server_of(dial: &Dial) -> Server {
         hop: dial.config.hop.clone(),
         quic: dial.config.quic,
         roots: dial.roots.clone(),
+        insecure: dial.config.insecure,
     }
 }
 
@@ -1294,6 +1297,13 @@ mod tests {
             server_of(&dial(None)),
             server_of(&dial(Some(cubic))),
             "a tuned lane never rides a plain connection"
+        );
+        let mut untrusted = dial(None);
+        untrusted.config.insecure = true;
+        assert_ne!(
+            server_of(&untrusted),
+            server_of(&dial(None)),
+            "an unverified lane is not reused by a verifying dial"
         );
     }
 
