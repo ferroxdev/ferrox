@@ -2695,6 +2695,33 @@ pub(crate) fn hysteria_version(node: Option<&Json>) -> Option<u32> {
     })
 }
 
+/// The auth strings an inbound accepts: `clients` replaces `users`, and either empty falls back to the transport's auth.
+pub(crate) fn hysteria_inbound_auths(
+    settings: Option<&Json>,
+    stream: Option<&Json>,
+) -> Vec<String> {
+    let users = settings.and_then(|node| {
+        node.get("clients")
+            .filter(|value| !matches!(value, Json::Null))
+            .or_else(|| node.get("users"))
+    });
+    if let Some(users) = users.and_then(Json::as_arr) {
+        if !users.is_empty() {
+            return users
+                .iter()
+                .filter_map(|user| user.get("auth").and_then(Json::as_str).map(str::to_owned))
+                .collect();
+        }
+    }
+    stream
+        .and_then(|node| node.get("hysteriaSettings"))
+        .and_then(|hy| hy.get("auth"))
+        .and_then(Json::as_str)
+        .filter(|auth| !auth.is_empty())
+        .map(|auth| vec![auth.to_owned()])
+        .unwrap_or_default()
+}
+
 /// A JSON integer, as a number or a decimal string; a fractional or non-numeric value names nothing.
 fn as_i64(node: &Json) -> Option<i64> {
     match node {
@@ -4232,6 +4259,61 @@ mod tests {
         assert!(
             config.insecure,
             "the TLS verdict reaches the QUIC handshake"
+        );
+    }
+
+    #[test]
+    fn a_hysteria_inbound_takes_clients_then_users_then_the_transport_auth() {
+        let auths = |text: &str| {
+            let inbound = crate::json::parse(text).expect("parses");
+            hysteria_inbound_auths(inbound.get("settings"), inbound.get("streamSettings"))
+        };
+        assert_eq!(
+            auths(
+                r#"{"settings": {"users": [{"auth": "user"}]}, "streamSettings": {"hysteriaSettings": {"auth": "transport"}}}"#
+            ),
+            ["user"],
+            "a named user owns the credential"
+        );
+        assert_eq!(
+            auths(
+                r#"{"settings": {"users": [{"auth": "user"}], "clients": [{"auth": "client"}]}, "streamSettings": {"hysteriaSettings": {"auth": "transport"}}}"#
+            ),
+            ["client"],
+            "the legacy clients spelling replaces users"
+        );
+        assert_eq!(
+            auths(
+                r#"{"settings": {"users": [{"auth": "user"}], "clients": []}, "streamSettings": {"hysteriaSettings": {"auth": "transport"}}}"#
+            ),
+            ["transport"],
+            "an empty clients list is present and leaves no validator, so the transport auth is used"
+        );
+        assert_eq!(
+            auths(
+                r#"{"settings": {"users": [{"auth": "user"}], "clients": null}, "streamSettings": {"hysteriaSettings": {"auth": "transport"}}}"#
+            ),
+            ["user"],
+            "a null clients list is absent"
+        );
+        assert_eq!(
+            auths(
+                r#"{"settings": {"users": [{}]}, "streamSettings": {"hysteriaSettings": {"auth": "transport"}}}"#
+            ),
+            Vec::<String>::new(),
+            "a user with no auth leaves the validator non-empty and suppresses the transport auth"
+        );
+        assert_eq!(
+            auths(
+                r#"{"settings": {}, "streamSettings": {"hysteriaSettings": {"auth": "transport"}}}"#
+            ),
+            ["transport"],
+            "an inbound with no users accepts the transport auth"
+        );
+        assert_eq!(
+            auths(r#"{"settings": {}, "streamSettings": {"hysteriaSettings": {}}}"#),
+            Vec::<String>::new(),
+            "no credential at all accepts nothing"
         );
     }
 

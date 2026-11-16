@@ -639,7 +639,13 @@ pub(crate) fn apply_hysteria_quic(
         config.set_initial_max_streams_bidi(streams);
         config.set_initial_max_streams_uni(streams);
     }
-    if params.no_path_mtu {
+    if params.no_path_mtu
+        || !cfg!(any(
+            target_os = "linux",
+            target_os = "windows",
+            target_os = "darwin"
+        ))
+    {
         config.discover_pmtu(false);
     }
 }

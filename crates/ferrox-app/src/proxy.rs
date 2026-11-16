@@ -12977,16 +12977,7 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
         eprintln!("hysteria inbound in {path} is not version 1 or 2: serves nothing");
         return false;
     }
-    let auths: Vec<String> = settings
-        .and_then(|node| node.get("users"))
-        .and_then(Json::as_arr)
-        .map(|users| {
-            users
-                .iter()
-                .filter_map(|user| user.get("auth").and_then(Json::as_str).map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+    let auths = crate::config::hysteria_inbound_auths(settings, inbound.get("streamSettings"));
     if auths.is_empty() {
         eprintln!("hysteria inbound in {path} names no user auth: serves nothing");
         return false;

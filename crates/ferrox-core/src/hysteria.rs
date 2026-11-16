@@ -938,6 +938,7 @@ pub fn verify_auth_request(block: &[u8], expected_auth: &str) -> bool {
         return false;
     };
     find(&fields, ":method") == Some(b"POST".as_slice())
+        && find(&fields, ":authority") == Some(AUTH_AUTHORITY.as_bytes())
         && find(&fields, ":path") == Some(AUTH_PATH.as_bytes())
         && find(&fields, AUTH_HEADER) == Some(expected_auth.as_bytes())
 }
@@ -949,6 +950,7 @@ pub fn is_hysteria_auth_shape(block: &[u8]) -> bool {
         return false;
     };
     find(&fields, ":method") == Some(b"POST".as_slice())
+        && find(&fields, ":authority") == Some(AUTH_AUTHORITY.as_bytes())
         && find(&fields, ":path") == Some(AUTH_PATH.as_bytes())
 }
 
@@ -1746,6 +1748,24 @@ mod tests {
             ],
             &mut block,
         );
+        assert!(!verify_auth_request(&block, "s3cret"));
+        // The authority is part of the handshake's shape: a POST to `/auth` under another name is refused.
+        let mut block = Vec::new();
+        hpack::qpack_literal_many(
+            &[
+                (":method", "POST"),
+                (":authority", "not-hysteria"),
+                (":path", "/auth"),
+                (AUTH_HEADER, "s3cret"),
+            ],
+            &mut block,
+        );
+        assert!(!verify_auth_request(&block, "s3cret"));
+        assert!(!is_hysteria_auth_shape(&block));
+        // A right-shape request with the wrong password stays a handshake attempt, so the masquerade refuses it rather than answering the cover site.
+        let mut block = Vec::new();
+        build_auth_request("wrong", 0, "", &mut block);
+        assert!(is_hysteria_auth_shape(&block));
         assert!(!verify_auth_request(&block, "s3cret"));
         assert!(!verify_auth_request(&[0x01, 0x00], "s3cret"));
     }
