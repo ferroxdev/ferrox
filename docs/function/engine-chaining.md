@@ -43,7 +43,10 @@ route registry, which is what lets `dial_through_proxy` resolve the next edge by
 
 The first hop's socket options are kept except for the upstream edge, which the chain list already
 names. A hop that cannot relay, such as `freedom`, `blackhole`, `dns`, `loopback`, `route`, the
-metrics lane or the API, is refused before the exit when it appears in an intermediate position.
+metrics lane or the API, is refused before the exit when it appears in an intermediate position. A
+hop whose carrier binds its own socket — `wireguard`, `warp`, `hysteria`, `foxy`, `veepn`, or a
+QUIC/KCP/hysteria carrier — is refused after the first position rather than reaching its peer
+from this machine; MASQUE takes the hop in its own spec because its carrier reads no thread-local.
 
 ## TCP and UDP
 
@@ -75,14 +78,18 @@ graph TD
 
 ## What was removed
 
-- **A `detour` that started the process and was ignored.** The key now normalises into the same
-  socket options as `dialerProxy`, so the existing TCP and UDP seams carry it and the cycle check
-  sees it.
-- **A chain that could only be spelled as a hand-written local front per flow.** The ordered list is
-  flattened and built once at startup, and each hop edge is a private registry entry rather than a
-  per-flow copy of the outbound.
-- **A cycle that could reach the runtime recursion.** Missing, self, duplicate, nested-out-of-place
-  and cyclic lists are refused before the route table is built.
+- **Against Xray-core: an unbounded recursive `dialerProxy` walk.** Xray resolves the hop by
+  recursively dialing the named outbound with no visited set, so a cycle is a runtime recursion.
+  Here the same edge is flattened and cycle-checked once, before any lane exists.
+- **Against sing-box: a single-resolution `detour`.** Sing-box reads one `DetourDialer` and resolves
+  it once, which cannot spell an ordered list and leaves the second hop uninspected. The `detour`
+  key now normalises into the same edge as `dialerProxy`, and the ordered list is the route.
+- **Against ZeroNet/LxBox: a per-flow chain walk and out-of-place nesting.** The ordered list is
+  flattened and built once at startup, each earlier hop gets a private registry tag, and a nested
+  chain outside the first position, a missing, self, duplicate or cyclic hop is refused before the
+  route table is built.
+- **Against this tree's previous behaviour: a `detour` that started the process and was ignored.**
+  It now reaches the existing TCP and UDP seams through the same socket options.
 
 What is **not** removed: each hop still pays the local-front loopback pipe on TCP and the shim's
 threads and SOCKS5 framing on UDP; the chain is not a pooled carrier; and a chain whose intermediate

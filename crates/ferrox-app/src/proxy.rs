@@ -356,6 +356,10 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         )
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
     });
+    if let Some(observatory) = &observatory {
+        crate::observatory::spawn(root, observatory, route.as_ref())
+            .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    }
     if let Some(api) = api.as_ref() {
         wire_api(
             api,
@@ -419,7 +423,7 @@ fn start_observatory(
     if test {
         crate::observatory::validate(root).map(|()| None)
     } else {
-        crate::observatory::start(root)
+        crate::observatory::configure(root)
     }
 }
 
@@ -2595,6 +2599,33 @@ impl RouteShared {
         self.tagged.get(tag)
     }
 
+    /// The probe target a health check reaches by tag, with the same source, options and target
+    /// strategy the route gives a flow; the chain tag resolves to its exit lane.
+    pub(crate) fn probe_target(&self, tag: &str) -> Option<ProbeTarget> {
+        let (out, source, sockopts, strategy) = if self.default_tag.as_deref() == Some(tag) {
+            (
+                self.default.clone(),
+                self.default_source,
+                self.default_sockopts.clone(),
+                self.default_strategy,
+            )
+        } else {
+            (
+                self.tagged.get(tag)?.clone(),
+                self.sources.get(tag).copied(),
+                self.sockopts.get(tag).cloned(),
+                self.strategies.get(tag).copied(),
+            )
+        };
+        Some(ProbeTarget {
+            out,
+            source,
+            sockopts,
+            strategy,
+            tag: Some(tag.to_owned()),
+        })
+    }
+
     /// The outbound a `geodata.outbound` tag names, or the default when the tag is empty, which is
     /// what the reference's forced-tag dispatch falls back to.
     pub(crate) fn outbound_for(&self, tag: &str) -> Option<Outbound> {
@@ -3664,6 +3695,34 @@ fn add_dialer_proxy_targets<'a>(
     Ok(())
 }
 
+/// Whether a hop's own dial seam reads the predecessor's `dialerProxy`; a carrier that binds its
+/// own socket instead would reach the peer from this machine and skip every earlier hop.
+fn chain_hop_can_dial_through(out: &Outbound) -> bool {
+    match out {
+        Outbound::Vless(vless) => vless.carrier.tcp_stream(),
+        Outbound::Vmess(vmess) => vmess.carrier.tcp_stream(),
+        Outbound::Trojan(trojan) => trojan.carrier.tcp_stream(),
+        Outbound::Shadowsocks(shadowsocks) => shadowsocks.carrier.tcp_stream(),
+        Outbound::Socks(_)
+        | Outbound::Http(_)
+        | Outbound::Psiphon(_)
+        | Outbound::Freedom(_)
+        | Outbound::Masque(_) => true,
+        Outbound::WireGuard(_)
+        | Outbound::Warp(_)
+        | Outbound::Hysteria(_)
+        | Outbound::Foxy(_)
+        | Outbound::Veepn(_)
+        | Outbound::Loopback(_)
+        | Outbound::Route(_)
+        | Outbound::Block(_)
+        | Outbound::Dns(_)
+        | Outbound::ReversePortal(_)
+        | Outbound::Metrics { .. }
+        | Outbound::Api(_) => false,
+    }
+}
+
 /// One lane in a chain: the tag the dial seam reaches, the outbound built for it, and the dial
 /// settings that lane carries. The innermost lane is the chain's route entry.
 struct ChainLane {
@@ -3705,7 +3764,21 @@ fn build_chain_lanes(
                 "chain `{tag}` needs private tag `{lane_tag}`, which an outbound already names"
             ));
         }
-        let out = routed_outbound(root, config, &lane_tag)?;
+        let mut out = routed_outbound(root, config, &lane_tag)?;
+        // MASQUE's spec owns its carrier hop; the first position clears any hop the config named.
+        let upstream = (index > 0).then(|| chain_lane_tag(tag, index - 1));
+        if let Outbound::Masque(masque) = &mut out {
+            let Some(masque) = Arc::get_mut(masque) else {
+                return Err(format!("chain `{tag}` hop `{hop}` MASQUE lane is shared"));
+            };
+            masque.set_dialer_proxy(upstream.as_deref());
+        }
+        if index > 0 && !chain_hop_can_dial_through(&out) {
+            return Err(format!(
+                "chain `{tag}` hop `{hop}` cannot dial through `{}`; only the first position dials the machine directly",
+                hops[index - 1]
+            ));
+        }
         if index + 1 < hops.len()
             && matches!(
                 out,
@@ -4158,6 +4231,15 @@ fn direct_tag(shared: &RouteShared, tag: &str) -> bool {
         if let Some(out) = dynamic.added.get(tag) {
             return matches!(out.as_ref(), Outbound::Freedom(_));
         }
+    }
+    // A direct-only inbound dials its own target, so a lane naming a hop is not a direct route.
+    let options = if Some(tag) == shared.default_tag.as_deref() {
+        shared.default_sockopts.as_deref()
+    } else {
+        shared.sockopts.get(tag).map(Arc::as_ref)
+    };
+    if options.is_some_and(|options| options.dialer_proxy().is_some()) {
+        return false;
     }
     (Some(tag) == shared.default_tag.as_deref() && matches!(&shared.default, Outbound::Freedom(_)))
         || matches!(shared.tagged.get(tag), Some(Outbound::Freedom(_)))
@@ -7798,6 +7880,17 @@ fn tunnel_stream(
     front: Front,
     name: &str,
 ) -> Option<Connection> {
+    tunnel_stream_with(out, dest, timeout, front, name, None)
+}
+
+fn tunnel_stream_with(
+    out: &Outbound,
+    dest: Destination,
+    timeout: Duration,
+    front: Front,
+    name: &str,
+    settings: Option<ProbeTarget>,
+) -> Option<Connection> {
     let listener = std::net::TcpListener::bind(SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         0,
@@ -7813,7 +7906,17 @@ fn tunnel_stream(
         .name(name.to_owned())
         .spawn({
             let out = out.clone();
+            let source = settings.as_ref().and_then(|settings| settings.source);
+            let sockopts = settings
+                .as_ref()
+                .and_then(|settings| settings.sockopts.clone());
+            let strategy = settings.as_ref().and_then(|settings| settings.strategy);
+            let tag = settings.as_ref().and_then(|settings| settings.tag.clone());
             move || {
+                let _source = SendThroughGuard::enter(source);
+                let _sockopts = DialSockoptsGuard::enter(sockopts);
+                let _strategy = TargetStrategyGuard::enter(strategy);
+                let _tag = OutboundTag::enter(tag.as_deref());
                 serve_connect(
                     Connection::Tcp(server),
                     &out,
@@ -7829,12 +7932,46 @@ fn tunnel_stream(
     Some(Connection::Tcp(client))
 }
 
+/// One probe target: the lane, the source, socket options and target strategy its tag names, and
+/// the tag itself for the dial seam's own loop check.
+#[derive(Clone)]
+pub(crate) struct ProbeTarget {
+    out: Outbound,
+    source: Option<SendThrough>,
+    sockopts: Option<Arc<crate::sockopt::SocketOptions>>,
+    strategy: Option<FreedomDomain>,
+    tag: Option<String>,
+}
+
+impl ProbeTarget {
+    pub(crate) fn plain(out: Outbound) -> Self {
+        Self {
+            out,
+            source: None,
+            sockopts: None,
+            strategy: None,
+            tag: None,
+        }
+    }
+
+    pub(crate) fn probe_stream(&self, dest: &Destination, timeout: Duration) -> Option<Connection> {
+        tunnel_stream_with(
+            &self.out,
+            dest.clone(),
+            timeout,
+            Front::Probe,
+            "ferrox-probe",
+            Some(self.clone()),
+        )
+    }
+}
+
 pub(crate) fn probe_stream(
     out: &Outbound,
     dest: &Destination,
     timeout: Duration,
 ) -> Option<Connection> {
-    tunnel_stream(out, dest.clone(), timeout, Front::Probe, "ferrox-probe")
+    ProbeTarget::plain(out.clone()).probe_stream(dest, timeout)
 }
 
 /// One DNS datagram through the route's chosen outbound. The SOCKS UDP frame needs the
@@ -75621,6 +75758,54 @@ mod tests {
             routing_for(&no_routing).expect("parses").is_some(),
             "a chain needs the route table even when the config has no routing block"
         );
+    }
+
+    /// A hop whose carrier binds its own socket cannot take the predecessor's local front, so the
+    /// chain refuses it instead of reaching the peer from this machine.
+    #[test]
+    fn a_chain_refuses_a_hop_that_binds_its_own_socket() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"chain","type":"chain","outbounds":["first","exit"]},
+                {"tag":"first","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"exit","protocol":"hysteria","settings":{"version":1,"address":"127.0.0.1","port":443,"auth":"pw"},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"serverName":"example.com","obfs":"key"}}}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let error = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect_err("a self-socket hop after the first is refused");
+        assert!(error.contains("cannot dial through"), "{error}");
+    }
+
+    /// A chain tag's health target is its exit lane with the hop's options, and a direct-only
+    /// inbound does not accept it as a direct route.
+    #[test]
+    fn a_chain_probe_target_and_direct_proof_read_its_exit() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"chain","type":"chain","outbounds":["hop","exit"]},
+                {"tag":"hop","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"exit","protocol":"freedom"}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let target = shared
+            .probe_target("chain")
+            .expect("the chain has a target");
+        assert_eq!(target.tag.as_deref(), Some("chain"));
+        let lane = chain_lane_tag("chain", 0);
+        assert_eq!(
+            target
+                .sockopts
+                .as_deref()
+                .and_then(|options| options.dialer_proxy()),
+            Some(lane.as_str())
+        );
+        assert!(!direct_tag(&shared, "chain"));
     }
 
     /// The socket options an outbound's `streamSettings.sockopt` names are the ones the socket its
