@@ -303,6 +303,11 @@ pub fn address_port(host: &str, port: u16) -> Option<Vec<u8>> {
 /// Writes one address and its port into a caller's buffer, so a packet that already holds the
 /// destination needs no `Vec` behind it. The returned length is what `encode_fragment` takes.
 pub fn address_port_into(address: Address<'_>, port: u16, out: &mut [u8]) -> Option<usize> {
+    if let Address::Name(bytes) = address {
+        if bytes.is_empty() || bytes.len() > MAX_ADDRESS {
+            return None;
+        }
+    }
     let len = address.wire_len();
     let total = len.checked_add(2)?;
     if out.len() < total {
@@ -345,6 +350,10 @@ mod tests {
             address_port_into(Address::V4([192, 0, 2, 1]), 1, &mut [0u8; 4]),
             None
         );
+        let mut out = [0u8; MAX_ADDRESS + 4];
+        assert_eq!(address_port_into(Address::Name(&[]), 1, &mut out), None);
+        let long = [b'a'; MAX_ADDRESS + 1];
+        assert_eq!(address_port_into(Address::Name(&long), 1, &mut out), None);
     }
 
     #[test]

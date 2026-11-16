@@ -46,6 +46,7 @@ const RESOLVE_WORKERS: usize = 4;
 const UDP_BUFFER: usize = 65_535;
 const UDP_PACKETS_PER_SWEEP: usize = 256;
 const UDP_PACKETS_PER_ASSOC: usize = 32;
+const DGRAM_SEND_QUEUE: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayMode {
@@ -446,7 +447,7 @@ impl TuicOut {
             quic::quiche_config_alpn(roots, self.cc.as_deref(), &[wire::ALPN])?
         };
         quic::tune_transport(&mut config);
-        config.enable_dgram(true, quic::MAX_DATAGRAM, 64);
+        config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
         if self.zero_rtt {
             config.enable_early_data();
         }
@@ -594,6 +595,7 @@ impl TuicOut {
                     let max = conn.dgram_max_writable_len();
                     send_message(
                         &mut conn,
+                        &lane.sock,
                         self.mode,
                         association,
                         packet,
@@ -762,6 +764,7 @@ fn export_token(
 #[allow(clippy::too_many_arguments)]
 fn send_message(
     conn: &mut quiche::Connection,
+    sock: &Datagram,
     mode: RelayMode,
     association: u16,
     packet: u16,
@@ -789,6 +792,14 @@ fn send_message(
         queue_stream(pending, association, packet, address, payload);
         return;
     };
+    let fragments = usize::from(plan.total);
+    if conn.dgram_send_queue_len() + fragments > DGRAM_SEND_QUEUE {
+        quic::flush_egress(conn, sock);
+        if conn.dgram_send_queue_len() + fragments > DGRAM_SEND_QUEUE {
+            queue_stream(pending, association, packet, address, payload);
+            return;
+        }
+    }
     frame.clear();
     if frame.capacity() < max {
         frame.reserve(max - frame.capacity());
@@ -810,7 +821,10 @@ fn send_message(
             frame,
         );
         if conn.dgram_send(&frame[..]).is_err() {
-            break;
+            quic::flush_egress(conn, sock);
+            if conn.dgram_send(&frame[..]).is_err() {
+                break;
+            }
         }
         left = &left[take..];
     }
@@ -1439,7 +1453,7 @@ pub(crate) fn serve_inbound(
             return false;
         }
     }
-    template.enable_dgram(true, quic::MAX_DATAGRAM, 64);
+    template.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
     if inbound.get("settings").is_some_and(|node| {
         bool_field(node, "zero_rtt_handshake") || bool_field(node, "zeroRttHandshake")
     }) {
@@ -1889,7 +1903,7 @@ impl Server {
         }
         let now = Instant::now();
         drain_resolved(&mut inner, now);
-        poll_udp(&mut conn, &mut inner, now);
+        poll_udp(&mut conn, &self.sock, &mut inner, now);
         inner
             .reassembly
             .retain(|_, parts| now.duration_since(parts.at) < REASSEMBLY_TTL);
@@ -1963,7 +1977,7 @@ impl Server {
                 .reassembly
                 .retain(|_, parts| now.duration_since(parts.at) < REASSEMBLY_TTL);
             drain_resolved(&mut inner, now);
-            poll_udp(&mut conn, &mut inner, now);
+            poll_udp(&mut conn, &self.sock, &mut inner, now);
             flush_inner(&mut conn, &self.sock, &mut inner);
             quic::flush_egress(&mut conn, &self.sock);
         }
@@ -2369,7 +2383,7 @@ fn accept_packet(
         Destination::Address(target) => {
             let now = Instant::now();
             deliver_udp(inner, packet.association, target, &payload, now);
-            poll_udp(conn, inner, now);
+            poll_udp(conn, sock, inner, now);
             flush_inner(conn, sock, inner);
         }
         Destination::Name(host, port) => {
@@ -2501,7 +2515,7 @@ fn flush_inner(conn: &mut quiche::Connection, sock: &Arc<Datagram>, inner: &mut 
     inner.pending = pending;
 }
 
-fn poll_udp(conn: &mut quiche::Connection, inner: &mut Inner, now: Instant) {
+fn poll_udp(conn: &mut quiche::Connection, sock: &Datagram, inner: &mut Inner, now: Instant) {
     let max = conn.dgram_max_writable_len();
     let mut buf = std::mem::take(&mut inner.udp_buf);
     buf.resize(UDP_BUFFER, 0);
@@ -2553,6 +2567,7 @@ fn poll_udp(conn: &mut quiche::Connection, inner: &mut Inner, now: Instant) {
                         *packet = next_packet(*packet);
                         send_message(
                             conn,
+                            sock,
                             mode,
                             *association,
                             *packet,
