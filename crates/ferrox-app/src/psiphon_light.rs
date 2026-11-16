@@ -775,7 +775,7 @@ fn idle(error: &io::Error) -> bool {
 /// payload, then a stop sentinel and ordinary payload; reads mirror it.
 pub(crate) struct LightStream<T> {
     inner: T,
-    header: Vec<u8>,
+    header_left: usize,
     read_padding_done: bool,
     write_padding_done: bool,
     wire: Vec<u8>,
@@ -793,7 +793,7 @@ impl<T> LightStream<T> {
         pending.extend_from_slice(&header);
         Self {
             inner,
-            header,
+            header_left: header.len(),
             read_padding_done: false,
             write_padding_done: false,
             wire: Vec::with_capacity(BUFFER),
@@ -928,7 +928,7 @@ impl<T: Write> Write for LightStream<T> {
             return Ok(buf.len());
         }
         let mut frame = Vec::with_capacity(buf.len() + 2 + 17);
-        let mut size = self.header.len() + buf.len() + 2 + 17;
+        let mut size = self.header_left + buf.len() + 2 + 17;
         if size > PADDING_MAX {
             frame.extend_from_slice(&STOP_PADDING.to_be_bytes());
             self.write_padding_done = true;
@@ -985,7 +985,10 @@ impl<T: Write> LightStream<T> {
                         "psiphon light: TLS writer accepted no bytes",
                     ));
                 }
-                Ok(written) => self.pending_at += written,
+                Ok(written) => {
+                    self.header_left = self.header_left.saturating_sub(written);
+                    self.pending_at += written;
+                }
                 Err(error) if idle(&error) => return Ok(false),
                 Err(error) => return Err(error),
             }
@@ -1354,6 +1357,22 @@ mod tests {
         stream.write_all(b"hello").expect("first");
         assert_eq!(&stream.inner[..2], &[0xaa, 0xbb]);
         assert!(stream.inner.windows(5).any(|window| window == b"hello"));
+    }
+
+    #[test]
+    fn a_flushed_header_is_not_counted_in_the_next_write_padding() {
+        let header = vec![0xaa; 100];
+        let mut stream = LightStream::new(Vec::new(), header.clone());
+        stream.flush().expect("header");
+        assert_eq!(stream.header_left, 0);
+        stream.write_all(&vec![0u8; 1300]).expect("first");
+        assert!(!stream.write_padding_done);
+        let wire = stream.inner;
+        assert_eq!(&wire[..header.len()], &header[..]);
+        let frame = &wire[header.len()..];
+        assert_ne!(u16::from_be_bytes([frame[0], frame[1]]), STOP_PADDING);
+        assert!(frame.len() + 17 >= PADDING_MIN);
+        assert!(frame.len() + 17 <= PADDING_MAX);
     }
 
     #[test]

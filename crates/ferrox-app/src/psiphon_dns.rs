@@ -989,6 +989,32 @@ fn random_in(address: IpAddr, prefix: u8) -> IpAddr {
     }
 }
 
+/// Fold one record answer into the aggregate, keeping the smallest TTL.
+fn merge_reply(
+    addresses: &mut Vec<IpAddr>,
+    ttl: &mut Option<Duration>,
+    error: &mut io::Error,
+    record: u16,
+    result: io::Result<(Vec<IpAddr>, Duration)>,
+) {
+    match result {
+        Ok((found, found_ttl)) if !found.is_empty() => {
+            *ttl = Some((*ttl).map_or(found_ttl, |ttl| ttl.min(found_ttl)));
+            addresses.extend(found);
+        }
+        Ok(_) => {
+            *error = io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "alternate DNS answered no {} record",
+                    if record == 1 { "A" } else { "AAAA" }
+                ),
+            );
+        }
+        Err(failure) => *error = failure,
+    }
+}
+
 /// Ask one server for A and AAAA in parallel, returning the addresses and the smallest TTL.
 fn query(
     host: &str,
@@ -1036,23 +1062,10 @@ fn query(
         let Ok((record, result)) = reply else {
             break;
         };
-        match result {
-            Ok((found, found_ttl)) if !found.is_empty() => {
-                answered = true;
-                ttl = Some(ttl.map_or(found_ttl, |ttl| ttl.min(found_ttl)));
-                addresses.extend(found);
-            }
-            Ok(_) => {
-                error = io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "alternate DNS answered no {} record",
-                        if record == 1 { "A" } else { "AAAA" }
-                    ),
-                );
-            }
-            Err(failure) => error = failure,
+        if matches!(&result, Ok((found, _)) if !found.is_empty()) {
+            answered = true;
         }
+        merge_reply(&mut addresses, &mut ttl, &mut error, record, result);
     }
     if addresses.is_empty() {
         Err(error)
@@ -1384,7 +1397,8 @@ mod tests {
         });
         let mut config = Config::from_servers(&[server]);
         config.request_timeout = std::time::Duration::from_millis(50);
-        let (_, ttl) = super::query(
+        config.await_timeout = std::time::Duration::from_secs(1);
+        let (addresses, ttl) = super::query(
             "psiphon.test",
             server,
             &config,
@@ -1393,7 +1407,34 @@ mod tests {
         )
         .expect("query");
         responder.join().expect("responder");
+        assert!(addresses.contains(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))));
+        let v6: IpAddr = "2001:db8::7".parse().expect("v6");
+        assert!(addresses.contains(&v6));
         assert_eq!(ttl, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn a_zero_ttl_wins_in_either_answer_order() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let v6: IpAddr = "2001:db8::7".parse().expect("v6");
+        for reverse in [false, true] {
+            let zero = (1u16, Ok((vec![v4], std::time::Duration::ZERO)));
+            let sixty = (28u16, Ok((vec![v6], std::time::Duration::from_secs(60))));
+            let replies = if reverse {
+                vec![sixty, zero]
+            } else {
+                vec![zero, sixty]
+            };
+            let mut addresses = Vec::new();
+            let mut ttl = None;
+            let mut error = std::io::Error::new(std::io::ErrorKind::NotFound, "no DNS answer");
+            for (record, result) in replies {
+                super::merge_reply(&mut addresses, &mut ttl, &mut error, record, result);
+            }
+            assert!(addresses.contains(&v4));
+            assert!(addresses.contains(&v6));
+            assert_eq!(ttl, Some(std::time::Duration::ZERO));
+        }
     }
 
     #[test]
