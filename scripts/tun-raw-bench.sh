@@ -217,50 +217,83 @@ run_variant() {
     fi
 
     sample_start "$OUT_DIR/$variant-$rep.samples"
-    timeout "$CLIENT_TIMEOUT" iperf3 -c 10.0.2.1 -p 5201 -t "$DURATION" -J > "$OUT_DIR/$variant-$rep-tcp.json" 2> /dev/null || true
+    if ! timeout "$CLIENT_TIMEOUT" iperf3 -c 10.0.2.1 -p 5201 -t "$DURATION" -J > "$OUT_DIR/$variant-$rep-tcp.json" 2> /dev/null; then
+        echo "  $variant: tcp iperf3 failed" >&2
+        stop_variant
+        return 1
+    fi
     set -- $(sample_stop "$OUT_DIR/$variant-$rep.samples")
     tcp=$(python3 - "$OUT_DIR/$variant-$rep-tcp.json" << 'PY'
-import json, sys
+import json, math, sys
 try:
     d = json.load(open(sys.argv[1]))
-except Exception:
-    print("0"); raise SystemExit
-end = d.get("end", {})
-received = end.get("sum_received") or end.get("sum") or {}
-print("%.3f" % (received.get("bits_per_second", 0) / 1e9))
+    received = d.get("end", {}).get("sum_received") or d.get("end", {}).get("sum") or {}
+    bits = float(received["bits_per_second"])
+except Exception as error:
+    print(f"tcp measurement: {error}", file=sys.stderr)
+    raise SystemExit(1)
+if not math.isfinite(bits) or bits <= 0:
+    print(f"tcp measurement: invalid bits_per_second {bits}", file=sys.stderr)
+    raise SystemExit(1)
+print("%.3f" % (bits / 1e9))
 PY
-)
+) || { echo "  $variant: tcp measurement failed" >&2; stop_variant; return 1; }
     emit "$variant" "tcp-${rep}" "$tcp" "Gbit/s" "$1" "$2" "$slot"
 
     sample_start "$OUT_DIR/$variant-$rep-udp.samples"
-    timeout "$CLIENT_TIMEOUT" iperf3 -c 10.0.2.1 -p 5201 -u -b 1G -t "$DURATION" -J > "$OUT_DIR/$variant-$rep-udp.json" 2> /dev/null || true
+    if ! timeout "$CLIENT_TIMEOUT" iperf3 -c 10.0.2.1 -p 5201 -u -b 1G -t "$DURATION" -J > "$OUT_DIR/$variant-$rep-udp.json" 2> /dev/null; then
+        echo "  $variant: udp iperf3 failed" >&2
+        stop_variant
+        return 1
+    fi
     set -- $(sample_stop "$OUT_DIR/$variant-$rep-udp.samples")
     udp_cpu=$1
     udp_rss=$2
     udp=$(python3 - "$OUT_DIR/$variant-$rep-udp.json" << 'PY'
-import json, sys
+import json, math, sys
 try:
     d = json.load(open(sys.argv[1]))
-except Exception:
-    print("0"); raise SystemExit
-end = d.get("end", {})
-total = end.get("sum") or {}
-bits = total.get("bits_per_second", 0) / 1e9
-lost = total.get("lost_percent")
-print("%.3f %.2f" % (bits, lost) if isinstance(lost, (int, float)) else "%.3f" % bits)
+    total = d.get("end", {}).get("sum") or {}
+    bits = float(total["bits_per_second"])
+    lost = total.get("lost_percent")
+except Exception as error:
+    print(f"udp measurement: {error}", file=sys.stderr)
+    raise SystemExit(1)
+if not math.isfinite(bits) or bits <= 0:
+    print(f"udp measurement: invalid bits_per_second {bits}", file=sys.stderr)
+    raise SystemExit(1)
+if isinstance(lost, (int, float)):
+    lost = float(lost)
+    if not math.isfinite(lost):
+        print(f"udp measurement: invalid lost_percent {lost}", file=sys.stderr)
+        raise SystemExit(1)
+    print("%.3f %.2f" % (bits / 1e9, lost))
+else:
+    print("%.3f" % (bits / 1e9))
 PY
-)
+) || { echo "  $variant: udp measurement failed" >&2; stop_variant; return 1; }
     set -- $udp
     emit "$variant" "udp-${rep}" "$1" "Gbit/s" "$udp_cpu" "$udp_rss" "$slot" "${2:-}"
 
-    timeout 10 ping -c 100 -i 0.01 -W 1 -q 10.0.2.1 > "$OUT_DIR/$variant-$rep-ping.log" 2>&1 || true
+    if ! timeout 10 ping -c 100 -i 0.01 -W 1 -q 10.0.2.1 > "$OUT_DIR/$variant-$rep-ping.log" 2>&1; then
+        echo "  $variant: ping failed" >&2
+        stop_variant
+        return 1
+    fi
     rtt=$(python3 - "$OUT_DIR/$variant-$rep-ping.log" << 'PY'
-import re, sys
+import math, re, sys
 text = open(sys.argv[1]).read()
 m = re.search(r'= ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)', text)
-print("%.3f" % float(m.group(2)) if m else "0")
+if not m:
+    print("ping measurement: no rtt", file=sys.stderr)
+    raise SystemExit(1)
+rtt = float(m.group(2))
+if not math.isfinite(rtt) or rtt <= 0:
+    print(f"ping measurement: invalid rtt {rtt}", file=sys.stderr)
+    raise SystemExit(1)
+print("%.3f" % rtt)
 PY
-)
+) || { echo "  $variant: ping measurement failed" >&2; stop_variant; return 1; }
     emit "$variant" "ping-${rep}" "$rtt" "ms" "0" "0" "$slot"
 
     stop_variant

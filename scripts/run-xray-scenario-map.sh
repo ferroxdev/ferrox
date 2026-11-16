@@ -294,6 +294,10 @@ while IFS= read -r spec; do
   fi
   status=0
   (cd "$dir" && FERROX_BINARY="$binary" bounded "$remaining" bash "$workspace/scripts/xray-scenarios.sh" "$suite") >"$log" 2>&1 || status=$?
+  budget_cut=0
+  if ((status == 124)); then
+    budget_cut=1
+  fi
   tallies="$(tally_log "$log")"
   f_pass=0 f_fail=0 f_skip=0 f_absent=0
   while IFS= read -r n; do
@@ -310,11 +314,19 @@ while IFS= read -r spec; do
   # launcher, a failed build or `-run` matching no name all leave a row that reads as a
   # verdict. Families that answer any test keep their rows below.
   if ((f_absent == f_total)); then
+    if ((budget_cut)); then
+      rows+=("| $family | NOT RUN | $f_total | the map budget of ${total_budget}s was spent during this family |")
+      cut=$((cut + 1))
+      continue
+    fi
     echo "::error::$self: family $family answered no test at all (exit $status), so it proves nothing"
     exit 1
   fi
   verdict="$(family_verdict "$log" "$f_pass" "$f_fail" "$f_absent" "$f_total")"
-  if ((f_absent > 0)); then
+  if ((budget_cut)); then
+    verdict="$verdict (budget)"
+  fi
+  if ((f_absent > 0 || budget_cut)); then
     cut=$((cut + 1))
   fi
   rows+=("| $family | $verdict | $f_total | $f_pass pass, $f_fail fail, $f_skip skip, $f_absent no verdict |")
