@@ -73,6 +73,7 @@ if [[ $fast == 0 ]]; then
   step "benchmark and matrix selftests"
   python3 scripts/benchstats.py
   python3 scripts/benchmark-delta.py --selftest
+  python3 scripts/validate-benchmark-matrix.py --selftest
   python3 scripts/check-comparator-rows.py --selftest
   python3 scripts/check-matrix-legs.py --selftest
   ./scripts/run-benchmark-matrix.sh --selftest
@@ -99,6 +100,7 @@ fi
 if [[ $fast == 0 ]]; then
   step "stall detector"
   mkdir -p target/ci
+  ./scripts/gc-target.sh --selftest
   ./scripts/watch-test.sh --selftest > target/ci/selftest.log 2>&1 &
   selftest=$!
 fi

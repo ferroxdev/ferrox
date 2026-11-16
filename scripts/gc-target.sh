@@ -37,7 +37,8 @@ while [[ $# -gt 0 ]]; do
     --reset-idle) reset_days="${2:?--reset-idle wants days}"; shift 2 ;;
     --ensure-free) ensure_free="${2:?--ensure-free wants GiB}"; shift 2 ;;
     --keep) keep="${2:?--keep wants a path}"; shift 2 ;;
-    *) echo "usage: scripts/gc-target.sh [--dry-run|--apply] [--lean] [--lean-age MINUTES] [--older-than HOURS] [--reset-idle DAYS] [--ensure-free GIB] [--keep PATH]" >&2; exit 2 ;;
+    --selftest) ferrox_target_probe_selftest; exit ;;
+    *) echo "usage: scripts/gc-target.sh [--selftest] [--dry-run|--apply] [--lean] [--lean-age MINUTES] [--older-than HOURS] [--reset-idle DAYS] [--ensure-free GIB] [--keep PATH]" >&2; exit 2 ;;
   esac
 done
 [[ "$hours" =~ ^[0-9]+$ ]] || { echo "--older-than wants whole hours" >&2; exit 2; }
@@ -155,9 +156,7 @@ prune_sessions() {
 
 prune_all_sessions() {
   local age="$1" dir path
-  if ferrox_target_in_use "$shared"; then
-    return 0
-  fi
+  ferrox_target_idle "$shared" || return 0
   for dir in "$shared"/*/incremental; do
     if [[ -d "$dir" ]]; then
       prune_sessions "$dir" "$age" "$shared"
@@ -167,7 +166,7 @@ prune_all_sessions() {
     if [[ ! -d "$path" ]]; then
       continue
     fi
-    ferrox_target_in_use "$path/target" && continue
+    ferrox_target_idle "$path/target" || continue
     for dir in "$path"/target/*/incremental; do
       if [[ -d "$dir" ]]; then
         prune_sessions "$dir" "$age" "$path/target"
@@ -194,7 +193,7 @@ reset_idle_targets() {
     if ! ferrox_target_is_own "$path"; then
       continue
     fi
-    ferrox_target_in_use "$path/target" && continue
+    ferrox_target_idle "$path/target" || continue
     recent="$(find "$path/target" -type f -mmin "-$age" ! -name .cargo-lock ! -name .cargo-build-lock -print -quit 2>/dev/null)"
     if [[ -z "$recent" ]]; then
       reclaim_locked "$path/target" "$path/target"
@@ -211,7 +210,7 @@ lean_worktrees() {
     [[ -d "$path" ]] || continue
     [[ -n "$keep" && "$path" == "$keep" ]] && continue
     ferrox_target_is_own "$path" || continue
-    ferrox_target_in_use "$path/target" && continue
+    ferrox_target_idle "$path/target" || continue
     for part in release doc debug/incremental; do
       [[ -d "$path/target/$part" ]] || continue
       recent="$(find "$path/target/$part" -type f -mmin "-$age" ! -name .cargo-lock ! -name .cargo-build-lock -print -quit 2>/dev/null)"
@@ -238,7 +237,7 @@ reclaim_temp_forges() {
     esac
     is_registered_worktree "$dir" && continue
     [[ -e "$dir/.git" ]] || continue
-    ferrox_target_in_use "$dir/target" && continue
+    ferrox_target_idle "$dir/target" || continue
     reclaim_locked "$dir/target" "$dir"
   done < <(
     if [[ -n "$age" ]]; then
