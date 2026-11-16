@@ -1190,40 +1190,47 @@ impl Inner {
         Some(Arc::clone(&sessions[at]))
     }
 
+    /// Whether a failed pass left a continuation window for this scan.
+    fn has_dial_window(&self) -> bool {
+        !self.settings.cdn_scan_specs.is_empty() && self.dial_window.load(Ordering::Acquire) != 0
+    }
+
     /// The first entry to dial and the head start its affinity buys, read once per batch.
     fn start(&self) -> (usize, Duration) {
-        let entries = {
-            let mut guard = lock(&self.entries);
-            if guard.is_empty() {
-                return (0, Duration::ZERO);
-            }
-            if self.settings.fronted_overrides.is_empty()
-                && coin(self.settings.server_entry_reset_probability)
-            {
-                let entries = Arc::make_mut(&mut *guard);
-                shuffle(entries.as_mut_slice());
-                lock(&self.moved_to_front).clear();
-            }
-            let has_placeholders = { !lock(&self.dsl_placeholders).is_empty() };
-            if has_placeholders {
-                let entries = Arc::make_mut(&mut *guard);
-                let mut moved = lock(&self.moved_to_front);
-                promote_dsl_placeholders(
-                    &self.dsl_placeholders,
-                    entries,
-                    &mut moved,
-                    self.settings.server_entry_max_move_to_front,
-                );
-            }
-            Arc::clone(&*guard)
-        };
         let window = if self.settings.cdn_scan_specs.is_empty() {
             0
         } else {
             self.dial_window.load(Ordering::Acquire)
         };
-        if window != 0 {
-            return (window % entries.len(), Duration::ZERO);
+        let entries = {
+            let mut guard = lock(&self.entries);
+            if guard.is_empty() {
+                return (0, Duration::ZERO);
+            }
+            if window == 0 {
+                if self.settings.fronted_overrides.is_empty()
+                    && coin(self.settings.server_entry_reset_probability)
+                {
+                    let entries = Arc::make_mut(&mut *guard);
+                    shuffle(entries.as_mut_slice());
+                    lock(&self.moved_to_front).clear();
+                }
+                let has_placeholders = { !lock(&self.dsl_placeholders).is_empty() };
+                if has_placeholders {
+                    let entries = Arc::make_mut(&mut *guard);
+                    let mut moved = lock(&self.moved_to_front);
+                    promote_dsl_placeholders(
+                        &self.dsl_placeholders,
+                        entries,
+                        &mut moved,
+                        self.settings.server_entry_max_move_to_front,
+                    );
+                }
+            }
+            Arc::clone(&*guard)
+        };
+        if let Some(start) = dial_window_start(window, entries.len()) {
+            return (start, Duration::ZERO);
         }
         let affinity = lock(&self.affinity);
         match affinity_index(&entries, affinity.as_ref()) {
@@ -1281,7 +1288,7 @@ impl Inner {
         if entries.is_empty() {
             return Err("psiphon: the server list holds no SSH entries".to_owned());
         }
-        let entries = if self.replay.wants_move_to_front() {
+        let entries = if !self.has_dial_window() && self.replay.wants_move_to_front() {
             let mut reordered = (*entries).clone();
             self.replay.move_to_front(&mut reordered);
             let affinity = lock(&self.affinity);
@@ -1618,10 +1625,8 @@ impl Inner {
             }
         }
         if !self.settings.cdn_scan_specs.is_empty() {
-            self.dial_window.store(
-                next_dial_start(start, offset, entries.len()),
-                Ordering::Release,
-            );
+            let next = next_dial_start(start, offset, entries.len()).wrapping_add(1);
+            self.dial_window.store(next, Ordering::Release);
         }
         Err(format!("psiphon: no server accepted the tunnel: {last}"))
     }
@@ -1786,13 +1791,13 @@ impl Inner {
                             let Some(server) = server else {
                                 continue;
                             };
-                            if !entry_allowed(
-                                &server,
+                            let Some(server) = runtime_entry(
+                                server,
                                 &self.settings.protocols,
                                 self.settings.fronted,
-                            ) {
+                            ) else {
                                 continue;
-                            }
+                            };
                             let name = server.dsl_tag();
                             if name.is_empty() {
                                 continue;
@@ -1890,9 +1895,11 @@ impl Inner {
             else {
                 continue;
             };
-            if !entry_allowed(&server, &self.settings.protocols, self.settings.fronted) {
+            let Some(server) =
+                runtime_entry(server, &self.settings.protocols, self.settings.fronted)
+            else {
                 continue;
-            }
+            };
             if !list
                 .iter()
                 .any(|known| known.host == server.host && known.port == server.port)
@@ -6739,7 +6746,7 @@ fn free_port(ip: IpAddr) -> Result<u16, String> {
 pub(crate) fn regions(settings: Option<&Json>) -> Result<Vec<(String, usize)>, String> {
     let settings = Settings::from_json(settings)?;
     let mut counts: BTreeMap<String, HashSet<IpAddr>> = BTreeMap::new();
-    for server in load_all_entries(&settings)? {
+    for server in load_all_entries(&settings, false)? {
         if let Some(region) = server.region {
             counts.entry(region).or_default().insert(server.address);
         }
@@ -7303,8 +7310,7 @@ fn split_dial(address: &str) -> Option<(String, u16)> {
 }
 
 fn load_entries(settings: &Settings) -> Result<Vec<Server>, String> {
-    let servers = load_all_entries(settings)?;
-    Ok(filter_region(servers, settings))
+    load_all_entries(settings, true)
 }
 
 fn load_tactics_entries(settings: &Settings) -> Result<Vec<Server>, String> {
@@ -7357,8 +7363,13 @@ fn filter_region(mut servers: Vec<Server>, settings: &Settings) -> Vec<Server> {
     servers
 }
 
-fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
+fn load_all_entries(settings: &Settings, regional: bool) -> Result<Vec<Server>, String> {
     let servers = load_source_entries(settings, true, settings.conduit)?;
+    let servers = if regional {
+        filter_region(servers, settings)
+    } else {
+        servers
+    };
     let servers: Vec<Server> = servers
         .into_iter()
         .filter(|server| {
@@ -7605,6 +7616,7 @@ fn limit_quic_versions(mut servers: Vec<Server>, settings: &Settings) -> Vec<Ser
             .iter()
             .any(|version| matches!(version.as_str(), "QUICv1" | "RANDOMIZED-QUICv1"));
         if !plain {
+            server.cdn_protocols &= !CDN_PROTOCOL_QUIC;
             if let Some(meek) = server.meek.as_mut().filter(|meek| meek.quic) {
                 meek.quic = false;
                 meek.protocol = match meek.protocol {
@@ -7818,6 +7830,23 @@ fn entry_allowed(server: &Server, protocols: &[String], fronted: bool) -> bool {
             protocols,
         ) || (cdn_supported && matches_shape(server, filter))
     })
+}
+
+/// The runtime entry to insert, converted to the CDN carrier the limit names.
+fn runtime_entry(server: Server, protocols: &[String], fronted: bool) -> Option<Server> {
+    if !entry_allowed(&server, protocols, fronted) {
+        return None;
+    }
+    let Some(filter) = shape_filter(protocols, "LimitTunnelProtocols") else {
+        return Some(server);
+    };
+    let named_meek = protocols.iter().any(|protocol| is_meek_protocol(protocol));
+    if matches_limit(&server, filter, named_meek, protocols) {
+        return Some(server);
+    }
+    cdn_variants(&server)
+        .into_iter()
+        .find(|variant| matches_limit(variant, filter, named_meek, protocols))
 }
 
 fn matches_limit(server: &Server, filter: Shape, meek_named: bool, protocols: &[String]) -> bool {
@@ -8115,6 +8144,9 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 &mut overrides,
                 &mut override_variants,
             );
+            let remaining = scan_cap.saturating_sub(group.len());
+            let override_take = overrides.len().min(remaining.div_ceil(2));
+            let builtin_cap = remaining.saturating_sub(override_take);
             let mut builtin = Vec::new();
             let mut builtin_variants = 0;
             push_scan_builtin_candidates(
@@ -8125,7 +8157,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 shuffle_key,
                 &mut builtin,
                 &mut builtin_variants,
-                scan_cap,
+                builtin_cap,
                 scan_start,
             );
             interleave_fronted(&mut group, builtin, overrides);
@@ -11087,7 +11119,20 @@ fn shuffle<T>(items: &mut [T]) {
 }
 
 /// The identity `add_entries` uses to keep the first copy of a server entry.
-fn server_key(entry: &Server) -> (IpAddr, u16, Option<u16>, bool, bool, bool) {
+#[allow(clippy::type_complexity)]
+fn server_key(
+    entry: &Server,
+) -> (
+    IpAddr,
+    u16,
+    Option<u16>,
+    bool,
+    bool,
+    bool,
+    u8,
+    Option<&'static str>,
+    Option<&'static str>,
+) {
     (
         entry.address,
         entry.port,
@@ -11095,6 +11140,9 @@ fn server_key(entry: &Server) -> (IpAddr, u16, Option<u16>, bool, bool, bool) {
         entry.quic,
         entry.ss,
         entry.tls,
+        entry.cdn_protocols,
+        entry.meek.as_ref().map(|meek| meek.protocol),
+        entry.unfronted_meek.as_ref().map(|meek| meek.protocol),
     )
 }
 
@@ -11520,6 +11568,12 @@ fn next_dial_start(start: usize, dialed: usize, count: usize) -> usize {
         return 0;
     }
     start.wrapping_add(dialed) % count
+}
+
+/// The continuation window stores `start + 1`, so zero can mean "no window"
+/// while a wrapped offset of zero still starts at the first entry.
+fn dial_window_start(window: usize, count: usize) -> Option<usize> {
+    (window != 0 && count != 0).then(|| (window - 1) % count)
 }
 
 /// Fill one batch, stopping before an intensive candidate over the limit so the next batch starts there.
@@ -13235,6 +13289,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_runtime_entry_takes_the_cdn_carrier_the_limit_names() {
+        let mut server = scan_test_server();
+        server.cdn_protocols = CDN_PROTOCOL_HTTP | CDN_PROTOCOL_QUIC;
+        server.meek.as_mut().expect("fronted").protocol = "FRONTED-MEEK-QUIC-OSSH";
+        let limit = vec!["FRONTED-MEEK-CDN-HTTP-OSSH".to_owned()];
+        let selected = runtime_entry(server, &limit, true).expect("allowed");
+        assert_eq!(
+            selected.meek.as_ref().expect("fronted").protocol,
+            "FRONTED-MEEK-CDN-HTTP-OSSH"
+        );
+    }
+
     /// The reference reaches the built-in sets once a server's overrides run
     /// out; draining the native list in server round-robin spends every opening
     /// dial on the fixed edge overrides instead.
@@ -13313,6 +13380,111 @@ mod tests {
                 "server {index} lost the built-in scan"
             );
         }
+    }
+
+    #[test]
+    fn every_builtin_set_survives_a_capped_scan_group() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "cdnSets": ["fastly", "bunny"],
+                    "FrontedMeekDialOverrides": [{
+                        "DialAddresses": [
+                            "198.51.100.1", "198.51.100.2", "198.51.100.3",
+                            "198.51.100.4", "198.51.100.5", "198.51.100.6",
+                            "198.51.100.7", "198.51.100.8"
+                        ],
+                        "SNIServerName": ["override.example"]
+                    }]
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut servers = Vec::new();
+        for index in 0..64 {
+            let mut server = scan_test_server();
+            let meek = server.meek.as_mut().expect("fronted");
+            meek.host = format!("cdn{index}.example");
+            meek.hosts = vec![format!("cdn{index}.example")];
+            servers.push(server);
+        }
+        apply_fronting_overrides(&mut servers, &settings);
+        let sets = crate::psiphon_cdn::select(&["fastly".to_owned(), "bunny".to_owned()]);
+        assert_eq!(sets.len(), 2);
+        for index in 0..64 {
+            let host = format!("cdn{index}.example");
+            let group: Vec<_> = servers
+                .iter()
+                .filter_map(|server| server.meek.as_ref())
+                .filter(|meek| meek.host == host)
+                .collect();
+            for set in &sets {
+                assert!(
+                    group
+                        .iter()
+                        .any(|meek| set.snis.iter().any(|sni| meek.sni.as_str() == *sni)),
+                    "server {index} lost the {} built-in set",
+                    set.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn region_filtering_happens_before_the_scan_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-psiphon-region-{}-{}",
+            std::process::id(),
+            hex(&random::<8>())
+        ));
+        std::fs::create_dir_all(&dir).expect("state");
+        let path = dir.join("entries");
+        let mut text = String::new();
+        for index in 0..64 {
+            let region = if index == 0 { "US" } else { "CA" };
+            let entry = format!(
+                r#"{{"ipAddress":"192.0.2.{}","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK"],"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front{index}.example"],"meekFrontingHosts":["cdn{index}.example"],"region":"{region}"}}"#,
+                index + 1
+            );
+            text.push_str(&hex(format!("0 0 0 0 {entry}").as_bytes()));
+            text.push('\n');
+        }
+        std::fs::write(&path, text).expect("entries");
+        let config = format!(
+            r#"{{"serverEntries":{:?},"region":"US","cdnSets":["fastly","bunny"],
+                "FrontedMeekDialOverrides":[{{"DialAddresses":[
+                    "198.51.100.1","198.51.100.2","198.51.100.3","198.51.100.4",
+                    "198.51.100.5","198.51.100.6","198.51.100.7","198.51.100.8"
+                ],"SNIServerName":["override.example"]}}]}}"#,
+            path.to_string_lossy()
+        );
+        let settings =
+            Settings::from_json(Some(&json::parse(&config).expect("settings"))).expect("settings");
+        let servers = load_entries(&settings).expect("entries");
+        let sets = crate::psiphon_cdn::select(&["fastly".to_owned(), "bunny".to_owned()]);
+        assert!(servers
+            .iter()
+            .all(|server| server.region.as_deref() == Some("US")));
+        for set in &sets {
+            assert!(
+                servers
+                    .iter()
+                    .filter_map(|server| server.meek.as_ref())
+                    .any(|meek| set.snis.iter().any(|sni| meek.sni.as_str() == *sni)),
+                "the only regional group lost the {} built-in set",
+                set.name
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wrapped_dial_window_still_starts_at_the_first_entry() {
+        let next = next_dial_start(448, 64, 512);
+        assert_eq!(next, 0);
+        assert_eq!(dial_window_start(next.wrapping_add(1), 512), Some(0));
+        assert_eq!(dial_window_start(0, 512), None);
     }
 
     /// The second pass starts where the first stopped, so the fourth server
@@ -15426,6 +15598,16 @@ mod tests {
         let meek = servers[0].meek.as_ref().expect("fronted");
         assert!(!meek.quic);
         assert_eq!(meek.protocol, "FRONTED-MEEK-OSSH");
+        assert_eq!(servers[0].cdn_protocols & CDN_PROTOCOL_QUIC, 0);
+        let protocols: Vec<String> = CDN_FRONTING_PROTOCOLS
+            .iter()
+            .map(|protocol| (*protocol).to_owned())
+            .collect();
+        let selected = select_protocols_with(servers, &protocols, &[], 0, true, false, None);
+        assert!(selected
+            .iter()
+            .filter_map(|server| server.meek.as_ref())
+            .all(|meek| meek.protocol != "FRONTED-MEEK-CDN-QUIC-OSSH"));
     }
 
     #[test]
@@ -17974,6 +18156,18 @@ mod tests {
         let added = new_entries(&current, vec![first, next.clone(), next]);
         assert_eq!(added.len(), 1);
         assert_eq!(added[0].port, 23);
+    }
+
+    #[test]
+    fn new_entries_keep_each_cdn_carrier() {
+        let mut ossh = scan_test_server();
+        ossh.cdn_protocols = 0;
+        let mut http = ossh.clone();
+        http.meek.as_mut().expect("fronted").protocol = "FRONTED-MEEK-CDN-HTTP-OSSH";
+        let mut quic = ossh.clone();
+        quic.meek.as_mut().expect("fronted").protocol = "FRONTED-MEEK-CDN-QUIC-OSSH";
+        let added = new_entries(&[], vec![ossh, http, quic]);
+        assert_eq!(added.len(), 3);
     }
 
     #[test]
