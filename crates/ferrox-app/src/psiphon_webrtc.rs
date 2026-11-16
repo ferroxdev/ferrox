@@ -1291,8 +1291,7 @@ impl Read for WebRtcStream {
                 Ok(Err(error)) => {
                     return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
                 }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {}
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
             }
             let mut terminal = lock(&self.terminal);
             if !terminal.is_empty() {
@@ -1457,10 +1456,8 @@ fn drive(
                         }
                         webrtc.take_received(raw, &mut peer_padding_done, &mut backlog);
                         let mut buffered = lock(&terminal);
-                        for message in backlog.drain(..) {
-                            if let Ok(data) = message {
-                                buffered.extend_from_slice(&data);
-                            }
+                        for data in backlog.drain(..).flatten() {
+                            buffered.extend_from_slice(&data);
                         }
                         drop(buffered);
                         *lock(&failure) = Some(error);

@@ -726,18 +726,10 @@ fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
             draining = true;
             drained = Instant::now();
         }
-        let mut peer_state = if peer_eof {
-            None
-        } else {
-            match ready(&peer) {
-                Ok(state) => state,
-                Err(_) => return,
-            }
+        let Ok(mut peer_state) = peer_ready(peer_eof, &peer) else {
+            return;
         };
-        if peer_state == Some(false) {
-            peer_eof = true;
-            peer_state = None;
-        }
+        peer_eof |= peer_state == Some(false);
         if !upload_blocked && peer_state == Some(true) {
             match peer.read(&mut up) {
                 Ok(0) => {
@@ -748,18 +740,11 @@ fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
                         return;
                     }
                     last_upload = Instant::now();
-                    peer_state = if peer_eof {
-                        None
-                    } else {
-                        match ready(&peer) {
-                            Ok(state) => state,
-                            Err(_) => return,
-                        }
+                    let Ok(state) = peer_ready(peer_eof, &peer) else {
+                        return;
                     };
-                    if peer_state == Some(false) {
-                        peer_eof = true;
-                        peer_state = None;
-                    }
+                    peer_state = state;
+                    peer_eof |= peer_state == Some(false);
                 }
                 Err(error) if idle(&error) => {}
                 Err(_) => return,
@@ -801,6 +786,14 @@ fn ready(peer: &TcpStream) -> io::Result<Option<bool>> {
     };
     let _ = peer.set_nonblocking(false);
     state
+}
+
+/// Whether the loopback peer has bytes ready, reached EOF, or is unchanged.
+fn peer_ready(peer_eof: bool, peer: &TcpStream) -> io::Result<Option<bool>> {
+    if peer_eof {
+        return Ok(None);
+    }
+    ready(peer)
 }
 
 /// Whether a read timeout means the other direction should get a turn.
