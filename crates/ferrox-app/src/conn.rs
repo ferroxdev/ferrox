@@ -89,6 +89,7 @@ pub(crate) struct Masked {
 struct SniState {
     shape: ferrox_core::evasion::SniShape,
     done: std::sync::atomic::AtomicBool,
+    written: std::sync::atomic::AtomicU8,
 }
 
 /// What the first TLS record of a stream goes out as.
@@ -370,22 +371,35 @@ impl Masked {
         self.keep_shape(armed.as_ref(), outcome)
     }
 
-    /// The empty record is a byte the peer decodes, so it takes the chain like the hello does.
+    /// The empty record is a byte the peer decodes, so it takes the chain like the hello does; it
+    /// resumes at the byte the last attempt reached, so a retry cannot repeat a prefix.
     fn write_empty_record(&self, chain: &mut ferrox_core::finalmask::Chain) -> io::Result<()> {
-        let mut rest = ferrox_core::evasion::EMPTY_RECORD.as_slice();
-        while !rest.is_empty() {
-            match chain.write(&mut &self.stream, rest) {
+        let empty = ferrox_core::evasion::EMPTY_RECORD;
+        let state = self.sni.as_deref();
+        let mut at = state.map_or(0, |sni| {
+            usize::from(sni.written.load(std::sync::atomic::Ordering::Acquire))
+        });
+        while at < empty.len() {
+            match chain.write(&mut &self.stream, &empty[at..]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(written) => rest = &rest[written..],
+                Ok(written) => {
+                    at += written;
+                    if let Some(sni) = state {
+                        sni.written
+                            .store(at as u8, std::sync::atomic::Ordering::Release);
+                    }
+                }
                 Err(error) => return Err(error),
             }
         }
         Ok(())
     }
 
-    /// A write that failed spent nothing, so the one-shot shape stays armed for the caller's retry.
+    /// A write that made no progress spent nothing, so the one-shot shape stays armed for the retry.
     fn keep_shape(&self, armed: Option<&SniArm>, outcome: io::Result<usize>) -> io::Result<usize> {
-        if outcome.is_err() && matches!(armed, Some(SniArm::Rewrite(_) | SniArm::Empty)) {
+        if matches!(outcome, Err(_) | Ok(0))
+            && matches!(armed, Some(SniArm::Rewrite(_) | SniArm::Empty))
+        {
             if let Some(sni) = self.sni.as_deref() {
                 sni.done.store(false, std::sync::atomic::Ordering::Release);
             }
@@ -625,6 +639,7 @@ impl Connection {
             std::sync::Arc::new(SniState {
                 shape,
                 done: std::sync::atomic::AtomicBool::new(false),
+                written: std::sync::atomic::AtomicU8::new(0),
             })
         };
         match self {
@@ -3865,6 +3880,7 @@ mod tests {
             sni: Some(std::sync::Arc::new(SniState {
                 shape,
                 done: std::sync::atomic::AtomicBool::new(false),
+                written: std::sync::atomic::AtomicU8::new(0),
             })),
         }
     }
@@ -3923,6 +3939,7 @@ mod tests {
         let state = SniState {
             shape: ferrox_core::evasion::SniShape::Record,
             done: std::sync::atomic::AtomicBool::new(false),
+            written: std::sync::atomic::AtomicU8::new(0),
         };
         assert!(matches!(state.arm(&[0x16]), SniArm::Plain));
         assert!(!state.done.load(std::sync::atomic::Ordering::Acquire));
