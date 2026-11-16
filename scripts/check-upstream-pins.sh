@@ -16,6 +16,7 @@ fi
 
 parsed="$(awk '
   /^\[sources\./ {
+    if (name != "") print name "\t" repo "\t" rev "\t" branch
     name = $0
     sub(/^\[sources\./, "", name)
     sub(/\]$/, "", name)

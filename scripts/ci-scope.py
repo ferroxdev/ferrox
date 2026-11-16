@@ -75,7 +75,7 @@ SYMBOL_KEYED = ("scripts/expected-ops.txt",)
 
 # The header of a Rust item, as far up as a hunk has to read to know what it
 # changed. `impl` is its own case: the name worth claiming is the type.
-ITEM_KIND = r"(?:const|static|fn|struct|enum|trait|type|mod)"
+ITEM_KIND = r"(?:const|static|async\s+fn|fn|struct|enum|trait|type|mod)"
 ITEM_HEAD = re.compile(rf"^(\s*)(?:pub(?:\([a-z]+\))?\s+)?(?:unsafe\s+)?{ITEM_KIND}\s+([A-Za-z0-9_]+)")
 IMPL_HEAD = re.compile(r"^(\s*)(?:pub(?:\([a-z]+\))?\s+)?(?:unsafe\s+)?impl"
                        r"(?:\s*<[^<>]*>)?\s+([A-Za-z0-9_]+)")
@@ -103,12 +103,13 @@ def item_at(lines: list[str], number: int) -> str | None:
 
 
 def enclosing(blob: str, start: int, count: int) -> list[str]:
-    """The item names one hunk reaches: its first changed line's and its last."""
+    """The item names one hunk reaches: every changed line's, not just its ends."""
     if not blob:
         return []
     lines = blob.splitlines()
     names: list[str] = []
-    for name in (item_at(lines, start), item_at(lines, start + max(count - 1, 0))):
+    for number in range(start, start + max(count, 1)):
+        name = item_at(lines, number)
         if name is None:
             return []
         if name not in names:
@@ -180,14 +181,21 @@ def hunk_pages(root: str, base: str, path: str,
                              capture_output=True, text=True, cwd=root)
         blobs[side] = out.stdout if out.returncode == 0 else ""
     for old_start, old_count, new_start, new_count in hunks:
+        resolved: list[tuple[str, list[str]]] = []
         for blob, start, count in ((blobs["old"], old_start, old_count),
                                    (blobs["new"], new_start, new_count)):
             if count == 0:
                 continue
             for name in enclosing(blob, start, count):
-                if any(name == seen for seen, _ in found):
+                if any(name == seen for seen, _ in resolved):
                     continue
-                found.append((name, pages_for(name, scopes)))
+                resolved.append((name, pages_for(name, scopes)))
+        if not resolved:
+            resolved.append((f"line {new_start or old_start}", []))
+        for name, pages in resolved:
+            if any(name == seen for seen, _ in found):
+                continue
+            found.append((name, pages))
     return found
 
 
@@ -488,12 +496,19 @@ def shared_paths(changed: list[str], scopes: dict) -> list[str]:
     return out
 
 
+def merge_base(root: str, base: str) -> str:
+    out = subprocess.run(["git", "merge-base", base, "HEAD"],
+                         capture_output=True, text=True, cwd=root)
+    return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else base
+
+
 def build_plan(root: str, changed: list[str], hunks: dict | None = None,
                bodies: dict | None = None, base: str = "") -> dict:
     """Classify a change list and fill in the matrix, rows and suites it owes."""
     scopes = pages(root)
     attributed = None
     if base and hunks is not None:
+        base = merge_base(root, base)
         attributed = {path: hunk_pages(root, base, path, hunks.get(path, []),
                                        (bodies or {}).get(path, []), scopes)
                       for path in shared_paths(changed, scopes)}

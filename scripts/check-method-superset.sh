@@ -69,7 +69,14 @@ def load_rows():
             continue
         cells = [c.strip().replace("\\|", "|")
                  for c in re.split(r"(?<!\\)\|", line)[1:-1]]
-        if len(cells) != 5 or cells[0] in ("row", "") or set(cells[0]) == {"-"}:
+        if not cells:
+            fails.append(f"docs/method-superset.md:{number}: empty row")
+            continue
+        if cells[0] in ("row", "") or set(cells[0]) == {"-"}:
+            continue
+        if len(cells) != 5:
+            fails.append(f"docs/method-superset.md:{number}: expected 5 cells, "
+                         f"got {len(cells)}")
             continue
         rows[cells[0]] = {
             "layer": cells[1],
@@ -90,11 +97,12 @@ def check_rows():
         if row["layer"] not in LAYERS:
             fails.append(f"{name}: layer {row['layer']!r} is not one of "
                          f"{', '.join(sorted(LAYERS))}")
-        if row["state"] in {"planned", "refused", "not-scheduled"} \
-                and not row["note"]:
-            fails.append(f"{name}: a {row['state']} row must say why")
+        if not row["note"]:
+            fails.append(f"{name}: a row must carry a note")
         if not row["references"]:
             fails.append(f"{name}: no reference path, so the row proves nothing")
+            continue
+        if os.environ.get("CHECK_SUPERSET_UPSTREAM") == "0":
             continue
         for path in row["references"].split(","):
             path = path.strip()
@@ -105,15 +113,14 @@ def check_rows():
 
 
 def check_in_flight():
-    table = " ".join(
-        f"{name} {row['layer']} {row['state']} {row['references']} {row['note']}"
-        for name, row in rows.items()
-    )
+    noted = set(rows)
+    for row in rows.values():
+        noted.update(re.findall(r"`([^`]+)`", row["note"]))
     with open(vless, encoding="utf-8") as f:
         head = f.read().split("#[cfg(test)]", 1)[0]
     for method in sorted(set(re.findall(r'"vless-[a-z0-9-]+"', head))):
         method = method.strip('"')
-        if method not in table:
+        if method not in noted:
             fails.append(f"`{method}` is an implemented method string in "
                          "vless.rs and no matrix row names it")
     for page in sorted(os.listdir(pages)):
@@ -234,7 +241,7 @@ printf '<!-- matrix:begin -->\n| row | layer | state | references | note |\n| --
 
 expect() {
   local want="$1" label="$2" out
-  out="$(FERROX_ROOT="$selftest" "$0" 2>&1)" && {
+  out="$(FERROX_ROOT="$selftest" CHECK_SUPERSET_UPSTREAM=1 "$0" 2>&1)" && {
     echo "::error::self-test: the $label mutation still passes, so the gate cannot fail"
     exit 1
   }

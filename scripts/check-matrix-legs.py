@@ -16,6 +16,7 @@ as standalone Hysteria v1, has no legs to attribute and is skipped.
 
 import argparse
 import json
+import math
 import statistics
 import subprocess
 import sys
@@ -113,18 +114,20 @@ def server_cpu_is_priced(cell):
 
 
 def cells_by_scenario(cells_dir):
-    """(base scenario, server) -> cell document."""
+    """(base scenario, server) -> cell document, plus the paths that failed to load."""
     grouped = {}
+    errors = []
     for path in sorted(Path(cells_dir).glob("*/cell.json")):
         cell = load(path)
         if cell is None:
+            errors.append(path)
             continue
         scenario = cell.get("scenario", "")
         base, sep, server = scenario.rpartition("--srv-")
         if not sep:
             continue
         grouped[(base, server)] = cell
-    return grouped
+    return grouped, errors
 
 
 def attempted(cell, engine):
@@ -134,8 +137,7 @@ def attempted(cell, engine):
             continue
         if entry.get("runs"):
             return True
-        return any(f.get("engine") == engine for f in cell.get("failures", []))
-    return False
+    return any(f.get("engine") == engine for f in cell.get("failures", []))
 
 
 def load_baseline(path):
@@ -157,9 +159,12 @@ def load_baseline(path):
         if basis not in ("raw", "ceiling"):
             continue
         try:
-            known[(base, leg)] = (float(ratio), issue, basis)
+            value = float(ratio)
         except ValueError:
             continue
+        if not math.isfinite(value):
+            continue
+        known[(base, leg)] = (value, issue, basis)
     return known
 
 
@@ -226,7 +231,12 @@ def check_grouped(grouped, threshold, cpu_threshold, threads_threshold):
         server_ratio = ceiling_ratio if ceiling_ratio is not None else raw_ratio
         rust_client = median_throughput(reference, "xray-core-rust")
         checked += 1
-        measured.add(base)
+        if client_leg is not None:
+            measured.add((base, "client"))
+        if server_ratio is not None:
+            measured.add((base, "server"))
+        if rust_client is not None and client_leg is not None:
+            measured.add((base, "rust"))
         if client_leg is None and attempted(reference, FERRORX):
             holes.append({
                 "base": base,
@@ -276,6 +286,8 @@ def check_grouped(grouped, threshold, cpu_threshold, threads_threshold):
                         f"xray-core server, {client_leg / rust_client:.2f}x",
             })
         if server_cell is not None and attempted(server_cell, REFERENCE):
+            measured.add((base, "server-cpu"))
+            measured.add((base, "server-threads"))
             holes.extend(server_cost_holes(
                 base,
                 reference,
@@ -461,6 +473,26 @@ def selftest():
         if proc.returncode == 0:
             return "a ceiling ratio worse than its filed baseline passed the gate"
 
+        # A baseline leg is fixed only when that leg was measured: a client-only
+        # cell cannot retire a server-cpu row.
+        for path in cells.glob("*/cell.json"):
+            path.unlink()
+        write_fixture(cells, "xray-core", 100.0, 8.0, 1000.0)
+        baseline.write_text("selftest-vless-raw-down-8|server-cpu|1.30|1\n")
+        proc = run_self(cells, baseline)
+        if proc.returncode != 0 or "no longer gaps" in proc.stderr:
+            return f"an unmeasured server leg was reported fixed: {proc.stderr}"
+
+        # A non-finite filed ratio cannot bless a hole.
+        for path in cells.glob("*/cell.json"):
+            path.unlink()
+        for server, throughput in (("xray-core", 1000.0), ("ferrox", 800.0)):
+            write_fixture(cells, server, 100.0, 8.0, throughput)
+        baseline.write_text("selftest-vless-raw-down-8|server|nan|1\n")
+        proc = run_self(cells, baseline)
+        if proc.returncode == 0:
+            return "a non-finite baseline ratio blessed a hole"
+
     for leg, ratio, filed, want in (
         ("client", 0.50, 0.56, True),
         ("client", 0.40, 0.56, False),
@@ -564,7 +596,14 @@ def main():
         parser.error("--cells is required")
     baseline = {} if args.no_baseline else load_baseline(args.baseline)
 
-    grouped = cells_by_scenario(args.cells)
+    grouped, errors = cells_by_scenario(args.cells)
+    if errors:
+        print(
+            f"::error::{len(errors)} cell(s) could not be read; the leg attribution "
+            "is incomplete",
+            file=sys.stderr,
+        )
+        return 1
     holes, checked, measured = check_grouped(
         grouped,
         args.threshold,
@@ -583,7 +622,7 @@ def main():
             new.append(hole)
     seen = {(hole["base"], hole["leg"]) for hole in holes}
     for key, (ratio, issue, _basis) in sorted(baseline.items()):
-        if key[0] in measured and key not in seen:
+        if key in measured and key not in seen:
             fixed.append((key, ratio, issue))
 
     for hole in new:

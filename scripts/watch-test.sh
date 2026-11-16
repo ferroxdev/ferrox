@@ -10,6 +10,14 @@ probe="${WATCH_PROBE:-60}"
 out="${WATCH_OUT:-target/ci/watch-test.log}"
 selftest=0
 
+if command -v stdbuf >/dev/null 2>&1; then
+  buffered() { stdbuf -oL -eL "$@"; }
+elif command -v gstdbuf >/dev/null 2>&1; then
+  buffered() { gstdbuf -oL -eL "$@"; }
+else
+  buffered() { "$@"; }
+fi
+
 usage() {
   cat >&2 <<'EOF'
 usage: watch-test.sh [--quiet SECONDS] [--bootstrap SECONDS] [--out FILE] [--selftest] -- COMMAND...
@@ -69,18 +77,20 @@ blocked_under() {
 STALLED=0
 WRC=0
 watch() {
-  local command="$1" sent=0 size last_change=$SECONDS pid limit running
+  local sent=0 size last_change=$SECONDS pid limit running
   STALLED=0
   WRC=0
   running=0
   mkdir -p "$(dirname "$out")"
-  printf '%s\n' "$command" >"$out"
+  printf '%s\n' "$*" >"$out"
   # -C, not -la: `cat -u` would buffer the very output this reads, and a pipe would
   # hand the kill signal to the reader instead of to the command under watch. The child
   # opens the file asynchronously, so create it here or the first poll's read can race it.
   : >"$out.part"
-  stdbuf -oL -eL bash -c "$command" >"$out.part" 2>&1 &
+  set -m
+  buffered "$@" >"$out.part" 2>&1 &
   pid=$!
+  set +m
   while kill -0 "$pid" 2>/dev/null; do
     size=$(wc -c <"$out.part" 2>/dev/null || echo 0)
     if ((size > sent)); then
@@ -100,9 +110,9 @@ watch() {
       # The shell reports a background job it had to kill; that line is noise under a
       # witness whose own messages already say what happened, so this group is mute.
       {
-        kill -TERM "$pid" 2>/dev/null || true
+        kill -TERM -- "-$pid" 2>/dev/null || true
         sleep 2
-        kill -KILL "$pid" 2>/dev/null || true
+        kill -KILL -- "-$pid" 2>/dev/null || true
         wait "$pid"
       } 2>/dev/null
       WRC=$?
@@ -139,11 +149,16 @@ watch() {
 # in one process -- and name the whole group when that stalls. probe bounds each solo pass
 # so a shared deadlock the co-run pass alone catches does not first cost the walk quiet.
 culprit() {
-  local binary="$1" keep="$out" names done missing name filters full
+  local binary="$1" keep="$out" names done missing name full
+  local -a filters=()
   [[ -x "$binary" ]] || return 1
   names=$("$binary" --list --format terse 2>/dev/null | sed -n 's/: test$//p')
   [[ -n "$names" ]] || return 1
-  done=$(grep -E '^test .* \.\.\. (ok|FAILED|ignored)' "$keep" 2>/dev/null |
+  done=$(awk '
+    /^ *[Rr]unning / { buf = ""; next }
+    /^test .* \.\.\. (ok|FAILED|ignored)/ { buf = buf $0 "\n" }
+    END { printf "%s", buf }
+  ' "$keep" 2>/dev/null |
     sed -E 's/^test (.*) \.\.\. (ok|FAILED|ignored).*/\1/')
   missing=$(comm -23 <(printf '%s\n' "$names" | sort) <(printf '%s\n' "$done" | sort))
   [[ -n "$missing" ]] || missing="$names"
@@ -151,7 +166,7 @@ culprit() {
   full="$quiet"
   quiet="$probe"
   for name in $missing; do
-    watch "$binary --exact '$name' --test-threads=1" >/dev/null
+    watch "$binary" --exact "$name" --test-threads=1 >/dev/null
     if ((STALLED == 1)); then
       quiet="$full"
       cp "$out" "$keep.last" 2>/dev/null || true
@@ -162,9 +177,8 @@ culprit() {
   done
   # None stalls alone, yet the parallel suite did: reproduce it the way the suite met it,
   # the still-missing names together in one process, so the shared deadlock names its group.
-  filters=""
-  for name in $missing; do filters="$filters '$name'"; done
-  watch "$binary --exact$filters" >/dev/null
+  for name in $missing; do filters+=("$name"); done
+  watch "$binary" --exact "${filters[@]}" >/dev/null
   quiet="$full"
   if ((STALLED == 1)); then
     cp "$out" "$keep.last" 2>/dev/null || true
@@ -182,9 +196,9 @@ last_binary() {
 }
 
 selftest_run() {
-  local fake="$PWD/target/ci/selftest-fake-abcd" want got probes
+  local fake="$PWD/target/ci/watch-selftest-fake-abcd" want got probes
   mkdir -p target/ci
-  probes="target/ci/selftest-probes.txt"
+  probes="target/ci/watch-selftest-probes.txt"
   cat >"$fake" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--list" ]]; then
@@ -200,8 +214,8 @@ if [[ "${1:-}" == "--exact" ]]; then
   for one in "$@"; do echo "test $one ... ok"; done
   exit 0
 fi
-echo "     Running unittests src/lib.rs (target/debug/deps/selftest-fake-abcd)"
-echo "     Running unittests src/lib.rs (target/debug/deps/selftest-fake-abcd)"
+echo "     Running unittests src/lib.rs (target/debug/deps/watch-selftest-fake-abcd)"
+echo "     Running unittests src/lib.rs (target/debug/deps/watch-selftest-fake-abcd)"
 echo "test early::done ... ok"
 sleep 600
 EOF
@@ -212,7 +226,7 @@ EOF
   quiet=5
   bootstrap=5
   probe=5
-  out="target/ci/selftest.log"
+  out="target/ci/watch-selftest.log"
   watch "$fake" >/dev/null
   ((STALLED == 1)) || { echo "selftest: a sleeping command did not read as stalled" >&2; return 1; }
   # The stalled log printed `test early::done ... ok`, so culprit must NOT re-run it: the
@@ -227,8 +241,8 @@ EOF
   # With nothing completed in the log to subtract, culprit falls back to the full list and
   # must reach every name -- here the finished one, which sorts before the hang, so it is
   # probed and returns before the hang names itself.
-  out="target/ci/selftest-empty.log"
-  printf '%s\n' '     Running unittests src/lib.rs (target/debug/deps/selftest-fake-abcd)' >"$out"
+  out="target/ci/watch-selftest-empty.log"
+  printf '%s\n' '     Running unittests src/lib.rs (target/debug/deps/watch-selftest-fake-abcd)' >"$out"
   : >"$probes"; export FAKE_PROBE="$PWD/$probes"
   want="$(culprit "$fake")" || { echo "selftest: the fallback walk did not name the hang" >&2; return 1; }
   unset FAKE_PROBE
@@ -237,9 +251,9 @@ EOF
   echo "selftest: ok   when the log names nothing finished, culprit walks every test"
   # A deadlock in what the tests share never shows when each runs alone; the co-run pass
   # meets the still-missing names together in one process and must name the whole group.
-  out="target/ci/selftest-shared.log"
+  out="target/ci/watch-selftest-shared.log"
   printf '%s\n' \
-    '     Running unittests src/lib.rs (target/debug/deps/selftest-fake-abcd)' \
+    '     Running unittests src/lib.rs (target/debug/deps/watch-selftest-fake-abcd)' \
     'test early::done ... ok' 'test hangs::forever ... ok' >"$out"
   : >"$probes"; export FAKE_PROBE="$PWD/$probes"
   want="$(culprit "$fake")" || { echo "selftest: the shared deadlock was not named" >&2; return 1; }
@@ -251,28 +265,28 @@ EOF
   echo "selftest: ok   a deadlock only present when tests share a process names its whole group"
   # culprit() runs only on what last_binary() hands back, and that has to be a runnable path:
   # cargo writes the deps separator as `/` on unix and `\` on Windows.
-  out="target/ci/selftest-last.log"
-  printf '%s\n' 'test x ... ok' '     Running unittests src\main.rs (target\ci\selftest-fake-abcd)' >"$out"
+  out="target/ci/watch-selftest-last.log"
+  printf '%s\n' 'test x ... ok' '     Running unittests src\main.rs (target\ci\watch-selftest-fake-abcd)' >"$out"
   got="$(last_binary "$out")"
-  [[ "$got" == "target/ci/selftest-fake-abcd" ]] || {
+  [[ "$got" == "target/ci/watch-selftest-fake-abcd" ]] || {
     echo "selftest: a windows-shaped Running line yielded '$got'" >&2; return 1; }
   [[ -x "$got" ]] || {
     echo "selftest: last_binary yielded '$got', which is not runnable: no test would be run alone" >&2; return 1; }
-  [[ "$(last_binary <(printf '%s\n' '     Running unittests src/main.rs (target/ci/selftest-fake-abcd)'))" \
-    == "target/ci/selftest-fake-abcd" ]] || {
+  [[ "$(last_binary <(printf '%s\n' '     Running unittests src/main.rs (target/ci/watch-selftest-fake-abcd)'))" \
+    == "target/ci/watch-selftest-fake-abcd" ]] || {
     echo "selftest: a unix-shaped Running line did not yield the same path" >&2; return 1; }
   echo "selftest: ok   the stalled run's log yields the runnable binary, on both separators"
-  watch "sleep 0.2; echo alive" >/dev/null
+  watch bash -c 'sleep 0.2; echo alive' >/dev/null
   ((STALLED == 0 && WRC == 0)) || { echo "selftest: a working command read as stalled" >&2; return 1; }
-  watch "exit 3" >/dev/null
+  watch bash -c 'exit 3' >/dev/null
   ((WRC == 3)) || { echo "selftest: a failing command's code did not survive the watch" >&2; return 1; }
   echo "selftest: ok   a command that writes is left alone, and its exit code is returned"
   # A suite names itself after the last poll: the failing test's name, the `failures:` block
   # and the `test result:` line all arrive as the process exits, between two polls.
-  out="target/ci/selftest-tail.log"
-  watch "sleep 1.2; echo 'a_name_that_failed'; echo 'test result: FAILED.'" \
-    >"target/ci/selftest-tail-output.log" 2>/dev/null
-  grep -q 'test result: FAILED' "target/ci/selftest-tail-output.log" || {
+  out="target/ci/watch-selftest-tail.log"
+  watch bash -c "sleep 1.2; echo 'a_name_that_failed'; echo 'test result: FAILED.'" \
+    >"target/ci/watch-selftest-tail-output.log" 2>/dev/null
+  grep -q 'test result: FAILED' "target/ci/watch-selftest-tail-output.log" || {
     echo "selftest: the bytes after the last poll never reached the watcher's own output" >&2; return 1; }
   echo "selftest: ok   the run's last lines reach the step log, so a red suite names itself"
   if [[ -d /proc/self/task ]]; then
@@ -283,18 +297,18 @@ EOF
     echo "note: no procfs on $(uname -s), so the thread witness is only proven on a Linux runner"
   fi
   quiet=1 bootstrap=8
-  out="target/ci/selftest-measuring.log"
+  out="target/ci/watch-selftest-measuring.log"
   started=$SECONDS
-  watch "echo '     Running unittests src/lib.rs (target/debug/deps/x-abcd)'; sleep 60" >/dev/null
+  watch bash -c "echo '     Running unittests src/lib.rs (target/debug/deps/x-abcd)'; sleep 60" >/dev/null
   ((STALLED == 1 && SECONDS - started < 6)) || {
     echo "selftest: a stall after a test started was not cut by the quiet limit" >&2; return 1; }
-  out="target/ci/selftest-building.log"
+  out="target/ci/watch-selftest-building.log"
   started=$SECONDS
-  watch "echo '   Compiling slow-crate v1.0.0'; sleep 60" >/dev/null
+  watch bash -c "echo '   Compiling slow-crate v1.0.0'; sleep 60" >/dev/null
   ((STALLED == 1 && SECONDS - started >= 8)) || {
     echo "selftest: a silent build was cut before its bootstrap limit" >&2; return 1; }
   echo "selftest: ok   patient while it builds, strict once a test is running"
-  rm -f "$fake" "$out" "${out}.stall" "$probes" target/ci/selftest-*.log
+  rm -f "$fake" "$out" "${out}.stall" "$probes" target/ci/watch-selftest-*.log
   return 0
 }
 
@@ -305,7 +319,7 @@ fi
 [[ $# -gt 0 ]] || usage
 
 mkdir -p "$(dirname "$out")"
-watch "$*"
+watch "$@"
 if ((STALLED == 1)); then
   echo "::error::$* stalled: nothing was written for $quiet s, so the log ends where it stopped"
   binary="$(last_binary "$out")"

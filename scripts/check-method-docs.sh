@@ -19,6 +19,7 @@ fails = []
 
 def load_counts():
     rows = {}
+    seen = set()
     with open(counts_path, encoding="utf-8") as f:
         for number, line in enumerate(f, 1):
             line = line.rstrip("\n")
@@ -30,10 +31,11 @@ def load_counts():
                              "expected `doc key value checker`")
                 continue
             doc, key, value, checker = parts
-            if rows.get(doc, {}).get(key, (value, checker)) != (value, checker):
+            if (doc, key) in seen:
                 fails.append(f"{os.path.basename(counts_path)}:{number}: "
                              f"{doc} {key} declared twice")
                 continue
+            seen.add((doc, key))
             rows.setdefault(doc, {})[key] = (value, checker)
     return rows
 
@@ -42,6 +44,7 @@ def load_doc(path):
     with open(path, encoding="utf-8") as f:
         text = f.read()
     rows = {}
+    seen = set()
     match = re.search(r"<!-- counts:begin -->(.*?)<!-- counts:end -->", text, re.S)
     if not match:
         fails.append(f"{os.path.basename(path)}: no counts block between the markers")
@@ -55,6 +58,10 @@ def load_doc(path):
             continue
         if set(cells[1]) == {"-"} or cells[0].startswith("-"):
             continue
+        if cells[0] in seen:
+            fails.append(f"{os.path.basename(path)}: `{cells[0]}` is claimed twice")
+            continue
+        seen.add(cells[0])
         rows[cells[0]] = (cells[1], cells[2])
     return rows
 

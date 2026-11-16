@@ -9,8 +9,11 @@ default_pattern="${1:-${BASELINE_PATTERN:-./...}}"
 # manual or local run wants.
 patterns=()
 if [[ -f .ferrox/ci-scope.json ]]; then
-  while IFS= read -r line; do [[ -n "$line" ]] && patterns+=("$line"); done \
-    < <(python3 scripts/ci-scope.py go-packages)
+  if ! plan="$(python3 scripts/ci-scope.py go-packages)"; then
+    echo "::error::ci-scope.py go-packages failed; refusing to read its silence as an empty plan" >&2
+    exit 1
+  fi
+  while IFS= read -r line; do [[ -n "$line" ]] && patterns+=("$line"); done <<<"$plan"
   if [[ "${#patterns[@]}" -eq 0 ]]; then
     echo "no package of the pinned reference measures this change: nothing to run"
     exit 0
@@ -86,6 +89,7 @@ pkg_notest="$(grep -c 'no test files' "$log" || true)"; pkg_notest="${pkg_notest
 pkg_cached="$(grep -c '[[:space:]](cached)$' "$log" || true)"; pkg_cached="${pkg_cached:-0}"
 case_fail="$(grep -c '^--- FAIL:' "$log" || true)"; case_fail="${case_fail:-0}"
 sub_fail="$(grep -c '^[[:space:]][[:space:]]*--- FAIL:' "$log" || true)"; sub_fail="${sub_fail:-0}"
+matched=$((pkg_ok + pkg_fail + pkg_notest))
 
 {
   echo "# xray-core baseline @ \`${rev:0:7}\`"
@@ -123,7 +127,10 @@ sub_fail="$(grep -c '^[[:space:]][[:space:]]*--- FAIL:' "$log" || true)"; sub_fa
     echo '```'
     echo
   fi
-  if ((pkg_fail == 0 && case_fail == 0 && test_rc == 0)); then
+  if ((matched == 0)); then
+    echo "No package matched \`$pattern\`, so there is nothing to call green."
+    echo
+  elif ((pkg_ok > 0 && pkg_fail == 0 && case_fail == 0 && test_rc == 0)); then
     echo "All ran green at this pin and pattern."
     echo
   else
@@ -135,7 +142,10 @@ sub_fail="$(grep -c '^[[:space:]][[:space:]]*--- FAIL:' "$log" || true)"; sub_fa
 
 cat "$summary"
 
-if ((pkg_fail > 0 || case_fail > 0)) || ((test_rc != 0)); then
+if ((matched == 0)); then
+  echo "::error::xray-core baseline: \`$pattern\` matched no package; refusing to report a green baseline"
+  exit 1
+elif ((pkg_fail > 0 || case_fail > 0)) || ((test_rc != 0)); then
   echo "::warning::xray-core baseline: $pkg_ok package(s) ok, $pkg_fail FAIL, $case_fail failing case(s); recorded, job stays green"
 else
   echo "xray-core baseline: all green ($pkg_ok packages ok)"

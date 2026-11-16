@@ -9,12 +9,20 @@ status=0
 ran=0
 
 libtest_ran_named() {
-  local command="$1" log="$2" filters="" word count named=0 sum=0 saw=0
+  local command="$1" log="$2" filters="" word count named=0 sum=0 saw=0 skip_next=0
   if [[ "$command" == *" -- "* ]]; then
     filters="${command##* -- }"
   fi
   for word in $filters; do
-    [[ "$word" == -* ]] || named=$((named + 1))
+    if ((skip_next)); then
+      skip_next=0
+      continue
+    fi
+    case "$word" in
+      --skip|--test-threads|--format|--color) skip_next=1 ;;
+      -*) ;;
+      *) named=$((named + 1)) ;;
+    esac
   done
   while IFS= read -r count; do
     saw=1
@@ -41,9 +49,14 @@ printf 'running 2 tests\n' >"$selftest/exact.log"
 printf 'running 5 tests\n' >"$selftest/prefix.log"
 printf 'running 0 tests\n' >"$selftest/empty.log"
 printf 'ok  pkg  0.01s\n' >"$selftest/other.log"
-for shape in exact:accept prefix:refuse empty:refuse other:accept; do
+printf 'running 1 tests\n' >"$selftest/skip.log"
+for shape in exact:accept prefix:refuse empty:refuse other:accept skip:accept; do
   verdict=0
-  libtest_ran_named "$selftest_names" "$selftest/${shape%%:*}.log" >/dev/null || verdict=$?
+  if [[ "$shape" == skip:* ]]; then
+    libtest_ran_named "cargo test -- --skip slow one" "$selftest/skip.log" >/dev/null || verdict=$?
+  else
+    libtest_ran_named "$selftest_names" "$selftest/${shape%%:*}.log" >/dev/null || verdict=$?
+  fi
   if [[ "$verdict" -eq 0 && "${shape##*:}" == refuse ]] || [[ "$verdict" -ne 0 && "${shape##*:}" == accept ]]; then
     echo "::error::self-test: ${shape%%:*}.log is answered $verdict; it must be ${shape##*:}"
     status=1

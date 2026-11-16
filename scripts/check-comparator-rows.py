@@ -11,6 +11,7 @@ re-noticed on every run.
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import tempfile
@@ -48,9 +49,14 @@ def load_baseline(path):
             )
         scenario, comparator, ratio, issue = parts
         try:
-            filed[(scenario, comparator)] = (float(ratio), issue)
+            value = float(ratio)
         except ValueError as exc:
             raise SystemExit(f"::error::{path}:{number}: {line!r}: {exc}") from exc
+        if not math.isfinite(value):
+            raise SystemExit(
+                f"::error::{path}:{number}: {line!r}: ratio is not finite"
+            )
+        filed[(scenario, comparator)] = (value, issue)
     return filed
 
 
@@ -174,9 +180,11 @@ def write_fixture(cells, scenario, comparator, ratio, deficit=True, runner_bound
     path.write_text(json.dumps(doc))
 
 
-def run_self(cells, baseline):
+def run_self(cells, baseline, allow_empty=False):
     command = [sys.executable, __file__, "--cells", str(cells)]
     command += ["--baseline", str(baseline)] if baseline else ["--no-baseline"]
+    if allow_empty:
+        command.append("--allow-empty")
     return subprocess.run(command, text=True, capture_output=True)
 
 
@@ -238,6 +246,20 @@ def selftest():
             return f"a filed line whose peer did not run was not reported: {proc.stderr}"
         if "no longer gaps" in proc.stderr:
             return f"a filed line whose peer did not run was called fixed: {proc.stderr}"
+
+        baseline.write_text("vless-raw-down-8--srv-ferrox|zeronet|nan|359\n")
+        proc = run_self(cells, baseline)
+        if proc.returncode == 0 or "not finite" not in proc.stderr:
+            return f"a non-finite baseline ratio was accepted: {proc.stderr}"
+
+        empty = Path(temp) / "empty"
+        empty.mkdir()
+        proc = run_self(empty, None)
+        if proc.returncode == 0:
+            return "an empty cells directory passed without --allow-empty"
+        proc = run_self(empty, None, allow_empty=True)
+        if proc.returncode != 0:
+            return f"--allow-empty did not accept an empty cells directory: {proc.stderr}"
     print("check-comparator-rows selftest: passed")
     return None
 
@@ -257,11 +279,22 @@ def main():
         help="deficits filed already; new or worse ones still fail",
     )
     parser.add_argument("--no-baseline", action="store_true", help="fail on every deficit")
+    parser.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="accept a cells directory with no paired comparator row",
+    )
     args = parser.parse_args()
     if not Path(args.cells).is_dir():
         parser.error(f"{args.cells} is not a directory")
     baseline = {} if args.no_baseline else load_baseline(args.baseline)
     found, paired = deficits(args.cells)
+    if not paired and not args.allow_empty:
+        print(
+            "::error::no per-comparator row was paired; the check would pass on nothing",
+            file=sys.stderr,
+        )
+        return 1
     return report(found, paired, baseline)
 
 

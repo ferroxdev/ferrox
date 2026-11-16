@@ -20,6 +20,10 @@ DEFAULT_EDGE = "162.159.198.2:443"
 DEFAULT_TARGET = "https://speed.cloudflare.com/__down?bytes=67108864"
 LOCAL_V4 = "10.13.0.2"
 LOCAL_V6 = "fd13::2"
+try:
+    CPU_TICK_MS = 1000.0 / os.sysconf("SC_CLK_TCK")
+except (AttributeError, ValueError, OSError):
+    CPU_TICK_MS = 10.0
 
 
 def fail(message):
@@ -115,8 +119,17 @@ def read_json(path):
 
 
 def write_json(path, value):
-    """Write a JSON document with a trailing newline."""
-    pathlib.Path(path).write_text(json.dumps(value, indent=2) + "\n")
+    """Write a JSON document with a trailing newline, owner-only because configs carry keys."""
+    path = pathlib.Path(path)
+    path.write_text(json.dumps(value, indent=2) + "\n")
+    path.chmod(0o600)
+
+
+def write_secret(path, data):
+    """Write a private key with owner-only permissions, tightening an existing file too."""
+    path = pathlib.Path(path)
+    path.write_bytes(data if isinstance(data, bytes) else data.encode())
+    path.chmod(0o600)
 
 
 def pem_text(path):
@@ -151,9 +164,10 @@ def ferrox_identity_from_aether(path, pin):
     if "BEGIN PRIVATE KEY" not in key_pem:
         fail(f"{path} carries no MASQUE private key")
     key_path = pathlib.Path(path).with_name("aether-key.pem")
-    key_path.write_text(key_pem)
+    write_secret(key_path, key_pem)
     key_der = key_path.with_name("aether-key.der")
     openssl_der(key_path, key_der)
+    key_der.chmod(0o600)
     v4 = doc.get("ipv4") or ""
     v6 = doc.get("ipv6") or ""
     if not v4 or not v6:
@@ -183,10 +197,11 @@ def aether_identity_from_ferrox(identity, out_dir):
     """Derive the Aether certificate and key from a ferrox identity's enrolled key."""
     _, masque = identity_blocks(identity)
     der = out_dir / "ferrox-key.der"
-    der.write_bytes(base64.b64decode(masque["privateKey"]))
+    write_secret(der, base64.b64decode(masque["privateKey"]))
     key = out_dir / "ferrox-key.pem"
     cert = out_dir / "ferrox-cert.pem"
     openssl_pem(der, key)
+    key.chmod(0o600)
     openssl_self_signed(key, cert)
     return cert, key
 
@@ -230,7 +245,7 @@ def measured_command(cmd, env, log_dir, name, timeout):
     stderr.close()
     return {
         "seconds": round(time.monotonic() - start, 3),
-        "cpu_millis": (cpu_last - cpu_start) * 10 if cpu_start is not None and cpu_last is not None else None,
+        "cpu_millis": round((cpu_last - cpu_start) * CPU_TICK_MS) if cpu_start is not None and cpu_last is not None else None,
         "rss_mib": round(peak_rss / 1024.0, 2) if peak_rss else None,
         "exit": proc.returncode,
     }
@@ -301,7 +316,7 @@ def socks_connect(port, host, target_port):
 def curl_download(port, url, out_path, timeout):
     """Download through the engine's SOCKS front and return its transfer record."""
     result = run([
-        "curl", "-sS", "--socks5-hostname", f"127.0.0.1:{port}",
+        "curl", "-sS", "--noproxy", "", "--socks5-hostname", f"127.0.0.1:{port}",
         "--max-time", str(timeout), "--fail", "-o", str(out_path),
         "-w", '{"http_code":%{http_code},"size":%{size_download},'
               '"total":%{time_total},"starttransfer":%{time_starttransfer}}',
@@ -537,7 +552,7 @@ def measure_engine(name, binary, adapter, config, socks_port, url, out_dir, repe
         pass
     record["rss_mib"] = round(peak_rss, 2) if peak_rss else record.get("startup_rss_mib")
     if startup_cpu is not None and cpu_end is not None:
-        record["cpu_millis"] = (cpu_end - startup_cpu) * 10
+        record["cpu_millis"] = round((cpu_end - startup_cpu) * CPU_TICK_MS)
     stop_process(proc, stdout)
     stderr.close()
     return record
@@ -577,6 +592,7 @@ def main():
         fail(f"no Aether adapter at {adapter}")
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    out.chmod(0o700)
     env = os.environ.copy()
     env.update({
         "AETHER_LOG_LEVEL": "warn",
@@ -590,11 +606,12 @@ def main():
     edge = (edge_host or args.edge, int(edge_port or "443"))
     target_url = args.target_url
     target_host = "speed.cloudflare.com"
-    target_port = 443
+    scheme = target_url.split("://", 1)[0].lower() if "://" in target_url else "https"
+    target_port = 80 if scheme == "http" else 443
     if "://" in target_url:
         rest = target_url.split("://", 1)[1]
         target_host = rest.split("/", 1)[0].split(":", 1)[0]
-        target_port = int(rest.split("/", 1)[0].split(":", 1)[1]) if ":" in rest.split("/", 1)[0] else 443
+        target_port = int(rest.split("/", 1)[0].split(":", 1)[1]) if ":" in rest.split("/", 1)[0] else target_port
     rows = []
     registrations = []
     local_server = None
@@ -645,6 +662,7 @@ def main():
         for provenance in ("ferrox", "aether"):
             identities = out / provenance
             identities.mkdir(parents=True, exist_ok=True)
+            identities.chmod(0o700)
             if provenance == "ferrox":
                 identity_path = identities / "identity.json"
                 cmd = [
@@ -673,7 +691,7 @@ def main():
                 cert = identities / "cert.pem"
                 key = identities / "key.pem"
                 cert.write_text(toml_identity["cert_pem"])
-                key.write_text(toml_identity["key_pem"])
+                write_secret(key, toml_identity["key_pem"])
                 identity, _, _ = ferrox_identity_from_aether(identity_path, "")
             cloud_v4, cloud_v6 = identity_addresses((identity.get("masque") or {}).get("address") or [])
             measure_pair(provenance, identity, cert, key, cloud_v4, cloud_v6)
