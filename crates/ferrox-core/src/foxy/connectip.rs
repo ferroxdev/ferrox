@@ -1007,7 +1007,9 @@ pub fn datagram_fits(payload: usize) -> bool {
 
 /// Writes one UDP datagram into `out` — IP header, UDP header, payload — taking the version from the tunnel address's width, so a v4-assigned lane writes v4 packets and a v6-assigned one v6, never mixed.
 pub fn udp_datagram(datagram: &UdpDatagram<'_>, out: &mut Vec<u8>) -> bool {
-    if !datagram_fits(datagram.payload.len()) {
+    let (source, destination) = (datagram.source.len(), datagram.destination.len());
+    let addresses = matches!((source, destination), (4, 4) | (16, 16));
+    if !datagram_fits(datagram.payload.len()) || !addresses {
         return false;
     }
     let payload = UDP_HEADER + datagram.payload.len();
@@ -1477,6 +1479,28 @@ mod tests {
         )
         .expect_refused();
         assert!(out.is_empty(), "and nothing was written");
+    }
+
+    #[test]
+    fn a_datagram_with_mismatched_address_widths_is_refused() {
+        for (source, destination) in [
+            (&[10u8, 0, 0, 1][..], &[0u8; 16][..]),
+            (&[0u8; 16][..], &[10u8, 0, 0, 2][..]),
+            (&[10u8, 0, 0][..], &[10u8, 0, 0, 2][..]),
+        ] {
+            let mut out = Vec::new();
+            assert!(!udp_datagram(
+                &UdpDatagram {
+                    source,
+                    destination,
+                    source_port: 1,
+                    destination_port: 2,
+                    payload: b"hi",
+                },
+                &mut out,
+            ));
+            assert!(out.is_empty(), "and nothing was written");
+        }
     }
 
     #[test]

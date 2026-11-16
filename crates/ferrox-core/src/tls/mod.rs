@@ -157,12 +157,19 @@ impl MasterKeyLog {
         let file = options.open(path).ok()?;
         #[cfg(unix)]
         {
+            use std::os::unix::fs::FileTypeExt as _;
             use std::os::unix::fs::PermissionsExt as _;
-            if file
-                .set_permissions(std::fs::Permissions::from_mode(0o600))
-                .is_err()
-            {
-                return None;
+            match file.metadata() {
+                Ok(meta) if meta.is_file() || meta.file_type().is_fifo() => {
+                    if file
+                        .set_permissions(std::fs::Permissions::from_mode(0o600))
+                        .is_err()
+                    {
+                        return None;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => return None,
             }
         }
         // 193 bytes is the longest line: a 30-byte label, a 32-byte random and a 48-byte SHA-384 secret.
@@ -1120,4 +1127,25 @@ pub fn accept<S: Stream + Send>(
 
 pub fn active_backends() -> &'static [&'static str] {
     &["rustls", "boring"]
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::MasterKeyLog;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn a_special_key_log_destination_keeps_its_permissions() {
+        let path = "/dev/null";
+        let mode = || {
+            std::fs::metadata(path)
+                .expect("the device exists")
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        let before = mode();
+        let _log = MasterKeyLog::open(path).expect("opens the device");
+        assert_eq!(before, mode());
+    }
 }
