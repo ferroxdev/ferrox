@@ -340,6 +340,11 @@ pub fn decode_tcp_request(packet: &[u8]) -> Result<(&str, usize), RequestError> 
 
 pub fn encode_tcp_request(address: &str, padding: &[u8], out: &mut Vec<u8>) {
     frames::quic_varint(out, TCP_FRAME);
+    encode_tcp_request_body(address, padding, out);
+}
+
+/// The request body behind a stream's own frame type, for a caller that already opened the stream.
+pub fn encode_tcp_request_body(address: &str, padding: &[u8], out: &mut Vec<u8>) {
     frames::quic_varint(out, address.len() as u64);
     out.extend_from_slice(address.as_bytes());
     frames::quic_varint(out, padding.len() as u64);
@@ -1307,6 +1312,13 @@ mod tests {
         want.extend_from_slice(b"127.0.0.1:8080");
         want.extend_from_slice(&[3, 0xAB, 0xAB, 0xAB]);
         assert_eq!(out, want);
+        let mut body = Vec::new();
+        encode_tcp_request_body("127.0.0.1:8080", &[0xAB; 3], &mut body);
+        assert_eq!(
+            body,
+            want[2..],
+            "a stream that carries its own frame type hands the body after it"
+        );
         assert_eq!(decode_tcp_request(&out), Ok(("127.0.0.1:8080", out.len())));
         assert_eq!(
             decode_tcp_request_body(&out[2..]),

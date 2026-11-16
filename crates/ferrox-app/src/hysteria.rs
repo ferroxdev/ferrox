@@ -1028,7 +1028,11 @@ pub(crate) fn read_request(flow: &mut Flow, deadline: Instant) -> Option<String>
                 if head.len().saturating_sub(prefix) >= HEAD_CAP || Instant::now() >= deadline {
                     return None;
                 }
-                let n = flow.read(room.as_mut()).ok()?;
+                let n = match flow.read_step(room.as_mut()) {
+                    Ok(Some(n)) => n,
+                    Ok(None) => continue,
+                    Err(_) => return None,
+                };
                 if n == 0 {
                     return None;
                 }
@@ -1055,7 +1059,11 @@ pub(crate) fn read_tcp_response(flow: &mut Flow, deadline: Instant) -> Option<(b
                 if head.len() >= HEAD_CAP || Instant::now() >= deadline {
                     return None;
                 }
-                let n = flow.read(room.as_mut()).ok()?;
+                let n = match flow.read_step(room.as_mut()) {
+                    Ok(Some(n)) => n,
+                    Ok(None) => continue,
+                    Err(_) => return None,
+                };
                 if n == 0 {
                     return None;
                 }

@@ -13214,7 +13214,7 @@ fn dial_hysteria_v2(client: &Connection, dial: &crate::hysteria::Dial, target: &
     let mut raw = [0u8; 2050];
     let padding = crate::hysteria::hysteria_padding(64, 512, &mut raw);
     let mut request = Vec::with_capacity(3 + target.authority_len() + 2 + padding.len());
-    ferrox_core::hysteria::encode_tcp_request(
+    ferrox_core::hysteria::encode_tcp_request_body(
         &target.authority(),
         padding.as_bytes(),
         &mut request,
