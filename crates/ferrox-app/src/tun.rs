@@ -537,6 +537,97 @@ fn read_limit(gso: bool, mss: usize, room: usize) -> usize {
     }
 }
 
+/// How long a queue parks on an answer that follows its own upload: an echo replies in microseconds, and past this the response thread's read is the cheaper waiter.
+const PING_PONG_SPIN: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// Emit one segment an upstream read already landed in `buf[body..body + n]` and whose sequence the reader reserved under its gate. The response thread and the queue's inline serve share it, so the GSO split and the bytes cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+fn emit_upstream(
+    dev: &PacketWriter,
+    flow: &Flow,
+    buf: &mut [u8],
+    n: usize,
+    seq: u32,
+    gso_capable: bool,
+    max: usize,
+    src: (IpAddr, u16),
+    dst: (IpAddr, u16),
+) -> bool {
+    let Some(head) = ip_header_len(src.0, dst.0) else {
+        return false;
+    };
+    let body = head + 20;
+    let gso = gso_capable && n > max;
+    if !render_tcp_headers_ip(
+        src,
+        dst,
+        seq,
+        flow.rcv_nxt.load(Relaxed),
+        FLAG_PSH | FLAG_ACK,
+        65535,
+        &[],
+        n,
+        gso,
+        &mut buf[..body + n],
+    ) {
+        return false;
+    }
+    let wrote = if gso {
+        dev.write_gso(&buf[..body + n], max as u16)
+    } else {
+        dev.write_packet(&buf[..body + n])
+    };
+    wrote.unwrap_or(false)
+}
+
+/// One upstream segment for the response thread, with its sequence already reserved: the dequeue and the reservation sit inside the stream's gate, so a queue serving the same stream cannot take the earlier bytes and number them later. A socket with nothing queued parks the thread on its descriptor rather than in the clock.
+#[cfg(unix)]
+fn read_upstream(
+    gate: &Mutex<()>,
+    reader: &mut Connection,
+    buf: &mut [u8],
+    budget: std::time::Duration,
+    snd_nxt: &AtomicU32,
+) -> io::Result<(usize, u32)> {
+    loop {
+        let read = {
+            let _gated = gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reader.read_ready(buf).map(|n| {
+                let seq = snd_nxt.load(Relaxed);
+                if n == 0 {
+                    (n, seq)
+                } else {
+                    (n, snd_nxt.fetch_add(n as u32, Relaxed))
+                }
+            })
+        };
+        match read {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if reader.wait_readable(budget)? {
+                    continue;
+                }
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// The same read on a host without a per-call non-blocking one: the queue never serves inline there, so the thread's own blocking read is the only reader and its socket timeout is the clock.
+#[cfg(not(unix))]
+fn read_upstream(
+    _gate: &Mutex<()>,
+    reader: &mut Connection,
+    buf: &mut [u8],
+    _budget: std::time::Duration,
+    snd_nxt: &AtomicU32,
+) -> io::Result<(usize, u32)> {
+    let n = reader.read(buf)?;
+    Ok((n, snd_nxt.fetch_add(n as u32, Relaxed)))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FlowKey {
     source: IpAddr,
@@ -1325,6 +1416,16 @@ impl SendWindow {
             self.parked.store(false, SeqCst);
         }
     }
+
+    /// Room the peer's window leaves right now, the queue's non-blocking reading of the same state: a shut window answers zero here where `room` would park for the ack that opens it.
+    fn room_now(&self, sent: &AtomicU32) -> Option<u32> {
+        if self.closed.load(SeqCst) {
+            return None;
+        }
+        let state = self.state.load(SeqCst);
+        let inflight = sent.load(SeqCst).wrapping_sub((state >> 32) as u32);
+        Some((state as u32).saturating_sub(inflight))
+    }
 }
 
 /// One active TCP flow's state. The two cursors are shared with the response
@@ -1353,6 +1454,10 @@ struct Flow {
     send: Arc<SendWindow>,
     /// One close packet — `FIN` or `RST` — leaves per flow, whichever thread sees the end first.
     signaled: Arc<AtomicBool>,
+    /// The last upload's answer arrived inside the queue's spin: a ping-pong keeps the window, a bulk upload drops to one non-blocking read.
+    spin: AtomicBool,
+    /// Held across one dequeue and the sequence it publishes, by whichever thread reads: the queue serving an answer and the response thread waiting on the same stream would otherwise number the two segments out of stream order.
+    read_gate: Mutex<()>,
     /// The device's `FIN` reached the upload half, so a response thread waiting on a direct lane
     /// whose download closed first can finish the flow.
     upload_finished: UploadFinished,
@@ -1535,6 +1640,8 @@ pub(crate) struct Handler {
     frame: Vec<u8>,
     /// Reused render buffer for every device-bound packet this thread emits (SYN-ACK, pure ACK, ICMP reply), so the emit path allocates nothing in steady state.
     emit: Vec<u8>,
+    /// The inline serve's buffer: sized once to one read's worth and never cleared, so an answer a queue takes keeps the flow thread's zeroing out of the hot path.
+    served: Vec<u8>,
     association: Option<Association>,
     /// The direct datagram lane this handler opened, kept alive by its control connection.
     direct_datagram: Option<crate::proxy::DirectDatagram>,
@@ -1612,6 +1719,7 @@ impl Handler {
             legs,
             frame: Vec::with_capacity(FRAME_CAP),
             emit,
+            served: Vec::new(),
             association: None,
             direct_datagram: None,
             opening: None,
@@ -1834,6 +1942,8 @@ impl Handler {
             }
             let fin = tcp.flags & FLAG_FIN != 0;
             let len = payload.len() as u32;
+            // Set when the answer rode out behind the upload, so its `PSH` already acknowledged this segment.
+            let mut answered = false;
             // A pure ACK only moves the window: it never touches the upload half, so it takes no pipe lock.
             if !payload.is_empty() || fin {
                 let mut guard = flow
@@ -1859,6 +1969,9 @@ impl Handler {
                     let sent = half.write(&payload[skip..]).unwrap_or(0);
                     end = rcv.wrapping_add(sent as u32);
                     flow.rcv_nxt.store(end, Relaxed);
+                    if sent > 0 && !fin {
+                        answered = self.serve_inline(half, &flow);
+                    }
                 }
                 if fin && tcp.seq.wrapping_add(len) == flow.rcv_nxt.load(Relaxed) {
                     flow.rcv_nxt.store(end.wrapping_add(1), Relaxed);
@@ -1871,7 +1984,10 @@ impl Handler {
                 .rcv_nxt
                 .load(Relaxed)
                 .wrapping_sub(flow.last_acked.load(Relaxed));
-            if fin
+            if answered {
+                // The response carried this segment's ack, so the standalone one would only repeat it.
+                flow.last_acked.store(flow.rcv_nxt.load(Relaxed), Relaxed);
+            } else if fin
                 || (tcp.flags & FLAG_PSH != 0 && !payload.is_empty())
                 || unacked >= self.device.mtu as u32
             {
@@ -1896,6 +2012,70 @@ impl Handler {
             }
         }
         Ok(())
+    }
+
+    /// Take an answer the peer has already readied, on the queue thread that still holds the flow, so a request-and-reply costs no response-thread wake. A non-blocking read never waits and the stream hands each byte to exactly one reader, so a flow thread parked in its own read keeps what this leaves. The window stays closed until one answer arrives: a bulk upload pays one `recv` per segment and never spins.
+    fn serve_inline(&mut self, half: &mut Connection, flow: &Flow) -> bool {
+        // A host whose descriptor has no per-call non-blocking read keeps the answer on the response thread rather than blocking a queue behind it.
+        if cfg!(not(unix)) || flow.signaled.load(Relaxed) {
+            return false;
+        }
+        let Some(body) = ip_header_len(flow.local.0, flow.remote.0).map(|head| head + 20) else {
+            return false;
+        };
+        let gso = self.device.gso();
+        let max = (flow.mss.load(Relaxed) as usize).max(1);
+        let Some(room) = flow.send.room_now(&flow.snd_nxt) else {
+            return false;
+        };
+        let limit = read_limit(gso, max, MAX_PACKET - body).min(room as usize);
+        if limit == 0 {
+            return false;
+        }
+        if self.served.len() < body + limit {
+            self.served.resize(body + limit, 0);
+        }
+        let armed = flow.spin.load(Relaxed);
+        let deadline = std::time::Instant::now() + PING_PONG_SPIN;
+        let mut served = false;
+        loop {
+            let gated = match flow.read_gate.try_lock() {
+                Ok(gated) => gated,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => break,
+            };
+            let read = half
+                .read_ready(&mut self.served[body..body + limit])
+                .map(|n| (n, flow.snd_nxt.fetch_add(n as u32, Relaxed)));
+            drop(gated);
+            match read {
+                Ok((0, _)) => break,
+                Ok((n, seq)) => {
+                    served = emit_upstream(
+                        &self.device,
+                        flow,
+                        &mut self.served,
+                        n,
+                        seq,
+                        gso,
+                        max,
+                        flow.local,
+                        flow.remote,
+                    );
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if !armed || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        flow.spin.store(served, Relaxed);
+        served
     }
 
     /// The device flow's byte pipe: one `AF_UNIX` pair on a Unix host instead of a loopback TCP
@@ -1991,6 +2171,8 @@ impl Handler {
             mss: Arc::clone(&mss),
             send: Arc::clone(&send),
             signaled: Arc::clone(&signaled),
+            spin: AtomicBool::new(false),
+            read_gate: Mutex::new(()),
             upload_finished: UploadFinished::default(),
         });
         // Claim the tuple under the table lock: a duplicate SYN that raced this handshake on another queue finds a flow here and keeps it instead of opening a second leg, and whatever flow ours replaces is retired rather than left running beside it.
@@ -2148,12 +2330,18 @@ impl Handler {
                     break FLAG_RST | FLAG_ACK;
                 };
                 let limit = read_limit(gso_capable, max, payload_cap).min(room as usize);
-                match reader.read(&mut pkt[body..body + limit]) {
-                    Ok(0) if outcome.as_ref().is_none() => {
+                match read_upstream(
+                    &flow.read_gate,
+                    &mut reader,
+                    &mut pkt[body..body + limit],
+                    budgets::udp_idle(),
+                    &snd_nxt,
+                ) {
+                    Ok((0, _)) if outcome.as_ref().is_none() => {
                         half_closed = true;
                         break FLAG_FIN | FLAG_ACK;
                     }
-                    Ok(0) => {
+                    Ok((0, _)) => {
                         // A clean close ends with FIN, a refused leg with RST; a relay that never reports is dead.
                         let clean = match outcome.as_ref() {
                             None => true,
@@ -2169,32 +2357,19 @@ impl Handler {
                             FLAG_RST | FLAG_ACK
                         };
                     }
-                    Ok(n) => {
-                        let gso = gso_capable && n > max;
-                        // Reserve the sequence before the write so an ACK a second queue hands us cannot name bytes the device has not been given yet.
-                        let seq = snd_nxt.fetch_add(n as u32, Relaxed);
-                        if !render_tcp_headers_ip(
+                    Ok((n, seq)) => {
+                        if !emit_upstream(
+                            &dev_writer,
+                            &flow,
+                            &mut pkt,
+                            n,
+                            seq,
+                            gso_capable,
+                            max,
                             (local_ip, local_port),
                             (remote_ip, remote_port),
-                            seq,
-                            rcv_nxt.load(Relaxed),
-                            FLAG_PSH | FLAG_ACK,
-                            65535,
-                            &[],
-                            n,
-                            gso,
-                            &mut pkt[..body + n],
                         ) {
                             break FLAG_RST | FLAG_ACK;
-                        }
-                        let wrote = if gso {
-                            dev_writer.write_gso(&pkt[..body + n], max as u16)
-                        } else {
-                            dev_writer.write_packet(&pkt[..body + n])
-                        };
-                        match wrote {
-                            Ok(true) => {}
-                            Ok(false) | Err(_) => break FLAG_RST | FLAG_ACK,
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
