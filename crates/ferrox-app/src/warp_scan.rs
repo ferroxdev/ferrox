@@ -423,7 +423,7 @@ impl Cooldowns {
 /// its other half to be reused.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LastEdge {
-    recent: Vec<(String, SocketAddr)>,
+    recent: Vec<(String, SocketAddr, Option<String>)>,
 }
 
 const RECENT_CAP: usize = 8;
@@ -453,13 +453,17 @@ impl LastEdge {
             else {
                 continue;
             };
+            let profile = row
+                .get("profile")
+                .and_then(crate::json::Json::as_str)
+                .map(str::to_owned);
             if recent
                 .iter()
-                .any(|(name, _): &(String, SocketAddr)| name == carrier)
+                .any(|(name, _, _): &(String, SocketAddr, Option<String>)| name == carrier)
             {
                 continue;
             }
-            recent.push((carrier.to_owned(), endpoint));
+            recent.push((carrier.to_owned(), endpoint, profile));
             if recent.len() == RECENT_CAP {
                 break;
             }
@@ -471,8 +475,8 @@ impl LastEdge {
         let rows = self
             .recent
             .iter()
-            .map(|(carrier, endpoint)| {
-                crate::json::Json::Obj(vec![
+            .map(|(carrier, endpoint, profile)| {
+                let mut row = vec![
                     (
                         "carrier".to_owned(),
                         crate::json::Json::Str(carrier.clone()),
@@ -481,7 +485,14 @@ impl LastEdge {
                         "endpoint".to_owned(),
                         crate::json::Json::Str(endpoint.to_string()),
                     ),
-                ])
+                ];
+                if let Some(profile) = profile {
+                    row.push((
+                        "profile".to_owned(),
+                        crate::json::Json::Str(profile.clone()),
+                    ));
+                }
+                crate::json::Json::Obj(row)
             })
             .collect();
         let json =
@@ -492,16 +503,19 @@ impl LastEdge {
             .map_err(|error| format!("warp: cannot save `{}`: {error}", path.display()))
     }
 
-    pub(crate) fn get(&self, carrier: &str) -> Option<SocketAddr> {
+    pub(crate) fn get(&self, carrier: &str) -> Option<(SocketAddr, Option<&str>)> {
         self.recent
             .iter()
-            .find(|(name, _)| name == carrier)
-            .map(|(_, endpoint)| *endpoint)
+            .find(|(name, _, _)| name == carrier)
+            .map(|(_, endpoint, profile)| (*endpoint, profile.as_deref()))
     }
 
-    pub(crate) fn record(&mut self, carrier: &str, endpoint: SocketAddr) {
-        self.recent.retain(|(name, _)| name != carrier);
-        self.recent.insert(0, (carrier.to_owned(), endpoint));
+    pub(crate) fn record(&mut self, carrier: &str, endpoint: SocketAddr, profile: Option<&str>) {
+        self.recent.retain(|(name, _, _)| name != carrier);
+        self.recent.insert(
+            0,
+            (carrier.to_owned(), endpoint, profile.map(str::to_owned)),
+        );
         self.recent.truncate(RECENT_CAP);
     }
 }
@@ -637,15 +651,19 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a temp dir");
         let path = dir.join("lastconn.json");
         let mut recent = LastEdge::default();
-        recent.record("wireguard", "192.0.2.1:2408".parse().expect("an edge"));
-        recent.record("masque", "192.0.2.2:443".parse().expect("an edge"));
+        recent.record(
+            "wireguard",
+            "192.0.2.1:2408".parse().expect("an edge"),
+            Some("gfw"),
+        );
+        recent.record("masque", "192.0.2.2:443".parse().expect("an edge"), None);
         assert_eq!(
             recent.get("wireguard"),
-            Some("192.0.2.1:2408".parse().expect("an edge"))
+            Some(("192.0.2.1:2408".parse().expect("an edge"), Some("gfw")))
         );
         assert_eq!(
             recent.get("masque"),
-            Some("192.0.2.2:443".parse().expect("an edge"))
+            Some(("192.0.2.2:443".parse().expect("an edge"), None))
         );
         recent.save(&path).expect("saves");
         assert_eq!(LastEdge::load(&path), recent);
@@ -653,21 +671,26 @@ mod tests {
             recent.record(
                 "wireguard",
                 SocketAddr::from(([192, 0, 2, index as u8 + 1], 2408)),
+                Some("balanced"),
             );
         }
         assert_eq!(recent.recent.len(), 2);
         assert_eq!(
             recent.get("wireguard"),
-            Some(SocketAddr::from(([192, 0, 2, RECENT_CAP as u8 + 4], 2408)))
+            Some((
+                SocketAddr::from(([192, 0, 2, RECENT_CAP as u8 + 4], 2408)),
+                Some("balanced")
+            ))
         );
         assert_eq!(
             recent.get("masque"),
-            Some("192.0.2.2:443".parse().expect("an edge"))
+            Some(("192.0.2.2:443".parse().expect("an edge"), None))
         );
         for index in 0..=RECENT_CAP {
             recent.record(
                 &format!("extra-{index}"),
                 SocketAddr::from(([198, 51, 100, index as u8 + 1], 443)),
+                None,
             );
         }
         assert_eq!(recent.recent.len(), RECENT_CAP);

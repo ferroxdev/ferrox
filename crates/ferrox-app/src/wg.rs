@@ -2449,12 +2449,16 @@ fn widen(socket: &UdpSocket) {
 
 fn is_initiation(packet: &[u8]) -> bool {
     packet.len() == INITIATION_SIZE
-        && u32::from_le_bytes(packet[..4].try_into().unwrap_or([0; 4])) == TYPE_INITIATION
+        && packet
+            .first()
+            .is_some_and(|first| u32::from(*first) == TYPE_INITIATION)
 }
 
 fn is_keepalive(packet: &[u8]) -> bool {
     packet.len() == WG_MIN_SIZE
-        && u32::from_le_bytes(packet[..4].try_into().unwrap_or([0; 4])) == TYPE_TRANSPORT
+        && packet
+            .first()
+            .is_some_and(|first| u32::from(*first) == TYPE_TRANSPORT)
 }
 
 fn send_noise(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packet: &[u8]) {
@@ -2563,6 +2567,20 @@ mod tests {
         destination: IpAddr,
     ) -> Option<usize> {
         routes.peer_for(peers, destination)
+    }
+
+    #[test]
+    fn a_reserved_word_still_names_the_handshake_and_keepalive() {
+        let mut initiation = vec![0u8; INITIATION_SIZE];
+        initiation[0] = TYPE_INITIATION as u8;
+        initiation[1..4].copy_from_slice(&[9, 8, 7]);
+        assert!(is_initiation(&initiation));
+
+        let mut keepalive = vec![0u8; WG_MIN_SIZE];
+        keepalive[0] = TYPE_TRANSPORT as u8;
+        keepalive[1..4].copy_from_slice(&[9, 8, 7]);
+        assert!(is_keepalive(&keepalive));
+        assert!(!is_initiation(&keepalive));
     }
 
     #[test]

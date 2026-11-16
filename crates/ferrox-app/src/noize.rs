@@ -45,12 +45,14 @@ impl NoizeSettings {
     }
 
     pub(crate) fn wireguard(&self) -> WireGuardNoize {
-        WireGuardNoize::from_profile(Some(
-            self.wireguard_override
-                .as_deref()
-                .or(self.profile.as_deref())
-                .unwrap_or("balanced"),
-        ))
+        WireGuardNoize::from_profile(Some(self.wireguard_name()))
+    }
+
+    pub(crate) fn wireguard_name(&self) -> &str {
+        self.wireguard_override
+            .as_deref()
+            .or(self.profile.as_deref())
+            .unwrap_or("balanced")
     }
 
     pub(crate) fn masque_profile(&self) -> &str {

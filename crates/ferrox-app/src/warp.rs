@@ -1633,8 +1633,15 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
     let now = Instant::now();
     if spec.quick_reconnect {
         if wireguard.is_none() && want_wireguard {
-            if let Some(edge) = last.get("wireguard") {
-                if check_wireguard(identity, spec, edge) {
+            if let Some((edge, profile)) = last.get("wireguard") {
+                let mut cached = spec.clone();
+                if let Some(profile) = profile {
+                    cached.noize.select_wireguard(profile);
+                }
+                if check_wireguard(identity, &cached, edge) {
+                    if let Some(profile) = profile {
+                        spec.noize.select_wireguard(profile);
+                    }
                     wireguard = Some(edge);
                     println!("[+] selected WireGuard endpoint {edge}");
                 } else {
@@ -1645,7 +1652,7 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
             }
         }
         if masque.is_none() && want_masque {
-            if let Some(edge) = last.get("masque") {
+            if let Some((edge, _)) = last.get("masque") {
                 if check_masque(identity, spec, edge) {
                     masque = Some(edge);
                     println!("[+] selected MASQUE gateway {edge}");
@@ -1713,10 +1720,10 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
     }
     if (spec.scan.is_some() || spec.quick_reconnect) && (wireguard.is_some() || masque.is_some()) {
         if let Some(edge) = wireguard {
-            last.record("wireguard", edge);
+            last.record("wireguard", edge, Some(spec.noize.wireguard_name()));
         }
         if let Some(edge) = masque {
-            last.record("masque", edge);
+            last.record("masque", edge, None);
         }
         if let Err(error) = last.save(&cache_path) {
             eprintln!("warp: {error}");
@@ -1747,7 +1754,7 @@ fn resolve_classic_edges(
     let now = Instant::now();
     if spec.quick_reconnect {
         if outer_edge.is_none() {
-            if let Some(edge) = last.get("classic-outer") {
+            if let Some((edge, _)) = last.get("classic-outer") {
                 if check_wireguard(outer, spec, edge) {
                     outer_edge = Some(edge);
                     println!("[+] selected outer WireGuard endpoint {edge}");
@@ -1759,7 +1766,7 @@ fn resolve_classic_edges(
             }
         }
         if inner_edge.is_none() {
-            if let Some(edge) = last.get("classic-inner") {
+            if let Some((edge, _)) = last.get("classic-inner") {
                 if check_wireguard(inner, spec, edge) {
                     inner_edge = Some(edge);
                     println!("[+] selected inner WireGuard endpoint {edge}");
@@ -1815,8 +1822,8 @@ fn resolve_classic_edges(
     outer.wireguard.endpoint = outer_edge;
     inner.wireguard.endpoint = inner_edge;
     if spec.scan.is_some() || spec.quick_reconnect {
-        last.record("classic-outer", outer_edge);
-        last.record("classic-inner", inner_edge);
+        last.record("classic-outer", outer_edge, None);
+        last.record("classic-inner", inner_edge, None);
         if let Err(error) = last.save(&cache_path) {
             eprintln!("warp: {error}");
         }
