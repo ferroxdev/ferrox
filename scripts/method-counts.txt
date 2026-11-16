@@ -1103,6 +1103,9 @@ carrier-masque h2-datagram-packet-queue-copies 0 ferrox-app-masque-h2::tests::a_
 carrier-masque h2-queued-capsule-cap 64 ferrox-app-masque-h2::tests::a_stalled_send_window_bounds_the_queued_capsules
 carrier-masque early-datagram-cap 64 ferrox-app-masque::tests::poll_refuses_a_pre_stack_datagram_flood
 carrier-masque early-datagram-byte-cap 1048576 ferrox-app-masque::tests::early_h3_datagrams_are_bounded_by_count_and_bytes
+carrier-masque quic-v2-bait-bytes 1200 ferrox-app-masque::tests::the_bait_is_a_v2_versioned_long_header_of_the_minimum_size
+carrier-masque quic-v2-generic-default off ferrox-app-masque::tests::the_quic_v2_setting_is_opt_in_for_generic_masque
+carrier-masque quic-v2-bait-answer consumed ferrox-app-masque::tests::the_bait_triggers_a_version_negotiation_from_a_v1_only_server
 carrier-psiphon ops-per-ssh-handshake UNBLESSED scripts/count-ops.sh
 carrier-psiphon syscalls-per-relayed-megabyte UNBLESSED scripts/count-ops.sh
 carrier-psiphon relay-staging-copies-per-byte UNBLESSED not measured
@@ -1153,6 +1156,8 @@ warp mim-inner-mtu-v4 1182 ferrox-app-warp::tests::the_mim_inner_budget_subtract
 warp noize-wireguard-profiles 6 noize::tests::six_wireguard_profiles_keep_six_shapes
 warp noize-masque-profiles 4 noize::tests::four_masque_profiles_keep_four_shapes
 warp noize-retry-candidates 4 noize::tests::a_scan_retries_the_fallback_profiles_once_each
+warp quic-v2-bait-bytes 1200 ferrox-app-masque::tests::the_bait_is_a_v2_versioned_long_header_of_the_minimum_size
+warp quic-v2-bait-answer consumed ferrox-app-masque::tests::the_bait_triggers_a_version_negotiation_from_a_v1_only_server
 
 # --- tagged outbound --------------------------------------------------------
 engine-tagged ops-retired-instructions UNBLESSED scripts/count-ops.sh

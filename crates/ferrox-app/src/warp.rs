@@ -201,6 +201,7 @@ struct WarpSpec {
     stale: Option<Duration>,
     cooldown: Duration,
     noize: crate::noize::NoizeSettings,
+    quic_v2: bool,
     gool: GoolSettings,
     mim: MimSettings,
 }
@@ -474,6 +475,7 @@ impl WarpSpec {
             masque_settings(settings.get("masque"));
         let edge = EdgeSpec::from(settings)?;
         let noize = crate::noize::NoizeSettings::from_settings(settings)?;
+        let quic_v2 = quic_v2_enabled(settings, std::env::var("AETHER_QUIC_V2").ok().as_deref());
         let gool = gool_settings(settings)?;
         let mim = if mode == Mode::Mim {
             mim_settings(settings)?
@@ -509,6 +511,7 @@ impl WarpSpec {
             stale: edge.stale,
             cooldown: edge.cooldown,
             noize,
+            quic_v2,
             gool,
             mim,
         })
@@ -685,6 +688,7 @@ impl WarpSpec {
             stale: None,
             cooldown: Duration::from_secs(COOLDOWN_SECS),
             noize: crate::noize::NoizeSettings::default(),
+            quic_v2: true,
             gool: GoolSettings::default(),
             mim: MimSettings::default(),
         }
@@ -738,6 +742,19 @@ fn peer_setting(
 
 fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name).ok()?.trim().parse().ok()
+}
+
+fn quic_v2_enabled(settings: &crate::json::Json, environment: Option<&str>) -> bool {
+    settings
+        .get("quicV2")
+        .and_then(crate::json::Json::as_bool)
+        .unwrap_or_else(|| {
+            !environment.is_some_and(|value| {
+                ["0", "off", "false", "no"]
+                    .iter()
+                    .any(|off| value.trim().eq_ignore_ascii_case(off))
+            })
+        })
 }
 
 fn env_bool(name: &str) -> Option<bool> {
@@ -2148,6 +2165,7 @@ fn masque_outbound(identity: &Identity, spec: &WarpSpec) -> Result<crate::json::
         ("host", string(&spec.masque_host)),
         ("path", string(&spec.masque_path)),
         ("noize", string(spec.noize.masque_profile())),
+        ("quicV2", crate::json::Json::Bool(spec.quic_v2)),
     ]);
     let tls = obj_pairs(vec![
         ("serverName", string(&spec.masque_server_name)),
@@ -2989,6 +3007,7 @@ pub(crate) struct ForcedPeers<'a> {
     mim_inner: Option<&'a str>,
     noize: Option<&'a str>,
     no_profile_retry: bool,
+    no_quic_v2: bool,
 }
 
 struct ForcedEdges {
@@ -3071,6 +3090,7 @@ pub(crate) fn one_tap(
         stale: None,
         cooldown: Duration::from_secs(COOLDOWN_SECS),
         noize: crate::noize::NoizeSettings::from_cli(peers.noize, peers.no_profile_retry),
+        quic_v2: !peers.no_quic_v2,
         gool: GoolSettings {
             wiw_outer,
             wiw_inner,
@@ -3120,6 +3140,9 @@ pub(crate) fn one_tap(
     }
     if peers.no_profile_retry {
         settings.push(("noProfileRetry", crate::json::Json::Bool(true)));
+    }
+    if peers.no_quic_v2 {
+        settings.push(("quicV2", crate::json::Json::Bool(false)));
     }
     Ok(config_text(settings))
 }
@@ -3241,6 +3264,7 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
     let mut mim_inner = None;
     let mut noize = None;
     let mut no_profile_retry = false;
+    let mut no_quic_v2 = false;
     while let Some(arg) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| usage());
         match arg.as_str() {
@@ -3253,6 +3277,7 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
             "--mim-inner" => mim_inner = Some(value()),
             "--noize" => noize = Some(value()),
             "--no-profile-retry" => no_profile_retry = true,
+            "--no-quic-v2" => no_quic_v2 = true,
             "--api" => api = Some(value()),
             "--api-address" => api_address = Some(value()),
             "--wg-config" => wireguard = Some(value()),
@@ -3287,6 +3312,7 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
                     mim_inner: mim_inner.as_deref(),
                     noize: noize.as_deref(),
                     no_profile_retry,
+                    no_quic_v2,
                 },
             )
         }
@@ -3370,6 +3396,7 @@ mod tests {
             stale: None,
             cooldown: Duration::from_secs(COOLDOWN_SECS),
             noize: crate::noize::NoizeSettings::default(),
+            quic_v2: true,
             gool: GoolSettings::default(),
             mim: MimSettings::default(),
         }
@@ -3465,6 +3492,7 @@ mod tests {
             stale: None,
             cooldown: Duration::from_secs(COOLDOWN_SECS),
             noize: crate::noize::NoizeSettings::default(),
+            quic_v2: true,
             gool: GoolSettings::default(),
             mim: MimSettings::default(),
         };
@@ -3556,6 +3584,7 @@ mod tests {
             stale: None,
             cooldown: Duration::from_secs(COOLDOWN_SECS),
             noize: crate::noize::NoizeSettings::default(),
+            quic_v2: true,
             gool: GoolSettings::default(),
             mim: MimSettings::default(),
         };
@@ -3566,6 +3595,15 @@ mod tests {
         assert_eq!(config.mtu, usize::from(DEFAULT_MTU));
         assert_eq!(config.peers[0].endpoint, Some(identity.wireguard.endpoint));
         let outbound = masque_outbound(&identity, &spec).expect("the MASQUE half");
+        assert_eq!(
+            outbound
+                .get("streamSettings")
+                .and_then(|settings| settings.get("masqueSettings"))
+                .and_then(|settings| settings.get("quicV2"))
+                .and_then(crate::json::Json::as_bool),
+            Some(true),
+            "the WARP MASQUE half carries the opener"
+        );
         crate::masque::MasqueOut::new(&outbound).expect("the MASQUE carrier");
         assert_eq!(
             wireguard_settings(&identity, &spec)
@@ -4021,6 +4059,22 @@ mod tests {
         };
         let error = register_with(&spec, false, &page).expect_err("not the API");
         assert!(!error.fatal, "{}", error.reason);
+    }
+
+    #[test]
+    fn the_quic_v2_opener_is_on_unless_a_setting_or_the_environment_turns_it_off() {
+        let settings = |text: &str| crate::json::parse(text).expect("settings");
+        assert!(quic_v2_enabled(&settings("{}"), None));
+        assert!(quic_v2_enabled(&settings("{}"), Some("1")));
+        assert!(quic_v2_enabled(&settings("{}"), Some("anything")));
+        for off in ["0", "off", "false", "no", " OFF "] {
+            assert!(!quic_v2_enabled(&settings("{}"), Some(off)), "{off}");
+        }
+        assert!(!quic_v2_enabled(
+            &settings(r#"{"quicV2":false}"#),
+            Some("1")
+        ));
+        assert!(quic_v2_enabled(&settings(r#"{"quicV2":true}"#), Some("0")));
     }
 
     #[test]
