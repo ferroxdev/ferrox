@@ -24674,7 +24674,7 @@ pub(crate) struct DirectDatagram {
     pub(crate) control: Connection,
 }
 
-/// The device front's datagram dial: a static SOCKS outbound with no TLS opens its association
+/// The device front's datagram dial: a static SOCKS5 outbound with no TLS opens its association
 /// once, and the handler frames every datagram straight at the relay, so no loopback association
 /// and no SOCKS server sit between the device and the outbound's own server. `None` means the
 /// lane falls back to the association the front serves.

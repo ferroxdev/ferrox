@@ -3911,6 +3911,49 @@ mod tests {
         assert_eq!(payload, b"who-is");
     }
 
+    /// A direct lane that refuses hands the flow back to the front's association: the worker's
+    /// refusal costs the datagram that found it, and the next one frames the association.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_direct_datagram_lane_falls_back_to_the_association() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&attempts);
+        let open: Datagram = Arc::new(move || {
+            seen.fetch_add(1, Relaxed);
+            None
+        });
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+        let mut handler = Handler::on(
+            Device::from_handle(a, DEFAULT_MTU),
+            relay,
+            echo_associate(frames.clone()),
+            None,
+            Some(open),
+            Flows::default(),
+            Legs::default(),
+            &Spec::new(None, None),
+        );
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let query = datagram(SCRIPT_CLIENT, [198, 51, 100, 7], 51500, 53, b"who-is");
+        for _ in 0..2_500 {
+            if !frames.lock().unwrap().is_empty() {
+                break;
+            }
+            peer.write_all(&query).unwrap();
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        wait_for_frames(&frames, 1);
+        assert_eq!(
+            attempts.load(Relaxed),
+            1,
+            "the refused lane costs one worker, not one per datagram"
+        );
+    }
+
     /// A multi-queue device's datagram gate: the queue that never saw the association still finds
     /// the leg, so one client source keeps one socket instead of one per queue.
     #[cfg(unix)]
