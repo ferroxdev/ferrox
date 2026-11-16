@@ -16,6 +16,8 @@ pub const CC_RX_HEADER: &str = "hysteria-cc-rx";
 
 pub const UDP_HEADER: &str = "hysteria-udp";
 
+pub const PADDING_HEADER: &str = "hysteria-padding";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Congestion {
     Reno,
@@ -258,6 +260,8 @@ pub struct Config {
     /// The realm rendezvous this dial knocks through STUN and punch first, or
     /// `None` for a direct dial to the configured address.
     pub realm: Option<Box<crate::realm::Config>>,
+    /// `tlsSettings.allowInsecure`: accept the presented chain without verifying it.
+    pub insecure: bool,
 }
 
 impl Default for Config {
@@ -272,6 +276,7 @@ impl Default for Config {
             udp_idle: 60,
             quic: None,
             realm: None,
+            insecure: false,
         }
     }
 }
@@ -335,10 +340,27 @@ pub fn decode_tcp_request(packet: &[u8]) -> Result<(&str, usize), RequestError> 
 
 pub fn encode_tcp_request(address: &str, padding: &[u8], out: &mut Vec<u8>) {
     frames::quic_varint(out, TCP_FRAME);
+    encode_tcp_request_body(address, padding, out);
+}
+
+/// The request body behind a stream's own frame type, for a caller that already opened the stream.
+pub fn encode_tcp_request_body(address: &str, padding: &[u8], out: &mut Vec<u8>) {
     frames::quic_varint(out, address.len() as u64);
     out.extend_from_slice(address.as_bytes());
     frames::quic_varint(out, padding.len() as u64);
     out.extend_from_slice(padding);
+}
+
+/// The server's answer to a standalone request: a status byte, a varint-string message and a varint-skip of padding, the shape `proxy/hysteria`'s `ReadTCPResponse` consumes. Only status zero is `ok`; the message is a refusal's reason.
+pub fn decode_tcp_response(packet: &[u8]) -> Result<(bool, &str, usize), RequestError> {
+    let Some((&status, rest)) = packet.split_first() else {
+        return Err(RequestError::Incomplete);
+    };
+    let mut at = 0usize;
+    let raw = bounded(rest, &mut at, MAX_MESSAGE_LENGTH)?;
+    let message = std::str::from_utf8(raw).map_err(|_| RequestError::Invalid)?;
+    bounded(rest, &mut at, MAX_PADDING_LENGTH)?;
+    Ok((status == 0, message, 1 + at))
 }
 
 /// Status byte, then varint-framed message and padding; `ok` is the only status a client continues on, matching `WriteTCPResponse(w, true, "")`.
@@ -857,33 +879,45 @@ fn rate_hint(value: u64, buf: &mut [u8; 20]) -> &str {
     std::str::from_utf8(&buf[at..]).expect("decimal digits")
 }
 
-/// `cc_rx` is the receiving side's `brutalDown`, the rate hint the peer reads before choosing Brutal; 0 is "no cap".
-pub fn build_auth_request(auth: &str, cc_rx: u64, out: &mut Vec<u8>) {
+/// `cc_rx` is the receiving side's `brutalDown`, the rate hint the peer reads before choosing Brutal; 0 is "no cap". `padding` is the cover header's value, omitted when empty.
+pub fn build_auth_request(auth: &str, cc_rx: u64, padding: &str, out: &mut Vec<u8>) {
     let mut digits = [0u8; 20];
     let cc_rx = rate_hint(cc_rx, &mut digits);
+    let fields = [
+        (":method", "POST"),
+        (":scheme", "https"),
+        (":authority", AUTH_AUTHORITY),
+        (":path", AUTH_PATH),
+        (AUTH_HEADER, auth),
+        (CC_RX_HEADER, cc_rx),
+        (PADDING_HEADER, padding),
+    ];
     hpack::qpack_literal_many(
-        &[
-            (":method", "POST"),
-            (":scheme", "https"),
-            (":authority", AUTH_AUTHORITY),
-            (":path", AUTH_PATH),
-            (AUTH_HEADER, auth),
-            (CC_RX_HEADER, cc_rx),
-        ],
+        if padding.is_empty() {
+            &fields[..6]
+        } else {
+            &fields[..]
+        },
         out,
     );
 }
 
-/// `cc_rx` is this server's `brutalDown`, the rate hint the client reads before choosing Brutal; 0 is "no cap".
-pub fn build_auth_response(udp: bool, cc_rx: u64, out: &mut Vec<u8>) {
+/// `cc_rx` is this server's `brutalDown`, the rate hint the client reads before choosing Brutal; 0 is "no cap". `padding` is the cover header's value, omitted when empty.
+pub fn build_auth_response(udp: bool, cc_rx: u64, padding: &str, out: &mut Vec<u8>) {
     let mut digits = [0u8; 20];
     let cc_rx = rate_hint(cc_rx, &mut digits);
+    let fields = [
+        (":status", "233"),
+        (UDP_HEADER, if udp { "true" } else { "false" }),
+        (CC_RX_HEADER, cc_rx),
+        (PADDING_HEADER, padding),
+    ];
     hpack::qpack_literal_many(
-        &[
-            (":status", "233"),
-            (UDP_HEADER, if udp { "true" } else { "false" }),
-            (CC_RX_HEADER, cc_rx),
-        ],
+        if padding.is_empty() {
+            &fields[..3]
+        } else {
+            &fields[..]
+        },
         out,
     );
 }
@@ -904,6 +938,7 @@ pub fn verify_auth_request(block: &[u8], expected_auth: &str) -> bool {
         return false;
     };
     find(&fields, ":method") == Some(b"POST".as_slice())
+        && find(&fields, ":authority") == Some(AUTH_AUTHORITY.as_bytes())
         && find(&fields, ":path") == Some(AUTH_PATH.as_bytes())
         && find(&fields, AUTH_HEADER) == Some(expected_auth.as_bytes())
 }
@@ -915,6 +950,7 @@ pub fn is_hysteria_auth_shape(block: &[u8]) -> bool {
         return false;
     };
     find(&fields, ":method") == Some(b"POST".as_slice())
+        && find(&fields, ":authority") == Some(AUTH_AUTHORITY.as_bytes())
         && find(&fields, ":path") == Some(AUTH_PATH.as_bytes())
 }
 
@@ -1278,6 +1314,13 @@ mod tests {
         want.extend_from_slice(b"127.0.0.1:8080");
         want.extend_from_slice(&[3, 0xAB, 0xAB, 0xAB]);
         assert_eq!(out, want);
+        let mut body = Vec::new();
+        encode_tcp_request_body("127.0.0.1:8080", &[0xAB; 3], &mut body);
+        assert_eq!(
+            &body[..],
+            &want[2..],
+            "a stream that carries its own frame type hands the body after it"
+        );
         assert_eq!(decode_tcp_request(&out), Ok(("127.0.0.1:8080", out.len())));
         assert_eq!(
             decode_tcp_request_body(&out[2..]),
@@ -1313,6 +1356,24 @@ mod tests {
         assert_eq!(refused[0], 1);
         assert_eq!(&refused[2..10], b"no route");
         assert_eq!(&refused[10..], [2, 7, 7]);
+        assert_eq!(decode_tcp_response(&out), Ok((true, "", 3)));
+        assert_eq!(
+            decode_tcp_response(&refused),
+            Ok((false, "no route", refused.len()))
+        );
+        assert_eq!(decode_tcp_response(&[]), Err(RequestError::Incomplete));
+        assert_eq!(decode_tcp_response(&[0]), Err(RequestError::Incomplete));
+        assert_eq!(
+            decode_tcp_response(&[0, 8, b'n']),
+            Err(RequestError::Incomplete)
+        );
+        assert_eq!(
+            decode_tcp_response(&[1, 0, 5, b'x']),
+            Err(RequestError::Incomplete)
+        );
+        let mut too_long = vec![0];
+        too_long.extend_from_slice(&[0xff; 8]);
+        assert_eq!(decode_tcp_response(&too_long), Err(RequestError::Invalid));
     }
 
     #[test]
@@ -1603,7 +1664,7 @@ mod tests {
     #[test]
     fn an_auth_request_carries_post_auth_and_the_brutal_hint() {
         let mut block = Vec::new();
-        build_auth_request("s3cret", 0, &mut block);
+        build_auth_request("s3cret", 0, "", &mut block);
         assert!(verify_auth_request(&block, "s3cret"));
         assert!(!verify_auth_request(&block, "wrong"));
         assert!(!verify_auth_request(&block, ""));
@@ -1613,9 +1674,14 @@ mod tests {
         assert!(fields.contains(&(b":authority".to_vec(), b"hysteria".to_vec())));
         assert!(fields.contains(&(b":path".to_vec(), b"/auth".to_vec())));
         assert!(fields.contains(&(b"hysteria-cc-rx".to_vec(), b"0".to_vec())));
+        let mut padded = Vec::new();
+        build_auth_request("s3cret", 0, "cover", &mut padded);
+        let fields = hpack::qpack_fields(&padded).expect("reads");
+        assert_eq!(fields.len(), 7);
+        assert_eq!(find(&fields, PADDING_HEADER), Some(b"cover".as_slice()));
         // A configured `brutalDown` is the hint the peer reads before choosing Brutal.
         let mut hinted = Vec::new();
-        build_auth_request("s3cret", 1_310_720, &mut hinted);
+        build_auth_request("s3cret", 1_310_720, "", &mut hinted);
         let fields = hpack::qpack_fields(&hinted).expect("reads");
         assert_eq!(find(&fields, CC_RX_HEADER), Some(b"1310720".as_slice()));
         // The digits land in a stack buffer, so a block built into a roomy buffer costs the heap nothing.
@@ -1624,7 +1690,7 @@ mod tests {
         let counts = crate::alloc_count::measure(|| {
             for _ in 0..4096 {
                 out.clear();
-                build_auth_request("s3cret", 1_310_720, &mut out);
+                build_auth_request("s3cret", 1_310_720, "", &mut out);
             }
         })
         .1;
@@ -1637,6 +1703,27 @@ mod tests {
             out.capacity(),
             capacity,
             "the block stays inside the caller's buffer"
+        );
+        // The cover header is a borrowed slice too; a roomy caller's buffer holds it without growth.
+        let padding = "a".repeat(2048);
+        let mut out = Vec::with_capacity(4096);
+        let capacity = out.capacity();
+        let counts = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                out.clear();
+                build_auth_request("s3cret", 1_310_720, &padding, &mut out);
+            }
+        })
+        .1;
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "the cover costs no heap"
+        );
+        assert_eq!(
+            out.capacity(),
+            capacity,
+            "the padded block stays inside the caller's buffer"
         );
     }
 
@@ -1662,22 +1749,46 @@ mod tests {
             &mut block,
         );
         assert!(!verify_auth_request(&block, "s3cret"));
+        // The authority is part of the handshake's shape: a POST to `/auth` under another name is refused.
+        let mut block = Vec::new();
+        hpack::qpack_literal_many(
+            &[
+                (":method", "POST"),
+                (":authority", "not-hysteria"),
+                (":path", "/auth"),
+                (AUTH_HEADER, "s3cret"),
+            ],
+            &mut block,
+        );
+        assert!(!verify_auth_request(&block, "s3cret"));
+        assert!(!is_hysteria_auth_shape(&block));
+        // A right-shape request with the wrong password stays a handshake attempt, so the masquerade refuses it rather than answering the cover site.
+        let mut block = Vec::new();
+        build_auth_request("wrong", 0, "", &mut block);
+        assert!(is_hysteria_auth_shape(&block));
+        assert!(!verify_auth_request(&block, "s3cret"));
         assert!(!verify_auth_request(&[0x01, 0x00], "s3cret"));
     }
 
     #[test]
     fn an_auth_response_is_status_233_and_advertises_the_udp_lane() {
         let mut block = Vec::new();
-        build_auth_response(true, 0, &mut block);
+        build_auth_response(true, 0, "", &mut block);
         assert!(verify_auth_response(&block));
         let fields = hpack::qpack_fields(&block).expect("reads");
+        assert_eq!(fields.len(), 3);
         assert_eq!(find(&fields, UDP_HEADER), Some(b"true".as_slice()));
+        let mut padded = Vec::new();
+        build_auth_response(true, 0, "cover", &mut padded);
+        let fields = hpack::qpack_fields(&padded).expect("reads");
+        assert_eq!(fields.len(), 4);
+        assert_eq!(find(&fields, PADDING_HEADER), Some(b"cover".as_slice()));
         let mut off = Vec::new();
-        build_auth_response(false, 0, &mut off);
+        build_auth_response(false, 0, "", &mut off);
         let fields = hpack::qpack_fields(&off).expect("reads");
         assert_eq!(find(&fields, UDP_HEADER), Some(b"false".as_slice()));
         let mut hinted = Vec::new();
-        build_auth_response(true, 65_536, &mut hinted);
+        build_auth_response(true, 65_536, "", &mut hinted);
         let fields = hpack::qpack_fields(&hinted).expect("reads");
         assert_eq!(find(&fields, CC_RX_HEADER), Some(b"65536".as_slice()));
         let mut block = Vec::new();

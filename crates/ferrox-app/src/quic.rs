@@ -639,7 +639,18 @@ pub(crate) fn apply_hysteria_quic(
         config.set_initial_max_streams_bidi(streams);
         config.set_initial_max_streams_uni(streams);
     }
-    if params.no_path_mtu {
+    apply_path_mtu(config, params.no_path_mtu);
+}
+
+/// The reference disables path-MTU discovery when the block names it or the platform is outside linux, windows and macOS.
+pub(crate) fn apply_path_mtu(config: &mut quiche::Config, disabled: bool) {
+    if disabled
+        || !cfg!(any(
+            target_os = "linux",
+            target_os = "windows",
+            target_os = "macos"
+        ))
+    {
         config.discover_pmtu(false);
     }
 }
@@ -772,6 +783,19 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quich
     quiche_config_alpn(roots, cc, &[ALPN])
 }
 
+/// A dial that accepts the presented chain, as `allowInsecure` names: no anchor is read, so no staged bundle is needed.
+pub(crate) fn quiche_config_insecure(cc: Option<&str>) -> Option<quiche::Config> {
+    quiche_config_insecure_alpn(cc, &[ALPN])
+}
+
+/// The unverified dial under another ALPN: v1's `allowInsecure` presents its own protocol, not this tree's carrier.
+pub(crate) fn quiche_config_insecure_alpn(
+    cc: Option<&str>,
+    alpn: &[&[u8]],
+) -> Option<quiche::Config> {
+    build_quiche_config(&[], cc, alpn, false)
+}
+
 /// The same staged trust bundle and tuning under another ALPN, for a client
 /// whose protocol is not this tree's own transport (`doq` is DNS-over-QUIC).
 pub(crate) fn quiche_config_alpn(
@@ -779,7 +803,16 @@ pub(crate) fn quiche_config_alpn(
     cc: Option<&str>,
     alpn: &[&[u8]],
 ) -> Option<quiche::Config> {
-    if roots.is_empty() {
+    build_quiche_config(roots, cc, alpn, true)
+}
+
+fn build_quiche_config(
+    roots: &[Vec<u8>],
+    cc: Option<&str>,
+    alpn: &[&[u8]],
+    verify: bool,
+) -> Option<quiche::Config> {
+    if verify && roots.is_empty() {
         return None;
     }
     let mut bundle = Vec::with_capacity(
@@ -791,20 +824,28 @@ pub(crate) fn quiche_config_alpn(
     for root in roots {
         append_pem(&mut bundle, root, "CERTIFICATE");
     }
-    let (path, path_text) = stage_trust_file(&bundle)?;
+    let staged = if verify {
+        Some(stage_trust_file(&bundle)?)
+    } else {
+        None
+    };
     let config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .ok()
         .and_then(|mut config| {
-            config.verify_peer(true);
+            config.verify_peer(verify);
             config.set_application_protos(alpn).ok()?;
             if let Some(name) = cc {
                 config.set_cc_algorithm_name(name).ok()?;
             }
             tune_transport(&mut config);
-            config.load_verify_locations_from_file(&path_text).ok()?;
+            if let Some((_, path_text)) = &staged {
+                config.load_verify_locations_from_file(path_text).ok()?;
+            }
             Some(config)
         });
-    let _ = std::fs::remove_file(&path);
+    if let Some((path, _)) = staged {
+        let _ = std::fs::remove_file(&path);
+    }
     config
 }
 
@@ -1232,6 +1273,11 @@ impl Batch {
     /// How many packets the last read filled, with a coalesced slot counted as the segments it carries.
     pub(crate) fn len(&self) -> usize {
         self.data().map_or(0, |data| data.len)
+    }
+
+    /// How many receive slots the last read filled: a full batch may have more queued, a short one is the kernel's drain.
+    pub(crate) fn slots(&self) -> usize {
+        self.data().map_or(0, |data| data.used)
     }
 
     /// The slot holding packet `at`, found through the prefix sums `recv_batch` wrote; a read the kernel did not coalesce has one packet per slot.
@@ -1699,18 +1745,22 @@ pub(crate) fn stream_send_all(
     sock: &Datagram,
     stream: u64,
     mut buf: &[u8],
-    fin: bool,
+    mut fin: bool,
     deadline: Instant,
 ) -> bool {
     while !buf.is_empty() || fin {
-        match conn.stream_send(stream, buf, fin && buf.is_empty()) {
+        let end = fin && buf.is_empty();
+        match conn.stream_send(stream, buf, end) {
             Ok(written) => {
                 buf = &buf[written..];
-                if buf.is_empty() {
+                if end {
+                    fin = false;
+                }
+                if buf.is_empty() && !fin {
                     flush_egress(conn, sock);
                     return true;
                 }
-                if written == 0 && !send_credit_wait(conn, sock, deadline) {
+                if written == 0 && !end && !send_credit_wait(conn, sock, deadline) {
                     return false;
                 }
             }
@@ -1746,7 +1796,7 @@ fn stream_send_all_parked(
     sock: &Datagram,
     stream: u64,
     mut buf: &[u8],
-    fin: bool,
+    mut fin: bool,
     deadline: Instant,
 ) -> bool {
     while !buf.is_empty() || fin {
@@ -1757,19 +1807,23 @@ fn stream_send_all_parked(
             if conn.is_closed() {
                 return false;
             }
-            match conn.stream_send(stream, buf, fin && buf.is_empty()) {
+            let end = fin && buf.is_empty();
+            match conn.stream_send(stream, buf, end) {
                 Ok(written) => {
                     flush_egress(&mut conn, sock);
-                    Some(written)
+                    Some((written, end))
                 }
                 Err(quiche::Error::Done) => None,
                 Err(_) => return false,
             }
         };
         match outcome {
-            Some(written) => {
+            Some((written, end)) => {
                 buf = &buf[written..];
-                if buf.is_empty() {
+                if end {
+                    fin = false;
+                }
+                if buf.is_empty() && !fin {
                     return true;
                 }
                 if written > 0 {
@@ -7766,6 +7820,43 @@ mod tests {
             pattern[..read],
             "the batch delivered the frame in order, whole"
         );
+    }
+
+    /// A finishing send puts the FIN on the wire after the last byte, not just the bytes: the peer reads the payload and the end in the same recv.
+    #[test]
+    fn a_finishing_send_marks_the_peer_stream_finished() {
+        let (mut client, mut server) = lane_pair();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(stream_send_all(
+            &mut server.conn,
+            &server.sock,
+            1,
+            b"fin",
+            true,
+            deadline
+        ));
+        let mut buf = [0u8; 8];
+        let mut seen = None;
+        for _ in 0..32 {
+            pass(
+                &mut server.conn,
+                &server.sock,
+                &mut client.conn,
+                &client.sock,
+                client.addr,
+            );
+            match client.conn.stream_recv(1, &mut buf) {
+                Ok((n, fin)) => {
+                    seen = Some((n, fin));
+                    if fin {
+                        break;
+                    }
+                }
+                Err(quiche::Error::Done) => {}
+                Err(error) => panic!("reads the finishing stream: {error:?}"),
+            }
+        }
+        assert_eq!(seen, Some((3, true)), "the last byte and the FIN arrived");
     }
 
     /// A waiter beside a pump must leave the pump's datagram on the socket: the queue is the witness, since a waiter that read it would empty the queue before the pump saw it.

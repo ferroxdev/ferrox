@@ -351,7 +351,12 @@ fn rebind_if_moved(session: &Session) -> bool {
     true
 }
 
-/// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling. The queue already behind the datagram the turn waited for is taken in the same turn, so a reader fed back-to-back packets pays one lock and one egress sweep for up to a batch of them rather than one of each per packet.
+#[cfg(test)]
+thread_local! {
+    static TAIL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling. A full batch earns a tail read because the queue may still be loaded; a short one does not, because the kernel drained it.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
     if !rebind_if_moved(session) {
@@ -441,7 +446,11 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
             let info = quiche::RecvInfo { from, to: local };
             let _ = conn.recv(bytes, info);
         }
-        take_queued(&mut conn, session);
+        if batch.slots() == crate::quic::RECV_SLOTS {
+            #[cfg(test)]
+            TAIL_READS.with(|reads| reads.set(reads.get() + 1));
+            take_queued(&mut conn, session);
+        }
         crate::quic::flush_egress(&mut conn, &session.sock);
         if session.migrated.load(Ordering::Acquire) && crate::quic::path_failed(&mut conn, local) {
             let _ = conn.close(false, 0, b"rebind");
@@ -546,9 +555,46 @@ fn control_settings(session: &Session) -> bool {
     send_all(session, 2, &settings, true)
 }
 
+const PADDING_CHARS: &[u8; 62] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+const AUTH_REQUEST_ROOM: usize = 160;
+const AUTH_RESPONSE_ROOM: usize = 96;
+
+/// The cover value the reference's auth headers carry: a random alphanumeric run whose length is drawn over `min..max`, from one getrandom fill into the caller's stack room, refilled only when rejected bytes exhaust it.
+pub(crate) fn hysteria_padding(min: usize, max: usize, raw: &mut [u8; 2050]) -> &str {
+    if getrandom::fill(raw).is_err() {
+        raw[3..3 + min].fill(b'a');
+        return std::str::from_utf8(&raw[3..3 + min]).expect("alphanumeric");
+    }
+    let span = max.saturating_sub(min).max(1);
+    let draw = u32::from_le_bytes([raw[0], raw[1], raw[2], 0]);
+    let length = min + (draw as usize % span);
+    let end = 3 + length;
+    let mut at = 3;
+    let mut out = 3;
+    while out < end {
+        if at == raw.len() {
+            if getrandom::fill(&mut raw[out..]).is_err() {
+                raw[out..end].fill(b'a');
+                break;
+            }
+            at = out;
+        }
+        let byte = raw[at];
+        at += 1;
+        if usize::from(byte) < PADDING_CHARS.len() * 4 {
+            raw[out] = PADDING_CHARS[usize::from(byte) % PADDING_CHARS.len()];
+            out += 1;
+        }
+    }
+    std::str::from_utf8(&raw[3..end]).expect("alphanumeric")
+}
+
 fn post_auth(session: &Session, auth: &str, cc_rx: u64) -> Option<bool> {
-    let mut block = Vec::with_capacity(64 + auth.len());
-    hysteria::build_auth_request(auth, cc_rx, &mut block);
+    let mut raw = [0u8; 2050];
+    let padding = hysteria_padding(256, 2048, &mut raw);
+    let mut block = Vec::with_capacity(AUTH_REQUEST_ROOM + auth.len() + padding.len());
+    hysteria::build_auth_request(auth, cc_rx, padding, &mut block);
     let mut frame = Vec::with_capacity(16 + block.len());
     frames::quic_varint(&mut frame, frames::H3_HEADERS);
     frames::quic_varint(&mut frame, block.len() as u64);
@@ -566,6 +612,22 @@ fn post_auth(session: &Session, auth: &str, cc_rx: u64) -> Option<bool> {
 pub(crate) static HANDSHAKES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+fn gso(sock: crate::quic::Datagram, quic: Option<&hysteria::QuicParams>) -> crate::quic::Datagram {
+    sock.with_gso(quic.is_none_or(|params| !params.disable_gso))
+}
+
+fn client_config(dial: &Dial, roots: &[Vec<u8>]) -> Option<quiche::Config> {
+    let mut config = if dial.config.insecure {
+        crate::quic::quiche_config_insecure(None)
+    } else {
+        crate::quic::quiche_config(roots, None)
+    }?;
+    if dial.config.quic.is_none() {
+        crate::quic::apply_path_mtu(&mut config, false);
+    }
+    Some(config)
+}
+
 /// Dial the configured lane, wrap its socket in the mask or hop it names, and finish the QUIC handshake and auth.
 pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     #[cfg(test)]
@@ -576,7 +638,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         peer = crate::hysteria_realm::dial_peer(&sock, realm)?;
     }
     let cid = crate::quic::hysteria_client_cid(dial.config.quic.as_ref())?;
-    let mut config = crate::quic::quiche_config(roots, None)?;
+    let mut config = client_config(dial, roots)?;
     crate::quic::apply_lane_congestion(
         &mut config,
         Some(dial.config.cc),
@@ -638,6 +700,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
             (None, _) => crate::quic::Datagram::plain(sock),
         },
     };
+    let sock = gso(sock, dial.config.quic.as_ref());
     let net = crate::quic::network_generation();
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
     let keep_alive = dial
@@ -985,7 +1048,42 @@ pub(crate) fn read_request(flow: &mut Flow, deadline: Instant) -> Option<String>
                 if head.len().saturating_sub(prefix) >= HEAD_CAP || Instant::now() >= deadline {
                     return None;
                 }
-                let n = flow.read(room.as_mut()).ok()?;
+                let n = match flow.read_step(room.as_mut()) {
+                    Ok(Some(n)) => n,
+                    Ok(None) => continue,
+                    Err(_) => return None,
+                };
+                if n == 0 {
+                    return None;
+                }
+                head.extend_from_slice(&room.as_mut()[..n]);
+            }
+        }
+    }
+}
+
+/// Reads the standalone server's answer before its payload, leaving any bytes after the status, message and padding in the backlog for the relay.
+pub(crate) fn read_tcp_response(flow: &mut Flow, deadline: Instant) -> Option<(bool, String)> {
+    let mut head = std::mem::take(&mut flow.backlog);
+    let mut room = Unfilled::<4096>::new();
+    loop {
+        match hysteria::decode_tcp_response(&head) {
+            Ok((ok, message, used)) => {
+                let message = message.to_owned();
+                flow.backlog = head;
+                flow.at = used;
+                return Some((ok, message));
+            }
+            Err(hysteria::RequestError::Invalid) => return None,
+            Err(hysteria::RequestError::Incomplete) => {
+                if head.len() >= HEAD_CAP || Instant::now() >= deadline {
+                    return None;
+                }
+                let n = match flow.read_step(room.as_mut()) {
+                    Ok(Some(n)) => n,
+                    Ok(None) => continue,
+                    Err(_) => return None,
+                };
                 if n == 0 {
                     return None;
                 }
@@ -1019,6 +1117,7 @@ struct Server {
     /// rendezvous, so a dial through another may not ride it.
     realm: Option<Box<ferrox_core::realm::Config>>,
     roots: Option<ferrox_core::tls::Anchors>,
+    insecure: bool,
 }
 
 /// How long an unused connection may sit before a dial pays a fresh handshake: half of quiche's idle timeout, so a reuse always lands before either side closes it.
@@ -1041,6 +1140,7 @@ fn server_of(dial: &Dial) -> Server {
         quic: dial.config.quic,
         realm: dial.config.realm.clone(),
         roots: dial.roots.clone(),
+        insecure: dial.config.insecure,
     }
 }
 
@@ -1302,15 +1402,15 @@ pub(crate) fn server_config(
     config.set_initial_congestion_window_packets(400);
     // A served connection always carries an auth validator, and the reference enables the datagram lane exactly when one is present, so the lane is on unconditionally here; the depths are the peer's unsent-datagram queue, matching `udpMessageChanSize`.
     config.enable_dgram(true, 1024, 1024);
-    match quic {
-        Some(params) => {
-            crate::quic::apply_hysteria_quic(&mut config, params, true);
-            crate::quic::apply_hysteria_pacing(&mut config, params);
-            config.set_max_send_udp_payload_size(crate::quic::MAX_DATAGRAM);
-            config.set_max_recv_udp_payload_size(crate::quic::MAX_DATAGRAM);
-        }
+    if let Some(params) = quic {
+        crate::quic::apply_hysteria_quic(&mut config, params, true);
+        crate::quic::apply_hysteria_pacing(&mut config, params);
+        config.set_max_send_udp_payload_size(crate::quic::MAX_DATAGRAM);
+        config.set_max_recv_udp_payload_size(crate::quic::MAX_DATAGRAM);
+    } else {
         // The served side carries the same ceilings as the dial: without them quiche's autotuner has no room above the initial window, and a peer's upload is paced by `window / rtt` for its whole life.
-        None => crate::quic::tune_transport(&mut config),
+        crate::quic::tune_transport(&mut config);
+        crate::quic::apply_path_mtu(&mut config, false);
     }
     Some(config)
 }
@@ -1347,10 +1447,17 @@ struct UdpFlow {
     stop: Arc<AtomicBool>,
 }
 
-fn answer_auth(conn: &mut quiche::Connection, ok: bool, cc_rx: u64) -> bool {
-    let mut block = Vec::with_capacity(32);
-    if ok {
-        hysteria::build_auth_response(true, cc_rx, &mut block);
+fn answer_auth(
+    conn: &mut quiche::Connection,
+    sock: &crate::quic::Datagram,
+    ok: bool,
+    cc_rx: u64,
+) -> bool {
+    let mut raw = [0u8; 2050];
+    let padding = ok.then(|| hysteria_padding(256, 2048, &mut raw));
+    let mut block = Vec::with_capacity(AUTH_RESPONSE_ROOM + padding.map_or(0, str::len));
+    if let Some(padding) = padding {
+        hysteria::build_auth_response(true, cc_rx, padding, &mut block);
     } else {
         ferrox_core::foxy::hpack::qpack_literal_many(&[(":status", "404")], &mut block);
     }
@@ -1358,7 +1465,7 @@ fn answer_auth(conn: &mut quiche::Connection, ok: bool, cc_rx: u64) -> bool {
     frames::quic_varint(&mut frame, frames::H3_HEADERS);
     frames::quic_varint(&mut frame, block.len() as u64);
     frame.extend_from_slice(&block);
-    conn.stream_send(AUTH_STREAM, &frame, true).is_ok()
+    crate::quic::stream_send_all(conn, sock, AUTH_STREAM, &frame, true, Instant::now())
 }
 
 /// Drains the client's HTTP/3 SETTINGS so the unread bytes never hold flow control, and reports the stream's FIN so the caller stops paying the call per packet.
@@ -2292,19 +2399,17 @@ fn auth_exchange(
         let peer = peer.to_string();
         let mut reply = Vec::new();
         masq_bytes(masq, &request, Some(&peer), &mut reply);
-        if conn.stream_send(AUTH_STREAM, &reply, true).is_err() {
+        if !crate::quic::stream_send_all(conn, sock, AUTH_STREAM, &reply, true, Instant::now()) {
             return None;
         }
-        crate::quic::flush_egress(conn, sock);
         return Some(Auth::Cover);
     }
     let ok = auths
         .iter()
         .any(|auth| hysteria::verify_auth_request(body, auth));
-    if !answer_auth(conn, ok, inbound.cc_rx) {
+    if !answer_auth(conn, sock, ok, inbound.cc_rx) {
         return None;
     }
-    crate::quic::flush_egress(conn, sock);
     inbound.auth_buf.clear();
     if ok {
         inbound.standing = Standing::Authed;
@@ -2642,6 +2747,7 @@ pub(crate) fn prepare(
         Some(obfs) => crate::quic::Datagram::obfuscated(sock, obfs),
         None => crate::quic::Datagram::plain(sock),
     };
+    let sock = gso(sock, quic);
     Some(Prepared {
         sock,
         local,
@@ -2765,6 +2871,33 @@ pub(crate) fn serve_prepared(
 mod tests {
     use super::*;
     use crate::quic::MAX_DATAGRAM;
+
+    #[test]
+    fn a_padded_auth_block_fits_the_handshakes_buffer() {
+        let padding = "a".repeat(2048);
+        let mut block = Vec::with_capacity(AUTH_REQUEST_ROOM + 6 + padding.len());
+        let counts = ferrox_core::alloc_count::measure(|| {
+            hysteria::build_auth_request("s3cret", 1_310_720, &padding, &mut block);
+        })
+        .1;
+        assert_eq!((counts.allocs, counts.bytes, counts.zeroed), (0, 0, 0));
+        let mut response = Vec::with_capacity(AUTH_RESPONSE_ROOM + padding.len());
+        let counts = ferrox_core::alloc_count::measure(|| {
+            hysteria::build_auth_response(true, 65_536, &padding, &mut response);
+        })
+        .1;
+        assert_eq!((counts.allocs, counts.bytes, counts.zeroed), (0, 0, 0));
+    }
+
+    #[test]
+    fn an_auth_padding_is_alphanumeric_inside_the_reference_range() {
+        let mut raw = [0u8; 2050];
+        for _ in 0..512 {
+            let padding = hysteria_padding(256, 2048, &mut raw);
+            assert!((256..2048).contains(&padding.len()), "{}", padding.len());
+            assert!(padding.bytes().all(|byte| PADDING_CHARS.contains(&byte)));
+        }
+    }
 
     /// The buffer form the decode had, kept as the bytes every path has to still reach.
     fn the_buffer_decode(input: &str) -> Option<String> {
@@ -3708,6 +3841,32 @@ mod tests {
             left += 1;
         }
         assert_eq!(left, 0, "a turn left {left} queued datagrams unread");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_short_batch_skips_the_tail_and_a_full_one_takes_it() {
+        let session = idle_session();
+        let to = session.sock.local_addr().expect("addr");
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
+        peer.send_to(&[0u8; 64], to).expect("sends");
+        TAIL_READS.with(|reads| reads.set(0));
+        assert!(drive_once(&session, Duration::from_millis(50)));
+        assert_eq!(
+            TAIL_READS.with(std::cell::Cell::get),
+            0,
+            "a short batch is already drained"
+        );
+        for _ in 0..crate::quic::RECV_SLOTS {
+            peer.send_to(&[0u8; 64], to).expect("sends");
+        }
+        TAIL_READS.with(|reads| reads.set(0));
+        assert!(drive_once(&session, Duration::from_millis(50)));
+        assert_eq!(
+            TAIL_READS.with(std::cell::Cell::get),
+            1,
+            "a full batch takes the tail"
+        );
     }
 
     fn lane_with(association: Association, source: SocketAddr) -> Lane {

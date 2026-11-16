@@ -572,7 +572,7 @@ trojan numeric-domain-header-allocations 0 ferrox-app-proxy::tests::the_trojan_n
 carrier-hysteria ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-hysteria tcp-flows-per-handshake 2 ferrox-app-proxy::tests::hysteria_shares_one_connection_between_two_flows
 carrier-hysteria closed-connections-reused 0 ferrox-app-proxy::tests::hysteria_redials_when_a_pooled_connection_closes
-carrier-hysteria datagrams-per-turn-witnessed 8 ferrox-app-hysteria::tests::a_turn_takes_the_datagrams_queued_behind_its_first
+carrier-hysteria datagrams-per-turn-witnessed 16 ferrox-app-hysteria::tests::a_turn_takes_the_datagrams_queued_behind_its_first
 carrier-hysteria request-parse-reallocations 0 ferrox-app-hysteria::tests::a_parsed_request_leaves_its_payload_where_it_landed
 carrier-hysteria request-parse-moves 0 ferrox-app-hysteria::tests::a_parsed_request_leaves_its_payload_where_it_landed
 carrier-hysteria wrong-password-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying
@@ -592,6 +592,7 @@ carrier-hysteria pinned-hysteria-client-verdicts 1 scripts/run-upstream-suite.sh
 carrier-hysteria masquerade-answers-browser-on-same-port 1 ferrox-app-proxy::tests::hysteria_serves_a_canned_masquerade_response
 carrier-hysteria masquerade-answer-allocations-per-response 0 ferrox-core-hysteria::tests::an_h3_answer_writes_its_block_straight_into_the_callers_buffer
 carrier-hysteria auth-request-allocations-per-block 0 ferrox-core-hysteria::tests::an_auth_request_carries_post_auth_and_the_brutal_hint
+carrier-hysteria auth-padding-witnessed 512 ferrox-app-hysteria::tests::an_auth_padding_is_alphanumeric_inside_the_reference_range
 carrier-hysteria masquerade-file-bytes-served 1 ferrox-app-proxy::tests::hysteria_serves_a_file_from_the_masquerade_directory
 carrier-hysteria masquerade-file-type-allocations 0 ferrox-core-hysteria::tests::a_static_files_type_is_decided_without_an_allocation
 carrier-hysteria masquerade-chunked-dechunk-allocations 1 ferrox-core-hysteria::tests::a_chunked_body_deframes_into_one_buffer

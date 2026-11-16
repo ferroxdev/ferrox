@@ -68,11 +68,19 @@ fn read_until(session: &Session, stream: u64, want: impl Fn(&[u8]) -> bool) -> O
     }
 }
 
+fn client_config(dial: &Dial, roots: &[Vec<u8>]) -> Option<quiche::Config> {
+    if dial.config.insecure {
+        crate::quic::quiche_config_insecure_alpn(None, &[wire::ALPN])
+    } else {
+        crate::quic::quiche_config_alpn(roots, None, &[wire::ALPN])
+    }
+}
+
 fn connect(dial: &Dial) -> Option<Session> {
     let roots = dial.roots.as_deref().unwrap_or(&[]);
     let (sock, peer, local) = crate::quic::udp_to_server(&dial.address, dial.port)?;
     let cid = crate::quic::hysteria_client_cid(dial.config.quic.as_ref())?;
-    let mut config = crate::quic::quiche_config_alpn(roots, None, &[wire::ALPN])?;
+    let mut config = client_config(dial, roots)?;
     crate::quic::apply_lane_congestion(
         &mut config,
         Some(dial.config.cc),
@@ -227,6 +235,8 @@ struct Server {
     /// A tuned QUIC lane is its own connection: its windows, controller profile and Brutal rates were negotiated, so a dial with another block may not ride it.
     quic: Option<ferrox_core::hysteria::QuicParams>,
     roots: Option<ferrox_core::tls::Anchors>,
+    /// A verifying dial may not ride a lane whose peer was accepted without the chain check.
+    insecure: bool,
 }
 
 const REUSE_WINDOW: Duration = Duration::from_millis(crate::quic::IDLE_TIMEOUT_MS / 2);
@@ -248,6 +258,7 @@ fn server_of(dial: &Dial) -> Server {
         hop: dial.config.hop.clone(),
         quic: dial.config.quic,
         roots: dial.roots.clone(),
+        insecure: dial.config.insecure,
     }
 }
 
@@ -1227,6 +1238,29 @@ mod tests {
     }
 
     #[test]
+    fn an_insecure_v1_dial_accepts_an_untrusted_chain() {
+        let dial = |insecure| Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port: 443,
+            config: ferrox_core::hysteria::Config {
+                version: 1,
+                insecure,
+                ..ferrox_core::hysteria::Config::default()
+            },
+            roots: None,
+        };
+        assert!(
+            client_config(&dial(true), &[]).is_some(),
+            "allowInsecure leaves no root to stage"
+        );
+        assert!(
+            client_config(&dial(false), &[]).is_none(),
+            "a verifying v1 dial still refuses an empty trust store"
+        );
+    }
+
+    #[test]
     fn a_v1_tuned_plan_is_its_own_pool_key() {
         // A controller or profile chosen for one lane may not ride a connection negotiated under another.
         let dial = |quic: Option<ferrox_core::hysteria::QuicParams>| Dial {
@@ -1263,6 +1297,13 @@ mod tests {
             server_of(&dial(None)),
             server_of(&dial(Some(cubic))),
             "a tuned lane never rides a plain connection"
+        );
+        let mut untrusted = dial(None);
+        untrusted.config.insecure = true;
+        assert_ne!(
+            server_of(&untrusted),
+            server_of(&dial(None)),
+            "an unverified lane is not reused by a verifying dial"
         );
     }
 

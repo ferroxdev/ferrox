@@ -2695,6 +2695,33 @@ pub(crate) fn hysteria_version(node: Option<&Json>) -> Option<u32> {
     })
 }
 
+/// The auth strings an inbound accepts: `clients` replaces `users`, and either empty falls back to the transport's auth.
+pub(crate) fn hysteria_inbound_auths(
+    settings: Option<&Json>,
+    stream: Option<&Json>,
+) -> Vec<String> {
+    let users = settings.and_then(|node| {
+        node.get("clients")
+            .filter(|value| !matches!(value, Json::Null))
+            .or_else(|| node.get("users"))
+    });
+    if let Some(users) = users.and_then(Json::as_arr) {
+        if !users.is_empty() {
+            return users
+                .iter()
+                .filter_map(|user| user.get("auth").and_then(Json::as_str).map(str::to_owned))
+                .collect();
+        }
+    }
+    stream
+        .and_then(|node| node.get("hysteriaSettings"))
+        .and_then(|hy| hy.get("auth"))
+        .and_then(Json::as_str)
+        .filter(|auth| !auth.is_empty())
+        .map(|auth| vec![auth.to_owned()])
+        .unwrap_or_default()
+}
+
 /// A JSON integer, as a number or a decimal string; a fractional or non-numeric value names nothing.
 fn as_i64(node: &Json) -> Option<i64> {
     match node {
@@ -2871,9 +2898,23 @@ pub(crate) fn hysteria_quic_params(
 }
 
 fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
+    hysteria_carrier_with_version(settings, network, None)
+}
+
+fn hysteria_carrier_with_version(
+    settings: Option<&Json>,
+    network: &str,
+    forced: Option<u32>,
+) -> Carrier {
     use ferrox_core::hysteria::{Config, Congestion};
     let hy = settings.and_then(|s| s.get("hysteriaSettings"));
-    let version = hysteria_version(hy.and_then(|h| h.get("version"))).unwrap_or(2);
+    let insecure = settings
+        .and_then(|s| s.get("tlsSettings"))
+        .and_then(|t| t.get("allowInsecure"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    let version =
+        forced.unwrap_or_else(|| hysteria_version(hy.and_then(|h| h.get("version"))).unwrap_or(2));
     if version != 1 && version != 2 {
         return Carrier::Unknown {
             network: network.to_owned(),
@@ -2933,6 +2974,7 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
             udp_idle,
             quic,
             realm: realm.map(Box::new),
+            insecure,
         });
     }
     // Salamander and its gecko fragmentation variant are the datagram obfuscations carried; any other named one, or one whose password is too short to mask with, is refused rather than silently sent in the clear.
@@ -2961,6 +3003,7 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
         udp_idle,
         quic,
         realm: realm.map(Box::new),
+        insecure,
     })
 }
 
@@ -2970,6 +3013,11 @@ pub(crate) fn hysteria_v1_config(
 ) -> Result<ferrox_core::hysteria::Config, String> {
     use ferrox_core::hysteria::{Config, Congestion};
     let hy = stream.and_then(|s| s.get("hysteriaSettings"));
+    let insecure = stream
+        .and_then(|s| s.get("tlsSettings"))
+        .and_then(|t| t.get("allowInsecure"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
     let quic = hysteria_quic_params(stream)?;
     let mut cc = Congestion::parse(
         hy.and_then(|h| h.get("congestion"))
@@ -2993,7 +3041,25 @@ pub(crate) fn hysteria_v1_config(
         udp_idle: hysteria_udp_idle(hy)?,
         quic,
         realm: hysteria_realm(stream, hy)?.map(Box::new),
+        insecure,
     })
+}
+
+/// The direct outbound config for the version its `settings.version` names, reusing the carrier's v2 assembly and its v1 config.
+pub(crate) fn hysteria_outbound_config(
+    stream: Option<&Json>,
+    version: u32,
+) -> Result<ferrox_core::hysteria::Config, String> {
+    if has_tcp_mask(stream) {
+        return Err("the hysteria outbound cannot carry finalmask.tcp".to_owned());
+    }
+    if version == 1 {
+        return hysteria_v1_config(stream);
+    }
+    match hysteria_carrier_with_version(stream, "hysteria", Some(version)) {
+        Carrier::Hysteria(config) => Ok(config),
+        _ => Err("the hysteria transport settings are unreadable".to_owned()),
+    }
 }
 
 /// The xplus password a Hysteria v1 transport names: `tlsSettings.obfs` itself is the key.
@@ -4084,7 +4150,7 @@ mod tests {
             )
         };
         let Carrier::Hysteria(config) = carrier(
-            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": 5}, "finalmask": {"quicParams": {"congestion": "brutal", "brutalUp": "10 mbps", "brutalDown": "10 mbps", "initStreamReceiveWindow": 65536, "maxIdleTimeout": 10, "keepAlivePeriod": 5, "maxIncomingStreams": 32, "disableChromeParrot": true}}}}"#,
+            r#"{"streamSettings": {"network": "hysteria", "security": "tls", "tlsSettings": {"allowInsecure": true}, "hysteriaSettings": {"version": 2, "udpIdleTimeout": 5}, "finalmask": {"quicParams": {"congestion": "brutal", "brutalUp": "10 mbps", "brutalDown": "10 mbps", "initStreamReceiveWindow": 65536, "maxIdleTimeout": 10, "keepAlivePeriod": 5, "maxIncomingStreams": 32, "disableChromeParrot": true, "disableGSO": true}}}}"#,
         ) else {
             panic!("a tuned hysteria carrier");
         };
@@ -4105,6 +4171,7 @@ mod tests {
             params.disable_chrome_parrot,
             "the mask is the block's, not a field the tree drops"
         );
+        assert!(params.disable_gso, "the switch reaches the datagram lane");
         assert_eq!(
             QuicParams::stream_window(0, false),
             8 * 1024 * 1024,
@@ -4178,6 +4245,76 @@ mod tests {
                 "{text} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn a_hysteria_carrier_reads_allow_insecure() {
+        let stream = crate::json::parse(
+            r#"{"streamSettings": {"network": "hysteria", "security": "tls", "tlsSettings": {"allowInsecure": true}, "hysteriaSettings": {"version": 2, "auth": "a"}}}"#,
+        )
+        .expect("parses");
+        let Carrier::Hysteria(config) = stream_carrier(stream.get("streamSettings")) else {
+            panic!("a hysteria carrier");
+        };
+        assert!(
+            config.insecure,
+            "the TLS verdict reaches the QUIC handshake"
+        );
+    }
+
+    #[test]
+    fn a_hysteria_inbound_takes_clients_then_users_then_the_transport_auth() {
+        let auths = |text: &str| {
+            let inbound = crate::json::parse(text).expect("parses");
+            hysteria_inbound_auths(inbound.get("settings"), inbound.get("streamSettings"))
+        };
+        assert_eq!(
+            auths(
+                r#"{"settings": {"users": [{"auth": "user"}]}, "streamSettings": {"hysteriaSettings": {"auth": "transport"}}}"#
+            ),
+            ["user"],
+            "a named user owns the credential"
+        );
+        assert_eq!(
+            auths(
+                r#"{"settings": {"users": [{"auth": "user"}], "clients": [{"auth": "client"}]}, "streamSettings": {"hysteriaSettings": {"auth": "transport"}}}"#
+            ),
+            ["client"],
+            "the legacy clients spelling replaces users"
+        );
+        assert_eq!(
+            auths(
+                r#"{"settings": {"users": [{"auth": "user"}], "clients": []}, "streamSettings": {"hysteriaSettings": {"auth": "transport"}}}"#
+            ),
+            ["transport"],
+            "an empty clients list is present and leaves no validator, so the transport auth is used"
+        );
+        assert_eq!(
+            auths(
+                r#"{"settings": {"users": [{"auth": "user"}], "clients": null}, "streamSettings": {"hysteriaSettings": {"auth": "transport"}}}"#
+            ),
+            ["user"],
+            "a null clients list is absent"
+        );
+        assert_eq!(
+            auths(
+                r#"{"settings": {"users": [{}]}, "streamSettings": {"hysteriaSettings": {"auth": "transport"}}}"#
+            ),
+            Vec::<String>::new(),
+            "a user with no auth leaves the validator non-empty and suppresses the transport auth"
+        );
+        assert_eq!(
+            auths(
+                r#"{"settings": {}, "streamSettings": {"hysteriaSettings": {"auth": "transport"}}}"#
+            ),
+            ["transport"],
+            "an inbound with no users accepts the transport auth"
+        );
+        assert_eq!(
+            auths(r#"{"settings": {}, "streamSettings": {"hysteriaSettings": {}}}"#),
+            Vec::<String>::new(),
+            "no credential at all accepts nothing"
+        );
     }
 
     #[test]
