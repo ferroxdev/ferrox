@@ -71,7 +71,16 @@ fn ctr8v(template: __m256i, ctr: u32) -> [__m256i; 4] {
     unsafe {
         let a0 = _mm256_add_epi32(
             template,
-            _mm256_set_epi32((ctr + 1).cast_signed(), 0, 0, 0, ctr.cast_signed(), 0, 0, 0),
+            _mm256_set_epi32(
+                ctr.wrapping_add(1).cast_signed(),
+                0,
+                0,
+                0,
+                ctr.cast_signed(),
+                0,
+                0,
+                0,
+            ),
         );
         let two = _mm256_set_epi32(2, 0, 0, 0, 2, 0, 0, 0);
         let a1 = _mm256_add_epi32(a0, two);
@@ -229,7 +238,7 @@ impl Engine {
                         bswap2(pairs[3]),
                     ],
                 );
-                ctr += 8;
+                ctr = ctr.wrapping_add(8);
             }
             super::ctr_ghash(
                 &self.rk,
@@ -283,7 +292,7 @@ impl Engine {
                         bswap2(pairs[3]),
                     ],
                 );
-                ctr += 8;
+                ctr = ctr.wrapping_add(8);
             }
             super::ctr_ghash_from(
                 &self.rk,
@@ -410,7 +419,7 @@ impl Engine {
                         bswap2(pairs[3]),
                     ],
                 );
-                ctr += 8;
+                ctr = ctr.wrapping_add(8);
             }
             super::ctr_ghash_from_uninit(
                 &self.rk,
@@ -505,7 +514,7 @@ impl Engine {
                 _mm256_xor_si256(ks[3], pt[3]),
             ];
             store_pairs(g, pairs);
-            ctr += 8;
+            ctr = ctr.wrapping_add(8);
         }
         super::ctr_only(&self.rk, template, &mut buf[done..], ctr);
         Some(buf.len())
@@ -589,7 +598,7 @@ impl Engine256 {
                         bswap2(pairs[3]),
                     ],
                 );
-                ctr += 8;
+                ctr = ctr.wrapping_add(8);
             }
             super::ctr_ghash_256(
                 &self.rk,
@@ -645,7 +654,7 @@ impl Engine256 {
                         bswap2(pairs[3]),
                     ],
                 );
-                ctr += 8;
+                ctr = ctr.wrapping_add(8);
             }
             super::ctr_ghash_from_256(
                 &self.rk,
@@ -703,7 +712,7 @@ impl Engine256 {
                         bswap2(pairs[3]),
                     ],
                 );
-                ctr += 8;
+                ctr = ctr.wrapping_add(8);
             }
             super::ctr_ghash_from_256_uninit(
                 &self.rk,
@@ -850,7 +859,7 @@ impl Engine256 {
                 _mm256_xor_si256(ks[3], pt[3]),
             ];
             store_pairs(g, pairs);
-            ctr += 8;
+            ctr = ctr.wrapping_add(8);
         }
         super::ctr_only_256(&self.rk, template, &mut buf[done..], ctr);
         Some(buf.len())
@@ -875,5 +884,33 @@ impl Engine256 {
             );
         }
         super::ghash(&self.h, state, &data[done..], tailq)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ctr8v;
+    use core::arch::x86_64::*;
+
+    #[test]
+    fn the_counter_pass_wraps_at_the_block_limit() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for start in [u32::MAX - 3, u32::MAX] {
+            let zero = unsafe { _mm256_setzero_si256() };
+            let blocks = ctr8v(zero, start);
+            let mut lanes = [0u8; 128];
+            for (i, block) in blocks.iter().enumerate() {
+                unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().add(i * 32).cast(), *block) };
+            }
+            for (i, at) in [12usize, 28, 44, 60, 76, 92, 108, 124]
+                .into_iter()
+                .enumerate()
+            {
+                let want = start.wrapping_add(i as u32).to_be_bytes();
+                assert_eq!(&lanes[at..at + 4], &want[..], "block {i}");
+            }
+        }
     }
 }
