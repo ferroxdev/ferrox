@@ -30703,8 +30703,7 @@ impl TcpCopy {
             Err(error) if is_timeout(&error) => {
                 if flow.ended() && flow.ended_and_idle(self.reply_idle) {
                     self.refuse();
-                    self.end();
-                    return Some(Next::Done);
+                    return Some(self.end());
                 }
                 return Some(Next::Idle);
             }
@@ -30729,10 +30728,7 @@ impl TcpCopy {
         }
         while self.off < self.filled {
             match self.dst.write(&self.bytes[self.off..self.filled]) {
-                Ok(0) => {
-                    self.end();
-                    return Next::Done;
-                }
+                Ok(0) => return self.end(),
                 Ok(n) => {
                     self.off += n;
                     self.stalled = None;
@@ -30749,18 +30745,14 @@ impl TcpCopy {
                     }
                     return Next::Idle;
                 }
-                Err(_) => {
-                    self.end();
-                    return Next::Done;
-                }
+                Err(_) => return self.end(),
             }
         }
         self.off = 0;
         self.filled = 0;
         self.stalled = None;
         if self.eof {
-            self.end();
-            return Next::Done;
+            return self.end();
         }
         if let Some(next) = self.strip_answer(flow) {
             return next;
@@ -30768,8 +30760,7 @@ impl TcpCopy {
         match self.src.read(&mut self.bytes) {
             Ok(0) => {
                 self.eof = true;
-                self.end();
-                Next::Done
+                self.end()
             }
             Ok(n) => {
                 self.filled = n;
@@ -30780,27 +30771,30 @@ impl TcpCopy {
                 note_wait_idle(self.reply_idle);
                 note_wait_finish(flow);
                 if flow.ended() && flow.ended_and_idle(self.reply_idle) {
-                    self.end();
-                    Next::Done
+                    self.end()
                 } else {
                     Next::Idle
                 }
             }
-            Err(_) => {
-                self.end();
-                Next::Done
-            }
+            Err(_) => self.end(),
         }
     }
 
-    fn end(&mut self) {
+    fn end(&mut self) -> Next {
         if self.ended {
-            return;
+            return Next::Done;
+        }
+        self.stalled = None;
+        match self.dst.flush() {
+            Ok(()) => {}
+            Err(error) if is_timeout(&error) || error.kind() == std::io::ErrorKind::Interrupted => {
+                return Next::Retry;
+            }
+            Err(_) => {}
         }
         self.ended = true;
-        self.stalled = None;
-        let _ = self.dst.flush();
         let _ = self.dst.shutdown(Shutdown::Write);
+        Next::Done
     }
 
     fn abandon(&mut self) {

@@ -29,6 +29,8 @@ pub struct PacketStream<R, W> {
     is_client: bool,
     stop: Arc<AtomicBool>,
     keepalive: Option<JoinHandle<()>>,
+    /// A keep-alive answer whose frame drain was refused, kept so the next read retries it.
+    pending_keepalive: Mutex<Option<i64>>,
 }
 
 #[derive(Default)]
@@ -191,6 +193,7 @@ where
             is_client,
             stop,
             keepalive,
+            pending_keepalive: Mutex::new(None),
         }
     }
 }
@@ -229,6 +232,42 @@ impl<R, W: Write> PacketStream<R, W> {
         }
     }
 
+    fn flush_pending_keepalive(&self) -> io::Result<()> {
+        let id = *self
+            .pending_keepalive
+            .lock()
+            .map_err(|_| io::Error::other("packet stream keepalive poisoned"))?;
+        let Some(id) = id else {
+            return Ok(());
+        };
+        match self.write_keepalive(id) {
+            Ok(()) => {
+                *self
+                    .pending_keepalive
+                    .lock()
+                    .map_err(|_| io::Error::other("packet stream keepalive poisoned"))? = None;
+                Ok(())
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Err(error)
+            }
+            Err(error) => {
+                *self
+                    .pending_keepalive
+                    .lock()
+                    .map_err(|_| io::Error::other("packet stream keepalive poisoned"))? = None;
+                Err(error)
+            }
+        }
+    }
+
     fn write_keepalive(&self, id: i64) -> io::Result<()> {
         let mut writer = self
             .writer
@@ -258,6 +297,7 @@ impl<R: Read, W: Write> Read for &PacketStream<R, W> {
         if output.is_empty() {
             return Ok(0);
         }
+        self.flush_pending_keepalive()?;
         let mut reader = self
             .reader
             .lock()
@@ -291,7 +331,12 @@ impl<R: Read, W: Write> Read for &PacketStream<R, W> {
                 Event::Payload(taken) => return Ok(taken),
                 Event::KeepAlive(id) => {
                     if self.is_client {
-                        self.write_keepalive(id)?;
+                        *self
+                            .pending_keepalive
+                            .lock()
+                            .map_err(|_| io::Error::other("packet stream keepalive poisoned"))? =
+                            Some(id);
+                        self.flush_pending_keepalive()?;
                     }
                 }
             }
