@@ -3389,7 +3389,7 @@ mod tests {
             let (rtcp, carried) = tcp_head(body).unwrap();
             assert_eq!(rtcp.flags, FLAG_SYN | FLAG_ACK, "an MTU of {mtu}");
             assert_eq!(rtcp.options, expected, "an MTU of {mtu}");
-            assert!(carried.is_empty());
+            assert_eq!(carried, [], "an MTU of {mtu}");
             assert_eq!(
                 tcp_checksum(&[10, 0, 0, 1], &[10, 0, 0, 2], &reply[IPV4_HEADER..rn]),
                 0
