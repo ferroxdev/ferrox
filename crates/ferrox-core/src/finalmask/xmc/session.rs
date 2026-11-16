@@ -386,6 +386,7 @@ impl<R, W: Write> Write for Handshake<R, W> {
             return Ok(input.len());
         };
         if input.is_empty() {
+            flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
             return Ok(0);
         }
         if self.pending < self.buffer.len() {
@@ -440,6 +441,7 @@ struct CipherWriter<W> {
 impl<W: Write> Write for CipherWriter<W> {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
         if input.is_empty() {
+            flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
             return Ok(0);
         }
         if self.pending < self.buffer.len() {

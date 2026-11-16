@@ -7014,6 +7014,21 @@ fn sealed_window(buffer: Option<usize>) -> usize {
         })
 }
 
+/// Drain a writer's retained output, retrying the transient kinds a nonblocking sink reports.
+fn flush_transient<W: Write>(writer: &mut W) -> std::io::Result<()> {
+    loop {
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// A relay over two independently sealed halves, so a parked read never stops the other direction.
 fn relay_split<R, W>(
     mut sealed_read: R,
@@ -7049,7 +7064,9 @@ fn relay_split<R, W>(
             match plain_read.read(buf.as_mut()) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if sealed_write.write_all(buf.filled(n)).is_err() {
+                    if sealed_write.write_all(buf.filled(n)).is_err()
+                        || flush_transient(&mut sealed_write).is_err()
+                    {
                         break;
                     }
                 }

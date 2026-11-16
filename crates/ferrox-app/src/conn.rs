@@ -240,6 +240,10 @@ impl std::io::Write for XmcWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        let Ok(mut chain) = self.chain.lock() else {
+            return Err(std::io::Error::other("the mask chain is gone"));
+        };
+        chain.flush(&mut &self.stream)?;
         (&self.stream).flush()
     }
 }
@@ -468,6 +472,18 @@ impl Masked {
         }
     }
 
+    /// Put the chain's retained output on the wire before a wait for the peer's answer.
+    fn flush(&self) -> io::Result<()> {
+        if let Some(session) = self.xmc_session()? {
+            return (&*session).flush();
+        }
+        let Ok(mut chain) = self.chain.lock() else {
+            return Err(io::Error::other("the mask chain is gone"));
+        };
+        chain.flush(&mut &self.stream)?;
+        (&self.stream).flush()
+    }
+
     /// One nonblocking read through the codec chain. The handshake is the blocking path's: a
     /// pending header answers `WouldBlock` instead of running it, so a readiness lane never waits.
     #[cfg(unix)]
@@ -545,6 +561,11 @@ impl std::io::Write for HeaderWire<'_> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        let Ok(mut chain) = self.chain.lock() else {
+            return Err(std::io::Error::other("the mask chain is gone"));
+        };
+        let mut source = self.stream;
+        chain.flush(&mut source)?;
         self.stream.flush()
     }
 }
@@ -1108,11 +1129,7 @@ impl Write for Connection {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Connection::Tcp(stream) => stream.flush(),
-            Connection::Masked(masked) => match masked.xmc_session() {
-                Ok(Some(session)) => (&*session).flush(),
-                Ok(None) => masked.stream.flush(),
-                Err(error) => Err(error),
-            },
+            Connection::Masked(masked) => masked.flush(),
             Connection::Metered(metered) => metered.inner.flush(),
             Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => inner.flush(),
             #[cfg(any(unix, windows))]
@@ -1247,10 +1264,7 @@ impl Write for &Connection {
                 let mut inner = stream;
                 inner.flush()
             }
-            Connection::Masked(masked) => {
-                let mut inner = &masked.stream;
-                inner.flush()
-            }
+            Connection::Masked(masked) => masked.flush(),
             Connection::Metered(ref metered) => {
                 let mut inner = &*metered.inner;
                 inner.flush()

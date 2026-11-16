@@ -881,6 +881,7 @@ impl Sudoku {
             ));
         };
         if p.is_empty() {
+            writer.flush(raw)?;
             return Ok(0);
         }
         if writer.written < writer.out.len() {
@@ -889,6 +890,14 @@ impl Sudoku {
         writer.encode(p)?;
         let _ = writer.flush(raw);
         Ok(p.len())
+    }
+
+    /// Put the last encoding's retained bytes on the wire without a new plaintext write.
+    pub fn flush<W: Write>(&mut self, raw: &mut W) -> io::Result<()> {
+        match self.writer.as_mut() {
+            Some(writer) => writer.flush(raw),
+            None => Ok(()),
+        }
     }
 
     pub fn read_from<R: Read>(&mut self, inner: &mut R, buf: &mut [u8]) -> io::Result<usize> {

@@ -202,6 +202,17 @@ impl Fragment {
         self.write_pieces(raw, p)
     }
 
+    /// Put the retained burst on the wire without a new plaintext write.
+    fn flush<W: Write>(&mut self, raw: &mut W) -> io::Result<()> {
+        if let Some(mut gathered) = self.gathered.take() {
+            if let Err(error) = flush_gathered(raw, &mut gathered) {
+                self.gathered = Some(gathered);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     /// The segment's width, or the body's last octet once `max_split` has taken its bound: the run
     /// always ends on the whole, so a bounded hello is a short hello, never a lost one.
     fn cut(&mut self, segment: usize, from: usize, end: usize, bound: usize) -> Option<usize> {
@@ -641,6 +652,13 @@ impl Stage {
         }
     }
 
+    fn flush<W: Write>(&mut self, raw: &mut W) -> io::Result<()> {
+        match self {
+            Self::Fragment(stage) => stage.flush(raw),
+            Self::Sudoku(stage) => stage.flush(raw),
+        }
+    }
+
     fn read<R: Read>(&mut self, inner: &mut R, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Fragment(_) => inner.read(buf),
@@ -762,6 +780,11 @@ impl Chain {
         drive(&mut self.stages, raw, p)
     }
 
+    /// Put every retained piece on the wire, nearest the socket first.
+    pub fn flush<W: Write>(&mut self, raw: &mut W) -> io::Result<()> {
+        flush_drive(&mut self.stages, raw)
+    }
+
     /// One read through every codec stage: the last configured stage sees the socket, and each
     /// stage above it reads that stage's output.
     pub fn read<R: Read>(&mut self, raw: &mut R, buf: &mut [u8]) -> io::Result<usize> {
@@ -785,6 +808,23 @@ fn drive<W: Write>(stages: &mut [Stage], raw: &mut W, p: &[u8]) -> io::Result<us
     }
     let mut pipe = Pipe { stages: rest, raw };
     first.write(&mut pipe, p)
+}
+
+fn flush_drive<W: Write>(stages: &mut [Stage], raw: &mut W) -> io::Result<()> {
+    let Some((first, rest)) = stages.split_first_mut() else {
+        return raw.flush();
+    };
+    if rest.is_empty() {
+        return first.flush(raw);
+    }
+    {
+        let mut pipe = Pipe {
+            stages: &mut *rest,
+            raw: &mut *raw,
+        };
+        first.flush(&mut pipe)?;
+    }
+    flush_drive(rest, raw)
 }
 
 fn read_drive<R: Read>(stages: &mut [Stage], raw: &mut R, buf: &mut [u8]) -> io::Result<usize> {
@@ -839,7 +879,7 @@ impl<W: Write> Write for Pipe<'_, W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.raw.flush()
+        flush_drive(&mut *self.stages, &mut *self.raw)
     }
 }
 
