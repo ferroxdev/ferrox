@@ -108,9 +108,14 @@ graph TD
 | h2-queued-capsule-cap | 64 | ferrox-app-masque-h2::tests::a_stalled_send_window_bounds_the_queued_capsules |
 | early-datagram-cap | 64 | ferrox-app-masque::tests::poll_refuses_a_pre_stack_datagram_flood |
 | early-datagram-byte-cap | 1048576 | ferrox-app-masque::tests::early_h3_datagrams_are_bounded_by_count_and_bytes |
+| quic-v2-generic-default | off | ferrox-app-masque::tests::the_quic_v2_setting_is_opt_in_for_generic_masque |
+| quic-v2-bait-bytes | 1200 | ferrox-app-masque::tests::the_bait_is_a_v2_versioned_long_header_of_the_minimum_size |
+| quic-v2-bait-answer | consumed | ferrox-app-masque::tests::the_bait_triggers_a_version_negotiation_from_a_v1_only_server |
 <!-- counts:end -->
 
 The row 194 noise hook is the HTTP/3 client's: `masqueSettings.noize` is read into `ClientSpec`, and `attempt` sends that profile's junk and `i1`/`i2` before `quiche::connect`, so the QUIC ClientHello follows them. The default is `off` when the setting is absent; WARP-generated MASQUE settings always write `firewall` unless the operator chooses another profile. HTTP/2 and HTTP/1.1 have no pre-handshake UDP datagrams and take no noise, and the server role is unchanged. `noize::tests::masque_signatures_follow_the_reference_order` and `noize::tests::an_off_profile_sends_nothing` are the checkers.
+
+The row 195 opener is the HTTP/3 client's too: `masqueSettings.quicV2` is read into `ClientSpec`, and `attempt` sends one 1200-byte long header carrying QUIC v2 `0x6b33_43cf` before the noise and `quiche::connect`, waits up to 600 ms (twice; 500 ms once on a probe) for Version Negotiation, consumes the answer, and runs the ordinary v1 handshake on the same socket. The setting is off for generic MASQUE; WARP writes `true` and `--no-quic-v2` or `AETHER_QUIC_V2` turns it off. HTTP/2 and HTTP/1.1 send no pre-handshake datagram, and the MIM inner hop carries none. `ferrox-app-masque::tests::the_bait_is_a_v2_versioned_long_header_of_the_minimum_size` and `ferrox-app-masque::tests::the_bait_triggers_a_version_negotiation_from_a_v1_only_server` are the checkers.
 
 ## Time
 

@@ -122,6 +122,11 @@ const DGRAM_SEND_QUEUE: usize = QUEUE;
 const MASQUE_BUFFER: i32 = 4 << 20;
 /// The server's own connection ID: a short header carries no length, so the demultiplexer reads exactly this many bytes.
 const CID_LEN: usize = 16;
+const QUIC_V2_VERSION: u32 = 0x6b33_43cf;
+const QUIC_V2_BAIT_LEN: usize = 1200;
+const QUIC_V2_BAIT_WAIT: Duration = Duration::from_millis(600);
+const QUIC_V2_VERIFY_WAIT: Duration = Duration::from_millis(500);
+const QUIC_V2_BAIT_TRIES: usize = 2;
 pub(crate) const AUTH_REALM: &str = "Basic realm=\"masque\", charset=\"UTF-8\"";
 const H3_SETTINGS: u64 = 0x04;
 const SETTINGS_H3_DATAGRAM: u64 = 0x33;
@@ -249,13 +254,13 @@ impl MasqueOut {
     }
 
     fn ensure(&self) -> Result<Arc<Inner>, String> {
-        self.ensure_at(Instant::now(), || open(&self.spec))
+        self.ensure_at(Instant::now(), || open(&self.spec, true))
     }
 
     /// A lane plus the lease that keeps its stack and connection alive while a datagram
     /// relay or fixed-target forwarder runs on it.
     fn ensure_leased(&self) -> Result<(Arc<Inner>, crate::wg_stack::FlowLease), String> {
-        self.ensure_flow_at(Instant::now(), || open(&self.spec))
+        self.ensure_flow_at(Instant::now(), || open(&self.spec, false))
     }
 
     /// Drop every lane whose stack ended or whose reuse window closed, and roll the reconnect
@@ -430,7 +435,7 @@ impl MasqueOut {
     }
 
     pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination, prefix: &[u8]) {
-        let (inner, lease) = match self.ensure_flow_at(Instant::now(), || open(&self.spec)) {
+        let (inner, lease) = match self.ensure_flow_at(Instant::now(), || open(&self.spec, false)) {
             Ok(lane) => lane,
             Err(reason) => {
                 eprintln!("masque: {reason}");
@@ -583,7 +588,7 @@ impl MasqueOut {
 }
 
 /// Open the carrier the configured security and ALPN select.
-fn open(spec: &ClientSpec) -> Result<Inner, String> {
+fn open(spec: &ClientSpec, probe: bool) -> Result<Inner, String> {
     let Some(tls) = spec.tls.as_deref() else {
         if spec.warp.is_some() {
             return Err("masque warp: security none is not a WARP carrier".to_owned());
@@ -625,7 +630,7 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
         None => sock,
     };
     let sock = sock.with_gso(spec.quic.is_none_or(|params| !params.disable_gso));
-    let mut lane = establish(spec, &sock, peer, local)?;
+    let mut lane = establish(spec, &sock, peer, local, probe)?;
     let addresses = lane.addresses.clone();
     let mtu = lane.mtu;
     let initial = std::mem::take(&mut lane.packets);
@@ -1000,6 +1005,7 @@ struct ClientSpec {
     headers: Vec<(String, String)>,
     remote_dns: Vec<IpAddr>,
     warp: Option<Warp>,
+    quic_v2: bool,
     noize: crate::noize::MasqueNoize,
     xmux: Xmux,
     large_segments: bool,
@@ -1087,6 +1093,10 @@ impl ClientSpec {
             .map(Warp::from)
             .transpose()?;
         let noize = masque_noize(transport)?;
+        let quic_v2 = transport
+            .and_then(|settings| settings.get("quicV2"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         let user = transport
             .and_then(|settings| settings.get("user"))
             .and_then(Json::as_str)
@@ -1150,6 +1160,7 @@ impl ClientSpec {
             headers,
             remote_dns,
             warp,
+            quic_v2,
             noize,
             xmux,
             large_segments,
@@ -1193,6 +1204,7 @@ impl std::fmt::Debug for ClientSpec {
             .field("headers", &headers)
             .field("remote_dns", &self.remote_dns)
             .field("warp", &self.warp)
+            .field("quic_v2", &self.quic_v2)
             .field("xmux", &self.xmux)
             .field("large_segments", &self.large_segments)
             .field("quic", &self.quic)
@@ -1792,13 +1804,64 @@ fn stage_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("masque warp staging: {error}"))
 }
 
+fn quic_varint2(value: u64) -> [u8; 2] {
+    (((value & 0x3fff) as u16) | 0x4000).to_be_bytes()
+}
+
+fn build_version_bait() -> [u8; QUIC_V2_BAIT_LEN] {
+    let mut dcid = [0u8; 8];
+    let mut scid = [0u8; 8];
+    let mut packet_number = [0u8; 4];
+    let _ = getrandom::fill(&mut dcid);
+    let _ = getrandom::fill(&mut scid);
+    let _ = getrandom::fill(&mut packet_number);
+
+    let mut bait = [0u8; QUIC_V2_BAIT_LEN];
+    let mut at = 0;
+    bait[at] = 0xc3;
+    at += 1;
+    bait[at..at + 4].copy_from_slice(&QUIC_V2_VERSION.to_be_bytes());
+    at += 4;
+    bait[at] = dcid.len() as u8;
+    at += 1;
+    bait[at..at + dcid.len()].copy_from_slice(&dcid);
+    at += dcid.len();
+    bait[at] = scid.len() as u8;
+    at += 1;
+    bait[at..at + scid.len()].copy_from_slice(&scid);
+    at += scid.len();
+    bait[at] = 0;
+    at += 1;
+    let remaining = QUIC_V2_BAIT_LEN - at - 2;
+    bait[at..at + 2].copy_from_slice(&quic_varint2(remaining as u64));
+    at += 2;
+    bait[at..at + packet_number.len()].copy_from_slice(&packet_number);
+    bait
+}
+
+fn send_version_bait(sock: &Datagram, peer: SocketAddr, wait: Duration, tries: usize) {
+    let bait = build_version_bait();
+    let mut answer = [0u8; 2048];
+    for _ in 0..tries.max(1) {
+        if sock.send_to(&bait, peer).is_err() {
+            return;
+        }
+        let _ = sock.set_read_timeout(Some(wait));
+        match sock.recv_from(&mut answer) {
+            Err(error) if crate::proxy::is_timeout(&error) => {}
+            _ => return,
+        }
+    }
+}
+
 fn establish(
     spec: &ClientSpec,
     sock: &Datagram,
     peer: SocketAddr,
     local: SocketAddr,
+    probe: bool,
 ) -> Result<Lane, String> {
-    attempt(spec, sock, peer, local).map_err(|reason| format!("masque: {reason}"))
+    attempt(spec, sock, peer, local, probe).map_err(|reason| format!("masque: {reason}"))
 }
 
 /// Open one QUIC attempt and take its assigned or configured addresses.
@@ -1807,6 +1870,7 @@ fn attempt(
     sock: &Datagram,
     peer: SocketAddr,
     local: SocketAddr,
+    probe: bool,
 ) -> Result<Lane, String> {
     let tls = spec
         .tls
@@ -1816,6 +1880,14 @@ fn attempt(
     let mut scid = vec![0u8; if spec.warp.is_some() { 20 } else { 16 }];
     getrandom::fill(&mut scid).map_err(|error| format!("masque: no connection id: {error}"))?;
     let cid = quiche::ConnectionId::from_ref(&scid);
+    if spec.quic_v2 {
+        let (wait, tries) = if probe {
+            (QUIC_V2_VERIFY_WAIT, 1)
+        } else {
+            (QUIC_V2_BAIT_WAIT, QUIC_V2_BAIT_TRIES)
+        };
+        send_version_bait(sock, peer, wait, tries);
+    }
     spec.noize.send_before(|packet| {
         let _ = sock.send_to(packet, peer);
     });
@@ -4350,6 +4422,76 @@ mod tests {
     }
 
     #[test]
+    fn the_bait_is_a_v2_versioned_long_header_of_the_minimum_size() {
+        let bait = build_version_bait();
+        assert_eq!(bait.len(), QUIC_V2_BAIT_LEN);
+        assert_eq!(bait[0], 0xc3);
+        assert_eq!(
+            u32::from_be_bytes([bait[1], bait[2], bait[3], bait[4]]),
+            0x6b33_43cf
+        );
+        assert_eq!(bait[5], 8);
+        assert_eq!(bait[14], 8);
+        let length = u16::from_be_bytes([bait[24], bait[25]]);
+        assert_eq!(length & 0xc000, 0x4000);
+        assert_eq!(usize::from(length & 0x3fff), QUIC_V2_BAIT_LEN - 26);
+        assert!(bait[30..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn the_quic_v2_setting_is_opt_in_for_generic_masque() {
+        let off = ClientSpec::from(&outbound(443)).expect("the default");
+        assert!(!off.quic_v2);
+        let on = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":443},"streamSettings":{"network":"masque","security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"quicV2":true,"headers":{"Authorization":"Basic dUBleGFtcGxlLmNvbTpw"}}}}"#,
+        )
+        .expect("the opt-in");
+        assert!(ClientSpec::from(&on).expect("the opt-in").quic_v2);
+    }
+
+    #[test]
+    fn two_baits_do_not_share_connection_ids() {
+        let first = build_version_bait();
+        let second = build_version_bait();
+        assert_ne!(first[6..14], second[6..14]);
+        assert_ne!(first[15..23], second[15..23]);
+    }
+
+    #[test]
+    fn the_bait_triggers_a_version_negotiation_from_a_v1_only_server() {
+        let server = UdpSocket::bind("127.0.0.1:0").expect("the server");
+        let address = server.local_addr().expect("the server address");
+        let responder = std::thread::spawn(move || {
+            let mut bait = [0u8; 2048];
+            let (read, from) = server.recv_from(&mut bait).expect("the bait");
+            assert_eq!(read, QUIC_V2_BAIT_LEN);
+            assert_eq!(
+                u32::from_be_bytes([bait[1], bait[2], bait[3], bait[4]]),
+                0x6b33_43cf
+            );
+            let dcid = bait[6..14].to_vec();
+            let scid = bait[15..23].to_vec();
+            let mut negotiation = vec![0xc0, 0, 0, 0, 0];
+            negotiation.push(scid.len() as u8);
+            negotiation.extend_from_slice(&scid);
+            negotiation.push(dcid.len() as u8);
+            negotiation.extend_from_slice(&dcid);
+            negotiation.extend_from_slice(&1u32.to_be_bytes());
+            server
+                .send_to(&negotiation, from)
+                .expect("the version negotiation");
+        });
+        let client = Datagram::plain(UdpSocket::bind("127.0.0.1:0").expect("the client"));
+        send_version_bait(&client, address, Duration::from_secs(2), 1);
+        responder.join().expect("the responder");
+        let _ = client.set_read_timeout(Some(Duration::from_millis(50)));
+        assert!(
+            client.recv_from(&mut [0u8; 2048]).is_err(),
+            "the answer was left in the socket for the handshake"
+        );
+    }
+
+    #[test]
     fn the_tunnel_queue_is_bounded() {
         let (release, held) = mpsc::channel();
         let inner = assemble(
@@ -4423,6 +4565,7 @@ mod tests {
             headers: Vec::new(),
             remote_dns: Vec::new(),
             warp: None,
+            quic_v2: false,
             noize: crate::noize::MasqueNoize::off(),
             xmux: Xmux::defaults(),
             large_segments: false,
@@ -5037,7 +5180,7 @@ mod tests {
         let spec = ClientSpec::from(&outbound(port)).expect("spec");
         let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port).expect("resolve");
         let sock = Datagram::plain(sock);
-        let mut lane = establish(&spec, &sock, peer, local).expect("lane");
+        let mut lane = establish(&spec, &sock, peer, local, false).expect("lane");
         let packet = ipv4_packet([10, 14, 0, 2], [192, 0, 2, 1]);
         let mut warm = Vec::with_capacity(3 + packet.len());
         connectip::datagram_prefix(lane.stream, &mut warm);
@@ -5375,6 +5518,7 @@ mod tests {
             headers: Vec::new(),
             remote_dns: Vec::new(),
             warp: None,
+            quic_v2: false,
             noize: crate::noize::MasqueNoize::off(),
             xmux: Xmux::defaults(),
             large_segments: false,
@@ -5835,7 +5979,7 @@ mod tests {
         let spec = ClientSpec::from(&outbound(port)).expect("spec");
         let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port).expect("resolve");
         let sock = Datagram::plain(sock);
-        let mut lane = establish(&spec, &sock, peer, local).expect("lane");
+        let mut lane = establish(&spec, &sock, peer, local, false).expect("lane");
         let mut packet = vec![0u8; 1400];
         packet[0] = 0x45;
         packet[2..4].copy_from_slice(&1400u16.to_be_bytes());
@@ -5890,7 +6034,7 @@ mod tests {
         let spec = ClientSpec::from(&outbound(port)).expect("spec");
         let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port).expect("resolve");
         let sock = Datagram::plain(sock);
-        let mut lane = establish(&spec, &sock, peer, local).expect("lane");
+        let mut lane = establish(&spec, &sock, peer, local, false).expect("lane");
         let mut packet = vec![0u8; 64];
         packet[0] = 0x45;
         packet[2..4].copy_from_slice(&64u16.to_be_bytes());
@@ -5932,7 +6076,7 @@ mod tests {
         let (_inbound, port) = serve("127.0.0.1:1");
         let outbound = outbound_with(port, "Basic dTpw");
         let spec = ClientSpec::from(&outbound).expect("spec");
-        let reason = open(&spec).expect_err("the edge refuses");
+        let reason = open(&spec, false).expect_err("the edge refuses");
         assert!(reason.ends_with("the edge answered 401"), "{reason}");
     }
 
@@ -6728,6 +6872,7 @@ mod tests {
             headers: Vec::new(),
             remote_dns: Vec::new(),
             warp: None,
+            quic_v2: false,
             noize: crate::noize::MasqueNoize::off(),
             xmux: Xmux::defaults(),
             large_segments: false,
