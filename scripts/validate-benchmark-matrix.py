@@ -40,14 +40,6 @@ REQUIRED_RESULTS_KEYS = {
     "scenarios",
     "manifest",
 }
-ALWAYS_CHARTS = [
-    "cpu-per-gib.png",
-    "memory-rss.png",
-    "threads.png",
-    "startup.png",
-    "ceiling.png",
-    "binary-size.png",
-]
 SETUP_CHART = "setup-latency.png"
 THROUGHPUT_ENGINES = [
     "xray-core",
@@ -304,44 +296,77 @@ def check_manifest(results, cells):
         )
 
 
-def check_charts(charts_dir, results, cells):
-    """Every chart the bundle should hold exists and is non-empty.
+def manifest_has_binary_sizes(results):
+    """True when the manifest gives an engine a size the chart can draw."""
+    for line in results.get("manifest", []):
+        parts = line.split()
+        if len(parts) > 1 and parts[0] == "engine":
+            if any(part.startswith("mib=") and part.partition("=")[2]
+                   for part in parts[2:]):
+                return True
+    return False
 
-    The setup chart exists only when a setup scenario ran. The ceiling and
-    CPU charts exist only when a priced cell produced the samples they draw:
-    a filtered run of UDP-only cells records none, and a priced cell whose
-    runs all failed has none to plot.
-    """
+
+def any_metric(cells, metric):
+    """True when any engine in any cell holds a sample the renderer can plot."""
+    return any(
+        cell_samples(cell, engine.get("name"), metric)
+        for cell in cells
+        for engine in cell.get("engines", [])
+    )
+
+
+def wanted_charts(results, cells):
+    """The charts the renderer draws from these results and cells."""
     scenarios = results.get("scenarios", [])
-    bulk = any("setup" not in scenario.get("id", "") for scenario in scenarios)
-    wanted = list(ALWAYS_CHARTS) if bulk else ["startup.png", "binary-size.png"]
-    priced = [
-        scenario
+    usable = {
+        scenario["id"]: cells[scenario["id"]]
         for scenario in scenarios
+        if cells.get(scenario["id"]) is not None
+    }
+    bulk = [
+        usable[scenario["id"]] for scenario in scenarios
+        if "setup" not in scenario.get("id", "")
+        and scenario["id"] in usable
+    ]
+    priced = [
+        usable[scenario["id"]] for scenario in scenarios
         if "setup" not in scenario.get("id", "")
         and scenario.get("workload", {}).get("traffic")
         in ("upload", "download", "full-duplex")
+        and scenario["id"] in usable
     ]
-    priced_cells = [
-        cells[scenario["id"]] for scenario in priced
-        if cells.get(scenario["id"]) is not None
-    ]
-    if "ceiling.png" in wanted and not any(
-        cell.get("harness_ceilings_mib_s")
-        and any(cell_samples(cell, engine.get("name"), "throughput_mib_s")
-                for engine in cell.get("engines", []))
-        for cell in priced_cells
+    wanted = []
+    if any_metric(bulk, "rss_mib"):
+        wanted.append("memory-rss.png")
+    if any_metric(bulk, "threads_peak"):
+        wanted.append("threads.png")
+    if any_metric(usable.values(), "startup_seconds"):
+        wanted.append("startup.png")
+    if any_metric(priced, "cpu_millis_per_gib"):
+        wanted.append("cpu-per-gib.png")
+    if any(
+        any(isinstance(value, (int, float)) and value > 0
+            for value in cell.get("harness_ceilings_mib_s", []))
+        and any_metric([cell], "throughput_mib_s")
+        for cell in priced
     ):
-        wanted.remove("ceiling.png")
-    if "cpu-per-gib.png" in wanted and not any(
-        cell_samples(cell, engine.get("name"), "cpu_millis_per_gib")
-        for cell in priced_cells
-        for engine in cell.get("engines", [])
-    ):
-        wanted.remove("cpu-per-gib.png")
+        wanted.append("ceiling.png")
+    if manifest_has_binary_sizes(results):
+        wanted.append("binary-size.png")
     if any("setup" in scenario.get("id", "") for scenario in scenarios):
         wanted.append(SETUP_CHART)
-    for name in wanted:
+    return wanted
+
+
+def check_charts(charts_dir, results, cells):
+    """Every chart the bundle should hold exists and is non-empty.
+
+    The set follows the renderer: a chart exists only when a cell holds the
+    samples it draws, so a filtered or failed run does not demand an empty plot.
+    """
+    scenarios = results.get("scenarios", [])
+    for name in wanted_charts(results, cells):
         path = Path(charts_dir) / name
         check(path.is_file(), f"missing chart {path}")
         if path.is_file():
@@ -477,34 +502,45 @@ def check_bundle_readme(path, results):
 
 
 def selftest():
-    """The chart gate follows the samples the renderer can draw."""
+    """Every chart the renderer omits is also not demanded here."""
     global failures
+    charts = ("cpu-per-gib.png", "memory-rss.png", "threads.png",
+              "startup.png", "ceiling.png", "binary-size.png")
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "scenarios").mkdir()
-        for name in ("memory-rss.png", "threads.png", "startup.png",
-                     "binary-size.png", "ceiling.png", "scenarios/x.png"):
+        for name in (*charts, "scenarios/x.png"):
             (root / name).write_bytes(b"png")
-        results = {"scenarios": [{
-            "id": "x", "base": "x", "workload": {"traffic": "upload"},
-            "ceilings_mib_s": [100],
-            "medians": {"ferrox": {"throughput_mib_s": 50}},
-        }]}
+        results = {
+            "manifest": ["engine ferrox: /x mib=10"],
+            "scenarios": [{
+                "id": "x", "base": "x", "workload": {"traffic": "upload"},
+                "ceilings_mib_s": [100],
+                "medians": {"ferrox": {"throughput_mib_s": 50}},
+            }],
+        }
         cells = {"x": {
             "scenario": "x", "workload": {"traffic": "upload"},
             "harness_ceilings_mib_s": [100],
-            "engines": [{"name": "ferrox",
-                         "runs": [{"throughput_mib_s": 50}]}],
+            "engines": [{"name": "ferrox", "runs": [{
+                "throughput_mib_s": 50,
+                "cpu_millis_per_gib": 10,
+                "rss_mib": 100,
+                "threads_peak": 4,
+                "startup_seconds": 0.1,
+            }]}],
         }}
+        assert set(wanted_charts(results, cells)) == set(charts)
         failures = []
         check_charts(root, results, cells)
         assert not failures, failures
+        (root / "startup.png").unlink()
+        failures = []
+        check_charts(root, results, cells)
+        assert any("missing chart" in failure for failure in failures), failures
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "scenarios").mkdir()
-        for name in ("memory-rss.png", "threads.png", "startup.png",
-                     "binary-size.png"):
-            (root / name).write_bytes(b"png")
         results = {"scenarios": [{
             "id": "x", "base": "x", "workload": {"traffic": "upload"},
             "ceilings_mib_s": [100], "medians": {},
@@ -514,18 +550,17 @@ def selftest():
             "harness_ceilings_mib_s": [100],
             "engines": [{"name": "ferrox", "runs": []}],
         }}
+        assert wanted_charts(results, cells) == []
         failures = []
         check_charts(root, results, cells)
         assert not failures, failures
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "scenarios").mkdir()
-        for name in ("memory-rss.png", "threads.png", "startup.png",
-                     "binary-size.png"):
-            (root / name).write_bytes(b"png")
         results = {"scenarios": [{
             "id": "x", "base": "x", "workload": {"traffic": "upload"},
         }]}
+        assert wanted_charts(results, {"x": None}) == []
         failures = []
         check_charts(root, results, {"x": None})
         assert not failures, failures

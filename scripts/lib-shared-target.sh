@@ -234,6 +234,7 @@ ferrox_lock_release() {
 # Without lsof or fuser, 2 says "unknown": cleanup must skip, not assume idle.
 ferrox_target_in_use() {
   local target="$1" profile
+  [[ -n "$target" ]] || return 2
   [[ -d "$target" ]] || return 1
   local -a locks=()
   for profile in debug release doc; do
@@ -241,8 +242,13 @@ ferrox_target_in_use() {
   done
   locks+=("$target/.cargo-lock")
   if command -v lsof >/dev/null; then
-    lsof -t "${locks[@]}" >/dev/null 2>&1
-    return
+    local holders status=0
+    holders="$(lsof -t "${locks[@]}" 2>/dev/null)" || status=$?
+    [[ -z "$holders" ]] || return 0
+    if [[ "$status" -eq 1 ]]; then
+      return 1
+    fi
+    return 2
   fi
   if command -v fuser >/dev/null; then
     fuser -s "${locks[@]}" >/dev/null 2>&1
@@ -256,6 +262,34 @@ ferrox_target_idle() {
   local status=0
   ferrox_target_in_use "$1" || status=$?
   [[ "$status" -eq 1 ]]
+}
+
+# A partial lsof match still lists its holders; only an empty, status-1 probe is idle.
+ferrox_target_probe_selftest() {
+  local tmp fake target rc
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/ferrox-probe.XXXXXX")"
+  target="$tmp/target"
+  fake="$tmp/bin/lsof"
+  mkdir -p "$target/debug" "$tmp/bin"
+  : >"$target/debug/.cargo-lock"
+  printf '#!/bin/sh\nprintf "%%s\\n" 123\nexit 1\n' >"$fake"
+  chmod +x "$fake"
+  rc=0
+  PATH="$tmp/bin:$PATH" ferrox_target_in_use "$target" || rc=$?
+  [[ "$rc" -eq 0 ]] || { rm -rf "$tmp"; echo "probe selftest: lsof holder with status 1 read as not busy" >&2; return 1; }
+  printf '#!/bin/sh\nexit 1\n' >"$fake"
+  rc=0
+  PATH="$tmp/bin:$PATH" ferrox_target_in_use "$target" || rc=$?
+  [[ "$rc" -eq 1 ]] || { rm -rf "$tmp"; echo "probe selftest: empty status-1 lsof read as not idle" >&2; return 1; }
+  printf '#!/bin/sh\nexit 2\n' >"$fake"
+  rc=0
+  PATH="$tmp/bin:$PATH" ferrox_target_in_use "$target" || rc=$?
+  [[ "$rc" -eq 2 ]] || { rm -rf "$tmp"; echo "probe selftest: failed lsof read as known" >&2; return 1; }
+  rc=0
+  ferrox_target_in_use "" || rc=$?
+  [[ "$rc" -eq 2 ]] || { rm -rf "$tmp"; echo "probe selftest: absent target read as known" >&2; return 1; }
+  rm -rf "$tmp"
+  echo "probe selftest: ok"
 }
 
 # Reserve Cargo's own locks before a reclaimer moves a target aside. The holder

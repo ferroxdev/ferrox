@@ -37,7 +37,8 @@ while [[ $# -gt 0 ]]; do
     --reset-idle) reset_days="${2:?--reset-idle wants days}"; shift 2 ;;
     --ensure-free) ensure_free="${2:?--ensure-free wants GiB}"; shift 2 ;;
     --keep) keep="${2:?--keep wants a path}"; shift 2 ;;
-    *) echo "usage: scripts/gc-target.sh [--dry-run|--apply] [--lean] [--lean-age MINUTES] [--older-than HOURS] [--reset-idle DAYS] [--ensure-free GIB] [--keep PATH]" >&2; exit 2 ;;
+    --selftest) ferrox_target_probe_selftest; exit ;;
+    *) echo "usage: scripts/gc-target.sh [--selftest] [--dry-run|--apply] [--lean] [--lean-age MINUTES] [--older-than HOURS] [--reset-idle DAYS] [--ensure-free GIB] [--keep PATH]" >&2; exit 2 ;;
   esac
 done
 [[ "$hours" =~ ^[0-9]+$ ]] || { echo "--older-than wants whole hours" >&2; exit 2; }
