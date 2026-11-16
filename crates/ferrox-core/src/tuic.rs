@@ -1,6 +1,6 @@
 //! TUIC v5 framing: the authentication header, CONNECT streams, and fragmented PACKET datagrams.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 pub const VERSION: u8 = 5;
 pub const ALPN: &[u8] = b"h3";
@@ -43,11 +43,11 @@ impl<'a> Address<'a> {
         if bytes.is_empty() {
             return None;
         }
-        if let Ok(ip) = host.parse::<Ipv4Addr>() {
-            return Some(Self::V4(ip.octets()));
-        }
-        if let Ok(ip) = host.parse::<Ipv6Addr>() {
-            return Some(Self::V6(ip.octets()));
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Some(match ip {
+                IpAddr::V4(ip) => Self::V4(ip.octets()),
+                IpAddr::V6(ip) => Self::V6(ip.octets()),
+            });
         }
         (bytes.len() <= MAX_ADDRESS).then_some(Self::Name(bytes))
     }
@@ -137,41 +137,65 @@ impl Packet<'_> {
 }
 
 pub fn parse_packet_prefix(data: &[u8]) -> Result<(Packet<'_>, usize), FrameError> {
-    if data.len() < 10 {
-        return Err(FrameError::Short);
-    }
-    let version = data[0];
+    let (header, mut rest) = data.split_at_checked(10).ok_or(FrameError::Short)?;
+    let version = header[0];
     if version != VERSION {
         return Err(FrameError::BadVersion(version));
     }
-    if data[1] != PACKET {
-        return Err(FrameError::BadCommand(data[1]));
+    if header[1] != PACKET {
+        return Err(FrameError::BadCommand(header[1]));
     }
-    let association = u16::from_be_bytes([data[2], data[3]]);
-    let packet = u16::from_be_bytes([data[4], data[5]]);
-    let total = data[6];
-    let index = data[7];
+    let association = u16::from_be_bytes([header[2], header[3]]);
+    let packet = u16::from_be_bytes([header[4], header[5]]);
+    let total = header[6];
+    let index = header[7];
     if total == 0 || index >= total {
         return Err(FrameError::BadFragment);
     }
-    let payload_len = usize::from(u16::from_be_bytes([data[8], data[9]]));
-    let mut at = 10;
+    let payload_len = usize::from(u16::from_be_bytes([header[8], header[9]]));
     let destination = if index == 0 {
-        let address = Address::take(data, &mut at)?;
-        let end = at.checked_add(2).ok_or(FrameError::Short)?;
-        let port = data.get(at..end).ok_or(FrameError::Short)?;
-        at = end;
-        Some((address, u16::from_be_bytes([port[0], port[1]])))
+        let (kind, after_kind) = rest.split_first().ok_or(FrameError::Short)?;
+        let (address, after_address) = match *kind {
+            0 => {
+                let (len, after_len) = after_kind.split_first().ok_or(FrameError::Short)?;
+                let (name, after_name) = after_len
+                    .split_at_checked(usize::from(*len))
+                    .ok_or(FrameError::Short)?;
+                if name.is_empty() {
+                    return Err(FrameError::EmptyName);
+                }
+                (Address::Name(name), after_name)
+            }
+            1 => {
+                let (octets, after) = after_kind
+                    .split_first_chunk::<4>()
+                    .ok_or(FrameError::Short)?;
+                (Address::V4(*octets), after)
+            }
+            2 => {
+                let (octets, after) = after_kind
+                    .split_first_chunk::<16>()
+                    .ok_or(FrameError::Short)?;
+                (Address::V6(*octets), after)
+            }
+            other => return Err(FrameError::BadAddress(other)),
+        };
+        let (port, after_port) = after_address
+            .split_first_chunk::<2>()
+            .ok_or(FrameError::Short)?;
+        rest = after_port;
+        Some((address, u16::from_be_bytes(*port)))
     } else {
-        let marker = *data.get(at).ok_or(FrameError::Short)?;
-        if marker != CONTINUATION {
+        let (marker, after) = rest.split_first().ok_or(FrameError::Short)?;
+        if *marker != CONTINUATION {
             return Err(FrameError::BadFragment);
         }
-        at += 1;
+        rest = after;
         None
     };
-    let end = at.checked_add(payload_len).ok_or(FrameError::Short)?;
-    let payload = data.get(at..end).ok_or(FrameError::Short)?;
+    let (payload, after) = rest
+        .split_at_checked(payload_len)
+        .ok_or(FrameError::Short)?;
     Ok((
         Packet {
             association,
@@ -181,7 +205,7 @@ pub fn parse_packet_prefix(data: &[u8]) -> Result<(Packet<'_>, usize), FrameErro
             destination,
             payload,
         },
-        end,
+        data.len() - after.len(),
     ))
 }
 
