@@ -2154,6 +2154,34 @@ impl Relay {
 mod tests {
     use super::*;
 
+    /// Input queued before a terminal failure is returned before the terminal datagram.
+    #[test]
+    fn terminal_data_waits_behind_queued_input() {
+        let (out, _out_rx) = mpsc::sync_channel(1);
+        let (input_tx, input) = mpsc::sync_channel(16);
+        input_tx.send(Ok(b"A".to_vec())).expect("queued input");
+        let mut stream = WebRtcStream {
+            out,
+            input: Arc::new(Mutex::new(input)),
+            terminal: Arc::new(Mutex::new(VecDeque::from([b"B".to_vec()]))),
+            pending: Arc::new(Mutex::new((Vec::new(), 0))),
+            stop: Arc::new(AtomicBool::new(false)),
+            failure: Arc::new(Mutex::new(Some("failed".to_owned()))),
+            padding_sent: Arc::new(AtomicBool::new(false)),
+            shaping: None,
+            media: false,
+            read_timeout: Arc::new(Mutex::new(Some(Duration::from_secs(1)))),
+            write_timeout: Arc::new(Mutex::new(Some(Duration::from_secs(1)))),
+        };
+        let mut byte = [0u8; 1];
+        assert_eq!(stream.read(&mut byte).expect("first"), 1);
+        assert_eq!(&byte, b"A");
+        assert_eq!(stream.read(&mut byte).expect("second"), 1);
+        assert_eq!(&byte, b"B");
+        assert!(stream.read(&mut byte).is_err());
+        drop(input_tx);
+    }
+
     #[test]
     fn a_weighted_coin_keeps_the_inclusive_endpoints() {
         assert!(weighted(1.0, 0.99));

@@ -1434,6 +1434,7 @@ mod tests {
             &config,
             None,
             super::QuestionMatch::None,
+            None,
         )
         .expect("query");
         responder.join().expect("responder");
@@ -1480,6 +1481,7 @@ mod tests {
             &config,
             None,
             super::QuestionMatch::None,
+            config.request_timeout,
         )
         .expect("alternate");
         responder.join().expect("responder");
@@ -1621,6 +1623,7 @@ mod tests {
             &config,
             None,
             super::QuestionMatch::None,
+            None,
         )
         .expect("query");
         responder.join().expect("responder");
