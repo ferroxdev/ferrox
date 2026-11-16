@@ -314,7 +314,7 @@ summarize_monitor() {
     python3 - "$OUT_DIR" "$1" << 'PY'
 import glob, json, sys
 out, tag = sys.argv[1], sys.argv[2]
-cpu = rss = pss = 0.0
+cpu = rss = pss = rss_sum = 0.0
 for path in glob.glob(f"{out}/mon-{tag}-*.json"):
     try:
         m = json.load(open(path))
@@ -323,7 +323,9 @@ for path in glob.glob(f"{out}/mon-{tag}-*.json"):
     cpu += m.get("avg_cpu_pct", 0.0)
     rss = max(rss, m.get("max_rss_kb", 0))
     pss = max(pss, m.get("max_pss_kb", 0))
-print(f"{cpu:.1f} {rss:.0f} {pss:.0f}")
+    # Summed as well as maxed, because engine_memory() sums the engine's processes: only a sum can be subtracted from its start, and summing per-process peaks is an upper bound on the simultaneous one.
+    rss_sum += m.get("max_rss_kb", 0)
+print(f"{cpu:.1f} {rss:.0f} {pss:.0f} {rss_sum:.0f}")
 PY
 }
 
@@ -393,10 +395,11 @@ run_scenario() {
     cpu_pct=$1
     peak_rss=$2
     peak_pss=$3
+    peak_rss_sum=$4
     sleep "$SETTLE"
     set -- $(engine_memory)
-    printf '{"engine":"%s","scenario":"%s","rep":%s,"slot":%s,"value":"%s","unit":"%s","cpu_pct":%s,"rss_kb":%s,"pss_kb":%s,"rss_after_kb":%s,"pss_after_kb":%s,"rss_start_kb":%s,"settle_s":%s,"mtu":%s,"queues":%s}\n' \
-        "$engine" "$scenario" "$rep" "$slot" "$value" "$unit" "$cpu_pct" "$peak_rss" "$peak_pss" "$1" "$2" "$RSS_START" "$SETTLE" "$MTU" "$QUEUES" >> "$RESULTS"
+    printf '{"engine":"%s","scenario":"%s","rep":%s,"slot":%s,"value":"%s","unit":"%s","cpu_pct":%s,"rss_kb":%s,"rss_sum_kb":%s,"pss_kb":%s,"rss_after_kb":%s,"pss_after_kb":%s,"rss_start_kb":%s,"settle_s":%s,"mtu":%s,"queues":%s}\n' \
+        "$engine" "$scenario" "$rep" "$slot" "$value" "$unit" "$cpu_pct" "$peak_rss" "$peak_rss_sum" "$peak_pss" "$1" "$2" "$RSS_START" "$SETTLE" "$MTU" "$QUEUES" >> "$RESULTS"
     printf "  %-18s %-12s rep %s: %s %s cpu %s%% rss %s KB, %s KB after %ss idle\n" \
         "$engine" "$scenario" "$rep" "$value" "$unit" "$cpu_pct" "$peak_rss" "$1" "$SETTLE"
 }
@@ -503,7 +506,7 @@ for (engine, scenario), group in groups.items():
     cpu = statistics.median(row["cpu_pct"] for row in group)
     rss = max(row["rss_kb"] for row in group) / 1024
     after = max(row.get("rss_after_kb", 0) for row in group) / 1024
-    above = max(row["rss_kb"] - row.get("rss_start_kb", 0) for row in group) / 1024
+    above = max(row.get("rss_sum_kb", row["rss_kb"]) - row.get("rss_start_kb", 0) for row in group) / 1024
     lines.append(f"| {engine} | {scenario} | {best['value']} {best['unit']} | {cpu:.0f} | {rss:.1f} | {after:.1f} | {above:.1f} |")
 open(sys.argv[2], "w").write("\n".join(lines) + "\n")
 print("\n".join(lines))
