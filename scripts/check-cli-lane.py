@@ -3344,13 +3344,28 @@ def main() -> int:
     running = {}
     states = []
     children = set()
-    children_lock = threading.Lock()
+    children_lock = threading.Condition()
+    in_flight = 0
+    shutting_down = False
     real_popen = subprocess.Popen
 
     def tracked_popen(*args, **kwargs):
-        proc = real_popen(*args, **kwargs)
+        nonlocal in_flight
+        with children_lock:
+            if shutting_down:
+                raise RuntimeError("check-cli-lane is shutting down")
+            in_flight += 1
+        try:
+            proc = real_popen(*args, **kwargs)
+        except BaseException:
+            with children_lock:
+                in_flight -= 1
+                children_lock.notify_all()
+            raise
         with children_lock:
             children.add(proc)
+            in_flight -= 1
+            children_lock.notify_all()
         return proc
 
     subprocess.Popen = tracked_popen
@@ -3383,8 +3398,10 @@ def main() -> int:
     finally:
         unfinished = list(running.values())
         pool.shutdown(wait=False, cancel_futures=True)
-        subprocess.Popen = real_popen
         with children_lock:
+            shutting_down = True
+            while in_flight:
+                children_lock.wait(timeout=0.1)
             snapshot = list(children)
         for proc in snapshot:
             try:
@@ -3422,6 +3439,7 @@ def main() -> int:
         sys.stderr.flush()
         # The pool's non-daemon threads join at interpreter exit; leave now so a wedged check cannot hang the job.
         os._exit(1)
+    subprocess.Popen = real_popen
     if failed:
         print(f"check-cli-lane: failed: {', '.join(failed)}", file=sys.stderr)
         return 1
