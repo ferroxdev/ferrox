@@ -35,12 +35,14 @@ def median(values):
     return statistics.median(values)
 
 
-def verdict_for(interval, direction):
+def verdict_for(interval, _direction):
     """Whole-interval verdict: better, worse, within-noise, or unproven.
 
-    `interval` is a (low, high) pair or None; `direction` is "higher" or
-    "lower". Mirrors `stats::verdict`: a verdict needs the whole interval
-    beyond tolerance on one side, and anything unmeasured is unproven.
+    `interval` is a (low, high) pair or None. It is already oriented by
+    `stats::paired_ratios`, which inverts lower-is-better pairs, so an
+    interval below 1 is worse whichever direction the row names. `_direction`
+    is kept for parity with `stats::verdict`, where the interval is likewise
+    oriented before this rule sees it.
     """
     if interval is None:
         return "unproven"
@@ -257,6 +259,10 @@ def selftest():
     assert stalled["state"] == "split" and stalled["ratio"] is None
     assert spread([0.0, 0.0]) is None
     assert spread([100.0]) is None
+    assert verdict_for((0.90, 0.94), "higher") == "worse"
+    assert verdict_for((1.06, 1.10), "lower") == "better"
+    assert verdict_for((0.96, 1.04), "lower") == "within-noise"
+    assert verdict_for(None, "higher") == "unproven"
     print("benchstats: selftest ok")
     return 0
 

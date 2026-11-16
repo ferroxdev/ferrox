@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -293,8 +294,8 @@ def check_manifest(results, cells):
         for part in parts[2:]:
             if part.startswith("sha256="):
                 digest = part.split("=", 1)[1]
-        check(digest is not None, f"manifest line without digest: {line}")
-        if digest is None or label not in headers:
+        check(bool(digest), f"manifest line without digest: {line}")
+        if not digest or label not in headers:
             continue
         check(
             headers[label] == {digest},
@@ -303,20 +304,17 @@ def check_manifest(results, cells):
         )
 
 
-def check_charts(charts_dir, results):
+def check_charts(charts_dir, results, cells):
     """Every chart the bundle should hold exists and is non-empty.
 
-    The setup chart exists only when a setup scenario ran, and the ceiling
-    chart only when a cell measured a harness ceiling: a filtered run of
-    UDP-only cells records none, so requiring it unconditionally would fail.
+    The setup chart exists only when a setup scenario ran. The ceiling and
+    CPU charts exist only when a priced cell produced the samples they draw:
+    a filtered run of UDP-only cells records none, and a priced cell whose
+    runs all failed has none to plot.
     """
     scenarios = results.get("scenarios", [])
     bulk = any("setup" not in scenario.get("id", "") for scenario in scenarios)
     wanted = list(ALWAYS_CHARTS) if bulk else ["startup.png", "binary-size.png"]
-    if "ceiling.png" in wanted and not any(
-        scenario.get("ceilings_mib_s") for scenario in scenarios
-    ):
-        wanted.remove("ceiling.png")
     priced = [
         scenario
         for scenario in scenarios
@@ -324,7 +322,22 @@ def check_charts(charts_dir, results):
         and scenario.get("workload", {}).get("traffic")
         in ("upload", "download", "full-duplex")
     ]
-    if "cpu-per-gib.png" in wanted and not priced:
+    priced_cells = [
+        cells[scenario["id"]] for scenario in priced
+        if scenario["id"] in cells
+    ]
+    if "ceiling.png" in wanted and not any(
+        cell.get("harness_ceilings_mib_s")
+        and any(cell_samples(cell, engine.get("name"), "throughput_mib_s")
+                for engine in cell.get("engines", []))
+        for cell in priced_cells
+    ):
+        wanted.remove("ceiling.png")
+    if "cpu-per-gib.png" in wanted and not any(
+        cell_samples(cell, engine.get("name"), "cpu_millis_per_gib")
+        for cell in priced_cells
+        for engine in cell.get("engines", [])
+    ):
         wanted.remove("cpu-per-gib.png")
     if any("setup" in scenario.get("id", "") for scenario in scenarios):
         wanted.append(SETUP_CHART)
@@ -463,9 +476,68 @@ def check_bundle_readme(path, results):
         )
 
 
+def selftest():
+    """The chart gate follows the samples the renderer can draw."""
+    global failures
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "scenarios").mkdir()
+        for name in ("memory-rss.png", "threads.png", "startup.png",
+                     "binary-size.png", "ceiling.png", "scenarios/x.png"):
+            (root / name).write_bytes(b"png")
+        results = {"scenarios": [{
+            "id": "x", "base": "x", "workload": {"traffic": "upload"},
+            "ceilings_mib_s": [100],
+            "medians": {"ferrox": {"throughput_mib_s": 50}},
+        }]}
+        cells = {"x": {
+            "scenario": "x", "workload": {"traffic": "upload"},
+            "harness_ceilings_mib_s": [100],
+            "engines": [{"name": "ferrox",
+                         "runs": [{"throughput_mib_s": 50}]}],
+        }}
+        failures = []
+        check_charts(root, results, cells)
+        assert not failures, failures
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "scenarios").mkdir()
+        for name in ("memory-rss.png", "threads.png", "startup.png",
+                     "binary-size.png"):
+            (root / name).write_bytes(b"png")
+        results = {"scenarios": [{
+            "id": "x", "base": "x", "workload": {"traffic": "upload"},
+            "ceilings_mib_s": [100], "medians": {},
+        }]}
+        cells = {"x": {
+            "scenario": "x", "workload": {"traffic": "upload"},
+            "harness_ceilings_mib_s": [100],
+            "engines": [{"name": "ferrox", "runs": []}],
+        }}
+        failures = []
+        check_charts(root, results, cells)
+        assert not failures, failures
+    failures = []
+    check_manifest({"manifest": ["engine xray-core: /x sha256="]},
+                   {"s": {"engines": [{"name": "xray-core",
+                                      "binary_sha256": "abc"}]}})
+    assert any("without digest" in failure for failure in failures), failures
+    failures = []
+    check_manifest({"manifest": ["engine xray-core: /x sha256=abc"]},
+                   {"s": {"engines": [{"name": "xray-core",
+                                      "binary_sha256": "def"}]}})
+    assert any("disagrees" in failure for failure in failures), failures
+    print("validate-benchmark-matrix: selftest ok")
+    return 0
+
+
 def main(argv=None):
     """Validate a rendered matrix bundle."""
     global args
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv == ["--selftest"]:
+        return selftest()
     parser = argparse.ArgumentParser(description="validate benchmark matrix bundle")
     parser.add_argument("--cells", required=True, help="cells/ directory")
     parser.add_argument("--results", required=True, help="matrix-results.json path")
@@ -519,7 +591,7 @@ def main(argv=None):
     check_spread(results_doc, cells)
     check_medians(results_doc, cells)
     check_manifest(results_doc, cells)
-    check_charts(args.charts, results_doc)
+    check_charts(args.charts, results_doc, cells)
     if args.readme:
         check_readme(args.readme, args.charts, results_doc)
     if args.bundle_readme:

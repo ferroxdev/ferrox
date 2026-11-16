@@ -251,6 +251,13 @@ ferrox_target_in_use() {
   return 2
 }
 
+# Only a positive idle probe may be reclaimed; an unknown probe is not idle.
+ferrox_target_idle() {
+  local status=0
+  ferrox_target_in_use "$1" || status=$?
+  [[ "$status" -eq 1 ]]
+}
+
 # Reserve Cargo's own locks before a reclaimer moves a target aside. The holder
 # is a process, so a build starting after the probe either waits on these locks
 # or finds the target gone; the inode a build waits on stays inside the moved
