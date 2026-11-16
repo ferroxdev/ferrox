@@ -7979,7 +7979,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
     };
     // Every scan group keeps a slice of the native cap, so no group is dropped.
     let scan_cap = if scan.is_some() {
-        (FRONTED_SERVERS / scan_groups).min(FRONTED_VARIANTS).max(1)
+        (FRONTED_SERVERS / scan_groups).clamp(1, FRONTED_VARIANTS)
     } else {
         FRONTED_VARIANTS
     };
