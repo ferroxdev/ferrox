@@ -537,11 +537,11 @@ fn read_limit(gso: bool, mss: usize, room: usize) -> usize {
     }
 }
 
-/// The upload size a ping-pong keeps under: a request that fits one small segment is a conversation the answer follows, where a bulk upload's segment is not.
-const PING_PONG_BYTES: usize = 1024;
-
 /// How long a queue waits for an answer that follows its own upload: an echo replies in microseconds, and past this the response thread's read is the cheaper waiter.
 const PING_PONG_SPIN: std::time::Duration = std::time::Duration::from_micros(100);
+
+/// Answers in a row that may miss before a flow stops waiting: a conversation answers inside the window every time, where a bulk upload's peer never does, and paying the wait four times once costs a flow less than a millisecond.
+const PING_PONG_MISSES: u32 = 4;
 
 /// Emit one segment an upstream read already landed in `buf[body..body + n]` and whose sequence the reader reserved under its gate, returning the cursor it carried. The response thread and the queue's inline serve share it, so the GSO split and the bytes cannot drift apart; bytes a device did not accept are consumed and cannot be re-read, so a refusal is an error both callers end the flow on.
 #[allow(clippy::too_many_arguments)]
@@ -1457,6 +1457,8 @@ struct Flow {
     isn: u32,
     /// The shift the peer offered for its own receive window in the SYN, so each ACK's window field is read in bytes.
     peer_shift: u8,
+    /// Answers in a row that did not arrive inside the queue's wait, so an upload whose peer speaks once a segment stops paying it and a ping-pong keeps it.
+    misses: AtomicU32,
     /// The upload half, installed once the lane is live: a direct dial or the loopback pair's device end. A retransmitted SYN waits for it instead of replaying a handshake no lane carries yet.
     write_half: Mutex<Option<Connection>>,
     rcv_nxt: Arc<AtomicU32>,
@@ -1986,7 +1988,7 @@ impl Handler {
                     end = rcv.wrapping_add(sent as u32);
                     flow.rcv_nxt.store(end, Relaxed);
                     if sent > 0 && !fin {
-                        served = self.serve_inline(half, &flow, payload.len() <= PING_PONG_BYTES);
+                        served = self.serve_inline(half, &flow);
                     }
                 }
                 if fin && tcp.seq.wrapping_add(len) == flow.rcv_nxt.load(Relaxed) {
@@ -2033,8 +2035,8 @@ impl Handler {
         Ok(())
     }
 
-    /// Take the answer a request-and-reply earns, on the queue thread that still holds the flow, so the transaction costs no response-thread wake. A non-blocking read never waits and the stream hands each byte to exactly one reader, so a flow thread parked in its own read keeps what this leaves. `wait` is the caller's verdict on whether an answer is due: a ping-pong waits one exchange window, a bulk upload takes one non-blocking read and moves on.
-    fn serve_inline(&mut self, half: &mut Connection, flow: &Flow, wait: bool) -> Served {
+    /// Take the answer a request-and-reply earns, on the queue thread that still holds the flow, so the transaction costs no response-thread wake. A non-blocking read never waits and the stream hands each byte to exactly one reader, so a flow thread parked in its own read keeps what this leaves. A flow learns whether an answer is due: it waits one exchange window while answers have been landing, and a bulk upload's four misses cost a millisecond once and leave it one non-blocking read per segment.
+    fn serve_inline(&mut self, half: &mut Connection, flow: &Flow) -> Served {
         // A host whose descriptor has no per-call non-blocking read keeps the answer on the response thread rather than blocking a queue behind it.
         if cfg!(not(unix)) || flow.signaled.load(Relaxed) {
             return Served::None;
@@ -2051,12 +2053,9 @@ impl Handler {
         if self.served.len() < body + cap {
             self.served.resize(body + cap, 0);
         }
-        let deadline = std::time::Instant::now()
-            + if wait {
-                PING_PONG_SPIN
-            } else {
-                std::time::Duration::ZERO
-            };
+        // No clock for a flow that stopped waiting: a bulk upload's segment takes one non-blocking read and nothing else.
+        let deadline = (flow.misses.load(Relaxed) < PING_PONG_MISSES)
+            .then(|| std::time::Instant::now() + PING_PONG_SPIN);
         let mut served = Served::None;
         loop {
             let gated = match flow.read_gate.try_lock() {
@@ -2082,6 +2081,7 @@ impl Handler {
             match read {
                 Ok((0, _)) => break,
                 Ok((n, seq)) => {
+                    flow.misses.store(0, Relaxed);
                     served = match emit_upstream(
                         flow,
                         &mut self.served,
@@ -2100,7 +2100,11 @@ impl Handler {
                     break;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if !wait || std::time::Instant::now() >= deadline {
+                    let Some(deadline) = deadline else { break };
+                    if std::time::Instant::now() >= deadline {
+                        if flow.misses.load(Relaxed) < PING_PONG_MISSES {
+                            flow.misses.fetch_add(1, Relaxed);
+                        }
                         break;
                     }
                     std::hint::spin_loop();
@@ -2208,6 +2212,7 @@ impl Handler {
             mss: Arc::clone(&mss),
             send: Arc::clone(&send),
             signaled: Arc::clone(&signaled),
+            misses: AtomicU32::new(0),
             read_gate: Mutex::new(()),
             upload_finished: UploadFinished::default(),
         });
@@ -3593,6 +3598,7 @@ mod tests {
             mss: Arc::new(AtomicU32::new(1460)),
             send: Arc::new(SendWindow::new(snd, 65535)),
             signaled: Arc::new(AtomicBool::new(false)),
+            misses: AtomicU32::new(0),
             read_gate: Mutex::new(()),
             upload_finished: UploadFinished::default(),
         }
@@ -3610,7 +3616,7 @@ mod tests {
         far.write_all(b"answer").unwrap();
         let flow = test_flow(5_000, 2_000);
         assert_eq!(
-            handler.serve_inline(&mut lane, &flow, true),
+            handler.serve_inline(&mut lane, &flow),
             Served::Ack(5_000),
             "the answer the lane already holds is served on this thread, carrying the cursor the flow held"
         );
@@ -3624,9 +3630,20 @@ mod tests {
         assert_eq!(tcp.ack_num, 5_000, "the request's ack rides the answer");
         assert_eq!(flow.snd_nxt.load(Relaxed), 2_006);
         assert_eq!(
-            handler.serve_inline(&mut lane, &flow, false),
+            handler.serve_inline(&mut lane, &flow),
             Served::None,
-            "a lane with nothing queued is not waited on when no answer is due"
+            "a lane with nothing queued is handed nothing"
+        );
+        assert_eq!(
+            flow.misses.load(Relaxed),
+            1,
+            "an answer that did not come is counted against the wait"
+        );
+        flow.misses.store(PING_PONG_MISSES, Relaxed);
+        assert_eq!(
+            handler.serve_inline(&mut lane, &flow),
+            Served::None,
+            "a flow that stopped landing answers is read once and not waited on"
         );
     }
 
@@ -3643,7 +3660,7 @@ mod tests {
         let flow = test_flow(5_000, 2_000);
         drop(peer);
         assert_eq!(
-            handler.serve_inline(&mut lane, &flow, false),
+            handler.serve_inline(&mut lane, &flow),
             Served::Failed,
             "a refused segment is not an answer"
         );
