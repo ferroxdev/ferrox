@@ -258,3 +258,7 @@ wireguard  wireguard::device::tests::a_replayed_transport_counter_is_refused  wi
 wireguard  wg::tests::a_prefix_table_picks_the_peer_the_scan_picks  ferrox_app::wg::tests::route_scan_once
 wireguard  wg::tests::a_prefix_table_picks_the_peer_the_scan_picks  ferrox_app::wg::tests::route_table_once
 carrier-quic  quic::tests::a_two_entry_identity_builds_every_context  quic::tls_config
+
+# The TUIC parser's own frame: one full PACKET header and payload over a fixed
+# buffer, with no socket, resolver or session state in the frame.
+tuic  tuic::tests::a_full_packet_fits_one_command  ferrox_core::tuic::parse_packet

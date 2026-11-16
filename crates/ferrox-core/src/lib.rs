@@ -33,6 +33,7 @@ pub mod stun;
 pub mod tls;
 pub mod transport;
 pub mod trojan;
+pub mod tuic;
 pub mod veepn;
 pub mod vless;
 pub mod vless_encryption;

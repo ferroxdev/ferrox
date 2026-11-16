@@ -171,6 +171,7 @@ impl PooledStream {
             id: self.id,
             meter: crate::stats::Meter::default(),
             peer_fin: Arc::new(AtomicBool::new(false)),
+            fin_sent: Arc::new(AtomicBool::new(false)),
             prefaced: Arc::new(AtomicBool::new(true)),
             activity: Arc::clone(&self.activity),
             stop: Arc::new(AtomicBool::new(false)),
@@ -3683,11 +3684,22 @@ pub(crate) fn udp_to_server_with(
     port: u16,
     options: Option<&crate::sockopt::SocketOptions>,
 ) -> Option<(UdpSocket, SocketAddr, SocketAddr)> {
+    udp_to_server_with_source(address, port, options, None)
+}
+
+/// The same dial with the flow's `sendThrough` source, so a carrier that binds its own socket does
+/// not leave from the address the kernel would pick.
+pub(crate) fn udp_to_server_with_source(
+    address: &str,
+    port: u16,
+    options: Option<&crate::sockopt::SocketOptions>,
+    source: Option<IpAddr>,
+) -> Option<(UdpSocket, SocketAddr, SocketAddr)> {
     let peer = match options {
         Some(options) => options.resolve_addr(address, port)?,
         None => crate::proxy::resolve_outbound(address, port)?,
     };
-    let (sock, local) = datagram_to_with(peer, options)?;
+    let (sock, local) = datagram_to_with_source(peer, options, source)?;
     Some((sock, peer, local))
 }
 
@@ -3695,29 +3707,38 @@ pub(crate) fn udp_to_server_with(
 /// event can compare that source with a fresh probe instead of a wildcard.
 #[cfg(test)]
 pub(crate) fn datagram_to(peer: SocketAddr) -> Option<(UdpSocket, SocketAddr)> {
-    datagram_to_with(peer, None)
+    datagram_to_with_source(peer, None, None)
 }
 
-fn datagram_to_with(
+fn datagram_to_with_source(
     peer: SocketAddr,
     options: Option<&crate::sockopt::SocketOptions>,
+    source: Option<IpAddr>,
 ) -> Option<(UdpSocket, SocketAddr)> {
     let bind = if peer.is_ipv6() {
         "[::]:0"
     } else {
         "0.0.0.0:0"
     };
-    let source = probe_source(peer, options)?;
+    let explicit = source.is_some();
     let at = match source {
-        SocketAddr::V4(addr) => SocketAddr::new(IpAddr::V4(*addr.ip()), 0),
-        SocketAddr::V6(addr) => SocketAddr::V6(std::net::SocketAddrV6::new(
-            *addr.ip(),
-            0,
-            addr.flowinfo(),
-            addr.scope_id(),
-        )),
+        Some(ip) if ip.is_ipv4() == peer.is_ipv4() => SocketAddr::new(ip, 0),
+        Some(_) => return None,
+        None => match probe_source(peer, options)? {
+            SocketAddr::V4(addr) => SocketAddr::new(IpAddr::V4(*addr.ip()), 0),
+            SocketAddr::V6(addr) => SocketAddr::V6(std::net::SocketAddrV6::new(
+                *addr.ip(),
+                0,
+                addr.flowinfo(),
+                addr.scope_id(),
+            )),
+        },
     };
-    let sock = bind_datagram_at(at).or_else(|_| bind_datagram(bind)).ok()?;
+    let sock = if explicit {
+        bind_datagram_at(at).ok()?
+    } else {
+        bind_datagram_at(at).or_else(|_| bind_datagram(bind)).ok()?
+    };
     if let Some(options) = options {
         options.apply_to_udp(&sock, peer).ok()?;
     }
@@ -4471,6 +4492,8 @@ pub(crate) struct QuicStream {
     meter: crate::stats::Meter,
     /// The peer's FIN can arrive with the last bytes, and `Read` has nowhere to report it; keeping it makes the next read the EOF instead of a read the poll repeats.
     peer_fin: Arc<AtomicBool>,
+    /// Our FIN was accepted by the connection, so a relay that ended gracefully must not reset it.
+    fin_sent: Arc<AtomicBool>,
     /// One H3 server preface per connection: the first request stream sends it, and a client-side
     /// handle starts true because it must never send one.
     prefaced: Arc<AtomicBool>,
@@ -4587,6 +4610,35 @@ impl crate::proxy::Duplicate for QuicStream {
 }
 
 impl QuicStream {
+    /// A stream handle built by a carrier that owns its own ids: the caller opens the stream first
+    /// and keeps it live until both directions end.
+    pub(crate) fn new(
+        conn: Arc<Mutex<quiche::Connection>>,
+        sock: Arc<Datagram>,
+        id: u64,
+        meter: crate::stats::Meter,
+    ) -> Self {
+        Self {
+            conn,
+            sock,
+            id,
+            meter,
+            peer_fin: Arc::new(AtomicBool::new(false)),
+            fin_sent: Arc::new(AtomicBool::new(false)),
+            prefaced: Arc::new(AtomicBool::new(true)),
+            activity: Arc::new(Activity::new()),
+            stop: Arc::new(AtomicBool::new(false)),
+            owner: None,
+        }
+    }
+
+    /// Drive this handle's reads and writes from the caller's stop, so a worker leaves with the loop
+    /// that owns the connection instead of holding the socket past it.
+    pub(crate) fn with_stop(mut self, stop: Arc<AtomicBool>) -> Self {
+        self.stop = stop;
+        self
+    }
+
     /// The request clock this stream's two directions share.
     pub(crate) fn activity(&self) -> Arc<Activity> {
         Arc::clone(&self.activity)
@@ -4663,16 +4715,33 @@ impl QuicStream {
                 }
             };
             match outcome {
-                Some(done) => return done,
+                Some(done) => {
+                    if done {
+                        self.fin_sent.store(true, Ordering::Relaxed);
+                    }
+                    return done;
+                }
                 None if Instant::now() >= deadline => return false,
                 None => std::thread::sleep(STREAM_POLL),
             }
         }
     }
 
+    pub(crate) fn fin_sent(&self) -> bool {
+        self.fin_sent.load(Ordering::Relaxed)
+    }
+
     /// Stop the stream in both directions; the connection itself is untouched.
     pub(crate) fn close(&self) {
         stop_stream(&self.conn, &self.sock, self.id);
+    }
+
+    /// Stop reading while keeping the send direction, so a FIN already sent is not reset.
+    pub(crate) fn shutdown_read(&self) {
+        if let Ok(mut conn) = self.conn.lock() {
+            let _ = conn.stream_shutdown(self.id, quiche::Shutdown::Read, 0);
+            flush_egress(&mut conn, &self.sock);
+        }
     }
 
     /// The H3 server preface, once per connection: SETTINGS and the QPACK hellos ride the server's
@@ -5112,6 +5181,7 @@ fn reap(
             id: stream,
             meter: crate::stats::Meter::default(),
             peer_fin: Arc::new(AtomicBool::new(false)),
+            fin_sent: Arc::new(AtomicBool::new(false)),
             prefaced: Arc::clone(&prefaced),
             activity: Arc::new(Activity::new()),
             stop,
@@ -5579,6 +5649,13 @@ mod tests {
             "a masked lane reads one datagram at a time"
         );
         assert!(udp_to_server("127.0.0.1", 443).is_some(), "still dials");
+        let plain = bind_datagram("127.0.0.1:0").expect("binds");
+        clear_gro(&plain);
+        assert_eq!(
+            gro(&plain),
+            Some(false),
+            "a lane that reads one datagram at a time never coalesces"
+        );
     }
 
     /// A GSO burst is one `sendmsg` on the wire and the same packets on the read side: the segment size the kernel
@@ -7314,6 +7391,7 @@ mod tests {
             id: 0,
             meter: crate::stats::Meter::default(),
             peer_fin: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fin_sent: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             prefaced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

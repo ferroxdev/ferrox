@@ -686,6 +686,20 @@ fn serve_inbounds_counted(
                             inbounds += 1;
                         }
                     }
+                    "tuic" => {
+                        if crate::tuic::serve_inbound(
+                            address,
+                            inbound,
+                            label,
+                            freedom,
+                            handler_stop.clone(),
+                        ) {
+                            if let Some(stop) = &handler_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            }
+                            inbounds += 1;
+                        }
+                    }
                     "socks" | "http" | "mixed" => {
                         let Some(out) = routed(inbound, true) else {
                             eprintln!(
@@ -892,12 +906,13 @@ fn refuse_inbound(protocol: &str, label: &str, inbound: &Json) {
 }
 
 /// Served inbounds; the `tun` device inbound opens a native interface and relays TCP flows.
-const SERVED_INBOUNDS: [&str; 14] = [
+const SERVED_INBOUNDS: [&str; 15] = [
     "vless",
     "trojan",
     "vmess",
     "shadowsocks",
     "hysteria",
+    "tuic",
     "socks",
     "http",
     "mixed",
@@ -1203,6 +1218,20 @@ fn default_outbound_tag() -> Option<String> {
         .clone()
 }
 
+/// The counters a carrier that builds its own stream handles charges, for a flow on this thread.
+pub(crate) fn flow_outbound_meter() -> Option<crate::stats::Meter> {
+    OUTBOUND_TAG.with(|cell| {
+        cell.borrow()
+            .as_deref()
+            .map(|tag| crate::stats::outbound(Some(tag)))
+    })
+}
+
+/// The counters an inbound listener charges, for a carrier whose streams carry their own handles.
+pub(crate) fn inbound_meter(inbound: &Json) -> crate::stats::Meter {
+    crate::stats::inbound(inbound_tag(inbound).as_deref())
+}
+
 struct OutboundTag;
 
 impl OutboundTag {
@@ -1303,6 +1332,13 @@ impl Drop for SendThroughGuard {
 /// The options the flow on this thread dials with, for a carrier that binds its own datagram socket.
 pub(crate) fn flow_sockopts() -> Option<Arc<crate::sockopt::SocketOptions>> {
     DIAL_SOCKOPTS.with(|cell| cell.borrow().clone())
+}
+
+/// The source the flow on this thread leaves from, for a carrier that binds its own datagram socket.
+pub(crate) fn flow_source() -> Option<IpAddr> {
+    resolve_source(SEND_THROUGH.with(std::cell::Cell::get))
+        .ok()
+        .flatten()
 }
 
 /// The options one flow's dial carries, cleared on drop so a pooled lane thread's next flow starts on the bare socket.
@@ -1555,6 +1591,7 @@ fn udp_lane_supported(out: &Outbound) -> bool {
         }
         Outbound::Vmess(_)
         | Outbound::Hysteria(_)
+        | Outbound::Tuic(_)
         | Outbound::Foxy(_)
         | Outbound::WireGuard(_)
         | Outbound::Masque(_)
@@ -2382,6 +2419,7 @@ pub(crate) enum Outbound {
     Vmess(VmessOut),
     Shadowsocks(ShadowsocksOut),
     Hysteria(Box<HysteriaOut>),
+    Tuic(Arc<crate::tuic::TuicOut>),
     Socks(SocksOut),
     Foxy(Box<FoxyOut>),
     Veepn(crate::veepn::VeepnOut),
@@ -2425,6 +2463,7 @@ impl Outbound {
             Self::Vmess(vmess) => resolve_outbound(&vmess.address, vmess.port),
             Self::Shadowsocks(ss) => resolve_outbound(&ss.address, ss.port),
             Self::Hysteria(hy) => resolve_outbound(&hy.address, hy.port),
+            Self::Tuic(tuic) => tuic.edge(),
             Self::Socks(socks) => resolve_outbound(&socks.address, socks.port),
             Self::Http(http) => resolve_outbound(&http.address, http.port),
             Self::WireGuard(wireguard) => wireguard.edge(),
@@ -3753,6 +3792,7 @@ fn chain_hop_can_dial_through(out: &Outbound) -> bool {
         Outbound::WireGuard(_)
         | Outbound::Warp(_)
         | Outbound::Hysteria(_)
+        | Outbound::Tuic(_)
         | Outbound::Foxy(_)
         | Outbound::Veepn(_)
         | Outbound::Loopback(_)
@@ -4220,7 +4260,7 @@ fn pick_script_outbound(
 fn dials_direct_inbound(protocol: &str) -> bool {
     matches!(
         canonical_protocol(protocol),
-        "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria"
+        "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria" | "tuic"
     )
 }
 
@@ -11528,6 +11568,46 @@ impl HalfShut for std::net::TcpStream {
     }
 }
 
+impl HalfShut for crate::quic::QuicStream {
+    fn spill(&self) {
+        self.fin();
+    }
+}
+
+/// Relay a dialled or served TUIC stream against a TCP flow: the QUIC half a socket cannot be, so
+/// the two lanes share this crate's relay and its FIN on the stream's own end.
+pub(crate) fn relay_quic_stream(
+    client: &Connection,
+    stream: crate::quic::QuicStream,
+    finish: Option<Box<dyn FnOnce() + Send>>,
+) {
+    let Some(upstream) = client.try_clone().ok() else {
+        stream.close();
+        drop(stream);
+        if let Some(finish) = finish {
+            finish();
+        }
+        return;
+    };
+    let stall = Some(crate::budgets::relay_stall());
+    let _ = client.set_write_timeout(stall);
+    let _ = upstream.set_write_timeout(stall);
+    let cancel = stream.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+    let flow = relay_lanes_handoff(Half::socket(upstream), Half::socket(stream), &close);
+    flow.then(move || {
+        if cancel.fin_sent() {
+            cancel.shutdown_read();
+        } else {
+            cancel.close();
+        }
+        drop(cancel);
+        if let Some(finish) = finish {
+            finish();
+        }
+    });
+}
+
 fn relay_lanes_shared<
     A: Read + Write + Send + 'static + HalfShut,
     B: Read + Write + Send + 'static + HalfShut,
@@ -11580,7 +11660,10 @@ where
             to.spill_write();
             Next::Done
         }
-        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => Next::More,
+        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => {
+            ended.mark_progress();
+            Next::More
+        }
         Err(error) if is_timeout(&error) => {
             if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                 Next::Done
@@ -11991,10 +12074,25 @@ struct RungAttempt<'a> {
 
 /// The edge a configured address names: a numeric address parses straight from its parts, so no `String` is written only for the parser to take it apart again, and a name keeps the resolver's own host-and-port form rather than a `host:port` serialisation it would re-split. A numeric host in a name field is answered identically by both routes, so the resolution and the bytes on the wire do not change. The picked lane's `addressPortStrategy`, when it names one, replaces the name before the resolver sees it.
 pub(crate) fn resolve_outbound(address: &str, port: u16) -> Option<SocketAddr> {
+    let options = dial_options();
+    resolve_outbound_with(options.as_deref(), address, port)
+}
+
+/// The picked lane's socket options, so a listener can hand a lookup to a worker without losing
+/// `addressPortStrategy` or the query socket it implies.
+pub(crate) fn dial_options() -> Option<Arc<crate::sockopt::SocketOptions>> {
+    DIAL_SOCKOPTS.with(|cell| cell.borrow().clone())
+}
+
+pub(crate) fn resolve_outbound_with(
+    options: Option<&crate::sockopt::SocketOptions>,
+    address: &str,
+    port: u16,
+) -> Option<SocketAddr> {
     if let Ok(ip) = address.parse::<std::net::IpAddr>() {
         return Some(SocketAddr::new(ip, port));
     }
-    let (address, port) = match DIAL_SOCKOPTS.with(|cell| cell.borrow().clone()) {
+    let (address, port) = match options {
         Some(options) => match options.address_port(address, port) {
             Some((address, port)) => (std::borrow::Cow::Owned(address), port),
             None => (std::borrow::Cow::Borrowed(address), port),
@@ -25861,6 +25959,7 @@ fn dial_socks_outbound(
             }
         }
         Outbound::Hysteria(hy) => crate::hysteria_v1::dial(client, &hy.dial(), target),
+        Outbound::Tuic(tuic) => tuic.dial(client, target),
         Outbound::Http(http) => {
             dial_http_outbound(client, server, http, target, ladder);
         }
@@ -27551,6 +27650,7 @@ fn serve_udp_lane_with(
     source: Option<SendThrough>,
     sockopts: Option<&Arc<crate::sockopt::SocketOptions>>,
 ) {
+    let _source = SendThroughGuard::enter(source);
     let _sockopts = DialSockoptsGuard::enter(sockopts.cloned());
     let sockopts = sockopts.map(Arc::as_ref);
     match out {
@@ -27597,6 +27697,7 @@ fn serve_udp_lane_with(
             serve_socks_udp_shadowsocks(relay, ss);
         }
         Outbound::Hysteria(hy) => crate::hysteria_v1::serve_udp(relay, &hy.dial()),
+        Outbound::Tuic(tuic) => tuic.serve_udp(relay, associate),
         Outbound::Foxy(foxy) => match foxy.carrier {
             // One tunnel for all destinations: later ones ride the first one opened.
             crate::foxy::Carrier::H3 => serve_socks_udp_foxy_ip(relay, foxy, associate),
@@ -38544,6 +38645,9 @@ fn find_outbound_with(root: &Json, test: bool) -> Result<Option<Outbound>, Strin
     }
     if let Some(hysteria) = find_hysteria_outbound(root) {
         return Ok(Some(Outbound::Hysteria(Box::new(hysteria))));
+    }
+    if let Some(tuic) = crate::tuic::outbound(root)? {
+        return Ok(Some(Outbound::Tuic(Arc::new(tuic))));
     }
     if let Some(wireguard) = find_wireguard_outbound(root)? {
         return Ok(Some(Outbound::WireGuard(Arc::new(wireguard))));
