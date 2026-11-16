@@ -64,7 +64,7 @@ matrix_server_serves() {
     sing-box:hysteria-v1-*) return 0 ;;
     sing-box:wireguard-*) return 0 ;;
     xray-core:*-quic-*) return 1 ;;
-    sing-box:*-quic-*) return 0 ;;
+    sing-box:vless-quic-*) return 0 ;;
     sing-box:*) return 1 ;;
   esac
   return 0
@@ -131,6 +131,12 @@ matrix_engine_skip_reason() {
     esac
   fi
   case "$engine:$id" in
+    sing-box:*-mux-*)
+      printf '%s\n' "sing-box at this pin has no Mux.Cool carrier" ;;
+    leaf:*-mux-*)
+      printf '%s\n' "leaf at this pin has no Mux.Cool carrier" ;;
+    zeronet:vmess-*-mux-*|zeronet:trojan-*-mux-*|zeronet:shadowsocks*-mux-*)
+      printf '%s\n' "zeronet at this pin supports Mux.Cool for VLESS only" ;;
     sing-box:*-quic-*)
       if [[ "$role" == client ]]; then
         printf '%s\n' "sing-box at this pin has no QUIC transport"
@@ -609,10 +615,13 @@ tls_xhttp_server_settings() {
 }
 
 tls_xhttp_client_settings() {
-  local mode="$1" alpn="$2" dir pin
+  local mode="$1" alpn="$2" xmux="${3:-}" dir pin extra=""
   dir="$(matrix_tls_dir)"
   pin="$(matrix_tls_pin "$dir/cert.pem")"
-  echo "\"streamSettings\": {\"network\": \"xhttp\", \"xhttpSettings\": {\"path\": \"/share\", \"mode\": \"$mode\"}, \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"$alpn\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
+  if [[ "$xmux" == xmux ]]; then
+    extra=', "xmux": {"maxConnections": 4, "maxConcurrency": 16, "cMaxReuseTimes": 64, "hMaxRequestTimes": 600, "hMaxReusableSecs": 1800}'
+  fi
+  echo "\"streamSettings\": {\"network\": \"xhttp\", \"xhttpSettings\": {\"path\": \"/share\", \"mode\": \"$mode\"$extra}, \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"$alpn\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
 }
 
 hysteria_server_settings() {
@@ -812,17 +821,23 @@ shadowsocks_client() { echo "\"tag\": \"proxy\", \"protocol\": \"shadowsocks\", 
 shadowsocks2022_server() { echo "\"protocol\": \"shadowsocks\", \"settings\": {\"method\": \"2022-blake3-aes-128-gcm\", \"password\": \"$SS2022_PASSWORD\", \"network\": \"tcp\"}"; }
 shadowsocks2022_client() { echo "\"tag\": \"proxy\", \"protocol\": \"shadowsocks\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $1, \"method\": \"2022-blake3-aes-128-gcm\", \"password\": \"$SS2022_PASSWORD\"}]}"; }
 
+mux_json() {
+  echo '"mux": {"enabled": true, "concurrency": 8, "xudpConcurrency": 8, "xudpProxyUDP443": "reject"}'
+}
+
 # One function per protocol family; the carrier decides the stream layer, so no protocol needs a
 # case arm per carrier.
 protocol_scenario() {
-  local proto="$1" carrier="$2" port="$3" cover="${4:-}" srv cli srv_stream cli_stream cover_json=""
+  local proto="$1" carrier="$2" port="$3" cover="${4:-}" mux="${5:-}" srv cli srv_stream cli_stream cover_json=""
   case "$proto" in
+    vless) srv="$(vless_server)"; cli="$(vless_client "" "$port")" ;;
     vmess) srv="$(vmess_server)"; cli="$(vmess_client "$port")" ;;
     trojan) srv="$(trojan_server)"; cli="$(trojan_client "$port")" ;;
     shadowsocks) srv="$(shadowsocks_server)"; cli="$(shadowsocks_client "$port")" ;;
     shadowsocks2022) srv="$(shadowsocks2022_server)"; cli="$(shadowsocks2022_client "$port")" ;;
     *) echo "::error::unknown protocol $proto" >&2; return 1 ;;
   esac
+  if [[ "$mux" == mux ]]; then cli="$cli, $(mux_json)"; fi
   if [[ "$carrier" == reality-raw ]]; then
     srv_stream="$(reality_server_settings tcp "")"
     cli_stream="$(reality_client_settings tcp "")"
@@ -852,6 +867,11 @@ scenario_config() {
   local port="$2" cover="${3:-}" inner="${4:-}" cover_json=""
   if [[ -n "$cover" ]]; then cover_json="$(cover_inbound "$cover")"; fi
   case "$1" in
+    vless-raw-mux-*) protocol_scenario vless raw "$port" "$cover" mux ;;
+    vmess-raw-mux-*) protocol_scenario vmess raw "$port" "$cover" mux ;;
+    trojan-raw-mux-*) protocol_scenario trojan raw "$port" "$cover" mux ;;
+    shadowsocks-raw-mux-*) protocol_scenario shadowsocks raw "$port" "$cover" mux ;;
+    shadowsocks2022-raw-mux-*) protocol_scenario shadowsocks2022 raw "$port" "$cover" mux ;;
     vless-raw-*) server_config "$(vless_server ', "streamSettings": {"network": "tcp"}')" "$(vless_client ', "streamSettings": {"network": "tcp"}' "$port")" "$port" ;;
     vless-encryption-raw-*) server_config "$(vless_server_encryption ', "streamSettings": {"network": "tcp"}')" "$(vless_client_encryption ', "streamSettings": {"network": "tcp"}' "$port")" "$port" ;;
     vless-encryption-tls-raw-*) server_config "$(vless_server_encryption ", $(tls_server_settings)")" "$(vless_client_encryption ", $(tls_client_settings)" "$port")" "$port" ;;
@@ -863,6 +883,7 @@ scenario_config() {
     vless-httpupgrade-ed-*) server_config "$(vless_server ", $(httpupgrade_ed_settings)")" "$(vless_client ", $(httpupgrade_ed_settings)" "$port")" "$port" ;;
     vless-tls-grpc-multi-*) server_config "$(vless_server ", $(tls_grpc_multi_server_settings)")" "$(vless_client ", $(tls_grpc_multi_client_settings)" "$port")" "$port" ;;
     vless-grpc-multi-*) server_config "$(vless_server ", $(grpc_multi_settings)")" "$(vless_client ", $(grpc_multi_settings)" "$port")" "$port" ;;
+    vless-tls-xhttp-h2-streamone-mux-*) server_config "$(vless_server ", $(tls_xhttp_server_settings stream-one h2)")" "$(vless_client ", $(tls_xhttp_client_settings stream-one h2 xmux)" "$port")" "$port" ;;
     vless-tls-xhttp-h2-*) server_config "$(vless_server ", $(tls_xhttp_server_settings auto h2)")" "$(vless_client ", $(tls_xhttp_client_settings auto h2)" "$port")" "$port" ;;
     vless-tls-xhttp-h3-*) server_config "$(vless_server ", $(tls_xhttp_server_settings auto h3)")" "$(vless_client ", $(tls_xhttp_client_settings auto h3)" "$port")" "$port" ;;
     vless-tls-xhttp-h1-*) server_config "$(vless_server ", $(tls_xhttp_server_settings auto http/1.1)")" "$(vless_client ", $(tls_xhttp_client_settings auto http/1.1)" "$port")" "$port" ;;
@@ -1072,6 +1093,19 @@ standard_scenarios() {
   echo "shadowsocks2022-kcp-down-8 download 8 256 65536"
   echo "socks-raw-down-8 download 8 256 65536"
   echo "http-raw-down-8 download 8 256 65536"
+  # Mux.Cool is a client-side carrier above every protocol, so one raw lane per
+  # family prices the shared session; the up/duplex/udp lanes show the same pool
+  # carrying each direction. `xmux` is the separate xHTTP stream-one H2 pool.
+  echo "vless-raw-mux-down-8 download 8 256 65536"
+  echo "vless-raw-mux-up-1 upload 1 2048 65536"
+  echo "vless-raw-mux-duplex-8 full-duplex 8 128 65536"
+  echo "vless-raw-mux-udp-8 udp 8 64 1200 0"
+  echo "vmess-raw-mux-down-8 download 8 256 65536"
+  echo "trojan-raw-mux-down-8 download 8 256 65536"
+  echo "shadowsocks-raw-mux-down-8 download 8 256 65536"
+  echo "shadowsocks2022-raw-mux-down-8 download 8 256 65536"
+  echo "vless-tls-xhttp-h2-streamone-mux-down-8 download 8 256 65536"
+  echo "vmess-quic-down-8 download 8 256 65536"
 }
 
 scenarios() {
@@ -1153,6 +1187,24 @@ scenarios() {
       echo "trojan-tls-raw-duplex-8 full-duplex 8 128 65536"
       echo "trojan-tls-ws-up-1 upload 1 2048 65536"
       echo "trojan-tls-ws-duplex-8 full-duplex 8 128 65536"
+      echo "vmess-raw-mux-up-1 upload 1 2048 65536"
+      echo "vmess-raw-mux-duplex-8 full-duplex 8 128 65536"
+      echo "vmess-raw-mux-udp-8 udp 8 64 1200 0"
+      echo "trojan-raw-mux-up-1 upload 1 2048 65536"
+      echo "trojan-raw-mux-duplex-8 full-duplex 8 128 65536"
+      echo "trojan-raw-mux-udp-8 udp 8 64 1200 0"
+      echo "shadowsocks-raw-mux-up-1 upload 1 2048 65536"
+      echo "shadowsocks-raw-mux-duplex-8 full-duplex 8 128 65536"
+      echo "shadowsocks-raw-mux-udp-8 udp 8 64 1200 0"
+      echo "shadowsocks2022-raw-mux-up-1 upload 1 2048 65536"
+      echo "shadowsocks2022-raw-mux-duplex-8 full-duplex 8 128 65536"
+      echo "shadowsocks2022-raw-mux-udp-8 udp 8 64 1200 0"
+      echo "vless-tls-xhttp-h2-streamone-mux-up-1 upload 1 2048 65536"
+      echo "vless-tls-xhttp-h2-streamone-mux-duplex-8 full-duplex 8 128 65536"
+      echo "vmess-quic-up-1 upload 1 2048 65536"
+      echo "vmess-quic-duplex-8 full-duplex 8 128 65536"
+      echo "trojan-quic-up-1 upload 1 2048 65536"
+      echo "trojan-quic-duplex-8 full-duplex 8 128 65536"
       carrier_matrix
       ;;
   esac
