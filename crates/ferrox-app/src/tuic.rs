@@ -1855,19 +1855,20 @@ impl Server {
                 return;
             }
         }
-        inner.seen.retain(|id| !conn.stream_closed(*id));
-        inner.readable.clear();
-        inner.readable.extend(conn.readable());
-        for id in inner.uni.keys() {
-            if !inner.readable.contains(id) {
-                inner.readable.push(*id);
+        let state = &mut *inner;
+        state.seen.retain(|id| !conn.stream_closed(*id));
+        state.readable.clear();
+        state.readable.extend(conn.readable());
+        for id in state.uni.keys() {
+            if !state.readable.contains(id) {
+                state.readable.push(*id);
             }
         }
-        let mut ids = std::mem::take(&mut inner.readable);
+        let mut ids = std::mem::take(&mut state.readable);
         for &id in &ids {
             match id % 4 {
                 0 => {
-                    if inner.seen.insert(id) {
+                    if state.seen.insert(id) {
                         let stream = QuicStream::new(
                             Arc::clone(&session.conn),
                             Arc::clone(&self.sock),
@@ -1883,12 +1884,12 @@ impl Server {
                             .spawn(move || serve_tcp(stream, freedom, worker));
                     }
                 }
-                2 => read_uni(&mut conn, &mut inner, &self.sock, id, self.freedom),
+                2 => read_uni(&mut conn, state, &self.sock, id, self.freedom),
                 _ => {}
             }
         }
         ids.clear();
-        inner.readable = ids;
+        state.readable = ids;
         while let Ok(data) = conn.dgram_recv_buf() {
             if self.freedom {
                 accept_packet(
@@ -1972,12 +1973,12 @@ impl Server {
                 continue;
             };
             inner.seen.retain(|id| !conn.stream_closed(*id));
+            drain_resolved(&mut inner, now);
+            poll_udp(&mut conn, &self.sock, &mut inner, now);
             expire_udp(&mut inner, now, self.udp_timeout);
             inner
                 .reassembly
                 .retain(|_, parts| now.duration_since(parts.at) < REASSEMBLY_TTL);
-            drain_resolved(&mut inner, now);
-            poll_udp(&mut conn, &self.sock, &mut inner, now);
             flush_inner(&mut conn, &self.sock, &mut inner);
             quic::flush_egress(&mut conn, &self.sock);
         }
@@ -2373,10 +2374,10 @@ fn accept_packet(
             .reassembly
             .retain(|_, parts| parts.at.elapsed() < REASSEMBLY_TTL);
     }
-    let Some((destination, payload)) = take_packet(&mut inner.reassembly, &packet) else {
+    let Some(generation) = select_assoc(inner, packet.association, stream) else {
         return;
     };
-    let Some(generation) = select_assoc(inner, packet.association, stream) else {
+    let Some((destination, payload)) = take_packet(&mut inner.reassembly, &packet) else {
         return;
     };
     match destination {
