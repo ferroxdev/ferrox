@@ -373,15 +373,15 @@ impl Connection {
         }
         let state = self.state();
         let draining = state == State::Terminating || state == State::PeerTerminating;
+        let written = self.write_pending.swap(false, Ordering::SeqCst);
         let necessary = self.sending.lock().unwrap().update_necessary();
         #[cfg(test)]
         self.pass_lock_gate("poll");
         let necessary = necessary || self.receiving.lock().unwrap().update_necessary();
         let last_flush = *self.last_flush.lock().unwrap();
         let last_uncond = *self.last_uncond.lock().unwrap();
-        let due = draining
-            || self.write_pending.swap(false, Ordering::SeqCst)
-            || now.saturating_duration_since(last_flush) >= tick;
+        let due =
+            draining || written || now.saturating_duration_since(last_flush) >= tick;
         if due
             && (draining
                 || necessary
