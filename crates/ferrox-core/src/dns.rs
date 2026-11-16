@@ -552,6 +552,7 @@ mod tests {
         message: Vec<u8>,
         rule: Option<Rule>,
         lookup: Option<Resolve>,
+        ttl: Option<u32>,
         feed: Vec<u8>,
     }
 
@@ -565,6 +566,7 @@ mod tests {
             message: Vec::new(),
             rule: None,
             lookup: None,
+            ttl: None,
             feed: Vec::new(),
         };
         match kind {
@@ -583,13 +585,14 @@ mod tests {
                         "feed" => case.feed = unhex(value),
                         // The tunnel's own dest the direct case named; the replay never dials it.
                         "dest" => {}
-                        "ttl" => {
-                            let ttl = value.parse::<u32>().expect("ttl");
-                            if let Some(Resolve::Records { ttl: named, .. }) = &mut case.lookup {
-                                *named = ttl;
-                            }
-                        }
+                        "ttl" => case.ttl = Some(value.parse::<u32>().expect("ttl")),
                         other => panic!("unknown attr {other}"),
+                    }
+                }
+                // Apply the TTL after `ips` has built the record it belongs to.
+                if let Some(ttl) = case.ttl {
+                    if let Some(Resolve::Records { ttl: named, .. }) = &mut case.lookup {
+                        *named = ttl;
                     }
                 }
             }
