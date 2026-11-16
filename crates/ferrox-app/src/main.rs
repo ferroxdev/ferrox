@@ -47,6 +47,7 @@ mod masque_h1;
 mod masque_h2;
 mod metrics;
 mod muxpool;
+mod noize;
 mod observatory;
 mod policy;
 mod process;
@@ -144,7 +145,7 @@ fn usage() -> ! {
     eprintln!(
         "        [-o|--config FILE] [--wg-config FILE] [--masque-config FILE] [--api URL] [--api-address ADDR]"
     );
-    eprintln!("        [--mode auto|wireguard|masque|gool|gool-classic|mim] [--gool-classic] [--wiw-outer ADDR] [--wiw-inner ADDR] [--mim-outer ADDR] [--mim-inner ADDR]");
+    eprintln!("        [--mode auto|wireguard|masque|gool|gool-classic|mim] [--gool-classic] [--wiw-outer ADDR] [--wiw-inner ADDR] [--mim-outer ADDR] [--mim-inner ADDR] [--noize off|light|firewall|balanced|gfw|aggressive] [--no-profile-retry]");
     eprintln!(
         "                                with --register, make the kind's identities and print them; without it, register one device, save the identity (0600 on Unix), print the outbound"
     );

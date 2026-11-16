@@ -26,7 +26,8 @@ use ferrox_core::wireguard::handshake::{
 };
 use ferrox_core::wireguard::transport::{
     check_mac2, clear_reserved, cookie_encryption_key, create_reply, COOKIE_NONCE_SIZE,
-    HEADER_SIZE as WG_HEADER_SIZE, TAG_SIZE as WG_TAG_SIZE,
+    HEADER_SIZE as WG_HEADER_SIZE, MIN_SIZE as WG_MIN_SIZE, TAG_SIZE as WG_TAG_SIZE,
+    TYPE_TRANSPORT,
 };
 
 use crate::conn::Connection;
@@ -212,8 +213,24 @@ impl WireGuardOut {
         Self::with_dns_port(config, DNS_PORT)
     }
 
+    /// Build the outbound and shape its `WireGuard` handshake with `noise`.
+    pub(crate) fn with_noise(
+        config: DeviceConfig,
+        noise: crate::noize::WireGuardNoize,
+    ) -> Result<Self, String> {
+        Self::with_dns_port_and_noise(config, DNS_PORT, noise)
+    }
+
     /// Build the outbound and route its DNS queries to `dns_port` through the tunnel.
     fn with_dns_port(config: DeviceConfig, dns_port: u16) -> Result<Self, String> {
+        Self::with_dns_port_and_noise(config, dns_port, crate::noize::WireGuardNoize::off())
+    }
+
+    fn with_dns_port_and_noise(
+        config: DeviceConfig,
+        dns_port: u16,
+        noise: crate::noize::WireGuardNoize,
+    ) -> Result<Self, String> {
         if config.is_client == Some(false) {
             return Err("a wireguard outbound must set `isClient: true`".to_owned());
         }
@@ -225,9 +242,12 @@ impl WireGuardOut {
         #[cfg(target_os = "linux")]
         if !config.no_kernel_tun {
             match KernelWireGuard::new(&config) {
-                Ok(kernel) => {
+                Ok(kernel) if !noise.is_enabled() => {
                     return Ok(Self::with_kernel(config, kernel, dns_servers, dns_port));
                 }
+                Ok(_) => eprintln!(
+                    "wireguard: the kernel device cannot carry handshake noise; serving the userspace stack"
+                ),
                 Err(error) => eprintln!(
                     "wireguard: kernel mode unavailable, using the userspace stack: {error}"
                 ),
@@ -261,6 +281,7 @@ impl WireGuardOut {
                 Some(io_stop),
                 io_recycle,
                 recycled,
+                noise,
             );
         });
         let stack_config = config.clone();
@@ -990,9 +1011,13 @@ pub(crate) fn verify_endpoint(
     local: Ipv4Addr,
     endpoint: SocketAddr,
     timeout: Duration,
+    noise: crate::noize::WireGuardNoize,
 ) -> Option<Duration> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     let started = Instant::now();
+    noise.send_before(|packet| {
+        let _ = socket.send_to(packet, endpoint);
+    });
     let mut tunnel = Tunnel::new(private, peer, [0; 32], endpoint, 0, reserved, tai64n_now());
     let mut events = Vec::new();
     tunnel.initiate(0, &mut events);
@@ -1004,6 +1029,7 @@ pub(crate) fn verify_endpoint(
     let source = ip_bytes(IpAddr::V4(local));
     let destination = ip_bytes(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
     let mut next_ask = Duration::ZERO;
+    let mut after_handshake = false;
     let mut buf = [0u8; 4096];
     loop {
         let now = started.elapsed();
@@ -1013,6 +1039,12 @@ pub(crate) fn verify_endpoint(
         for event in events.drain(..) {
             if let Event::Send { endpoint, packet } = event {
                 let _ = socket.send_to(&packet, endpoint);
+                if !after_handshake && is_initiation(&packet) {
+                    after_handshake = true;
+                    noise.send_after(|noise| {
+                        let _ = socket.send_to(noise, endpoint);
+                    });
+                }
             }
         }
         tunnel.poll(now.as_millis() as u64, &mut events);
@@ -1114,6 +1146,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
             None,
             io_recycle,
             recycled,
+            crate::noize::WireGuardNoize::off(),
         );
     });
     let stack_config = config;
@@ -1136,6 +1169,39 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
 struct Peer {
     config: PeerConfig,
     tunnel: Tunnel,
+    noise: PeerNoise,
+}
+
+struct PeerNoise {
+    profile: crate::noize::WireGuardNoize,
+    before: AtomicBool,
+    after: AtomicBool,
+}
+
+impl PeerNoise {
+    fn new(profile: crate::noize::WireGuardNoize) -> Self {
+        Self {
+            profile,
+            before: AtomicBool::new(false),
+            after: AtomicBool::new(false),
+        }
+    }
+
+    fn before_handshake(&self, send: impl FnMut(&[u8])) {
+        if !self.before.swap(true, Ordering::Relaxed) {
+            self.profile.send_before(send);
+        }
+    }
+
+    fn after_handshake(&self, send: impl FnMut(&[u8])) {
+        if !self.after.swap(true, Ordering::Relaxed) {
+            self.profile.send_after(send);
+        }
+    }
+
+    fn keepalive(&self, send: impl FnMut(&[u8])) {
+        self.profile.send_keepalive(send);
+    }
 }
 
 trait Allowed {
@@ -1207,12 +1273,13 @@ fn io(
     stop: Option<Arc<AtomicBool>>,
     recycle: Sender<Vec<u8>>,
     recycled: Receiver<Vec<u8>>,
+    noise: crate::noize::WireGuardNoize,
 ) {
     let _ = socket.set_read_timeout(Some(IO_TICK));
     widen(&socket);
     let ipv6_socket = socket.local_addr().is_ok_and(|address| address.is_ipv6());
     let epoch = tai64n_now();
-    let mut peers = peers(&config, epoch);
+    let mut peers = peers(&config, epoch, noise);
     let mut cookies = CookieGuard::default();
     let started = Instant::now();
     #[cfg(target_os = "linux")]
@@ -1813,11 +1880,29 @@ fn flush(
                 if is_initiation(&packet) {
                     flush_sends(socket, ipv6_socket, endpoint, sends);
                     endpoint = None;
+                    if let Some(index) = peer {
+                        peers[index].noise.before_handshake(|noise| {
+                            send_noise(socket, ipv6_socket, to, noise);
+                        });
+                    }
                     send_packet(socket, ipv6_socket, to, &packet, candidates);
+                    if let Some(index) = peer {
+                        peers[index].noise.after_handshake(|noise| {
+                            send_noise(socket, ipv6_socket, to, noise);
+                        });
+                    }
                 } else if ipv6_socket || to.is_ipv4() {
                     if endpoint != Some(to) {
                         flush_sends(socket, ipv6_socket, endpoint, sends);
                         endpoint = Some(to);
+                    }
+                    if is_keepalive(&packet) {
+                        flush_sends(socket, ipv6_socket, endpoint, sends);
+                        if let Some(index) = peer {
+                            peers[index].noise.keepalive(|noise| {
+                                send_noise(socket, ipv6_socket, to, noise);
+                            });
+                        }
                     }
                     sends.push(packet);
                     if sends.len() == SEND_BATCH {
@@ -2124,7 +2209,7 @@ fn tai64n_now() -> [u8; 12] {
     tai64n(now.as_secs(), now.subsec_nanos())
 }
 
-fn peers(config: &DeviceConfig, epoch: [u8; 12]) -> Peers {
+fn peers(config: &DeviceConfig, epoch: [u8; 12], noise: crate::noize::WireGuardNoize) -> Peers {
     Peers::new(
         config
             .peers
@@ -2149,6 +2234,7 @@ fn peers(config: &DeviceConfig, epoch: [u8; 12]) -> Peers {
                     config.reserved,
                     epoch,
                 ),
+                noise: PeerNoise::new(noise),
             })
             .collect(),
     )
@@ -2361,14 +2447,29 @@ fn widen(socket: &UdpSocket) {
     let _ = sock.set_send_buffer_size(SOCKET_BUFFER);
 }
 
+fn is_initiation(packet: &[u8]) -> bool {
+    packet.len() == INITIATION_SIZE
+        && packet
+            .first()
+            .is_some_and(|first| u32::from(*first) == TYPE_INITIATION)
+}
+
+fn is_keepalive(packet: &[u8]) -> bool {
+    packet.len() == WG_MIN_SIZE
+        && packet
+            .first()
+            .is_some_and(|first| u32::from(*first) == TYPE_TRANSPORT)
+}
+
+fn send_noise(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packet: &[u8]) {
+    if ipv6 || endpoint.is_ipv4() {
+        let _ = socket.send_to(packet, send_endpoint(endpoint, ipv6));
+    }
+}
+
 /// Send a handshake to every configured endpoint candidate, so a name that
 /// resolves to two families or two hosts is raced; data follows the endpoint
 /// the responder pinned.
-fn is_initiation(packet: &[u8]) -> bool {
-    packet.len() == INITIATION_SIZE
-        && u32::from_le_bytes(packet[..4].try_into().unwrap_or([0; 4])) == TYPE_INITIATION
-}
-
 fn send_packet(
     socket: &UdpSocket,
     ipv6: bool,
@@ -2469,6 +2570,20 @@ mod tests {
     }
 
     #[test]
+    fn a_reserved_word_still_names_the_handshake_and_keepalive() {
+        let mut initiation = vec![0u8; INITIATION_SIZE];
+        initiation[0] = TYPE_INITIATION as u8;
+        initiation[1..4].copy_from_slice(&[9, 8, 7]);
+        assert!(is_initiation(&initiation));
+
+        let mut keepalive = vec![0u8; WG_MIN_SIZE];
+        keepalive[0] = TYPE_TRANSPORT as u8;
+        keepalive[1..4].copy_from_slice(&[9, 8, 7]);
+        assert!(is_keepalive(&keepalive));
+        assert!(!is_initiation(&keepalive));
+    }
+
+    #[test]
     fn a_probe_waits_no_longer_than_the_deadline_or_the_poll() {
         assert_eq!(poll_wait(Duration::ZERO), None);
         assert_eq!(poll_wait(Duration::from_secs(30)), Some(VERIFY_POLL));
@@ -2540,7 +2655,7 @@ mod tests {
             large_segments: false,
             dns: Vec::new(),
         };
-        let peers = peers(&config, [0; 12]);
+        let peers = peers(&config, [0; 12], crate::noize::WireGuardNoize::off());
         let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
         let (to_stack, packets) = mpsc::channel();
         let mut packet = vec![0u8; 20];
@@ -3198,7 +3313,7 @@ mod tests {
             large_segments: false,
             dns: Vec::new(),
         };
-        let peers = peers(&config, [0; 12]);
+        let peers = peers(&config, [0; 12], crate::noize::WireGuardNoize::off());
         let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
         let target = UdpSocket::bind("127.0.0.1:0")
             .expect("target")
@@ -3539,7 +3654,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("timeout");
 
-        let mut peer = peers(&config, [0; 12]);
+        let mut peer = peers(&config, [0; 12], crate::noize::WireGuardNoize::off());
         let (to_stack, _) = mpsc::channel();
         let mut guard = CookieGuard::default();
         let mut initiator = Tunnel::new(

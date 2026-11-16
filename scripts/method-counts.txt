@@ -1150,6 +1150,9 @@ warp last-edge-cap 8 warp_scan::tests::the_last_edge_keeps_one_entry_per_carrier
 warp ironclad-status 204 warp::tests::an_http_status_line_is_read_not_guessed
 warp mim-inner-datagram-v4 1252 ferrox-app-warp::tests::the_mim_inner_budget_subtracts_the_headers_and_the_masque_overhead
 warp mim-inner-mtu-v4 1182 ferrox-app-warp::tests::the_mim_inner_budget_subtracts_the_headers_and_the_masque_overhead
+warp noize-wireguard-profiles 6 noize::tests::six_wireguard_profiles_keep_six_shapes
+warp noize-masque-profiles 4 noize::tests::four_masque_profiles_keep_four_shapes
+warp noize-retry-candidates 4 noize::tests::a_scan_retries_the_fallback_profiles_once_each
 
 # --- tagged outbound --------------------------------------------------------
 engine-tagged ops-retired-instructions UNBLESSED scripts/count-ops.sh

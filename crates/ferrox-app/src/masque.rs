@@ -1000,6 +1000,7 @@ struct ClientSpec {
     headers: Vec<(String, String)>,
     remote_dns: Vec<IpAddr>,
     warp: Option<Warp>,
+    noize: crate::noize::MasqueNoize,
     xmux: Xmux,
     large_segments: bool,
     quic: Option<ferrox_core::hysteria::QuicParams>,
@@ -1024,6 +1025,14 @@ fn configured_mtu(settings: &Json) -> usize {
         .filter(|mtu| *mtu > 0)
         .map_or(DEFAULT_MTU, |mtu| mtu as usize)
         .clamp(MIN_MTU, crate::quic::MAX_DATAGRAM)
+}
+
+fn masque_noize(transport: Option<&Json>) -> Result<crate::noize::MasqueNoize, String> {
+    match transport.and_then(|settings| settings.get("noize")) {
+        None | Some(Json::Null) => Ok(crate::noize::MasqueNoize::off()),
+        Some(Json::Str(name)) => Ok(crate::noize::MasqueNoize::from_profile(name)),
+        Some(_) => Err("masque `noize` must be a profile name".to_owned()),
+    }
 }
 
 fn masque_endpoint(settings: &Json) -> Result<(String, u16), String> {
@@ -1077,6 +1086,7 @@ impl ClientSpec {
             .and_then(|settings| settings.get("warp"))
             .map(Warp::from)
             .transpose()?;
+        let noize = masque_noize(transport)?;
         let user = transport
             .and_then(|settings| settings.get("user"))
             .and_then(Json::as_str)
@@ -1140,6 +1150,7 @@ impl ClientSpec {
             headers,
             remote_dns,
             warp,
+            noize,
             xmux,
             large_segments,
             quic,
@@ -1191,6 +1202,7 @@ impl std::fmt::Debug for ClientSpec {
             .field("mtu", &self.mtu)
             .field("mtu_named", &self.mtu_named)
             .field("max_datagram", &self.max_datagram)
+            .field("noize", &self.noize)
             .finish()
     }
 }
@@ -1804,6 +1816,9 @@ fn attempt(
     let mut scid = vec![0u8; if spec.warp.is_some() { 20 } else { 16 }];
     getrandom::fill(&mut scid).map_err(|error| format!("masque: no connection id: {error}"))?;
     let cid = quiche::ConnectionId::from_ref(&scid);
+    spec.noize.send_before(|packet| {
+        let _ = sock.send_to(packet, peer);
+    });
     let mut conn = quiche::connect(Some(&tls.server_name), &cid, local, peer, &mut config)
         .map_err(|error| format!("masque: cannot open a connection: {error}"))?;
     quic::drive_handshake_by(&mut conn, sock, local, ESTABLISH_TIMEOUT)
@@ -4408,6 +4423,7 @@ mod tests {
             headers: Vec::new(),
             remote_dns: Vec::new(),
             warp: None,
+            noize: crate::noize::MasqueNoize::off(),
             xmux: Xmux::defaults(),
             large_segments: false,
             quic: None,
@@ -5359,6 +5375,7 @@ mod tests {
             headers: Vec::new(),
             remote_dns: Vec::new(),
             warp: None,
+            noize: crate::noize::MasqueNoize::off(),
             xmux: Xmux::defaults(),
             large_segments: false,
             quic: None,
@@ -6711,6 +6728,7 @@ mod tests {
             headers: Vec::new(),
             remote_dns: Vec::new(),
             warp: None,
+            noize: crate::noize::MasqueNoize::off(),
             xmux: Xmux::defaults(),
             large_segments: false,
             quic: None,
