@@ -287,7 +287,15 @@ impl Fragment {
         }
         loop {
             match raw.write(&p[record_len..]) {
-                Ok(taken) => return Ok(record_len + taken),
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(taken) if taken == p.len() - record_len => return Ok(p.len()),
+                Ok(taken) => {
+                    self.gathered = Some(Gathered {
+                        bytes: p[record_len + taken..].to_vec(),
+                        at: 0,
+                    });
+                    return Ok(p.len());
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error)
                     if matches!(
