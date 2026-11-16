@@ -1410,7 +1410,12 @@ struct UdpFlow {
     stop: Arc<AtomicBool>,
 }
 
-fn answer_auth(conn: &mut quiche::Connection, ok: bool, cc_rx: u64) -> bool {
+fn answer_auth(
+    conn: &mut quiche::Connection,
+    sock: &crate::quic::Datagram,
+    ok: bool,
+    cc_rx: u64,
+) -> bool {
     let mut raw = [0u8; 2050];
     let padding = ok.then(|| hysteria_padding(256, 2048, &mut raw));
     let mut block = Vec::with_capacity(AUTH_RESPONSE_ROOM + padding.map_or(0, str::len));
@@ -1423,7 +1428,7 @@ fn answer_auth(conn: &mut quiche::Connection, ok: bool, cc_rx: u64) -> bool {
     frames::quic_varint(&mut frame, frames::H3_HEADERS);
     frames::quic_varint(&mut frame, block.len() as u64);
     frame.extend_from_slice(&block);
-    conn.stream_send(AUTH_STREAM, &frame, true).is_ok()
+    crate::quic::stream_send_all(conn, sock, AUTH_STREAM, &frame, true, Instant::now())
 }
 
 /// Drains the client's HTTP/3 SETTINGS so the unread bytes never hold flow control, and reports the stream's FIN so the caller stops paying the call per packet.
@@ -2357,19 +2362,24 @@ fn auth_exchange(
         let peer = peer.to_string();
         let mut reply = Vec::new();
         masq_bytes(masq, &request, Some(&peer), &mut reply);
-        if conn.stream_send(AUTH_STREAM, &reply, true).is_err() {
+        if !crate::quic::stream_send_all(
+            conn,
+            sock,
+            AUTH_STREAM,
+            &reply,
+            true,
+            Instant::now(),
+        ) {
             return None;
         }
-        crate::quic::flush_egress(conn, sock);
         return Some(Auth::Cover);
     }
     let ok = auths
         .iter()
         .any(|auth| hysteria::verify_auth_request(body, auth));
-    if !answer_auth(conn, ok, inbound.cc_rx) {
+    if !answer_auth(conn, sock, ok, inbound.cc_rx) {
         return None;
     }
-    crate::quic::flush_egress(conn, sock);
     inbound.auth_buf.clear();
     if ok {
         inbound.standing = Standing::Authed;
