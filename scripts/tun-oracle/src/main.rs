@@ -115,6 +115,7 @@ fn build_tcp_packet(
 ) -> Vec<u8> {
     let tcp_len = 20 + payload.len();
     let ip_len = 20 + tcp_len;
+    assert!(ip_len <= usize::from(u16::MAX), "IPv4 TCP packet too large");
     let mut pkt = vec![0u8; ip_len];
     pkt[0] = 0x45;
     pkt[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
@@ -161,6 +162,7 @@ fn build_udp_packet(
 ) -> Vec<u8> {
     let udp_len = 8 + payload.len();
     let ip_len = 20 + udp_len;
+    assert!(ip_len <= usize::from(u16::MAX), "IPv4 UDP packet too large");
     let mut pkt = vec![0u8; ip_len];
     pkt[0] = 0x45;
     pkt[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
@@ -260,6 +262,7 @@ fn parse_script(path: &std::path::Path) -> (Vec<Flow>, Vec<DatagramFlow>) {
 }
 
 fn hex_decode(s: &str) -> Vec<u8> {
+    assert!(s.len() % 2 == 0, "hex literal has an odd length: {s}");
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
         .collect()
@@ -386,6 +389,8 @@ fn main() {
         );
 
         let mut seq = flow.syn_seq + 1;
+        let mut payload = Vec::new();
+        let mut buf = [0u8; 4096];
         for chunk in &flow.chunks {
             let psh = build_tcp_packet(
                 client,
@@ -406,6 +411,7 @@ fn main() {
                 bytes: psh,
             });
             poll(&mut iface, &mut device, &mut sockets, now, 4);
+            drain_tcp(&mut sockets, *handle, &mut payload, &mut buf);
             seq += chunk.len() as u32;
         }
         let fin = build_tcp_packet(
@@ -427,23 +433,14 @@ fn main() {
             bytes: fin,
         });
         poll(&mut iface, &mut device, &mut sockets, now, 8);
-
-        let mut payload = Vec::new();
-        let mut buf = [0u8; 4096];
-        let socket = sockets.get_mut::<TcpSocket>(*handle);
-        loop {
-            match socket.recv_slice(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => payload.extend_from_slice(&buf[..n]),
-                Err(_) => break,
-            }
-        }
+        drain_tcp(&mut sockets, *handle, &mut payload, &mut buf);
         let target = format!("{}", flow.destination);
         tcp_dials.push((target, payload));
     }
 
     for (flow, handle) in dgram_flows.iter().zip(udp_handles.iter()) {
         let IpAddress::Ipv4(dst) = flow.destination.addr;
+        let target = format!("{}", flow.destination);
         for body in &flow.datagrams {
             let pkt = build_udp_packet(client, dst, flow.source_port, flow.destination.port, body);
             now += smoltcp::time::Duration::from_millis(1);
@@ -452,12 +449,11 @@ fn main() {
                 bytes: pkt,
             });
             poll(&mut iface, &mut device, &mut sockets, now, 4);
-        }
-        // Drain in arrival order: the stack hands each datagram up on its own, so a flow of two bodies is two dials, never the concatenation a TCP stream would form.
-        let socket = sockets.get_mut::<UdpSocket>(*handle);
-        let target = format!("{}", flow.destination);
-        while let Ok((payload, _meta)) = socket.recv() {
-            udp_dials.push((target.clone(), payload.to_vec()));
+            // Drain in arrival order: the stack hands each datagram up on its own, so a flow of two bodies is two dials, never the concatenation a TCP stream would form.
+            let socket = sockets.get_mut::<UdpSocket>(*handle);
+            while let Ok((payload, _meta)) = socket.recv() {
+                udp_dials.push((target.clone(), payload.to_vec()));
+            }
         }
     }
 
@@ -483,4 +479,14 @@ fn poll(
 
 fn state(sockets: &SocketSet, handle: SocketHandle) -> smoltcp::socket::tcp::State {
     sockets.get::<TcpSocket>(handle).state()
+}
+
+fn drain_tcp(sockets: &mut SocketSet, handle: SocketHandle, payload: &mut Vec<u8>, buf: &mut [u8]) {
+    let socket = sockets.get_mut::<TcpSocket>(handle);
+    loop {
+        match socket.recv_slice(buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => payload.extend_from_slice(&buf[..n]),
+        }
+    }
 }
