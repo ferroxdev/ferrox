@@ -356,6 +356,11 @@ impl<R, W: Write> Write for &PacketStream<R, W> {
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     )
                 {
+                    frame.bytes.clear();
+                    frame.pos = 0;
+                    if written > 0 {
+                        return Ok(written);
+                    }
                     return Err(error);
                 }
                 return Ok(end);

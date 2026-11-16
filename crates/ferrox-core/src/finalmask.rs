@@ -405,6 +405,7 @@ impl Fragment {
             if let Err(error) = write_iovecs(raw, &mut parts) {
                 let progressed = parts.len() < before;
                 if !progressed
+                    && from == HEADER
                     && !matches!(
                         error.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
