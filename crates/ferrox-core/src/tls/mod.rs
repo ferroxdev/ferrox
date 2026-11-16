@@ -157,13 +157,19 @@ impl MasterKeyLog {
         let file = options.open(path).ok()?;
         #[cfg(unix)]
         {
+            use std::os::unix::fs::FileTypeExt as _;
             use std::os::unix::fs::PermissionsExt as _;
-            if file.metadata().is_ok_and(|meta| meta.is_file())
-                && file
-                    .set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .is_err()
-            {
-                return None;
+            match file.metadata() {
+                Ok(meta) if meta.is_file() || meta.file_type().is_fifo() => {
+                    if file
+                        .set_permissions(std::fs::Permissions::from_mode(0o600))
+                        .is_err()
+                    {
+                        return None;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => return None,
             }
         }
         // 193 bytes is the longest line: a 30-byte label, a 32-byte random and a 48-byte SHA-384 secret.
