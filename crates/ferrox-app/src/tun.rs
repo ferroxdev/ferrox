@@ -765,6 +765,19 @@ impl Device {
         ))
     }
 
+    /// Whether another packet is already waiting on the device, so a queue with work serves it instead of waiting on one flow's answer: one `poll` with no timeout, and nothing on a host whose descriptor cannot say.
+    #[cfg(unix)]
+    fn readable_now(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut row = libc::pollfd {
+            fd: self.handle.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one descriptor this handler owns, one element in the array, and the call writes only `revents`.
+        unsafe { libc::poll(&raw mut row, 1, 0) > 0 && row.revents != 0 }
+    }
+
     fn write_packet(&mut self, packet: &[u8]) -> io::Result<bool> {
         write_framed(&mut self.handle, self.framing, None, packet)
     }
@@ -2056,6 +2069,11 @@ impl Handler {
         // No clock for a flow that stopped waiting: a bulk upload's segment takes one non-blocking read and nothing else.
         let deadline = (flow.misses.load(Relaxed) < PING_PONG_MISSES)
             .then(|| std::time::Instant::now() + PING_PONG_SPIN);
+        // A packet already in the ring belongs to another flow: waiting here would hold it back for a wait that only helps this one.
+        #[cfg(unix)]
+        if deadline.is_some() && self.device.readable_now() {
+            return Served::None;
+        }
         let mut served = Served::None;
         loop {
             let gated = match flow.read_gate.try_lock() {
