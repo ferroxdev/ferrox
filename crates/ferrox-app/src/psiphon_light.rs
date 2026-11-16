@@ -20,6 +20,7 @@ const PADDING_MAX: usize = 1400;
 const MAX_RECORD: usize = 16 * 1024;
 const POLL: Duration = Duration::from_millis(50);
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
+const DRAIN: Duration = Duration::from_secs(30);
 const BUFFER: usize = 16 * 1024;
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 
@@ -684,11 +685,19 @@ fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
     let mut down_len = 0usize;
     let mut peer_eof = false;
     let mut stream_eof = false;
+    let mut last_down = Instant::now();
+    let mut drained = Instant::now();
     loop {
+        if peer_eof && drained.elapsed() >= DRAIN {
+            return;
+        }
         if down_at < down_len {
             match peer.write(&down[down_at..down_len]) {
                 Ok(0) => return,
-                Ok(count) => down_at += count,
+                Ok(count) => {
+                    down_at += count;
+                    drained = Instant::now();
+                }
                 Err(error) if idle(&error) => {}
                 Err(_) => return,
             }
@@ -703,27 +712,46 @@ fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
             Err(_) => return,
         }
         let upload_blocked = stream.queued() > 0;
-        let peer_state = if peer_eof { None } else { ready(&peer) };
-        if !upload_blocked && peer_state.is_some() {
+        let mut peer_state = if peer_eof { None } else { ready(&peer) };
+        if peer_state == Some(false) {
+            peer_eof = true;
+            peer_state = None;
+            drained = Instant::now();
+        }
+        if !upload_blocked && peer_state == Some(true) {
             match peer.read(&mut up) {
                 Ok(0) => {
                     peer_eof = true;
+                    drained = Instant::now();
                 }
                 Ok(count) => {
                     if stream.write_all(&up[..count]).is_err() {
                         return;
+                    }
+                    drained = Instant::now();
+                    peer_state = if peer_eof { None } else { ready(&peer) };
+                    if peer_state == Some(false) {
+                        peer_eof = true;
+                        peer_state = None;
+                        drained = Instant::now();
                     }
                 }
                 Err(error) if idle(&error) => {}
                 Err(_) => return,
             }
         }
-        if down_at == down_len && !stream_eof && (upload_blocked || peer_state != Some(true)) {
+        let down_due = last_down.elapsed() >= IO_TIMEOUT;
+        if down_at == down_len
+            && !stream_eof
+            && (upload_blocked || peer_state != Some(true) || down_due)
+        {
+            last_down = Instant::now();
             match stream.read(&mut down) {
                 Ok(0) => stream_eof = true,
                 Ok(count) => {
                     down_len = count;
                     down_at = 0;
+                    drained = Instant::now();
                 }
                 Err(error) if idle(&error) => {}
                 Err(_) => return,
