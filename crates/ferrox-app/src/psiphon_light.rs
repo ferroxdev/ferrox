@@ -630,7 +630,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// The loopback side of a light connection: a local socket the direct relay
 /// already knows how to copy, so no new flow kind is needed.
-fn loopback<T: Read + Write + Queued + Send + 'static>(
+fn loopback<T: Read + Write + Queued + HalfClose + Send + 'static>(
     stream: T,
     timeout: Duration,
 ) -> Result<TcpStream, String> {
@@ -674,8 +674,25 @@ impl<T> Queued for LightStream<T> {
     }
 }
 
+/// A framed stream that can close its write direction while reads continue.
+trait HalfClose {
+    fn shutdown_write(&mut self) -> io::Result<()>;
+}
+
+impl<T: ferrox_core::tls::TlsProvider> HalfClose for LightStream<T> {
+    fn shutdown_write(&mut self) -> io::Result<()> {
+        if !self.drain()? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "psiphon light: upload is still pending",
+            ));
+        }
+        self.inner.close_notify().map_err(io::Error::other)
+    }
+}
+
 /// Service both directions over one framed TLS stream, keeping partial writes.
-fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
+fn relay<T: Read + Write + Queued + HalfClose>(mut stream: T, mut peer: TcpStream) {
     let _ = peer.set_nodelay(true);
     let _ = peer.set_read_timeout(Some(POLL));
     let _ = peer.set_write_timeout(Some(POLL));
@@ -689,6 +706,7 @@ fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
     let mut last_upload = Instant::now();
     let mut drained = Instant::now();
     let mut draining = false;
+    let mut half_closed = false;
     loop {
         let queued = stream.queued();
         if peer_eof && queued > 0 && last_upload.elapsed() >= DRAIN {
@@ -722,6 +740,12 @@ fn relay<T: Read + Write + Queued>(mut stream: T, mut peer: TcpStream) {
             last_upload = Instant::now();
         }
         let upload_blocked = stream.queued() > 0;
+        if peer_eof && !upload_blocked && !half_closed {
+            if stream.shutdown_write().is_err() {
+                return;
+            }
+            half_closed = true;
+        }
         if peer_eof && !upload_blocked && !draining {
             draining = true;
             drained = Instant::now();
@@ -1323,6 +1347,61 @@ mod tests {
         );
         assert_eq!(stream.wire.as_ptr(), base, "the wire buffer did not move");
         assert_eq!(stream.wire.capacity(), capacity, "the wire capacity held");
+    }
+
+    /// A TLS stand-in that records the framed bytes and the close notification.
+    #[derive(Default)]
+    struct FakeTls {
+        written: Vec<u8>,
+        closed: usize,
+    }
+
+    impl Read for FakeTls {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for FakeTls {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ferrox_core::tls::TlsProvider for FakeTls {
+        fn name() -> &'static str {
+            "fake"
+        }
+
+        fn suites(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn handshake(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+            Ok(())
+        }
+
+        fn alpn(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn close_notify(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+            self.closed += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_half_close_drains_the_header_before_the_notification() {
+        let mut stream = LightStream::new(FakeTls::default(), vec![0xaa, 0xbb]);
+        stream.shutdown_write().expect("half close");
+        assert_eq!(stream.inner.written, [0xaa, 0xbb]);
+        assert_eq!(stream.inner.closed, 1);
     }
 
     /// A writer that reports one timeout before accepting bytes.

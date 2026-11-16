@@ -1411,6 +1411,35 @@ impl<S: Stream> Session<S> {
         })
     }
 
+    /// Send a close notification without closing the read direction.
+    pub(crate) fn close_notify(&mut self) -> Result<(), TlsError> {
+        if !self.done {
+            return Ok(());
+        }
+        if self.ktls.is_some() {
+            return Err(TlsError::Other(
+                "close notification is unavailable under kTLS".to_owned(),
+            ));
+        }
+        let version = self.version;
+        let mut out = std::mem::take(&mut self.out);
+        out.clear();
+        let alert = [1u8, 0u8];
+        let sealed = {
+            let keys = self
+                .write_key
+                .as_mut()
+                .ok_or_else(|| TlsError::Other("no write keys".to_owned()))?;
+            match version {
+                Some(Version::Tls12) => record::seal12_parts(keys, ALERT, &[&alert], &mut out),
+                _ => record::seal13_parts(keys, ALERT, &[&alert], &mut out),
+            }
+        };
+        let result = sealed.and_then(|()| self.io.write_all(&out).map_err(TlsError::from));
+        self.out = out;
+        result
+    }
+
     /// Seals `parts` into the session's own write buffer and sends it, so a relay write after the first costs no allocation.
     fn seal_out(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         let mut out = std::mem::take(&mut self.out);
