@@ -125,7 +125,7 @@ pub(crate) struct WebRtc {
     debug: bool,
     shaping: Option<(TrafficShapingParameters, [u8; 32])>,
     media_shaping: Option<Shaping>,
-    send_timeout: Duration,
+    send_timeout: Option<Duration>,
 }
 
 impl WebRtc {
@@ -229,7 +229,7 @@ impl WebRtc {
                 debug,
                 shaping: None,
                 media_shaping: None,
-                send_timeout: Duration::from_secs(30),
+                send_timeout: Some(Duration::from_secs(30)),
             },
             offer.to_sdp_string(),
         ))
@@ -289,7 +289,7 @@ impl WebRtc {
         let channel = self
             .channel
             .ok_or_else(|| "psiphon webrtc: data channel is closed".to_owned())?;
-        let deadline = Instant::now() + self.send_timeout;
+        let deadline = self.send_timeout.map(|timeout| Instant::now() + timeout);
         loop {
             let accepted = self
                 .rtc
@@ -303,10 +303,10 @@ impl WebRtc {
             if accepted {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err("psiphon webrtc write timed out".to_owned());
             }
-            self.wait(next.min(deadline))?;
+            self.wait(deadline.map_or(next, |deadline| next.min(deadline)))?;
         }
     }
 
@@ -440,7 +440,7 @@ impl WebRtc {
 
     /// Move the engine onto a driver thread and expose it as an `io` stream.
     pub(crate) fn into_stream(mut self, timeout: Duration) -> Result<WebRtcStream, String> {
-        self.send_timeout = timeout;
+        self.send_timeout = Some(timeout);
         WebRtcStream::spawn(self, timeout, false)
     }
 
@@ -449,7 +449,7 @@ impl WebRtc {
         mut self,
         timeout: Duration,
     ) -> Result<WebRtcStream, String> {
-        self.send_timeout = timeout;
+        self.send_timeout = Some(timeout);
         WebRtcStream::spawn(self, timeout, true)
     }
 
@@ -1154,6 +1154,8 @@ impl WebRtcStream {
             .map(|(parameters, secret)| Arc::new(Mutex::new(Shaping::new(parameters, secret))));
         let unframed = raw && shaping.is_none();
         let padding_sent = Arc::new(AtomicBool::new(unframed));
+        let write_timeout = Arc::new(Mutex::new(Some(timeout)));
+        let thread_write_timeout = Arc::clone(&write_timeout);
         let driver_shaping = shaping.as_ref().map(Arc::clone);
         thread::Builder::new()
             .name("psiphon-webrtc".to_owned())
@@ -1166,6 +1168,7 @@ impl WebRtcStream {
                     thread_failure,
                     unframed,
                     driver_shaping,
+                    thread_write_timeout,
                 );
             })
             .map_err(|error| format!("psiphon webrtc driver: {error}"))?;
@@ -1179,7 +1182,7 @@ impl WebRtcStream {
             shaping,
             media,
             read_timeout: Arc::new(Mutex::new(Some(timeout))),
-            write_timeout: Arc::new(Mutex::new(Some(timeout))),
+            write_timeout,
         })
     }
 
@@ -1357,7 +1360,7 @@ impl Write for WebRtcStream {
 }
 
 /// Move datagrams between the engine and the bounded stream queues.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn drive(
     mut webrtc: WebRtc,
     out: Receiver<Vec<u8>>,
@@ -1366,6 +1369,7 @@ fn drive(
     failure: Arc<Mutex<Option<String>>>,
     raw: bool,
     shaping: Option<Arc<Mutex<Shaping>>>,
+    write_timeout: Arc<Mutex<Option<Duration>>>,
 ) {
     let mut peer_padding_done = false;
     let mut backlog: VecDeque<Result<Vec<u8>, String>> = VecDeque::new();
@@ -1373,6 +1377,7 @@ fn drive(
         if stop.load(Ordering::Acquire) {
             return;
         }
+        webrtc.send_timeout = *lock(&write_timeout);
         let mut wrote = false;
         for _ in 0..16 {
             match out.try_recv() {
