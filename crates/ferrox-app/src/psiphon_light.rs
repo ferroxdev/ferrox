@@ -687,8 +687,27 @@ impl<T: ferrox_core::tls::TlsProvider> HalfClose for LightStream<T> {
                 "psiphon light: upload is still pending",
             ));
         }
-        self.inner.close_notify().map_err(io::Error::other)
+        match self.inner.close_notify() {
+            Ok(()) | Err(ferrox_core::tls::TlsError::Timeout) => Ok(()),
+            Err(error) => Err(io::Error::other(error)),
+        }
     }
+}
+
+/// Close the proxy write side once the local peer has ended and its frames drained.
+fn half_close<T: HalfClose>(
+    stream: &mut T,
+    peer_eof: bool,
+    upload_blocked: bool,
+    half_closed: &mut bool,
+) -> bool {
+    if peer_eof && !upload_blocked && !*half_closed {
+        if stream.shutdown_write().is_err() {
+            return false;
+        }
+        *half_closed = true;
+    }
+    true
 }
 
 /// Service both directions over one framed TLS stream, keeping partial writes.
@@ -740,11 +759,8 @@ fn relay<T: Read + Write + Queued + HalfClose>(mut stream: T, mut peer: TcpStrea
             last_upload = Instant::now();
         }
         let upload_blocked = stream.queued() > 0;
-        if peer_eof && !upload_blocked && !half_closed {
-            if stream.shutdown_write().is_err() {
-                return;
-            }
-            half_closed = true;
+        if !half_close(&mut stream, peer_eof, upload_blocked, &mut half_closed) {
+            return;
         }
         if peer_eof && !upload_blocked && !draining {
             draining = true;

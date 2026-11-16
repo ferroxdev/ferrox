@@ -81,6 +81,9 @@ pub struct Session<S: Stream> {
     in_at: usize,
     reply: Vec<u8>,
     out: Vec<u8>,
+    close: Vec<u8>,
+    close_at: usize,
+    close_sent: bool,
     key_log: Option<Arc<dyn rustls::KeyLog>>,
     client_cert: Option<ClientIdentity>,
     ktls: Option<ktls::Layer>,
@@ -287,6 +290,9 @@ impl<S: Stream> Session<S> {
             in_at: 0,
             reply: Vec::new(),
             out: Vec::new(),
+            close: Vec::new(),
+            close_at: 0,
+            close_sent: false,
             key_log: None,
             client_cert: None,
             ktls: None,
@@ -1413,7 +1419,7 @@ impl<S: Stream> Session<S> {
 
     /// Send a close notification without closing the read direction.
     pub(crate) fn close_notify(&mut self) -> Result<(), TlsError> {
-        if !self.done {
+        if !self.done || self.close_sent || self.version != Some(Version::Tls13) {
             return Ok(());
         }
         if self.ktls.is_some() {
@@ -1421,23 +1427,50 @@ impl<S: Stream> Session<S> {
                 "close notification is unavailable under kTLS".to_owned(),
             ));
         }
-        let version = self.version;
-        let mut out = std::mem::take(&mut self.out);
-        out.clear();
-        let alert = [1u8, 0u8];
-        let sealed = {
-            let keys = self
-                .write_key
-                .as_mut()
-                .ok_or_else(|| TlsError::Other("no write keys".to_owned()))?;
-            match version {
-                Some(Version::Tls12) => record::seal12_parts(keys, ALERT, &[&alert], &mut out),
-                _ => record::seal13_parts(keys, ALERT, &[&alert], &mut out),
+        if self.close.is_empty() {
+            let version = self.version;
+            let mut out = Vec::new();
+            if !self.reply.is_empty() {
+                out.append(&mut self.reply);
             }
-        };
-        let result = sealed.and_then(|()| self.io.write_all(&out).map_err(TlsError::from));
-        self.out = out;
-        result
+            let alert = [1u8, 0u8];
+            let sealed = {
+                let keys = self
+                    .write_key
+                    .as_mut()
+                    .ok_or_else(|| TlsError::Other("no write keys".to_owned()))?;
+                match version {
+                    Some(Version::Tls12) => record::seal12_parts(keys, ALERT, &[&alert], &mut out),
+                    _ => record::seal13_parts(keys, ALERT, &[&alert], &mut out),
+                }
+            };
+            sealed?;
+            self.close = out;
+            self.close_at = 0;
+        }
+        self.flush_close()
+    }
+
+    /// Write the sealed close record from its last offset, so a timeout resumes instead of
+    /// sealing a second alert.
+    fn flush_close(&mut self) -> Result<(), TlsError> {
+        while self.close_at < self.close.len() {
+            match self.io.write(&self.close[self.close_at..]) {
+                Ok(0) => {
+                    return Err(TlsError::Other(
+                        "close notification accepted no bytes".to_owned(),
+                    ));
+                }
+                Ok(count) => self.close_at += count,
+                Err(error) => return Err(TlsError::from(error)),
+            }
+        }
+        if self.close_at > 0 {
+            self.close.clear();
+            self.close_at = 0;
+            self.close_sent = true;
+        }
+        Ok(())
     }
 
     /// Seals `parts` into the session's own write buffer and sends it, so a relay write after the first costs no allocation.
@@ -1527,6 +1560,10 @@ impl<S: Stream> TlsProvider for Session<S> {
 
     fn closed(&self) -> bool {
         self.eof
+    }
+
+    fn close_notify(&mut self) -> Result<(), TlsError> {
+        self.close_notify()
     }
 
     fn peer_leaf(&self) -> Option<&[u8]> {
@@ -1690,6 +1727,7 @@ impl<S: Stream> Write for Session<S> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_close().map_err(std::io::Error::other)?;
         if let Some(layer) = &mut self.ktls {
             return layer.flush(&mut self.io);
         }
@@ -2464,6 +2502,9 @@ mod tests {
             in_at: 0,
             reply: Vec::new(),
             out: Vec::new(),
+            close: Vec::new(),
+            close_at: 0,
+            close_sent: false,
             key_log: None,
             client_cert: None,
             ktls: None,

@@ -230,11 +230,10 @@ pub trait TlsProvider: std::io::Read + std::io::Write {
         false
     }
 
-    /// Send this side's close notification without closing the read direction.
+    /// Send this side's close notification when the backend and protocol support a
+    /// half-close; a backend with no such signal sends nothing.
     fn close_notify(&mut self) -> Result<(), TlsError> {
-        Err(TlsError::Other(
-            "close notification is unsupported by this backend".to_owned(),
-        ))
+        Ok(())
     }
 
     /// The server name the front's hello named, once the handshake has read
