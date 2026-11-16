@@ -6,6 +6,7 @@ use crate::proxy::{self, Destination};
 use crate::quic::{self, Datagram, QuicStream};
 use ferrox_core::tls::Anchors;
 use ferrox_core::tuic as wire;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -117,19 +118,35 @@ struct Lane {
     heartbeat: thread::Thread,
     auth: Auth,
     authed: AtomicBool,
+    early_since: Option<Instant>,
+    establish_by: Option<Instant>,
+}
+
+fn lane_established(conn: &quiche::Connection, lane: &Lane) -> bool {
+    if conn.is_closed() {
+        return false;
+    }
+    if conn.is_established() {
+        return true;
+    }
+    let Some(since) = lane.early_since else {
+        return true;
+    };
+    Instant::now() < lane.establish_by.unwrap_or(since + quic::HANDSHAKE_TIMEOUT)
+        && !(since.elapsed() >= quic::SILENT_HANDSHAKE && conn.stats().recv == 0)
 }
 
 struct Auth {
     uuid: [u8; 16],
     password: String,
-    host: String,
-    pins: Arc<[[u8; 32]]>,
+    frame: OnceLock<Vec<u8>>,
+    sent: AtomicUsize,
 }
 
 impl Lane {
-    /// Finish the handshake once: pins first, then the exporter token, then resumption. An early
-    /// lane calls this from its driver after the flight lands; a cold lane calls it before it is
-    /// returned, so a caller never writes into a connection whose trust is still unread.
+    /// Finish the handshake once: the exporter token, then resumption. An early lane calls this
+    /// from its driver after the flight lands; a cold lane calls it before it is returned, so a
+    /// caller never writes into a connection whose trust is still unread.
     fn finish_handshake(&self) -> bool {
         if self.authed.load(Ordering::Relaxed) {
             return true;
@@ -140,23 +157,50 @@ impl Lane {
         if !conn.is_established() {
             return !conn.is_closed();
         }
-        if !self.auth.pins.is_empty() && !edge_pinned(&conn, &self.auth.pins, &self.auth.host) {
-            let _ = conn.close(false, 0, b"pinned certificate");
-            quic::flush_egress(&mut conn, &self.sock);
-            return false;
+        if self.auth.frame.get().is_none() {
+            let Some(token) =
+                export_token(&mut conn, &self.auth.uuid, self.auth.password.as_bytes())
+            else {
+                let _ = conn.close(false, 0, b"authentication");
+                quic::flush_egress(&mut conn, &self.sock);
+                return false;
+            };
+            let mut auth = Vec::with_capacity(wire::AUTH_LEN);
+            wire::encode_auth(&self.auth.uuid, &token, &mut auth);
+            let _ = self.auth.frame.set(auth);
         }
-        let Some(token) = export_token(&mut conn, &self.auth.uuid, self.auth.password.as_bytes())
-        else {
-            let _ = conn.close(false, 0, b"authentication");
-            quic::flush_egress(&mut conn, &self.sock);
+        let Some(auth) = self.auth.frame.get() else {
             return false;
         };
-        let mut auth = Vec::with_capacity(wire::AUTH_LEN);
-        wire::encode_auth(&self.auth.uuid, &token, &mut auth);
-        if !send_frame(&mut conn, 2, &auth, true) {
-            let _ = conn.close(false, 0, b"authentication");
-            quic::flush_egress(&mut conn, &self.sock);
-            return false;
+        let mut at = self.auth.sent.load(Ordering::Relaxed);
+        while at < auth.len() {
+            match conn.stream_send(2, &auth[at..], false) {
+                Ok(written) if written > 0 => {
+                    at += written;
+                    self.auth.sent.store(at, Ordering::Relaxed);
+                }
+                Ok(_) | Err(quiche::Error::Done | quiche::Error::StreamLimit) => {
+                    quic::flush_egress(&mut conn, &self.sock);
+                    return !conn.is_closed();
+                }
+                Err(_) => {
+                    let _ = conn.close(false, 0, b"authentication");
+                    quic::flush_egress(&mut conn, &self.sock);
+                    return false;
+                }
+            }
+        }
+        match conn.stream_send(2, &[], true) {
+            Ok(_) => {}
+            Err(quiche::Error::Done | quiche::Error::StreamLimit) => {
+                quic::flush_egress(&mut conn, &self.sock);
+                return !conn.is_closed();
+            }
+            Err(_) => {
+                let _ = conn.close(false, 0, b"authentication");
+                quic::flush_egress(&mut conn, &self.sock);
+                return false;
+            }
         }
         quic::flush_egress(&mut conn, &self.sock);
         remember_session(&conn, &self.session);
@@ -289,9 +333,19 @@ impl TuicOut {
         let mut held = self.lane.lock().ok()?;
         if let Some(lane) = held.as_ref() {
             let live = !lane.stop.load(Ordering::Relaxed)
-                && lane.conn.lock().is_ok_and(|conn| !conn.is_closed());
+                && lane
+                    .conn
+                    .lock()
+                    .is_ok_and(|conn| lane_established(&conn, lane));
             if live {
                 return Some(Arc::clone(lane));
+            }
+            lane.stop.store(true, Ordering::Relaxed);
+            if let Ok(mut conn) = lane.conn.lock() {
+                if !conn.is_closed() {
+                    let _ = conn.close(true, 0, b"handshake deadline");
+                    quic::flush_egress(&mut conn, &lane.sock);
+                }
             }
         }
         let lane = self.connect_lane()?;
@@ -354,10 +408,12 @@ impl TuicOut {
             auth: Auth {
                 uuid: self.uuid,
                 password: self.password.clone(),
-                host: self.host.clone(),
-                pins: Arc::clone(&self.cert_pins),
+                frame: OnceLock::new(),
+                sent: AtomicUsize::new(0),
             },
             authed: AtomicBool::new(false),
+            early_since: early.then(Instant::now),
+            establish_by: early.then(|| Instant::now() + quic::HANDSHAKE_TIMEOUT),
         });
         if !early && !lane.finish_handshake() {
             return None;
@@ -371,7 +427,14 @@ impl TuicOut {
 
     fn client_config(&self) -> Option<quiche::Config> {
         let roots = self.roots.as_deref().unwrap_or(&[]);
-        let mut config = if self.insecure || !self.cert_pins.is_empty() {
+        let mut config = if !self.cert_pins.is_empty() {
+            let mut config = pinned_config(Arc::clone(&self.cert_pins), self.host.clone())?;
+            config.set_application_protos(&[wire::ALPN]).ok()?;
+            if let Some(name) = self.cc.as_deref() {
+                config.set_cc_algorithm_name(name).ok()?;
+            }
+            config
+        } else if self.insecure {
             let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
             config.verify_peer(false);
             config.set_application_protos(&[wire::ALPN]).ok()?;
@@ -397,9 +460,12 @@ impl TuicOut {
         let Some(lane) = self.lane() else {
             return;
         };
-        let (host, port) = destination_parts(target);
+        let (host, port): (Cow<'_, str>, u16) = match target {
+            Destination::Name(host, port) => (Cow::Borrowed(host.as_str()), *port),
+            Destination::Address(address) => (Cow::Owned(address.ip().to_string()), address.port()),
+        };
         let mut header = Vec::with_capacity(host.len() + 5);
-        if wire::encode_connect(&host, port, &mut header).is_err() {
+        if wire::encode_connect(host.as_ref(), port, &mut header).is_err() {
             return;
         }
         let deadline = Instant::now() + crate::budgets::dial();
@@ -489,6 +555,7 @@ impl TuicOut {
         let watch_started = watcher.is_some();
         let mut buf = vec![0u8; UDP_BUFFER];
         let mut packet = 0u16;
+        let mut frame = Vec::new();
         let _ = relay.set_read_timeout(Some(POLL));
         loop {
             if lane.stop.load(Ordering::Relaxed) {
@@ -514,8 +581,7 @@ impl TuicOut {
                     } else {
                         break;
                     }
-                    let (host, port) = destination_parts(&destination);
-                    let Some(address) = wire::address_port(&host, port) else {
+                    let Some((address, port)) = destination_wire(&destination) else {
                         continue;
                     };
                     packet = next_packet(packet);
@@ -531,14 +597,15 @@ impl TuicOut {
                     let max = conn.dgram_max_writable_len();
                     send_message(
                         &mut conn,
-                        &lane.sock,
                         self.mode,
                         association,
                         packet,
-                        &address,
+                        address,
+                        port,
                         payload,
                         max,
                         &mut pending,
+                        &mut frame,
                     );
                     flush_pending(&mut conn, &lane.sock, &mut pending, &lane.next_uni);
                     touch(&sink.last);
@@ -569,10 +636,16 @@ impl TuicOut {
     }
 }
 
-fn destination_parts(destination: &Destination) -> (String, u16) {
+fn destination_wire(destination: &Destination) -> Option<(wire::Address<'_>, u16)> {
     match destination {
-        Destination::Name(host, port) => (host.clone(), *port),
-        Destination::Address(address) => (address.ip().to_string(), address.port()),
+        Destination::Name(host, port) => Some((wire::Address::of(host)?, *port)),
+        Destination::Address(address) => {
+            let port = address.port();
+            match address.ip() {
+                IpAddr::V4(ip) => Some((wire::Address::V4(ip.octets()), port)),
+                IpAddr::V6(ip) => Some((wire::Address::V6(ip.octets()), port)),
+            }
+        }
     }
 }
 
@@ -585,15 +658,30 @@ fn next_packet(packet: u16) -> u16 {
     }
 }
 
-fn edge_pinned(conn: &quiche::Connection, pins: &Arc<[[u8; 32]]>, name: &str) -> bool {
-    let chain: Vec<Vec<u8>> = match conn.peer_cert_chain() {
-        Some(chain) => chain.iter().map(|cert| cert.to_vec()).collect(),
-        None => conn
-            .peer_cert()
-            .map(|cert| vec![cert.to_vec()])
-            .unwrap_or_default(),
-    };
-    ferrox_core::tls::verify_cert_pinned(&chain, pins, name)
+/// A pin is the handshake's own verifier, so a chain that does not match never reaches the
+/// exporter key or the authentication frame. The callback receives the DER the edge sent, and
+/// the same `verify_cert_pinned` rule the other TLS lanes use decides it.
+fn pinned_config(pins: Arc<[[u8; 32]]>, name: String) -> Option<quiche::Config> {
+    use boring::ssl::{SslAlert, SslMethod, SslVerifyError, SslVerifyMode};
+    let mut builder = boring::ssl::SslContextBuilder::new(SslMethod::tls()).ok()?;
+    builder.set_custom_verify_callback(SslVerifyMode::PEER, move |ssl| {
+        let Some(chain) = ssl.peer_cert_chain() else {
+            return Err(SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE));
+        };
+        let mut chain_der = Vec::with_capacity(chain.len());
+        for cert in chain.iter() {
+            let Ok(der) = cert.to_der() else {
+                return Err(SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE));
+            };
+            chain_der.push(der);
+        }
+        if ferrox_core::tls::verify_cert_pinned(&chain_der, &pins, &name) {
+            Ok(())
+        } else {
+            Err(SslVerifyError::Invalid(SslAlert::UNKNOWN_CA))
+        }
+    });
+    quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder).ok()
 }
 
 fn remember_session(conn: &quiche::Connection, session: &Mutex<Option<Vec<u8>>>) -> bool {
@@ -663,15 +751,21 @@ fn export_token(
 #[allow(clippy::too_many_arguments)]
 fn send_message(
     conn: &mut quiche::Connection,
-    sock: &Datagram,
     mode: RelayMode,
     association: u16,
     packet: u16,
-    address: &[u8],
+    address: wire::Address<'_>,
+    port: u16,
     payload: &[u8],
     max: Option<usize>,
     pending: &mut Vec<Pending>,
+    frame: &mut Vec<u8>,
 ) {
+    let mut destination = [0u8; wire::MAX_ADDRESS + 4];
+    let Some(destination_len) = wire::address_port_into(address, port, &mut destination) else {
+        return;
+    };
+    let address = &destination[..destination_len];
     if mode == RelayMode::Quic {
         queue_stream(pending, association, packet, address, payload);
         return;
@@ -684,7 +778,10 @@ fn send_message(
         queue_stream(pending, association, packet, address, payload);
         return;
     };
-    let mut frame = Vec::with_capacity(max);
+    frame.clear();
+    if frame.capacity() < max {
+        frame.reserve(max - frame.capacity());
+    }
     let mut left = payload;
     for index in 0..plan.total {
         let take = left.len().min(if index == 0 {
@@ -699,14 +796,13 @@ fn send_message(
             index,
             address,
             &left[..take],
-            &mut frame,
+            frame,
         );
-        if conn.dgram_send(&frame).is_err() {
+        if conn.dgram_send(&frame[..]).is_err() {
             break;
         }
         left = &left[take..];
     }
-    quic::flush_egress(conn, sock);
 }
 
 fn queue_stream(
@@ -741,17 +837,6 @@ fn queue_dissociate(pending: &mut Vec<Pending>, association: u16) {
         at: 0,
         finish: true,
     });
-}
-
-fn send_frame(conn: &mut quiche::Connection, id: u64, data: &[u8], finish: bool) -> bool {
-    let mut at = 0;
-    while at < data.len() {
-        match conn.stream_send(id, &data[at..], false) {
-            Ok(n) if n > 0 => at += n,
-            _ => return false,
-        }
-    }
-    !finish || conn.stream_send(id, &[], true).is_ok()
 }
 
 fn flush_one(conn: &mut quiche::Connection, frame: &mut Pending, next_uni: &AtomicU64) -> Sent {
@@ -989,6 +1074,9 @@ fn client_reply(
     last: &Mutex<Instant>,
     reply: &UdpSocket,
 ) {
+    if !reassembly.is_empty() {
+        reassembly.retain(|_, parts| parts.at.elapsed() < REASSEMBLY_TTL);
+    }
     let Some((host, port, payload)) = assemble(data, association, reassembly) else {
         return;
     };
@@ -1000,10 +1088,7 @@ fn client_reply(
     };
     let mut head = Vec::with_capacity(22);
     let (head, payload) = proxy::socks_udp_parts(&mut head, &target, &payload);
-    let mut frame = Vec::with_capacity(head.len() + payload.len());
-    frame.extend_from_slice(head);
-    frame.extend_from_slice(payload);
-    if reply.send_to(&frame, source).is_ok() {
+    if proxy::send_to_two(reply, head, payload, source).is_ok() {
         touch(last);
     }
 }
@@ -1018,11 +1103,11 @@ fn idle(last: &Mutex<Instant>) -> bool {
     last.lock().is_ok_and(|last| last.elapsed() >= UDP_IDLE)
 }
 
-fn assemble(
-    data: &[u8],
+fn assemble<'a>(
+    data: &'a [u8],
     association: u16,
     reassembly: &mut HashMap<(u16, u16), Parts>,
-) -> Option<(String, u16, Vec<u8>)> {
+) -> Option<(String, u16, Cow<'a, [u8]>)> {
     if wire::Packet::is_heartbeat(data) {
         return None;
     }
@@ -1033,15 +1118,14 @@ fn assemble(
     take_packet(reassembly, &packet)
 }
 
-fn take_packet(
+fn take_packet<'a>(
     reassembly: &mut HashMap<(u16, u16), Parts>,
-    packet: &wire::Packet<'_>,
-) -> Option<(String, u16, Vec<u8>)> {
+    packet: &wire::Packet<'a>,
+) -> Option<(String, u16, Cow<'a, [u8]>)> {
     let size = packet.payload.len();
-    reassembly.retain(|_, parts| parts.at.elapsed() < REASSEMBLY_TTL);
     if packet.total == 1 {
         let (address, port) = packet.destination?;
-        return Some((address_host(address), port, packet.payload.to_vec()));
+        return Some((address_host(address), port, Cow::Borrowed(packet.payload)));
     }
     if size > MAX_PACKET_PAYLOAD {
         return None;
@@ -1092,7 +1176,7 @@ fn take_packet(
     for part in entry.payload {
         payload.extend_from_slice(part.as_deref()?);
     }
-    Some((host, port, payload))
+    Some((host, port, Cow::Owned(payload)))
 }
 
 struct Parts {
@@ -1787,7 +1871,7 @@ impl Server {
             }
         }
         drain_resolved(&mut inner);
-        poll_udp(&mut conn, &mut inner, &self.sock);
+        poll_udp(&mut conn, &mut inner);
         let now = Instant::now();
         inner
             .reassembly
@@ -1862,7 +1946,7 @@ impl Server {
                 .reassembly
                 .retain(|_, parts| now.duration_since(parts.at) < REASSEMBLY_TTL);
             drain_resolved(&mut inner);
-            poll_udp(&mut conn, &mut inner, &self.sock);
+            poll_udp(&mut conn, &mut inner);
             flush_inner(&mut conn, &self.sock, &mut inner);
             quic::flush_egress(&mut conn, &self.sock);
         }
@@ -2242,6 +2326,11 @@ fn accept_packet(
     let Ok(packet) = wire::parse_packet(data) else {
         return;
     };
+    if !inner.reassembly.is_empty() {
+        inner
+            .reassembly
+            .retain(|_, parts| parts.at.elapsed() < REASSEMBLY_TTL);
+    }
     let Some((host, port, payload)) = take_packet(&mut inner.reassembly, &packet) else {
         return;
     };
@@ -2256,14 +2345,14 @@ fn accept_packet(
             &payload,
             stream,
         );
-        poll_udp(conn, inner, sock);
+        poll_udp(conn, inner);
         flush_inner(conn, sock, inner);
     } else {
         let job = ResolveJob {
             association: packet.association,
             host,
             port,
-            payload,
+            payload: payload.into_owned(),
             stream,
             generation,
             options: proxy::dial_options(),
@@ -2387,11 +2476,12 @@ fn flush_inner(conn: &mut quiche::Connection, sock: &Arc<Datagram>, inner: &mut 
     inner.pending = pending;
 }
 
-fn poll_udp(conn: &mut quiche::Connection, inner: &mut Inner, sock: &Arc<Datagram>) {
+fn poll_udp(conn: &mut quiche::Connection, inner: &mut Inner) {
     let max = conn.dgram_max_writable_len();
     let mut buf = std::mem::take(&mut inner.udp_buf);
     buf.resize(UDP_BUFFER, 0);
     let mut pending = std::mem::take(&mut inner.pending);
+    let mut frame = Vec::new();
     let mut swept = 0usize;
     let cursor = inner.udp_cursor;
     let mut after = cursor.is_none_or(|key| !inner.udp.contains_key(&key));
@@ -2430,22 +2520,23 @@ fn poll_udp(conn: &mut quiche::Connection, inner: &mut Inner, sock: &Arc<Datagra
                     Ok((n, from)) => {
                         taken += 1;
                         swept += 1;
-                        let host = from.ip().to_string();
-                        let Some(address) = wire::address_port(&host, from.port()) else {
-                            continue;
+                        let address = match from.ip() {
+                            IpAddr::V4(ip) => wire::Address::V4(ip.octets()),
+                            IpAddr::V6(ip) => wire::Address::V6(ip.octets()),
                         };
                         *last = Instant::now();
                         *packet = next_packet(*packet);
                         send_message(
                             conn,
-                            sock,
                             mode,
                             *association,
                             *packet,
-                            &address,
+                            address,
+                            from.port(),
                             &buf[..n],
                             max,
                             &mut pending,
+                            &mut frame,
                         );
                     }
                     Err(error) if is_wait(&error) => break,
@@ -2517,6 +2608,31 @@ mod tests {
     }
 
     #[test]
+    fn a_pin_verifies_the_handshake() {
+        let (identity, roots) = test_identity();
+        let leaf = identity.certs[0].cert_chain[0].clone();
+        let digest = ring::digest::digest(&ring::digest::SHA256, &leaf);
+        let pin: [u8; 32] = digest.as_ref().try_into().expect("a sha256 digest");
+        let mut config = quic::serve_config(&identity).expect("the server builds");
+        let server = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let address = server.local_addr().expect("address");
+        let server_thread = thread::spawn(move || {
+            let sock = Datagram::plain(server);
+            let _ = quic::server_accept(&sock, address, &mut config);
+        });
+        let mut out = test_out(address, roots);
+        out.zero_rtt = false;
+        out.cert_pins = Arc::from(vec![pin]);
+        let lane = out.lane().expect("a pinned handshake");
+        assert!(
+            lane.conn.lock().expect("the lane lock").is_established(),
+            "the pin did not complete the handshake"
+        );
+        lane.stop.store(true, Ordering::Relaxed);
+        server_thread.join().expect("the server thread");
+    }
+
+    #[test]
     fn a_resumed_lane_carries_application_data_before_the_handshake() {
         let (identity, roots) = test_identity();
         let mut config = quic::serve_config(&identity).expect("the server builds");
@@ -2568,9 +2684,6 @@ mod tests {
                         early.send(data[..read].to_vec()).expect("reports");
                         break;
                     }
-                }
-                while let Ok((written, info)) = second.send(&mut out) {
-                    let _ = sock.send_to(&out[..written], info.to);
                 }
                 if let Some((n, from)) = quic::server_poll(&sock, &mut buf) {
                     second
@@ -2788,7 +2901,7 @@ mod tests {
     }
 
     #[test]
-    fn a_single_fragment_packet_payload_is_copied_once() {
+    fn a_single_fragment_packet_payload_is_not_copied() {
         let address = Some((wire::Address::V4([192, 0, 2, 1]), 53));
         let empty = Vec::new();
         let empty_packet = wire::Packet {
@@ -2815,10 +2928,10 @@ mod tests {
             ferrox_core::alloc_count::measure(|| take_packet(&mut HashMap::new(), &packet));
         let (host, port, copied) = taken.expect("one packet");
         assert_eq!((host.as_str(), port), ("192.0.2.1", 53));
-        assert_eq!(copied, payload);
-        assert_ne!(copied.as_ptr(), source);
-        assert_eq!(counts.allocs - base.allocs, 1);
-        assert_eq!(counts.bytes - base.bytes, payload.len());
+        assert_eq!(copied.as_ref(), payload);
+        assert_eq!(copied.as_ptr(), source);
+        assert_eq!(counts.allocs - base.allocs, 0);
+        assert_eq!(counts.bytes - base.bytes, 0);
     }
 
     #[test]

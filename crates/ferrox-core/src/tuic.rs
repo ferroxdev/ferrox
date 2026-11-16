@@ -276,9 +276,52 @@ pub fn address_port(host: &str, port: u16) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Writes one address and its port into a caller's buffer, so a packet that already holds the
+/// destination needs no `Vec` behind it. The returned length is what `encode_fragment` takes.
+pub fn address_port_into(address: Address<'_>, port: u16, out: &mut [u8]) -> Option<usize> {
+    let len = address.wire_len();
+    let total = len.checked_add(2)?;
+    if out.len() < total {
+        return None;
+    }
+    match address {
+        Address::V4(octets) => {
+            out[0] = 1;
+            out[1..5].copy_from_slice(&octets);
+        }
+        Address::V6(octets) => {
+            out[0] = 2;
+            out[1..17].copy_from_slice(&octets);
+        }
+        Address::Name(bytes) => {
+            out[0] = 0;
+            out[1] = bytes.len() as u8;
+            out[2..len].copy_from_slice(bytes);
+        }
+    }
+    out[len..total].copy_from_slice(&port.to_be_bytes());
+    Some(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_address_and_port_write_into_a_borrowed_buffer() {
+        for host in ["192.0.2.1", "2001:db8::1", "example.test"] {
+            let address = Address::of(host).expect("an address");
+            let expected = address_port(host, 443).expect("bytes");
+            let mut out = [0u8; MAX_ADDRESS + 4];
+            let written =
+                address_port_into(address, 443, &mut out).expect("the buffer is wide enough");
+            assert_eq!(&out[..written], expected.as_slice());
+        }
+        assert_eq!(
+            address_port_into(Address::V4([192, 0, 2, 1]), 1, &mut [0u8; 4]),
+            None
+        );
+    }
 
     #[test]
     fn the_three_address_families_match_the_wire() {
