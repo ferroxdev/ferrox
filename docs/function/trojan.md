@@ -46,7 +46,7 @@ graph TD
 | trojan-tls-raw-down-8-ubuntu-x86-64-mib-per-second | 2814.1 | CI benchmark-matrix.yml trojan-tls-raw-down-8 |
 | password-bytes-on-the-wire | 56 | ferrox-app-proxy::tests::trojan_key_is_sha224_hex |
 | framing-bytes-added-after-the-header | 0 | ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers |
-| udp-framing-bytes-per-datagram | 2 | ferrox-app-proxy::tests::trojan_udp_frames_carry |
+| udp-length-prefix-bytes-per-datagram | 2 | ferrox-app-proxy::tests::trojan_udp_frames_carry |
 | udp-carriers-holding-an-association | 7 | ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier |
 | reality-tcp-carriers-holding-an-echo | 6 | ferrox-app-proxy::tests::a_trojan_reality_inbound_answers_every_tcp_carrier |
 | reality-kcp-pairs-holding-an-echo | 1 | ferrox-app-proxy::tests::a_trojan_reality_kcp_inbound_answers_the_session |
@@ -59,7 +59,7 @@ graph TD
 | numeric-domain-header-allocations | 0 | ferrox-app-proxy::tests::the_trojan_numeric_domain_header_allocates_nothing |
 <!-- counts:end -->
 
-`udp-framing-bytes-per-datagram` counts the two-byte length prefix only; the SOCKS address and the two-byte CRLF that surround it scale with the address type and are not in that row.
+`udp-length-prefix-bytes-per-datagram` counts the two-byte length prefix only; the SOCKS address and the two-byte CRLF that surround it scale with the address type and are not in that row.
 
 ## Ops
 

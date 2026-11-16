@@ -101,6 +101,7 @@ shadowsocks host-port-strings-per-datagram 0 ferrox-app-shadowsocks::tests::a_da
 
 # --- VLESS ------------------------------------------------------------------
 vless ops-retired-instructions UNBLESSED scripts/count-ops.sh
+vless syscalls-per-request UNBLESSED no syscall checker yet
 vless request-header-allocations 0 ferrox-bench-gate-2
 vless request-header-bytes-zero-filled 0 ferrox-bench-gate-2
 vless address-families-encoded 4 ferrox-core-vless::tests::header_address_families_encode_stably
@@ -128,7 +129,7 @@ trojan syscalls-per-handshake UNBLESSED scripts/count-ops.sh
 trojan trojan-tls-raw-down-8-ubuntu-x86-64-mib-per-second 2814.1 CI benchmark-matrix.yml trojan-tls-raw-down-8
 trojan password-bytes-on-the-wire 56 ferrox-app-proxy::tests::trojan_key_is_sha224_hex
 trojan framing-bytes-added-after-the-header 0 ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers
-trojan udp-framing-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_frames_carry
+trojan udp-length-prefix-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_frames_carry
 trojan udp-carriers-holding-an-association 7 ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier
 trojan reality-tcp-carriers-holding-an-echo 6 ferrox-app-proxy::tests::a_trojan_reality_inbound_answers_every_tcp_carrier
 trojan reality-kcp-pairs-holding-an-echo 1 ferrox-app-proxy::tests::a_trojan_reality_kcp_inbound_answers_the_session
