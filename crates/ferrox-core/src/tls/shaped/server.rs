@@ -895,7 +895,11 @@ impl<S: Stream> Read for Server<S> {
             return Ok(0);
         }
         self.handshake().map_err(std::io::Error::other)?;
-        self.flush_out()?;
+        if let Err(error) = self.flush_out() {
+            if !TlsError::is_timeout(&error) {
+                return Err(error);
+            }
+        }
         loop {
             if self.plain_at < self.plain_end {
                 let n = (self.plain_end - self.plain_at).min(buf.len());

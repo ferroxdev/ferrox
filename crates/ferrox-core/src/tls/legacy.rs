@@ -358,7 +358,7 @@ pub(crate) fn server_context(cfg: &TlsServerConfig) -> Result<Arc<SslContext>, T
         send_tickets: cfg.send_tickets,
         reject_unknown_sni: cfg.reject_unknown_sni,
         ech_server_keys: cfg.ech_server_keys.clone(),
-        master_key_log: cfg.master_key_log.as_ref().map(|log| log.path().to_owned()),
+        master_key_log: cfg.master_key_log.clone(),
     };
     if let Some((built_for, ctx)) = guard.legacy.as_ref() {
         if built_for == &key {

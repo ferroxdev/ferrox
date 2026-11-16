@@ -774,9 +774,7 @@ pub(crate) fn read_to_fill<R: Read>(io: &mut R, buf: &mut [u8]) -> usize {
                 if waits > WAIT_LIMIT {
                     break;
                 }
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                std::thread::sleep(Duration::from_millis(1));
             }
             Err(_) => break,
         }
@@ -1906,7 +1904,10 @@ impl<S: Stream> Session13<S> {
                     share.extend_from_slice(public.as_bytes());
                     share.extend_from_slice(ciphertext.as_ref());
                     shared.extend_from_slice(&x_shared);
-                    let mixed = crate::tls::shaped::keys::draft_shared(shared_key.as_ref(), &share);
+                    let mixed = crate::tls::shaped::keys::draft_shared(
+                        shared_key.as_ref(),
+                        ciphertext.as_ref(),
+                    );
                     shared.extend_from_slice(&mixed);
                 } else {
                     share.extend_from_slice(ciphertext.as_ref());

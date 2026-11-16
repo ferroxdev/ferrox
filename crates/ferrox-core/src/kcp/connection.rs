@@ -57,6 +57,7 @@ pub struct ConnMetadata {
 pub enum ConnError {
     IoTimeout,
     Closed,
+    MtuTooSmall,
 }
 
 impl std::fmt::Display for ConnError {
@@ -64,6 +65,7 @@ impl std::fmt::Display for ConnError {
         match self {
             Self::IoTimeout => write!(f, "read/write timeout"),
             Self::Closed => write!(f, "connection closed"),
+            Self::MtuTooSmall => write!(f, "mtu leaves no payload"),
         }
     }
 }
@@ -697,6 +699,9 @@ impl Connection {
     }
 
     pub fn write(&self, b: &[u8]) -> Result<usize, ConnError> {
+        if !b.is_empty() && self.mss == 0 {
+            return Err(ConnError::MtuTooSmall);
+        }
         let mut offset = 0;
         let mut pushed = false;
         while offset < b.len() {
@@ -1062,6 +1067,26 @@ mod tests {
     fn read_once(conn: &Connection, b: &mut [u8]) -> Result<usize, super::ConnError> {
         conn.set_read_deadline(std::time::Instant::now() + Duration::from_millis(200));
         conn.read(b)
+    }
+
+    #[test]
+    fn a_tiny_mtu_refuses_a_write_instead_of_dropping_it() {
+        let local = ([127, 0, 0, 1], 1).into();
+        let conn = Connection::new(
+            ConnMetadata {
+                local,
+                remote: local,
+                conversation: 4,
+            },
+            Box::new(|_| Ok(())),
+            Box::new(|| {}),
+            Config {
+                mtu: 18,
+                ..Config::default()
+            },
+        );
+        assert_eq!(conn.write(b"x"), Err(super::ConnError::MtuTooSmall));
+        assert_eq!(conn.write(b""), Ok(0));
     }
 
     #[test]

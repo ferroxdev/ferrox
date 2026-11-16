@@ -1483,9 +1483,6 @@ impl<S: Stream> Session<S> {
     /// Seals `parts` into the session's own write buffer and sends it, so a relay write after the first costs no allocation.
     fn seal_out(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         self.flush_reply()?;
-        if self.out_at < self.out.len() {
-            self.flush_out()?;
-        }
         let mut out = std::mem::take(&mut self.out);
         out.clear();
         self.out_at = 0;
@@ -1512,6 +1509,9 @@ impl<S: Stream> Session<S> {
     }
 
     fn flush_reply(&mut self) -> std::io::Result<()> {
+        if self.out_at < self.out.len() {
+            self.flush_out()?;
+        }
         if !self.close.is_empty() || self.close_sent {
             return Ok(());
         }
@@ -1692,6 +1692,9 @@ impl<S: Stream> TlsProvider for Session<S> {
         if let Some(layer) = &mut self.ktls {
             return layer.seal_into(&[plaintext], out);
         }
+        if self.out_at < self.out.len() {
+            self.flush_out()?;
+        }
         self.seal_parts(&[plaintext], out)
             .map_err(std::io::Error::other)?;
         Ok(plaintext.len())
@@ -1704,6 +1707,9 @@ impl<S: Stream> TlsProvider for Session<S> {
         if let Some(layer) = &mut self.ktls {
             layer.seal_into(parts, out)?;
             return Ok(());
+        }
+        if self.out_at < self.out.len() {
+            self.flush_out()?;
         }
         self.seal_parts(parts, out).map_err(std::io::Error::other)
     }
@@ -1741,8 +1747,11 @@ impl<S: Stream> Read for Session<S> {
         if let Some(layer) = &mut self.ktls {
             return layer.read(&mut self.io, buf);
         }
-        self.flush_reply()?;
-        self.flush_out()?;
+        if let Err(error) = self.flush_reply() {
+            if !TlsError::is_timeout(&error) {
+                return Err(error);
+            }
+        }
         self.pump(buf).map_err(std::io::Error::other)
     }
 }
@@ -1763,8 +1772,8 @@ impl<S: Stream> Write for Session<S> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.flush_close().map_err(std::io::Error::other)?;
         self.flush_reply()?;
+        self.flush_close().map_err(std::io::Error::other)?;
         self.flush_out()?;
         if let Some(layer) = &mut self.ktls {
             return layer.flush(&mut self.io);
@@ -2620,6 +2629,26 @@ mod tests {
             Direction::tls13(Suite::Aes128GcmSha256, &[0u8; 32]),
             Direction::tls13(Suite::Aes128GcmSha256, &[0u8; 32]),
         )
+    }
+
+    #[test]
+    fn a_pending_record_precedes_a_queued_reply() {
+        let mut subject = tls13_session(Wire::default());
+        subject.out = b"record".to_vec();
+        subject.reply = b"reply".to_vec();
+        subject.flush_reply().expect("flushes");
+        assert_eq!(subject.io.wire, b"recordreply");
+    }
+
+    #[test]
+    fn a_seal_after_a_partial_write_sends_the_pending_record_first() {
+        let mut subject = tls13_session(Wire::default());
+        subject.out = b"old".to_vec();
+        let mut fresh = Vec::new();
+        subject.seal_into(b"new", &mut fresh).expect("seals");
+        assert_eq!(subject.io.wire, b"old");
+        assert!(!fresh.is_empty());
+        assert_eq!(subject.out_at, subject.out.len());
     }
 
     #[test]

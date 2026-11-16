@@ -1815,7 +1815,7 @@ pub struct LegacyServerKey {
     pub send_tickets: bool,
     pub reject_unknown_sni: bool,
     pub ech_server_keys: Option<std::sync::Arc<[u8]>>,
-    pub master_key_log: Option<String>,
+    pub master_key_log: Option<std::sync::Arc<super::MasterKeyLog>>,
 }
 
 impl PartialEq for LegacyServerKey {
@@ -1829,7 +1829,11 @@ impl PartialEq for LegacyServerKey {
             && self.send_tickets == other.send_tickets
             && self.reject_unknown_sni == other.reject_unknown_sni
             && self.ech_server_keys == other.ech_server_keys
-            && self.master_key_log == other.master_key_log
+            && match (&self.master_key_log, &other.master_key_log) {
+                (None, None) => true,
+                (Some(ours), Some(theirs)) => std::sync::Arc::ptr_eq(ours, theirs),
+                _ => false,
+            }
     }
 }
 
