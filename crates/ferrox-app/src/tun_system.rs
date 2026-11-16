@@ -645,7 +645,7 @@ fn accept_loop(
                 thread::spawn(move || {
                     let conn = crate::conn::Connection::Tcp(stream);
                     let destination = crate::proxy::Destination::Address(destination);
-                    let _ = crate::proxy::serve_device_flow(conn, &out, &destination);
+                    let _ = crate::proxy::serve_device_flow(conn, None, &out, &destination);
                     if let Ok(mut nat) = nat.lock() {
                         nat.closed(port, generation);
                     }

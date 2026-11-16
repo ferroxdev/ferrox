@@ -1196,7 +1196,8 @@ impl SendWindow {
 
     /// Room the peer's window leaves right now; `None` when the flow ended or a silent peer kept the window shut past the idle budget.
     fn room(&self, sent: &AtomicU32) -> Option<u32> {
-        let deadline = std::time::Instant::now() + budgets::udp_idle();
+        // The clock is only read when the window is shut: an open window returns without a syscall per segment.
+        let mut deadline = None;
         loop {
             if self.closed.load(SeqCst) {
                 return None;
@@ -1220,6 +1221,7 @@ impl SendWindow {
                 continue;
             }
             let now = std::time::Instant::now();
+            let deadline = *deadline.get_or_insert(now + budgets::udp_idle());
             if now >= deadline {
                 self.parked.store(false, SeqCst);
                 return None;
@@ -1241,7 +1243,8 @@ struct Flow {
     id: u64,
     /// The client's initial sequence, so a retransmitted SYN replays the handshake instead of minting a second flow.
     isn: u32,
-    write_half: Mutex<Connection>,
+    /// The upload half, installed once the lane is live: a direct dial or the loopback pair's device end. A retransmitted SYN waits for it instead of replaying a handshake no lane carries yet.
+    write_half: Mutex<Option<Connection>>,
     rcv_nxt: Arc<AtomicU32>,
     snd_nxt: Arc<AtomicU32>,
     /// Payload reached the proxy since the response thread's last idle expiry: a flow is alive when either direction spoke inside the budget.
@@ -1255,13 +1258,85 @@ struct Flow {
     send: Arc<SendWindow>,
     /// One close packet — `FIN` or `RST` — leaves per flow, whichever thread sees the end first.
     signaled: Arc<AtomicBool>,
+    /// The device's `FIN` reached the upload half, so a response thread waiting on a direct lane
+    /// whose download closed first can finish the flow.
+    upload_finished: UploadFinished,
 }
 
-/// The relay function the TUN handler calls per TCP flow: takes the proxied Connection and
-/// the destination extracted from the packet headers. An error means the proxy leg was
-/// refused, so the device's established flow is reset rather than left silent.
-pub(crate) type Relay =
-    Arc<dyn Fn(Connection, crate::proxy::Destination) -> io::Result<()> + Send + Sync>;
+/// The upload's half-close, signalled from the handler to a response thread that ended the
+/// download first: a direct lane's upstream may close only its write direction, and the flow
+/// lives until the device's own `FIN` or the stall budget names it dead.
+#[derive(Default)]
+struct UploadFinished {
+    state: Mutex<UploadState>,
+    wake: std::sync::Condvar,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum UploadState {
+    #[default]
+    Live,
+    Finished,
+}
+
+impl UploadFinished {
+    fn finish(&self) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = UploadState::Finished;
+        self.wake.notify_all();
+    }
+
+    /// Wait for the upload's `FIN` up to `budget`, and answer whether it arrived.
+    fn wait(&self, budget: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *state == UploadState::Live {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            state = self
+                .wake
+                .wait_timeout(state, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+}
+
+/// The relay function the TUN handler calls per TCP flow: takes the proxied Connection, the lane
+/// the dial already resolved for a fallback flow, and the destination from the packet headers. An
+/// error means the proxy leg was refused, so the device's established flow is reset rather than
+/// left silent.
+pub(crate) type Relay = Arc<
+    dyn Fn(Connection, Option<&crate::proxy::Lane>, crate::proxy::Destination) -> io::Result<()>
+        + Send
+        + Sync,
+>;
+
+/// The direct dial: a lane that reaches its edge with the destination alone hands the handler the
+/// connected stream, so a device flow owes no loopback pair and no second thread.
+pub(crate) type Dial = Arc<dyn Fn(&crate::proxy::Destination) -> DialOutcome + Send + Sync>;
+
+/// What a direct dial found: a stream the device speaks through, a lane the front's own
+/// `serve_connect` has to carry over the loopback pair (already resolved, so it is not picked
+/// twice), or a target the edge refused.
+pub(crate) enum DialOutcome {
+    Direct(Connection),
+    Fallback(crate::proxy::Lane),
+    Refused,
+}
+
+/// The device's datagram dial: the SOCKS5 association the outbound's own server answers, opened
+/// once and ridden by every leg, so a device datagram crosses no loopback association and no
+/// second SOCKS server. `None` keeps the front-served association.
+pub(crate) type Datagram = crate::proxy::Datagram;
 
 /// The datagram entry the TUN handler rides per UDP flow: handed the client half of an association, it runs the same SOCKS5 UDP server the SOCKS inbound reaches, `serve_socks_udp`.
 pub(crate) type Associate = Arc<dyn Fn(Connection) + Send + Sync>;
@@ -1311,9 +1386,17 @@ impl Flows {
     }
 }
 
+/// One leg in the shared datagram table: its id, the socket that frames its datagrams, and the
+/// direct relay it was opened for, so a dead control drops only the legs that rode that relay.
+struct Leg {
+    id: u64,
+    socket: Arc<UdpSocket>,
+    relay: Option<SocketAddr>,
+}
+
 /// The datagram table every queue reads: one leg per tuple, so a client's packets that hash to
 /// different queues still ride the one socket the association opened.
-type LegTable = HashMap<UdpKey, (u64, Arc<UdpSocket>)>;
+type LegTable = HashMap<UdpKey, Leg>;
 
 #[derive(Clone, Default)]
 pub(crate) struct Legs {
@@ -1336,6 +1419,11 @@ impl Legs {
     fn len(&self) -> usize {
         self.table().len()
     }
+
+    #[cfg(all(test, unix))]
+    fn relay_of(&self, key: &UdpKey) -> Option<SocketAddr> {
+        self.table().get(key).and_then(|leg| leg.relay)
+    }
 }
 
 /// The TUN handler: reads packets, relays each TCP flow and each UDP flow through the proxy outbound.
@@ -1343,12 +1431,27 @@ pub(crate) struct Handler {
     device: Device,
     relay: Relay,
     associate: Associate,
+    /// The lanes this front can reach without the loopback pair; a flow the dial falls back on keeps the pair.
+    dial: Option<Dial>,
+    /// The outbound's own datagram association, when its lane has one the handler can ride directly.
+    datagram: Option<Datagram>,
     flows: Flows,
     legs: Legs,
     frame: Vec<u8>,
     /// Reused render buffer for every device-bound packet this thread emits (SYN-ACK, pure ACK, ICMP reply), so the emit path allocates nothing in steady state.
     emit: Vec<u8>,
     association: Option<Association>,
+    /// The direct datagram lane this handler opened, kept alive by its control connection.
+    direct_datagram: Option<crate::proxy::DirectDatagram>,
+    /// The direct lane's association while a worker dials it: the dial and its handshake cost a
+    /// network round trip, and the queue keeps dispatching while it is pending.
+    opening: Option<mpsc::Receiver<Option<crate::proxy::DirectDatagram>>>,
+    /// The earliest moment a refused direct lane may be tried again, so a dead server costs one
+    /// worker per budget instead of one per datagram.
+    datagram_retry: Option<std::time::Instant>,
+    /// Set by the watcher parked on the direct lane's control: the relay ended the association, so
+    /// the lane and its legs are dropped before the next datagram frames at a dead address.
+    direct_dead: Arc<AtomicBool>,
     ended_tx: mpsc::Sender<Ended>,
     ended_rx: mpsc::Receiver<Ended>,
     udp_idle: std::time::Duration,
@@ -1362,6 +1465,27 @@ impl Handler {
             device,
             relay,
             associate,
+            None,
+            None,
+            Flows::default(),
+            Legs::default(),
+            &Spec::new(None, None),
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_dial(
+        device: Device,
+        relay: Relay,
+        associate: Associate,
+        dial: Dial,
+    ) -> Self {
+        Self::on(
+            device,
+            relay,
+            associate,
+            Some(dial),
+            None,
             Flows::default(),
             Legs::default(),
             &Spec::new(None, None),
@@ -1370,10 +1494,13 @@ impl Handler {
 
     /// One queue of a multi-queue device: every queue passes the same `flows` and `legs`, so a flow
     /// is whole wherever the kernel hashes its next segment or datagram.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on(
         device: Device,
         relay: Relay,
         associate: Associate,
+        dial: Option<Dial>,
+        datagram: Option<Datagram>,
         flows: Flows,
         legs: Legs,
         spec: &Spec,
@@ -1384,11 +1511,17 @@ impl Handler {
             device,
             relay,
             associate,
+            dial,
+            datagram,
             flows,
             legs,
             frame: Vec::with_capacity(FRAME_CAP),
             emit,
             association: None,
+            direct_datagram: None,
+            opening: None,
+            datagram_retry: None,
+            direct_dead: Arc::new(AtomicBool::new(false)),
             ended_tx,
             ended_rx,
             udp_idle: spec.udp_idle(),
@@ -1421,7 +1554,7 @@ impl Handler {
                 }
                 Ended::Datagram(key, id) => {
                     let mut table = self.legs.table();
-                    if table.get(&key).is_some_and(|leg| leg.0 == id) {
+                    if table.get(&key).is_some_and(|leg| leg.id == id) {
                         table.remove(&key);
                     }
                 }
@@ -1443,15 +1576,31 @@ impl Handler {
         let Some((udp, payload)) = udp_head(body) else {
             return Ok(());
         };
-        if self.association.is_none() {
-            if let Ok(association) = Association::open(&self.associate) {
+        if self.direct_dead.swap(false, Relaxed) {
+            // The control closed, so the relay address its legs frame at is gone: drop only those, and let the retry budget gate a fresh lane while the front's association carries the datagrams.
+            if let Some(dead) = self.direct_datagram.take() {
+                self.legs
+                    .table()
+                    .retain(|_, leg| leg.relay != Some(dead.relay));
+            }
+            self.datagram_retry = Some(std::time::Instant::now() + budgets::handshake());
+        }
+        self.poll_datagram_lane();
+        if self.association.is_none() && self.direct_datagram.is_none() && self.opening.is_none() {
+            let direct_due = self
+                .datagram_retry
+                .is_none_or(|at| std::time::Instant::now() >= at);
+            if self.datagram.is_some() && direct_due {
+                self.open_datagram_lane();
+            } else if let Ok(association) = Association::open(&self.associate) {
                 self.association = Some(association);
             }
         }
-        let Some(association) = &self.association else {
-            return Ok(());
+        let (relay, direct_relay) = match (&self.direct_datagram, &self.association) {
+            (Some(direct), _) => (direct.relay, Some(direct.relay)),
+            (None, Some(association)) => (association.relay, None),
+            (None, None) => return Ok(()),
         };
-        let relay = association.relay;
         let target = SocketAddr::new(ip.destination, udp.destination_port);
         // An endpoint-independent mapping keys on the client source alone; the frame still names each datagram's destination, and the reply's source comes back off that frame.
         let (key, pinned) = if self.endpoint_independent_nat {
@@ -1479,12 +1628,12 @@ impl Handler {
             let mut table = self.legs.table();
             match table.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
-                    let (id, leg) = &*entry.into_mut();
-                    (*id, Arc::clone(leg))
+                    let leg = entry.into_mut();
+                    (leg.id, Arc::clone(&leg.socket))
                 }
                 std::collections::hash_map::Entry::Vacant(vacant) => {
                     let id = self.legs.next_id();
-                    let leg = Arc::new(open_leg(
+                    let socket = Arc::new(open_leg(
                         &self.device,
                         relay,
                         pinned,
@@ -1494,8 +1643,12 @@ impl Handler {
                         id,
                         &self.ended_tx,
                     )?);
-                    vacant.insert((id, Arc::clone(&leg)));
-                    (id, leg)
+                    vacant.insert(Leg {
+                        id,
+                        socket: Arc::clone(&socket),
+                        relay: direct_relay,
+                    });
+                    (id, socket)
                 }
             }
         };
@@ -1505,11 +1658,56 @@ impl Handler {
         self.frame = frame;
         if sent.is_err() {
             let mut table = self.legs.table();
-            if table.get(&key).is_some_and(|leg| leg.0 == id) {
+            if table.get(&key).is_some_and(|leg| leg.id == id) {
                 table.remove(&key);
             }
         }
         Ok(())
+    }
+
+    /// Start the direct datagram lane's association on a worker: the dial and the server's SOCKS
+    /// handshake are network round trips, and the packet queue must keep dispatching while they
+    /// are outstanding.
+    fn open_datagram_lane(&mut self) {
+        let Some(open) = self.datagram.clone() else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.opening = Some(rx);
+        budgets::spawn(move || {
+            let _ = tx.send(open());
+        });
+    }
+
+    /// Take the worker's verdict: a lane becomes this handler's, and a refusal starts the retry
+    /// budget so the next datagram falls back to the front's association.
+    fn poll_datagram_lane(&mut self) {
+        let Some(rx) = self.opening.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Some(direct)) => {
+                // The relay ends the association with its control connection; a watcher parks on that socket so the next datagram can drop the lane instead of framing at a dead address.
+                if let Ok(mut control) = direct.control.try_clone() {
+                    let dead = Arc::clone(&self.direct_dead);
+                    std::thread::spawn(move || {
+                        let mut byte = [0u8; 1];
+                        loop {
+                            match control.read(&mut byte) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                        }
+                        dead.store(true, Relaxed);
+                    });
+                }
+                self.direct_datagram = Some(direct);
+            }
+            Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
+                self.datagram_retry = Some(std::time::Instant::now() + budgets::handshake());
+            }
+            Err(mpsc::TryRecvError::Empty) => self.opening = Some(rx),
+        }
     }
 
     fn handle_tcp(&mut self, ip: &IpHead, body: &[u8]) -> io::Result<()> {
@@ -1540,31 +1738,38 @@ impl Handler {
             }
             let fin = tcp.flags & FLAG_FIN != 0;
             let len = payload.len() as u32;
-            let mut half = flow
-                .write_half
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // A device retransmits and can reorder, so only the bytes past `rcv_nxt` reach the proxy: a duplicate is dropped and an overlapping segment is trimmed, never written twice. The trim and the store sit inside the pair's lock because a second queue can be handed the same flow at the same time.
-            let rcv = flow.rcv_nxt.load(Relaxed);
-            let gap = rcv.wrapping_sub(tcp.seq);
-            let skip = if i32::try_from(gap).is_ok() {
-                gap as usize
-            } else {
-                usize::MAX
-            };
-            let mut end = rcv;
-            if skip < payload.len() {
-                flow.busy.store(true, Relaxed);
-                // The cursor moves by what the pair accepted, so a short or refused write is the device's to retransmit; the read leg still delivers what the relay wrote before it closed.
-                let sent = half.write(&payload[skip..]).unwrap_or(0);
-                end = rcv.wrapping_add(sent as u32);
-                flow.rcv_nxt.store(end, Relaxed);
+            // A pure ACK only moves the window: it never touches the upload half, so it takes no pipe lock.
+            if !payload.is_empty() || fin {
+                let mut guard = flow
+                    .write_half
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(half) = guard.as_mut() else {
+                    // The lane is not live yet; the device retransmits what this segment carried.
+                    return Ok(());
+                };
+                // A device retransmits and can reorder, so only the bytes past `rcv_nxt` reach the proxy: a duplicate is dropped and an overlapping segment is trimmed, never written twice. The trim and the store sit inside the pipe's lock because a second queue can be handed the same flow at the same time.
+                let rcv = flow.rcv_nxt.load(Relaxed);
+                let gap = rcv.wrapping_sub(tcp.seq);
+                let skip = if i32::try_from(gap).is_ok() {
+                    gap as usize
+                } else {
+                    usize::MAX
+                };
+                let mut end = rcv;
+                if skip < payload.len() {
+                    flow.busy.store(true, Relaxed);
+                    // The cursor moves by what the pipe accepted, so a short or refused write is the device's to retransmit; the read leg still delivers what the relay wrote before it closed.
+                    let sent = half.write(&payload[skip..]).unwrap_or(0);
+                    end = rcv.wrapping_add(sent as u32);
+                    flow.rcv_nxt.store(end, Relaxed);
+                }
+                if fin && tcp.seq.wrapping_add(len) == flow.rcv_nxt.load(Relaxed) {
+                    flow.rcv_nxt.store(end.wrapping_add(1), Relaxed);
+                    let _ = half.shutdown(Shutdown::Write);
+                    flow.upload_finished.finish();
+                }
             }
-            if fin && tcp.seq.wrapping_add(len) == flow.rcv_nxt.load(Relaxed) {
-                flow.rcv_nxt.store(end.wrapping_add(1), Relaxed);
-                let _ = half.shutdown(Shutdown::Write);
-            }
-            drop(half);
             // Delayed like the references: answer at a push, at a finish, or at a full MTU unacked.
             let unacked = flow
                 .rcv_nxt
@@ -1621,6 +1826,15 @@ impl Handler {
         if let Some(flow) = existing {
             // A retransmitted SYN keeps its flow and only needs the SYN-ACK again; a new SYN on a live tuple ends the old flow first, so its threads and lane cannot outlive it.
             if flow.isn == tcp.seq {
+                // A lane still dialing has no SYN-ACK to replay: the device's next retransmission finds one.
+                if flow
+                    .write_half
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_none()
+                {
+                    return Ok(());
+                }
                 let mut emit = std::mem::take(&mut self.emit);
                 render_tcp_packet_ip(
                     flow.local,
@@ -1646,33 +1860,12 @@ impl Handler {
         let syn_seq = tcp.seq;
         let mss = Arc::new(AtomicU32::new(self.device.mss(remote_ip)));
 
-        let mut emit = std::mem::take(&mut self.emit);
-        render_tcp_packet_ip(
-            (local_ip, local_port),
-            (remote_ip, remote_port),
-            syn_seq.wrapping_add(1),
-            syn_seq.wrapping_add(1),
-            FLAG_SYN | FLAG_ACK,
-            65535,
-            &[],
-            false,
-            &mut emit,
-        );
-        let wrote = self.device.write_packet(&emit);
-        self.emit = emit;
-        wrote?;
-
+        // The lane comes first and the SYN-ACK follows it, so a refused edge never opens a half handshake and no segment outruns the pipe that carries it.
         let target = SocketAddr::new(ip.destination, tcp.destination_port);
         let destination = crate::proxy::Destination::from(target);
         let relay = Arc::clone(&self.relay);
+        let dial = self.dial.clone();
 
-        let (tun_half, proxy_half) = Self::flow_pair()?;
-        let proxy_hold = proxy_half.try_clone()?;
-
-        let write_half = tun_half.try_clone()?;
-        let mut read_half = tun_half;
-        // Silence past the idle budget is death: an untimed read parks a thread, and with it the flow's relay leg and its lane, for the life of the process.
-        read_half.set_read_timeout(Some(budgets::udp_idle()))?;
         let mut dev_writer = self.device.clone_writer()?;
         let rcv_nxt = Arc::new(AtomicU32::new(syn_seq.wrapping_add(1)));
         let snd_nxt = Arc::new(AtomicU32::new(syn_seq.wrapping_add(2)));
@@ -1683,7 +1876,7 @@ impl Handler {
         let flow = Arc::new(Flow {
             id,
             isn: syn_seq,
-            write_half: Mutex::new(write_half),
+            write_half: Mutex::new(None),
             rcv_nxt: Arc::clone(&rcv_nxt),
             snd_nxt: Arc::clone(&snd_nxt),
             busy: Arc::clone(&busy),
@@ -1693,8 +1886,10 @@ impl Handler {
             mss: Arc::clone(&mss),
             send: Arc::clone(&send),
             signaled: Arc::clone(&signaled),
+            upload_finished: UploadFinished::default(),
         });
         // Claim the tuple under the table lock: a duplicate SYN that raced this handshake on another queue finds a flow here and keeps it instead of opening a second leg, and whatever flow ours replaces is retired rather than left running beside it.
+        let response_flow = Arc::clone(&flow);
         let (racer, displaced) = {
             let mut table = self.flows.table();
             match table.get(&key).map(|flow| flow.isn) {
@@ -1710,14 +1905,8 @@ impl Handler {
         }
 
         let ended_tx = self.ended_tx.clone();
-        let (outcome_tx, outcome_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = outcome_tx.send(relay(proxy_half, destination).is_ok());
-            // The duplicate holds the pair's far end open until the verdict is queued, so an EOF before it is a clean remote close, not a refusal.
-            drop(proxy_hold);
-        });
-
-        std::thread::spawn(move || {
+        let flow = response_flow;
+        budgets::spawn(move || {
             let _ = send.thread.set(std::thread::current());
             let gso_capable = dev_writer.gso();
             let initial = (mss.load(Relaxed) as usize).max(1);
@@ -1729,19 +1918,143 @@ impl Handler {
                 initial
             };
             let mut pkt = vec![0u8; body + payload_cap];
+            let (direct, lane, refused) = match dial.map(|dial| dial(&destination)) {
+                Some(DialOutcome::Direct(stream)) => (Some(stream), None, false),
+                Some(DialOutcome::Fallback(lane)) => (None, Some(lane), false),
+                Some(DialOutcome::Refused) => (None, None, true),
+                None => (None, None, false),
+            };
+            let mut outcome = None;
+            let mut reader;
+            if let Some(upstream) = direct {
+                let Ok(write) = upstream.try_clone() else {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                };
+                // Silence past the idle budget is death: an untimed read parks a thread, and with it the flow's lane, for the life of the process.
+                if upstream
+                    .set_read_timeout(Some(budgets::udp_idle()))
+                    .is_err()
+                {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                }
+                // The handler writes this half on the queue's own thread while it holds the flow, so a peer that stops reading must not park the queue: the timeout turns it into a short write the device retransmits.
+                if write
+                    .set_write_timeout(Some(budgets::relay_quantum()))
+                    .is_err()
+                {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                }
+                *flow
+                    .write_half
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(write);
+                reader = upstream;
+            } else if refused {
+                refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                return;
+            } else {
+                let Ok((tun_half, proxy_half)) = Self::flow_pair() else {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                };
+                let Ok(write_half) = tun_half.try_clone() else {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                };
+                let Ok(proxy_hold) = proxy_half.try_clone() else {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                };
+                if tun_half
+                    .set_read_timeout(Some(budgets::udp_idle()))
+                    .is_err()
+                {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                }
+                if write_half
+                    .set_write_timeout(Some(budgets::relay_quantum()))
+                    .is_err()
+                {
+                    refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                    return;
+                }
+                *flow
+                    .write_half
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(write_half);
+                reader = tun_half;
+                let (outcome_tx, outcome_rx) = mpsc::channel();
+                outcome = Some(outcome_rx);
+                budgets::spawn(move || {
+                    let ok = relay(proxy_half, lane.as_ref(), destination).is_ok();
+                    let _ = outcome_tx.send(ok);
+                    // The duplicate holds the pair's far end open until the verdict is queued, so an EOF before it is a clean remote close, not a refusal.
+                    drop(proxy_hold);
+                });
+            }
+            // The device reset the tuple while the lane dialed: the entry is gone, so nothing answers.
+            if flow.signaled.load(Relaxed) {
+                let _ = ended_tx.send(Ended::Stream(key, id));
+                return;
+            }
+            // The handshake answers only once the pipe exists, so the device's first segment has somewhere to land.
+            let rendered = render_tcp_headers_ip(
+                (local_ip, local_port),
+                (remote_ip, remote_port),
+                syn_seq.wrapping_add(1),
+                syn_seq.wrapping_add(1),
+                FLAG_SYN | FLAG_ACK,
+                65535,
+                0,
+                false,
+                &mut pkt[..body],
+            );
+            // A device that dropped the SYN-ACK has not refused the lane: retry the same packet for one relay quantum before resetting, so a transient refusal cannot kill a connection the device will retransmit the SYN for.
+            let handshake = rendered && {
+                let deadline = std::time::Instant::now() + budgets::relay_quantum();
+                loop {
+                    match dev_writer.write_packet(&pkt[..body]) {
+                        Ok(true) => break true,
+                        Ok(false)
+                            if std::time::Instant::now() < deadline
+                                && !flow.signaled.load(Relaxed) =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Ok(false) | Err(_) => break false,
+                    }
+                }
+            };
+            if !handshake {
+                refuse_flow(&flow, key, &mut dev_writer, &mut pkt, &ended_tx);
+                return;
+            }
+            // A direct lane's upstream can half-close: its EOF leaves the upload live, where a pair lane's EOF is the whole flow.
+            let mut half_closed = false;
             let end = loop {
                 let max = (mss.load(Relaxed) as usize).max(1);
                 let Some(room) = send.room(&snd_nxt) else {
                     break FLAG_RST | FLAG_ACK;
                 };
                 let limit = read_limit(gso_capable, max, payload_cap).min(room as usize);
-                match read_half.read(&mut pkt[body..body + limit]) {
+                match reader.read(&mut pkt[body..body + limit]) {
+                    Ok(0) if outcome.as_ref().is_none() => {
+                        half_closed = true;
+                        break FLAG_FIN | FLAG_ACK;
+                    }
                     Ok(0) => {
                         // A clean close ends with FIN, a refused leg with RST; a relay that never reports is dead.
-                        let clean = match outcome_rx.try_recv() {
-                            Ok(clean) => clean,
-                            Err(mpsc::TryRecvError::Empty) => true,
-                            Err(mpsc::TryRecvError::Disconnected) => false,
+                        let clean = match outcome.as_ref() {
+                            None => true,
+                            Some(rx) => match rx.try_recv() {
+                                Ok(clean) => clean,
+                                Err(mpsc::TryRecvError::Empty) => true,
+                                Err(mpsc::TryRecvError::Disconnected) => false,
+                            },
                         };
                         break if clean {
                             FLAG_FIN | FLAG_ACK
@@ -1792,10 +2105,15 @@ impl Handler {
                 }
             };
             if !signaled.swap(true, Relaxed) {
+                // A FIN consumes one sequence number, so a half-closed flow's later ACKs name the sequence after it; reserve it before the write the way the data path does.
+                let seq = snd_nxt.load(Relaxed);
+                if end & FLAG_FIN != 0 {
+                    snd_nxt.store(seq.wrapping_add(1), Relaxed);
+                }
                 render_tcp_packet_ip(
                     (local_ip, local_port),
                     (remote_ip, remote_port),
-                    snd_nxt.load(Relaxed),
+                    seq,
                     rcv_nxt.load(Relaxed),
                     end,
                     65535,
@@ -1805,10 +2123,29 @@ impl Handler {
                 );
                 let _ = dev_writer.write_packet(&pkt);
             }
+            if half_closed {
+                // The FIN above closed the download; the upload stays until the device's FIN or a stall budget, never reaped by a removal queued before it. A segment that moves the receive window is progress, so an upload longer than one budget is not cut on the clock.
+                let mut seen = rcv_nxt.load(Relaxed);
+                let mut stalled = std::time::Duration::ZERO;
+                while !flow.upload_finished.wait(budgets::relay_quantum()) {
+                    let now = rcv_nxt.load(Relaxed);
+                    if now == seen {
+                        stalled += budgets::relay_quantum();
+                        if stalled >= budgets::relay_stall() {
+                            break;
+                        }
+                    } else {
+                        seen = now;
+                        stalled = std::time::Duration::ZERO;
+                    }
+                }
+                let _ = ended_tx.send(Ended::Stream(key, id));
+                return;
+            }
             // Queue the entry's removal before the shutdown that wakes the relay leg, so a caller that sees the leg end can reap the entry at its next dispatch.
             let _ = ended_tx.send(Ended::Stream(key, id));
             // Both halves, because the handler's write half is a clone of this descriptor and only a shutdown tells it the flow is over.
-            let _ = read_half.shutdown(Shutdown::Both);
+            let _ = reader.shutdown(Shutdown::Both);
         });
 
         Ok(())
@@ -1868,6 +2205,8 @@ impl Handler {
     }
 
     fn retire(&mut self, flow: &Flow, signal: Option<u8>) {
+        // A half-closed flow's response thread is waiting for its upload; a reset ends that wait.
+        flow.upload_finished.finish();
         match signal {
             Some(flags) if !flow.signaled.swap(true, Relaxed) => {
                 let mut emit = std::mem::take(&mut self.emit);
@@ -1889,11 +2228,14 @@ impl Handler {
             _ => flow.signaled.store(true, Relaxed),
         }
         flow.send.close();
-        let _ = flow
+        if let Some(half) = flow
             .write_half
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .shutdown(Shutdown::Both);
+            .as_ref()
+        {
+            let _ = half.shutdown(Shutdown::Both);
+        }
     }
 }
 
@@ -1903,6 +2245,42 @@ impl Drop for Handler {
         if let Some(association) = self.association.take() {
             let _ = association.control.shutdown(Shutdown::Both);
         }
+        if let Some(direct) = self.direct_datagram.take() {
+            let _ = direct.control.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// End a flow whose lane never opened: reset the device's half-open flow once and hand the entry back, so a refused edge costs no silent thread.
+fn refuse_flow(
+    flow: &Flow,
+    key: FlowKey,
+    writer: &mut PacketWriter,
+    pkt: &mut Vec<u8>,
+    ended: &mpsc::Sender<Ended>,
+) {
+    if !flow.signaled.swap(true, Relaxed) {
+        render_tcp_packet_ip(
+            flow.local,
+            flow.remote,
+            flow.snd_nxt.load(Relaxed),
+            flow.rcv_nxt.load(Relaxed),
+            FLAG_RST | FLAG_ACK,
+            65535,
+            &[],
+            false,
+            pkt,
+        );
+        let _ = writer.write_packet(pkt);
+    }
+    let _ = ended.send(Ended::Stream(key, flow.id));
+    if let Some(half) = flow
+        .write_half
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        let _ = half.shutdown(Shutdown::Both);
     }
 }
 
@@ -2096,7 +2474,7 @@ mod tests {
         let (a, mut peer) = peer_with_deadline().unwrap();
         let payload: Vec<u8> = (0..4_000u32).map(|i| (i % 251) as u8).collect();
         let sent = payload.clone();
-        let relay: Relay = Arc::new(move |mut conn: Connection, _dest| {
+        let relay: Relay = Arc::new(move |mut conn: Connection, _lane, _dest| {
             conn.write_all(&sent)?;
             Ok(())
         });
@@ -2293,7 +2671,7 @@ mod tests {
         let (a, mut first) = unix_socketpair().unwrap();
         let (b, mut second) = unix_socketpair().unwrap();
         let (seen_tx, seen_rx) = mpsc::channel();
-        let relay: Relay = Arc::new(move |mut conn: Connection, _dest| {
+        let relay: Relay = Arc::new(move |mut conn: Connection, _lane, _dest| {
             let mut got = [0u8; 5];
             conn.read_exact(&mut got)?;
             let _ = seen_tx.send(got);
@@ -2305,6 +2683,8 @@ mod tests {
             Device::from_handle(a, DEFAULT_MTU),
             Arc::clone(&relay),
             no_associate(),
+            None,
+            None,
             flows.clone(),
             Legs::default(),
             &spec,
@@ -2313,6 +2693,8 @@ mod tests {
             Device::from_handle(b, DEFAULT_MTU),
             relay,
             no_associate(),
+            None,
+            None,
             flows,
             Legs::default(),
             &spec,
@@ -2789,7 +3171,7 @@ mod tests {
         let device = Device::from_handle(a, DEFAULT_MTU);
         let mut peer = b;
 
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::new(device, relay, no_associate());
 
         let syn = build_tcp_packet(
@@ -2875,7 +3257,7 @@ mod tests {
         let (a, b) = unix_socketpair().unwrap();
         let device = Device::from_handle(a, DEFAULT_MTU);
         let mut peer = b;
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::new(device, relay, no_associate());
 
         let request = icmp_echo([10, 0, 0, 2], [10, 0, 0, 1], 0x1234, 0x0007, b"ping data");
@@ -2915,7 +3297,7 @@ mod tests {
         let (a, b) = unix_socketpair().unwrap();
         let (_release, hold) = std::sync::mpsc::channel::<()>();
         let hold = Arc::new(std::sync::Mutex::new(hold));
-        let relay: Relay = Arc::new(move |_conn, _dest| {
+        let relay: Relay = Arc::new(move |_conn, _lane, _dest| {
             let _ = hold.lock().unwrap().recv();
             Ok(())
         });
@@ -2976,7 +3358,7 @@ mod tests {
         let (a, b) = unix_socketpair().unwrap();
         let (_release, hold) = std::sync::mpsc::channel::<()>();
         let hold = Arc::new(std::sync::Mutex::new(hold));
-        let relay: Relay = Arc::new(move |_conn, _dest| {
+        let relay: Relay = Arc::new(move |_conn, _lane, _dest| {
             let _ = hold.lock().unwrap().recv();
             Ok(())
         });
@@ -3175,7 +3557,7 @@ mod tests {
     #[cfg(unix)]
     fn recording_relay(results: Dials) -> Relay {
         Arc::new(
-            move |mut conn: Connection, dest: crate::proxy::Destination| {
+            move |mut conn: Connection, _lane, dest: crate::proxy::Destination| {
                 let mut payload = Vec::new();
                 let _ = conn.read_to_end(&mut payload);
                 let target = match dest {
@@ -3301,6 +3683,242 @@ mod tests {
         assert_eq!(got, expected, "the dial set is the reference's own");
     }
 
+    /// The direct lane's whole path: the device's bytes reach the dialed stream, the stream's
+    /// answer leaves as the device's next segment, and the close that ends it is the stream's own.
+    #[cfg(unix)]
+    #[test]
+    fn a_direct_lane_carries_the_flow_without_the_pair() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let (upstream, mut lane) = UnixStream::pair().unwrap();
+        lane.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let dialed = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&dialed);
+        let dial: Dial = Arc::new(move |_dest| {
+            seen.store(true, Relaxed);
+            DialOutcome::Direct(Connection::from(upstream.try_clone().unwrap()))
+        });
+        let mut handler = Handler::with_dial(
+            Device::from_handle(a, DEFAULT_MTU),
+            Arc::new(|_conn, _lane, _dest| Ok(())),
+            no_associate(),
+            dial,
+        );
+
+        let client = ([10, 0, 0, 2], 44444);
+        let endpoint = ([10, 0, 0, 1], 8080);
+        let syn = build_tcp_packet(client, endpoint, 1, 0, FLAG_SYN, 65535, &[]);
+        peer.write_all(&syn).unwrap();
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+        let syn_ack = next_syn_ack(&mut peer);
+        assert!(dialed.load(Relaxed), "the direct dial was the lane");
+
+        let ack = syn_ack.seq.wrapping_add(1);
+        let request = build_tcp_packet(
+            client,
+            endpoint,
+            2,
+            ack,
+            FLAG_PSH | FLAG_ACK,
+            65535,
+            b"ping",
+        );
+        peer.write_all(&request).unwrap();
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+        let mut got = [0u8; 4];
+        lane.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"ping", "the device's bytes reach the dialed stream");
+        // The push the device just sent is acknowledged before the lane's answer, so the next segment the device reads is that ACK.
+        let (ack, ack_payload) = next_tcp_packet(&mut peer, &mut buf);
+        assert_eq!(ack.flags, FLAG_ACK);
+        assert_eq!(ack_payload, [] as [u8; 0]);
+
+        lane.write_all(b"pong").unwrap();
+        let (reply, payload) = next_tcp_packet(&mut peer, &mut buf);
+        assert_eq!(payload, b"pong", "the stream's answer leaves as a segment");
+        assert_eq!(reply.flags, FLAG_PSH | FLAG_ACK);
+
+        lane.shutdown(Shutdown::Write).unwrap();
+        let (end, payload) = next_tcp_packet(&mut peer, &mut buf);
+        assert_eq!(end.flags, FLAG_FIN | FLAG_ACK);
+        assert_eq!(payload, [] as [u8; 0]);
+
+        // The stream closed only its write half: a pause lets a full close shut the pipe first, so this gate fails against the old behaviour.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let upload = build_tcp_packet(
+            client,
+            endpoint,
+            6,
+            end.ack_num,
+            FLAG_PSH | FLAG_ACK,
+            65535,
+            b"late",
+        );
+        peer.write_all(&upload).unwrap();
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+        let mut got = [0u8; 4];
+        lane.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"late", "the upload outlives the download's FIN");
+        // The FIN consumed one sequence number: the ACK for the late upload names the sequence after it, not the FIN's own.
+        let (late_ack, _) = next_tcp_packet(&mut peer, &mut buf);
+        assert_eq!(late_ack.flags, FLAG_ACK);
+        assert_eq!(late_ack.seq, end.seq.wrapping_add(1));
+    }
+
+    /// One queue's dead direct control drops only the legs that rode its relay: a second queue
+    /// sharing the table keeps its own leg and socket.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_control_drops_only_its_own_legs() {
+        use std::io::Write;
+        let legs = Legs::default();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let queue = |relay: std::net::UdpSocket| {
+            let relay_addr = relay.local_addr().unwrap();
+            relay.set_nonblocking(true).unwrap();
+            let (ctl, ctl_peer) = UnixStream::pair().unwrap();
+            let (a, peer) = peer_with_deadline().unwrap();
+            let open: Datagram = Arc::new(move || {
+                Some(crate::proxy::DirectDatagram {
+                    relay: relay_addr,
+                    control: Connection::from(ctl.try_clone().unwrap()),
+                })
+            });
+            let relay_fn: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+            let handler = Handler::on(
+                Device::from_handle(a, DEFAULT_MTU),
+                relay_fn,
+                echo_associate(frames.clone()),
+                None,
+                Some(open),
+                Flows::default(),
+                legs.clone(),
+                &Spec::new(None, None),
+            );
+            (handler, peer, ctl_peer, relay)
+        };
+        let (mut one, mut one_peer, one_ctl, one_relay) =
+            queue(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        let (mut two, mut two_peer, _two_ctl, two_relay) =
+            queue(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        let key_one = UdpKey {
+            source: IpAddr::from(SCRIPT_CLIENT),
+            source_port: 51510,
+            destination: IpAddr::from([198, 51, 100, 10]),
+            destination_port: 53,
+        };
+        let key_two = UdpKey {
+            source_port: 51511,
+            ..key_one
+        };
+        let query_one = datagram(SCRIPT_CLIENT, [198, 51, 100, 10], 51510, 53, b"one");
+        let query_two = datagram(SCRIPT_CLIENT, [198, 51, 100, 10], 51511, 53, b"two");
+        assert!(
+            pump_datagram(&mut one, &mut one_peer, &one_relay, &query_one),
+            "the first queue frames at its own relay"
+        );
+        assert!(
+            pump_datagram(&mut two, &mut two_peer, &two_relay, &query_two),
+            "the second queue frames at its own relay"
+        );
+        let dead = one_relay.local_addr().unwrap();
+        let healthy = two_relay.local_addr().unwrap();
+        assert_eq!(legs.relay_of(&key_one), Some(dead));
+        assert_eq!(legs.relay_of(&key_two), Some(healthy));
+        drop(one_ctl);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        for _ in 0..2_500 {
+            if legs.relay_of(&key_one) != Some(dead) {
+                break;
+            }
+            one_peer.write_all(&query_one).unwrap();
+            let mut buf = vec![0u8; DEFAULT_MTU + 64];
+            let n = one.device.read_packet(&mut buf).unwrap();
+            one.dispatch(&buf[..n]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_ne!(
+            legs.relay_of(&key_one),
+            Some(dead),
+            "the dead lane's leg is gone"
+        );
+        assert_eq!(
+            legs.relay_of(&key_two),
+            Some(healthy),
+            "the other queue's leg keeps its socket"
+        );
+    }
+
+    /// A direct datagram lane whose control closes is dropped: the legs on its dead relay are
+    /// cleared and the datagrams fall back to the front's association until the retry budget.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_direct_datagram_control_drops_the_lane() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        relay.set_nonblocking(true).unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let (ctl, ctl_peer) = UnixStream::pair().unwrap();
+        let opens = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&opens);
+        let open: Datagram = Arc::new(move || {
+            seen.fetch_add(1, Relaxed);
+            Some(crate::proxy::DirectDatagram {
+                relay: relay_addr,
+                control: Connection::from(ctl.try_clone().unwrap()),
+            })
+        });
+        let relay_fn: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+        let mut handler = Handler::on(
+            Device::from_handle(a, DEFAULT_MTU),
+            relay_fn,
+            echo_associate(frames.clone()),
+            None,
+            Some(open),
+            Flows::default(),
+            Legs::default(),
+            &Spec::new(None, None),
+        );
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let query = datagram(SCRIPT_CLIENT, [198, 51, 100, 9], 51501, 53, b"dead");
+        // A datagram rides the lane once the worker installs it.
+        let mut rode = false;
+        for _ in 0..2_500 {
+            peer.write_all(&query).unwrap();
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+            if relay.recv(&mut buf[..]).is_ok() {
+                rode = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(rode, "a datagram rides the direct lane's relay");
+        // The relay ends its control: the next datagram drops the lane and takes the front's association.
+        drop(ctl_peer);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        for _ in 0..2_500 {
+            if !frames.lock().unwrap().is_empty() {
+                break;
+            }
+            peer.write_all(&query).unwrap();
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        wait_for_frames(&frames, 1);
+        assert_eq!(
+            opens.load(Relaxed),
+            1,
+            "the retry budget gates a second lane"
+        );
+    }
+
     #[cfg(unix)]
     type Frames = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
 
@@ -3347,10 +3965,33 @@ mod tests {
         })
     }
 
+    /// Pump one queue with a datagram until the fake relay receives a frame, so a test can wait
+    /// for the asynchronously opened lane without a fixed sleep.
+    #[cfg(unix)]
+    fn pump_datagram(
+        handler: &mut Handler,
+        peer: &mut std::fs::File,
+        relay: &std::net::UdpSocket,
+        packet: &[u8],
+    ) -> bool {
+        use std::io::Write;
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        for _ in 0..2_500 {
+            peer.write_all(packet).unwrap();
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+            if relay.recv(&mut buf[..]).is_ok() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        false
+    }
+
     #[cfg(unix)]
     fn wait_for_frames(frames: &Frames, count: usize) {
         for _ in 0..2_500 {
-            if frames.lock().unwrap().len() == count {
+            if frames.lock().unwrap().len() >= count {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -3383,7 +4024,7 @@ mod tests {
     fn a_datagram_flow_frames_the_association_and_returns_the_echo() {
         let (a, mut peer) = peer_with_deadline().unwrap();
         let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::new(
             Device::from_handle(a, DEFAULT_MTU),
             relay,
@@ -3417,6 +4058,144 @@ mod tests {
         assert_eq!(payload, b"who-is");
     }
 
+    /// A direct datagram lane frames the outbound's own relay and renders its answer without the
+    /// front's loopback association: the handler writes the same RFC 1928 request the association
+    /// path writes, and the leg reader turns the relay's framed answer back into a device packet.
+    #[cfg(unix)]
+    #[test]
+    fn a_direct_datagram_lane_frames_the_relay_without_the_association() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+        upstream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let relay_address = upstream.local_addr().unwrap();
+        let seen = frames.clone();
+        // The relay every leg frames onto: the outbound server's own echo, no front association behind it.
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((n, src)) = upstream.recv_from(&mut buf) {
+                let frame = buf[..n].to_vec();
+                let Some((target, payload)) = crate::proxy::parse_socks_udp(&frame) else {
+                    continue;
+                };
+                let mut back = vec![0u8, 0, 0];
+                crate::proxy::push_socks_addr(&mut back, &target);
+                back.extend_from_slice(payload);
+                seen.lock().unwrap().push(frame);
+                if upstream.send_to(&back, src).is_err() {
+                    break;
+                }
+            }
+        });
+        let (control, _hold) = UnixStream::pair().unwrap();
+        let slot = Arc::new(std::sync::Mutex::new(Some(Connection::from(control))));
+        let open: Datagram = Arc::new(move || {
+            let control = slot.lock().unwrap().take()?;
+            Some(crate::proxy::DirectDatagram {
+                relay: relay_address,
+                control,
+            })
+        });
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+        let associate: Associate = Arc::new(|_conn| {
+            unreachable!("a direct datagram lane must not open the front association")
+        });
+        let mut handler = Handler::on(
+            Device::from_handle(a, DEFAULT_MTU),
+            relay,
+            associate,
+            None,
+            Some(open),
+            Flows::default(),
+            Legs::default(),
+            &Spec::new(None, None),
+        );
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let query = datagram(SCRIPT_CLIENT, [198, 51, 100, 7], 51500, 53, b"who-is");
+        peer.write_all(&query).unwrap();
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+        // The lane opens on a worker, so the first datagram is dropped while it dials: turn the queue until the handler holds the lane, then send again.
+        for _ in 0..2_500 {
+            if handler.direct_datagram.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            handler.poll_datagram_lane();
+        }
+        assert!(
+            handler.direct_datagram.is_some(),
+            "the direct lane opened on its worker"
+        );
+        peer.write_all(&query).unwrap();
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+
+        let mut want = vec![0u8, 0, 0, 1, 198, 51, 100, 7, 0, 53];
+        want.extend_from_slice(b"who-is");
+        wait_for_frames(&frames, 1);
+        assert_eq!(
+            frames.lock().unwrap().first().map(Vec::as_slice),
+            Some(want.as_slice()),
+            "the direct lane writes the same frame the association path writes"
+        );
+
+        let n = next_datagram(&mut peer, &mut buf);
+        let (ip, body) = ipv4_head(&buf[..n]).unwrap();
+        assert_eq!(
+            (ip.source, ip.destination),
+            ([198, 51, 100, 7], SCRIPT_CLIENT)
+        );
+        let (udp, payload) = udp_head(body).unwrap();
+        assert_eq!((udp.source_port, udp.destination_port), (53, 51500));
+        assert_eq!(payload, b"who-is");
+    }
+
+    /// A direct lane that refuses hands the flow back to the front's association: the worker's
+    /// refusal costs the datagram that found it, and the next one frames the association.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_direct_datagram_lane_falls_back_to_the_association() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&attempts);
+        let open: Datagram = Arc::new(move || {
+            seen.fetch_add(1, Relaxed);
+            None
+        });
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+        let mut handler = Handler::on(
+            Device::from_handle(a, DEFAULT_MTU),
+            relay,
+            echo_associate(frames.clone()),
+            None,
+            Some(open),
+            Flows::default(),
+            Legs::default(),
+            &Spec::new(None, None),
+        );
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let query = datagram(SCRIPT_CLIENT, [198, 51, 100, 7], 51500, 53, b"who-is");
+        for _ in 0..2_500 {
+            if !frames.lock().unwrap().is_empty() {
+                break;
+            }
+            peer.write_all(&query).unwrap();
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        wait_for_frames(&frames, 1);
+        assert_eq!(
+            attempts.load(Relaxed),
+            1,
+            "the refused lane costs one worker, not one per datagram"
+        );
+    }
+
     /// A multi-queue device's datagram gate: the queue that never saw the association still finds
     /// the leg, so one client source keeps one socket instead of one per queue.
     #[cfg(unix)]
@@ -3425,13 +4204,15 @@ mod tests {
         let (a, mut first) = unix_socketpair().unwrap();
         let (b, mut second) = unix_socketpair().unwrap();
         let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let spec = Spec::new(None, None).with_endpoint_independent_nat(true);
         let legs = Legs::default();
         let mut one = Handler::on(
             Device::from_handle(a, DEFAULT_MTU),
             Arc::clone(&relay),
             echo_associate(frames.clone()),
+            None,
+            None,
             Flows::default(),
             legs.clone(),
             &spec,
@@ -3440,6 +4221,8 @@ mod tests {
             Device::from_handle(b, DEFAULT_MTU),
             relay,
             echo_associate(frames),
+            None,
+            None,
             Flows::default(),
             legs,
             &spec,
@@ -3465,12 +4248,14 @@ mod tests {
     fn an_endpoint_independent_leg_serves_every_destination() {
         let (a, mut peer) = peer_with_deadline().unwrap();
         let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let spec = Spec::new(None, None).with_endpoint_independent_nat(true);
         let mut handler = Handler::on(
             Device::from_handle(a, DEFAULT_MTU),
             relay,
             echo_associate(frames.clone()),
+            None,
+            None,
             Flows::default(),
             Legs::default(),
             &spec,
@@ -3509,7 +4294,7 @@ mod tests {
     fn the_default_datagram_leg_is_per_destination() {
         let (a, mut peer) = peer_with_deadline().unwrap();
         let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::new(
             Device::from_handle(a, DEFAULT_MTU),
             relay,
@@ -3585,7 +4370,7 @@ mod tests {
         let wanted: usize = flows.iter().map(|flow| flow.datagrams.len()).sum();
         let dials: Dials = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (a, mut peer) = peer_with_deadline().unwrap();
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::new(
             Device::from_handle(a, DEFAULT_MTU),
             relay,
@@ -3712,7 +4497,7 @@ mod tests {
     #[test]
     fn the_response_bytes_come_back_as_ip_packets() {
         let (a, mut peer) = peer_with_deadline().unwrap();
-        let relay: Relay = Arc::new(|mut conn: Connection, _dest| {
+        let relay: Relay = Arc::new(|mut conn: Connection, _lane, _dest| {
             use std::io::Write;
             let _ = conn.write_all(b"pong\n");
             Ok(())
@@ -3775,8 +4560,9 @@ mod tests {
             "",
             crate::socks::Version::V5,
         ));
-        let relay: Relay =
-            Arc::new(move |conn, dest| crate::proxy::serve_device_flow(conn, &out, &dest));
+        let relay: Relay = Arc::new(move |conn, lane, dest| {
+            crate::proxy::serve_device_flow(conn, lane, &out, &dest)
+        });
         let (a, mut peer) = peer_with_deadline().unwrap();
         let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let flow = FlowSpec {
@@ -3980,7 +4766,7 @@ mod tests {
         });
         let (a, mut peer) = peer_with_deadline().unwrap();
         let (gone_tx, gone_rx) = std::sync::mpsc::channel::<()>();
-        let relay: Relay = Arc::new(move |mut conn: Connection, _dest| {
+        let relay: Relay = Arc::new(move |mut conn: Connection, _lane, _dest| {
             let mut sink = Vec::new();
             let _ = conn.read_to_end(&mut sink);
             let _ = gone_tx.send(());
@@ -4045,7 +4831,7 @@ mod tests {
     #[test]
     fn a_closed_proxy_leg_sends_fin_after_its_bytes() {
         let (a, mut peer) = peer_with_deadline().unwrap();
-        let relay: Relay = Arc::new(|mut conn: Connection, _dest| {
+        let relay: Relay = Arc::new(|mut conn: Connection, _lane, _dest| {
             use std::io::Write;
             let _ = conn.write_all(b"reply");
             Ok(())
@@ -4105,7 +4891,7 @@ mod tests {
     #[test]
     fn a_refused_proxy_leg_resets_the_device_flow() {
         let (a, mut peer) = peer_with_deadline().unwrap();
-        let relay: Relay = Arc::new(|_conn: Connection, _dest| {
+        let relay: Relay = Arc::new(|_conn: Connection, _lane, _dest| {
             Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"))
         });
         let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
@@ -4188,7 +4974,7 @@ mod tests {
     #[test]
     fn the_syn_ack_numbers_wrap_at_the_sequence_space_boundary() {
         let (a, mut peer) = unix_socketpair().unwrap();
-        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let syn = build_tcp_packet(
             ([10, 0, 0, 2], 44444),

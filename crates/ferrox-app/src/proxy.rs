@@ -2487,6 +2487,30 @@ impl Picked<'_> {
     }
 }
 
+/// The lane `device_dial` resolved for a flow that still needs the front's own relay: the outbound
+/// and its tag travel with the verdict, so the relay does not pick a second time off a balancer.
+pub(crate) struct Lane {
+    pub(crate) out: Arc<Outbound>,
+    pub(crate) tag: Option<String>,
+    /// The dial settings routing left for this lane. The fallback relay runs on a thread a
+    /// `budgets::spawn` started, where the thread-locals `device_dial` set are not visible, so
+    /// they travel with the lane and are reinstalled before the dial.
+    source: Option<SendThrough>,
+    sockopts: Option<Arc<crate::sockopt::SocketOptions>>,
+    strategy: Option<FreedomDomain>,
+}
+
+impl Lane {
+    /// Reinstall the captured settings on the thread that dials this lane.
+    fn enter(&self) -> (SendThroughGuard, DialSockoptsGuard, TargetStrategyGuard) {
+        (
+            SendThroughGuard::enter(self.source),
+            DialSockoptsGuard::enter(self.sockopts.clone()),
+            TargetStrategyGuard::enter(self.strategy),
+        )
+    }
+}
+
 /// The outbounds the management API added or removed after startup. `changed` keeps the routing
 /// fast path free of the lock until the first mutation; `closed` answers a removed tag the way a
 /// blackhole outbound does.
@@ -15807,16 +15831,27 @@ fn serve_tun_inbound(
     };
     let flows = crate::tun::Flows::default();
     let legs = crate::tun::Legs::default();
+    let dial = Some(device_dial(out));
+    let datagram = device_datagram(out);
     for device in devices {
         let outbound = out.clone();
-        let relay: crate::tun::Relay =
-            std::sync::Arc::new(move |conn, dest| serve_device_flow(conn, &outbound, &dest));
-        let datagram = out.clone();
+        let relay: crate::tun::Relay = std::sync::Arc::new(move |conn, lane, dest| {
+            serve_device_flow(conn, lane, &outbound, &dest)
+        });
+        let datagram_out = out.clone();
         // The device's association is the protocol's own: the front reads the greeting and the `UDP ASSOCIATE` request and answers with the relay's address.
         let associate: crate::tun::Associate =
-            std::sync::Arc::new(move |conn| serve_socks(conn, &datagram, &no_accounts()));
-        let mut handler =
-            crate::tun::Handler::on(device, relay, associate, flows.clone(), legs.clone(), spec);
+            std::sync::Arc::new(move |conn| serve_socks(conn, &datagram_out, &no_accounts()));
+        let mut handler = crate::tun::Handler::on(
+            device,
+            relay,
+            associate,
+            dial.clone(),
+            datagram.clone(),
+            flows.clone(),
+            legs.clone(),
+            spec,
+        );
         thread::spawn(move || {
             if let Err(e) = handler.serve() {
                 eprintln!("tun handler ended: {e}");
@@ -24543,22 +24578,37 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
 ///
 /// The device does not know what an outbound is, so it asks for the dial every other
 /// front reaches — the same `serve_connect` the socks and http fronts call, with the
-/// same rules and the same grant.
+/// same rules and the same grant. A fallback flow carries the lane `device_dial`
+/// already resolved, so a balancer is drawn once per flow instead of twice.
 pub(crate) fn serve_device_flow(
     client: Connection,
+    carried: Option<&Lane>,
     out: &Outbound,
     dest: &Destination,
 ) -> std::io::Result<()> {
-    let (dial, lane, tag) = sniff_lane(out, dest, &client, None, None);
+    if let Some(lane) = carried {
+        let _settings = lane.enter();
+        return serve_lane(client, dest, &lane.out, lane.tag.as_deref());
+    }
+    let (dial, picked, tag) = sniff_lane(out, dest, &client, None, None);
     let dest = dial.as_ref().unwrap_or(dest);
+    serve_lane(client, dest, &picked, tag.as_deref())
+}
+
+fn serve_lane(
+    client: Connection,
+    dest: &Destination,
+    lane: &Outbound,
+    tag: Option<&str>,
+) -> std::io::Result<()> {
     let ((), dial_report) = observe_dial(|| {
         serve_connect(
             client,
-            &lane,
+            lane,
             dest,
             Front::Socks,
             &[],
-            tag.as_deref(),
+            tag,
             FlowFacts::default(),
         );
     });
@@ -24569,6 +24619,91 @@ pub(crate) fn serve_device_flow(
         )),
         _ => Ok(()),
     }
+}
+
+/// The device front's direct dial: a lane whose destination is its whole request hands the handler
+/// the connected stream, so the flow owes no loopback pair and no relay thread. Every other lane
+/// reports `Fallback` with the outbound it resolved, and keeps the front's own `serve_connect`.
+pub(crate) fn device_dial(out: &Outbound) -> crate::tun::Dial {
+    let out = out.clone();
+    std::sync::Arc::new(move |dest: &Destination| {
+        let (lane, tag) = out.resolved_lane_with_protocol(
+            dest,
+            crate::router::Network::Tcp,
+            None,
+            FlowFacts::default(),
+        );
+        let lane = lane.into_owned();
+        let socks = match &lane {
+            Outbound::Socks(socks) if socks.tls.is_none() => Some(socks),
+            _ => None,
+        };
+        if let Some(socks) = socks {
+            let tag = tag
+                .map(std::borrow::Cow::into_owned)
+                .or_else(default_outbound_tag);
+            let _outbound = OutboundTag::enter(tag.as_deref());
+            let _source = SendThroughGuard::enter(SEND_THROUGH.with(std::cell::Cell::take));
+            let _sockopts =
+                DialSockoptsGuard::enter(DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take()));
+            let _target = TargetStrategyGuard::enter(TARGET_STRATEGY.with(std::cell::Cell::take));
+            let Some(server) = lane.edge() else {
+                return crate::tun::DialOutcome::Refused;
+            };
+            return match connect_socks(
+                &server,
+                &socks.credential,
+                socks.version,
+                &socks_destination(dest),
+            ) {
+                Some(tunnel) => crate::tun::DialOutcome::Direct(tunnel),
+                None => crate::tun::DialOutcome::Refused,
+            };
+        }
+        crate::tun::DialOutcome::Fallback(Lane {
+            out: std::sync::Arc::new(lane),
+            tag: tag.map(std::borrow::Cow::into_owned),
+            source: SEND_THROUGH.with(std::cell::Cell::take),
+            sockopts: DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take()),
+            strategy: TARGET_STRATEGY.with(std::cell::Cell::take),
+        })
+    })
+}
+
+/// What a direct datagram lane needs: the relay the server named, and the control connection that
+/// keeps the association alive for as long as the device holds the lane.
+pub(crate) struct DirectDatagram {
+    pub(crate) relay: SocketAddr,
+    pub(crate) control: Connection,
+}
+
+/// The device front's datagram dial: a static SOCKS5 outbound with no TLS opens its association
+/// once, and the handler frames every datagram straight at the relay, so no loopback association
+/// and no SOCKS server sit between the device and the outbound's own server. `None` means the
+/// lane falls back to the association the front serves.
+pub(crate) type Datagram = Arc<dyn Fn() -> Option<DirectDatagram> + Send + Sync>;
+
+pub(crate) fn device_datagram(out: &Outbound) -> Option<Datagram> {
+    let Outbound::Socks(socks) = out else {
+        return None;
+    };
+    if socks.tls.is_some() || socks.version == crate::socks::Version::V4 {
+        return None;
+    }
+    let socks = socks.clone();
+    Some(std::sync::Arc::new(move || {
+        let server = resolve_outbound(&socks.address, socks.port)?;
+        let stream = dial_or_report(&server)?;
+        let _ = stream.set_read_timeout(Some(budgets::handshake()));
+        let _ = stream.set_write_timeout(Some(budgets::handshake()));
+        let association = crate::socks::associate(stream, &socks.credential)?;
+        let _ = association.control.set_read_timeout(None);
+        let _ = association.control.set_write_timeout(None);
+        Some(DirectDatagram {
+            relay: association.relay,
+            control: association.control,
+        })
+    }))
 }
 
 /// One mux `New` target for a flow the portal carries.
@@ -25329,6 +25464,23 @@ fn socks_destination(target: &Destination) -> crate::socks::Destination<'_> {
     }
 }
 
+/// The SOCKS5 exchange over a fresh dial: the tunnel a lane carries, or `None` when the edge refuses the target.
+fn connect_socks(
+    server: &SocketAddr,
+    credential: &crate::socks::Credential,
+    version: crate::socks::Version,
+    destination: &crate::socks::Destination<'_>,
+) -> Option<Connection> {
+    let upstream = dial_or_report(server)?;
+    let read = upstream.read_timeout().ok().flatten();
+    let _ = upstream.set_read_timeout(Some(budgets::SESSION_POLL));
+    let _ = upstream.set_write_timeout(Some(budgets::handshake()));
+    let tunnel = crate::socks::connect(upstream, credential, destination, version)?;
+    let _ = tunnel.set_read_timeout(read);
+    let _ = tunnel.set_write_timeout(None);
+    Some(tunnel)
+}
+
 fn dial_socks_client(
     client: &Connection,
     server: &SocketAddr,
@@ -25336,17 +25488,9 @@ fn dial_socks_client(
     version: crate::socks::Version,
     destination: &crate::socks::Destination<'_>,
 ) {
-    let Some(upstream) = dial_or_report(server) else {
+    let Some(tunnel) = connect_socks(server, credential, version, destination) else {
         return;
     };
-    let read = upstream.read_timeout().ok().flatten();
-    let _ = upstream.set_read_timeout(Some(budgets::SESSION_POLL));
-    let _ = upstream.set_write_timeout(Some(budgets::handshake()));
-    let Some(tunnel) = crate::socks::connect(upstream, credential, destination, version) else {
-        return;
-    };
-    let _ = tunnel.set_read_timeout(read);
-    let _ = tunnel.set_write_timeout(None);
     relay_handoff(client, &tunnel);
 }
 
@@ -26631,9 +26775,16 @@ pub(crate) fn relay_leg_armed(
     relay: SocketAddr,
     idle: std::time::Duration,
 ) -> std::io::Result<UdpSocket> {
-    let leg = UdpSocket::bind(SocketAddr::new(relay.ip(), 0))?;
+    // An upstream relay is not a local address, so the socket is bound wildcard-side, as the outbound's own client socket is.
+    let leg = UdpSocket::bind(udp_bind_for(relay))?;
     leg.connect(relay)?;
     leg.set_read_timeout(Some(idle))?;
+    #[cfg(unix)]
+    {
+        // A burst the reader has not drained yet is dropped by the kernel's few-kilobyte default; ask for room in both directions.
+        crate::quic::set_receive_buffer(&leg, 4 << 20);
+        crate::quic::set_send_buffer(&leg, 4 << 20);
+    }
     Ok(leg)
 }
 

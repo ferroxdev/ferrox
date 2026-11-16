@@ -787,12 +787,14 @@ front-tun gso-frames-per-large-response-read 1 ferrox-app-tun::tests::a_large_re
 front-tun emit-packet-reallocations-per-render 0 ferrox-app-tun::tests::an_emitted_packet_reuses_its_render_buffer
 front-tun response-payload-copies-per-read 0 ferrox-app-tun::tests::a_response_is_rendered_where_the_relay_read_landed
 front-tun flows-served-off-the-queue-that-opened-them 1 ferrox-app-tun::tests::a_flow_opened_on_one_queue_is_served_from_another
-front-tun time-tcp-up-10 ferrox=34.6Gbit/s,zeptun=36.1Gbit/s,ratio=0.96 tun-bench.yml
-front-tun time-tcp-down-10 ferrox=33.9Gbit/s,zeptun=38.9Gbit/s,ratio=0.87 tun-bench.yml
-front-tun time-rr-8x1k ferrox=70041tps,zeptun=107728tps,ratio=0.65 tun-bench.yml
-front-tun time-udp-100k ferrox=97024pps,zeptun=99976pps,ratio=0.97 tun-bench.yml
-front-tun cpu-cores-at-tcp-down-10 ferrox=2.33cores,zeptun=2.04cores tun-bench.yml
-front-tun rss-mb-at-ten-flows ferrox=15.8MB,zeptun=6.2MB tun-bench.yml
+front-tun direct-lane-flows-without-a-pair 1 ferrox-app-tun::tests::a_direct_lane_carries_the_flow_without_the_pair
+front-tun direct-datagram-lanes-without-the-association 1 ferrox-app-tun::tests::a_direct_datagram_lane_frames_the_relay_without_the_association
+front-tun time-tcp-up-10 ferrox=19.122Gbit/s,zeptun=20.739Gbit/s,ratio=0.92 tun-bench.yml
+front-tun time-tcp-down-10 ferrox=20.222Gbit/s,zeptun=21.407Gbit/s,ratio=0.94 tun-bench.yml
+front-tun time-rr-8x1k ferrox=38994tps,zeptun=33469tps,ratio=1.17 tun-bench.yml
+front-tun time-udp-100k ferrox=99083pps,zeptun=99940pps,ratio=0.99 tun-bench.yml
+front-tun cpu-cores-at-tcp-down-10 ferrox=2.15cores,zeptun=1.76cores tun-bench.yml
+front-tun rss-mb-at-ten-flows ferrox=13.2MB,zeptun=5.3MB tun-bench.yml
 
 # --- finalmask post-TLS TCP mask chain --------------------------------------
 finalmask sudoku-ops-retired-instructions UNBLESSED scripts/count-ops.sh
