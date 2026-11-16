@@ -71,6 +71,8 @@ def change_for(metric, before, after, threshold=CHANGE_THRESHOLD):
     if after is None:
         return {"kind": "missing", "change": None, "verdict": "missing"}
     if before == 0:
+        if after == 0:
+            return None
         return {"kind": "new", "change": None, "verdict": "new"}
     change = (after - before) / before
     if abs(change) <= threshold:
@@ -86,52 +88,78 @@ def change_for(metric, before, after, threshold=CHANGE_THRESHOLD):
 def compare_results(after, before, threshold=CHANGE_THRESHOLD):
     """Every scenario/engine/metric that moved beyond the noise threshold.
 
-    Both documents are `matrix-results.json`; the comparison is only between
-    cells both runs measured, so a tier that added a scenario reports the new
-    scenario's absence rather than inventing a ratio.
+    Both documents are `matrix-results.json`; scenarios and engines that
+    disappeared are reported as coverage loss rather than dropped, so a tier
+    that loses a row cannot look unchanged.
     """
     previous = {
         scenario.get("id"): scenario for scenario in before.get("scenarios", [])
     }
+    current = {
+        scenario.get("id"): scenario for scenario in after.get("scenarios", [])
+    }
     changes = []
-    for scenario in after.get("scenarios", []):
-        old = previous.get(scenario.get("id"))
-        if old is None:
+    for scenario_id in sorted(previous, key=str):
+        old = previous[scenario_id]
+        scenario = current.get(scenario_id)
+        if scenario is None:
             changes.append(
                 {
-                    "scenario": scenario.get("id"),
-                    "base": scenario.get("base"),
-                    "server": scenario.get("server"),
+                    "scenario": scenario_id,
+                    "base": old.get("base"),
+                    "server": old.get("server"),
                     "engine": "all",
                     "metric": "scenario",
                     "before": None,
                     "after": None,
-                    "kind": "new-scenario",
+                    "kind": "missing-scenario",
                     "change": None,
-                    "verdict": "new scenario",
+                    "verdict": "removed scenario",
                 }
             )
             continue
-        for engine, medians in sorted(scenario.get("medians", {}).items()):
-            old_medians = old.get("medians", {}).get(engine, {})
+        old_medians = old.get("medians", {})
+        new_medians = scenario.get("medians", {})
+        for engine in sorted(set(old_medians) | set(new_medians)):
+            before_values = old_medians.get(engine, {})
+            after_values = new_medians.get(engine, {})
             for metric in COMPARE_METRICS:
                 found = change_for(
-                    metric, old_medians.get(metric), medians.get(metric), threshold
+                    metric,
+                    before_values.get(metric),
+                    after_values.get(metric),
+                    threshold,
                 )
                 if found is None:
                     continue
                 changes.append(
                     {
-                        "scenario": scenario.get("id"),
+                        "scenario": scenario_id,
                         "base": scenario.get("base"),
                         "server": scenario.get("server"),
                         "engine": engine,
                         "metric": metric,
-                        "before": old_medians.get(metric),
-                        "after": medians.get(metric),
+                        "before": before_values.get(metric),
+                        "after": after_values.get(metric),
                         **found,
                     }
                 )
+    for scenario_id in sorted(set(current) - set(previous), key=str):
+        scenario = current[scenario_id]
+        changes.append(
+            {
+                "scenario": scenario_id,
+                "base": scenario.get("base"),
+                "server": scenario.get("server"),
+                "engine": "all",
+                "metric": "scenario",
+                "before": None,
+                "after": None,
+                "kind": "new-scenario",
+                "change": None,
+                "verdict": "new scenario",
+            }
+        )
     return changes
 
 
@@ -152,7 +180,7 @@ def changes_markdown(changes, before_date="previous run", threshold=CHANGE_THRES
     ]
     for change in changes:
         if change["metric"] == "scenario":
-            metric = ("new scenario", "")
+            metric = (change["verdict"], "")
             before = after = delta = "\u2014"
         else:
             metric = COMPARE_METRICS[change["metric"]]

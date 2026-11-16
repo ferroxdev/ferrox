@@ -144,10 +144,14 @@ def write_summary(out_dir, meta, configs):
             cpu = core_median(ok, "cpu_millis_per_gib")
             rss = core_median(ok, "rss_mib")
             ttfb = core_median(ok, "ttfb_s")
-            if ok and not data["errors"]:
+            if ok and not data["errors"] and not data["skipped"]:
                 status = "ok"
             elif ok:
-                status = f"ok x{len(ok)}, failed x{len(data['errors'])}"
+                status = f"ok x{len(ok)}"
+                if data["errors"]:
+                    status += f", failed x{len(data['errors'])}"
+                if data["skipped"]:
+                    status += f", skipped x{len(data['skipped'])}"
             elif data["skipped"]:
                 status = f"skipped: {data['skipped'][0]}"
             else:
@@ -157,9 +161,15 @@ def write_summary(out_dir, meta, configs):
                 f"| {core} | {len(ok)} | {fmt(thr)} | {fmt(cpu)} | "
                 f"{fmt(rss)} | "
                 f"{'—' if ttfb is None else f'{ttfb:.2f}'} | {status} |")
+            throughput = [
+                record["throughput_mib_s"] for record in ok
+                if isinstance(record.get("throughput_mib_s"), (int, float))
+            ]
             entry["cores"][core] = {
                 "n": len(ok),
                 "throughput_mib_s": thr,
+                "throughput_lo": min(throughput) if throughput else None,
+                "throughput_hi": max(throughput) if throughput else None,
                 "cpu_millis_per_gib": cpu,
                 "rss_mib": rss,
                 "ttfb_s": ttfb,
@@ -188,20 +198,24 @@ def draw_throughput(out_dir, machine):
     for index, core in enumerate(cores):
         values, lo, hi = [], [], []
         for entry in machine["configs"]:
-            med = entry["cores"].get(core, {}).get("throughput_mib_s")
+            cell = entry["cores"].get(core, {})
+            med = cell.get("throughput_mib_s")
             if med is None:
                 values.append(float("nan"))
                 lo.append(0.0)
                 hi.append(0.0)
                 continue
+            low = cell.get("throughput_lo")
+            high = cell.get("throughput_hi")
             values.append(med)
-            lo.append(0.0)
-            hi.append(0.0)
+            lo.append(0.0 if low is None else max(0.0, med - low))
+            hi.append(0.0 if high is None else max(0.0, high - med))
         xs = [p + (index - (len(cores) - 1) / 2) * width
               for p in range(len(labels))]
         ax.bar(xs, values, width=width, label=core,
                color=PALETTE.get(core, "#BBBBBB"), edgecolor="black",
-               linewidth=0.5)
+               linewidth=0.5, yerr=[lo, hi], capsize=2,
+               error_kw={"elinewidth": 0.8, "ecolor": "#444444"})
         for x, value in zip(xs, values):
             if value == value:
                 ax.text(x, value, f"{value:.0f}", ha="center",

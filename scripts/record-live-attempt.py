@@ -37,6 +37,13 @@ NUMERIC = {
 
 def main(argv):
     """One JSON object on stdout."""
+    if len(argv) != len(KEYS):
+        print(
+            f"record-live-attempt: expected {len(KEYS)} fields "
+            f"({', '.join(KEYS)}), got {len(argv)}",
+            file=sys.stderr,
+        )
+        return 2
     values = []
     for key, arg in zip(KEYS, argv):
         if arg == "":

@@ -53,6 +53,17 @@ tmp="${TMPDIR:-/tmp}"
 tmp="${tmp%/}"
 worktrees="$(git worktree list --porcelain | sed -n 's/^worktree //p')"
 
+is_registered_worktree() {
+  local dir="$1" path
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    if [[ "$dir" -ef "$path" || "$dir" == "$path"/* ]]; then
+      return 0
+    fi
+  done <<< "$worktrees"
+  return 1
+}
+
 free_kib() {
   local k
   k="$(df -k "$1" 2>/dev/null | awk 'NR==2 {print $4}')"
@@ -81,6 +92,11 @@ if [[ $ensure_free -gt 0 ]]; then
   fi
 fi
 before_free="$(free_gib "$top")"
+
+if [[ $apply == 1 ]]; then
+  ferrox_lock_acquire "$shared" || exit 1
+  trap 'ferrox_lock_release "$shared"' EXIT
+fi
 
 size_of() { du -sh "$1" 2>/dev/null | cut -f1; }
 reclaim() {
@@ -116,6 +132,9 @@ prune_sessions() {
 
 prune_all_sessions() {
   local age="$1" dir path
+  if ferrox_target_in_use "$shared"; then
+    return 0
+  fi
   for dir in "$shared"/*/incremental; do
     if [[ -d "$dir" ]]; then
       prune_sessions "$dir" "$age"
@@ -125,6 +144,7 @@ prune_all_sessions() {
     if [[ ! -d "$path" ]]; then
       continue
     fi
+    ferrox_target_in_use "$path/target" && continue
     for dir in "$path"/target/*/incremental; do
       if [[ -d "$dir" ]]; then
         prune_sessions "$dir" "$age"
@@ -151,6 +171,7 @@ reset_idle_targets() {
     if ! ferrox_target_is_own "$path"; then
       continue
     fi
+    ferrox_target_in_use "$path/target" && continue
     recent="$(find "$path/target" -type f -mmin "-$age" -print -quit 2>/dev/null)"
     if [[ -z "$recent" ]]; then
       reclaim "$path/target"
@@ -167,6 +188,7 @@ lean_worktrees() {
     [[ -d "$path" ]] || continue
     [[ -n "$keep" && "$path" == "$keep" ]] && continue
     ferrox_target_is_own "$path" || continue
+    ferrox_target_in_use "$path/target" && continue
     for part in release doc debug/incremental; do
       [[ -d "$path/target/$part" ]] || continue
       recent="$(find "$path/target/$part" -type f -mmin "-$age" -print -quit 2>/dev/null)"
@@ -191,6 +213,9 @@ reclaim_temp_forges() {
     case "$dir" in
       "$top"/*) continue ;;
     esac
+    is_registered_worktree "$dir" && continue
+    [[ -e "$dir/.git" ]] || continue
+    ferrox_target_in_use "$dir/target" && continue
     reclaim "$dir"
   done < <(
     if [[ -n "$age" ]]; then
@@ -213,7 +238,11 @@ while IFS= read -r path; do
   fi
   # A claim that died mid-copy leaves this staging dir, never a half `target`.
   if [[ -d "$path/target.claim" ]]; then
-    reclaim "$path/target.claim"
+    if ferrox_claim_is_live "$path/target.claim"; then
+      printf 'keep %s (claim in progress)\n' "$path/target.claim"
+    else
+      reclaim "$path/target.claim"
+    fi
   fi
 done <<< "$worktrees"
 

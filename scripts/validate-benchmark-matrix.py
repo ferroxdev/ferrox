@@ -146,25 +146,40 @@ def check_repeat_digests(path, doc):
             )
 
 
-def check_spread(results):
+def cell_samples(cell, engine, metric):
+    """Per-repeat samples for one engine and metric, as the renderer reads them."""
+    if cell is None:
+        return []
+    for entry in cell.get("engines", []):
+        if entry.get("name") != engine:
+            continue
+        out = []
+        for run in entry.get("runs", []):
+            value = run.get(metric)
+            if metric == "latency_us":
+                if isinstance(value, dict):
+                    value = value.get("median")
+                else:
+                    continue
+            if isinstance(value, (int, float)):
+                out.append(value)
+        return out
+    return []
+
+
+def check_spread(results, cells):
     """Every reported repeat spread re-derived from its cell runs."""
     for scenario in results.get("scenarios", []):
-        cell_path = Path(args.cells) / scenario["id"] / "cell.json"
-        cell = load_json(cell_path)
-        if cell is None:
-            continue
+        cell = cells.get(scenario["id"])
         for engine, reported in scenario.get("spread", {}).items():
-            samples = []
-            for entry in cell.get("engines", []):
-                if entry.get("name") != engine:
-                    continue
-                samples = [
-                    run["throughput_mib_s"]
-                    for run in entry.get("runs", [])
-                    if isinstance(run.get("throughput_mib_s"), (int, float))
-                ]
+            samples = cell_samples(cell, engine, "throughput_mib_s")
             expected = benchstats.spread(samples) if samples else None
-            if not expected:
+            if expected is None:
+                check(
+                    reported is None,
+                    f"{scenario['id']}/{engine}/spread is reported but no "
+                    "throughput samples re-derive it",
+                )
                 continue
             for key in ("n", "median", "min", "max", "state"):
                 check(
@@ -174,47 +189,53 @@ def check_spread(results):
                 )
 
 
-def check_medians(results):
+def check_medians(results, cells):
     """Every plotted median re-derived from its repeats."""
     for scenario in results.get("scenarios", []):
+        cell = cells.get(scenario["id"])
         for engine, values in scenario.get("medians", {}).items():
             for metric, median in values.items():
-                samples = []
-                cell_path = None
-                for cell_file in Path(args.cells).glob(f"{scenario['id']}/cell.json"):
-                    cell_path = cell_file
-                if cell_path is None:
-                    continue
-                cell = load_json(cell_path)
-                if cell is None:
-                    continue
-                for entry in cell.get("engines", []):
-                    if entry.get("name") == engine:
-                        samples = [
-                            run[metric]
-                            for run in entry.get("runs", [])
-                            if isinstance(run.get(metric), (int, float))
-                        ]
-                if samples:
-                    check(
-                        benchstats.median(samples) == median,
+                samples = cell_samples(cell, engine, metric)
+                if not samples:
+                    fail(
                         f"{scenario['id']}/{engine}/{metric}: median {median} "
-                        f"re-derives to {benchstats.median(samples)}",
+                        "has no samples to re-derive it"
                     )
+                    continue
+                check(
+                    benchstats.median(samples) == median,
+                    f"{scenario['id']}/{engine}/{metric}: median {median} "
+                    f"re-derives to {benchstats.median(samples)}",
+                )
 
 
-def check_manifest(results_dir, results):
-    """Manifest digests match the committed files they name."""
+def check_manifest(results, cells):
+    """Manifest engine digests match every cell header that names them."""
+    headers = {}
+    for scenario, cell in cells.items():
+        for engine in cell.get("engines", []):
+            if engine.get("binary_sha256"):
+                headers.setdefault(engine.get("name"), set()).add(
+                    engine["binary_sha256"]
+                )
     manifest = results.get("manifest", [])
     for line in manifest:
         if not line.startswith("engine "):
             continue
         parts = line.split()
+        label = parts[1].rstrip(":") if len(parts) > 1 else "?"
         digest = None
         for part in parts[2:]:
             if part.startswith("sha256="):
                 digest = part.split("=", 1)[1]
         check(digest is not None, f"manifest line without digest: {line}")
+        if digest is None or label not in headers:
+            continue
+        check(
+            digest in headers[label],
+            f"manifest engine {label} digest {digest} disagrees with the "
+            f"cell header {sorted(headers[label])}",
+        )
 
 
 def check_charts(charts_dir, results):
@@ -247,11 +268,34 @@ def check_charts(charts_dir, results):
         check(path.is_file(), f"missing chart {path}")
         if path.is_file():
             check(path.stat().st_size > 0, f"empty chart {path}")
-    for base in {scenario.get("base", scenario["id"]) for scenario in results.get("scenarios", [])}:
+    measured = {
+        scenario.get("base", scenario["id"])
+        for scenario in scenarios
+        if scenario.get("medians")
+    }
+    for base in measured:
         path = Path(charts_dir) / "scenarios" / f"{base}.png"
         check(path.is_file(), f"missing per-test scenario chart {path}")
         if path.is_file():
             check(path.stat().st_size > 0, f"empty chart {path}")
+
+
+def readme_row(section, base, server):
+    """The throughput row for one test, parsed into raw pipe-separated cells."""
+    prefix = f"| `{base}` | {server} |"
+    for line in section.splitlines():
+        if line.startswith(prefix):
+            return line.split("|")[1:-1]
+    return None
+
+
+def readme_number(cell):
+    """A rendered throughput cell as an integer, or None for a gap label."""
+    text = cell.strip().replace("*", "").replace(",", "").strip()
+    try:
+        return round(float(text))
+    except ValueError:
+        return None
 
 
 def check_readme(readme_path, charts_dir, results):
@@ -272,29 +316,47 @@ def check_readme(readme_path, charts_dir, results):
         f"<!-- runner:{runner} -->" in section,
         f"README has no block for runner {runner}",
     )
-    engines = [
-        name for name in THROUGHPUT_ENGINES
-        if any(name in scenario.get("medians", {}) for scenario in results.get("scenarios", []))
-    ]
-    for base in {scenario.get("base", scenario["id"]) for scenario in results.get("scenarios", [])}:
+    seen = set()
+    for scenario in results.get("scenarios", []):
+        seen.update(scenario.get("medians", {}))
+        seen.update(
+            item.get("engine") for item in scenario.get("skipped", [])
+            if item.get("engine")
+        )
+        seen.update(
+            item.get("engine") for item in scenario.get("failures", [])
+            if item.get("engine")
+        )
+    engines = [name for name in THROUGHPUT_ENGINES if name in seen]
+    engines += sorted(seen - set(engines))
+    measured = {
+        scenario.get("base", scenario["id"])
+        for scenario in results.get("scenarios", [])
+        if scenario.get("medians")
+    }
+    for base in measured:
         image = f"scenarios/{base}.png"
         check(image in section, f"README has no per-test chart for {base}")
     for scenario in results.get("scenarios", []):
         if "setup" in scenario.get("id", ""):
             continue
         medians = scenario.get("medians", {})
-        cells = []
-        for engine in engines:
-            value = medians.get(engine, {}).get("throughput_mib_s")
-            cells.append("\u2014" if value is None else f"{value:.0f}")
         base = scenario.get("base", scenario["id"])
         server = scenario.get("server") or "\u2014"
-        expected = f"| `{base}` | {server} | " + " | ".join(cells) + " |"
-        check(
-            expected in section,
-            f"README row for {scenario['id']} does not match "
-            f"matrix-results.json ({'/'.join(cells)})",
-        )
+        row = readme_row(section, base, server)
+        if row is None:
+            fail(f"README has no throughput row for {scenario['id']}")
+            continue
+        values = row[2:2 + len(engines)]
+        for engine, raw in zip(engines, values):
+            value = medians.get(engine, {}).get("throughput_mib_s")
+            number = readme_number(raw)
+            expected = None if value is None else round(value)
+            check(
+                number == expected,
+                f"README row for {scenario['id']}/{engine} prints {raw!r} "
+                f"but matrix-results.json re-derives {expected}",
+            )
     check("## Coverage" in section, "README has no coverage table section")
     check("| scenario | server |" in section, "README has no coverage table header")
 
@@ -308,7 +370,12 @@ def check_bundle_readme(path, results):
         return
     check("## Coverage" in text, "bundle document has no coverage table")
     check("| scenario | server |" in text, "bundle document has no coverage header")
-    for base in {scenario.get("base", scenario["id"]) for scenario in results.get("scenarios", [])}:
+    measured = {
+        scenario.get("base", scenario["id"])
+        for scenario in results.get("scenarios", [])
+        if scenario.get("medians")
+    }
+    for base in measured:
         check(
             f"scenarios/{base}.png" in text,
             f"bundle document has no chart for {base}",
@@ -332,8 +399,25 @@ def main(argv=None):
         return 1
     missing = REQUIRED_RESULTS_KEYS - set(results_doc)
     check(not missing, f"matrix-results.json missing keys {sorted(missing)}")
+    reported = [scenario.get("id") for scenario in results_doc.get("scenarios", [])]
+    check(
+        len(reported) == len(set(reported)),
+        "matrix-results.json repeats a scenario id",
+    )
+    on_disk = {
+        path.parent.name
+        for path in Path(args.cells).glob("*/cell.json")
+    }
+    check(
+        set(reported) == on_disk,
+        "matrix-results.json scenario inventory disagrees with the cells "
+        f"directory (missing {sorted(on_disk - set(reported))}, "
+        f"extra {sorted(set(reported) - on_disk)})",
+    )
+    cells = {}
     for scenario in results_doc.get("scenarios", []):
         cell = check_cell(Path(args.cells) / scenario["id"] / "cell.json")
+        cells[scenario["id"]] = cell
         if cell is not None:
             check(
                 cell.get("scenario") == scenario["id"],
@@ -351,9 +435,9 @@ def main(argv=None):
                 not ran or cell.get("harness_ceilings_mib_s") or not throughput,
                 f"{scenario['id']}: engines ran but no harness ceiling was recorded",
             )
-    check_spread(results_doc)
-    check_medians(results_doc)
-    check_manifest(Path(args.cells).parent, results_doc)
+    check_spread(results_doc, cells)
+    check_medians(results_doc, cells)
+    check_manifest(results_doc, cells)
     check_charts(args.charts, results_doc)
     if args.readme:
         check_readme(args.readme, args.charts, results_doc)

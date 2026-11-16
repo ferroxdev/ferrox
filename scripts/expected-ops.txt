@@ -210,7 +210,7 @@ ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_n
 # caller buffer's length once instead of matching the Option per frame, and one
 # at/next pair advances the cursor where two dot updates stood. The probe drops
 # 4608 (14.9%); the frames, commands and bytes are unchanged.
-vision::Linkferrox_app::vision::tests::Fake::pump 26240 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
+ferrox_app::vision::tests::Fake::pump 26240 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
 
 # Blessed 1170 by the mux rendezvous: the domain arm compares the host against
 # `v1.mux.cool` before the resolver, which is three instructions on every domain

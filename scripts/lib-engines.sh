@@ -13,6 +13,25 @@ release_of() {
   ' "$pins_file"
 }
 
+release_digest_of() {
+  awk -v want="$1" -v asset="$2" '
+    /^\[sources\./ { in_source = ($0 == "[sources." want "]") }
+    in_source && /^bench_sha256[[:space:]]*=/ {
+      line = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", line)
+      sub(/"[[:space:]]*$/, "", line)
+      count = split(line, entries, ",")
+      for (i = 1; i <= count; i++) {
+        split(entries[i], pair, "=")
+        name = pair[1]; value = pair[2]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+        if (name == asset) { print value; exit }
+      }
+    }
+  ' "$pins_file"
+}
+
 pin_of() {
   awk -v want="$1" '
     /^\[sources\./ { in_source = ($0 == "[sources." want "]") }
@@ -130,9 +149,28 @@ build() {
           return 1
           ;;
       esac
+      local digest part actual
+      digest="$(release_digest_of "$name" "$asset")"
+      [[ -n "$digest" ]] || { note "no pinned digest for $name $asset"; return 1; }
       note "downloading xray-core-rust $release ($asset)"
-      curl -fsSL --retry 3 -o "$binary" \
-        "https://github.com/Be90nia/xray-core-rust/releases/download/$release/$asset" || return 1
+      part="$binary.part"
+      rm -f "$part"
+      curl -fsSL --retry 3 -o "$part" \
+        "https://github.com/Be90nia/xray-core-rust/releases/download/$release/$asset" || {
+        rm -f "$part"
+        return 1
+      }
+      actual="$(python3 -c 'import hashlib,sys
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$part")" || {
+        rm -f "$part"
+        return 1
+      }
+      if [[ "$actual" != "$digest" ]]; then
+        rm -f "$part"
+        note "$asset digest $actual does not match the pinned $digest"
+        return 1
+      fi
+      mv -f "$part" "$binary" || return 1
       chmod +x "$binary" 2>/dev/null || true
       ;;
     leaf)

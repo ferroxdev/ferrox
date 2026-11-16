@@ -226,13 +226,14 @@ routed_server_config() {
   server_config "$1" "$2" "$3" "${4:-}" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-d.setdefault("routing", {}).setdefault("rules", []).extend(
+rules = d.setdefault("routing", {}).setdefault("rules", [])
+head, rest = rules[:1], rules[1:]
+rules[:] = head + [
     {"type": "field", "domain": [f"no-route-{i}.test"], "outboundTag": "direct"}
     for i in range(1000)
-)
-d["routing"]["rules"].append(
+] + [
     {"type": "field", "ip": ["127.0.0.1/32"], "outboundTag": "direct"}
-)
+] + rest
 print(json.dumps(d, separators=(",", ":")))
 '
 }
@@ -461,8 +462,10 @@ tls_grpc_client_settings() {
 }
 
 reality_server_settings() {
-  local network="$1" carrier="$2"
-  echo "\"streamSettings\": {\"network\": \"$network\"$carrier, \"security\": \"reality\", \"realitySettings\": {\"dest\": \"${MATRIX_REALITY_DEST:-127.0.0.1:9}\", \"serverNames\": [\"carrier.test\"], \"privateKey\": \"$(matrix_reality_private)\", \"shortIds\": [\"0123456789abcdef\"]}}"
+  local network="$1" carrier="$2" dest="${MATRIX_REALITY_DEST:-}"
+  if [[ -z "$dest" && -n "${cover:-}" ]]; then dest="127.0.0.1:$cover"; fi
+  dest="${dest:-127.0.0.1:9}"
+  echo "\"streamSettings\": {\"network\": \"$network\"$carrier, \"security\": \"reality\", \"realitySettings\": {\"dest\": \"$dest\", \"serverNames\": [\"carrier.test\"], \"privateKey\": \"$(matrix_reality_private)\", \"shortIds\": [\"0123456789abcdef\"]}}"
 }
 
 reality_client_settings() {
@@ -816,9 +819,9 @@ vmess_server() { echo "\"protocol\": \"vmess\", \"settings\": {\"clients\": [{\"
 vmess_client() { echo "\"tag\": \"proxy\", \"protocol\": \"vmess\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $1, \"users\": [{\"id\": \"$UUID\", \"security\": \"auto\"}]}]}" ; }
 trojan_server() { echo "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}"; }
 trojan_client() { echo "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $1, \"password\": \"$PASSWORD\"}]}"; }
-shadowsocks_server() { echo "\"protocol\": \"shadowsocks\", \"settings\": {\"method\": \"aes-256-gcm\", \"password\": \"$SS_PASSWORD\", \"network\": \"tcp\"}"; }
+shadowsocks_server() { echo "\"protocol\": \"shadowsocks\", \"settings\": {\"method\": \"aes-256-gcm\", \"password\": \"$SS_PASSWORD\", \"network\": \"tcp,udp\"}"; }
 shadowsocks_client() { echo "\"tag\": \"proxy\", \"protocol\": \"shadowsocks\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $1, \"method\": \"aes-256-gcm\", \"password\": \"$SS_PASSWORD\"}]}"; }
-shadowsocks2022_server() { echo "\"protocol\": \"shadowsocks\", \"settings\": {\"method\": \"2022-blake3-aes-128-gcm\", \"password\": \"$SS2022_PASSWORD\", \"network\": \"tcp\"}"; }
+shadowsocks2022_server() { echo "\"protocol\": \"shadowsocks\", \"settings\": {\"method\": \"2022-blake3-aes-128-gcm\", \"password\": \"$SS2022_PASSWORD\", \"network\": \"tcp,udp\"}"; }
 shadowsocks2022_client() { echo "\"tag\": \"proxy\", \"protocol\": \"shadowsocks\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $1, \"method\": \"2022-blake3-aes-128-gcm\", \"password\": \"$SS2022_PASSWORD\"}]}"; }
 
 mux_json() {
@@ -867,6 +870,7 @@ scenario_config() {
   local port="$2" cover="${3:-}" inner="${4:-}" cover_json=""
   if [[ -n "$cover" ]]; then cover_json="$(cover_inbound "$cover")"; fi
   case "$1" in
+    vless-raw-routed-*) routed_server_config "$(vless_server ', "streamSettings": {"network": "tcp"}')" "$(vless_client ', "streamSettings": {"network": "tcp"}' "$port")" "$port" ;;
     vless-raw-mux-*) protocol_scenario vless raw "$port" "$cover" mux ;;
     vmess-raw-mux-*) protocol_scenario vmess raw "$port" "$cover" mux ;;
     trojan-raw-mux-*) protocol_scenario trojan raw "$port" "$cover" mux ;;
@@ -890,7 +894,6 @@ scenario_config() {
     vless-xhttp-streamup-*) server_config "$(vless_server ", $(xhttp_h1_settings stream-up)")" "$(vless_client ", $(xhttp_h1_settings stream-up)" "$port")" "$port" ;;
     vless-xhttp-streamone-*) server_config "$(vless_server ", $(xhttp_h1_settings stream-one)")" "$(vless_client ", $(xhttp_h1_settings stream-one)" "$port")" "$port" ;;
     vless-xhttp-packets-*) server_config "$(vless_server ", $(xhttp_h1_settings packet-up)")" "$(vless_client ", $(xhttp_h1_settings packet-up)" "$port")" "$port" ;;
-    vless-raw-routed-*) routed_server_config "$(vless_server ', "streamSettings": {"network": "tcp"}')" "$(vless_client ', "streamSettings": {"network": "tcp"}' "$port")" "$port" ;;
     vless-tls-raw-*) server_config "$(vless_server ", $(tls_server_settings)")" "$(vless_client ", $(tls_client_settings)" "$port")" "$port" ;;
     vless-ws-*) server_config "$(vless_server ", $(stream_json ws)")" "$(vless_client ", $(stream_json ws)" "$port")" "$port" ;;
     vless-grpc-*) server_config "$(vless_server ", $(stream_json grpc)")" "$(vless_client ", $(stream_json grpc)" "$port")" "$port" ;;
@@ -901,8 +904,8 @@ scenario_config() {
     trojan-raw-*) server_config "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}" "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"password\": \"$PASSWORD\"}]}" "$port" ;;
     trojan-tls-raw-*) server_config "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}, $(tls_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"password\": \"$PASSWORD\"}]}, $(tls_client_settings)" "$port" ;;
     vless-tls-ws-*) server_config "$(vless_server ", $(tls_ws_server_settings)")" "$(vless_client ", $(tls_ws_client_settings)" "$port")" "$port" ;;
-    shadowsocks-raw-*) server_config "\"protocol\": \"shadowsocks\", \"settings\": {\"method\": \"aes-256-gcm\", \"password\": \"$SS_PASSWORD\", \"network\": \"tcp\"}" "\"tag\": \"proxy\", \"protocol\": \"shadowsocks\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"method\": \"aes-256-gcm\", \"password\": \"$SS_PASSWORD\"}]}" "$port" ;;
-    shadowsocks2022-raw-*) server_config "\"protocol\": \"shadowsocks\", \"settings\": {\"method\": \"2022-blake3-aes-128-gcm\", \"password\": \"$SS2022_PASSWORD\", \"network\": \"tcp\"}" "\"tag\": \"proxy\", \"protocol\": \"shadowsocks\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"method\": \"2022-blake3-aes-128-gcm\", \"password\": \"$SS2022_PASSWORD\"}]}" "$port" ;;
+    shadowsocks-raw-*) server_config "\"protocol\": \"shadowsocks\", \"settings\": {\"method\": \"aes-256-gcm\", \"password\": \"$SS_PASSWORD\", \"network\": \"tcp,udp\"}" "\"tag\": \"proxy\", \"protocol\": \"shadowsocks\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"method\": \"aes-256-gcm\", \"password\": \"$SS_PASSWORD\"}]}" "$port" ;;
+    shadowsocks2022-raw-*) server_config "\"protocol\": \"shadowsocks\", \"settings\": {\"method\": \"2022-blake3-aes-128-gcm\", \"password\": \"$SS2022_PASSWORD\", \"network\": \"tcp,udp\"}" "\"tag\": \"proxy\", \"protocol\": \"shadowsocks\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"method\": \"2022-blake3-aes-128-gcm\", \"password\": \"$SS2022_PASSWORD\"}]}" "$port" ;;
     vless-httpupgrade-*) server_config "$(vless_server ", $(httpupgrade_settings)")" "$(vless_client ", $(httpupgrade_settings)" "$port")" "$port" ;;
     vless-tls-grpc-*) server_config "$(vless_server ", $(tls_grpc_server_settings)")" "$(vless_client ", $(tls_grpc_client_settings)" "$port")" "$port" ;;
     vless-reality-raw-*) server_config "$(vless_server ", $(reality_server_settings tcp "")")" "$(vless_client ", $(reality_client_settings tcp "")" "$port")" "$port" "$cover_json" ;;

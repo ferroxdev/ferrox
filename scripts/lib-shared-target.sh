@@ -122,9 +122,91 @@ ferrox_adopt_seed_inputs() {
   printf 'seed: workspace artefacts reused (%s dep-info file(s) repointed)\n' "$rewritten"
 }
 
+# Adoption failed, so the clone's fingerprints are newer than the worktree's
+# checkout. Age every workspace input past them or Cargo may reuse the seed's
+# objects for source this worktree does not have.
+ferrox_invalidate_seed_inputs() {
+  local dest="$1" rel
+  while IFS= read -r rel; do
+    ferrox_touch_path "$dest" "$rel" ""
+  done < <(ferrox_reuse_paths)
+  ferrox_touch_path "$dest" crates/ferrox-prompt ""
+  ferrox_touch_path "$dest" crates/ferrox-bench ""
+}
+
 # Probe before pointing anything at it: a root-owned seed (one sudo'd build is
 # enough) fails every cargo call, and the private dir that follows looks like a
 # choice rather than a write failure.
+# One writer at a time across worktrees: claiming and reclaiming both move
+# directories under the shared tree, and two of them interleaving can delete a
+# clone another process just created.
+ferrox_lock_path() {
+  printf '%s/.ferrox.lock\n' "$1"
+}
+
+ferrox_lock_acquire() {
+  local shared="$1" lock owner waited=0
+  lock="$(ferrox_lock_path "$shared")"
+  mkdir -p "$shared"
+  while ! mkdir "$lock" 2>/dev/null; do
+    owner="$(cat "$lock/pid" 2>/dev/null || true)"
+    if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$lock"
+      continue
+    fi
+    if [[ -z "$owner" ]]; then
+      sleep 1
+      owner="$(cat "$lock/pid" 2>/dev/null || true)"
+      if [[ -z "$owner" ]] && (( waited >= 30 )); then
+        rm -rf "$lock"
+        continue
+      fi
+    fi
+    sleep 0.2
+    waited=$((waited + 1))
+    if (( waited >= 3000 )); then
+      echo "::error::timed out waiting for $lock" >&2
+      return 1
+    fi
+  done
+  printf '%s\n' "$$" >"$lock/pid"
+}
+
+ferrox_lock_release() {
+  local shared="$1" lock
+  lock="$(ferrox_lock_path "$shared")"
+  [[ -d "$lock" ]] || return 0
+  [[ "$(cat "$lock/pid" 2>/dev/null)" == "$$" ]] || return 0
+  rm -rf "$lock"
+}
+
+# Cargo holds its per-target lock for the whole build, so an open descriptor is
+# the witness that a target is live even when no file changed in the age window.
+ferrox_target_in_use() {
+  local target="$1" profile
+  [[ -d "$target" ]] || return 1
+  local -a locks=()
+  for profile in debug release doc; do
+    locks+=("$target/$profile/.cargo-lock" "$target/$profile/.cargo-build-lock")
+  done
+  locks+=("$target/.cargo-lock")
+  if command -v lsof >/dev/null; then
+    lsof -t "${locks[@]}" >/dev/null 2>&1
+    return
+  fi
+  if command -v fuser >/dev/null; then
+    fuser -s "${locks[@]}" >/dev/null 2>&1
+    return
+  fi
+  return 1
+}
+
+ferrox_claim_is_live() {
+  local staging="$1" owner
+  owner="$(awk 'NR == 1 {print $1}' "$staging/.ferrox-claim" 2>/dev/null)"
+  [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null
+}
+
 ferrox_require_shared_writable() {
   local shared="$1" probe
   probe="$shared/.write-probe"
@@ -212,9 +294,10 @@ ferrox_clone_dir() {
 # copy-on-write blocks every branch pays for. `FERROX_TARGET_PROFILES` widens it
 # for a branch that really does measure release locally.
 ferrox_target_profiles() {
-  local part
+  local part profiles="${FERROX_TARGET_PROFILES:-debug}"
   local -a parts
-  read -ra parts <<< "${FERROX_TARGET_PROFILES:-debug}"
+  profiles="${profiles//$'\n'/ }"
+  read -ra parts <<< "$profiles"
   for part in "${parts[@]}"; do
     case "$part" in
       debug|release|doc) printf '%s\n' "$part" ;;
@@ -229,6 +312,7 @@ ferrox_clone_target() {
   local profiles
   local -a parts
   profiles="$(ferrox_target_profiles)" || return 1
+  profiles="${profiles//$'\n'/ }"
   read -ra parts <<< "$profiles"
   rm -rf "$staging"
   mkdir -p "$staging"
@@ -244,7 +328,7 @@ ferrox_clone_target() {
   fi
   rm -rf "$staging/debug/incremental" "$staging/release/incremental"
   rm -f "$staging"/debug/.cargo-*lock "$staging"/release/.cargo-*lock
-  : > "$staging/.ferrox-claim"
+  printf '%s\n' "$$" > "$staging/.ferrox-claim"
   # A half-copied target must never read as claimed: replace `target` only once
   # the clone is complete.
   rm -rf "$dest/target"
@@ -280,6 +364,11 @@ ferrox_claim_target() {
   if ferrox_target_is_own "$dest"; then
     return 0
   fi
+  ferrox_lock_acquire "$shared" || return 1
+  if ferrox_target_is_own "$dest"; then
+    ferrox_lock_release "$shared"
+    return 0
+  fi
   # Refresh the seed before the clone, so the clone carries the fresh artefacts
   # rather than the ones the refresh would have replaced. Adoption is only safe
   # when the clone was taken after a successful refresh.
@@ -292,9 +381,10 @@ ferrox_claim_target() {
     fresh=1
   fi
   ferrox_clone_target "$dest" "$shared"
-  if [[ "$fresh" == 1 ]]; then
-    ferrox_adopt_seed_inputs "$dest" "$shared" || true
+  if [[ "$fresh" != 1 ]] || ! ferrox_adopt_seed_inputs "$dest" "$shared"; then
+    ferrox_invalidate_seed_inputs "$dest"
   fi
+  ferrox_lock_release "$shared"
 }
 
 ferrox_config_is_shared() {

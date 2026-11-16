@@ -31,6 +31,7 @@ import csv
 import io
 import json
 import random
+import statistics
 import sys
 from pathlib import Path
 
@@ -42,10 +43,7 @@ try:
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 except ImportError:
-    sys.exit(
-        "matplotlib is required for charts only: "
-        "pip install -r scripts/requirements-benchmark.txt"
-    )
+    plt = Line2D = Patch = None
 
 import benchstats
 
@@ -290,17 +288,20 @@ def gated_verdict(cell, engine, metric_word):
     return None
 
 
-def summary_bars(series, unit, title, path, foot, suffix="", reference=None, percent=False):
-    """One horizontal bar per engine: the median of that engine's cell medians.
+def summary_bars(series, unit, title, path, foot, suffix="", reference=None,
+                 percent=False, mean=False):
+    """One horizontal bar per engine: the median (or mean) of its cell medians.
 
     The per-test plots carry the scenario detail; a 56-group bar chart is wider
     than a page and reads as noise, so the cost plots answer the one question a
     reader has here: which engine is cheapest overall, and over how many cells.
+    A share is the mean of its flags, not the median.
     """
     present = [name for name in ENGINE_ORDER if series.get(name)]
     if not present:
         return None
-    values = [benchstats.median(series[name]) for name in present]
+    aggregate = statistics.fmean if mean else benchstats.median
+    values = [aggregate(series[name]) for name in present]
     fig, ax = plt.subplots(figsize=(7.6, max(2.4, 0.5 * len(present) + 1.3)))
     ax.barh(
         present,
@@ -923,6 +924,7 @@ def ceiling_chart(scenarios, cells, path, foot):
         path,
         foot,
         percent=True,
+        mean=True,
     )
 
 def threads_chart(scenarios, cells, path, foot):
@@ -1249,7 +1251,7 @@ TABLE_METRICS = (
     ("rss_mib", "rss", "MiB"),
     ("threads_peak", "threads", "threads"),
     ("startup_seconds", "startup", "s"),
-    ("kernel_calls_per_gib", "kernel", "calls/MiB"),
+    ("kernel_calls_per_gib", "kernel", "calls/GiB"),
     ("latency_us", "latency", "us"),
     ("transfer_seconds", "transfer", "s"),
 )
@@ -1503,8 +1505,17 @@ def spread_markdown(results):
     return "\n".join(lines)
 
 
-def matrix_markdown(results, image_prefix):
-    """The complete bundle document: tables, one multi-metric image per test, coverage."""
+def matrix_markdown(results, image_prefix, made=None):
+    """The complete bundle document: tables, one multi-metric image per test, coverage.
+
+    `made` names the PNGs actually written; a link is omitted when its chart
+    had no successful samples to draw, rather than promising a missing file.
+    """
+    available = None if made is None else set(made)
+
+    def has(name):
+        return available is None or name in available
+
     scenarios = results.get("scenarios", [])
     bulk = any("setup" not in scenario.get("id", "") for scenario in scenarios)
     priced = any(
@@ -1569,9 +1580,9 @@ def matrix_markdown(results, image_prefix):
             "",
             f"Servers: {', '.join(servers)}.",
             "",
-            f"![{base}]({image_prefix}/scenarios/{base}.png)",
-            "",
         ]
+        if has(f"{base}.png"):
+            lines += [f"![{base}]({image_prefix}/scenarios/{base}.png)", ""]
     lines += [
         "## Cost",
         "",
@@ -1589,46 +1600,37 @@ def matrix_markdown(results, image_prefix):
         "",
     ]
     if bulk:
-        if priced:
+        if priced and has("cpu-per-gib.png"):
             lines += [
                 f"![CPU per GiB]({image_prefix}/cpu-per-gib.png)",
                 "",
             ]
-        lines += [
-            f"![peak RSS]({image_prefix}/memory-rss.png)",
-            "",
-            f"![peak threads]({image_prefix}/threads.png)",
-            "",
-        ]
-    lines += [
-        f"![cold start]({image_prefix}/startup.png)",
-        "",
-    ]
-    if priced:
+        if has("memory-rss.png"):
+            lines += [f"![peak RSS]({image_prefix}/memory-rss.png)", ""]
+        if has("threads.png"):
+            lines += [f"![peak threads]({image_prefix}/threads.png)", ""]
+    if has("startup.png"):
+        lines += [f"![cold start]({image_prefix}/startup.png)", ""]
+    if priced and has("ceiling.png"):
         lines += [
             f"![cells at harness ceiling]({image_prefix}/ceiling.png)",
             "",
         ]
-    if setup:
-        lines += [
-            f"![setup latency]({image_prefix}/setup-latency.png)",
-            "",
-        ]
-    lines += [
-        f"![binary size]({image_prefix}/binary-size.png)",
-        "",
-    ]
+    if setup and has("setup-latency.png"):
+        lines += [f"![setup latency]({image_prefix}/setup-latency.png)", ""]
+    if has("binary-size.png"):
+        lines += [f"![binary size]({image_prefix}/binary-size.png)", ""]
     return "\n".join(lines)
 
 
-def write_bundle_markdown(input_dir, results):
+def write_bundle_markdown(input_dir, results, made=None):
     """Put the complete document in the bundle, beside the plots it embeds."""
     path = Path(input_dir) / "README.md"
-    path.write_text(matrix_markdown(results, "charts"))
+    path.write_text(matrix_markdown(results, "charts", made))
     print(f"bundle document written to {path}")
 
 
-def update_readme(readme_path, results, charts_dir, runner):
+def update_readme(readme_path, results, charts_dir, runner, made=None):
     """Rewrite one runner's README block from the same numbers as the charts."""
     del charts_dir
     img = f"docs/benchmarks/charts/latest/{runner}"
@@ -1640,7 +1642,7 @@ def update_readme(readme_path, results, charts_dir, runner):
     end = "<!-- benchmark-matrix:end -->"
     if start not in text or end not in text:
         sys.exit("README has no benchmark-matrix markers")
-    section = matrix_markdown(results, img)
+    section = matrix_markdown(results, img, made)
     before, _, rest = text.partition(start)
     area, _, after = rest.partition(end)
     area = replace_runner_block(area, runner, section)
@@ -1702,6 +1704,8 @@ def main(argv=None):
     parser.add_argument("--change-threshold", type=float,
                         default=benchstats.CHANGE_THRESHOLD,
                         help="fraction a median must move to count (default 0.10)")
+    parser.add_argument("--no-images", action="store_true",
+                        help="write results and tables without drawing PNGs")
     args = parser.parse_args(argv)
 
     input_dir = Path(args.input)
@@ -1734,46 +1738,54 @@ def main(argv=None):
         if cells[s].get("workload", {}).get("traffic")
         in ("upload", "download", "full-duplex")
     )
-    families = {}
-    for scenario, cell in cells.items():
-        families.setdefault(scenario.partition("--srv-")[0], {})[scenario] = cell
     made = []
-    for base, group in sorted(families.items()):
-        chart = scenario_family_chart(
-            base,
-            group,
-            str(charts_dir / "scenarios" / f"{base}.png"),
-            foot,
-            setup_index,
+    if not args.no_images and plt is None:
+        sys.exit(
+            "matplotlib is required for charts only: "
+            "pip install -r scripts/requirements-benchmark.txt "
+            "(or pass --no-images)"
         )
-        if chart:
-            made.append(chart)
-    made += [
-        metric_chart(
-            priced, cells, "cpu_millis_per_gib", "cpu", "ms/GiB",
-            "CPU per GiB (median over cells, lower is better)",
-            str(charts_dir / "cpu-per-gib.png"), foot,
-        ),
-        metric_chart(
-            bulk, cells, "rss_mib", "rss", "MiB",
-            "peak RSS (median over cells, lower is better)",
-            str(charts_dir / "memory-rss.png"), foot,
-        ),
-        threads_chart(bulk, cells, str(charts_dir / "threads.png"), foot),
-        startup_chart(
-            sorted(cells), cells, str(charts_dir / "startup.png"), foot
-        ),
-        ceiling_chart(priced, cells, str(charts_dir / "ceiling.png"), foot),
-        setup_chart(cells, setup_index, str(charts_dir / "setup-latency.png"), foot),
-        binary_size_chart(meta, str(charts_dir / "binary-size.png"), foot),
-    ]
-    made = [path for path in made if path]
+    if not args.no_images:
+        families = {}
+        for scenario, cell in cells.items():
+            families.setdefault(scenario.partition("--srv-")[0], {})[scenario] = cell
+        for base, group in sorted(families.items()):
+            chart = scenario_family_chart(
+                base,
+                group,
+                str(charts_dir / "scenarios" / f"{base}.png"),
+                foot,
+                setup_index,
+            )
+            if chart:
+                made.append(chart)
+        made += [
+            metric_chart(
+                priced, cells, "cpu_millis_per_gib", "cpu", "ms/GiB",
+                "CPU per GiB (median over cells, lower is better)",
+                str(charts_dir / "cpu-per-gib.png"), foot,
+            ),
+            metric_chart(
+                bulk, cells, "rss_mib", "rss", "MiB",
+                "peak RSS (median over cells, lower is better)",
+                str(charts_dir / "memory-rss.png"), foot,
+            ),
+            threads_chart(bulk, cells, str(charts_dir / "threads.png"), foot),
+            startup_chart(
+                sorted(cells), cells, str(charts_dir / "startup.png"), foot
+            ),
+            ceiling_chart(priced, cells, str(charts_dir / "ceiling.png"), foot),
+            setup_chart(cells, setup_index, str(charts_dir / "setup-latency.png"), foot),
+            binary_size_chart(meta, str(charts_dir / "binary-size.png"), foot),
+        ]
+        made = [path for path in made if path]
+    made_names = {Path(path).name for path in made}
     print(f"charts: {len(made)} PNGs in {charts_dir}")
     for path in made:
         print(f"  {path}")
-    write_bundle_markdown(input_dir, results)
+    write_bundle_markdown(input_dir, results, made_names)
     if args.readme:
-        update_readme(args.readme, results, str(charts_dir), runner)
+        update_readme(args.readme, results, str(charts_dir), runner, made_names)
     return 0
 
 
