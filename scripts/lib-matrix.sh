@@ -830,7 +830,7 @@ mux_json() {
 protocol_scenario() {
   local proto="$1" carrier="$2" port="$3" cover="${4:-}" mux="${5:-}" srv cli srv_stream cli_stream cover_json=""
   case "$proto" in
-    vless) srv="$(vless_server)"; cli="$(vless_client "" "$port")" ;;
+    vless) srv="$(vless_server "")"; cli="$(vless_client "" "$port")" ;;
     vmess) srv="$(vmess_server)"; cli="$(vmess_client "$port")" ;;
     trojan) srv="$(trojan_server)"; cli="$(trojan_client "$port")" ;;
     shadowsocks) srv="$(shadowsocks_server)"; cli="$(shadowsocks_client "$port")" ;;
