@@ -1104,7 +1104,7 @@ fn serve_vless_inbound(
                     let _flow = crate::accesslog::flow(Some(conn.remote_addr()), "", 0);
                     serve_vless_kcp(conn, &users, freedom, meter.clone());
                 });
-                return serve_kcp_bound(&owned, config, &serve);
+                return serve_kcp_bound(&owned, config, &serve, inbound);
             }
             let fallbacks = match server_fallbacks(inbound) {
                 Ok(fallbacks) => fallbacks.map(Arc::from),
@@ -9413,7 +9413,7 @@ fn serve_vless_tls_inbound(
             let _flow = crate::accesslog::flow(Some(conn.remote_addr()), "", 0);
             serve_vless_kcp_tls(conn, &users, freedom, &server, meter.clone());
         });
-        return serve_kcp_bound(&owned, config, &serve);
+        return serve_kcp_bound(&owned, config, &serve, inbound);
     }
     let role = inbound_role(
         inbound,
@@ -9476,7 +9476,7 @@ fn serve_vless_reality_inbound(
             let _flow = crate::accesslog::flow(Some(conn.remote_addr()), "", 0);
             serve_vless_kcp_reality(conn, &users, freedom, &server, meter.clone());
         });
-        return serve_kcp_bound(&owned, config, &serve);
+        return serve_kcp_bound(&owned, config, &serve, inbound);
     }
     let role = inbound_role(
         inbound,
@@ -13547,13 +13547,28 @@ fn kcp_dial_session(
     };
     let server = resolve_outbound(address, port)?;
     let conv = ferrox_core::kcp::fresh_conversation();
-    if let Some(options) = DIAL_SOCKOPTS.with(|cell| cell.borrow().clone()) {
-        if let Some(tag) = options.dialer_proxy() {
-            let (socket, stop) = dial_udp_through_proxy(server, tag, options.as_ref())?;
-            return ferrox_core::kcp::dial_with(socket, server, config.clone(), conv, stop).ok();
-        }
+    let options = DIAL_SOCKOPTS.with(|cell| cell.borrow().clone());
+    let dialer = options
+        .as_deref()
+        .and_then(|options| options.dialer_proxy().map(|tag| (tag, options)));
+    if let Some((tag, options)) = dialer {
+        let (socket, stop) = dial_udp_through_proxy(server, tag, options)?;
+        return ferrox_core::kcp::dial_with(socket, server, config.clone(), conv, stop).ok();
     }
-    ferrox_core::kcp::dial(server, config.clone(), conv).ok()
+    let source = flow_source();
+    if source.is_none() && options.is_none() {
+        return ferrox_core::kcp::dial(server, config.clone(), conv).ok();
+    }
+    let bind = match source {
+        Some(ip) if ip.is_ipv4() == server.is_ipv4() => SocketAddr::new(ip, 0),
+        Some(_) => return None,
+        None if server.is_ipv6() => "[::]:0".parse().ok()?,
+        None => "0.0.0.0:0".parse().ok()?,
+    };
+    let socket = crate::sockopt::bind_datagram_at(options.as_deref(), bind).ok()?;
+    socket.connect(server).ok()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    ferrox_core::kcp::dial_with(socket, server, config.clone(), conv, stop).ok()
 }
 
 fn dial_trojan_kcp(
@@ -14237,11 +14252,27 @@ fn serve_ss_xdrive(
 }
 
 /// Bind before answering, so a port already taken is the listener's refusal and not a thread's later accident.
-fn serve_kcp_bound(address: &str, config: ferrox_core::kcp::Config, serve: &KcpServe) -> bool {
+fn serve_kcp_bound(
+    address: &str,
+    config: ferrox_core::kcp::Config,
+    serve: &KcpServe,
+    inbound: &Json,
+) -> bool {
     let Some(server) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
         return false;
     };
-    let Ok(listener) = ferrox_core::kcp::Listener::bind(server, config) else {
+    let Ok(sockopt) = crate::sockopt::parse_inbound(
+        inbound
+            .get("streamSettings")
+            .and_then(|settings| settings.get("sockopt")),
+    ) else {
+        eprintln!("unreadable streamSettings.sockopt on {address}: refused, not served");
+        return false;
+    };
+    let Ok(sock) = crate::sockopt::bind_datagram_at(sockopt.as_deref(), server) else {
+        return false;
+    };
+    let Ok(listener) = ferrox_core::kcp::Listener::with_socket(sock, config) else {
         return false;
     };
     let serve = Arc::clone(serve);
@@ -14552,7 +14583,7 @@ fn serve_trojan_inbound(
                     serve_trojan_kcp(conn, &key, &accounts, freedom, meter.clone());
                 })
             };
-            serve_kcp_bound(address, config, &serve)
+            serve_kcp_bound(address, config, &serve, inbound)
         }
         Carrier::Xdrive { settings } => {
             let email = account.email.clone();
@@ -14915,7 +14946,7 @@ fn serve_vmess_inbound_users(
                 })
             };
             let owned = address.to_owned();
-            serve_kcp_bound(&owned, config, &serve)
+            serve_kcp_bound(&owned, config, &serve, inbound)
         }
         Carrier::Xdrive { settings } => {
             let email = account.email.clone();
@@ -15727,7 +15758,7 @@ fn serve_ss_kcp_listener(
             }
         })
     };
-    serve_kcp_bound(address, config, &serve)
+    serve_kcp_bound(address, config, &serve, inbound)
 }
 
 /// The datagram half a shadowsocks listener owns before it reports served: bound here, refused here, or never asked for.
@@ -56846,7 +56877,8 @@ mod tests {
         assert!(serve_kcp_bound(
             &format!("127.0.0.1:{port}"),
             config,
-            &serve
+            &serve,
+            &inbound
         ));
         thread::sleep(Duration::from_millis(50));
         let root = crate::json::parse(&format!(
@@ -68702,7 +68734,7 @@ mod tests {
     }
 
     #[test]
-    fn kcp_settings_parse_in_both_casings_with_guarded_fallbacks() {
+    fn kcp_settings_parse_in_both_casings_with_the_reference_bounds() {
         let base = ferrox_core::kcp::Config::default();
         let plain = crate::json::parse(r#"{"network":"kcp"}"#).expect("parses");
         assert!(matches!(stream_carrier(Some(&plain)), Carrier::Kcp(cfg) if cfg == base));
@@ -68730,22 +68762,101 @@ mod tests {
         assert_eq!(cfg.downlink_capacity, 9);
         assert_eq!(cfg.cwnd_multiplier, 3);
         assert_eq!(cfg.max_sending_window, 4096);
-        let bad = crate::json::parse(
-            r#"{"network":"kcp","kcpSettings":{"mtu":10,"tti":0,"uplinkCapacity":7}}"#,
+        for (doc, mtu, tti, cwnd, window) in [
+            (
+                r#"{"network":"kcp","kcpSettings":{"mtu":21,"tti":10,"cwndMultiplier":1,"maxSendingWindow":21}}"#,
+                21,
+                10,
+                1,
+                21,
+            ),
+            (
+                r#"{"network":"kcp","kcpSettings":{"tti":1000}}"#,
+                base.mtu,
+                1000,
+                base.cwnd_multiplier,
+                base.max_sending_window,
+            ),
+            (
+                r#"{"network":"kcp","kcpSettings":{"mtu":1349,"maxSendingWindow":1349}}"#,
+                1349,
+                base.tti,
+                base.cwnd_multiplier,
+                1349,
+            ),
+        ] {
+            let settings = crate::json::parse(doc).expect("parses");
+            let Carrier::Kcp(cfg) = stream_carrier(Some(&settings)) else {
+                panic!("{doc} is inside the reference's bounds");
+            };
+            assert_eq!(
+                (
+                    cfg.mtu,
+                    cfg.tti,
+                    cfg.cwnd_multiplier,
+                    cfg.max_sending_window
+                ),
+                (mtu, tti, cwnd, window),
+                "{doc}"
+            );
+        }
+        for doc in [
+            r#"{"network":"kcp","kcpSettings":{"mtu":10}}"#,
+            r#"{"network":"kcp","kcpSettings":{"mtu":20}}"#,
+            r#"{"network":"kcp","kcpSettings":{"tti":0}}"#,
+            r#"{"network":"kcp","kcpSettings":{"tti":9}}"#,
+            r#"{"network":"kcp","kcpSettings":{"tti":1001}}"#,
+            r#"{"network":"kcp","kcpSettings":{"cwndMultiplier":0}}"#,
+            r#"{"network":"kcp","kcpSettings":{"maxSendingWindow":0}}"#,
+            r#"{"network":"kcp","kcpSettings":{"mtu":1350,"maxSendingWindow":1349}}"#,
+        ] {
+            let settings = crate::json::parse(doc).expect("parses");
+            assert!(
+                matches!(stream_carrier(Some(&settings)), Carrier::Unknown { .. }),
+                "{doc} is outside the reference's bounds and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kcp_inbound_refuses_a_sockopt_the_socket_cannot_take() {
+        let inbound = crate::json::parse(
+            r#"{"protocol":"vmess","settings":{},"streamSettings":{"network":"kcp",
+                "sockopt":{"customSockopt":[{"system":"","network":"udp","level":9999,"opt":1,"type":"int","value":"1"}]}}}"#,
         )
         .expect("parses");
-        let Carrier::Kcp(cfg) = stream_carrier(Some(&bad)) else {
-            panic!("bad values still Kcp");
+        let Carrier::Kcp(config) = inbound_carrier(&inbound) else {
+            panic!("the inbound names kcp");
         };
-        assert_eq!(cfg.mtu, base.mtu);
-        assert_eq!(cfg.tti, base.tti);
-        assert_eq!(cfg.uplink_capacity, 7);
-        let slow =
-            crate::json::parse(r#"{"network":"kcp","kcpSettings":{"tti":5000}}"#).expect("parses");
-        let Carrier::Kcp(cfg) = stream_carrier(Some(&slow)) else {
-            panic!("slow tti still Kcp");
-        };
-        assert_eq!(cfg.tti, base.tti);
+        let serve: KcpServe = Arc::new(|conn| conn.close());
+        assert!(
+            !serve_kcp_bound("127.0.0.1:0", config, &serve, &inbound),
+            "a sockopt the socket refused must refuse the listener, not bind without it"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kcp_dial_binds_the_configured_source() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let source = parse_send_through(
+            &crate::json::parse(r#"{"sendThrough":"127.0.0.2"}"#).expect("parses"),
+        )
+        .expect("parses")
+        .expect("names a source");
+        let _guard = SendThroughGuard::enter(Some(source));
+        let conn = kcp_dial_session(
+            &Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            "127.0.0.1",
+            peer.local_addr().expect("address").port(),
+        )
+        .expect("dials");
+        assert_eq!(
+            conn.local_addr().ip(),
+            "127.0.0.2".parse::<IpAddr>().expect("source"),
+            "the dial bound the configured source"
+        );
+        conn.close();
     }
 
     #[test]

@@ -1488,10 +1488,10 @@ pub(crate) fn stream_reality(
     }))
 }
 
-pub(crate) fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
+pub(crate) fn kcp_config(settings: Option<&Json>) -> Option<ferrox_core::kcp::Config> {
     let base = ferrox_core::kcp::Config::default();
     let Some(kcp) = settings.and_then(|s| s.get("kcpSettings")) else {
-        return base;
+        return Some(base);
     };
     let num = |camel: &str, snake: &str| {
         kcp.get(camel)
@@ -1500,29 +1500,30 @@ pub(crate) fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
     };
     let mtu = num("mtu", "mtu").unwrap_or(base.mtu);
     let tti = num("tti", "tti").unwrap_or(base.tti);
-    ferrox_core::kcp::Config {
-        mtu: if mtu > ferrox_core::kcp::DATA_SEGMENT_OVERHEAD {
-            mtu
-        } else {
-            base.mtu
-        },
-        tti: if (1..=1000).contains(&tti) {
-            tti
-        } else {
-            base.tti
-        },
+    let cwnd_multiplier = num("cwndMultiplier", "cwnd_multiplier").unwrap_or(base.cwnd_multiplier);
+    let max_sending_window =
+        num("maxSendingWindow", "max_sending_window").unwrap_or(base.max_sending_window);
+    if mtu < 21
+        || !(10..=1000).contains(&tti)
+        || cwnd_multiplier < 1
+        || max_sending_window / mtu == 0
+    {
+        return None;
+    }
+    Some(ferrox_core::kcp::Config {
+        mtu,
+        tti,
         uplink_capacity: num("uplinkCapacity", "uplink_capacity").unwrap_or(base.uplink_capacity),
         downlink_capacity: num("downlinkCapacity", "downlink_capacity")
             .unwrap_or(base.downlink_capacity),
-        cwnd_multiplier: num("cwndMultiplier", "cwnd_multiplier").unwrap_or(base.cwnd_multiplier),
-        max_sending_window: num("maxSendingWindow", "max_sending_window")
-            .unwrap_or(base.max_sending_window),
+        cwnd_multiplier,
+        max_sending_window,
         mask: base.mask,
         filters: base.filters,
         max_sessions: num("maxSessions", "max_sessions").map_or(base.max_sessions, |n| {
             usize::try_from(n).unwrap_or(usize::MAX).max(1)
         }),
-    }
+    })
 }
 
 pub(crate) fn sub_path(settings: Option<&Json>, key: &str) -> String {
@@ -1955,7 +1956,11 @@ fn resolve_kcp(settings: Option<&Json>, network: &str) -> Carrier {
             network: network.to_owned(),
         };
     };
-    let mut config = kcp_config(settings);
+    let Some(mut config) = kcp_config(settings) else {
+        return Carrier::Unknown {
+            network: network.to_owned(),
+        };
+    };
     config.mask = mask;
     config.filters = filters;
     Carrier::Kcp(config)
