@@ -3694,7 +3694,7 @@ mod tests {
             writable: Condvar::new(),
         });
         super::fail(&shared, &mut engine, "boom");
-        assert!(engine.received.is_empty());
+        assert_eq!(engine.received.as_slice(), b"");
         let mut stream = super::QuicStream { shared };
         let mut out = [0u8; 8];
         assert_eq!(stream.read(&mut out).expect("buffered"), 4);

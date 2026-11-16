@@ -789,8 +789,6 @@ pub(crate) struct LightStream<T> {
 impl<T> LightStream<T> {
     /// Wrap the TLS stream with the header its first write must carry.
     fn new(inner: T, header: Vec<u8>) -> Self {
-        let mut pending = Vec::with_capacity(header.len());
-        pending.extend_from_slice(&header);
         Self {
             inner,
             header_left: header.len(),
@@ -799,7 +797,7 @@ impl<T> LightStream<T> {
             wire: Vec::with_capacity(BUFFER),
             wire_at: 0,
             payload: 0..0,
-            pending,
+            pending: header,
             pending_at: 0,
             shutdown: None,
         }
