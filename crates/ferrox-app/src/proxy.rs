@@ -71482,6 +71482,47 @@ mod tests {
     }
 
     #[test]
+    fn hysteria_v2_carries_a_tcp_echo_over_loopback() {
+        let _serial = quic_serial();
+        let echo_port = echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("v2-auth", id, "");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = HysteriaOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            host: "localhost".to_owned(),
+            config: ferrox_core::hysteria::Config {
+                version: 2,
+                auth: "v2-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                ..ferrox_core::hysteria::Config::default()
+            },
+            roots: Some(roots.into()),
+        };
+        let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_socks_outbound(
+                &stream,
+                &Outbound::Hysteria(Box::new(out)),
+                &server,
+                &Destination::from(target),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(b"v2").expect("writes");
+        let mut back = [0u8; 2];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"v2");
+    }
+
+    #[test]
     fn hysteria_v1_carries_a_tcp_echo_over_loopback() {
         let _serial = quic_serial();
         let echo_port = echo_loop();
