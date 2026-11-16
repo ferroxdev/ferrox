@@ -3678,13 +3678,14 @@ mod tests {
         let mut lane = Connection::from(lane);
         let flow = test_flow(5_000, 1_000);
         let mut buf = [0u8; 16];
+        let cap = buf.len();
         far.write_all(b"abc").unwrap();
         let (n, seq) = read_upstream(
             &flow,
             &flow.read_gate,
             &mut lane,
             &mut buf,
-            buf.len(),
+            cap,
             std::time::Duration::from_millis(10),
             &flow.snd_nxt,
         )
@@ -3697,7 +3698,7 @@ mod tests {
             &flow.read_gate,
             &mut lane,
             &mut buf,
-            buf.len(),
+            cap,
             std::time::Duration::from_millis(10),
             &flow.snd_nxt,
         )
@@ -3716,6 +3717,7 @@ mod tests {
         let flow = test_flow(5_000, 1_000);
         flow.send.acked(1_000, 0, 1_000);
         let mut buf = [0u8; 16];
+        let cap = buf.len();
         far.write_all(b"abc").unwrap();
         assert_eq!(
             read_upstream(
@@ -3723,7 +3725,7 @@ mod tests {
                 &flow.read_gate,
                 &mut lane,
                 &mut buf,
-                buf.len(),
+                cap,
                 std::time::Duration::from_millis(10),
                 &flow.snd_nxt,
             )
