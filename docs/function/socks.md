@@ -50,7 +50,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 758 | scripts/count-ops.sh |
+| ops-retired-instructions | 889 | scripts/count-ops.sh |
 | socks-raw-down-8-client-mib-per-second | 2658 | CI benchmark-matrix.yml run 43292720499 |
 | socks-raw-down-8-server-mib-per-second | 2808 | CI benchmark-matrix.yml run 43292720499 |
 | oracle-lines-matching-the-pinned-go | 8 | ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes |
@@ -154,7 +154,7 @@ Copies: the handshake's bytes are built once — the greeting on the stack, the 
   socks::tests::the_client_writes_the_bytes_the_pinned_go_writes 'ferrox_core::socks::request'
 ```
 
-`758` is the `ops.yml` report of run `43358662526` (commit `47904835`); the same command on main's run `43253246183` reports `929`. The report also holds `datagram` at **701** against **1006** on main; the per-byte `MaybeUninit::write` loop before this slice reported **762**. `Target::encode_into` is inlined into both callers — the artifact reports `inlined-not-a-frame` — so the request and the datagram frames carry its match. macOS/aarch64 ships no `valgrind`, so the gate runs in CI there; the number in `scripts/expected-ops.txt` is what the check compares.
+The oracle script's sixth handshake line, added with the remaining fixtures (#114), carries one more `request` through `encode_into`'s inlined match, so the row reads **889** today against **758** at five lines; `758` is the `ops.yml` report of run `43358662526` (commit `47904835`); the same command on main's run `43253246183` reports `929`. The report also holds `datagram` at **701** against **1006** on main; the per-byte `MaybeUninit::write` loop before this slice reported **762**. `Target::encode_into` is inlined into both callers — the artifact reports `inlined-not-a-frame` — so the request and the datagram frames carry its match. macOS/aarch64 ships no `valgrind`, so the gate runs in CI there; the number in `scripts/expected-ops.txt` is what the check compares.
 
 ## Time
 
