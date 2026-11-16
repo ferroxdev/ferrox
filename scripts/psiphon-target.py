@@ -120,9 +120,7 @@ def entry(state, host, selected_port, protocol):
             return line, protocol
         if not reference_port(server.get("sshPort")):
             continue
-        if protocol == "OSSH" and not reference_port(
-            server.get("sshObfuscatedPort")
-        ):
+        if not reference_port(server.get("sshObfuscatedPort")):
             continue
         obfuscated = port(server.get("sshObfuscatedPort"))
         plain = port(server.get("sshPort"))
@@ -240,6 +238,12 @@ def selftest():
             "capabilities": ["FRONTED-MEEK-QUIC"],
             "meekFrontingDomain": "front.example",
         },
+        {
+            "ipAddress": "192.0.2.18",
+            "sshPort": 22,
+            "sshObfuscatedPort": None,
+            "sshObfuscatedKey": "k",
+        },
     ]
     assert port(443) == 443
     assert port(443.0) == 0
@@ -254,14 +258,14 @@ def selftest():
             for server in servers:
                 line = ("0 0 0 0 " + json.dumps(server)).encode().hex()
                 handle.write(line + "\n")
-        assert entry(state, "192.0.2.1", 22, "SSH") is not None
+        assert entry(state, "192.0.2.1", 22, "SSH") is None
         assert entry(state, "192.0.2.1", 443, "OSSH") is None
-        assert entry(state, "192.0.2.2", 22, "SSH") is not None
+        assert entry(state, "192.0.2.2", 22, "SSH") is None
         assert entry(state, "192.0.2.2", 443, "OSSH") is None
         assert entry(state, "192.0.2.3", 443, "OSSH") is None
         assert entry(state, "192.0.2.4", 443, "OSSH") is not None
         assert entry(state, "192.0.2.5", 443, "OSSH") is None
-        assert entry(state, "192.0.2.6", 22, "SSH") is not None
+        assert entry(state, "192.0.2.6", 22, "SSH") is None
         assert entry(state, "192.0.2.7", 443, "OSSH") is None
         assert entry(state, "192.0.2.8", 443, "FRONTED-MEEK-OSSH") is not None
         assert entry(state, "192.0.2.8", 443, "FRONTED-MEEK-HTTP-OSSH") is None
@@ -278,6 +282,7 @@ def selftest():
         assert entry(state, "192.0.2.14", 443, "FRONTED-MEEK-OSSH") is None
         assert entry(state, "192.0.2.15", 8443, "UNFRONTED-MEEK-HTTPS-OSSH") is None
         assert entry(state, "192.0.2.16", 443, "FRONTED-MEEK-OSSH") is None
+        assert entry(state, "192.0.2.18", 22, "SSH") is not None
 
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
         handle.write(

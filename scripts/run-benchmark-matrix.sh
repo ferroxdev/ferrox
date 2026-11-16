@@ -502,7 +502,9 @@ while read -r id traffic connections iterations payload duration_ms; do
     echo "# $id: skipped, no external WARP reference on this host" >>"$out/commands.sh"
     continue
   fi
-  if matrix_udp_carrier "$id"; then
+  if [[ "$id" == shadowsocks-* || "$id" == shadowsocks2022-* ]]; then
+    srvport="$(matrix_tcp_udp_srvport)"
+  elif matrix_udp_carrier "$id"; then
     srvport="$(matrix_udp_srvport)"
   else
     srvport="$(matrix_srvport)"

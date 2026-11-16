@@ -153,8 +153,7 @@ build() {
       digest="$(release_digest_of "$name" "$asset")"
       [[ -n "$digest" ]] || { note "no pinned digest for $name $asset"; return 1; }
       note "downloading xray-core-rust $release ($asset)"
-      part="$binary.part"
-      rm -f "$part"
+      part="$(mktemp "$binary.part.XXXXXX")" || return 1
       curl -fsSL --retry 3 -o "$part" \
         "https://github.com/Be90nia/xray-core-rust/releases/download/$release/$asset" || {
         rm -f "$part"

@@ -25,6 +25,30 @@ print(s.getsockname()[1])
 s.close()'
 }
 
+# Shadowsocks listens on TCP and UDP under one port; a port free for only one
+# protocol fails the cell at bind time.
+matrix_tcp_udp_srvport() {
+  python3 -c 'import socket
+import sys
+for _ in range(100):
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp.bind(("127.0.0.1", 0))
+    port = tcp.getsockname()[1]
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        udp.bind(("127.0.0.1", port))
+    except OSError:
+        udp.close()
+        tcp.close()
+        continue
+    print(port)
+    tcp.close()
+    udp.close()
+    break
+else:
+    sys.exit(1)'
+}
+
 matrix_udp_carrier() {
   case "$1" in
     masque-h1-*|masque-h2-*|masque-h2c-*) return 1 ;;

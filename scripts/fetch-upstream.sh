@@ -229,8 +229,7 @@ run_all() {
     fetch_one "$name" "$repo" "$rev" "$fallback" &
     running=$((running + 1))
     if [[ "$running" -ge "$cores" ]]; then
-      if [[ "$reclaim" == "wait -n" ]]; then
-        $reclaim 2>/dev/null || wait
+      if [[ "$reclaim" == "wait -n" ]] && $reclaim 2>/dev/null; then
         running=$((running - 1))
       else
         wait

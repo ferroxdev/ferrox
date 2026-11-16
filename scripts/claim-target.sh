@@ -21,10 +21,14 @@ if [[ "$(git rev-parse --git-dir)" == "$(git rev-parse --git-common-dir)" ]]; th
   # the main checkout with a private one every clone has to bypass.
   if [[ -d "$PWD/target" && ! -L "$PWD/target" ]]; then
     echo "claim: adopting the main checkout's target as the seed" >&2
+    ferrox_lock_acquire "$shared" || exit 1
+    trap 'ferrox_lock_release "$shared"' EXIT
     chmod -R u+w "$shared" 2>/dev/null || true
     rm -rf "$shared"
     mv "$PWD/target" "$shared"
     ln -s "$shared" "$PWD/target"
+    ferrox_lock_release "$shared"
+    trap - EXIT
   fi
   # The main checkout keeps the seed; repair its config here so a changed
   # generator does not make `check-worktree-artifacts` red before the first

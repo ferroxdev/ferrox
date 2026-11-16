@@ -54,10 +54,13 @@ tmp="${tmp%/}"
 worktrees="$(git worktree list --porcelain | sed -n 's/^worktree //p')"
 
 is_registered_worktree() {
-  local dir="$1" path
+  local dir="$1" path real_dir real_path
+  real_dir="$(cd "$dir" 2>/dev/null && pwd -P)" || real_dir="$dir"
   while IFS= read -r path; do
     [[ -n "$path" ]] || continue
-    if [[ "$dir" -ef "$path" || "$dir" == "$path"/* ]]; then
+    real_path="$(cd "$path" 2>/dev/null && pwd -P)" || real_path="$path"
+    if [[ "$real_dir" -ef "$real_path" || "$real_dir" == "$real_path"/* ||
+          "$real_path" == "$real_dir"/* ]]; then
       return 0
     fi
   done <<< "$worktrees"
@@ -100,13 +103,33 @@ fi
 
 size_of() { du -sh "$1" 2>/dev/null | cut -f1; }
 reclaim() {
-  local path="$1" size
+  local path="$1" display="${2:-$1}" size
   size="$(size_of "$path")"
-  printf '%s %s\n' "$([[ $apply == 1 ]] && echo remove || echo would-remove)" "$path ($size)"
+  printf '%s %s\n' "$([[ $apply == 1 ]] && echo remove || echo would-remove)" "$display ($size)"
   if [[ $apply == 1 ]]; then
     chmod -R u+w "$path" 2>/dev/null || true
     rm -rf "$path"
   fi
+}
+
+# The age and liveness checks are observations. Reservation makes the removal
+# the only possible writer, and moving the tree first keeps the reserved Cargo
+# lock inode inside what gets deleted.
+reclaim_locked() {
+  local target="$1" victim="$2" stage
+  if [[ $apply != 1 || ! -d "$target" ]]; then
+    reclaim "$victim"
+    return
+  fi
+  if ! ferrox_target_reserve "$target"; then
+    printf 'keep %s (target lock is busy)\n' "$victim"
+    return
+  fi
+  stage="$(dirname "$victim")/.$(basename "$victim").gc.$$"
+  if mv "$victim" "$stage" 2>/dev/null; then
+    reclaim "$stage" "$victim"
+  fi
+  ferrox_target_unreserve
 }
 
 total() { du -sk "$1" 2>/dev/null | cut -f1; }
@@ -119,13 +142,13 @@ fi
 # seed's sessions and an idle worktree's sessions only grow. Age is the witness:
 # a build that is running has just touched its session.
 prune_sessions() {
-  local root="$1" age="$2" session
+  local root="$1" age="$2" target="$3" session
   if [[ ! -d "$root" ]]; then
     return 0
   fi
   while IFS= read -r session; do
     if [[ -n "$session" ]]; then
-      reclaim "$session"
+      reclaim_locked "$target" "$session"
     fi
   done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -mmin "+$age" 2>/dev/null)
 }
@@ -137,7 +160,7 @@ prune_all_sessions() {
   fi
   for dir in "$shared"/*/incremental; do
     if [[ -d "$dir" ]]; then
-      prune_sessions "$dir" "$age"
+      prune_sessions "$dir" "$age" "$shared"
     fi
   done
   while IFS= read -r path; do
@@ -147,7 +170,7 @@ prune_all_sessions() {
     ferrox_target_in_use "$path/target" && continue
     for dir in "$path"/target/*/incremental; do
       if [[ -d "$dir" ]]; then
-        prune_sessions "$dir" "$age"
+        prune_sessions "$dir" "$age" "$path/target"
       fi
     done
   done <<< "$worktrees"
@@ -174,7 +197,7 @@ reset_idle_targets() {
     ferrox_target_in_use "$path/target" && continue
     recent="$(find "$path/target" -type f -mmin "-$age" -print -quit 2>/dev/null)"
     if [[ -z "$recent" ]]; then
-      reclaim "$path/target"
+      reclaim_locked "$path/target" "$path/target"
     fi
   done <<< "$worktrees"
 }
@@ -193,7 +216,7 @@ lean_worktrees() {
       [[ -d "$path/target/$part" ]] || continue
       recent="$(find "$path/target/$part" -type f -mmin "-$age" -print -quit 2>/dev/null)"
       [[ -n "$recent" ]] && continue
-      reclaim "$path/target/$part"
+      reclaim_locked "$path/target" "$path/target/$part"
       if [[ $ensure_free -gt 0 ]] && (( $(free_kib "$top") >= ensure_free * 1048576 )); then
         return 0
       fi
@@ -216,7 +239,7 @@ reclaim_temp_forges() {
     is_registered_worktree "$dir" && continue
     [[ -e "$dir/.git" ]] || continue
     ferrox_target_in_use "$dir/target" && continue
-    reclaim "$dir"
+    reclaim_locked "$dir/target" "$dir"
   done < <(
     if [[ -n "$age" ]]; then
       find "$tmp" -maxdepth 3 -type d -name 'ferrox-*target*' -mmin "+$age" 2>/dev/null

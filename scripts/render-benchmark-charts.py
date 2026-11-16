@@ -47,19 +47,20 @@ except ImportError:
 
 import benchstats
 
-plt.rcParams.update(
-    {
-        "font.family": "DejaVu Sans",
-        "axes.titlesize": 10,
-        "axes.labelsize": 8,
-        "xtick.labelsize": 8,
-        "ytick.labelsize": 9,
-        "axes.edgecolor": "#CCCCCC",
-        "axes.linewidth": 0.8,
-        "figure.facecolor": "white",
-        "axes.facecolor": "white",
-    }
-)
+if plt is not None:
+    plt.rcParams.update(
+        {
+            "font.family": "DejaVu Sans",
+            "axes.titlesize": 10,
+            "axes.labelsize": 8,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 9,
+            "axes.edgecolor": "#CCCCCC",
+            "axes.linewidth": 0.8,
+            "figure.facecolor": "white",
+            "axes.facecolor": "white",
+        }
+    )
 
 PANELS = (
     ("throughput_mib_s", "throughput", "MiB/s", 1.0, "higher"),

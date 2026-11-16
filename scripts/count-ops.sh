@@ -47,7 +47,7 @@ find_bin() {
 # Returns the count, or 2 when the measurement broke, 3 when the test ran and the profile holds no frame, 4 when neither test binary has a test by the filter's name.
 ir_of() {
     local filter="$1" symbol="$2"
-    local bin key data
+    local bin key data done
     # Profiling a binary where the filter matches no test runs zero tests, and then every symbol reads frame-less; the test is confirmed before valgrind is pointed at it.
     bin="$(find_bin "$filter" "$symbol")" || {
         echo "count-ops: no test named $filter in either test binary" >&2
@@ -58,9 +58,10 @@ ir_of() {
     # valgrind once each.
     key="$(printf '%s\n' "$filter" "$bin" | cksum | awk '{print $1}')"
     data="$outdir/callgrind.$key"
-    if [ ! -f "$data.done" ]; then
+    done="$outdir/done.$key"
+    local status=0
+    if [ ! -f "$done" ]; then
         rm -f "$data"*
-        local status=0
         valgrind --tool=callgrind --callgrind-out-file="$data" \
             --compress-strings=no --compress-pos=no \
             "$bin" --exact "$filter" --nocapture >"$outdir/valgrind.out" 2>"$outdir/valgrind.err" || status=$?
@@ -69,7 +70,16 @@ ir_of() {
             tail -n 15 "$outdir/valgrind.err" >&2
             return 2
         fi
-        : >"$data.done"
+        local found=0 profile
+        for profile in "$data"*; do
+            [[ -e "$profile" ]] && found=1
+        done
+        if [ "$found" -eq 0 ]; then
+            echo "count-ops: no callgrind output for $filter (valgrind exit $status)" >&2
+            tail -n 15 "$outdir/valgrind.err" >&2
+            return 2
+        fi
+        : >"$done"
     fi
     # A test that spawns a thread writes a profile of its own, and a relay's work happens on
     # those threads, so every file the run left is read rather than the first one named.

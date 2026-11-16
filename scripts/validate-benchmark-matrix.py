@@ -58,6 +58,15 @@ THROUGHPUT_ENGINES = [
     "xray-rust",
     "leaf",
 ]
+MEDIAN_METRICS = (
+    "throughput_mib_s",
+    "cpu_millis_per_gib",
+    "rss_mib",
+    "threads_peak",
+    "startup_seconds",
+    "kernel_calls_per_gib",
+    "transfer_seconds",
+)
 
 failures = []
 
@@ -168,51 +177,94 @@ def cell_samples(cell, engine, metric):
 
 
 def check_spread(results, cells):
-    """Every reported repeat spread re-derived from its cell runs."""
+    """Every cell's repeat spread is present and re-derived from its runs."""
+    keys = ("n", "min", "median", "max", "mean", "stdev", "cv", "ratio",
+            "gap_ratio", "state")
     for scenario in results.get("scenarios", []):
         cell = cells.get(scenario["id"])
-        for engine, reported in scenario.get("spread", {}).items():
-            samples = cell_samples(cell, engine, "throughput_mib_s")
-            expected = benchstats.spread(samples) if samples else None
-            if expected is None:
+        expected = {}
+        if cell is not None:
+            for entry in cell.get("engines", []):
+                engine = entry.get("name")
+                samples = cell_samples(cell, engine, "throughput_mib_s")
+                stats = benchstats.spread(samples) if samples else None
+                if stats is not None:
+                    expected[engine] = stats
+        reported = scenario.get("spread", {})
+        for engine, stats in expected.items():
+            if engine not in reported:
+                fail(
+                    f"{scenario['id']}/{engine}/spread is missing but its "
+                    "throughput samples re-derive one"
+                )
+                continue
+            for key in keys:
                 check(
-                    reported is None,
+                    reported[engine].get(key) == stats.get(key),
+                    f"{scenario['id']}/{engine}/spread {key} "
+                    f"{reported[engine].get(key)} re-derives to {stats.get(key)}",
+                )
+        for engine, stats in reported.items():
+            if engine not in expected:
+                check(
+                    stats is None,
                     f"{scenario['id']}/{engine}/spread is reported but no "
                     "throughput samples re-derive it",
                 )
-                continue
-            for key in ("n", "median", "min", "max", "state"):
-                check(
-                    reported.get(key) == expected.get(key),
-                    f"{scenario['id']}/{engine}/spread {key} {reported.get(key)} "
-                    f"re-derives to {expected.get(key)}",
-                )
+
+
+def expected_medians(cell):
+    """The medians the renderer would derive from one cell, by engine."""
+    expected = {}
+    if cell is None:
+        return expected
+    for entry in cell.get("engines", []):
+        name = entry.get("name")
+        values = {}
+        for metric in MEDIAN_METRICS:
+            samples = cell_samples(cell, name, metric)
+            if samples:
+                values[metric] = benchstats.median(samples)
+        latency = cell_samples(cell, name, "latency_us")
+        if latency:
+            values["latency_us"] = benchstats.median(latency)
+        if values:
+            expected[name] = values
+    return expected
 
 
 def check_medians(results, cells):
-    """Every plotted median re-derived from its repeats."""
+    """Every plotted median is present and re-derived from its repeats."""
     for scenario in results.get("scenarios", []):
         cell = cells.get(scenario["id"])
-        for engine, values in scenario.get("medians", {}).items():
+        reported = scenario.get("medians", {})
+        expected = expected_medians(cell)
+        for engine, values in expected.items():
             for metric, median in values.items():
-                samples = cell_samples(cell, engine, metric)
-                if not samples:
-                    fail(
-                        f"{scenario['id']}/{engine}/{metric}: median {median} "
-                        "has no samples to re-derive it"
-                    )
-                    continue
                 check(
-                    benchstats.median(samples) == median,
-                    f"{scenario['id']}/{engine}/{metric}: median {median} "
-                    f"re-derives to {benchstats.median(samples)}",
+                    reported.get(engine, {}).get(metric) == median,
+                    f"{scenario['id']}/{engine}/{metric}: median "
+                    f"{reported.get(engine, {}).get(metric)} re-derives to {median}",
                 )
+            extra = set(reported.get(engine, {})) - set(values)
+            check(
+                not extra,
+                f"{scenario['id']}/{engine}: reported medians {sorted(extra)} "
+                "have no cell samples",
+            )
+        for engine in set(reported) - set(expected):
+            fail(
+                f"{scenario['id']}/{engine}: medians are reported but the cell "
+                "has no samples to re-derive them"
+            )
 
 
 def check_manifest(results, cells):
     """Manifest engine digests match every cell header that names them."""
     headers = {}
     for scenario, cell in cells.items():
+        if cell is None:
+            continue
         for engine in cell.get("engines", []):
             if engine.get("binary_sha256"):
                 headers.setdefault(engine.get("name"), set()).add(
@@ -232,9 +284,9 @@ def check_manifest(results, cells):
         if digest is None or label not in headers:
             continue
         check(
-            digest in headers[label],
+            headers[label] == {digest},
             f"manifest engine {label} digest {digest} disagrees with the "
-            f"cell header {sorted(headers[label])}",
+            f"cell headers {sorted(headers[label])}",
         )
 
 
@@ -280,6 +332,17 @@ def check_charts(charts_dir, results):
             check(path.stat().st_size > 0, f"empty chart {path}")
 
 
+def runner_block(section, runner):
+    """The README block for one runner, without the other runners' rows."""
+    marker = f"<!-- runner:{runner} -->"
+    start = section.find(marker)
+    if start == -1:
+        return None
+    start += len(marker)
+    end = section.find("<!-- runner:", start)
+    return section[start:] if end == -1 else section[start:end]
+
+
 def readme_row(section, base, server):
     """The throughput row for one test, parsed into raw pipe-separated cells."""
     prefix = f"| `{base}` | {server} |"
@@ -312,10 +375,10 @@ def check_readme(readme_path, charts_dir, results):
         return
     section = text.split(start)[1].split(end)[0]
     runner = results.get("runner", "?")
-    check(
-        f"<!-- runner:{runner} -->" in section,
-        f"README has no block for runner {runner}",
-    )
+    block = runner_block(section, runner)
+    if block is None:
+        fail(f"README has no block for runner {runner}")
+        return
     seen = set()
     for scenario in results.get("scenarios", []):
         seen.update(scenario.get("medians", {}))
@@ -336,19 +399,24 @@ def check_readme(readme_path, charts_dir, results):
     }
     for base in measured:
         image = f"scenarios/{base}.png"
-        check(image in section, f"README has no per-test chart for {base}")
+        check(image in block, f"README has no per-test chart for {base}")
     for scenario in results.get("scenarios", []):
         if "setup" in scenario.get("id", ""):
             continue
         medians = scenario.get("medians", {})
         base = scenario.get("base", scenario["id"])
         server = scenario.get("server") or "\u2014"
-        row = readme_row(section, base, server)
+        row = readme_row(block, base, server)
         if row is None:
             fail(f"README has no throughput row for {scenario['id']}")
             continue
         values = row[2:2 + len(engines)]
-        for engine, raw in zip(engines, values):
+        check(
+            len(values) == len(engines),
+            f"README row for {scenario['id']} has {len(values)} engine "
+            f"column(s), expected {len(engines)}",
+        )
+        for engine, raw in zip(engines, values, strict=False):
             value = medians.get(engine, {}).get("throughput_mib_s")
             number = readme_number(raw)
             expected = None if value is None else round(value)
@@ -357,8 +425,8 @@ def check_readme(readme_path, charts_dir, results):
                 f"README row for {scenario['id']}/{engine} prints {raw!r} "
                 f"but matrix-results.json re-derives {expected}",
             )
-    check("## Coverage" in section, "README has no coverage table section")
-    check("| scenario | server |" in section, "README has no coverage table header")
+    check("## Coverage" in block, "README has no coverage table section")
+    check("| scenario | server |" in block, "README has no coverage table header")
 
 
 def check_bundle_readme(path, results):
