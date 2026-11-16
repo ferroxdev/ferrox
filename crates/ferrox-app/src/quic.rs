@@ -639,7 +639,12 @@ pub(crate) fn apply_hysteria_quic(
         config.set_initial_max_streams_bidi(streams);
         config.set_initial_max_streams_uni(streams);
     }
-    if params.no_path_mtu
+    apply_path_mtu(config, params.no_path_mtu);
+}
+
+/// The reference disables path-MTU discovery when the block names it or the platform is outside linux, windows and macOS.
+pub(crate) fn apply_path_mtu(config: &mut quiche::Config, disabled: bool) {
+    if disabled
         || !cfg!(any(
             target_os = "linux",
             target_os = "windows",

@@ -627,6 +627,8 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     if let Some(params) = &dial.config.quic {
         crate::quic::apply_hysteria_quic(&mut config, params, false);
         crate::quic::apply_hysteria_pacing(&mut config, params);
+    } else {
+        crate::quic::apply_path_mtu(&mut config, false);
     }
     // A bulk upload starts at 400 packets: quiche's ten leaves the first window smaller than the server's first read, and BBR then paces every ACK.
     config.set_initial_congestion_window_packets(400);
@@ -1390,7 +1392,10 @@ pub(crate) fn server_config(
             config.set_max_recv_udp_payload_size(crate::quic::MAX_DATAGRAM);
         }
         // The served side carries the same ceilings as the dial: without them quiche's autotuner has no room above the initial window, and a peer's upload is paced by `window / rtt` for its whole life.
-        None => crate::quic::tune_transport(&mut config),
+        None => {
+            crate::quic::tune_transport(&mut config);
+            crate::quic::apply_path_mtu(&mut config, false);
+        }
     }
     Some(config)
 }
