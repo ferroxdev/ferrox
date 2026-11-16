@@ -159,6 +159,17 @@ run_selftest() {
   return "$failures"
 }
 
+bounded() {
+  local seconds="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout -k 10s "${seconds}s" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout -k 10s "${seconds}s" "$@"
+  else
+    "$@"
+  fi
+}
+
 if [[ "${1:-}" == "--selftest" ]]; then
   run_selftest
   exit $?
@@ -273,7 +284,8 @@ while IFS= read -r spec; do
   names="$(tr ',' '\n' <<<"$names_csv")"
   suite="go test -count=1 -timeout $family_timeout -v -run '$(run_pattern "$names_csv")' ./$scenarios"
   log="$log_dir/$family.log"
-  if ((SECONDS - started >= total_budget)); then
+  remaining=$((total_budget - (SECONDS - started)))
+  if ((remaining <= 0)); then
     rows+=("| $family | NOT RUN | $(count_rows <<<"$names") | the map budget of ${total_budget}s was spent before this family |")
     while IFS= read -r n; do
       if [[ -n "$n" ]]; then absent=$((absent + 1)); fi
@@ -281,7 +293,7 @@ while IFS= read -r spec; do
     continue
   fi
   status=0
-  (cd "$dir" && FERROX_BINARY="$binary" bash "$workspace/scripts/xray-scenarios.sh" "$suite") >"$log" 2>&1 || status=$?
+  (cd "$dir" && FERROX_BINARY="$binary" bounded "$remaining" bash "$workspace/scripts/xray-scenarios.sh" "$suite") >"$log" 2>&1 || status=$?
   tallies="$(tally_log "$log")"
   f_pass=0 f_fail=0 f_skip=0 f_absent=0
   while IFS= read -r n; do

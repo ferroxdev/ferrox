@@ -315,6 +315,11 @@ while [ "$rep" -le "$REPEAT" ]; do
     rep=$((rep + 1))
 done
 
+if [ ! -s "$RESULTS" ]; then
+    printf 'no measurements: no variant produced a result\n' >&2
+    STATUS=1
+fi
+
 python3 - "$RESULTS" "$OUT_DIR/summary.md" << 'PY'
 import json, statistics, sys
 rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
