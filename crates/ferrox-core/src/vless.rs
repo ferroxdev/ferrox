@@ -184,12 +184,28 @@ impl VlessLink {
     /// A consented cleartext session is byte-for-byte the private one, so every rung below reads it
     /// as `Security::None` and reports the method the private link reports.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn support_opted(&self, opt_in: UnsafeOptIn) -> Support {
+        if self.wants_unsafe_fingerprint() && !opt_in.unsafe_fingerprint() {
+            return Support::UnsafeRequiresOptIn {
+                reason: "unsafe fingerprint requested: re-run with explicit opt-in",
+            };
+        }
         if self.has_encryption() {
             if self.transport_kind() == TransportKind::Tcp
                 && crate::vless_encryption::ClientConfig::parse(self.encryption()).is_ok()
             {
-                let method = match self.security() {
+                let security = match self.security() {
+                    Security::NoneToPublic if opt_in.plaintext_to_public() => Security::None,
+                    Security::NoneToPublic => {
+                        return Support::UnsafeRequiresOptIn {
+                            reason:
+                                "security=none to a public address (`PattNG` extension): explicit opt-in required",
+                        };
+                    }
+                    other => other,
+                };
+                let method = match security {
                     Security::None | Security::NoneToPublic => "vless-tcp-encryption",
                     Security::Tls => "vless-tcp-tls-encryption",
                     Security::Reality => "vless-tcp-reality-encryption",
@@ -331,50 +347,64 @@ impl VlessLink {
         out: &mut [u8],
     ) -> usize {
         let addr = carries_address(command).then(|| Addr::of(target_host));
-        let vision = self.is_vision();
-        let tail = addr.map_or(0, |a| 2 + a.wire_len());
-        // The flow is already decided above; `addons_len` would re-look it up in the params map.
-        let addons = if vision { VISION_ADDONS.len() + 1 } else { 1 };
-        let need = 1 + 16 + addons + 1 + tail;
+        let need = self.request_command_len(command, target_host);
         assert!(out.len() >= need, "vless header buffer too short");
-
-        out[0] = 0;
-        out[1..17].copy_from_slice(&self.uuid_bytes);
-        let mut o = 17;
-        if vision {
-            out[o] = VISION_ADDONS.len() as u8;
-            o += 1;
-            out[o..o + VISION_ADDONS.len()].copy_from_slice(&VISION_ADDONS);
-            o += VISION_ADDONS.len();
-        } else {
-            out[o] = 0;
-            o += 1;
-        }
-        out[o] = command.byte();
-        o += 1;
-        if let Some(addr) = addr {
-            out[o..o + 2].copy_from_slice(&target_port.to_be_bytes());
-            o += 2;
-            o += addr.encode_into(&mut out[o..]);
-        }
-        debug_assert_eq!(o, need);
-        o
+        let mut at = 0;
+        let written = self.write_request(command, addr, target_port, |bytes| {
+            out[at..at + bytes.len()].copy_from_slice(bytes);
+            at += bytes.len();
+        });
+        debug_assert_eq!(written, need);
+        at
     }
 
-    #[allow(
-        clippy::uninit_vec,
-        reason = "the header is written into the room below before the vector is read"
-    )]
     #[must_use]
     pub fn encode_request_header(&self, target_host: &str, target_port: u16) -> Vec<u8> {
         let len = self.request_header_len(target_host);
         let mut out = Vec::with_capacity(len);
-        out.reserve_exact(len);
-        // SAFETY: `encode_into` writes every byte of the header, and the vector is not read before it does.
-        unsafe { out.set_len(len) };
-        let n = self.encode_into(target_host, target_port, &mut out);
-        debug_assert_eq!(n, out.len());
+        let addr = Addr::of(target_host);
+        let written = self.write_request(Command::Tcp, Some(addr), target_port, |bytes| {
+            out.extend_from_slice(bytes);
+        });
+        debug_assert_eq!(written, len);
         out
+    }
+
+    /// Write the request's fields through one sink, so the caller's slice and its own vector share
+    /// the order without either staging the other.
+    fn write_request(
+        &self,
+        command: Command,
+        addr: Option<Addr<'_>>,
+        target_port: u16,
+        mut put: impl FnMut(&[u8]),
+    ) -> usize {
+        let vision = self.is_vision();
+        put(&[0]);
+        put(&self.uuid_bytes);
+        if vision {
+            put(&[VISION_ADDONS.len() as u8]);
+            put(&VISION_ADDONS);
+        } else {
+            put(&[0]);
+        }
+        put(&[command.byte()]);
+        let mut written = 17 + self.addons_len() + 1;
+        if let Some(addr) = addr {
+            put(&target_port.to_be_bytes());
+            let family = match addr {
+                Addr::V4(_) => crate::addr::IPV4,
+                Addr::V6(_) => crate::addr::IPV6,
+                Addr::Name(_) => crate::addr::DOMAIN,
+            };
+            put(&[family]);
+            if let Addr::Name(bytes) = addr {
+                put(&[bytes.len() as u8]);
+            }
+            put(addr.body());
+            written += 2 + addr.wire_len();
+        }
+        written
     }
 
     pub fn decode_response_header(buf: &[u8]) -> Result<usize, VlessError> {
@@ -524,27 +554,47 @@ enum Body {
 fn flow_of(body: &[u8]) -> Flow {
     let mut at = 0;
     while at < body.len() {
-        let tag = body[at];
-        at += 1;
-        let (field, wire) = (tag >> 3, tag & 0x07);
-        let Some(len) = read_varint(body, &mut at) else {
+        let Some(tag) = read_varint(body, &mut at) else {
             return Flow::None;
         };
-        let len = len as usize;
-        match (field, wire) {
-            (1, 2) => {
-                let Some(bytes) = body.get(at..at.saturating_add(len)) else {
+        let (field, wire) = (tag >> 3, tag & 0x07);
+        match wire {
+            0 => {
+                if skip_varint64(body, &mut at).is_none() {
+                    return Flow::None;
+                }
+            }
+            1 => {
+                let Some(next) = at.checked_add(8).filter(|end| *end <= body.len()) else {
                     return Flow::None;
                 };
-                return match std::str::from_utf8(bytes) {
-                    Ok("") | Err(_) => Flow::None,
-                    Ok(flow) if flow == VISION_FLOW => Flow::Vision,
-                    Ok(_) => Flow::Other,
-                };
+                at = next;
             }
-            (0, _) | (1, 0) | (_, 2) => at += len,
-            (_, 5) => at += 4,
-            (_, 1) => at += 8,
+            2 => {
+                let Some(len) = read_varint(body, &mut at) else {
+                    return Flow::None;
+                };
+                let Some(next) = at
+                    .checked_add(len as usize)
+                    .filter(|end| *end <= body.len())
+                else {
+                    return Flow::None;
+                };
+                if field == 1 {
+                    return match std::str::from_utf8(&body[at..next]) {
+                        Ok("") | Err(_) => Flow::None,
+                        Ok(flow) if flow == VISION_FLOW => Flow::Vision,
+                        Ok(_) => Flow::Other,
+                    };
+                }
+                at = next;
+            }
+            5 => {
+                let Some(next) = at.checked_add(4).filter(|end| *end <= body.len()) else {
+                    return Flow::None;
+                };
+                at = next;
+            }
             _ => return Flow::None,
         }
     }
@@ -559,6 +609,20 @@ fn read_varint(body: &[u8], at: &mut usize) -> Option<u32> {
         word |= u32::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Some(word);
+        }
+    }
+    None
+}
+
+fn skip_varint64(body: &[u8], at: &mut usize) -> Option<()> {
+    for index in 0..10 {
+        let byte = *body.get(*at)?;
+        *at += 1;
+        if index == 9 && byte & 0xfe != 0 {
+            return None;
+        }
+        if byte & 0x80 == 0 {
+            return Some(());
         }
     }
     None
@@ -1754,12 +1818,18 @@ mod tests {
     /// The add-ons name a flow; the parse says which without building a string for it.
     #[test]
     fn the_flow_is_named_without_building_a_string() {
-        let cases: [(&[u8], Flow); 5] = [
+        let cases: [(&[u8], Flow); 8] = [
             (&[], Flow::None),
             (&b"\x0a\x00"[..], Flow::None),
             (&b"\x0a\x10xtls-rprx-vision"[..], Flow::Vision),
             (&b"\x0a\x17xtls-rprx-vision-udp443"[..], Flow::Other),
             (&b"\x0a\x04none"[..], Flow::Other),
+            (&b"\x18\x01\x0a\x10xtls-rprx-vision"[..], Flow::Vision),
+            (&b"\x08\x01\x0a\x10xtls-rprx-vision"[..], Flow::Vision),
+            (
+                &b"\x18\x80\x80\x80\x80\x80\x01\x0a\x10xtls-rprx-vision"[..],
+                Flow::Vision,
+            ),
         ];
         for (addons, want) in cases {
             assert_eq!(flow_of(addons), want, "{addons:?}");

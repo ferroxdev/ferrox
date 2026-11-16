@@ -58,6 +58,19 @@ impl Config {
         if private_key_der.is_empty() || public_key_der.is_empty() {
             return Err(invalid_input("xmc: empty key"));
         }
+        let key = PKey::public_key_from_der(&public_key_der)
+            .and_then(|key| key.rsa())
+            .map_err(|error| invalid_data(format!("xmc: public key: {error}")))?;
+        let limit = usize::try_from(key.size())
+            .unwrap_or(usize::MAX)
+            .saturating_sub(11)
+            .saturating_sub(4);
+        if password.len() > limit {
+            return Err(invalid_input(format!(
+                "xmc: password is {} bytes; the RSA key carries at most {limit}",
+                password.len()
+            )));
+        }
         Ok(Self {
             profiles,
             password,
@@ -108,6 +121,7 @@ impl<R: Read, W: Write + Send + 'static> Session<R, W> {
         write_string(&mut data, &profile.username)?;
         write_uuid(&mut data, &profile.uuid)?;
         write_packet(&mut stream, 0x00, &data)?;
+        stream.flush()?;
 
         let packet = read_packet(&mut stream)?;
         if packet.id != 0x01 {
@@ -131,6 +145,7 @@ impl<R: Read, W: Write + Send + 'static> Session<R, W> {
         write_bytes(&mut data, &encrypted_secret)?;
         write_bytes(&mut data, &encrypted_token)?;
         write_packet(&mut stream, 0x01, &data)?;
+        stream.flush()?;
         stream.enable_cipher(&secret);
 
         let packet = read_packet(&mut stream)?;
@@ -149,6 +164,7 @@ impl<R: Read, W: Write + Send + 'static> Session<R, W> {
         }
 
         let first_prefix = write_packet_with_length(&mut stream, 0x03, &[])?;
+        stream.flush()?;
         let schedule = new_client_schedule()?;
         run_stream(&mut stream, true, i64_len(first_prefix), &schedule)?;
         let (reader, writer) = stream.into_cipherstream()?;
@@ -196,6 +212,7 @@ impl<R: Read, W: Write + Send + 'static> Session<R, W> {
         write_bytes(&mut data, &token)?;
         write_boolean(&mut data, true)?;
         write_packet(&mut stream, 0x01, &data)?;
+        stream.flush()?;
 
         let packet = read_packet(&mut stream)?;
         if packet.id != 0x01 {
@@ -232,6 +249,7 @@ impl<R: Read, W: Write + Send + 'static> Session<R, W> {
         write_boolean(&mut data, true)?;
         write_string(&mut data, &profile.textures_signature)?;
         write_packet(&mut stream, 0x02, &data)?;
+        stream.flush()?;
 
         let (packet, first_prefix) = read_packet_with_length(&mut stream)?;
         if packet.id != 0x03 || !packet.data.is_empty() {
@@ -309,6 +327,7 @@ struct Handshake<R, W> {
     read_cipher: Option<Cfb8>,
     write_cipher: Option<Cfb8>,
     buffer: Vec<u8>,
+    pending: usize,
 }
 
 impl<R, W> Handshake<R, W> {
@@ -319,6 +338,7 @@ impl<R, W> Handshake<R, W> {
             read_cipher: None,
             write_cipher: None,
             buffer: Vec::new(),
+            pending: 0,
         }
     }
 
@@ -343,6 +363,7 @@ impl<R, W> Handshake<R, W> {
                 writer: self.writer,
                 cipher: write_cipher,
                 buffer: Vec::new(),
+                pending: 0,
             },
         ))
     }
@@ -360,20 +381,41 @@ impl<R: Read, W> Read for Handshake<R, W> {
 
 impl<R, W: Write> Write for Handshake<R, W> {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-        if let Some(cipher) = &mut self.write_cipher {
-            self.buffer.clear();
-            self.buffer.extend_from_slice(input);
-            cipher.apply(&mut self.buffer);
-            self.writer.write_all(&self.buffer)?;
-        } else {
+        let Some(cipher) = &mut self.write_cipher else {
             self.writer.write_all(input)?;
+            return Ok(input.len());
+        };
+        if input.is_empty() {
+            flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
+            return Ok(0);
         }
+        if self.pending < self.buffer.len() {
+            flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
+        }
+        self.buffer.clear();
+        self.buffer.extend_from_slice(input);
+        cipher.apply(&mut self.buffer);
+        self.pending = 0;
+        let _ = flush_cipher(&mut self.writer, &self.buffer, &mut self.pending);
         Ok(input.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
         self.writer.flush()
     }
+}
+
+fn flush_cipher<W: Write>(writer: &mut W, buffer: &[u8], at: &mut usize) -> io::Result<()> {
+    while *at < buffer.len() {
+        match writer.write(&buffer[*at..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(taken) => *at += taken,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 struct CipherReader<R> {
@@ -393,18 +435,28 @@ struct CipherWriter<W> {
     writer: W,
     cipher: Cfb8,
     buffer: Vec<u8>,
+    pending: usize,
 }
 
 impl<W: Write> Write for CipherWriter<W> {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if input.is_empty() {
+            flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
+            return Ok(0);
+        }
+        if self.pending < self.buffer.len() {
+            flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
+        }
         self.buffer.clear();
         self.buffer.extend_from_slice(input);
         self.cipher.apply(&mut self.buffer);
-        self.writer.write_all(&self.buffer)?;
+        self.pending = 0;
+        let _ = flush_cipher(&mut self.writer, &self.buffer, &mut self.pending);
         Ok(input.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        flush_cipher(&mut self.writer, &self.buffer, &mut self.pending)?;
         self.writer.flush()
     }
 }
@@ -465,7 +517,7 @@ fn status<R: Read, W: Write>(stream: &mut Handshake<R, W>) -> io::Error {
             0x01 => write_packet(stream, 0x01, &packet.data),
             _ => Ok(()),
         };
-        if result.is_err() {
+        if result.is_err() || stream.flush().is_err() {
             break;
         }
     }
@@ -478,7 +530,8 @@ fn write_disconnect<R: Read, W: Write>(
 ) -> io::Result<()> {
     let mut data = Vec::new();
     write_string(&mut data, reason)?;
-    write_packet(stream, 0x00, &data)
+    write_packet(stream, 0x00, &data)?;
+    stream.flush()
 }
 
 fn i64_len(length: usize) -> i64 {

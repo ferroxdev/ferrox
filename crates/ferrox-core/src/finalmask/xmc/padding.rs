@@ -262,6 +262,7 @@ fn write_turn<W: Write>(writer: &mut W, turn: &Turn, prefix_length: usize) -> io
         if let Some(delay) = delays.get(index) {
             let delay = random_delay(*delay)?;
             if !delay.is_zero() {
+                writer.flush()?;
                 std::thread::sleep(delay);
             }
         }
@@ -277,6 +278,7 @@ fn write_turn<W: Write>(writer: &mut W, turn: &Turn, prefix_length: usize) -> io
             "padding chunks total {written}, want {record_length}"
         )));
     }
+    writer.flush()?;
     Ok(())
 }
 

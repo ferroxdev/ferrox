@@ -586,7 +586,7 @@ pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 pub struct Client {
     config: ClientConfig,
     ticket: Mutex<Option<Ticket>>,
-    clock: Clock,
+    clock: Option<Clock>,
 }
 
 impl std::fmt::Debug for Client {
@@ -598,8 +598,14 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
+    /// A client without a clock: tickets are never stored or reused, because no lifetime can be
+    /// read without one.
     pub fn new(config: ClientConfig) -> Arc<Self> {
-        Self::with_clock(config, Arc::new(|| 0))
+        Arc::new(Self {
+            config,
+            ticket: Mutex::new(None),
+            clock: None,
+        })
     }
 
     /// A client whose tickets are timed by the host's clock.
@@ -607,18 +613,19 @@ impl Client {
         Arc::new(Self {
             config,
             ticket: Mutex::new(None),
-            clock,
+            clock: Some(clock),
         })
     }
 
     fn valid_ticket(&self) -> Option<(Vec<u8>, [u8; 16])> {
+        let clock = self.clock.as_ref()?;
         let guard = self
             .ticket
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
             .as_ref()
-            .filter(|ticket| (self.clock)() < ticket.expires)
+            .filter(|ticket| clock() < ticket.expires)
             .map(|ticket| (ticket.pfs_key.clone(), ticket.value))
     }
 
@@ -767,15 +774,17 @@ impl Client {
         peer_aead.open_in_place(None, &mut ticket, &[])?;
         let seconds = decode_length(&ticket);
         if config.zero_rtt && seconds > 0 {
-            let mut guard = self
-                .ticket
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *guard = Some(Ticket {
-                expires: (self.clock)() + i64::try_from(seconds).unwrap_or(i64::MAX),
-                pfs_key: pfs_key.clone(),
-                value: ticket[..16].try_into().unwrap(),
-            });
+            if let Some(clock) = self.clock.as_ref() {
+                let mut guard = self
+                    .ticket
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard = Some(Ticket {
+                    expires: clock().saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX)),
+                    pfs_key: pfs_key.clone(),
+                    value: ticket[..16].try_into().unwrap(),
+                });
+            }
         }
 
         let mut length = [0u8; 18];
@@ -800,6 +809,10 @@ impl Client {
         Ok(stream)
     }
 }
+
+/// The most first flights one ticket may name before it is spent: a bounded set is the difference
+/// between a replay guard and a heap a peer can grow until the ticket's lifetime ends.
+const MAX_TICKET_RESUMPTIONS: usize = 1024;
 
 struct Session {
     pfs_key: Vec<u8>,
@@ -827,7 +840,7 @@ impl Tickets {
 pub struct Server {
     config: ServerConfig,
     tickets: Mutex<Tickets>,
-    clock: Clock,
+    clock: Option<Clock>,
 }
 
 impl std::fmt::Debug for Server {
@@ -839,8 +852,14 @@ impl std::fmt::Debug for Server {
 }
 
 impl Server {
+    /// A server without a clock: it issues no resumable ticket, because no lifetime can be timed
+    /// without one.
     pub fn new(config: ServerConfig) -> Arc<Self> {
-        Self::with_clock(config, Arc::new(|| 0))
+        Arc::new(Self {
+            config,
+            tickets: Mutex::new(Tickets::default()),
+            clock: None,
+        })
     }
 
     /// A server whose ticket lifetime is read from the host's clock.
@@ -848,7 +867,7 @@ impl Server {
         Arc::new(Self {
             config,
             tickets: Mutex::new(Tickets::default()),
-            clock,
+            clock: Some(clock),
         })
     }
 
@@ -963,7 +982,9 @@ impl Server {
 
         let mut ticket = [0u8; 16];
         getrandom::fill(&mut ticket).map_err(|_| io::Error::other("no entropy"))?;
-        let seconds = if config.seconds_to == 0 {
+        let seconds = if self.clock.is_none() {
+            0
+        } else if config.seconds_to == 0 {
             config.seconds_from * i64::from(rand_between(50, 100)) / 100
         } else {
             i64::from(rand_between(
@@ -972,8 +993,8 @@ impl Server {
             ))
         };
         ticket[..2].copy_from_slice(&encode_length(seconds as usize));
-        if seconds > 0 {
-            let now = (self.clock)();
+        if let (Some(clock), true) = (self.clock.as_ref(), seconds > 0) {
+            let now = clock();
             let expires = now.saturating_add(seconds);
             let mut tickets = self
                 .tickets
@@ -1059,21 +1080,33 @@ impl Server {
         let nfs_id: [u8; 32] = nfs_key
             .try_into()
             .map_err(|_| invalid("VLESS encryption first-flight key has the wrong length"))?;
-        let pfs_key = {
-            let now = (self.clock)();
-            let mut tickets = self
-                .tickets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tickets.sweep(now);
-            match tickets.sessions.get_mut(&ticket) {
-                None => None,
-                Some(session) => {
-                    if !session.seen.insert(nfs_id) {
-                        return Err(invalid("VLESS encryption: replayed 0-RTT first flight"));
+        let pfs_key = match self.clock.as_ref() {
+            None => None,
+            Some(clock) => {
+                let now = clock();
+                let mut tickets = self
+                    .tickets
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                tickets.sweep(now);
+                let mut spent = false;
+                let pfs = match tickets.sessions.get_mut(&ticket) {
+                    None => None,
+                    Some(session) if session.seen.len() >= MAX_TICKET_RESUMPTIONS => {
+                        spent = true;
+                        None
                     }
-                    Some(session.pfs_key.clone())
+                    Some(session) => {
+                        if !session.seen.insert(nfs_id) {
+                            return Err(invalid("VLESS encryption: replayed 0-RTT first flight"));
+                        }
+                        Some(session.pfs_key.clone())
+                    }
+                };
+                if spent {
+                    tickets.sessions.remove(&ticket);
                 }
+                pfs
             }
         };
         let Some(pfs_key) = pfs_key else {
@@ -1223,6 +1256,7 @@ struct ReadSide {
     plain_to: usize,
     header: Option<[u8; HEADER_LEN]>,
     direct: bool,
+    eof: bool,
 }
 
 impl ReadSide {
@@ -1240,6 +1274,7 @@ impl ReadSide {
         match read {
             Ok(0) => {
                 self.wire.truncate(base);
+                self.eof = true;
                 Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "failed to fill whole buffer",
@@ -1247,6 +1282,7 @@ impl ReadSide {
             }
             Ok(n) => {
                 self.wire.truncate(base + n);
+                self.eof = false;
                 Ok(())
             }
             Err(error) => {
@@ -1389,7 +1425,19 @@ impl ReadSide {
             self.in_mask.apply(&mut buf[..n], false);
             return Ok(n);
         }
-        self.fill_input(inner)?;
+        match self.fill_input(inner) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == io::ErrorKind::UnexpectedEof
+                    && self.eof
+                    && self.wire.is_empty()
+                    && self.header.is_none()
+                    && matches!(self.read_stage, ReadStage::Records) =>
+            {
+                return Ok(0);
+            }
+            Err(error) => return Err(error),
+        }
         let n = (self.plain_to - self.plain_from).min(buf.len());
         buf[..n].copy_from_slice(&self.wire[self.plain_from..self.plain_from + n]);
         self.plain_from += n;
@@ -1404,6 +1452,7 @@ struct WriteSide {
     out_mask: HeaderMask,
     pre_write: Vec<u8>,
     out: Vec<u8>,
+    out_pos: usize,
     direct: bool,
     #[cfg(test)]
     last_slices: Vec<(*const u8, usize)>,
@@ -1444,16 +1493,34 @@ fn part_slice<'a>(parts: &[&'a [u8]], at: usize, len: usize) -> Option<&'a [u8]>
 }
 
 impl WriteSide {
+    /// Hand the sealed bytes to the sink, resuming at the first octet it refused so a blocked write
+    /// never re-seals a record the cipher already advanced past.
+    fn flush_out<W: Write>(&mut self, inner: &mut W) -> io::Result<()> {
+        while self.out_pos < self.out.len() {
+            match inner.write(&self.out[self.out_pos..]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(taken) => self.out_pos += taken,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     fn write<W: Write>(&mut self, inner: &mut W, buf: &[u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
+        if self.out_pos < self.out.len() {
+            self.flush_out(inner)?;
+        }
         let take = buf.len().min(MAX_BATCH_PLAINTEXT);
         self.out.clear();
+        self.out_pos = 0;
         if self.direct {
             self.out.extend_from_slice(&buf[..take]);
             self.out_mask.apply(&mut self.out, true);
-            inner.write_all(&self.out)?;
+            let _ = self.flush_out(inner);
             return Ok(take);
         }
         self.out.append(&mut self.pre_write);
@@ -1475,7 +1542,7 @@ impl WriteSide {
             at += n;
         }
         self.out_mask.apply(&mut self.out, true);
-        inner.write_all(&self.out)?;
+        let _ = self.flush_out(inner);
         Ok(take)
     }
 
@@ -1490,14 +1557,18 @@ impl WriteSide {
         }
         let total = parts.iter().map(|part| part.len()).sum::<usize>();
         let mut at = 0;
+        if self.out_pos < self.out.len() {
+            self.flush_out(inner)?;
+        }
         while at < total {
             let take = (total - at).min(MAX_BATCH_PLAINTEXT);
             self.out.clear();
+            self.out_pos = 0;
             if self.direct {
                 copy_from_parts(parts, at, take, &mut self.out);
                 debug_assert_eq!(self.out.len(), take);
                 self.out_mask.apply(&mut self.out, true);
-                inner.write_all(&self.out)?;
+                self.flush_out(inner)?;
                 at += take;
                 continue;
             }
@@ -1533,7 +1604,7 @@ impl WriteSide {
                 done += n;
             }
             self.out_mask.apply(&mut self.out, true);
-            inner.write_all(&self.out)?;
+            self.flush_out(inner)?;
             at += take;
         }
         Ok(())
@@ -1580,6 +1651,7 @@ impl<S> EncryptedStream<S> {
                 plain_to: 0,
                 header: None,
                 direct: false,
+                eof: false,
             },
             write: WriteSide {
                 united_key: key,
@@ -1587,6 +1659,7 @@ impl<S> EncryptedStream<S> {
                 out_mask: HeaderMask::new(None, 0),
                 pre_write: Vec::new(),
                 out: Vec::new(),
+                out_pos: 0,
                 direct: false,
                 #[cfg(test)]
                 last_slices: Vec::new(),
@@ -1650,6 +1723,7 @@ impl<S: Write> Write for EncryptedStream<S> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.write.flush_out(&mut self.inner)?;
         self.inner.flush()
     }
 }
@@ -1754,6 +1828,7 @@ impl<W: Write> Write for EncryptedWriter<W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.side.flush_out(&mut self.inner)?;
         self.inner.flush()
     }
 }
@@ -2633,6 +2708,81 @@ mod tests {
             (counts.allocs, counts.bytes, counts.zeroed),
             (0, 0, 0),
             "a record write reuses its staging buffer"
+        );
+    }
+
+    /// A sink that takes part of a sealed record and then blocks must be resumed at that octet,
+    /// not sealed again: the cipher's nonce has already advanced.
+    #[test]
+    fn a_blocked_record_write_resumes_without_resealing() {
+        use std::io::Write as _;
+
+        struct Stalling {
+            bytes: Vec<u8>,
+            calls: usize,
+        }
+
+        impl Write for Stalling {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                match self.calls {
+                    1 => {
+                        let take = buf.len().min(7);
+                        self.bytes.extend_from_slice(&buf[..take]);
+                        Ok(take)
+                    }
+                    2 => Err(io::ErrorKind::WouldBlock.into()),
+                    _ => {
+                        self.bytes.extend_from_slice(buf);
+                        Ok(buf.len())
+                    }
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let key = vec![9u8; 32];
+        let context = b"blocked record write";
+        let plaintext = [0x5au8; 300];
+        let mut expected = Vec::new();
+        EncryptedStream::new(
+            &mut expected,
+            key.clone(),
+            Aead::new(context, &key),
+            None,
+            ReadStage::Records,
+        )
+        .write_all(&plaintext)
+        .unwrap();
+
+        let mut stream = EncryptedStream::new(
+            Stalling {
+                bytes: Vec::new(),
+                calls: 0,
+            },
+            key.clone(),
+            Aead::new(context, &key),
+            None,
+            ReadStage::Records,
+        );
+        let mut at = 0usize;
+        while at < plaintext.len() {
+            match stream.write(&plaintext[at..]) {
+                Ok(0) => panic!("the writer made no progress"),
+                Ok(taken) => at += taken,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("write: {error}"),
+            }
+        }
+        while let Err(error) = stream.flush() {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        }
+        assert_eq!(
+            stream.inner.bytes, expected,
+            "a retried write continues the sealed record instead of sealing it twice"
         );
     }
 

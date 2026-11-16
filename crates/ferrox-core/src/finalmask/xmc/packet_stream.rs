@@ -25,10 +25,18 @@ const KEEPALIVE_POLLS: usize = 150;
 pub struct PacketStream<R, W> {
     reader: Mutex<ReadState<R>>,
     writer: Arc<Mutex<W>>,
-    write_buffer: Mutex<Vec<u8>>,
+    write_buffer: Arc<Mutex<WriteBuffer>>,
     is_client: bool,
     stop: Arc<AtomicBool>,
     keepalive: Option<JoinHandle<()>>,
+    /// A keep-alive answer whose frame drain was refused, kept so the next read retries it.
+    pending_keepalive: Mutex<Option<i64>>,
+}
+
+#[derive(Default)]
+struct WriteBuffer {
+    bytes: Vec<u8>,
+    pos: usize,
 }
 
 struct ReadState<R> {
@@ -159,11 +167,16 @@ where
 {
     pub fn new(reader: R, writer: W, is_client: bool) -> Self {
         let writer = Arc::new(Mutex::new(writer));
+        let write_buffer = Arc::new(Mutex::new(WriteBuffer::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let keepalive = if is_client {
             None
         } else {
-            Some(spawn_keepalive(Arc::clone(&writer), Arc::clone(&stop)))
+            Some(spawn_keepalive(
+                Arc::clone(&writer),
+                Arc::clone(&write_buffer),
+                Arc::clone(&stop),
+            ))
         };
         Self {
             reader: Mutex::new(ReadState {
@@ -176,11 +189,21 @@ where
                 chunk: [0; 8192],
             }),
             writer,
-            write_buffer: Mutex::new(Vec::new()),
+            write_buffer,
             is_client,
             stop,
             keepalive,
+            pending_keepalive: Mutex::new(None),
         }
+    }
+}
+
+impl<R, W> PacketStream<R, W> {
+    /// Stop the keepalive thread without waiting on a writer lock it may never get back: the stop
+    /// flag ends the loop, and the handle is detached so a stalled socket cannot hold the close.
+    fn stop_keepalive(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.keepalive.take();
     }
 }
 
@@ -190,10 +213,7 @@ impl<R, W: Write> PacketStream<R, W> {
     }
 
     pub fn shutdown(&mut self) {
-        self.stop();
-        if let Some(handle) = self.keepalive.take() {
-            let _ = handle.join();
-        }
+        self.stop_keepalive();
     }
 
     fn local_custom_payload_id(&self) -> i32 {
@@ -212,13 +232,58 @@ impl<R, W: Write> PacketStream<R, W> {
         }
     }
 
+    fn flush_pending_keepalive(&self) -> io::Result<()> {
+        let id = *self
+            .pending_keepalive
+            .lock()
+            .map_err(|_| io::Error::other("packet stream keepalive poisoned"))?;
+        let Some(id) = id else {
+            return Ok(());
+        };
+        match self.write_keepalive(id) {
+            Ok(()) => {
+                *self
+                    .pending_keepalive
+                    .lock()
+                    .map_err(|_| io::Error::other("packet stream keepalive poisoned"))? = None;
+                Ok(())
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Err(error)
+            }
+            Err(error) => {
+                *self
+                    .pending_keepalive
+                    .lock()
+                    .map_err(|_| io::Error::other("packet stream keepalive poisoned"))? = None;
+                Err(error)
+            }
+        }
+    }
+
     fn write_keepalive(&self, id: i64) -> io::Result<()> {
         let mut writer = self
             .writer
             .lock()
             .map_err(|_| io::Error::other("packet stream writer poisoned"))?;
+        let mut frame = self
+            .write_buffer
+            .lock()
+            .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
+        flush_frame(&mut *writer, &mut frame)
+            .map_err(|error| io::Error::new(error.kind(), format!("flush frame: {error}")))?;
         write_packet(&mut *writer, KEEPALIVE_PACKET, &id.to_be_bytes())
-            .map_err(|error| io::Error::other(format!("write minecraft keep-alive: {error}")))
+            .map_err(|error| io::Error::other(format!("write minecraft keep-alive: {error}")))?;
+        writer
+            .flush()
+            .map_err(|error| io::Error::other(format!("flush minecraft keep-alive: {error}")))
     }
 
     #[cfg(test)]
@@ -232,6 +297,7 @@ impl<R: Read, W: Write> Read for &PacketStream<R, W> {
         if output.is_empty() {
             return Ok(0);
         }
+        self.flush_pending_keepalive()?;
         let mut reader = self
             .reader
             .lock()
@@ -265,7 +331,12 @@ impl<R: Read, W: Write> Read for &PacketStream<R, W> {
                 Event::Payload(taken) => return Ok(taken),
                 Event::KeepAlive(id) => {
                     if self.is_client {
-                        self.write_keepalive(id)?;
+                        *self
+                            .pending_keepalive
+                            .lock()
+                            .map_err(|_| io::Error::other("packet stream keepalive poisoned"))? =
+                            Some(id);
+                        self.flush_pending_keepalive()?;
                     }
                 }
             }
@@ -282,7 +353,15 @@ impl<R: Read, W: Write> Read for PacketStream<R, W> {
 impl<R, W: Write> Write for &PacketStream<R, W> {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
         if input.is_empty() {
-            return Ok(0);
+            let mut writer = self
+                .writer
+                .lock()
+                .map_err(|_| io::Error::other("packet stream writer poisoned"))?;
+            let mut frame = self
+                .write_buffer
+                .lock()
+                .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
+            return flush_frame(&mut *writer, &mut frame).map(|()| 0);
         }
 
         let mut writer = self
@@ -293,6 +372,14 @@ impl<R, W: Write> Write for &PacketStream<R, W> {
             .write_buffer
             .lock()
             .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
+        if frame.pos < frame.bytes.len() {
+            flush_frame(&mut *writer, &mut frame).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("write minecraft custom payload: {error}"),
+                )
+            })?;
+        }
         let mut written = 0;
         while written < input.len() {
             let end = (written + MAX_PACKET_DATA).min(input.len());
@@ -300,24 +387,45 @@ impl<R, W: Write> Write for &PacketStream<R, W> {
             let body = varint_size(id) + varint_size(8) + CHANNEL.len() + end - written;
             let body = i32::try_from(body)
                 .map_err(|_| io::Error::other("packet length exceeds a varint"))?;
-            frame.clear();
-            write_varint(&mut *frame, body)?;
-            write_varint(&mut *frame, id)?;
-            write_string(&mut *frame, CHANNEL)?;
-            frame.extend_from_slice(&input[written..end]);
-            writer.write_all(&frame).map_err(|error| {
-                io::Error::other(format!("write minecraft custom payload: {error}"))
-            })?;
+            frame.bytes.clear();
+            frame.pos = 0;
+            write_varint(&mut frame.bytes, body)?;
+            write_varint(&mut frame.bytes, id)?;
+            write_string(&mut frame.bytes, CHANNEL)?;
+            frame.bytes.extend_from_slice(&input[written..end]);
+            let before = frame.pos;
+            if let Err(error) = flush_frame(&mut *writer, &mut frame) {
+                if frame.pos == before
+                    && !matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    )
+                {
+                    frame.bytes.clear();
+                    frame.pos = 0;
+                    if written > 0 {
+                        return Ok(written);
+                    }
+                    return Err(error);
+                }
+                return Ok(end);
+            }
             written = end;
         }
         Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.writer
+        let mut writer = self
+            .writer
             .lock()
-            .map_err(|_| io::Error::other("packet stream writer poisoned"))?
-            .flush()
+            .map_err(|_| io::Error::other("packet stream writer poisoned"))?;
+        let mut frame = self
+            .write_buffer
+            .lock()
+            .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
+        flush_frame(&mut *writer, &mut frame)?;
+        writer.flush()
     }
 }
 
@@ -333,10 +441,7 @@ impl<R, W: Write> Write for PacketStream<R, W> {
 
 impl<R, W> Drop for PacketStream<R, W> {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.keepalive.take() {
-            let _ = handle.join();
-        }
+        self.stop_keepalive();
     }
 }
 
@@ -393,8 +498,21 @@ fn read_channel<'a>(data: &mut &'a [u8]) -> io::Result<&'a str> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "read string: invalid utf-8"))
 }
 
+fn flush_frame<W: Write>(writer: &mut W, frame: &mut WriteBuffer) -> io::Result<()> {
+    while frame.pos < frame.bytes.len() {
+        match writer.write(&frame.bytes[frame.pos..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(taken) => frame.pos += taken,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn spawn_keepalive<W: Write + Send + 'static>(
     writer: Arc<Mutex<W>>,
+    frame: Arc<Mutex<WriteBuffer>>,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -409,8 +527,25 @@ fn spawn_keepalive<W: Write + Send + 'static>(
             let Ok(mut writer) = writer.lock() else {
                 return;
             };
+            let Ok(mut frame) = frame.lock() else {
+                return;
+            };
+            if let Err(error) = flush_frame(&mut *writer, &mut frame) {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) {
+                    continue;
+                }
+                return;
+            }
             let value = id.fetch_add(1, Ordering::Relaxed) + 1;
             if write_packet(&mut *writer, KEEPALIVE_PACKET, &value.to_be_bytes()).is_err() {
+                return;
+            }
+            if writer.flush().is_err() {
                 return;
             }
         }
@@ -527,6 +662,81 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_frame_resumes_after_the_bytes_the_sink_took() {
+        #[derive(Clone)]
+        struct Stalling {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            calls: Arc<Mutex<usize>>,
+        }
+
+        impl Write for Stalling {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let mut calls = self.calls.lock().expect("calls");
+                *calls += 1;
+                let call = *calls;
+                drop(calls);
+                match call {
+                    1 => {
+                        let take = buf.len().min(7);
+                        self.bytes
+                            .lock()
+                            .expect("bytes")
+                            .extend_from_slice(&buf[..take]);
+                        Ok(take)
+                    }
+                    2 => Err(io::ErrorKind::WouldBlock.into()),
+                    _ => {
+                        self.bytes.lock().expect("bytes").extend_from_slice(buf);
+                        Ok(buf.len())
+                    }
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Stalling {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+            calls: Arc::new(Mutex::new(0)),
+        };
+        let observed = Arc::clone(&sink.bytes);
+        let stream = PacketStream::new(std::io::Cursor::new(Vec::<u8>::new()), sink, true);
+        let payload = vec![0x44u8; MAX_PACKET_DATA + 9];
+        let mut write = &stream;
+        let mut at = 0usize;
+        while at < payload.len() {
+            match write.write(&payload[at..]) {
+                Ok(0) => panic!("the writer made no progress"),
+                Ok(taken) => at += taken,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("write: {error}"),
+            }
+        }
+
+        let bytes = observed.lock().expect("bytes");
+        let mut data = bytes.as_slice();
+        let mut recovered = Vec::new();
+        while !data.is_empty() {
+            let (length, _) = read_varint_with_length(&mut data).expect("length");
+            let body = &data[..length as usize];
+            data = &data[length as usize..];
+            let mut body_reader = body;
+            let _ = read_varint_with_length(&mut body_reader).expect("id");
+            let packet = Packet {
+                id: body[0] as i32,
+                data: body[1..].to_vec(),
+            };
+            let chunk = parse_custom_payload(&packet)
+                .expect("payload")
+                .expect("channel");
+            recovered.extend_from_slice(chunk);
+        }
+        assert_eq!(recovered, payload, "no frame is replayed or lost");
+    }
+
+    #[test]
     fn the_frame_buffer_holds_its_capacity() {
         let stream = PacketStream::new(
             std::io::Cursor::new(Vec::<u8>::new()),
@@ -536,11 +746,11 @@ mod tests {
         let mut write = &stream;
         let input = vec![0x33u8; MAX_PACKET_DATA];
         write.write_all(&input).expect("writes");
-        let capacity = stream.write_buffer.lock().expect("buffer").capacity();
+        let capacity = stream.write_buffer.lock().expect("buffer").bytes.capacity();
         for _ in 0..4 {
             write.write_all(&input).expect("writes");
             assert_eq!(
-                stream.write_buffer.lock().expect("buffer").capacity(),
+                stream.write_buffer.lock().expect("buffer").bytes.capacity(),
                 capacity,
                 "the frame buffer does not grow again"
             );

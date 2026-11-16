@@ -32,8 +32,12 @@ fn round_trip(server: &Arc<Server>, client: &Arc<Client>) {
 #[test]
 fn random_zero_rtt_resumes_with_a_masked_reply() {
     let (encryption, decryption) = generate_pair(false, "random", "0rtt", "600s");
-    let server = Server::new(ServerConfig::parse(&decryption).unwrap());
-    let client = Client::new(ClientConfig::parse(&encryption).unwrap());
+    let clock: Clock = Arc::new(|| 0);
+    let server = Server::with_clock(
+        ServerConfig::parse(&decryption).unwrap(),
+        Arc::clone(&clock),
+    );
+    let client = Client::with_clock(ClientConfig::parse(&encryption).unwrap(), clock);
     round_trip(&server, &client);
     round_trip(&server, &client);
 }

@@ -7014,6 +7014,21 @@ fn sealed_window(buffer: Option<usize>) -> usize {
         })
 }
 
+/// Drain a writer's retained output, retrying the transient kinds a nonblocking sink reports.
+fn flush_transient<W: Write>(writer: &mut W) -> std::io::Result<()> {
+    loop {
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// A relay over two independently sealed halves, so a parked read never stops the other direction.
 fn relay_split<R, W>(
     mut sealed_read: R,
@@ -7049,7 +7064,9 @@ fn relay_split<R, W>(
             match plain_read.read(buf.as_mut()) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if sealed_write.write_all(buf.filled(n)).is_err() {
+                    if sealed_write.write_all(buf.filled(n)).is_err()
+                        || flush_transient(&mut sealed_write).is_err()
+                    {
                         break;
                     }
                 }
@@ -30686,8 +30703,7 @@ impl TcpCopy {
             Err(error) if is_timeout(&error) => {
                 if flow.ended() && flow.ended_and_idle(self.reply_idle) {
                     self.refuse();
-                    self.end();
-                    return Some(Next::Done);
+                    return Some(self.end());
                 }
                 return Some(Next::Idle);
             }
@@ -30712,10 +30728,7 @@ impl TcpCopy {
         }
         while self.off < self.filled {
             match self.dst.write(&self.bytes[self.off..self.filled]) {
-                Ok(0) => {
-                    self.end();
-                    return Next::Done;
-                }
+                Ok(0) => return self.end(),
                 Ok(n) => {
                     self.off += n;
                     self.stalled = None;
@@ -30732,18 +30745,14 @@ impl TcpCopy {
                     }
                     return Next::Idle;
                 }
-                Err(_) => {
-                    self.end();
-                    return Next::Done;
-                }
+                Err(_) => return self.end(),
             }
         }
         self.off = 0;
         self.filled = 0;
         self.stalled = None;
         if self.eof {
-            self.end();
-            return Next::Done;
+            return self.end();
         }
         if let Some(next) = self.strip_answer(flow) {
             return next;
@@ -30751,8 +30760,7 @@ impl TcpCopy {
         match self.src.read(&mut self.bytes) {
             Ok(0) => {
                 self.eof = true;
-                self.end();
-                Next::Done
+                self.end()
             }
             Ok(n) => {
                 self.filled = n;
@@ -30763,32 +30771,36 @@ impl TcpCopy {
                 note_wait_idle(self.reply_idle);
                 note_wait_finish(flow);
                 if flow.ended() && flow.ended_and_idle(self.reply_idle) {
-                    self.end();
-                    Next::Done
+                    self.end()
                 } else {
                     Next::Idle
                 }
             }
-            Err(_) => {
-                self.end();
-                Next::Done
-            }
+            Err(_) => self.end(),
         }
     }
 
-    fn end(&mut self) {
+    fn end(&mut self) -> Next {
         if self.ended {
-            return;
+            return Next::Done;
+        }
+        self.stalled = None;
+        match self.dst.flush() {
+            Err(error) if is_timeout(&error) || error.kind() == std::io::ErrorKind::Interrupted => {
+                return Next::Retry;
+            }
+            _ => {}
         }
         self.ended = true;
-        self.stalled = None;
         let _ = self.dst.shutdown(Shutdown::Write);
+        Next::Done
     }
 
     fn abandon(&mut self) {
         self.ended = true;
         self.stalled = None;
         let _ = self.src.shutdown(Shutdown::Both);
+        let _ = self.dst.flush();
         let _ = self.dst.shutdown(Shutdown::Both);
     }
 }
@@ -30867,6 +30879,12 @@ fn relay_vectored_direct(
 /// Copy one direction with eight pooled windows: the kernel fills them in order and drains them in
 /// order, so a partial send resumes at the first byte it did not take.
 #[cfg(windows)]
+fn finish_vectored(dst: &mut Connection) {
+    let _ = dst.flush();
+    let _ = dst.shutdown(Shutdown::Write);
+}
+
+#[cfg(windows)]
 fn vectored_copy(mut src: Connection, mut dst: Connection, flow: &RelayFinish) {
     const SMALL_WINDOWS: usize = 8;
     const LARGE_WINDOWS: usize = 16;
@@ -30892,20 +30910,20 @@ fn vectored_copy(mut src: Connection, mut dst: Connection, flow: &RelayFinish) {
             .collect();
         let n = match src.read_vectored(&mut slices) {
             Ok(0) => {
-                let _ = dst.shutdown(Shutdown::Write);
+                finish_vectored(&mut dst);
                 break;
             }
             Ok(n) => n,
             // An idle read waits while the sibling lives, and the response grace decides once it ends.
             Err(error) if is_timeout(&error) => {
                 if flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
-                    let _ = dst.shutdown(Shutdown::Write);
+                    finish_vectored(&mut dst);
                     break;
                 }
                 continue;
             }
             Err(_) => {
-                let _ = dst.shutdown(Shutdown::Write);
+                finish_vectored(&mut dst);
                 break;
             }
         };
@@ -30931,12 +30949,12 @@ fn vectored_copy(mut src: Connection, mut dst: Connection, flow: &RelayFinish) {
             }
             match dst.write_vectored(&slices) {
                 Ok(0) => {
-                    let _ = dst.shutdown(Shutdown::Write);
+                    finish_vectored(&mut dst);
                     break 'copy;
                 }
                 Ok(written) => off += written,
                 Err(_) => {
-                    let _ = dst.shutdown(Shutdown::Write);
+                    finish_vectored(&mut dst);
                     break 'copy;
                 }
             }

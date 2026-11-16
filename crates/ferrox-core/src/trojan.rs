@@ -121,7 +121,12 @@ impl TrojanLink {
 
     #[must_use]
     pub fn security(&self) -> Security {
-        Security::from_link(self.param("security"), &self.host)
+        let security = self.param("security");
+        // A trojan link without `security` is TLS, the reference's default for this scheme.
+        if security.is_empty() {
+            return Security::Tls;
+        }
+        Security::from_link(security, &self.host)
     }
 
     #[must_use]
@@ -475,12 +480,17 @@ mod tests {
     fn the_support_verdict_reads_the_state_cell() {
         for (text, method) in [
             ("trojan://pw@example.com:443?security=tls", "trojan-tcp-tls"),
-            ("trojan://pw@127.0.0.1:443", "trojan-tcp"),
+            ("trojan://pw@127.0.0.1:443", "trojan-tcp-tls"),
+            ("trojan://pw@127.0.0.1:443?security=none", "trojan-tcp"),
             (
                 "trojan://pw@example.com:443?security=tls&type=ws",
                 "trojan-ws-tls",
             ),
-            ("trojan://pw@127.0.0.1:443?type=ws", "trojan-ws"),
+            ("trojan://pw@127.0.0.1:443?type=ws", "trojan-ws-tls"),
+            (
+                "trojan://pw@127.0.0.1:443?security=none&type=ws",
+                "trojan-ws",
+            ),
             (
                 "trojan://pw@example.com:443?security=tls&type=httpupgrade",
                 "trojan-httpupgrade-tls",
@@ -489,18 +499,30 @@ mod tests {
                 "trojan://pw@example.com:443?security=tls&type=grpc",
                 "trojan-grpc-tls",
             ),
-            ("trojan://pw@127.0.0.1:443?type=xhttp", "trojan-xhttp"),
+            ("trojan://pw@127.0.0.1:443?type=xhttp", "trojan-xhttp-tls"),
+            (
+                "trojan://pw@127.0.0.1:443?security=none&type=xhttp",
+                "trojan-xhttp",
+            ),
             (
                 "trojan://pw@example.com:443?security=tls&type=kcp",
                 "trojan-kcp-tls",
             ),
-            ("trojan://pw@127.0.0.1:443?type=kcp", "trojan-kcp"),
+            ("trojan://pw@127.0.0.1:443?type=kcp", "trojan-kcp-tls"),
+            (
+                "trojan://pw@127.0.0.1:443?security=none&type=kcp",
+                "trojan-kcp",
+            ),
             (
                 "trojan://pw@example.com:443?security=tls&headerType=http",
                 "trojan-httpheader-tls",
             ),
             (
                 "trojan://pw@127.0.0.1:443?headerType=http",
+                "trojan-httpheader-tls",
+            ),
+            (
+                "trojan://pw@127.0.0.1:443?security=none&headerType=http",
                 "trojan-httpheader",
             ),
             (
@@ -528,12 +550,6 @@ mod tests {
                 },
             ),
             (
-                "trojan://pw@198.51.100.3:443",
-                Support::UnsafeRequiresOptIn {
-                    reason: "security=none to a public address: explicit opt-in required",
-                },
-            ),
-            (
                 "trojan://pw@example.com:443?security=tls&fp=unsafe-chrome",
                 Support::UnsafeRequiresOptIn {
                     reason: "unsafe fingerprint requested: re-run with explicit opt-in",
@@ -550,7 +566,8 @@ mod tests {
 
     #[test]
     fn each_consent_clears_only_its_own_veto() {
-        let plain = TrojanLink::parse("trojan://pw@198.51.100.3:443").expect("parses");
+        let plain =
+            TrojanLink::parse("trojan://pw@198.51.100.3:443?security=none").expect("parses");
         let fp = TrojanLink::parse("trojan://pw@example.com:443?security=tls&fp=unsafe-chrome")
             .expect("parses");
         assert_eq!(
