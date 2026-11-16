@@ -2601,7 +2601,7 @@ impl RouteShared {
 
     /// The probe target a health check reaches by tag, with the same source, options and target
     /// strategy the route gives a flow; the chain tag resolves to its exit lane.
-    pub(crate) fn probe_target(&self, tag: &str) -> Option<ProbeTarget> {
+    pub(crate) fn probe_target(self: &Arc<Self>, tag: &str) -> Option<ProbeTarget> {
         let out = if self.default_tag.as_deref() == Some(tag) {
             self.default.clone()
         } else {
@@ -2612,7 +2612,13 @@ impl RouteShared {
 
     /// A target for a configured tag no rule selected: the route never built it, but its dial
     /// settings are still in the table, so a probe reads the same hop a flow would.
-    pub(crate) fn probe_target_with(&self, tag: &str, out: Outbound) -> ProbeTarget {
+    pub(crate) fn probe_target_with(self: &Arc<Self>, tag: &str, out: Outbound) -> ProbeTarget {
+        if let Outbound::Loopback(loopback) = &out {
+            loopback.bind(self);
+        }
+        if let Outbound::Masque(masque) = &out {
+            masque.install_route(self);
+        }
         let (source, sockopts, strategy) = if self.default_tag.as_deref() == Some(tag) {
             (
                 self.default_source,
@@ -75868,6 +75874,38 @@ mod tests {
                 .and_then(|options| options.dialer_proxy()),
             Some("hop")
         );
+    }
+
+    /// A probe target built outside the route still binds a carrier that reads its own spec.
+    #[test]
+    fn a_probe_target_binds_carrier_owned_options() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"default","protocol":"freedom"},
+                {"tag":"edge","protocol":"masque","settings":{"address":"127.0.0.1","port":443},
+                 "streamSettings":{"network":"masque","security":"tls",
+                 "tlsSettings":{"serverName":"edge.example","allowInsecure":true},
+                 "sockopt":{"dialerProxy":"default"}}}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        assert!(!shared.tagged.contains_key("edge"));
+        let config = root
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")
+            .iter()
+            .find(|outbound| outbound.get("tag").and_then(Json::as_str) == Some("edge"))
+            .expect("the tag");
+        let out = build_outbound(config, "edge").expect("builds");
+        let target = shared.probe_target_with("edge", out);
+        let Outbound::Masque(masque) = &target.out else {
+            panic!("the target is the masque carrier");
+        };
+        assert!(masque.route_bound());
     }
 
     /// The socket options an outbound's `streamSettings.sockopt` names are the ones the socket its
