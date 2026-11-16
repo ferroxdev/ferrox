@@ -13423,7 +13423,7 @@ mod tests {
                 assert!(
                     group
                         .iter()
-                        .any(|meek| set.snis.iter().any(|sni| meek.sni.as_str() == *sni)),
+                        .any(|meek| set.snis.contains(&meek.sni.as_str())),
                     "server {index} lost the {} built-in set",
                     set.name
                 );
@@ -13471,7 +13471,7 @@ mod tests {
                 servers
                     .iter()
                     .filter_map(|server| server.meek.as_ref())
-                    .any(|meek| set.snis.iter().any(|sni| meek.sni.as_str() == *sni)),
+                    .any(|meek| set.snis.contains(&meek.sni.as_str())),
                 "the only regional group lost the {} built-in set",
                 set.name
             );
