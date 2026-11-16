@@ -44431,6 +44431,11 @@ mod tests {
     /// lane: the setup workers that took the first eight still reach the ninth handshake.
     #[test]
     fn a_plaintext_h2_preface_releases_its_setup_worker() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_plaintext_h2_preface_releases_its_setup_worker",
+        ) {
+            return;
+        }
         let id = [0x2Bu8; 16];
         let users: Arc<[VlessUser]> = Arc::from(one_vless_user(&id));
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -66969,6 +66974,9 @@ mod tests {
 
     #[test]
     fn socks_dials_vless_quic_to_echo() {
+        if !crate::conn::in_a_quiet_process("proxy::tests::socks_dials_vless_quic_to_echo") {
+            return;
+        }
         let _serial = quic_serial();
         socks_quic_once();
     }
