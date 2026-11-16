@@ -38977,11 +38977,8 @@ fn freedom_noise_kind(
         .and_then(Json::as_str)
         .or(rand_spec.map(|_| "rand"))
         .unwrap_or("rand");
-    let text = item
-        .get("packet")
-        .and_then(Json::as_str)
-        .unwrap_or("")
-        .trim();
+    let raw = item.get("packet").and_then(Json::as_str).unwrap_or("");
+    let text = raw.trim();
     let (kind, length_min, length_max, shown) = match kind_name {
         "rand" => {
             let spec = rand_spec.unwrap_or(text);
@@ -39011,7 +39008,7 @@ fn freedom_noise_kind(
             (NoiseKind::Quic, min as u64, max as u64, spec.to_owned())
         }
         "str" => (
-            NoiseKind::Fixed(text.as_bytes().to_vec()),
+            NoiseKind::Fixed(raw.as_bytes().to_vec()),
             0,
             0,
             String::new(),
@@ -39040,11 +39037,18 @@ fn parse_freedom_noise(item: &Json) -> Result<FreedomNoise, String> {
         None | Some(Json::Null) => (0, 0),
         Some(value) => freedom_u64_range(value, "noise delay")?.unwrap_or((0, 0)),
     };
-    let count = match item.get("count").and_then(Json::as_i64) {
-        None => 1,
-        Some(count) => u32::try_from(count).map_err(|_| {
-            "freedom: noise count is not a number between 0 and 4294967295".to_owned()
-        })?,
+    let count = match item.get("count") {
+        None | Some(Json::Null) => 1,
+        Some(value) => match value.as_i64() {
+            Some(count) => u32::try_from(count).map_err(|_| {
+                "freedom: noise count is not a number between 0 and 4294967295".to_owned()
+            })?,
+            None => {
+                return Err(
+                    "freedom: noise count is not a number between 0 and 4294967295".to_owned(),
+                );
+            }
+        },
     };
     let apply_to = match item
         .get("applyTo")
@@ -61946,6 +61950,33 @@ mod tests {
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let ss = ss2022_mux_out(port, Carrier::Raw(Chain::default()), &password);
         ss_mux_stream("ss2022", ss, echo);
+    }
+
+    /// A `str` packet is the datagram's own bytes, so its spaces are content, and a `count` that
+    /// is present but not an integer is refused rather than silently sending one copy.
+    #[test]
+    fn a_str_noise_keeps_its_spaces_and_its_count_is_strict() {
+        use ferrox_core::evasion::NoiseKind;
+        let out = freedom_out(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"noises":[{"type":"str","packet":"  hi  "}]}}]}"#,
+        );
+        let Outbound::Freedom(freedom) = out else {
+            panic!("a freedom outbound");
+        };
+        assert_eq!(
+            freedom.noises[0].noise.kind,
+            NoiseKind::Fixed(b"  hi  ".to_vec())
+        );
+        for count in ["1.5", "\"2\"", "-1", "4294967296"] {
+            let root = crate::json::parse(&format!(
+                r#"{{"outbounds":[{{"protocol":"freedom","settings":{{"noises":[{{"type":"str","packet":"x","count":{count}}}]}}}}]}}"#
+            ))
+            .expect("parses");
+            assert!(
+                find_outbound(&root).is_err(),
+                "a count of {count} is refused"
+            );
+        }
     }
 
     /// The datagram path selects the 2022 mux before the direct session, and one session carries the target.

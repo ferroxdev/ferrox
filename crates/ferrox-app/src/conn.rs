@@ -385,8 +385,7 @@ impl Masked {
                 Ok(written) => {
                     at += written;
                     if let Some(sni) = state {
-                        sni.written
-                            .store(at as u8, std::sync::atomic::Ordering::Release);
+                        sni.written.store(at as u8, std::sync::atomic::Ordering::Release);
                     }
                 }
                 Err(error) => return Err(error),
