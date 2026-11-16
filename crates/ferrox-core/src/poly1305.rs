@@ -32,7 +32,7 @@ fn reduce_split(mut low: u128, mut over: u64) -> (u128, u64) {
     // Two fixed masked folds cover the callers, each folding only where the reference loop does.
     for _ in 0..2 {
         let (lifted, carry) = low.overflowing_add(5);
-        let fold = (over >= 4) | ((over == 3) & carry);
+        let fold = (u8::from(over >= 4) | (u8::from(over == 3) & u8::from(carry))) != 0;
         let select = u128::from(fold).wrapping_neg();
         let lifted_over = over.wrapping_add(u64::from(carry)).wrapping_sub(4);
         let over_select = u64::from(fold).wrapping_neg();
