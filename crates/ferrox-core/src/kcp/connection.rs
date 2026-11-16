@@ -380,8 +380,7 @@ impl Connection {
         let necessary = necessary || self.receiving.lock().unwrap().update_necessary();
         let last_flush = *self.last_flush.lock().unwrap();
         let last_uncond = *self.last_uncond.lock().unwrap();
-        let due =
-            draining || written || now.saturating_duration_since(last_flush) >= tick;
+        let due = draining || written || now.saturating_duration_since(last_flush) >= tick;
         if due
             && (draining
                 || necessary
