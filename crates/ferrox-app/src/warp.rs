@@ -4607,10 +4607,10 @@ mod tests {
 
     #[test]
     fn wireguard_rides_inside_masque() {
+        use ferrox_core::wireguard::device::public_key;
         if !crate::conn::in_a_quiet_process("warp::tests::wireguard_rides_inside_masque") {
             return;
         }
-        use ferrox_core::wireguard::device::public_key;
 
         let client_private = [0x11; 32];
         let allowed = public_key(&client_private);
