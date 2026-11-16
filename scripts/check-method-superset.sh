@@ -69,7 +69,14 @@ def load_rows():
             continue
         cells = [c.strip().replace("\\|", "|")
                  for c in re.split(r"(?<!\\)\|", line)[1:-1]]
-        if len(cells) != 5 or cells[0] in ("row", "") or set(cells[0]) == {"-"}:
+        if not cells:
+            fails.append(f"docs/method-superset.md:{number}: empty row")
+            continue
+        if cells[0] in ("row", "") or set(cells[0]) == {"-"}:
+            continue
+        if len(cells) != 5:
+            fails.append(f"docs/method-superset.md:{number}: expected 5 cells, "
+                         f"got {len(cells)}")
             continue
         rows[cells[0]] = {
             "layer": cells[1],
@@ -90,9 +97,8 @@ def check_rows():
         if row["layer"] not in LAYERS:
             fails.append(f"{name}: layer {row['layer']!r} is not one of "
                          f"{', '.join(sorted(LAYERS))}")
-        if row["state"] in {"planned", "refused", "not-scheduled"} \
-                and not row["note"]:
-            fails.append(f"{name}: a {row['state']} row must say why")
+        if not row["note"]:
+            fails.append(f"{name}: a row must carry a note")
         if not row["references"]:
             fails.append(f"{name}: no reference path, so the row proves nothing")
             continue
@@ -100,20 +106,21 @@ def check_rows():
             path = path.strip()
             if not path or path.startswith("#"):
                 continue
+            if os.environ.get("CHECK_SUPERSET_UPSTREAM") == "0" and path.startswith("upstream/"):
+                continue
             if not os.path.exists(os.path.join(root, path)):
                 fails.append(f"{name}: reference `{path}` does not exist")
 
 
 def check_in_flight():
-    table = " ".join(
-        f"{name} {row['layer']} {row['state']} {row['references']} {row['note']}"
-        for name, row in rows.items()
-    )
+    noted = set(rows)
+    for row in rows.values():
+        noted.update(re.findall(r"`([^`]+)`", row["note"]))
     with open(vless, encoding="utf-8") as f:
         head = f.read().split("#[cfg(test)]", 1)[0]
     for method in sorted(set(re.findall(r'"vless-[a-z0-9-]+"', head))):
         method = method.strip('"')
-        if method not in table:
+        if method not in noted:
             fails.append(f"`{method}` is an implemented method string in "
                          "vless.rs and no matrix row names it")
     for page in sorted(os.listdir(pages)):
@@ -227,14 +234,14 @@ printf '[sources.xray-core]\n[sources.sing-box]\n[sources.xray-rust]\n[sources.z
 printf 'let support = Support::Implemented { method: "vless-probe" };\n#[cfg(test)]\n' \
     > "$selftest/crates/ferrox-core/src/vless.rs"
 printf '# page\n' > "$selftest/docs/function/probe-page.md"
-refs="upstream/xray-core/proxy/probe, upstream/xray-core/transport/internet/probe, upstream/sing-box/protocol/probe, upstream/sing-box/transport/probe, upstream/xray-rust/crates/probe, upstream/zeronet/crates/probe, upstream/zeronet/bench/hotpath, upstream/xray-rust/fuzz, upstream/zeronet/fuzz"
+refs="upstream/xray-core/proxy/probe, upstream/xray-core/transport/internet/probe, upstream/sing-box/protocol/probe, upstream/sing-box/transport/probe, upstream/xray-rust/crates/probe, upstream/zeronet/crates/probe, upstream/zeronet/bench/hotpath, upstream/xray-rust/fuzz, upstream/zeronet/fuzz, crates/ferrox-core/src/vless.rs"
 matrix="$selftest/docs/method-superset.md"
 printf '<!-- matrix:begin -->\n| row | layer | state | references | note |\n| --- | --- | --- | --- | --- |\n| probe-page | surface | implemented | %s | carries `vless-probe` |\n<!-- matrix:end -->\n' \
     "$refs" > "$matrix"
 
 expect() {
   local want="$1" label="$2" out
-  out="$(FERROX_ROOT="$selftest" "$0" 2>&1)" && {
+  out="$(FERROX_ROOT="$selftest" CHECK_SUPERSET_UPSTREAM=1 "$0" 2>&1)" && {
     echo "::error::self-test: the $label mutation still passes, so the gate cannot fail"
     exit 1
   }
@@ -246,9 +253,18 @@ expect() {
 
 sed -i.bak 's#upstream/zeronet/fuzz##' "$matrix"
 expect 'upstream/zeronet/fuzz` is a method directory' "uncited catalogue"
+sed -i.bak 's#crates/ferrox-core/src/vless.rs#crates/ferrox-core/src/missing.rs#' "$matrix"
+out="$(FERROX_ROOT="$selftest" CHECK_SUPERSET_UPSTREAM=0 "$0" 2>&1)" && {
+  echo "::error::self-test: a missing local reference still passes with upstream checks off"
+  exit 1
+}
+if ! grep -q 'crates/ferrox-core/src/missing.rs` does not exist' <<<"$out"; then
+  echo "::error::self-test: the local-reference mutation failed for the wrong reason: $out"
+  exit 1
+fi
 sed -i.bak 's/| implemented |/| maybe |/' "$matrix"
 expect "state 'maybe' is not one of" "unknown state"
 sed -i.bak 's/| probe-page |/| probe |/' "$matrix"
 expect "no matrix row is named for it" "renamed row"
-printf '%s\n' 'check-method-superset: self-test passed (three mutations refused)'
+printf '%s\n' 'check-method-superset: self-test passed (four mutations refused)'
 

@@ -294,11 +294,11 @@ while IFS= read -r spec; do
     esac
   done <<<"$names"
   f_total=$((f_pass + f_fail + f_skip + f_absent))
-  # The launcher touches its marker on the way to Ferrox; no marker means the family never
-  # spawned our binary. A family that answers no test while the command still exits 0 is
-  # the same nothing: `-run` matched no name, so its row would read as a verdict.
-  if ((f_absent == f_total)) && { ((status == 0)) || grep -q 'never ran what its own build produced' "$log"; }; then
-    echo "::error::$self: family $family answered no test at all, so it proves nothing"
+  # A family that answers no test proves nothing, whatever its exit status: a missing
+  # launcher, a failed build or `-run` matching no name all leave a row that reads as a
+  # verdict. Families that answer any test keep their rows below.
+  if ((f_absent == f_total)); then
+    echo "::error::$self: family $family answered no test at all (exit $status), so it proves nothing"
     exit 1
   fi
   verdict="$(family_verdict "$log" "$f_pass" "$f_fail" "$f_absent" "$f_total")"

@@ -142,7 +142,7 @@ if ((selftest)); then
 fi
 
 main() {
-mkdir -p "$out" "$engine_dir" "$out/cells"
+mkdir -p "$out" "$engine_dir"
 [[ -f "$pins_file" ]] || fail "$pins_file is missing; refusing to guess a comparator"
 
 if ((gaps)); then
@@ -354,6 +354,8 @@ if ((build_only)); then
   echo "build-only: engines built, no cell configs written"
   exit 0
 fi
+rm -rf "$out/cells"
+mkdir -p "$out/cells"
 {
   echo "# Replay: tier $tier on $(date -u +%FT%TZ)"
   echo "# engines: ${engines[*]}"
@@ -431,7 +433,7 @@ matrix_start_server() {
     dash-c) args=(-c "$config") ;;
   esac
   "$bin" "${args[@]}" >>"$logdir/server.log" 2>&1 &
-  echo "$!"
+  server_pid=$!
 }
 
 matrix_wait_tcp() {
@@ -650,7 +652,7 @@ while read -r id traffic connections iterations payload duration_ms; do
       continue
     fi
     server_bin="$(engine_path "$server")"
-    server_pid="$(matrix_start_server "$server" "$server_bin" "$server_config" "$celldir")"
+    matrix_start_server "$server" "$server_bin" "$server_config" "$celldir"
     if ! matrix_wait_tcp 127.0.0.1 "$readyport" || ! kill -0 "$server_pid" 2>/dev/null; then
       cells_failed+=("$cell (server $server never listened on $readyport)")
       status=1
@@ -719,6 +721,10 @@ done < <(scenarios "$tier")
   for f in "${cells_failed[@]+"${cells_failed[@]}"}"; do echo "failed: $f"; done
   for s in "${skipped[@]+"${skipped[@]}"}"; do echo "skipped engine: $s"; done
 } | tee "$out/summary.txt" >&2
+if ((cells_run == 0)); then
+  echo "::error::no cells ran; the filters matched nothing, so this is not a passing run" >&2
+  status=1
+fi
 return "$status"
 }
 

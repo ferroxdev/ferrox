@@ -118,6 +118,12 @@ for name in zeronet xray-rust; do
   ran="$(sed -n 's/^running \([0-9][0-9]*\) tests\{0,1\}$/\1/p' "$log" | head -1)"; ran="${ran:-0}"
   passed="$(grep -c '^test .* \.\.\. ok$' "$log" || true)"; passed="${passed:-0}"
   failed="$(grep -c '^test .* \.\.\. FAILED$' "$log" || true)"; failed="${failed:-0}"
+  completed="$(grep -c '^test result:' "$log" || true)"; completed="${completed:-0}"
+  if ((test_rc != 0)) && ((completed == 0)); then
+    echo "::error::$name suite never reached a test result (exit $test_rc); a build or startup failure is not a recorded baseline"
+    tail -n 40 "$log" >&2 || true
+    exit 1
+  fi
   {
     echo "## $name @ \`${rev:0:7}\` (go exit $test_rc; libtest running $ran; $passed passed, $failed failed)"
     echo

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Translate the matrix's Xray-dialect client config into Aether's environment: a MASQUE, WARP or nested MASQUE dial to its masque identity, or a WireGuard dial to its wg one."""
 
+import base64
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import time
 
@@ -71,26 +73,65 @@ def base64_key(value):
 
 
 def identity(path, fields):
-    """Write a TOML identity file and return its path."""
+    """Write a TOML identity file, owner-only because it carries private keys."""
     lines = []
     for key, value in fields:
         lines.append(f"{key} = {value}")
-    path.write_text("\n".join(lines) + "\n")
+    path = pathlib.Path(path)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write("\n".join(lines) + "\n")
+    path.chmod(0o600)
     return path
 
 
-def masque_identity(cfg_path, stream, name="aether-identity.toml", v4="10.13.0.2", v6="fd13::2"):
-    """Build the MASQUE identity TOML from the client TLS settings."""
-    tls = stream.get("tlsSettings") or {}
-    certificates = tls.get("certificates") or []
-    certificate = certificates[0].get("certificateFile") if certificates else None
-    if not certificate:
-        certificate = tls.get("caCertFile")
-    if not certificate:
-        fail("the MASQUE client config names no certificate")
-    cert_path = pathlib.Path(certificate)
-    key_file = certificates[0].get("keyFile") if certificates else None
-    key_path = pathlib.Path(key_file) if key_file else cert_path.with_name("key.pem")
+def masque_identity(cfg_path, stream, name="aether-identity.toml", v4="10.13.0.2", v6="fd13::2", inline=None):
+    """Build the MASQUE identity TOML from the client TLS settings or an inline identity."""
+    if inline is not None:
+        private = ((inline or {}).get("masque") or {}).get("privateKey")
+        if not private:
+            fail("the inner MASQUE identity has no private key")
+        stem = pathlib.Path(name).stem
+        cert_path = cfg_path.with_name(f"{stem}-cert.pem")
+        key_path = cfg_path.with_name(f"{stem}-key.pem")
+        der_path = cfg_path.with_name(f"{stem}-key.der")
+        try:
+            payload = base64.b64decode(private)
+        except ValueError as error:
+            fail(f"the inner MASQUE private key is not base64: {error}")
+        descriptor = os.open(der_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+        der_path.chmod(0o600)
+        try:
+            key_descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(key_descriptor, 0o600)
+            os.close(key_descriptor)
+            subprocess.run(
+                ["openssl", "pkey", "-inform", "DER", "-in", str(der_path), "-out", str(key_path)],
+                check=True, stdin=subprocess.DEVNULL, capture_output=True,
+            )
+            key_path.chmod(0o600)
+            subprocess.run(
+                ["openssl", "req", "-new", "-x509", "-key", str(key_path), "-days", "7",
+                 "-subj", "/CN=aether-inner", "-out", str(cert_path)],
+                check=True, stdin=subprocess.DEVNULL, capture_output=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            fail(f"cannot derive the inner MASQUE certificate: {error}")
+    else:
+        tls = stream.get("tlsSettings") or {}
+        certificates = tls.get("certificates") or []
+        certificate = certificates[0].get("certificateFile") if certificates else None
+        if not certificate:
+            certificate = tls.get("caCertFile")
+        if not certificate:
+            fail("the MASQUE client config names no certificate")
+        cert_path = pathlib.Path(certificate)
+        key_file = certificates[0].get("keyFile") if certificates else None
+        key_path = pathlib.Path(key_file) if key_file else cert_path.with_name("key.pem")
     if not cert_path.exists() or not key_path.exists():
         fail(f"the MASQUE client identity is missing at {cert_path}")
     identity_path = cfg_path.with_name(name)
@@ -141,7 +182,7 @@ def inline_wireguard(identity):
     return {
         "secretKey": block.get("privateKey"),
         "address": block.get("address"),
-        "peers": [{"publicKey": block.get("publicKey")}],
+        "peers": [{"publicKey": block.get("publicKey"), "endpoint": block.get("endpoint")}],
     }
 
 
@@ -249,7 +290,8 @@ def main():
         inner_v4, inner_v6 = inline_masque_addresses(inner_identity)
         outer_config = masque_identity(cfg_path, stream)
         masque_identity(
-            cfg_path, stream, "aether-identity-secondary.toml", inner_v4, inner_v6
+            cfg_path, stream, "aether-identity-secondary.toml", inner_v4, inner_v6,
+            inline=inner_identity,
         )
         command = [
             str(real), "--protocol", "mim", "--mim-outer", outer_peer,

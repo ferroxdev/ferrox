@@ -5,7 +5,14 @@
 # no host route is touched. CI only: local numbers measure a VPN, not the code.
 set -eu
 
-if [ "${TUN_BENCH_INNER:-}" != "1" ]; then
+# The marker is not proof of isolation: a caller can export it. Compare the network
+# namespace with the init process's and re-exec when they are the same.
+same_netns() {
+    [ -r /proc/self/ns/net ] && [ -r /proc/1/ns/net ] \
+        && [ "$(readlink /proc/self/ns/net)" = "$(readlink /proc/1/ns/net)" ]
+}
+
+if [ "${TUN_BENCH_INNER:-}" != "1" ] || same_netns; then
     export TUN_BENCH_INNER=1
     exec unshare --user --map-root-user --net --fork -- sh "$0" "$@"
 fi
@@ -27,6 +34,7 @@ TUN2SOCKS=${TUN2SOCKS:-}
 
 DURATION=${DURATION:-5}
 REPEAT=${REPEAT:-2}
+STATUS=0
 QUEUES=${QUEUES:-4}
 MTU=${MTU:-1500}
 SETTLE=${SETTLE:-3}
@@ -350,14 +358,15 @@ run_scenario() {
     monitor_engine "$tag"
     value=""
     unit=""
+    ok=1
     case "$scenario" in
         tcp-up-*|tcp-down-*)
             streams=${scenario##*-}
             reverse=""
             case "$scenario" in tcp-down-*) reverse="--reverse" ;; esac
             timeout "$CLIENT_TIMEOUT" "$BENCH" tcp-client --connect "$SERVER_ADDR:5201" --seconds "$DURATION" \
-                --streams "$streams" $reverse --json "$OUT_DIR/$tag.json" > /dev/null 2>&1 || true
-            value=$(python3 -c "import json,sys; print('%.3f' % json.load(open(sys.argv[1]))['gbps'])" "$OUT_DIR/$tag.json" 2> /dev/null || echo 0)
+                --streams "$streams" $reverse --json "$OUT_DIR/$tag.json" > /dev/null 2>&1 || ok=0
+            value=$(python3 -c "import json,sys; print('%.3f' % json.load(open(sys.argv[1]))['gbps'])" "$OUT_DIR/$tag.json" 2> /dev/null) || ok=0
             unit=Gbit/s
             ;;
         rr|rr-8x1k)
@@ -365,8 +374,8 @@ run_scenario() {
             size=64
             [ "$scenario" = rr-8x1k ] && { conns=8; size=1024; }
             timeout "$CLIENT_TIMEOUT" "$BENCH" rr-client --connect "$SERVER_ADDR:5203" --seconds "$DURATION" \
-                --conns "$conns" --size "$size" --json "$OUT_DIR/$tag.json" > /dev/null 2>&1 || true
-            value=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('%.0f tps p50=%.0fus p99=%.0fus' % (d['tps'], d['p50_us'], d['p99_us']))" "$OUT_DIR/$tag.json" 2> /dev/null || echo 0)
+                --conns "$conns" --size "$size" --json "$OUT_DIR/$tag.json" > /dev/null 2>&1 || ok=0
+            value=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('%.0f tps p50=%.0fus p99=%.0fus' % (d['tps'], d['p50_us'], d['p99_us']))" "$OUT_DIR/$tag.json" 2> /dev/null) || ok=0
             unit=""
             ;;
         udp|udp-*)
@@ -379,8 +388,8 @@ run_scenario() {
             esac
             case "$pps" in *k) pps=$((${pps%k} * 1000)) ;; esac
             timeout "$CLIENT_TIMEOUT" "$BENCH" udp-client --connect "$SERVER_ADDR:5202" --seconds "$DURATION" \
-                --size "$size" --pps "$pps" --echo $gso --json "$OUT_DIR/$tag.json" > /dev/null 2>&1 || true
-            value=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('%.0f echo pps (%.1f%% of %.0f sent)' % (d['received']/d['seconds'], 100.0*d['received']/max(d['sent'],1), d['sent']/d['seconds']))" "$OUT_DIR/$tag.json" 2> /dev/null || echo 0)
+                --size "$size" --pps "$pps" --echo $gso --json "$OUT_DIR/$tag.json" > /dev/null 2>&1 || ok=0
+            value=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('%.0f echo pps (%.1f%% of %.0f sent)' % (d['received']/d['seconds'], 100.0*d['received']/max(d['sent'],1), d['sent']/d['seconds']))" "$OUT_DIR/$tag.json" 2> /dev/null) || ok=0
             unit=""
             ;;
         *) note "unknown scenario $scenario"; return 0 ;;
@@ -388,6 +397,10 @@ run_scenario() {
     for mp in $MON_PIDS; do wait "$mp" 2> /dev/null || true; done
     # A profiled round is not a measurement: it is left out of the medians so the sampler's own cost cannot move them.
     [ "${PROFILE_PASS:-0}" = 1 ] && return 0
+    if [ "$ok" -ne 1 ]; then
+        note "$engine $scenario rep $rep: the client failed or wrote no result; not recording a zero"
+        return 1
+    fi
     set -- $(summarize_monitor "$tag")
     cpu_pct=$1
     peak_rss=$2
@@ -458,16 +471,18 @@ while [ "$rep" -le "$REPEAT" ]; do
         printf 'round %s engine %s\n' "$rep" "$engine"
         if ! start_engine "$engine"; then
             printf '  failed to start %s\n' "$engine"
+            STATUS=1
             stop_engine
             continue
         fi
         if ! probe_engine "$engine"; then
             printf '  %s did not pass the TCP probe\n' "$engine"
+            STATUS=1
             stop_engine
             continue
         fi
         for scenario in $SCENARIOS; do
-            run_scenario "$engine" "$scenario" "$rep" "$slot"
+            run_scenario "$engine" "$scenario" "$rep" "$slot" || STATUS=1
         done
         if [ "${PROFILE:-0}" = 1 ] && [ "$engine" = ferrox-native ] && [ "$rep" = 1 ]; then
             profile_engine "$slot"
@@ -504,3 +519,4 @@ for (engine, scenario), group in groups.items():
 open(sys.argv[2], "w").write("\n".join(lines) + "\n")
 print("\n".join(lines))
 PY
+exit "$STATUS"

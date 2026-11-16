@@ -60,8 +60,12 @@ build() {
   rev="$(pin_of "$name")"
   binary="$engine_dir/$name$(exe_suffix)"
   if cached="$(built "$binary")"; then
-    echo "$cached"
-    return 0
+    if [[ "$(cat "$binary.rev" 2>/dev/null)" == "$rev" ]]; then
+      echo "$cached"
+      return 0
+    fi
+    note "$name at $binary was not built from $rev; rebuilding"
+    rm -f "$binary" "$binary.rev"
   fi
   if ! (verify_checkout "$name" 2>/dev/null); then
     note "re-fetching $name at its pin; the handoff did not carry it"
@@ -108,6 +112,8 @@ build() {
       fail "unknown engine source `$name`"
       ;;
   esac
+  built "$binary" >/dev/null || return 1
+  printf '%s\n' "$rev" >"$binary.rev"
   built "$binary"
 }
 
@@ -164,9 +170,11 @@ for entry in $engine_list; do
 
   engines+=("$label=$path")
   engine_args+=(--engine "$label=$path")
-  shape="$(config_arg_for "$source")"
+  mapping="$source"
+  [[ "$source" == /* ]] && mapping="$label"
+  shape="$(config_arg_for "$mapping")"
   [[ "$shape" == "long" ]] || { engine_args+=(--config-arg "$label=$shape"); config_shapes+=("$shape"); }
-  engine_args+=(--dialect "$label=$(dialect_for "$source")")
+  engine_args+=(--dialect "$label=$(dialect_for "$mapping")")
 done
 
 ferrox_path="$(built target/release/ferrox-app)" || fail \

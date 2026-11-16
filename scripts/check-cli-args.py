@@ -8,6 +8,7 @@ non-zero inside the watchdog and name the thing it is missing.
 
 from __future__ import annotations
 
+import atexit
 import os
 import pathlib
 import shutil
@@ -56,6 +57,7 @@ CASES = [
 
 def main() -> int:
     state = pathlib.Path(tempfile.mkdtemp(prefix="ferrox-cli-args-"))
+    atexit.register(shutil.rmtree, state, True)
     env = dict(os.environ)
     env["FERROX_CONF_DIR"] = str(state)
     env["FERROX_BIN"] = shutil.which("true") or "/bin/true"

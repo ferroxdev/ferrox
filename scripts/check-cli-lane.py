@@ -31,6 +31,7 @@ import os
 import pathlib
 import pty
 import re
+import select
 import shutil
 import signal
 import socket
@@ -508,16 +509,29 @@ def under_a_terminal(answer: bytes, env: dict[str, str]) -> str:
     os.close(slave)
     os.write(master, answer)
     spoken = bytearray()
-    while True:
-        try:
-            chunk = os.read(master, 4096)
-        except OSError:
-            break
-        if not chunk:
-            break
-        spoken.extend(chunk)
-    run.wait(timeout=WATCH)
-    os.close(master)
+    deadline = time.monotonic() + WATCH
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("the terminal lane did not answer")
+            ready, _, _ = select.select([master], [], [], remaining)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            spoken.extend(chunk)
+        run.wait(timeout=max(deadline - time.monotonic(), 0.0))
+    except (OSError, subprocess.TimeoutExpired):
+        run.kill()
+        run.wait()
+        raise
+    finally:
+        os.close(master)
     return spoken.decode(errors="replace")
 
 
@@ -2713,8 +2727,14 @@ def check_instance_ports(state: pathlib.Path) -> int:
 
 
 def check_instance_lifecycle(state: pathlib.Path) -> int:
-    unnamed = subprocess.Popen(["sleep", "60"])
-    named = subprocess.Popen(["sleep", "60"])
+    lane = state / "fake-lane"
+    lane.write_text(
+        "#!/bin/sh\nsleep 60 &\nchild=$!\ntrap 'kill \"$child\" 2>/dev/null' TERM INT\nwait \"$child\"\n",
+        encoding="utf-8",
+    )
+    lane.chmod(0o755)
+    unnamed = subprocess.Popen([str(lane), str(state / "lane.json")])
+    named = subprocess.Popen([str(lane), str(state / "lane-two.json")])
     port = free_port()
     (state / "lane.pid").write_text(f"{unnamed.pid}\n", encoding="utf-8")
     (state / "lane.json").write_text(
@@ -2732,6 +2752,8 @@ def check_instance_lifecycle(state: pathlib.Path) -> int:
         ),
         encoding="utf-8",
     )
+    env = env_for(state)
+    env["FERROX_BIN"] = str(lane)
     try:
         status = subprocess.run(
             [str(CLI), "status", "--instance", "two"],
@@ -2739,7 +2761,7 @@ def check_instance_lifecycle(state: pathlib.Path) -> int:
             capture_output=True,
             text=True,
             timeout=WATCH,
-            env=env_for(state),
+            env=env,
         )
         output = status.stdout + status.stderr
         if f"lane 'two' pid {named.pid}" not in output or str(port) not in output:
@@ -2754,10 +2776,16 @@ def check_instance_lifecycle(state: pathlib.Path) -> int:
             capture_output=True,
             text=True,
             timeout=WATCH,
-            env=env_for(state),
+            env=env,
         )
         output += down.stdout + down.stderr
         named.wait(timeout=WATCH)
+        if unnamed.poll() is not None:
+            print(
+                f"check-cli-lane: down --instance took the unnamed lane too:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
         if (state / "lane-two.json").exists() or (state / "lane-two.pid").exists():
             print(
                 f"check-cli-lane: down --instance left its lane behind:\n{output}",
@@ -3314,10 +3342,38 @@ def main() -> int:
     workers = min(8, max(4, os.cpu_count() or 4))
     failed = []
     running = {}
+    states = []
+    children = set()
+    children_lock = threading.Condition()
+    in_flight = 0
+    shutting_down = False
+    real_popen = subprocess.Popen
+
+    def tracked_popen(*args, **kwargs):
+        nonlocal in_flight
+        with children_lock:
+            if shutting_down:
+                raise RuntimeError("check-cli-lane is shutting down")
+            in_flight += 1
+        try:
+            proc = real_popen(*args, **kwargs)
+        except BaseException:
+            with children_lock:
+                in_flight -= 1
+                children_lock.notify_all()
+            raise
+        with children_lock:
+            children.add(proc)
+            in_flight -= 1
+            children_lock.notify_all()
+        return proc
+
+    subprocess.Popen = tracked_popen
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     try:
         for name, check in CHECKS:
             state = pathlib.Path(tempfile.mkdtemp(prefix=f"ferrox-cli-{check.__name__}-"))
+            states.append(state)
             running[pool.submit(check, state)] = name
         deadline = time.monotonic() + SUITE
         while running:
@@ -3342,12 +3398,48 @@ def main() -> int:
     finally:
         unfinished = list(running.values())
         pool.shutdown(wait=False, cancel_futures=True)
+        with children_lock:
+            shutting_down = True
+            while in_flight:
+                children_lock.wait(timeout=0.1)
+            snapshot = list(children)
+        for proc in snapshot:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+        stop_by = time.monotonic() + 2
+        for proc in snapshot:
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=max(0.0, stop_by - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                    try:
+                        proc.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+        for state in states:
+            shutil.rmtree(state, ignore_errors=True)
     if unfinished:
         failed.extend(unfinished)
         print(
             f"check-cli-lane: unfinished after {SUITE} s: {', '.join(unfinished)}",
             file=sys.stderr,
         )
+        sys.stderr.flush()
+        # The pool's non-daemon threads join at interpreter exit; leave now so a wedged check cannot hang the job.
+        os._exit(1)
+    subprocess.Popen = real_popen
     if failed:
         print(f"check-cli-lane: failed: {', '.join(failed)}", file=sys.stderr)
         return 1

@@ -119,6 +119,15 @@ if selftest:
 graph = json.load(sys.stdin)
 expressions = sorted({p["license"] for p in graph["packages"] if p.get("license")})
 failed = False
+for package in graph["packages"]:
+    if package.get("license"):
+        continue
+    name = package.get("name", "?")
+    if package.get("license_file"):
+        print(f"::error::{name} names only a license_file, so its licence cannot be validated")
+    else:
+        print(f"::error::{name} has no license or license_file")
+    failed = True
 for expression in expressions:
     try:
         passed = allowed(expression)

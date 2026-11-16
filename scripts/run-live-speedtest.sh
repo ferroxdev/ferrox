@@ -143,8 +143,8 @@ main() {
       fi
       for ((r = 1; r <= repeats; r++)); do
         attempt "$index" "$label" "$core" "$r" "$cfg" "$port" "$link" || true
-        port=$((port + 1))
       done
+      port=$((port + 1))
     done
   done
   local measured ok
@@ -223,7 +223,7 @@ attempt() {
   local file="$out/dl/cfg${index}-${core}-r${repeat}.bin"
   local curl_json="$adir/curl.json"
   local curl_code=0
-  curl -sS --socks5-hostname "127.0.0.1:$port" \
+  curl -sS --noproxy "" --socks5-hostname "127.0.0.1:$port" \
     --max-time "$curl_max_time" --speed-time "$stall_time" --speed-limit "$stall_bytes" \
     --retry 0 --fail \
     -o "$file" \
@@ -246,16 +246,16 @@ attempt() {
   total="$(python3 -c 'import json,sys; print(float(json.load(open(sys.argv[1]))["total"]))' "$curl_json")"
   starttransfer="$(python3 -c 'import json,sys; print(float(json.load(open(sys.argv[1]))["starttransfer"]))' "$curl_json")"
   local window
-  window="$(python3 -c 'print(max(float(sys.argv[1]) - float(sys.argv[2]), 0.001))' "$total" "$starttransfer")"
+  window="$(python3 -c 'import sys; print(max(float(sys.argv[1]) - float(sys.argv[2]), 0.001))' "$total" "$starttransfer")"
   local mib_per_s
-  mib_per_s="$(python3 -c 'print(float(sys.argv[1]) / 1048576.0 / float(sys.argv[2]))' "$size" "$window")"
+  mib_per_s="$(python3 -c 'import sys; print(float(sys.argv[1]) / 1048576.0 / float(sys.argv[2]))' "$size" "$window")"
   local cpu_ms gib
   cpu_ms="$(((cpu_end - cpu_start) * 10))"
-  gib="$(python3 -c 'print(float(sys.argv[1]) / 1073741824.0)' "$size")"
+  gib="$(python3 -c 'import sys; print(float(sys.argv[1]) / 1073741824.0)' "$size")"
   local cpu_per_gib
-  cpu_per_gib="$(python3 -c 'print(float(sys.argv[1]) / float(sys.argv[2])) if float(sys.argv[2]) > 0 else print(0.0)' "$cpu_ms" "$gib")"
+  cpu_per_gib="$(python3 -c 'import sys; print(float(sys.argv[1]) / float(sys.argv[2])) if float(sys.argv[2]) > 0 else print(0.0)' "$cpu_ms" "$gib")"
   local rss_mib
-  rss_mib="$(python3 -c 'print(float(sys.argv[1]) / 1024.0)' "$rss_kib")"
+  rss_mib="$(python3 -c 'import sys; print(float(sys.argv[1]) / 1024.0)' "$rss_kib")"
   local hash="unverified"
   local want_hash="" want_algo=""
   if [[ -n "$target_sha256" ]]; then

@@ -17,6 +17,7 @@ TUN_RS_DIR=${TUN_RS_DIR:-}
 DURATION=${DURATION:-5}
 CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-$((DURATION + 20))}
 REPEAT=${REPEAT:-2}
+STATUS=0
 QUEUES=${QUEUES:-4}
 VARIANTS=${VARIANTS:-"ferrox-raw-plain ferrox-raw-gso ferrox-raw-mq ferrox-raw-gso-mq tun-rs-sync-normal tun-rs-sync-gso tun-rs-sync-gso-concurrent"}
 
@@ -92,7 +93,7 @@ start_variant() {
     variant=$1
     command=$(command_for "$variant") || {
         echo "  $variant: no command (TUN_RS_DIR unset or unknown variant)" >&2
-        return 1
+        return 2
     }
     # shellcheck disable=SC2086
     $command > "$OUT_DIR/$variant.log" 2>&1 &
@@ -191,8 +192,11 @@ emit() {
     cpu=$5
     rss=$6
     slot=$7
-    printf '{"engine":"%s","scenario":"%s","slot":%s,"value":%s,"unit":"%s","cpu_pct":%s,"rss_kb":%s,"mtu":1500,"queues":%s}\n' \
-        "$variant" "$scenario" "$slot" "$value" "$unit" "$cpu" "$rss" "$QUEUES" >> "$RESULTS"
+    loss=${8:-}
+    loss_field=""
+    [ -n "$loss" ] && loss_field=",\"loss_pct\":$loss"
+    printf '{"engine":"%s","scenario":"%s","slot":%s,"value":%s,"unit":"%s","cpu_pct":%s,"rss_kb":%s,"mtu":1500,"queues":%s%s}\n' \
+        "$variant" "$scenario" "$slot" "$value" "$unit" "$cpu" "$rss" "$QUEUES" "$loss_field" >> "$RESULTS"
     printf '  %-28s %-6s %s %s cpu %s%% rss %s KB\n' "$variant" "$scenario" "$value" "$unit" "$cpu" "$rss"
 }
 
@@ -201,9 +205,15 @@ run_variant() {
     rep=$2
     slot=$3
     echo "round $rep variant $variant"
-    if ! start_variant "$variant"; then
+    rc=0
+    start_variant "$variant" || rc=$?
+    if [ "$rc" -eq 2 ]; then
         stop_variant
         return 0
+    fi
+    if [ "$rc" -ne 0 ]; then
+        stop_variant
+        return 1
     fi
 
     sample_start "$OUT_DIR/$variant-$rep.samples"
@@ -232,14 +242,16 @@ import json, sys
 try:
     d = json.load(open(sys.argv[1]))
 except Exception:
-    print("0 0"); raise SystemExit
+    print("0"); raise SystemExit
 end = d.get("end", {})
 total = end.get("sum") or {}
-print("%.3f %.2f" % (total.get("bits_per_second", 0) / 1e9, total.get("lost_percent", 0)))
+bits = total.get("bits_per_second", 0) / 1e9
+lost = total.get("lost_percent")
+print("%.3f %.2f" % (bits, lost) if isinstance(lost, (int, float)) else "%.3f" % bits)
 PY
 )
     set -- $udp
-    emit "$variant" "udp-${rep}" "$1" "Gbit/s" "$udp_cpu" "$udp_rss" "$slot"
+    emit "$variant" "udp-${rep}" "$1" "Gbit/s" "$udp_cpu" "$udp_rss" "$slot" "${2:-}"
 
     timeout 10 ping -c 100 -i 0.01 -W 1 -q 10.0.2.1 > "$OUT_DIR/$variant-$rep-ping.log" 2>&1 || true
     rtt=$(python3 - "$OUT_DIR/$variant-$rep-ping.log" << 'PY'
@@ -298,26 +310,34 @@ while [ "$rep" -le "$REPEAT" ]; do
     slot=0
     for variant in $(order_for_round "$rep"); do
         slot=$((slot + 1))
-        run_variant "$variant" "$rep" "$slot"
+        run_variant "$variant" "$rep" "$slot" || STATUS=1
     done
     rep=$((rep + 1))
 done
 
 python3 - "$RESULTS" "$OUT_DIR/summary.md" << 'PY'
-import json, sys
+import json, statistics, sys
 rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
 groups = {}
 for row in rows:
     groups.setdefault((row["engine"], row["scenario"].rsplit("-", 1)[0]), []).append(row)
 def median(values):
     values = sorted(values)
-    return values[len(values) // 2] if values else 0
-lines = ["| engine | scenario | median | cpu % | max rss MB |", "|---|---|---:|---:|---:|"]
+    if not values:
+        return 0
+    middle = len(values) // 2
+    if len(values) % 2:
+        return values[middle]
+    return (values[middle - 1] + values[middle]) / 2
+lines = ["| engine | scenario | median | cpu % | max rss MB | loss % |", "|---|---|---:|---:|---:|---:|"]
 for (engine, scenario), group in groups.items():
     value = median([row["value"] for row in group])
     cpu = median([row["cpu_pct"] for row in group])
     rss = max(row["rss_kb"] for row in group) / 1024
-    lines.append(f"| {engine} | {scenario} | {value:.3f} {group[0]['unit']} | {cpu:.0f} | {rss:.1f} |")
+    losses = [row["loss_pct"] for row in group if "loss_pct" in row]
+    loss = f"{statistics.median(losses):.2f}" if losses else ""
+    lines.append(f"| {engine} | {scenario} | {value:.3f} {group[0]['unit']} | {cpu:.0f} | {rss:.1f} | {loss} |")
 open(sys.argv[2], "w").write("\n".join(lines) + "\n")
 print("\n".join(lines))
 PY
+exit "$STATUS"
