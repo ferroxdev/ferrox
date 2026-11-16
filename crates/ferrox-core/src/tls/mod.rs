@@ -849,6 +849,11 @@ impl<S: Stream> ClientSession<S> {
         }
     }
 
+    /// Whether this session shapes its handshake and retries polling timeouts until its deadline.
+    pub fn is_shaped(&self) -> bool {
+        matches!(self, Self::Shaped(_))
+    }
+
     /// Whether a relay may read this session's transport itself and hand it only the ciphertext.
     /// The `BoringSSL` path owns its transport, so it stays on the shared shape.
     pub fn separates_ciphertext(&self) -> bool {
