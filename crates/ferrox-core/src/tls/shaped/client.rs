@@ -1469,6 +1469,7 @@ impl<S: Stream> Session<S> {
             self.close.clear();
             self.close_at = 0;
             self.close_sent = true;
+            self.reply.clear();
         }
         Ok(())
     }
@@ -1486,6 +1487,9 @@ impl<S: Stream> Session<S> {
     }
 
     fn flush_reply(&mut self) -> std::io::Result<()> {
+        if !self.close.is_empty() || self.close_sent {
+            return Ok(());
+        }
         if !self.reply.is_empty() {
             self.io.write_all(&self.reply)?;
             self.reply.clear();
