@@ -16,7 +16,7 @@ so the checkout has to exist first:
 tree has local edits. Confirm it is clean before recording bytes:
 
 ```sh
-git -C ../../upstream/xray-core status --short
+git -C upstream/xray-core status --short
 ```
 
 Then, from this directory:
