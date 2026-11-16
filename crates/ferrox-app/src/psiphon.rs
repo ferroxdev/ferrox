@@ -13474,9 +13474,9 @@ mod tests {
         let meek = servers
             .iter()
             .filter_map(|server| server.meek.as_ref())
-            .find(|meek| meek.dial == "23.215.0.206")
+            .find(|meek| meek.dial == "23.215.0.206" && meek.sni == "23.215.0.206")
             .expect("edge candidate");
-        assert_eq!(meek.sni, "23.215.0.206");
+        assert_eq!(meek.alpn, vec![b"http/1.1".to_vec()]);
         assert_eq!(meek.alpn, vec![b"http/1.1".to_vec()]);
         assert!(meek
             .verify_server_names
