@@ -966,6 +966,7 @@ fn reply_worker(weak: &std::sync::Weak<Lane>) -> std::sync::mpsc::SyncSender<Vec
     replies
 }
 
+#[allow(clippy::too_many_lines)]
 fn drive_client(weak: &std::sync::Weak<Lane>) {
     if weak.upgrade().is_none() {
         return;
@@ -2271,6 +2272,11 @@ fn read_stream_address(stream: &mut QuicStream, deadline: Instant) -> Option<(St
     Some((host, u16::from_be_bytes(port)))
 }
 
+thread_local! {
+    static UNI_ROOM: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn read_uni(
     conn: &mut quiche::Connection,
     inner: &mut Inner,
@@ -2278,8 +2284,10 @@ fn read_uni(
     id: u64,
     freedom: bool,
 ) {
-    let mut room = [0u8; UDP_BUFFER];
+    let mut room = UNI_ROOM.with(|held| held.borrow_mut().take());
+    room.resize(UDP_BUFFER, 0);
     read_uni_with(conn, inner, sock, id, freedom, &mut room);
+    UNI_ROOM.with(|held| *held.borrow_mut() = room);
 }
 
 fn read_uni_with(
