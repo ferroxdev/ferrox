@@ -643,7 +643,7 @@ pub(crate) fn apply_hysteria_quic(
         || !cfg!(any(
             target_os = "linux",
             target_os = "windows",
-            target_os = "darwin"
+            target_os = "macos"
         ))
     {
         config.discover_pmtu(false);
