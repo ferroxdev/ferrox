@@ -2517,6 +2517,116 @@ mod tests {
         }
     }
 
+    /// A writer that records every byte it accepts.
+    #[derive(Default)]
+    struct Recorder {
+        bytes: Vec<u8>,
+    }
+
+    impl Read for Recorder {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer that accepts one short write, then reports one timeout.
+    struct StallingWriter {
+        bytes: Vec<u8>,
+        limit: usize,
+        stalled: bool,
+    }
+
+    impl Read for StallingWriter {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for StallingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.bytes.is_empty() {
+                let count = self.limit.min(buf.len());
+                self.bytes.extend_from_slice(&buf[..count]);
+                self.stalled = true;
+                return Ok(count);
+            }
+            if self.stalled {
+                self.stalled = false;
+                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "poll"));
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn tls13_session<S: Stream>(io: S) -> Session<S> {
+        session_on(
+            io,
+            Version::Tls13,
+            Suite::Aes128GcmSha256,
+            Direction::tls13(Suite::Aes128GcmSha256, &[0u8; 32]),
+            Direction::tls13(Suite::Aes128GcmSha256, &[0u8; 32]),
+        )
+    }
+
+    #[test]
+    fn a_close_notification_follows_a_queued_reply() {
+        let mut subject = tls13_session(Recorder::default());
+        subject.reply = b"reply".to_vec();
+        subject.close_notify().expect("close");
+        assert!(subject.io.bytes.starts_with(b"reply"));
+        assert!(subject.close_sent);
+    }
+
+    #[test]
+    fn a_close_notification_resumes_its_record_after_a_timeout() {
+        let mut subject = tls13_session(StallingWriter {
+            bytes: Vec::new(),
+            limit: 5,
+            stalled: false,
+        });
+        let error = subject.close_notify().expect_err("the short write stalls");
+        assert!(matches!(error, TlsError::Timeout));
+        assert_eq!(subject.close_at, 5);
+        assert!(!subject.close_sent);
+        subject.flush().expect("the record resumes");
+        assert!(subject.close_sent);
+        assert!(subject.close.is_empty());
+        assert!(subject.io.bytes.len() > 5);
+    }
+
+    #[test]
+    fn a_reply_waits_for_a_pending_close_record() {
+        let mut subject = tls13_session(StallingWriter {
+            bytes: Vec::new(),
+            limit: 5,
+            stalled: false,
+        });
+        subject.reply = b"reply".to_vec();
+        let error = subject.close_notify().expect_err("the short write stalls");
+        assert!(matches!(error, TlsError::Timeout));
+        subject.flush_reply().expect("the reply waits");
+        assert_eq!(subject.io.bytes.len(), 5);
+        subject.flush().expect("the close resumes");
+        assert!(subject.io.bytes.starts_with(b"reply"));
+        assert!(subject.close_sent);
+    }
+
     /// A retried handshake's transcript opens with a synthetic `message_hash` and a
     /// `HelloRetryRequest`, so the binding must read the second hello pair.
     #[cfg_attr(
