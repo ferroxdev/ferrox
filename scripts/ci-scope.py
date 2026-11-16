@@ -182,15 +182,20 @@ def hunk_pages(root: str, base: str, path: str,
         blobs[side] = out.stdout if out.returncode == 0 else ""
     for old_start, old_count, new_start, new_count in hunks:
         resolved: list[tuple[str, list[str]]] = []
+        unresolved = False
         for blob, start, count in ((blobs["old"], old_start, old_count),
                                    (blobs["new"], new_start, new_count)):
             if count == 0:
                 continue
-            for name in enclosing(blob, start, count):
+            names = list(enclosing(blob, start, count))
+            if not names:
+                unresolved = True
+                continue
+            for name in names:
                 if any(name == seen for seen, _ in resolved):
                     continue
                 resolved.append((name, pages_for(name, scopes)))
-        if not resolved:
+        if unresolved or not resolved:
             resolved.append((f"line {new_start or old_start}", []))
         for name, pages in resolved:
             if any(name == seen for seen, _ in found):

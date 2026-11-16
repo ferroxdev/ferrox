@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from urllib.parse import urlsplit
 
 CONNECT_HOST = "cloudflareaccess.com"
 CONNECT_SNI = "consumer-masque.cloudflareclient.com"
@@ -118,18 +119,18 @@ def read_json(path):
     return json.loads(pathlib.Path(path).read_text())
 
 
-def write_json(path, value):
-    """Write a JSON document with a trailing newline, owner-only because configs carry keys."""
-    path = pathlib.Path(path)
-    path.write_text(json.dumps(value, indent=2) + "\n")
-    path.chmod(0o600)
-
-
 def write_secret(path, data):
     """Write a private key with owner-only permissions, tightening an existing file too."""
     path = pathlib.Path(path)
-    path.write_bytes(data if isinstance(data, bytes) else data.encode())
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "wb" if isinstance(data, bytes) else "w") as handle:
+        handle.write(data)
     path.chmod(0o600)
+
+
+def write_json(path, value):
+    """Write a JSON document with a trailing newline, owner-only because configs carry keys."""
+    write_secret(path, json.dumps(value, indent=2) + "\n")
 
 
 def pem_text(path):
@@ -591,8 +592,10 @@ def main():
     if not adapter.is_file():
         fail(f"no Aether adapter at {adapter}")
     out = pathlib.Path(args.out)
+    created = not out.exists()
     out.mkdir(parents=True, exist_ok=True)
-    out.chmod(0o700)
+    if created:
+        out.chmod(0o700)
     env = os.environ.copy()
     env.update({
         "AETHER_LOG_LEVEL": "warn",
@@ -609,9 +612,9 @@ def main():
     scheme = target_url.split("://", 1)[0].lower() if "://" in target_url else "https"
     target_port = 80 if scheme == "http" else 443
     if "://" in target_url:
-        rest = target_url.split("://", 1)[1]
-        target_host = rest.split("/", 1)[0].split(":", 1)[0]
-        target_port = int(rest.split("/", 1)[0].split(":", 1)[1]) if ":" in rest.split("/", 1)[0] else target_port
+        parts = urlsplit(target_url)
+        target_host = parts.hostname or target_host
+        target_port = parts.port or target_port
     rows = []
     registrations = []
     local_server = None

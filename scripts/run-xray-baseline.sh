@@ -133,6 +133,9 @@ matched=$((pkg_ok + pkg_fail + pkg_notest))
   elif ((pkg_ok > 0 && pkg_fail == 0 && case_fail == 0 && test_rc == 0)); then
     echo "All ran green at this pin and pattern."
     echo
+  elif ((pkg_ok == 0 && pkg_fail == 0 && case_fail == 0 && test_rc == 0)); then
+    echo "No test files in the matched packages; nothing ran, so this is not a green baseline."
+    echo
   else
     echo "Red at this pin and pattern; the rows above are the work list."
     echo
@@ -147,6 +150,8 @@ if ((matched == 0)); then
   exit 1
 elif ((pkg_fail > 0 || case_fail > 0)) || ((test_rc != 0)); then
   echo "::warning::xray-core baseline: $pkg_ok package(s) ok, $pkg_fail FAIL, $case_fail failing case(s); recorded, job stays green"
+elif ((pkg_ok == 0)); then
+  echo "::warning::xray-core baseline: no test files in $pkg_notest matched package(s); nothing ran, job stays green"
 else
   echo "xray-core baseline: all green ($pkg_ok packages ok)"
 fi

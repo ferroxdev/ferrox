@@ -143,8 +143,6 @@ fi
 
 main() {
 mkdir -p "$out" "$engine_dir"
-rm -rf "$out/cells"
-mkdir -p "$out/cells"
 [[ -f "$pins_file" ]] || fail "$pins_file is missing; refusing to guess a comparator"
 
 if ((gaps)); then
@@ -356,6 +354,8 @@ if ((build_only)); then
   echo "build-only: engines built, no cell configs written"
   exit 0
 fi
+rm -rf "$out/cells"
+mkdir -p "$out/cells"
 {
   echo "# Replay: tier $tier on $(date -u +%FT%TZ)"
   echo "# engines: ${engines[*]}"

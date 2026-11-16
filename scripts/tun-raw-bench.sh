@@ -242,14 +242,16 @@ import json, sys
 try:
     d = json.load(open(sys.argv[1]))
 except Exception:
-    print("0 0"); raise SystemExit
+    print("0"); raise SystemExit
 end = d.get("end", {})
 total = end.get("sum") or {}
-print("%.3f %.2f" % (total.get("bits_per_second", 0) / 1e9, total.get("lost_percent", 0)))
+bits = total.get("bits_per_second", 0) / 1e9
+lost = total.get("lost_percent")
+print("%.3f %.2f" % (bits, lost) if isinstance(lost, (int, float)) else "%.3f" % bits)
 PY
 )
     set -- $udp
-    emit "$variant" "udp-${rep}" "$1" "Gbit/s" "$udp_cpu" "$udp_rss" "$slot" "$2"
+    emit "$variant" "udp-${rep}" "$1" "Gbit/s" "$udp_cpu" "$udp_rss" "$slot" "${2:-}"
 
     timeout 10 ping -c 100 -i 0.01 -W 1 -q 10.0.2.1 > "$OUT_DIR/$variant-$rep-ping.log" 2>&1 || true
     rtt=$(python3 - "$OUT_DIR/$variant-$rep-ping.log" << 'PY'

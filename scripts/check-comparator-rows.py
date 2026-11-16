@@ -252,6 +252,22 @@ def selftest():
         if proc.returncode == 0 or "not finite" not in proc.stderr:
             return f"a non-finite baseline ratio was accepted: {proc.stderr}"
 
+        no_peer = Path(temp) / "no-peer"
+        (no_peer / "vless-raw-down-8--srv-ferrox").mkdir(parents=True)
+        (no_peer / "vless-raw-down-8--srv-ferrox" / "cell.json").write_text(
+            json.dumps(
+                {
+                    "scenario": "vless-raw-down-8--srv-ferrox",
+                    "rows": [{"label": "throughput", "gates": True}],
+                }
+            )
+        )
+        proc = run_self(no_peer, None)
+        if proc.returncode != 0:
+            return f"a two-engine run with only reference rows failed: {proc.stderr}"
+        if "no per-comparator row was paired" not in proc.stderr:
+            return f"a run with only reference rows was not warned: {proc.stderr}"
+
         empty = Path(temp) / "empty"
         empty.mkdir()
         proc = run_self(empty, None)
@@ -290,11 +306,17 @@ def main():
     baseline = {} if args.no_baseline else load_baseline(args.baseline)
     found, paired = deficits(args.cells)
     if not paired and not args.allow_empty:
+        if not any(Path(args.cells).glob("*/cell.json")):
+            print(
+                "::error::no cell was rendered; the check would pass on nothing",
+                file=sys.stderr,
+            )
+            return 1
         print(
-            "::error::no per-comparator row was paired; the check would pass on nothing",
+            "::warning::no per-comparator row was paired; the cells carry only "
+            "reference rows, so this run gates no peer",
             file=sys.stderr,
         )
-        return 1
     return report(found, paired, baseline)
 
 

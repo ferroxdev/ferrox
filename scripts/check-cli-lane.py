@@ -3343,6 +3343,15 @@ def main() -> int:
     failed = []
     running = {}
     states = []
+    children = set()
+    real_popen = subprocess.Popen
+
+    def tracked_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        children.add(proc)
+        return proc
+
+    subprocess.Popen = tracked_popen
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     try:
         for name, check in CHECKS:
@@ -3372,6 +3381,33 @@ def main() -> int:
     finally:
         unfinished = list(running.values())
         pool.shutdown(wait=False, cancel_futures=True)
+        subprocess.Popen = real_popen
+        for proc in children:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        pass
+        stop_by = time.monotonic() + 2
+        for proc in children:
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=max(0.0, stop_by - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                    try:
+                        proc.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
         for state in states:
             shutil.rmtree(state, ignore_errors=True)
     if unfinished:

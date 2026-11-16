@@ -4,6 +4,24 @@
 # binary's tests one at a time until the one that never returns is the only answer left.
 set -uo pipefail
 
+WORKLOAD_PID=""
+cleanup() {
+  local code=$?
+  trap - EXIT TERM INT
+  if [[ -n "${WORKLOAD_PID:-}" ]] && kill -0 "$WORKLOAD_PID" 2>/dev/null; then
+    kill -TERM -- "-$WORKLOAD_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "$WORKLOAD_PID" 2>/dev/null || break
+      sleep 0.2
+    done
+    kill -KILL -- "-$WORKLOAD_PID" 2>/dev/null || true
+  fi
+  exit "$code"
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
 quiet="${WATCH_QUIET:-240}"
 bootstrap="${WATCH_BOOTSTRAP:-900}"
 probe="${WATCH_PROBE:-60}"
@@ -90,6 +108,7 @@ watch() {
   set -m
   buffered "$@" >"$out.part" 2>&1 &
   pid=$!
+  WORKLOAD_PID=$pid
   set +m
   while kill -0 "$pid" 2>/dev/null; do
     size=$(wc -c <"$out.part" 2>/dev/null || echo 0)
@@ -135,6 +154,7 @@ watch() {
   fi
   cat "$out.part" >>"$out" 2>/dev/null || true
   rm -f "$out.part"
+  WORKLOAD_PID=""
 }
 
 # culprit BINARY: print the test in BINARY that does not return, running each candidate

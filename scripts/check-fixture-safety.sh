@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 status=0
 
 python3 - <<'EOF'
-import re, subprocess, sys
+import os, re, subprocess, sys
 result = subprocess.run(
     ["git", "grep", "-I", "-z", "--name-only", "-E",
      r"[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}", "--", "."],
@@ -14,7 +14,7 @@ result = subprocess.run(
 if result.returncode not in (0, 1):
     sys.exit(result.returncode)
 raw = result.stdout
-files = [f for f in raw.decode("utf-8", "replace").split("\0") if f]
+files = [os.fsdecode(f) for f in raw.split(b"\0") if f]
 ip = re.compile(r"([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})")
 WARP = {
     ".github/workflows/warp-parity.yml",
@@ -77,14 +77,15 @@ sys.exit(1 if bad else 0)
 EOF
 
 python3 - <<'EOF'
-import re, subprocess, sys
+import base64, json, re, subprocess, sys
 link = re.compile(r"(?:vless|vmess|trojan|ss)://[^@#? ]+@([^/?# ]+)")
+vmess = re.compile(r"vmess://([A-Za-z0-9+/=_-]+)")
 allowed = re.compile(
     r"^(\[::1\]|(127|10)\.\d{1,3}\.\d{1,3}\.\d{1,3}"
     r"|192\.168\.\d{1,3}\.\d{1,3}"
     r"|172\.(1[6-9]|2[0-9]|3[01])\.\d{1,3}\.\d{1,3}"
     r"|(192\.0\.2|198\.51\.100|203\.0\.113)\.\d{1,3}"
-    r"|localhost|example\.[a-z]+"
+    r"|localhost|example\.(com|net|org)"
     r"|[A-Za-z0-9.-]+\.(test|invalid|localhost|example)"
     r"|uuid|host|\{host\})([:/?#]|$)"
 )
@@ -102,6 +103,25 @@ for line in result.stdout.splitlines():
         where = re.match(r"^(.*?):(\d+):", line)
         prefix = f"{where.group(1)}:{where.group(2)}" if where else "?"
         print(f"::error::{prefix}: share-link with a non-documentation host — working configs arrive as masked CI input only")
+        bad += 1
+vmess_result = subprocess.run(
+    ["git", "grep", "-I", "-n", "-E", r"vmess://[A-Za-z0-9+/=_-]+", "--", "."],
+    capture_output=True, text=True)
+if vmess_result.returncode not in (0, 1):
+    sys.exit(vmess_result.returncode)
+for line in vmess_result.stdout.splitlines():
+    for match in vmess.finditer(line):
+        token = match.group(1) + "=" * (-len(match.group(1)) % 4)
+        try:
+            document = json.loads(base64.b64decode(token, altchars=b"-_", validate=False))
+        except (ValueError, json.JSONDecodeError):
+            continue
+        host = document.get("add") or document.get("host") if isinstance(document, dict) else ""
+        if not isinstance(host, str) or not host or allowed.match(host + ":"):
+            continue
+        where = re.match(r"^(.*?):(\d+):", line)
+        prefix = f"{where.group(1)}:{where.group(2)}" if where else "?"
+        print(f"::error::{prefix}: vmess link with a non-documentation host — working configs arrive as masked CI input only")
         bad += 1
 sys.exit(1 if bad else 0)
 EOF

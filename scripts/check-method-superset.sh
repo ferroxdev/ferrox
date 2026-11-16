@@ -102,11 +102,11 @@ def check_rows():
         if not row["references"]:
             fails.append(f"{name}: no reference path, so the row proves nothing")
             continue
-        if os.environ.get("CHECK_SUPERSET_UPSTREAM") == "0":
-            continue
         for path in row["references"].split(","):
             path = path.strip()
             if not path or path.startswith("#"):
+                continue
+            if os.environ.get("CHECK_SUPERSET_UPSTREAM") == "0" and path.startswith("upstream/"):
                 continue
             if not os.path.exists(os.path.join(root, path)):
                 fails.append(f"{name}: reference `{path}` does not exist")
@@ -234,7 +234,7 @@ printf '[sources.xray-core]\n[sources.sing-box]\n[sources.xray-rust]\n[sources.z
 printf 'let support = Support::Implemented { method: "vless-probe" };\n#[cfg(test)]\n' \
     > "$selftest/crates/ferrox-core/src/vless.rs"
 printf '# page\n' > "$selftest/docs/function/probe-page.md"
-refs="upstream/xray-core/proxy/probe, upstream/xray-core/transport/internet/probe, upstream/sing-box/protocol/probe, upstream/sing-box/transport/probe, upstream/xray-rust/crates/probe, upstream/zeronet/crates/probe, upstream/zeronet/bench/hotpath, upstream/xray-rust/fuzz, upstream/zeronet/fuzz"
+refs="upstream/xray-core/proxy/probe, upstream/xray-core/transport/internet/probe, upstream/sing-box/protocol/probe, upstream/sing-box/transport/probe, upstream/xray-rust/crates/probe, upstream/zeronet/crates/probe, upstream/zeronet/bench/hotpath, upstream/xray-rust/fuzz, upstream/zeronet/fuzz, crates/ferrox-core/src/vless.rs"
 matrix="$selftest/docs/method-superset.md"
 printf '<!-- matrix:begin -->\n| row | layer | state | references | note |\n| --- | --- | --- | --- | --- |\n| probe-page | surface | implemented | %s | carries `vless-probe` |\n<!-- matrix:end -->\n' \
     "$refs" > "$matrix"
@@ -253,9 +253,18 @@ expect() {
 
 sed -i.bak 's#upstream/zeronet/fuzz##' "$matrix"
 expect 'upstream/zeronet/fuzz` is a method directory' "uncited catalogue"
+sed -i.bak 's#crates/ferrox-core/src/vless.rs#crates/ferrox-core/src/missing.rs#' "$matrix"
+out="$(FERROX_ROOT="$selftest" CHECK_SUPERSET_UPSTREAM=0 "$0" 2>&1)" && {
+  echo "::error::self-test: a missing local reference still passes with upstream checks off"
+  exit 1
+}
+if ! grep -q 'crates/ferrox-core/src/missing.rs` does not exist' <<<"$out"; then
+  echo "::error::self-test: the local-reference mutation failed for the wrong reason: $out"
+  exit 1
+fi
 sed -i.bak 's/| implemented |/| maybe |/' "$matrix"
 expect "state 'maybe' is not one of" "unknown state"
 sed -i.bak 's/| probe-page |/| probe |/' "$matrix"
 expect "no matrix row is named for it" "renamed row"
-printf '%s\n' 'check-method-superset: self-test passed (three mutations refused)'
+printf '%s\n' 'check-method-superset: self-test passed (four mutations refused)'
 

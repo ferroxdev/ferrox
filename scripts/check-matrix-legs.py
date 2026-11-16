@@ -286,8 +286,20 @@ def check_grouped(grouped, threshold, cpu_threshold, threads_threshold):
                         f"xray-core server, {client_leg / rust_client:.2f}x",
             })
         if server_cell is not None and attempted(server_cell, REFERENCE):
-            measured.add((base, "server-cpu"))
-            measured.add((base, "server-threads"))
+            ref_cpu = median_server_metric(reference, REFERENCE, "cpu_millis_per_gib")
+            fer_cpu = median_server_metric(server_cell, REFERENCE, "cpu_millis_per_gib")
+            if (
+                ref_cpu is not None
+                and fer_cpu is not None
+                and server_cpu_is_priced(reference)
+                and server_cpu_is_priced(server_cell)
+            ):
+                measured.add((base, "server-cpu"))
+            if (
+                median_server_metric(reference, REFERENCE, "threads_peak") is not None
+                and median_server_metric(server_cell, REFERENCE, "threads_peak") is not None
+            ):
+                measured.add((base, "server-threads"))
             holes.extend(server_cost_holes(
                 base,
                 reference,
