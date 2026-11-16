@@ -543,7 +543,6 @@ const PING_PONG_SPIN: std::time::Duration = std::time::Duration::from_micros(50)
 /// Emit one segment an upstream read already landed in `buf[body..body + n]` and whose sequence the reader reserved under its gate. The response thread and the queue's inline serve share it, so the GSO split and the bytes cannot drift apart.
 #[allow(clippy::too_many_arguments)]
 fn emit_upstream(
-    dev: &PacketWriter,
     flow: &Flow,
     buf: &mut [u8],
     n: usize,
@@ -552,6 +551,7 @@ fn emit_upstream(
     max: usize,
     src: (IpAddr, u16),
     dst: (IpAddr, u16),
+    write: impl FnOnce(&[u8], bool) -> io::Result<bool>,
 ) -> bool {
     let Some(head) = ip_header_len(src.0, dst.0) else {
         return false;
@@ -572,12 +572,7 @@ fn emit_upstream(
     ) {
         return false;
     }
-    let wrote = if gso {
-        dev.write_gso(&buf[..body + n], max as u16)
-    } else {
-        dev.write_packet(&buf[..body + n])
-    };
-    wrote.unwrap_or(false)
+    write(&buf[..body + n], gso).unwrap_or(false)
 }
 
 /// One upstream segment for the response thread, with its sequence already reserved: the dequeue and the reservation sit inside the stream's gate, so a queue serving the same stream cannot take the earlier bytes and number them later. A socket with nothing queued parks the thread on its descriptor rather than in the clock.
@@ -2023,12 +2018,12 @@ impl Handler {
         let Some(body) = ip_header_len(flow.local.0, flow.remote.0).map(|head| head + 20) else {
             return false;
         };
-        let gso = self.device.gso();
         let max = (flow.mss.load(Relaxed) as usize).max(1);
         let Some(room) = flow.send.room_now(&flow.snd_nxt) else {
             return false;
         };
-        let limit = read_limit(gso, max, MAX_PACKET - body).min(room as usize);
+        // One segment: a queue's own descriptor writes without the offload a GSO frame needs, so a larger answer is the response thread's.
+        let limit = max.min(room as usize).min(MAX_PACKET - body);
         if limit == 0 {
             return false;
         }
@@ -2052,15 +2047,15 @@ impl Handler {
                 Ok((0, _)) => break,
                 Ok((n, seq)) => {
                     served = emit_upstream(
-                        &self.device,
                         flow,
                         &mut self.served,
                         n,
                         seq,
-                        gso,
+                        false,
                         max,
                         flow.local,
                         flow.remote,
+                        |packet, _| self.device.write_packet(packet).map(|()| true),
                     );
                     break;
                 }
@@ -2359,7 +2354,6 @@ impl Handler {
                     }
                     Ok((n, seq)) => {
                         if !emit_upstream(
-                            &dev_writer,
                             &flow,
                             &mut pkt,
                             n,
@@ -2368,6 +2362,13 @@ impl Handler {
                             max,
                             (local_ip, local_port),
                             (remote_ip, remote_port),
+                            |packet, gso| {
+                                if gso {
+                                    dev_writer.write_gso(packet, max as u16)
+                                } else {
+                                    dev_writer.write_packet(packet)
+                                }
+                            },
                         ) {
                             break FLAG_RST | FLAG_ACK;
                         }
