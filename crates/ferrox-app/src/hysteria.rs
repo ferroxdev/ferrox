@@ -600,6 +600,14 @@ fn gso(sock: crate::quic::Datagram, quic: Option<&hysteria::QuicParams>) -> crat
     sock.with_gso(quic.is_none_or(|params| !params.disable_gso))
 }
 
+fn client_config(dial: &Dial, roots: &[Vec<u8>]) -> Option<quiche::Config> {
+    if dial.config.insecure {
+        crate::quic::quiche_config_insecure(None)
+    } else {
+        crate::quic::quiche_config(roots, None)
+    }
+}
+
 /// Dial the configured lane, wrap its socket in the mask or hop it names, and finish the QUIC handshake and auth.
 pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     #[cfg(test)]
@@ -610,11 +618,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         peer = crate::hysteria_realm::dial_peer(&sock, realm)?;
     }
     let cid = crate::quic::hysteria_client_cid(dial.config.quic.as_ref())?;
-    let mut config = if dial.config.insecure {
-        crate::quic::quiche_config_insecure(None)?
-    } else {
-        crate::quic::quiche_config(roots, None)?
-    };
+    let mut config = client_config(dial, roots)?;
     crate::quic::apply_lane_congestion(
         &mut config,
         Some(dial.config.cc),
