@@ -14,6 +14,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const USER_AGENT: &str = "MozillaVPN/2.35.0 (sys:linux; iap:true)";
 pub(crate) const JSON_ACCEPT: &str = "application/json";
 const MAX_HEAD: usize = 16 * 1024;
+/// The one-shot reply body cap; the relay streams its body instead.
 pub(crate) const MAX_BODY: usize = 1024 * 1024;
 /// The default response body read chunk when the caller does not limit it.
 pub(crate) const DEFAULT_READ_CHUNK: usize = 64 * 1024;
@@ -393,6 +394,7 @@ pub(crate) fn request(
 }
 
 /// Head to the blank line, then the declared body shape; a TLS record costs a syscall, so the head is buffered.
+#[cfg(test)]
 pub(crate) fn read_reply<S: Read>(io: &mut S, chunk: usize) -> Result<Reply, Failure> {
     read_reply_limited(io, chunk, MAX_BODY)
 }
