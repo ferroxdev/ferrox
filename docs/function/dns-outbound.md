@@ -58,7 +58,7 @@ The decision's retired instructions are the decide probe's frame — `ferrox-cor
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 51893400 | scripts/count-ops.sh |
+| ops-retired-instructions | 52343912 | scripts/count-ops.sh |
 | syscalls-per-forwarded-question | UNBLESSED | scripts/count-ops.sh |
 | user-space-copies-per-forwarded-question | UNBLESSED | no copy checker yet |
 | seconds-per-forwarded-question | UNBLESSED | CI bench.yml (no cell yet) |

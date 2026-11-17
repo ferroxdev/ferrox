@@ -207,6 +207,8 @@ impl SendingWorker {
     }
 }
 
+const ACK_WAKE_SEGMENTS: u16 = 16;
+
 pub struct ReceivingWorker {
     ctx: Arc<Ctx>,
     /// Spent payload buffers, ready to be filled by the next inbound segment.
@@ -218,6 +220,7 @@ pub struct ReceivingWorker {
     next_number: u32,
     window_size: u32,
     ack_limit: usize,
+    acks_since_wake: u16,
 }
 
 impl std::fmt::Debug for ReceivingWorker {
@@ -239,6 +242,7 @@ impl ReceivingWorker {
             next_number: 0,
             window_size,
             ack_limit: config.ack_limit(),
+            acks_since_wake: 0,
         }
     }
 
@@ -255,6 +259,16 @@ impl ReceivingWorker {
     #[must_use]
     pub fn is_data_available(&self) -> bool {
         self.window.has(self.next_number)
+    }
+
+    /// Every sixteenth ack wakes the flush clock: a sender's window keeps sliding between ticks without a wake per datagram.
+    #[must_use]
+    pub fn ack_batch_due(&mut self) -> bool {
+        if self.acks_since_wake >= ACK_WAKE_SEGMENTS {
+            self.acks_since_wake = 0;
+            return true;
+        }
+        false
     }
 
     pub fn process_sending_next(&mut self, next_number: u32) {
@@ -275,6 +289,7 @@ impl ReceivingWorker {
         }
         self.acklist.clear(seg.sending_next);
         self.acklist.add(number, seg.timestamp);
+        self.acks_since_wake = self.acks_since_wake.saturating_add(1);
         if let Some(rejected) = self.window.insert(number, seg) {
             self.recycle(rejected.payload);
         }
@@ -330,6 +345,7 @@ impl ReceivingWorker {
     }
 
     pub fn flush(&mut self, current: u32) {
+        self.acks_since_wake = 0;
         let rto = self.ctx.round_trip.lock().unwrap().timeout();
         let limit = self.ack_limit;
         let ctx = Arc::clone(&self.ctx);

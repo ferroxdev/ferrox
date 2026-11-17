@@ -129,7 +129,7 @@ vless sealed-record-buffer-growth 0 ferrox-core-vless::tests::a_record_is_opened
 vless sealed-record-sizes-swept 12 ferrox-core-vless::tests::a_record_of_any_size_reads_back_the_octets_that_were_written
 vless sealed-record-writes-per-batch 1 ferrox-core-vless::tests::a_batched_record_write_is_one_call_and_the_same_bytes
 vless sealed-record-copies 2 ferrox-core-vless::tests::a_record_inside_one_part_is_sealed_from_that_part
-vless sealed-record-write-instructions 50871336 scripts/count-ops.sh
+vless sealed-record-write-instructions 50874900 scripts/count-ops.sh
 
 # --- Trojan -----------------------------------------------------------------
 trojan ops-retired-instructions 1182 scripts/count-ops.sh
@@ -171,10 +171,10 @@ xtls-vision shared-state-acquisitions-per-steady-framed-write 1 ferrox-app-visio
 xtls-vision shared-state-acquisitions-per-spent-direct-read 0 ferrox-app-vision::tests::a_spent_direct_read_takes_no_shared_state
 
 # --- Mux.Cool ---------------------------------------------------------------
-mux-cool ops-retired-instructions 618496 scripts/count-ops.sh
+mux-cool ops-retired-instructions 610304 scripts/count-ops.sh
 mux-cool seconds-per-framed-megabyte UNBLESSED CI parity.yml
 mux-cool frame-encode-ops-retired-instructions 876544 scripts/count-ops.sh
-mux-cool header-encode-ops-retired-instructions UNBLESSED scripts/count-ops.sh
+mux-cool header-encode-ops-retired-instructions 507904 scripts/count-ops.sh
 mux-cool maximum-frame-payload-bytes 8192 ferrox-core-mux::tests::the_decoder_refuses_only_what_it_cannot_frame
 mux-cool downlink-copies-per-byte-written 0 ferrox-app-proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer
 mux-cool xudp-uplink-copies-per-byte-written 0 ferrox-app-proxy::tests::xudp_uplink_hands_the_payload_over_by_pointer
@@ -555,6 +555,7 @@ kcp ack-numbers-reallocations-per-cycle 0 ferrox-core-kcp::segment::tests::a_rec
 kcp segment-header-staging-copies-per-segment 0 ferrox-core-kcp::segment::tests::a_borrowed_payload_serialises_identically_to_an_owned_one
 kcp segment-list-vectors-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next
 kcp reader-wakeups-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries
+kcp ack-wake-threshold-segments 16 ferrox-core-kcp::connection::tests::an_ack_batch_flushes_before_the_tick
 kcp receiving-lock-acquisitions-per-multi-segment-datagram 1 ferrox-core-kcp::connection::tests::a_multi_segment_datagram_takes_the_receiving_lock_once
 kcp mask-families-implemented 9 ferrox-core-kcp::listener::tests::every_mask_family_echoes_over_loopback
 kcp filter-verdicts-from-one-list 5 ferrox-app-config::tests::a_finalmask_filter_reads_both_lists
@@ -822,7 +823,7 @@ finalmask sudoku-entropy-getrandoms 512 ferrox-core-finalmask-sudoku::tests::the
 finalmask sudoku-encoder-capacity-growth 0 ferrox-core-finalmask-sudoku::tests::the_encoder_buffer_holds_its_capacity
 finalmask sudoku-pure-octets-per-plaintext-octet 4 ferrox-core-finalmask-sudoku::tests::the_wire_ratio_is_the_reference_shape
 finalmask sudoku-packed-octets-per-three-octets 4 ferrox-core-finalmask-sudoku::tests::the_wire_ratio_is_the_reference_shape
-finalmask ops-retired-instructions 323610 scripts/count-ops.sh
+finalmask ops-retired-instructions 346140 scripts/count-ops.sh
 finalmask pieces-restaged-per-hello 0 ferrox-core-finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies
 finalmask filter-verdicts-from-one-list 5 ferrox-app-config::tests::a_finalmask_filter_reads_both_lists
 finalmask merged-pieces-restaged-per-hello 0 ferrox-core-finalmask::tests::a_merged_run_gathers_the_callers_body_without_restaging_it
@@ -879,7 +880,7 @@ engine-router dns-lookups-ip-on-demand-source-failed 0 ferrox-app-router::tests:
 engine-router gunzip-write-chunk-bytes 65536 ferrox-app-geodata::tests::a_gzipped_asset_is_written_while_it_is_decompressed
 
 # --- SOCKS5, both roles ------------------------------------------------------
-socks ops-retired-instructions 889 scripts/count-ops.sh
+socks ops-retired-instructions 895 scripts/count-ops.sh
 socks socks-raw-down-8-client-mib-per-second 2658 CI benchmark-matrix.yml run 43292720499
 socks socks-raw-down-8-server-mib-per-second 2808 CI benchmark-matrix.yml run 43292720499
 socks oracle-lines-matching-the-pinned-go 10 ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
@@ -969,7 +970,7 @@ carrier-foxy edge-strike-lookup-allocations 0 ferrox-core-foxy::tests::an_edge_s
 carrier-foxy carrier-alpn-allocations-per-dial 0 ferrox-app-foxy::tests::a_carriers_alpn_list_is_shared_rather_than_built_per_dial
 
 # --- the DNS outbound -------------------------------------------------------
-dns-outbound ops-retired-instructions 51893400 scripts/count-ops.sh
+dns-outbound ops-retired-instructions 52343912 scripts/count-ops.sh
 dns-outbound syscalls-per-forwarded-question UNBLESSED scripts/count-ops.sh
 dns-outbound user-space-copies-per-forwarded-question UNBLESSED no copy checker yet
 dns-outbound seconds-per-forwarded-question UNBLESSED CI bench.yml (no cell yet)
@@ -1122,7 +1123,7 @@ carrier-psiphon move-to-front-allocations 0 ferrox-app-psiphon::tests::a_live_se
 carrier-psiphon capability-name-allocations 0 ferrox-app-psiphon::tests::capability_names_borrow_when_no_mask_is_needed
 carrier-psiphon preresolved-pick-allocations 0 ferrox-app-psiphon-dns::tests::a_preresolved_pick_takes_no_heap
 carrier-psiphon ss-direct-write-probe-ops UNBLESSED scripts/count-ops.sh
-carrier-psiphon ss-flatten-write-probe-ops 47621526 scripts/count-ops.sh
+carrier-psiphon ss-flatten-write-probe-ops 47810192 scripts/count-ops.sh
 carrier-psiphon quic-varint-probe-ops 131079 scripts/count-ops.sh
 carrier-psiphon seconds-per-live-transfer UNBLESSED .github/workflows/psiphon-live.yml
 carrier-psiphon rc4-passes-per-byte 1 ferrox-app-psiphon-ssh::tests::rc4_apply_matches_the_stream_across_every_length

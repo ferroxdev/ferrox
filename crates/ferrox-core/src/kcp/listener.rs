@@ -268,9 +268,13 @@ impl std::fmt::Debug for Listener {
 }
 
 impl Listener {
-    #[allow(clippy::too_many_lines)]
     pub fn bind(addr: SocketAddr, config: Config) -> io::Result<Self> {
-        let sock = UdpSocket::bind(addr)?;
+        Self::with_socket(UdpSocket::bind(addr)?, config)
+    }
+
+    /// A listener over a socket the caller bound and armed, so an inbound's `sockopt` lands before the port is claimed.
+    #[allow(clippy::too_many_lines)]
+    pub fn with_socket(sock: UdpSocket, config: Config) -> io::Result<Self> {
         let local = sock.local_addr()?;
         let inner = Arc::new(ListenerInner {
             sessions: Mutex::new(HashMap::new()),
@@ -280,7 +284,8 @@ impl Listener {
             closed: AtomicBool::new(false),
             addr: local,
         });
-        let sock_r = sock.try_clone()?;
+        let sock_r = sock;
+        sock_r.set_nonblocking(false)?;
         sock_r.set_read_timeout(Some(Duration::from_millis(50)))?;
         let weak = Arc::downgrade(&inner);
         thread::spawn(move || {

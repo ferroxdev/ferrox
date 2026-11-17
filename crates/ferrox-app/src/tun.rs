@@ -775,7 +775,7 @@ impl Device {
             revents: 0,
         };
         // SAFETY: one descriptor this handler owns, one element in the array, and the call writes only `revents`.
-        unsafe { libc::poll(&raw mut row, 1, 0) > 0 && row.revents != 0 }
+        unsafe { libc::poll(&raw mut row, 1, 0) > 0 && (row.revents & libc::POLLIN) != 0 }
     }
 
     fn write_packet(&mut self, packet: &[u8]) -> io::Result<bool> {
@@ -2011,6 +2011,7 @@ impl Handler {
                 }
             }
             if served == Served::Failed {
+                self.retire(&flow, Some(FLAG_RST | FLAG_ACK));
                 return Ok(());
             }
             // Delayed like the references: answer at a push, at a finish, or at a full MTU unacked.
@@ -2112,7 +2113,7 @@ impl Handler {
                         |packet, _| self.device.write_packet(packet),
                     ) {
                         Ok(ack) => Served::Ack(ack),
-                        // The answer left the stream and the cursor moved with it; a device that took neither leaves a hole no retransmit can fill, so the flow ends here as it does on the response thread.
+                        // The answer left the stream and the cursor moved with it; a device that took neither leaves a hole no retransmit can fill, so this reports the refusal and the caller retires the flow outside the pipe lock.
                         Err(_) => Served::Failed,
                     };
                     break;
@@ -2130,9 +2131,6 @@ impl Handler {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
-        }
-        if served == Served::Failed {
-            self.retire(flow, Some(FLAG_RST | FLAG_ACK));
         }
         served
     }
@@ -3669,20 +3667,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_refused_inline_answer_ends_the_flow() {
-        let (device_end, peer) = unix_socketpair().unwrap();
+        let (device_end, _reader) = full_pipe().unwrap();
         let device = Device::from_handle(device_end, DEFAULT_MTU);
         let mut handler = Handler::new(device, Arc::new(|_, _, _| Ok(())), no_associate());
         let (lane, mut far) = UnixStream::pair().unwrap();
-        let mut lane = Connection::from(lane);
         far.write_all(b"answer").unwrap();
         let flow = test_flow(5_000, 2_000);
         flow.misses.store(PING_PONG_MISSES, Relaxed);
-        drop(peer);
+        let mut guard = flow.write_half.lock().unwrap();
+        *guard = Some(Connection::from(lane));
         assert_eq!(
-            handler.serve_inline(&mut lane, &flow),
+            handler.serve_inline(guard.as_mut().unwrap(), &flow),
             Served::Failed,
             "a refused segment is not an answer"
         );
+        drop(guard);
+        handler.retire(&flow, Some(FLAG_RST | FLAG_ACK));
         assert!(
             flow.signaled.load(Relaxed),
             "the flow is ended instead of acknowledged for bytes it never carried"
@@ -4069,6 +4069,34 @@ mod tests {
             handler.flows.table().get(&key).unwrap().mss.load(Relaxed),
             1220
         );
+    }
+
+    /// A full pipe with its read end open: a device that refuses a write without a hangup for `poll`.
+    #[cfg(unix)]
+    fn full_pipe() -> io::Result<(std::fs::File, std::fs::File)> {
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let chunk = [0u8; 4096];
+        loop {
+            match writer.write(&chunk) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok((writer, reader))
     }
 
     #[cfg(unix)]

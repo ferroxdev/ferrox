@@ -194,7 +194,11 @@ append_pem 562
 # Re-blessed 51893400 by the ferrox-core re-land (#38, #39): the added modules moved this
 # test binary's thin-LTO layout by forty instructions; dns.rs is untouched and the five
 # decisions still walk 4096 times. ops.yml run 43806222498.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51893400 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# Re-blessed 52343912 by main's SOCKS guards and mux header initialization
+# (aa2db45, feb11e7): the added code moved this test binary's thin-LTO layout;
+# dns.rs is untouched and the five decisions still walk 4096 times. ops.yml run
+# 44015809956.
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 52343912 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
@@ -314,7 +318,13 @@ ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::t
 # Re-blessed 47621538 by p2-kcp-mkcp: the KCP receive path and its witness tests
 # link into the same ferrox-app bin, moving its thin-LTO layout;
 # psiphon_shadowsocks.rs is untouched. ops.yml run 43603010310.
-ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621526 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+# Re-blessed 47810162 by the KCP sockopt and ack-batch tests: the added code
+# links into the same ferrox-app bin, moving its thin-LTO layout;
+# psiphon_shadowsocks.rs is untouched. ops.yml run 43968877918.
+# Re-blessed 47810192 on main df177ae: the rebase moved the same ferrox-app
+# thin-LTO layout another thirty instructions; psiphon_shadowsocks.rs is
+# untouched. ops.yml run 43989485702.
+ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47810192 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
 # The fused size-line walk: 256 turns over a twelve-byte line, the first digit
 # changed each turn so the call is not hoisted. The hex run is parsed in place
 # and only a non-closing terminator pays a second, CRLF-only pass; the line is
@@ -322,35 +332,52 @@ ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47621526 psiphon_s
 ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_costs_one_walk
 # The merged hello: 256 fixed 300-octet hellos cut at widths 11 and 37 through
 # one stage with a single zero delay, over a sink that takes a whole gathered
-# write and keeps nothing. 323610 is 1264.1 per turn; the two widths and the
+# write and keeps nothing. 346140 is 1352.1 per turn; the two widths and the
 # zero delay never draw, so the probe prices the cuts and the 32-record gather.
 # The record bytes are the same as the merge-copy path this replaced.
-ferrox_core::finalmask::tests::merged_hello_probe 323610 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
+# Re-blessed from 317726 by main's finalmask range fix (aa2db45) and xmc write
+# and length contracts (7678f98): the zero delay still selects the low bound and
+# the cuts are unchanged, while the widened span and the added code moved this
+# test binary's thin-LTO layout. ops.yml run 44009241010.
+ferrox_core::finalmask::tests::merged_hello_probe 346140 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
 # The client request built by `request`: one address type byte, the address and
 # the port, written in one match with the vector's room reserved exactly once,
 # through `spare_capacity_mut` and one `copy_nonoverlapping` per field so no
 # reference is formed over uninitialized memory and no byte loop runs. The copy
 # stays one pass, a block per field; the oracle test replays the pinned Go
 # writer's bytes.
-# Re-blessed 889 by the oracle's sixth handshake line (#114 added `handshake none name
-# 192.0.2.1 443`): one more `request` carries `encode_into`'s inlined match, and every byte
-# still matches the pinned Go writer. ops.yml run 43806222498.
-ferrox_core::socks::request 889 socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
+# Re-blessed 895 by main's SOCKS name-length guards (#145): the assert in
+# `Target::Name` adds six instructions over the oracle's six lines, and every
+# byte still matches the pinned Go writer. ops.yml run 44015809956.
+ferrox_core::socks::request 895 socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
 # The sealed record write: 256 turns over a four-part Vision frame (uuid, five-byte
 # head, seven 8 KiB payload records, trailer) through an AES engine and a discard
 # sink. A record wholly inside the payload part is sealed from that part, so only
-# the two records that cross a part boundary are copied; 50871336 is 198716.2 per turn.
-ferrox_core::vless_encryption::tests::sealed_write_probe 50871336 vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
+# the two records that cross a part boundary are copied; 50874900 is 198730.1 per turn.
+# Re-blessed from 50871336 by the KCP sockopt and ack-batch tests: the added code
+# links into the same ferrox-core test binary, moving its thin-LTO layout;
+# vless_encryption.rs is untouched and the seal still copies only the two
+# crossing records. ops.yml run 43968877918.
+# Re-blessed to 50874900 on main df177ae by the KCP sockopt and ack-batch tests:
+# the rebase moved the same ferrox-core test binary's thin-LTO layout again;
+# vless_encryption.rs is untouched and the seal still copies only the two
+# crossing records. ops.yml run 43989485702.
+ferrox_core::vless_encryption::tests::sealed_write_probe 50874900 vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
 # The mux decode probe: 4096 decodes of one fixed New/domain frame, so the row
 # prices the frame walk and nothing else. The probe branch built from origin/main
-# read 634880 (155 a call); splitting the frame once, fusing the status with the
-# target question, and taking the target walk from the head's own remainder reads
-# 618496 (151 a call). Every status, option and target shape is held by the
-# decoder's own sweep, so the bytes do not move.
-ferrox_core::mux::decode 618496 mux::tests::the_decode_probe_costs_the_frame_walk_and_nothing_else
+# read 634880 (155 a call); splitting the frame once and fusing the status with
+# the target question read 618496 (151 a call). Main's mux identity fix (aa2db45)
+# then let `decode` ask the target alone for the UDP identity instead of also
+# requiring DATA, reading 610304 (149 a call). Every status, option and target
+# shape is held by the decoder's own sweep, so the bytes do not move.
+# Re-blessed by that fix in ops.yml run 44009241010.
+ferrox_core::mux::decode 610304 mux::tests::the_decode_probe_costs_the_frame_walk_and_nothing_else
 # The two encode probes landed with the decode change, so these rows are the
 # code they found, not a before/after pair: the first attempt to fuse the fixed
 # head and skip `clear`/`reserve` measured 884736 and 409600, 2 and 4 Ir a call
-# dearer than these, and was reverted rather than blessed.
+# dearer than these, and was reverted rather than blessed. Main's header
+# initialization (feb11e7) made `encode_header_into` a frame: the probe reads
+# 507904 (124 a call), the zero fill the safe form added, in ops.yml run
+# 44015809956.
 ferrox_core::mux::Outgoing::encode_into 876544 mux::tests::the_frame_probe_costs_the_metadata_and_payload_write_and_nothing_else
-ferrox_core::mux::Outgoing::encode_header_into UNBLESSED mux::tests::the_header_probe_costs_the_metadata_write_and_nothing_else
+ferrox_core::mux::Outgoing::encode_header_into 507904 mux::tests::the_header_probe_costs_the_metadata_write_and_nothing_else
