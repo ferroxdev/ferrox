@@ -147,10 +147,10 @@ impl StateStore {
         remote: Option<SocketAddr>,
         now: Duration,
     ) -> Option<Vars> {
+        self.prune(now);
         if local.is_none() || remote.is_none() {
             return None;
         }
-        self.prune(now);
         self.entries
             .get(&(local, remote))
             .map(|(vars, _)| vars.clone())
@@ -163,10 +163,10 @@ impl StateStore {
         vars: &Vars,
         now: Duration,
     ) {
+        self.prune(now);
         if local.is_none() || remote.is_none() {
             return;
         }
-        self.prune(now);
         let key = (local, remote);
         if vars.is_empty() {
             self.entries.remove(&key);
