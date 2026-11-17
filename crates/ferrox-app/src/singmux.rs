@@ -1395,6 +1395,10 @@ impl Flow {
         self.stream.take_replies()
     }
 
+    pub(crate) fn end_upload(&self) {
+        self.stream.finish();
+    }
+
     pub(crate) fn close(self) {
         self.stream.finish();
     }

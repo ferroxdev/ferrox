@@ -5225,6 +5225,19 @@ impl PooledFlow {
         }
     }
 
+    fn end_upload(&self) {
+        match self {
+            Self::Cool(flow) => flow.end_upload(),
+            Self::Sing(flow) => flow.end_upload(),
+        }
+    }
+
+    fn release(self) {
+        if let Self::Cool(flow) = self {
+            flow.release();
+        }
+    }
+
     fn close(self) {
         match self {
             Self::Cool(flow) => flow.close(),
