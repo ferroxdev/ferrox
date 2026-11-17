@@ -5455,6 +5455,19 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
+    fn test_channel(inner: Arc<Inner>, state: Arc<ChannelState>) -> Channel {
+        Channel {
+            owner: Arc::new(ChannelOwner {
+                session: Arc::clone(&inner),
+                state: Arc::clone(&state),
+            }),
+            session: inner,
+            state,
+            deadline: None,
+            shutdown: None,
+        }
+    }
+
     #[test]
     fn the_window_adjust_never_exceeds_half_the_configured_window() {
         assert_eq!(window_adjust_at(DEFAULT_CHANNEL_WINDOW), WINDOW_ADJUST_AT);
@@ -5824,16 +5837,7 @@ mod tests {
             last_active: Mutex::new(Instant::now()),
             pool: Arc::clone(&pool),
         });
-        let mut channel = Channel {
-            owner: Arc::new(ChannelOwner {
-                session: Arc::clone(&inner),
-                state: Arc::clone(&state),
-            }),
-            session: Arc::clone(&inner),
-            state: Arc::clone(&state),
-            deadline: None,
-            shutdown: None,
-        };
+        let mut channel = test_channel(Arc::clone(&inner), Arc::clone(&state));
         let mut buffer = vec![0u8; PACKET_CHUNK];
         let pointer = buffer.as_ptr();
         buffer[8..13].copy_from_slice(b"hello");
@@ -5925,16 +5929,7 @@ mod tests {
             last_active: Mutex::new(Instant::now()),
             pool: Arc::clone(&pool),
         });
-        let mut channel = Channel {
-            owner: Arc::new(ChannelOwner {
-                session: Arc::clone(&inner),
-                state: Arc::clone(&state),
-            }),
-            session: Arc::clone(&inner),
-            state: Arc::clone(&state),
-            deadline: None,
-            shutdown: None,
-        };
+        let mut channel = test_channel(Arc::clone(&inner), Arc::clone(&state));
         let mut buffer = vec![0u8; PACKET_CHUNK];
         let pointer = buffer.as_ptr();
         let capacity = buffer.capacity();
@@ -6045,16 +6040,7 @@ mod tests {
             ),
             Dispatch::Queued
         ));
-        let mut channel = Channel {
-            owner: Arc::new(ChannelOwner {
-                session: Arc::clone(&inner),
-                state: Arc::clone(&state),
-            }),
-            session: Arc::clone(&inner),
-            state,
-            deadline: None,
-            shutdown: None,
-        };
+        let mut channel = test_channel(Arc::clone(&inner), state);
         let mut out = [0u8; 2];
         channel.read_exact(&mut out).expect("read");
         assert_eq!(&out, b"hi");
@@ -6151,16 +6137,7 @@ mod tests {
             Dispatch::Recycle(_)
         ));
 
-        let mut channel = Channel {
-            owner: Arc::new(ChannelOwner {
-                session: Arc::clone(&inner),
-                state: Arc::clone(&state),
-            }),
-            session: Arc::clone(&inner),
-            state,
-            deadline: None,
-            shutdown: None,
-        };
+        let mut channel = test_channel(Arc::clone(&inner), state);
         let mut out = [0u8; 2];
         channel.read_exact(&mut out).expect("read the queued bytes");
         assert_eq!(&out, b"hi");
@@ -6281,16 +6258,7 @@ mod tests {
             pool: Arc::clone(&pool),
         });
         lock(&inner.channels).insert(1, Arc::clone(&state));
-        let mut channel = Channel {
-            owner: Arc::new(ChannelOwner {
-                session: Arc::clone(&inner),
-                state: Arc::clone(&state),
-            }),
-            session: Arc::clone(&inner),
-            state,
-            deadline: None,
-            shutdown: None,
-        };
+        let mut channel = test_channel(Arc::clone(&inner), state);
         channel.close();
         let mut head = [0u8; 4];
         wire.read_exact(&mut head).expect("packet length");

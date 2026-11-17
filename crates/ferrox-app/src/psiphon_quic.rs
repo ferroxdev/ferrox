@@ -3229,7 +3229,7 @@ mod tests {
         assert_eq!(engine.dcid.as_slice(), &b"server"[..]);
         let mut empty = test_engine();
         empty.accept_server_cid(b"");
-        assert!(empty.dcid.is_empty());
+        assert_eq!(empty.dcid.len(), 0);
     }
 
     #[test]

@@ -1097,7 +1097,7 @@ impl PsiphonOut {
             let packet_shutdown = shutdown.signal();
             thread::Builder::new()
                 .name("psiphon-packet-tunnel".to_owned())
-                .spawn(move || packet_tunnel_loop(&weak, device, dns, packet_shutdown))
+                .spawn(move || packet_tunnel_loop(&weak, device, dns, &packet_shutdown))
                 .map_err(|error| format!("psiphon: packet tunnel thread: {error}"))?;
         }
         // The edge binds before a tunnel exists, so a refusal is retried, never a lane that exits.
@@ -2458,14 +2458,14 @@ fn packet_tunnel_loop(
     lane: &Weak<Inner>,
     mut device: crate::tun::Device,
     dns: crate::psiphon_packet_tunnel::Dns,
-    shutdown: ShutdownSignal,
+    shutdown: &ShutdownSignal,
 ) {
     let mut logged: Option<Instant> = None;
     loop {
         if shutdown.stopped.load(Ordering::Acquire) {
             return;
         }
-        let outcome = packet_tunnel_once(lane, &mut device, dns, &shutdown);
+        let outcome = packet_tunnel_once(lane, &mut device, dns, shutdown);
         if shutdown.stopped.load(Ordering::Acquire) {
             return;
         }
