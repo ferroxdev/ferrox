@@ -5,13 +5,22 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ferrox_core::kcp::{read_segment, Config, ConnMetadata, Connection};
+use ferrox_core::kcp::{read_segment, Config, ConnError, ConnMetadata, Connection};
 
-fn main() {
-    let megabytes: usize = std::env::args()
+fn payload_megabytes() -> usize {
+    let megabytes = std::env::args()
         .nth(1)
         .and_then(|a| a.parse().ok())
         .unwrap_or(64);
+    if megabytes == 0 {
+        eprintln!("usage: kcp_bench <megabytes >= 1>");
+        std::process::exit(2);
+    }
+    megabytes
+}
+
+fn main() {
+    let megabytes = payload_megabytes();
 
     let ssock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let slocal = ssock.local_addr().unwrap();
@@ -71,18 +80,14 @@ fn main() {
     let recv2 = Arc::clone(&received);
     let p1 = Arc::clone(&payload);
     let rconn = Arc::clone(&cconn);
-    let reader = thread::spawn(move || {
+    let reader = thread::spawn(move || -> Result<(), ConnError> {
         let mut buf = vec![0u8; 1 << 20];
         rconn.set_read_deadline(Instant::now() + Duration::from_secs(60));
         loop {
-            match rconn.read(&mut buf) {
-                Ok(n) => {
-                    let total = recv2.fetch_add(n, Ordering::SeqCst) + n;
-                    if total >= p1.len() {
-                        return;
-                    }
-                }
-                Err(_) => return,
+            let n = rconn.read(&mut buf)?;
+            let total = recv2.fetch_add(n, Ordering::SeqCst) + n;
+            if total >= p1.len() {
+                return Ok(());
             }
         }
     });
@@ -93,10 +98,20 @@ fn main() {
     let writer_thread = thread::spawn(move || {
         wconn.write(&p2).unwrap();
     });
+    if let Err(error) = reader.join().expect("reader thread") {
+        eprintln!("read failed before the echo completed: {error}");
+        std::process::exit(1);
+    }
     writer_thread.join().unwrap();
-    reader.join().unwrap();
     let elapsed = start.elapsed();
     let bytes = received.load(Ordering::SeqCst);
+    if bytes != payload.len() {
+        eprintln!(
+            "incomplete echo: sent {} bytes, received {bytes}",
+            payload.len()
+        );
+        std::process::exit(1);
+    }
     let mib = f64::from(u32::try_from(bytes / 1_000_000).unwrap_or(u32::MAX));
     println!(
         "rust: {} bytes in {:?} -> {:.2} MB/s",

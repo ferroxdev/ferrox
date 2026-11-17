@@ -194,6 +194,9 @@ impl Ladder {
             self.packed.store(Self::pack(current, 0), Ordering::Relaxed);
             return None;
         };
+        if above < current {
+            return None;
+        }
         self.packed.store(Self::pack(above, 0), Ordering::Relaxed);
         if above != current {
             counts.climbs = counts.climbs.saturating_add(1);
@@ -646,6 +649,25 @@ mod tests {
         assert_eq!(ladder.current(), Rung::Ws);
         assert_eq!(ladder.climbs(), 1);
         assert_eq!(ladder.record_failure(Rung::HttpUpgrade, &failure), None);
+    }
+
+    /// A failure that lands after the ladder has already climbed past its rung cannot drag it back
+    /// down to a transport another dial already proved worse.
+    #[test]
+    fn a_delayed_failure_from_a_lower_rung_never_regresses_the_ladder() {
+        let ladder = Ladder::new();
+        let unreachable = Failure::new(Stage::SocketConnected, Kind::Unreachable);
+        assert_eq!(
+            ladder.record_failure(Rung::Raw, &unreachable),
+            Some(Rung::Ws)
+        );
+        assert_eq!(
+            ladder.record_failure(Rung::Ws, &unreachable),
+            Some(Rung::Xhttp)
+        );
+        assert_eq!(ladder.record_failure(Rung::Raw, &unreachable), None);
+        assert_eq!(ladder.current(), Rung::Xhttp);
+        assert_eq!(ladder.climbs(), 2, "the delayed failure climbs nothing");
     }
 
     #[test]

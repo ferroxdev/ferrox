@@ -459,6 +459,9 @@ impl Session {
     }
 
     pub(crate) fn send(&self, id: u16, data: &[u8]) -> bool {
+        if data.len() > ferrox_core::mux::CHUNK_MAX {
+            return false;
+        }
         let keep = ferrox_core::mux::Outgoing {
             id,
             status: ferrox_core::mux::Status::Keep,
