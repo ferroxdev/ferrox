@@ -2408,14 +2408,13 @@ fn packet_tunnel_loop(
 ) {
     let mut logged: Option<Instant> = None;
     loop {
-        let Some(inner) = lane.upgrade() else {
-            return;
-        };
-        if inner.stopping.load(Ordering::Acquire) {
+        if lane.strong_count() == 0 {
             return;
         }
-        let outcome = packet_tunnel_once(&inner, &mut device, dns);
-        drop(inner);
+        let outcome = packet_tunnel_once(lane, &mut device, dns);
+        if lane.strong_count() == 0 {
+            return;
+        }
         if let Err(why) = outcome {
             let now = Instant::now();
             if logged.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(10)) {
@@ -2428,11 +2427,19 @@ fn packet_tunnel_loop(
 }
 
 fn packet_tunnel_once(
-    inner: &Inner,
+    lane: &Weak<Inner>,
     device: &mut crate::tun::Device,
     dns: crate::psiphon_packet_tunnel::Dns,
 ) -> Result<(), String> {
-    let session = inner.ensure()?;
+    let session = {
+        let Some(inner) = lane.upgrade() else {
+            return Ok(());
+        };
+        if inner.stopping.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        inner.ensure()?
+    };
     let channel = session.open_packet_tunnel()?;
     let writer = device
         .clone_writer()
@@ -2445,10 +2452,18 @@ fn packet_tunnel_once(
     thread::scope(|scope| {
         let failed_reader = &failed;
         let stop_reader = &stop;
+        let reader_lane = lane;
         let handle = scope.spawn(move || {
-            packet_tunnel_downstream(&mut downstream, writer, dns, failed_reader, stop_reader)
+            packet_tunnel_downstream(
+                &mut downstream,
+                writer,
+                dns,
+                failed_reader,
+                stop_reader,
+                reader_lane,
+            )
         });
-        let outcome = packet_tunnel_upstream(device, &mut upstream, dns, &failed);
+        let outcome = packet_tunnel_upstream(device, &mut upstream, dns, &failed, lane);
         stop.store(true, Ordering::Release);
         close.close();
         let read = handle
@@ -2465,6 +2480,7 @@ fn packet_tunnel_upstream(
     channel: &mut crate::psiphon_ssh::Channel,
     dns: crate::psiphon_packet_tunnel::Dns,
     failed: &AtomicBool,
+    lane: &Weak<Inner>,
 ) -> Result<(), String> {
     let fd = device.raw_fd();
     let mut packet = vec![0u8; crate::psiphon_packet_tunnel::MTU + 4];
@@ -2472,6 +2488,9 @@ fn packet_tunnel_upstream(
     loop {
         if failed.load(Ordering::Acquire) {
             return Err("packet tunnel reader stopped".to_owned());
+        }
+        if lane.strong_count() == 0 {
+            return Err("psiphon: the lane is stopping".to_owned());
         }
         let ready = crate::psiphon_packet_tunnel::wait_readable(fd, PACKET_TUNNEL_POLL_MS)
             .map_err(|error| format!("tun poll: {error}"))?;
@@ -2491,6 +2510,12 @@ fn packet_tunnel_upstream(
             Err(error) => return Err(format!("tun read: {error}")),
         }
         while batch.len() < PACKET_TUNNEL_BATCH {
+            if failed.load(Ordering::Acquire) {
+                return Err("packet tunnel reader stopped".to_owned());
+            }
+            if lane.strong_count() == 0 {
+                return Err("psiphon: the lane is stopping".to_owned());
+            }
             let ready = crate::psiphon_packet_tunnel::wait_readable(fd, 0)
                 .map_err(|error| format!("tun poll: {error}"))?;
             if !ready {
@@ -2523,9 +2548,13 @@ fn packet_tunnel_downstream(
     dns: crate::psiphon_packet_tunnel::Dns,
     failed: &AtomicBool,
     stop: &AtomicBool,
+    lane: &Weak<Inner>,
 ) -> Result<(), String> {
     let mut packet = Vec::with_capacity(crate::psiphon_packet_tunnel::MTU);
     loop {
+        if lane.strong_count() == 0 || stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let read = match crate::psiphon_packet_tunnel::read_frame(channel, &mut packet) {
             Ok(read) => read,
             Err(error) => {

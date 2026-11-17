@@ -718,13 +718,25 @@ impl Config {
         Some(with_port(&entry.addresses, port))
     }
 
+    /// A zero-TTL answer is not cached; a live TTL is raised to the configured floor.
+    fn cache_ttl(&self, ttl: Duration) -> Option<Duration> {
+        if ttl.is_zero() {
+            return None;
+        }
+        Some(ttl.max(self.cache_extension))
+    }
+
     /// Cache an answer for its TTL, evicting expired entries at the limit.
     fn cache_put(&self, host: &str, addresses: Vec<IpAddr>, ttl: Duration) {
         if addresses.is_empty() {
             return;
         }
-        let ttl = ttl.saturating_add(self.cache_extension);
+        let ttl = self.cache_ttl(ttl);
         let Ok(mut cache) = self.cache.lock() else {
+            return;
+        };
+        let Some(ttl) = ttl else {
+            cache.remove(host);
             return;
         };
         if cache.len() >= CACHE_LIMIT {
@@ -737,7 +749,7 @@ impl Config {
             host.to_owned(),
             CacheEntry {
                 addresses,
-                expires: Instant::now() + ttl.max(Duration::from_secs(1)),
+                expires: Instant::now() + ttl,
             },
         );
     }
@@ -1295,10 +1307,12 @@ fn parse_reply(
             .get(at..at + length)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short DNS record"))?;
         at += length;
+        if class == 1 && (kind == record || kind == 5) {
+            ttl = ttl.min(Duration::from_secs(u64::from(seconds)));
+        }
         if kind != record || class != 1 {
             continue;
         }
-        ttl = ttl.min(Duration::from_secs(u64::from(seconds)));
         match (kind, data) {
             (1, [a, b, c, d]) => addresses.push(IpAddr::V4(Ipv4Addr::new(*a, *b, *c, *d))),
             (28, bytes) if bytes.len() == 16 => {
@@ -1351,6 +1365,7 @@ mod tests {
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn a_literal_address_needs_no_query() {
@@ -1537,6 +1552,49 @@ mod tests {
         responder.join().expect("responder");
         let second = resolve_with(&config, "psiphon.test", 443).expect("cached");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_zero_ttl_answer_is_not_cached() {
+        let config = Config::from_servers(&[]);
+        config.cache_put(
+            "psiphon.test",
+            vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))],
+            Duration::ZERO,
+        );
+        assert!(config.cache_addrs("psiphon.test", 443).is_none());
+    }
+
+    #[test]
+    fn a_zero_ttl_answer_drops_an_existing_entry() {
+        let config = Config::from_servers(&[]);
+        config.cache_put(
+            "psiphon.test",
+            vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))],
+            Duration::from_secs(60),
+        );
+        assert!(config.cache_addrs("psiphon.test", 443).is_some());
+        config.cache_put(
+            "psiphon.test",
+            vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8))],
+            Duration::ZERO,
+        );
+        assert!(config.cache_addrs("psiphon.test", 443).is_none());
+    }
+
+    #[test]
+    fn the_cache_extension_is_a_floor_not_an_addition() {
+        let mut config = Config::from_servers(&[]);
+        config.cache_extension = Duration::from_secs(3600);
+        assert_eq!(
+            config.cache_ttl(Duration::from_secs(60)),
+            Some(Duration::from_secs(3600))
+        );
+        assert_eq!(
+            config.cache_ttl(Duration::from_secs(7200)),
+            Some(Duration::from_secs(7200))
+        );
+        assert_eq!(config.cache_ttl(Duration::ZERO), None);
     }
 
     #[test]

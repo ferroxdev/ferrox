@@ -5413,6 +5413,53 @@ mod tests {
     }
 
     #[test]
+    fn a_packet_tunnel_channel_uses_its_own_adjust_threshold() {
+        let payloads = [vec![0u8; 8192], vec![0u8; 8192]];
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let mut channel = test_channel_with_chunks(&refs);
+        Arc::get_mut(&mut channel.state)
+            .expect("unique channel state")
+            .window = 32 * 1024;
+        let (_, first) = channel.take_chunk();
+        assert_eq!(first, 0);
+        let (_, second) = channel.take_chunk();
+        assert_eq!(
+            second,
+            16 * 1024,
+            "the adjust threshold followed the session window, not the channel's"
+        );
+
+        let mut channel = test_channel_with_chunks(&refs);
+        Arc::get_mut(&mut channel.state)
+            .expect("unique channel state")
+            .window = 32 * 1024;
+        let mut out = vec![0u8; 8192];
+        assert_eq!(channel.read(&mut out).expect("first read"), out.len());
+        let before = lock(&channel.state.recv).local_window;
+        assert_eq!(channel.read(&mut out).expect("second read"), out.len());
+        let after = lock(&channel.state.recv).local_window;
+        assert_eq!(
+            after - before,
+            16 * 1024,
+            "the read path used the session window"
+        );
+
+        let mut channel = test_channel_with_chunks(&refs);
+        Arc::get_mut(&mut channel.state)
+            .expect("unique channel state")
+            .window = 32 * 1024;
+        let before = lock(&channel.state.recv).local_window;
+        let mut batch = Vec::new();
+        assert!(channel.next_batch(&mut batch, 2).expect("batch"));
+        let after = lock(&channel.state.recv).local_window;
+        assert_eq!(
+            after - before,
+            16 * 1024,
+            "the batch path used the session window"
+        );
+    }
+
+    #[test]
     fn rc4_matches_the_known_vector() {
         let mut rc4 = Rc4::new(b"Key");
         let mut data = *b"Plaintext";

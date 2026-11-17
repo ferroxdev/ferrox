@@ -48,7 +48,7 @@ const PMTU_STEP: usize = 100;
 const PMTU_MIN_STEP: usize = 16;
 const PMTU_MAX_LOSSES: u8 = 4;
 const PMTU_BACKOFF: Duration = Duration::from_millis(250);
-const INPROXY_PACKET_ADJUSTMENT: usize = 109;
+const INPROXY_PACKET_ADJUSTMENT: usize = 110;
 const MAX_UDP_PAYLOAD: u64 = 1439;
 const INITIAL_WINDOW: u64 = 8 * 1024 * 1024;
 const STREAM_WINDOW: u64 = 8 * 1024 * 1024;
@@ -442,6 +442,10 @@ fn packet_io(
     if !obfuscated {
         return Udp::Plain(io);
     }
+    let limit = match &io {
+        PacketIo::WebRtc(stream) => stream.media_payload_limit().unwrap_or(MAX_PACKET_SIZE),
+        PacketIo::Socket(_) => MAX_PACKET_SIZE,
+    };
     Udp::Obfuscated(ObfuscatedUdp {
         io,
         key: packet_key,
@@ -452,6 +456,7 @@ fn packet_io(
         } else {
             None
         },
+        limit,
     })
 }
 
@@ -1112,11 +1117,12 @@ struct ObfuscatedUdp {
     nonce: [u8; 12],
     nonce_transform: Option<std::sync::Arc<Vec<crate::psiphon_dns::Transform>>>,
     decoy: Option<u8>,
+    limit: usize,
 }
 
 impl ObfuscatedUdp {
     fn send(&mut self, plain: &[u8]) -> io::Result<usize> {
-        if plain.len() > MAX_PACKET_SIZE - OBFUSCATION_OVERHEAD {
+        if plain.len() > self.limit.saturating_sub(OBFUSCATION_OVERHEAD) {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
                 "psiphon quic packet too long",
@@ -1130,7 +1136,13 @@ impl ObfuscatedUdp {
                 &mut self.nonce,
             )
             .map_err(io::Error::other)?;
-            let max_padding = PADDING_LIMIT.saturating_sub(plain.len()).min(255);
+            let max_padding = PADDING_LIMIT
+                .saturating_sub(plain.len())
+                .min(
+                    self.limit
+                        .saturating_sub(OBFUSCATION_OVERHEAD + plain.len()),
+                )
+                .min(255);
             let padding = bounded_random(max_padding + 1);
             framed[..12].copy_from_slice(&self.nonce);
             framed[12] = padding as u8;
@@ -1810,16 +1822,16 @@ impl Engine {
                 }
             }
         } else if self.crypto_pending(space) {
-            let data = &self.crypto_send[space][self.crypto_sent[space]..];
-            let len = data
-                .len()
+            let start = self.crypto_sent[space];
+            let len = (self.crypto_send[space].len() - start)
                 .min(self.max_payload_room(space, payload.len() - head));
             if len > 0 {
-                let offset = self.crypto_sent[space] as u64;
+                let offset = start as u64;
                 payload.push(0x06);
                 put_varint(&mut payload, offset);
                 put_varint(&mut payload, len as u64);
-                payload.extend_from_slice(&data[..len]);
+                payload.extend_from_slice(&self.crypto_send[space][start..start + len]);
+                self.crypto_sent[space] += len;
                 crypto_frame = Some((offset, len as u64));
                 ack_eliciting = true;
             }
@@ -1917,7 +1929,10 @@ impl Engine {
             self.max_datagram
                 .saturating_sub(1 + self.dcid.len() + 4 + 16 + used + 16)
         } else {
-            self.max_datagram.min(MAX_PAYLOAD).saturating_sub(used)
+            let header = long_header_len(space == INITIAL, self.dcid.len(), self.scid.len(), 4);
+            self.max_datagram
+                .min(MAX_PAYLOAD)
+                .saturating_sub(header + 16 + used + 16)
         }
     }
 
@@ -3073,8 +3088,9 @@ mod tests {
         get_varint, get_varint_byte, lock, mint_obfuscated_sessions, noise_expand,
         quic_server_name, randomize_cipher_suites, randomize_kx_groups, sessions, transport_params,
         Engine, ObfuscatedUdp, PacketIo, QuicNoise, SentPacket, Udp, INITIAL, INITIAL_CWND,
-        MAX_PACKET_SIZE, OBFUSCATION_OVERHEAD, ONE_RTT, PASSTHROUGH_RANDOM, PENDING_ORDER_SEED,
-        PMTU_BACKOFF, PMTU_MIN_STEP, PMTU_STEP,
+        INPROXY_PACKET_ADJUSTMENT, MAX_PACKET_SIZE, MAX_PAYLOAD, MIN_DATAGRAM,
+        OBFUSCATION_OVERHEAD, ONE_RTT, PASSTHROUGH_RANDOM, PENDING_ORDER_SEED, PMTU_BACKOFF,
+        PMTU_MIN_STEP, PMTU_STEP,
     };
     use rustls::client::ClientSessionMemoryCache;
     use rustls::crypto::SecureRandom as _;
@@ -3327,6 +3343,7 @@ mod tests {
             nonce: [0u8; 12],
             nonce_transform: None,
             decoy: None,
+            limit: MAX_PACKET_SIZE,
         };
         let mut receiver = ObfuscatedUdp {
             io: PacketIo::Socket(left),
@@ -3334,6 +3351,7 @@ mod tests {
             nonce: [0u8; 12],
             nonce_transform: None,
             decoy: None,
+            limit: MAX_PACKET_SIZE,
         };
         for length in [1usize, 13, 64, 255, 1199, 1200, 1267] {
             let plain: Vec<u8> = (0..length).map(|index| index as u8 | 0x40).collect();
@@ -3445,12 +3463,12 @@ mod tests {
     #[test]
     fn an_inproxy_initial_fits_the_media_payload() {
         let mut engine = test_engine();
-        engine.packet_limit = 1171;
-        engine.max_datagram = 1171;
+        engine.packet_limit = MIN_DATAGRAM - INPROXY_PACKET_ADJUSTMENT;
+        engine.max_datagram = engine.packet_limit;
         let mut payload = Vec::new();
         engine.pad_initial(&mut payload, 0);
         let packet = engine.seal(INITIAL, 0, &payload).expect("initial");
-        assert!(packet.len() <= 1171);
+        assert!(packet.len() <= engine.packet_limit);
     }
 
     #[test]
@@ -3595,6 +3613,39 @@ mod tests {
             engine.stream_sent > 0,
             "the stream did not follow the probe"
         );
+    }
+
+    #[test]
+    fn a_crypto_frame_advances_its_send_cursor() {
+        let mut engine = test_engine();
+        engine.crypto_send[INITIAL] = vec![0xab; 3000];
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("timeout");
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
+        socket
+            .connect(receiver.local_addr().expect("receiver address"))
+            .expect("connect");
+        let mut udp = Udp::Plain(PacketIo::Socket(socket));
+        assert!(engine
+            .send_space(INITIAL, &mut udp, Instant::now())
+            .expect("first crypto frame"));
+        let first = engine.crypto_sent[INITIAL];
+        assert!(first > 0, "the first crypto frame sent nothing");
+        assert!(engine
+            .send_space(INITIAL, &mut udp, Instant::now())
+            .expect("second crypto frame"));
+        assert!(
+            engine.crypto_sent[INITIAL] > first,
+            "the crypto cursor did not advance, so a multi-packet handshake stalls"
+        );
+        let mut datagram = [0u8; MAX_PACKET_SIZE + 64];
+        let target = engine.max_datagram.min(MAX_PAYLOAD);
+        let first_len = receiver.recv(&mut datagram).expect("first datagram");
+        assert!(first_len <= target, "{first_len} > {target}");
+        let second_len = receiver.recv(&mut datagram).expect("second datagram");
+        assert!(second_len <= target, "{second_len} > {target}");
     }
 
     #[test]

@@ -1397,7 +1397,7 @@ fn decode_depth(bytes: &[u8], depth: usize) -> Option<(Value, usize)> {
     used += 1;
     match major {
         0 => Some((Value::UInt(argument), used)),
-        1 => Some((Value::Int(-1 - argument.cast_signed()), used)),
+        1 => Some((Value::Int(-1 - i64::try_from(argument).ok()?), used)),
         2 | 3 => {
             let length = usize::try_from(argument).ok()?;
             let start = used;
@@ -1502,6 +1502,16 @@ mod tests {
             encode(&value),
             vec![0xa3, 0x01, 0x02, 0x18, 0x18, 0x01, 0x62, 0x61, 0x61, 0x03,]
         );
+    }
+
+    #[test]
+    fn a_negative_integer_wider_than_i64_is_rejected() {
+        let mut too_wide = vec![0x3b];
+        too_wide.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(decode(&too_wide), None);
+        let mut minimum = vec![0x3b];
+        minimum.extend_from_slice(&(i64::MAX as u64).to_be_bytes());
+        assert_eq!(decode(&minimum), Some((Value::Int(i64::MIN), 9)));
     }
 
     /// The reference decode the one-load read is measured against: the byte loop the encoder was
