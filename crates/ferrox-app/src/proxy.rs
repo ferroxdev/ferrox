@@ -20856,45 +20856,35 @@ fn dial_tls_session(
     Some(session)
 }
 
-// The handle a sealed writer puts its records on: the write clock must live on this duplicate, not on the session's own descriptor, because Windows gives each duplicate its own clock.
-trait WriteClock {
-    fn write_clock(&self) -> Option<Connection>;
+// The handle a split's writer puts its records on: a socket becomes the sealed wire itself, so the write clock lives on the handle that sends and the split buys no second descriptor for it.
+trait WriteClock: Write + Send + Sized + 'static {
+    fn into_sealed(self) -> Sealed;
 }
 
 impl WriteClock for Connection {
-    fn write_clock(&self) -> Option<Connection> {
-        self.try_clone().ok()
+    fn into_sealed(self) -> Sealed {
+        Sealed::wired(self)
     }
 }
 
 impl WriteClock for KcpIo {
-    fn write_clock(&self) -> Option<Connection> {
-        None
-    }
-}
-
-impl WriteClock for std::io::Sink {
-    fn write_clock(&self) -> Option<Connection> {
-        None
+    fn into_sealed(self) -> Sealed {
+        Sealed::new(self)
     }
 }
 
 // One session, two owners: the reader drives the transport when the session exposes one, so its parked read holds no session lock.
 fn session_halves<S, W>(session: S, transport: W) -> (TlsHalf<S>, TlsHalf<S>)
 where
-    W: Write + Send + 'static + WriteClock,
+    W: WriteClock,
     S: ferrox_core::tls::TlsProvider
         + ferrox_core::tls::RecordAlignment
         + Drivable
         + Send
         + 'static,
 {
-    let clock = transport.write_clock();
-    // The clock handle is the one that writes, so the transport is not duplicated a second time.
-    let out = Arc::new(Mutex::new(match clock {
-        Some(wire) => Sealed::wired(wire),
-        None => Sealed::new(transport),
-    }));
+    // A socket's writer sends on the handle it was handed, so the split spends no second duplicate on a clock.
+    let out = Arc::new(Mutex::new(transport.into_sealed()));
     let cipher = session.transport().and_then(|cipher| {
         cipher
             .set_read_timeout(Some(RELAY_POLL))
@@ -21429,8 +21419,7 @@ impl Sealed {
         }
     }
 
-    /// A split whose transport is a socket writes through the armed handle alone, so it needs no
-    /// second descriptor to fall back to.
+    /// A socket writer sends through the one handle it owns; the boxed fallback is never read.
     fn wired(wire: Connection) -> Self {
         Self {
             transport: Box::new(std::io::sink()),
@@ -65702,8 +65691,8 @@ mod tests {
     }
 
     impl WriteClock for CountedTransport {
-        fn write_clock(&self) -> Option<Connection> {
-            None
+        fn into_sealed(self) -> Sealed {
+            Sealed::new(self)
         }
     }
 
