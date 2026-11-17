@@ -1924,9 +1924,11 @@ fn lock_state(path: &Path) -> Result<std::fs::File, String> {
         })?;
     for _ in 0..200 {
         match file.try_lock() {
-            Ok(true) => return Ok(file),
-            Ok(false) => std::thread::sleep(std::time::Duration::from_millis(10)),
-            Err(error) => {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
                 return Err(format!(
                     "could not lock {}: {error}; nothing was written",
                     lock.display()

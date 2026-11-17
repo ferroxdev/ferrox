@@ -11,7 +11,7 @@ pub fn run(args: &[String]) -> i32 {
         eprintln!("make-tls needs one argument: the directory for cert.pem and key.pem");
         return 2;
     };
-    if let Err(e) = write_pair(std::path::Path::new(dir), ensure) {
+    if let Err(e) = write_pair(std::path::Path::new(dir.as_str()), ensure) {
         eprintln!("make-tls: {e}");
         return 1;
     }
