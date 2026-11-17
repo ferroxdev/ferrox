@@ -231,7 +231,7 @@ jobs:
           }
           fetch_mb() {
             local front="$1" port="$2" file="$3" label="$4" code=0 timing got
-            timing=$(via "$front" "$port" --max-time 300 \
+            timing=$(via "$front" "$port" --max-time 300 --limit-rate 1m \
               -w '%{size_download} %{time_total} %{speed_download}' \
               'https://speed.cloudflare.com/__down?bytes=10000000' -o "$file") || code=$?
             echo "$label ${timing:-0 0 0}" >> psiphon-legs.tsv
