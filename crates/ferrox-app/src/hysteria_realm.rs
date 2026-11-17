@@ -967,7 +967,7 @@ fn map_via_gateway(
     let base = url_base.as_deref().unwrap_or(location);
     let control = ferrox_core::portmap::join_control(Some(base), &service.control_url);
     let (control_host, control_port, control_path) = ferrox_core::portmap::split_url(&control)?;
-    let internal_client = reachable_client(internal_client, &gateway_host, gateway_port)?;
+    let internal_client = reachable_client(internal_client, &control_host, control_port)?;
     let mut body = [0u8; 4096];
     let lease = u32::try_from(lifetime_secs).unwrap_or(u32::MAX);
     let written = ferrox_core::portmap::add_mapping_body(

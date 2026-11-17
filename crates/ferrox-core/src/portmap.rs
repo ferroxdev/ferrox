@@ -266,7 +266,11 @@ fn resolve_dot_segments(url: &str) -> String {
         return url.to_owned();
     };
     let origin = &url[..path_start];
-    let path = &url[path_start..];
+    let path_and_query = &url[path_start..];
+    let split = path_and_query
+        .find(['?', '#'])
+        .unwrap_or(path_and_query.len());
+    let (path, suffix) = path_and_query.split_at(split);
     let absolute = path.starts_with('/');
     let mut segments: Vec<&str> = Vec::new();
     for segment in path.split('/').skip(usize::from(absolute)) {
@@ -289,6 +293,7 @@ fn resolve_dot_segments(url: &str) -> String {
     {
         out.push('/');
     }
+    out.push_str(suffix);
     out
 }
 
@@ -420,6 +425,10 @@ mod tests {
         assert_eq!(
             join_control(Some("http://192.168.1.1/igd/root.xml"), "/igd//ctl"),
             "http://192.168.1.1/igd//ctl"
+        );
+        assert_eq!(
+            join_control(Some("http://192.168.1.1/root.xml"), "/ctl?next=/../x"),
+            "http://192.168.1.1/ctl?next=/../x"
         );
         assert!(parse_root_desc("<root></root>").is_none());
     }

@@ -98,11 +98,11 @@ fn main() {
     let writer_thread = thread::spawn(move || {
         wconn.write(&p2).unwrap();
     });
-    writer_thread.join().unwrap();
     if let Err(error) = reader.join().expect("reader thread") {
         eprintln!("read failed before the echo completed: {error}");
         std::process::exit(1);
     }
+    writer_thread.join().unwrap();
     let elapsed = start.elapsed();
     let bytes = received.load(Ordering::SeqCst);
     if bytes != payload.len() {
