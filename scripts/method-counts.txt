@@ -506,7 +506,7 @@ carrier-quic bbr-profiles 3 ferrox-app-quic::tests::the_three_profiles_move_the_
 carrier-quic bbr-knobs-set-by-a-profile 8 ferrox-app-quic::tests::the_three_profiles_move_the_gains_and_nothing_else
 carrier-quic standard-profile-overrides 0 ferrox-app-quic::tests::the_three_profiles_move_the_gains_and_nothing_else
 
-reality-tls ops-retired-instructions UNBLESSED scripts/count-ops.sh
+reality-tls ops-retired-instructions 202 scripts/count-ops.sh
 reality-tls tls-providers 1 ferrox-core::active_backends
 reality-tls client-outbound-rows-dialled 6 ferrox-app-proxy::tests::vless_outbound_with_reality_dials_raw_and_every_carrier
 reality-tls client-carriers-roundtrip-verified 1 ferrox-app-proxy::tests::reality_ws_dial_reaches_echo_through_the_relay
@@ -544,6 +544,7 @@ reality-tls transport-reads-per-answer-write 0 ferrox-core-tls::rustls_backend::
 reality-tls relay-write-waits-for-a-parked-read 0 ferrox-app-proxy::tests::a_relay_write_goes_out_while_the_reader_is_parked
 reality-tls session-write-waits-for-a-parked-read 0 ferrox-app-proxy::tests::a_session_write_goes_out_while_its_read_is_parked
 reality-tls session-read-waits-for-a-parked-write 0 ferrox-app-proxy::tests::a_session_read_runs_while_its_write_is_parked
+reality-tls tls-split-wire-descriptors 1 ferrox-app-proxy::tests::a_split_buys_no_descriptor_for_its_wire
 reality-tls transport-reads-behind-ready-plaintext 0 ferrox-app-proxy::tests::a_driven_read_hands_over_ready_plaintext_without_another_transport_read
 reality-tls driven-session-opens-per-steady-read 1 ferrox-app-proxy::tests::a_steady_read_opens_the_session_once
 reality-tls relay-reads-on-an-unarmed-handle 0 ferrox-app-proxy::tests::the_socket_half_reads_on_the_armed_handle
