@@ -95,8 +95,8 @@ const MAX_QUEUES: usize = 4;
 pub(crate) struct Spec {
     name: String,
     mtu: usize,
-    address: IpAddr,
-    prefix: u8,
+    /// Every address the config names, the first being the one `address()` and `prefix()` hand a single-address caller.
+    addresses: Vec<(IpAddr, u8)>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     queues: usize,
     udp_idle: std::time::Duration,
@@ -117,11 +117,7 @@ impl Spec {
         queues: Option<usize>,
     ) -> Self {
         let address = address.unwrap_or(DEFAULT_ADDRESS);
-        let prefix = prefix.unwrap_or(if address.is_ipv6() {
-            DEFAULT_PREFIX_V6
-        } else {
-            DEFAULT_PREFIX
-        });
+        let prefix = prefix.unwrap_or_else(|| default_prefix(address));
         // macOS only accepts `utunN`, and the reference lets the system name its own device; elsewhere the stable name keeps a restart on the same interface.
         let name = name.filter(|n| !n.is_empty()).map_or_else(
             || {
@@ -136,8 +132,7 @@ impl Spec {
         Self {
             name,
             mtu: mtu.filter(|m| *m > 0).unwrap_or(DEFAULT_MTU),
-            address,
-            prefix,
+            addresses: vec![(address, prefix)],
             queues: queues.unwrap_or_else(default_queues),
             udp_idle: budgets::udp_idle(),
             endpoint_independent_nat: false,
@@ -171,6 +166,14 @@ impl Spec {
         self.endpoint_independent_nat
     }
 
+    /// The rest of the config's addresses: the device gets every one of them, so a config that names a second address is not narrowed.
+    pub(crate) fn with_addresses(mut self, addresses: Vec<(IpAddr, u8)>) -> Self {
+        if !addresses.is_empty() {
+            self.addresses = addresses;
+        }
+        self
+    }
+
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn gso(&self) -> bool {
         self.gso
@@ -184,12 +187,18 @@ impl Spec {
         self.mtu
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn address(&self) -> IpAddr {
-        self.address
+        self.addresses[0].0
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn prefix(&self) -> u8 {
-        self.prefix
+        self.addresses[0].1
+    }
+
+    pub(crate) fn addresses(&self) -> &[(IpAddr, u8)] {
+        &self.addresses
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -204,15 +213,14 @@ impl Spec {
                 format!("tun mtu {} exceeds 65535", self.mtu),
             ));
         }
-        let max_prefix = if self.address.is_ipv6() { 128 } else { 32 };
-        if self.prefix > max_prefix {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "tun prefix /{} is outside /0../{max_prefix} for {}",
-                    self.prefix, self.address
-                ),
-            ));
+        for (address, prefix) in &self.addresses {
+            let max_prefix = if address.is_ipv6() { 128 } else { 32 };
+            if *prefix > max_prefix {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("tun prefix /{prefix} is outside /0../{max_prefix} for {address}"),
+                ));
+            }
         }
         let max_queues = if cfg!(target_os = "linux") {
             MAX_QUEUES
@@ -237,6 +245,15 @@ pub(crate) fn default_queues() -> usize {
         std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_QUEUES))
     } else {
         1
+    }
+}
+
+/// The prefix a family gets when a config names only the address.
+pub(crate) fn default_prefix(address: IpAddr) -> u8 {
+    if address.is_ipv6() {
+        DEFAULT_PREFIX_V6
+    } else {
+        DEFAULT_PREFIX
     }
 }
 
@@ -3656,10 +3673,17 @@ mod tests {
             "an answer that did not come is counted against the wait"
         );
         flow.misses.store(PING_PONG_MISSES, Relaxed);
+        far.write_all(b"late").unwrap();
         assert_eq!(
             handler.serve_inline(&mut lane, &flow),
             Served::None,
-            "a flow that stopped landing answers is read once and not waited on"
+            "a flow that stopped landing answers takes no read at all"
+        );
+        let mut held = [0u8; 4];
+        lane.read_exact(&mut held).unwrap();
+        assert_eq!(
+            &held, b"late",
+            "the bytes stay on the lane for the response thread, which is the proof the queue never read them"
         );
     }
 
