@@ -5225,19 +5225,6 @@ impl PooledFlow {
         }
     }
 
-    fn end_upload(&self) {
-        match self {
-            Self::Cool(flow) => flow.end_upload(),
-            Self::Sing(flow) => flow.end_upload(),
-        }
-    }
-
-    fn release(self) {
-        if let Self::Cool(flow) = self {
-            flow.release();
-        }
-    }
-
     fn close(self) {
         match self {
             Self::Cool(flow) => flow.close(),
@@ -19864,9 +19851,8 @@ fn relay_pool_flow(client: &Connection, mut flow: PooledFlow) {
             }
         }
     }
-    flow.end_upload();
+    flow.close();
     join(&done);
-    flow.release();
 }
 
 /// One session's replies as the client's downlink: every `Keep` payload is written in arrival order,

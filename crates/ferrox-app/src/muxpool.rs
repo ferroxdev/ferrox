@@ -68,10 +68,6 @@ impl Flow {
             .frame(self.id, mux::Status::End, 0, None, None, &[]);
     }
 
-    pub(crate) fn release(self) {
-        self.carrier.release(self.id);
-    }
-
     pub(crate) fn close(self) {
         // End is on the wire before the id returns to the table; the writer lock orders every frame.
         self.end_upload();
