@@ -5892,7 +5892,6 @@ mod tests {
             pool: Arc::clone(&pool),
         });
         lock(&inner.channels).insert(1, Arc::clone(&state));
-
         let mut confirm = vec![MSG_CHANNEL_OPEN_CONFIRMATION];
         put_u32(&mut confirm, 1);
         put_u32(&mut confirm, 2);
@@ -6265,9 +6264,10 @@ mod tests {
         assert_eq!(queued.queued, 2048);
         assert_eq!(queued.chunks.len(), 1);
         drop(queued);
+        let payload = vec![b'x'; 34000];
         let mut packet = vec![MSG_CHANNEL_DATA];
         put_u32(&mut packet, 1);
-        put_str(&mut packet, &[b'x'; 34000]);
+        put_str(&mut packet, &payload);
         let end = packet.len();
         assert!(matches!(
             dispatch(
