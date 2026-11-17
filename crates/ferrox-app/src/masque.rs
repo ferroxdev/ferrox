@@ -4803,10 +4803,7 @@ mod tests {
         assert_eq!(family.network, 0);
         assert_eq!(family.first, 1);
         assert_eq!(family.last, u128::from(u32::MAX) - 1);
-        assert_eq!(
-            pool.assign(),
-            vec!["0.0.0.2".parse::<IpAddr>().expect("an address")]
-        );
+        assert_eq!(pool.assign(), vec![IpAddr::V4(Ipv4Addr::from(2))]);
     }
 
     #[test]
