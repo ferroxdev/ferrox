@@ -1343,8 +1343,81 @@ pub(crate) fn outbound_tls(
         kernel_tx: tls_kernel(tls, "kernel_tx"),
         kernel_rx: tls_kernel(tls, "kernel_rx"),
         sni: outbound_sni_spoof(outbound)?,
+        fragment: outbound_tls_fragment(tls, outbound)?,
         ..Default::default()
     }))
+}
+
+/// The `ClientHello` cut a TLS outbound arms. `evasion.fragment` is the same stage the raw carrier's
+/// `finalmask.tcp` names; sing-box's `tlsSettings.fragment` cuts the first write at a random byte and
+/// `recordFragment` puts one record boundary inside every server-name label, with
+/// `fragmentFallbackDelay` between the pieces. A stage that cannot advance is refused, never sent
+/// whole, because a config that asked for a cut and got none is the silent no-op this row fixes.
+fn outbound_tls_fragment(
+    tls: Option<&Json>,
+    outbound: &Json,
+) -> Result<Option<ferrox_core::finalmask::Fragment>, String> {
+    use ferrox_core::finalmask::{Fragment, Range};
+    if let Some(node) = outbound
+        .get("evasion")
+        .and_then(|evasion| evasion.get("fragment"))
+        .filter(|value| !matches!(value, Json::Null))
+    {
+        return fragment(Some(node))
+            .map(Some)
+            .ok_or_else(|| "evasion.fragment is not a stage this tree can drive".to_owned());
+    }
+    let split = matches!(tls.and_then(|t| t.get("fragment")), Some(Json::Bool(true)));
+    let records = matches!(
+        tls.and_then(|t| t.get("recordFragment").or_else(|| t.get("record_fragment"))),
+        Some(Json::Bool(true))
+    );
+    if !split && !records {
+        return Ok(None);
+    }
+    let wait = match tls.and_then(|t| {
+        t.get("fragmentFallbackDelay")
+            .or_else(|| t.get("fragment_fallback_delay"))
+    }) {
+        None | Some(Json::Null) => 0,
+        Some(node) => duration_ms(node)
+            .ok_or("tlsSettings.fragmentFallbackDelay must be a non-negative duration")?,
+    };
+    let wait = i64::try_from(wait).unwrap_or(i64::MAX);
+    let stage = Fragment::new(
+        u64::from(!records),
+        1,
+        vec![Range::ordered(1, 32_768)],
+        vec![Range::ordered(wait, wait)],
+        Range::ordered(0, 0),
+    )
+    .ok_or("tlsSettings.fragment is not a stage this tree can drive")?;
+    Ok(Some(if records { stage.sni() } else { stage }))
+}
+
+/// A wait in milliseconds: a bare number is milliseconds, a string may carry `ms`, `s`, `m` or `h`.
+fn duration_ms(node: &Json) -> Option<u64> {
+    match node {
+        Json::Num(value) if *value >= 0.0 && value.is_finite() => Some(*value as u64),
+        Json::Str(text) => parse_duration_ms(text),
+        _ => None,
+    }
+}
+
+fn parse_duration_ms(text: &str) -> Option<u64> {
+    let text = text.trim();
+    for (suffix, scale) in [
+        ("ms", 1.0),
+        ("s", 1000.0),
+        ("m", 60_000.0),
+        ("h", 3_600_000.0),
+    ] {
+        if let Some(number) = text.strip_suffix(suffix) {
+            let value: f64 = number.trim().parse().ok()?;
+            return (value >= 0.0 && value.is_finite()).then_some((value * scale) as u64);
+        }
+    }
+    None
 }
 
 /// The outbound's `evasion.sniSpoof`: how the first hello keeps its server name from a filter that
@@ -1406,12 +1479,20 @@ fn outbound_sni_spoof(outbound: &Json) -> Result<Option<ferrox_core::evasion::Sn
     if fooling == DecoyFooling::Ttl && ttl == 0 {
         return Err("evasion.sniSpoof.ttl must be above zero for fooling \"ttl\"".to_owned());
     }
+    let mixed_case = matches!(
+        value
+            .get("mixedCase")
+            .or_else(|| value.get("mixed_case"))
+            .or_else(|| value.get("mixedCaseSni")),
+        Some(Json::Bool(true))
+    );
     Ok(Some(SniSpoof {
         fake_sni: fake_sni.to_owned(),
         sequence,
         method,
         fooling,
         ttl,
+        mixed_case,
     }))
 }
 
@@ -2563,7 +2644,7 @@ pub(crate) fn fragment(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Fr
         .unwrap_or("")
         .to_lowercase();
     let (packets_from, packets_to) = match packets.as_str() {
-        "tlshello" => (0, 1),
+        "tlshello" | "tlssni" => (0, 1),
         "" => (0, 0),
         // The reference reads a window as a range and refuses a low end of 0, which would make every write a hello.
         other => {
@@ -2585,13 +2666,18 @@ pub(crate) fn fragment(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Fr
                 |range| Some(vec![range]),
             )
     })?;
-    Fragment::new(
+    let stage = Fragment::new(
         packets_from,
         packets_to,
         widths,
         waits,
         single_range(conf, "maxSplit")?,
-    )
+    )?;
+    Some(if packets == "tlssni" {
+        stage.sni()
+    } else {
+        stage
+    })
 }
 
 /// One `sudoku` stage. The new spellings win only when they hold a value, exactly as the reference's
@@ -5035,7 +5121,7 @@ mod tests {
         };
         let tls = outbound_tls(
             &outbound(
-                r#""sniSpoof":{"method":"decoy","fakeSni":"cdn.example","sequence":7,"fooling":"ttl","ttl":4}"#,
+                r#""sniSpoof":{"method":"decoy","fakeSni":"cdn.example","sequence":7,"fooling":"ttl","ttl":4,"mixedCase":true}"#,
             ),
             "127.0.0.1",
         )
@@ -5046,10 +5132,12 @@ mod tests {
         assert_eq!(sni.sequence, 7);
         assert_eq!(sni.fooling, DecoyFooling::Ttl);
         assert_eq!(sni.ttl, 4);
-        assert!(outbound_tls(&outbound(""), "127.0.0.1")
+        assert!(sni.mixed_case);
+        assert!(!outbound_tls(&outbound(""), "127.0.0.1")
             .expect("builds")
             .sni
-            .is_none());
+            .as_ref()
+            .is_some_and(|sni| sni.mixed_case));
         for evasion in [
             r#""sniSpoof":{"method":"nope"}"#,
             r#""sniSpoof":{"method":"decoy","fakeSni":""}"#,
@@ -5061,6 +5149,55 @@ mod tests {
                 "{evasion} is refused"
             );
         }
+    }
+
+    /// The TLS settings arm the `ClientHello` cut, and a stage that cannot advance is refused rather
+    /// than sent whole.
+    #[test]
+    fn a_tls_fragment_setting_reaches_the_dial() {
+        let outbound = |tls: &str| {
+            crate::json::parse(&format!(
+                r#"{{"streamSettings":{{"security":"tls","tlsSettings":{{"serverName":"tls.test","allowInsecure":true{tls}}}}}}}"#
+            ))
+            .expect("parses")
+        };
+        assert!(outbound_tls(&outbound(""), "127.0.0.1")
+            .expect("builds")
+            .fragment
+            .is_none());
+        for tls in [
+            r#","fragment":true"#,
+            r#","recordFragment":true"#,
+            r#","fragment":true,"recordFragment":true"#,
+            r#","recordFragment":true,"fragmentFallbackDelay":"250ms""#,
+        ] {
+            assert!(
+                outbound_tls(&outbound(tls), "127.0.0.1")
+                    .expect("builds")
+                    .fragment
+                    .is_some(),
+                "{tls} arms a cut"
+            );
+        }
+        assert!(outbound_tls(
+            &outbound(r#","fragment":true,"fragmentFallbackDelay":-1"#),
+            "127.0.0.1"
+        )
+        .is_err());
+        assert!(outbound_tls(
+            &outbound(r#","fragment":true,"fragmentFallbackDelay":"soon""#),
+            "127.0.0.1"
+        )
+        .is_err());
+
+        let evasion = crate::json::parse(
+            r#"{"evasion":{"fragment":{"packets":"tlssni","lengths":[40],"delays":[1]}},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"tls.test","allowInsecure":true}}}"#,
+        )
+        .expect("parses");
+        assert!(outbound_tls(&evasion, "127.0.0.1")
+            .expect("builds")
+            .fragment
+            .is_some());
     }
 
     #[test]

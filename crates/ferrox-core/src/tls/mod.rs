@@ -126,6 +126,10 @@ pub struct TlsConfig {
     /// How the dial keeps its server name from a filter that reads the first `ClientHello`, as the
     /// outbound's `evasion.sniSpoof` names it. `None` writes the hello as the backend does.
     pub sni: Option<crate::evasion::SniSpoof>,
+    /// The first-write cut the TLS settings arm (`fragment`, `recordFragment`, `evasion.fragment`),
+    /// applied under the backend so the `ClientHello` reaches the wire in pieces. `None` writes it
+    /// whole.
+    pub fragment: Option<crate::finalmask::Fragment>,
 }
 
 /// Whether a client build can offer a group a config named: the shaped hello draws its own key

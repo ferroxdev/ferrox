@@ -10541,6 +10541,7 @@ fn accept_tls_session(
     if stream.set_read_timeout(Some(budgets::handshake())).is_err() {
         return None;
     }
+    let stream = stream.read_past_mark();
     let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
         echo_trace("tls-server accept refused");
         return None;
@@ -20748,6 +20749,7 @@ fn arm_sni(cfg: &ferrox_core::tls::TlsConfig, uplink: Connection) -> Connection 
     let fallback = match sni.method {
         SniMethod::EmptyRecord => SniShape::EmptyRecord,
         SniMethod::Record => SniShape::Record,
+        SniMethod::Urgent => SniShape::Urgent,
         SniMethod::Auto | SniMethod::Decoy => match inject_sni_decoy(&uplink, sni) {
             Ok(true) => return uplink,
             Ok(false) => {
@@ -20761,14 +20763,12 @@ fn arm_sni(cfg: &ferrox_core::tls::TlsConfig, uplink: Connection) -> Connection 
                 SniShape::Record
             }
         },
-        SniMethod::Urgent | SniMethod::FastOpen => {
-            warn_sni(
-                "the urgent-byte and fast-open methods are not implemented; this dial rewrites the first record instead",
-            );
+        SniMethod::FastOpen => {
+            warn_sni("fast open is not implemented; this dial rewrites the first record instead");
             SniShape::Record
         }
     };
-    uplink.with_sni_shape(fallback)
+    uplink.with_sni(fallback, sni.mixed_case)
 }
 
 fn warn_sni(message: &str) {
@@ -20812,8 +20812,15 @@ fn dial_tls_session(
                 note_dial_failure(server, failure);
                 return None;
             }
-        }
-        .with_mask(mask);
+        };
+        let cut = current.fragment.as_ref().map(|fragment| {
+            mask.map_or_else(
+                || ferrox_core::finalmask::Chain::default().with_front(fragment),
+                |chain| chain.with_front(fragment),
+            )
+        });
+        let mask = cut.as_ref().or(mask);
+        let uplink = uplink.with_mask(mask);
         let uplink = arm_sni(current, uplink);
         let Ok(mut session) = ferrox_core::tls::connect(current, uplink) else {
             note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));

@@ -1225,6 +1225,9 @@ obfs-evasion noise-packets-per-count 3 ferrox-app-proxy::tests::a_noise_count_se
 obfs-evasion noise-entry-kinds-parsed 5 ferrox-app-proxy::tests::a_freedom_noise_keeps_its_packet_and_family
 obfs-evasion noise-overlay-precedence 1 ferrox-app-proxy::tests::a_finalmask_noise_wins_over_the_legacy_list
 obfs-evasion record-header-version-bytes 2 ferrox-app-conn::tests::a_record_shape_rewrites_one_header
+obfs-evasion sni-label-cuts 4 ferrox-core-evasion::tests::every_label_of_a_name_takes_a_cut_inside_it
+obfs-evasion mixed-case-name-octets 15 ferrox-core-evasion::tests::a_mixed_case_name_is_the_same_name_to_the_server
+obfs-evasion sni-record-count 5 ferrox-core-finalmask::tests::an_sni_record_is_cut_inside_the_name_and_arrives_whole
 obfs-evasion empty-record-octets 5 ferrox-app-conn::tests::an_empty_shape_precedes_one_record
 obfs-evasion noise-ops-retired-instructions UNBLESSED scripts/count-ops.sh
 obfs-evasion decoy-ops-retired-instructions UNBLESSED scripts/count-ops.sh

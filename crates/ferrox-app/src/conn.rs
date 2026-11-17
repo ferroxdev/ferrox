@@ -81,6 +81,9 @@ pub(crate) struct Masked {
     header: Option<std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::HeaderRun>>>,
     xmc: Option<std::sync::Arc<XmcState>>,
     sni: Option<std::sync::Arc<SniState>>,
+    /// The bytes this side has read, for the server's read-past-mark window; `None` leaves reads
+    /// untouched.
+    mark: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// The first-write rewrite an outbound's `sniSpoof` arms, shared by every handle of one stream
@@ -88,6 +91,7 @@ pub(crate) struct Masked {
 #[derive(Debug)]
 struct SniState {
     shape: ferrox_core::evasion::SniShape,
+    mixed_case: bool,
     done: std::sync::atomic::AtomicBool,
     written: std::sync::atomic::AtomicU8,
 }
@@ -96,7 +100,7 @@ struct SniState {
 enum SniArm {
     Plain,
     Rewrite(Vec<u8>),
-    Empty,
+    Empty { hello: Option<Vec<u8>> },
 }
 
 impl SniState {
@@ -115,12 +119,22 @@ impl SniState {
             return SniArm::Plain;
         }
         match self.shape {
-            ferrox_core::evasion::SniShape::Record => {
+            ferrox_core::evasion::SniShape::Record | ferrox_core::evasion::SniShape::Urgent => {
                 let mut record = buf.to_vec();
                 record[1..3].copy_from_slice(&ferrox_core::evasion::RECORD_VERSION);
+                if self.mixed_case {
+                    ferrox_core::evasion::mixed_case_sni(&mut record);
+                }
                 SniArm::Rewrite(record)
             }
-            ferrox_core::evasion::SniShape::EmptyRecord => SniArm::Empty,
+            ferrox_core::evasion::SniShape::EmptyRecord => {
+                let hello = self.mixed_case.then(|| {
+                    let mut record = buf.to_vec();
+                    ferrox_core::evasion::mixed_case_sni(&mut record);
+                    record
+                });
+                SniArm::Empty { hello }
+            }
         }
     }
 }
@@ -352,16 +366,23 @@ impl Masked {
     /// makes a writer, so a leg drained by reference masks exactly as one moved by value. An xmc
     /// session carries the same plaintext, so the record shape is applied before it too.
     fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(sni) = self.sni.as_deref() {
+            if let Some(sent) = self.try_urgent(sni, buf)? {
+                return Ok(sent);
+            }
+        }
         if let Some(session) = self.xmc_session()? {
             let armed = self.sni.as_deref().map(|sni| sni.arm(buf));
-            if matches!(armed, Some(SniArm::Empty)) {
+            let mut shaped = None;
+            if let Some(SniArm::Empty { hello }) = &armed {
                 if let Err(error) = (&*session).write_all(&ferrox_core::evasion::EMPTY_RECORD) {
                     return self.keep_shape(armed.as_ref(), Err(error));
                 }
+                shaped = hello.as_deref();
             }
             let buf = match &armed {
                 Some(SniArm::Rewrite(record)) => record.as_slice(),
-                _ => buf,
+                _ => shaped.unwrap_or(buf),
             };
             let outcome = (&*session).write(buf);
             return self.keep_shape(armed.as_ref(), outcome);
@@ -371,17 +392,98 @@ impl Masked {
             return Err(io::Error::other("the mask chain is gone"));
         };
         let armed = self.sni.as_deref().map(|sni| sni.arm(buf));
-        if matches!(armed, Some(SniArm::Empty)) {
+        let mut shaped = None;
+        if let Some(SniArm::Empty { hello }) = &armed {
             if let Err(error) = self.write_empty_record(&mut chain) {
                 return self.keep_shape(armed.as_ref(), Err(error));
             }
+            shaped = hello.as_deref();
         }
         let buf = match &armed {
             Some(SniArm::Rewrite(record)) => record.as_slice(),
-            _ => buf,
+            _ => shaped.unwrap_or(buf),
         };
         let outcome = chain.write(&mut &self.stream, buf);
         self.keep_shape(armed.as_ref(), outcome)
+    }
+
+    /// Whether the write path is the socket alone: no mask stage, no codec, no header handshake.
+    /// The urgent byte is sent on the descriptor, so a shaping stage between it and the wire would
+    /// be bypassed; that dial falls back to the record rewrite instead.
+    fn chain_is_plain(&self) -> bool {
+        self.chain.lock().is_ok_and(|chain| chain.is_empty())
+    }
+
+    /// The urgent-byte method: send the hello's first half with one extra byte marked `MSG_OOB`, so
+    /// the peer's stack removes the extra byte and a filter that rebuilds the stream keeps it.
+    /// `Some(sent)` is how much of `buf` went; `None` falls back to the record rewrite.
+    fn try_urgent(&self, sni: &SniState, buf: &[u8]) -> io::Result<Option<usize>> {
+        if sni.shape != ferrox_core::evasion::SniShape::Urgent
+            || sni.done.load(std::sync::atomic::Ordering::Acquire)
+            || buf.len() < 3
+            || buf[0] != 0x16
+            || buf[1] != 0x03
+            || !self.chain_is_plain()
+            || self.read_chain.is_some()
+            || self.xmc.is_some()
+            || self.header.is_some()
+        {
+            return Ok(None);
+        }
+        if sni.done.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(None);
+        }
+        let mut hello = buf.to_vec();
+        if sni.mixed_case {
+            ferrox_core::evasion::mixed_case_sni(&mut hello);
+        }
+        let Some(name) = ferrox_core::evasion::server_name_range(&hello) else {
+            sni.done.store(false, std::sync::atomic::Ordering::Release);
+            return Ok(None);
+        };
+        let cut = name.start + name.len() / 2;
+        hello.truncate(cut);
+        let mut draw = [0u8; 1];
+        let letter = getrandom::fill(&mut draw).map_or(b'a', |()| b'a' + draw[0] % 26);
+        hello.push(letter);
+        match self.urgent_send(&hello) {
+            Ok(true) => Ok(Some(cut)),
+            Ok(false) => {
+                sni.done.store(false, std::sync::atomic::Ordering::Release);
+                Ok(None)
+            }
+            Err(error) => {
+                sni.done.store(false, std::sync::atomic::Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn urgent_send(&self, bytes: &[u8]) -> io::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+        let sent = unsafe {
+            libc::send(
+                self.stream.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                libc::MSG_OOB | libc::MSG_NOSIGNAL,
+            )
+        };
+        match usize::try_from(sent) {
+            Ok(sent) if sent == bytes.len() => Ok(true),
+            Ok(0) => Ok(false),
+            Ok(_) => Err(io::Error::other(
+                "the urgent byte could not be sent whole; the connection is dropped",
+            )),
+            Err(_) => Ok(false),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn urgent_send(&self, _bytes: &[u8]) -> io::Result<bool> {
+        Ok(false)
     }
 
     /// The empty record is a byte the peer decodes, so it takes the chain like the hello does; it
@@ -411,7 +513,7 @@ impl Masked {
     /// A write that made no progress spent nothing, so the one-shot shape stays armed for the retry.
     fn keep_shape(&self, armed: Option<&SniArm>, outcome: io::Result<usize>) -> io::Result<usize> {
         if matches!(outcome, Err(_) | Ok(0))
-            && matches!(armed, Some(SniArm::Rewrite(_) | SniArm::Empty))
+            && matches!(armed, Some(SniArm::Rewrite(_) | SniArm::Empty { .. }))
         {
             if let Some(sni) = self.sni.as_deref() {
                 sni.done.store(false, std::sync::atomic::Ordering::Release);
@@ -441,14 +543,16 @@ impl Masked {
                 .as_deref()
                 .filter(|_| Some(index) == first)
                 .map(|sni| sni.arm(part));
-            if matches!(armed, Some(SniArm::Empty)) {
+            let mut shaped = None;
+            if let Some(SniArm::Empty { hello }) = &armed {
                 if let Err(error) = self.write_empty_record(&mut chain) {
                     return self.keep_shape(armed.as_ref(), Err(error));
                 }
+                shaped = hello.as_deref();
             }
             let part = match &armed {
                 Some(SniArm::Rewrite(record)) => record.as_slice(),
-                _ => *part,
+                _ => shaped.unwrap_or(*part),
             };
             match chain.write(&mut &self.stream, part) {
                 Ok(written) => total += written,
@@ -465,13 +569,56 @@ impl Masked {
         }
         self.ensure_header()?;
         let Some(chain) = &self.read_chain else {
-            return (&self.stream).read(buf);
+            let read = (&self.stream).read(buf)?;
+            return Ok(read + self.drain_past_mark(buf, read));
         };
         let Ok(mut chain) = chain.lock() else {
             return Err(io::Error::other("the mask chain is gone"));
         };
         let mut source = &self.stream;
         chain.read(&mut source, buf)
+    }
+
+    /// A blocking read stops at an urgent mark even when more arrived behind it, and the next
+    /// ordinary read then waits for a segment that never comes. In the first 16 KiB, one
+    /// nonblocking `recv` picks up whatever lies past the mark; after that the window is spent and
+    /// the drain costs a comparison, not a syscall. Only armed on a TLS inbound (`read_past_mark`).
+    fn drain_past_mark(&self, buf: &mut [u8], read: usize) -> usize {
+        let Some(mark) = &self.mark else {
+            return 0;
+        };
+        let seen = mark.load(std::sync::atomic::Ordering::Relaxed);
+        if read == 0 || seen >= 16 * 1024 || read >= buf.len() {
+            return 0;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let mut total = 0;
+            while read + total < buf.len() {
+                let at = read + total;
+                // SAFETY: `at` is inside `buf`; `recv` writes at most the room it is given, and only the bytes it reports are added to the length.
+                let got = unsafe {
+                    libc::recv(
+                        self.stream.as_raw_fd(),
+                        buf[at..].as_mut_ptr().cast(),
+                        buf.len() - at,
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                let Ok(got @ 1..) = usize::try_from(got) else {
+                    break;
+                };
+                total += got;
+            }
+            mark.fetch_add((read + total) as u64, std::sync::atomic::Ordering::Relaxed);
+            total
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (buf, read);
+            0
+        }
     }
 
     fn recv_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
@@ -644,6 +791,7 @@ impl Connection {
                     header,
                     xmc,
                     sni: None,
+                    mark: None,
                 })
             }
             (Connection::Metered(metered), mask) => Connection::Metered(Metered {
@@ -664,10 +812,12 @@ impl Connection {
 
     /// Arm the first-record rewrite on the socket the hello writes through, wrapping the stream
     /// in the mask when the config named no chain.
-    pub(crate) fn with_sni_shape(self, shape: ferrox_core::evasion::SniShape) -> Self {
+    /// The same one-shot shape with the mixed-case name `LxBox` pairs it with.
+    pub(crate) fn with_sni(self, shape: ferrox_core::evasion::SniShape, mixed_case: bool) -> Self {
         let state = || {
             std::sync::Arc::new(SniState {
                 shape,
+                mixed_case,
                 done: std::sync::atomic::AtomicBool::new(false),
                 written: std::sync::atomic::AtomicU8::new(0),
             })
@@ -682,21 +832,58 @@ impl Connection {
                 header: None,
                 xmc: None,
                 sni: Some(state()),
+                mark: None,
             }),
             Connection::Masked(mut masked) => {
                 masked.sni = Some(state());
                 Connection::Masked(masked)
             }
             Connection::Metered(metered) => Connection::Metered(Metered {
-                inner: Box::new(metered.inner.with_sni_shape(shape)),
+                inner: Box::new(metered.inner.with_sni(shape, mixed_case)),
                 meter: metered.meter,
             }),
             Connection::Proxied { inner, peer } => Connection::Proxied {
-                inner: Box::new(inner.with_sni_shape(shape)),
+                inner: Box::new(inner.with_sni(shape, mixed_case)),
                 peer,
             },
             Connection::Policied { inner, flow } => Connection::Policied {
-                inner: Box::new(inner.with_sni_shape(shape)),
+                inner: Box::new(inner.with_sni(shape, mixed_case)),
+                flow,
+            },
+            #[cfg(any(unix, windows))]
+            Connection::Unix(stream) => Connection::Unix(stream),
+        }
+    }
+
+    /// Arm the server's read-past-mark window on this stream ([`Masked::drain_past_mark`]).
+    pub(crate) fn read_past_mark(self) -> Self {
+        let mark = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        match self {
+            Connection::Tcp(stream) => Connection::Masked(Masked {
+                stream,
+                chain: std::sync::Arc::new(std::sync::Mutex::new(
+                    ferrox_core::finalmask::Chain::default(),
+                )),
+                read_chain: None,
+                header: None,
+                xmc: None,
+                sni: None,
+                mark: Some(mark),
+            }),
+            Connection::Masked(mut masked) => {
+                masked.mark = Some(mark);
+                Connection::Masked(masked)
+            }
+            Connection::Metered(metered) => Connection::Metered(Metered {
+                inner: Box::new(metered.inner.read_past_mark()),
+                meter: metered.meter,
+            }),
+            Connection::Proxied { inner, peer } => Connection::Proxied {
+                inner: Box::new(inner.read_past_mark()),
+                peer,
+            },
+            Connection::Policied { inner, flow } => Connection::Policied {
+                inner: Box::new(inner.read_past_mark()),
                 flow,
             },
             #[cfg(any(unix, windows))]
@@ -1323,6 +1510,7 @@ impl Connection {
                     header: masked.header.as_ref().map(std::sync::Arc::clone),
                     xmc: masked.xmc.as_ref().map(std::sync::Arc::clone),
                     sni: masked.sni.as_ref().map(std::sync::Arc::clone),
+                    mark: masked.mark.as_ref().map(std::sync::Arc::clone),
                 })
             }),
             Connection::Metered(metered) => metered.inner.try_clone().map(|inner| {
@@ -4121,6 +4309,29 @@ mod tests {
         );
     }
 
+    /// One `ClientHello` record carrying `name`, with the lengths a server reassembles from.
+    fn client_hello(name: &str) -> Vec<u8> {
+        let mut server = vec![0, 0, 0];
+        server.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        server.extend_from_slice(name.as_bytes());
+        server[0..2].copy_from_slice(&((name.len() + 3) as u16).to_be_bytes());
+        let mut ext = vec![0, 0];
+        ext.extend_from_slice(&(server.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&server);
+        let mut handshake = vec![0x01, 0, 0, 0, 0x03, 0x03];
+        handshake.extend_from_slice(&[0x11; 32]);
+        handshake.push(0);
+        handshake.extend_from_slice(&[0x00, 0x02, 0x13, 0x01, 0x01, 0x00]);
+        handshake.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        handshake.extend_from_slice(&ext);
+        let length = (handshake.len() - 4) as u32;
+        handshake[1..4].copy_from_slice(&length.to_be_bytes()[1..4]);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
     fn masked_with(client: TcpStream, shape: ferrox_core::evasion::SniShape) -> Masked {
         Masked {
             stream: client,
@@ -4132,9 +4343,11 @@ mod tests {
             xmc: None,
             sni: Some(std::sync::Arc::new(SniState {
                 shape,
+                mixed_case: false,
                 done: std::sync::atomic::AtomicBool::new(false),
                 written: std::sync::atomic::AtomicU8::new(0),
             })),
+            mark: None,
         }
     }
 
@@ -4185,12 +4398,70 @@ mod tests {
         assert_eq!(&got, &[0x16, 0x03, 0x04, 0x00, 0x04, 0xde, 0xad]);
     }
 
+    #[test]
+    fn a_mixed_case_shape_rewrites_the_name_without_changing_its_length() {
+        let hello = client_hello("www.example.com");
+        let state = SniState {
+            shape: ferrox_core::evasion::SniShape::Record,
+            mixed_case: true,
+            done: std::sync::atomic::AtomicBool::new(false),
+            written: std::sync::atomic::AtomicU8::new(0),
+        };
+        let SniArm::Rewrite(record) = state.arm(&hello) else {
+            panic!("the hello is rewritten");
+        };
+        assert_eq!(record.len(), hello.len());
+        assert_eq!(&record[1..3], &[0x03, 0x04]);
+        let name = ferrox_core::evasion::server_name_range(&record).expect("a name");
+        assert!(record[name].eq_ignore_ascii_case(b"www.example.com"));
+    }
+
+    #[test]
+    fn an_urgent_shape_never_sends_through_a_masking_stage() {
+        use ferrox_core::finalmask::{Fragment, Range};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connects");
+        let masked = masked_with(client, ferrox_core::evasion::SniShape::Urgent);
+        masked
+            .try_urgent(
+                masked.sni.as_deref().expect("armed"),
+                &client_hello("a.example"),
+            )
+            .expect("a plain stream owns the urgent send");
+        let mut chain = ferrox_core::finalmask::Chain::default();
+        chain.push(
+            Fragment::new(
+                1,
+                1,
+                vec![Range::ordered(1, 1)],
+                vec![Range::ordered(0, 0)],
+                Range::ordered(0, 0),
+            )
+            .expect("a stage"),
+        );
+        let chained = masked_with(
+            TcpStream::connect(addr).expect("connects"),
+            ferrox_core::evasion::SniShape::Urgent,
+        );
+        *chained.chain.lock().expect("the chain") = chain;
+        let state = chained.sni.as_deref().expect("armed");
+        assert_eq!(
+            chained
+                .try_urgent(state, &client_hello("a.example"))
+                .expect("no error"),
+            None
+        );
+        assert!(!state.done.load(std::sync::atomic::Ordering::Acquire));
+    }
+
     /// A write that does not open a TLS record leaves the state armed, so a later record still
     /// gets the shape instead of the shape being spent on a fragment.
     #[test]
     fn a_write_before_the_hello_keeps_the_shape_armed() {
         let state = SniState {
             shape: ferrox_core::evasion::SniShape::Record,
+            mixed_case: false,
             done: std::sync::atomic::AtomicBool::new(false),
             written: std::sync::atomic::AtomicU8::new(0),
         };

@@ -137,6 +137,9 @@ pub struct Fragment {
     pub lengths: Vec<Range>,
     pub delays: Vec<Range>,
     pub max_split: Range,
+    /// Cut inside every label of the hello's server name, one record per piece. The widths are
+    /// unused here; `tlsSettings.recordFragment` is what arms it.
+    sni: bool,
     ent: Entropy,
     count: u64,
     gathered: Option<Gathered>,
@@ -174,10 +177,19 @@ impl Fragment {
             lengths,
             delays,
             max_split,
+            sni: false,
             ent: Entropy::new(),
             count: 0,
             gathered: None,
         })
+    }
+
+    /// The same stage with the server-name cut: one record boundary inside every label, which a
+    /// filter that reconstructs each record on its own cannot rejoin into a name.
+    #[must_use]
+    pub fn sni(mut self) -> Self {
+        self.sni = true;
+        self
     }
 
     /// The write the chain hands this stage, answered with how much of it reached the wire.
@@ -193,7 +205,11 @@ impl Fragment {
         }
         self.count += 1;
         if self.packets_from == 0 && self.packets_to == 1 {
-            return self.write_hello(raw, p);
+            return if self.sni {
+                self.write_sni(raw, p)
+            } else {
+                self.write_hello(raw, p)
+            };
         }
         if self.packets_from != 0
             && (self.count < self.packets_from || self.count > self.packets_to)
@@ -356,6 +372,82 @@ impl Fragment {
                 at += width;
             }
         }
+    }
+
+    /// The `tlssni` mode: one record boundary inside every label of the server name, so a filter
+    /// that reads a name out of a single record never finds one whole. Every piece is a complete
+    /// handshake record and the server reassembles the handshake exactly as it would any hello.
+    /// A write with no name falls back to the width cut, which still splits the record.
+    fn write_sni<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
+        let Some(record_len) = self.hello_shape(p) else {
+            return raw.write(p);
+        };
+        let Some(name) = crate::evasion::server_name_range(&p[..record_len]) else {
+            return self.write_hello(raw, p);
+        };
+        let mut cuts: Vec<usize> = crate::evasion::label_cuts(&p[name.clone()])
+            .into_iter()
+            .map(|at| name.start + at)
+            .filter(|at| *at > HEADER && *at < record_len)
+            .collect();
+        let Some(bound) = self.max_split.pick_from(&mut self.ent) else {
+            return write_progress(raw, p);
+        };
+        if bound > 1 {
+            cuts.truncate(usize::try_from(bound - 1).unwrap_or(usize::MAX));
+        }
+        cuts.push(record_len);
+
+        let merged = self.delays.len() == 1 && self.delays[0].high == 0;
+        if merged {
+            let mut heads = Vec::with_capacity(cuts.len());
+            let mut from = HEADER;
+            for to in &cuts {
+                heads.push(head_of(p, to - from));
+                from = *to;
+            }
+            let mut parts = Vec::with_capacity(heads.len() * 2 + 1);
+            let mut from = HEADER;
+            for (head, to) in heads.iter().zip(&cuts) {
+                parts.push(io::IoSlice::new(head));
+                parts.push(io::IoSlice::new(&p[from..*to]));
+                from = *to;
+            }
+            if p.len() > record_len {
+                parts.push(io::IoSlice::new(&p[record_len..]));
+            }
+            let mut parts = &mut parts[..];
+            let before = parts.len();
+            if let Err(error) = write_iovecs(raw, &mut parts) {
+                let progressed = parts.len() < before;
+                if !progressed
+                    && !matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    )
+                {
+                    return Err(error);
+                }
+                let mut bytes = Vec::new();
+                for part in parts.iter() {
+                    bytes.extend_from_slice(part);
+                }
+                if !bytes.is_empty() {
+                    self.gathered = Some(Gathered { bytes, at: 0 });
+                }
+                return Ok(p.len());
+            }
+            return Ok(p.len());
+        }
+        let mut from = HEADER;
+        for (segment, to) in cuts.iter().enumerate() {
+            write_record(raw, &head_of(p, to - from), &p[from..*to])?;
+            if segment + 1 < cuts.len() {
+                self.park(self.delay_at(segment));
+            }
+            from = *to;
+        }
+        self.finish_hello(raw, p, record_len)
     }
 
     /// The merged hello: every record's header goes into a bounded stack scratch and each body is
@@ -715,6 +807,15 @@ impl Chain {
         self.stages.push(Stage::Fragment(stage));
     }
 
+    /// The same chain with `stage` in front, where it sees the session's whole before every
+    /// configured stage: the TLS cut runs on the `ClientHello`, not on what a mask below made of it.
+    #[must_use]
+    pub fn with_front(&self, stage: &Fragment) -> Self {
+        let mut chain = self.clone();
+        chain.stages.insert(0, Stage::Fragment(stage.clone()));
+        chain
+    }
+
     /// One more codec stage.
     pub fn push_sudoku(&mut self, stage: Sudoku) {
         self.stages.push(Stage::Sudoku(stage));
@@ -934,6 +1035,29 @@ mod tests {
         p.extend_from_slice(&(body as u16).to_be_bytes());
         p.extend((0..body).map(|i| (i % 251) as u8));
         p
+    }
+
+    /// One `ClientHello` record carrying `name`, with the lengths a server reassembles from.
+    fn client_hello(name: &str) -> Vec<u8> {
+        let mut server = vec![0, 0, 0];
+        server.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        server.extend_from_slice(name.as_bytes());
+        server[0..2].copy_from_slice(&((name.len() + 3) as u16).to_be_bytes());
+        let mut ext = vec![0, 0];
+        ext.extend_from_slice(&(server.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&server);
+        let mut handshake = vec![0x01, 0, 0, 0, 0x03, 0x03];
+        handshake.extend_from_slice(&[0x11; 32]);
+        handshake.push(0);
+        handshake.extend_from_slice(&[0x00, 0x02, 0x13, 0x01, 0x01, 0x00]);
+        handshake.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        handshake.extend_from_slice(&ext);
+        let length = (handshake.len() - 4) as u32;
+        handshake[1..4].copy_from_slice(&length.to_be_bytes()[1..4]);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
     }
 
     /// The wire as a peer sees it: every write call, the runs it was made of, and the octets.
@@ -1290,6 +1414,59 @@ mod tests {
             whole.len() + (widths.len() - 1) * HEADER,
             "the hello's own header is reused, and only one is added per extra record"
         );
+    }
+
+    #[test]
+    fn an_sni_record_is_cut_inside_the_name_and_arrives_whole() {
+        let whole = client_hello("www.example.co.uk");
+        let name = crate::evasion::server_name_range(&whole).expect("a name");
+        let mut mask = Fragment::new(0, 1, vec![range(1, 32_768)], vec![range(0, 0)], range(0, 0))
+            .expect("valid")
+            .sni();
+        let mut wire = Wire::default();
+        assert_eq!(mask.write(&mut wire, &whole).expect("writes"), whole.len());
+        assert_eq!(wire.calls, 1, "one zero delay merges the records");
+        let (widths, message) = records(&wire.bytes);
+        assert_eq!(widths.len(), 5, "one record per label and the tail");
+        assert_eq!(message, whole[HEADER..], "the handshake arrives whole");
+        let mut at = 0usize;
+        for width in widths {
+            let body = &wire.bytes[at + HEADER..at + HEADER + width];
+            assert!(
+                !body
+                    .windows(name.len())
+                    .any(|window| window == &whole[name.clone()]),
+                "no record carries the whole name"
+            );
+            at += HEADER + width;
+        }
+    }
+
+    #[test]
+    fn a_hello_without_a_name_falls_back_to_the_width_cut() {
+        let whole = hello(300);
+        let mut mask = Fragment::new(
+            0,
+            1,
+            vec![range(11, 11), range(37, 37)],
+            vec![range(0, 0)],
+            range(24, 24),
+        )
+        .expect("valid")
+        .sni();
+        let mut plain = Fragment::new(
+            0,
+            1,
+            vec![range(11, 11), range(37, 37)],
+            vec![range(0, 0)],
+            range(24, 24),
+        )
+        .expect("valid");
+        let mut sni_wire = Wire::default();
+        let mut plain_wire = Wire::default();
+        mask.write(&mut sni_wire, &whole).expect("writes");
+        plain.write(&mut plain_wire, &whole).expect("writes");
+        assert_eq!(sni_wire.bytes, plain_wire.bytes);
     }
 
     #[test]
