@@ -65677,6 +65677,40 @@ mod tests {
         );
     }
 
+    /// A split buys no descriptor for its wire: the writer sends on the handle the caller
+    /// duplicated, so a relay flow holds one where it held two.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_split_buys_no_descriptor_for_its_wire() {
+        fn open_descriptors() -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("reads the descriptor table")
+                .count()
+        }
+        if !crate::conn::in_a_quiet_process("proxy::tests::a_split_buys_no_descriptor_for_its_wire")
+        {
+            return;
+        }
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let socket = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let (_accepted, _) = listener.accept().expect("accepts");
+        let before = open_descriptors();
+        let wire = socket.try_clone().expect("dups the wire");
+        let after_dup = open_descriptors();
+        let (_reader, _writer) = session_halves(CountedSession::default(), wire);
+        let after_split = open_descriptors();
+        assert_eq!(
+            after_dup,
+            before + 1,
+            "the caller's duplicate is the only one"
+        );
+        assert_eq!(
+            after_split, after_dup,
+            "the split adds no descriptor of its own"
+        );
+    }
+
     /// What the write side of the halves put on the wire: one entry per send, holding the bytes it
     /// carried, which a session-side call count cannot see.
     #[derive(Clone, Default)]
