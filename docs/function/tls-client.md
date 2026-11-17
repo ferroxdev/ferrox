@@ -65,7 +65,7 @@ The two parse rows are the seven carrier forms in `tls_stream_cases`: raw, `kcp`
 
 ## Time
 
-**Not measured yet.**  The matrix has no SOCKS-over-TLS or HTTP-over-TLS cell, so a local duration would measure a tunnel, not this code.  The echo tests bound the functional path; a throughput number waits for a CI cell.
+The matrix has no SOCKS-over-TLS or HTTP-over-TLS cell in its tier, so one was tried for this row and is not kept: `benchmark-matrix.yml` run 44110457162 measured `socks-tls-raw-down-8` (8 flows, 256 iterations, 64 KiB, three pairs, `ubuntu-latest`) and lost the cell on its served leg.  The client leg ran: ferrox **815.5 MiB/s** against `xray-core`'s **694.9** — 1.169x, interval [1.102x, 1.209x] — and `zeronet`'s **858.4**, which is 0.95x, interval [0.920x, 0.982x] and below the ratio floor, so it is a defect named rather than a variance noted: on the same bytes the client spends 2.002x less cpu per GiB and 4.405x fewer kernel calls than `xray-core`, so what it loses to `zeronet` is not system calls, and the profile that prices a byte path is CI's (`bench.yml`).  The served leg moved nothing: every client failed with zero bytes, because this tree serves a `socks` inbound as plain TCP — `inbound_role` wraps only a PROXY header — so `streamSettings.security: "tls"` on a SOCKS, HTTP or mixed inbound is a silent no-op where the reference handshakes.  That lane is this row's open work and the reason the three arms the trial used are not in `scripts/lib-matrix.sh`.
 
 ## What we removed
 
@@ -74,7 +74,7 @@ The two parse rows are the seven carrier forms in `tls_stream_cases`: raw, `kcp`
 - **The second relay shape.** The carried SOCKS and HTTP fronts split the session into one reader and one writer and hand it to `relay_sink`, so one direction's read cannot hold the other direction's write behind a shared lock. The raw branch uses the same split. The tests drive both branches; the point is structural, not a new copy count, so `relay-staging-copies-per-byte` stays `UNBLESSED`.
 - **The single-read SOCKS handshake.** The TLS session polls its transport on a 1 ms quantum; a handshake read that took the first `WouldBlock` for a refusal reset a flow under load. The SOCKS greeting, request and bound-address reads now wait out the poll under the handshake budget, and `a_handshake_read_waits_out_a_polled_transport` is the deterministic witness.
 
-The bullets above are removals against earlier Ferrox, not against the references. Against Xray-core, sing-box and ZeroNet no instruction, syscall, copy or time removal is claimed: each also dials TLS and hands it to the carrier, and this page has no comparison cell for a ratio.  The two parse rows and six echo rows are correctness witnesses; the four cost rows stay `UNBLESSED`.
+The bullets above are removals against earlier Ferrox, not against the references. Against Xray-core no instruction, syscall or copy removal is claimed: it also dials TLS and hands it to the carrier.  The one ratio this page carries is the trial's client leg above, where the same bytes cost 2.002x less cpu and 4.405x fewer kernel calls; the two parse rows and six echo rows are correctness witnesses, and the four cost rows stay `UNBLESSED`.
 
 ## Pins
 
