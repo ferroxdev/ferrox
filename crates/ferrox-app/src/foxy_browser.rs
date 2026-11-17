@@ -15,12 +15,14 @@ const VERIFIER_ALPHABET: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
 const LANGUAGE: &str = "en-US,en;q=0.5";
 
-fn verifier() -> String {
+fn verifier() -> Option<String> {
     let mut raw = [0u8; VERIFIER_LEN];
-    getrandom::fill(&mut raw).unwrap_or_default();
-    raw.iter()
-        .map(|byte| char::from(VERIFIER_ALPHABET[usize::from(*byte) % VERIFIER_ALPHABET.len()]))
-        .collect()
+    getrandom::fill(&mut raw).ok()?;
+    Some(
+        raw.iter()
+            .map(|byte| char::from(VERIFIER_ALPHABET[usize::from(*byte) % VERIFIER_ALPHABET.len()]))
+            .collect(),
+    )
 }
 
 fn challenge(verifier: &str) -> String {
@@ -127,7 +129,9 @@ pub(crate) fn login(email: &str, token_file: &str, code: Option<&str>, no_open: 
         exit("the Guardian endpoint did not parse");
     };
     let jar = std::sync::Mutex::new(Jar::default());
-    let verifier = verifier();
+    let Some(verifier) = verifier() else {
+        exit("no randomness for the sign-in verifier");
+    };
     let location = start_url(&endpoint, &verifier);
     if no_open {
         println!("open this in a browser: {location}");
@@ -208,7 +212,7 @@ mod tests {
             challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
-        assert_eq!(verifier().len(), VERIFIER_LEN);
+        assert_eq!(verifier().expect("randomness").len(), VERIFIER_LEN);
     }
 
     #[test]

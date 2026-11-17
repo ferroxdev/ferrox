@@ -65,11 +65,11 @@ impl Wire {
     fn head(&mut self, budget: Duration) -> Option<usize> {
         let until = Instant::now() + budget;
         loop {
+            if let Some(at) = head_end(&self.pending) {
+                return (at + 4 <= HEAD_LIMIT).then_some(at + 4);
+            }
             if self.pending.len() >= HEAD_LIMIT {
                 return None;
-            }
-            if let Some(at) = head_end(&self.pending) {
-                return Some(at + 4);
             }
             if Instant::now() >= until || !self.fill() {
                 return None;

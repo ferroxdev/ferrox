@@ -15,6 +15,8 @@ const OP_DATA: u8 = 0x02;
 const OP_CLOSE: u8 = 0x08;
 const OP_PING: u8 = 0x09;
 const OP_PONG: u8 = 0x0A;
+/// A deferred control frame whose head and payload are already encoded, so a partial write resumes without a fresh mask.
+const OP_RAW: u8 = 0xFF;
 const CLOSE_BODY: [u8; 2] = [0x03, 0xE8];
 
 /// The accept key the server answers with: twenty-eight bytes of base64, on the stack.
@@ -138,18 +140,14 @@ unsafe fn mask_narrow(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
         for lane in 0..4 {
             let off = at + lane * 16;
             // SAFETY: `off..off + 16` sits inside the whole 64-byte blocks of both ranges.
-            let chunk = unsafe { core::slice::from_raw_parts(src.add(off), 16) };
-            let out = unsafe { core::slice::from_raw_parts_mut(dst.add(off), 16) };
-            xor_block(chunk, &wide, out);
+            unsafe { xor_block(src.add(off), &wide, dst.add(off)) };
         }
     }
     let chunks = (len - blocks * 64) / 16;
     for c in 0..chunks {
         let at = blocks * 64 + c * 16;
         // SAFETY: `at..at + 16` sits inside the whole 16-byte chunks past the blocks.
-        let chunk = unsafe { core::slice::from_raw_parts(src.add(at), 16) };
-        let out = unsafe { core::slice::from_raw_parts_mut(dst.add(at), 16) };
-        xor_block(chunk, &wide, out);
+        unsafe { xor_block(src.add(at), &wide, dst.add(at)) };
     }
     let tail_at = blocks * 64 + chunks * 16;
     for i in tail_at..len {
@@ -166,29 +164,32 @@ unsafe fn mask_narrow(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
     reason = "load-bearing: keeps the vector op inlined at every call site"
 )]
 #[inline(always)]
-fn xor_block(chunk: &[u8], wide: &[u8; 16], out: &mut [u8]) {
+unsafe fn xor_block(src: *const u8, wide: &[u8; 16], dst: *mut u8) {
     #[cfg(target_arch = "x86_64")]
     {
         use core::arch::x86_64::{_mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128};
         unsafe {
-            let data = _mm_loadu_si128(chunk.as_ptr().cast());
+            let data = _mm_loadu_si128(src.cast());
             let key = _mm_loadu_si128(wide.as_ptr().cast());
-            _mm_storeu_si128(out.as_mut_ptr().cast(), _mm_xor_si128(data, key));
+            _mm_storeu_si128(dst.cast(), _mm_xor_si128(data, key));
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
         use core::arch::aarch64::{veorq_u8, vld1q_u8, vst1q_u8};
         unsafe {
-            let data = vld1q_u8(chunk.as_ptr());
+            let data = vld1q_u8(src);
             let key = vld1q_u8(wide.as_ptr());
-            vst1q_u8(out.as_mut_ptr(), veorq_u8(data, key));
+            vst1q_u8(dst, veorq_u8(data, key));
         }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        for ((out, &byte), &key) in out.iter_mut().zip(chunk).zip(wide.iter()) {
-            *out = byte ^ key;
+        for (at, &key) in wide.iter().enumerate() {
+            unsafe {
+                let byte = src.add(at).read();
+                dst.add(at).write(byte ^ key);
+            }
         }
     }
 }
@@ -225,6 +226,8 @@ struct Shared {
     open: AtomicUsize,
     /// Head bytes a full socket cut: `open` is the payload length they announce, so the rest is rebuilt and sent first.
     cut: AtomicUsize,
+    /// Control frames that arrived while a data frame was still being written.
+    pending: Mutex<Vec<(u8, Vec<u8>)>>,
 }
 
 impl std::fmt::Debug for Shared {
@@ -233,6 +236,72 @@ impl std::fmt::Debug for Shared {
             .field("closed", &self.closed)
             .field("masked", &self.masked)
             .finish_non_exhaustive()
+    }
+}
+
+enum Flushed {
+    Clear,
+    Parked,
+    Lost,
+}
+
+impl Shared {
+    /// Defer a control frame that cannot interleave a data frame whose head is already on the wire; a later Pong replaces an unsent one, so a ping flood cannot grow the queue.
+    fn defer(&self, opcode: u8, payload: &[u8]) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        if opcode == OP_PONG {
+            if let Some((_, queued)) = pending
+                .iter_mut()
+                .rev()
+                .find(|(opcode, _)| *opcode == OP_PONG)
+            {
+                queued.clear();
+                queued.extend_from_slice(payload);
+                return;
+            }
+        }
+        pending.push((opcode, payload.to_vec()));
+    }
+
+    /// Write deferred control frames without waiting: an encoded frame stays in the queue until the socket takes it, and a partial take resumes at the next byte.
+    fn flush(&self, stream: &mut dyn crate::proxy::FrameWrite) -> Flushed {
+        let Ok(mut pending) = self.pending.lock() else {
+            return Flushed::Lost;
+        };
+        loop {
+            let Some((opcode, payload)) = pending.first() else {
+                return Flushed::Clear;
+            };
+            if *opcode != OP_RAW {
+                let Some(frame) = encode_frame(self.masked, *opcode, payload) else {
+                    return Flushed::Lost;
+                };
+                pending[0] = (OP_RAW, frame);
+            }
+            let len = pending[0].1.len();
+            match stream.write_ready(&[&pending[0].1]) {
+                Some(Ok(0)) => return Flushed::Lost,
+                Some(Ok(n)) if n >= len => {
+                    pending.remove(0);
+                }
+                Some(Ok(n)) => {
+                    pending[0].1.drain(..n);
+                    return Flushed::Parked;
+                }
+                Some(Err(error)) if crate::proxy::is_descriptor_wait(&error) => {
+                    return Flushed::Parked;
+                }
+                Some(Err(_)) => return Flushed::Lost,
+                None => {
+                    if !stream.write_slices(&[&pending[0].1]) {
+                        return Flushed::Lost;
+                    }
+                    pending.remove(0);
+                }
+            }
+        }
     }
 }
 
@@ -348,6 +417,7 @@ impl<R: Read> WsReader<R> {
                     break 0;
                 }
                 Ok(n) => break n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) if crate::proxy::is_timeout(&error) => match self.handshake {
                     // The opening decode is the one wait a budget owns, and a silence past it is the end.
                     Some(until) if std::time::Instant::now() < until => {}
@@ -501,9 +571,24 @@ impl<R: Read> WsReader<R> {
         if opcode == OP_CLOSE && self.shared.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        if opcode != OP_CLOSE && self.shared.closed.load(Ordering::SeqCst) {
+            return;
+        }
         let Ok(mut stream) = self.shared.stream.lock() else {
             return;
         };
+        if self.shared.open.load(Ordering::Relaxed) != 0
+            || self.shared.cut.load(Ordering::Relaxed) != 0
+            || self
+                .shared
+                .pending
+                .lock()
+                .map_or(true, |pending| !pending.is_empty())
+        {
+            drop(stream);
+            self.shared.defer(opcode, payload);
+            return;
+        }
         let _ = write_frame(&mut **stream, self.shared.masked, opcode, payload);
     }
 
@@ -676,6 +761,14 @@ impl WsWriter {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return false;
         };
+        if self.shared.open.load(Ordering::Relaxed) != 0
+            || self.shared.cut.load(Ordering::Relaxed) != 0
+        {
+            return false;
+        }
+        if !matches!(self.shared.flush(&mut **stream), Flushed::Clear) {
+            return false;
+        }
         write_frame(&mut **stream, self.masked, OP_DATA, data)
     }
 
@@ -683,6 +776,14 @@ impl WsWriter {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return false;
         };
+        if self.shared.open.load(Ordering::Relaxed) != 0
+            || self.shared.cut.load(Ordering::Relaxed) != 0
+        {
+            return false;
+        }
+        if !matches!(self.shared.flush(&mut **stream), Flushed::Clear) {
+            return false;
+        }
         write_frame(&mut **stream, self.masked, OP_TEXT, data)
     }
 
@@ -691,6 +792,16 @@ impl WsWriter {
             return crate::proxy::Push::Lost;
         };
         if self.masked {
+            if self.shared.open.load(Ordering::Relaxed) != 0
+                || self.shared.cut.load(Ordering::Relaxed) != 0
+            {
+                return crate::proxy::Push::Parked;
+            }
+            match self.shared.flush(&mut **stream) {
+                Flushed::Clear => {}
+                Flushed::Parked => return crate::proxy::Push::Parked,
+                Flushed::Lost => return crate::proxy::Push::Lost,
+            }
             return if write_frame(&mut **stream, self.masked, OP_DATA, data) {
                 crate::proxy::Push::Took(data.len())
             } else {
@@ -699,6 +810,13 @@ impl WsWriter {
         }
         let mut owed = self.shared.open.load(Ordering::Relaxed);
         let mut cut = self.shared.cut.load(Ordering::Relaxed);
+        if owed == 0 && cut == 0 {
+            match self.shared.flush(&mut **stream) {
+                Flushed::Clear => {}
+                Flushed::Parked => return crate::proxy::Push::Parked,
+                Flushed::Lost => return crate::proxy::Push::Lost,
+            }
+        }
         let mut taken = 0;
         // A bare second offer starts the payload when the first only landed the head, so a full socket parks here.
         loop {
@@ -714,10 +832,13 @@ impl WsWriter {
             };
             match offer {
                 None => {
-                    return if write_frame(&mut **stream, self.masked, OP_DATA, data) {
-                        crate::proxy::Push::Took(data.len())
-                    } else {
+                    if !write_frame(&mut **stream, self.masked, OP_DATA, data) {
+                        return crate::proxy::Push::Lost;
+                    }
+                    return if matches!(self.shared.flush(&mut **stream), Flushed::Lost) {
                         crate::proxy::Push::Lost
+                    } else {
+                        crate::proxy::Push::Took(data.len())
                     };
                 }
                 Some(Ok((n, left_owed, left_cut))) => {
@@ -741,6 +862,9 @@ impl WsWriter {
         }
         self.shared.open.store(owed, Ordering::Relaxed);
         self.shared.cut.store(cut, Ordering::Relaxed);
+        if owed == 0 && cut == 0 && matches!(self.shared.flush(&mut **stream), Flushed::Lost) {
+            return crate::proxy::Push::Lost;
+        }
         crate::proxy::Push::Took(taken)
     }
 
@@ -751,9 +875,22 @@ impl WsWriter {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return;
         };
-        if self.shared.open.load(Ordering::Relaxed) > 0 {
+        if self.shared.open.load(Ordering::Relaxed) > 0
+            || self.shared.cut.load(Ordering::Relaxed) > 0
+        {
             // The head on the wire still owes payload: a close frame would land inside it.
+            drop(stream);
+            self.shared.defer(OP_CLOSE, &CLOSE_BODY);
             return;
+        }
+        match self.shared.flush(&mut **stream) {
+            Flushed::Clear => {}
+            Flushed::Parked => {
+                drop(stream);
+                self.shared.defer(OP_CLOSE, &CLOSE_BODY);
+                return;
+            }
+            Flushed::Lost => return,
         }
         let _ = write_frame(&mut **stream, self.masked, OP_CLOSE, &CLOSE_BODY);
     }
@@ -828,6 +965,23 @@ fn write_cut_ready(
         Ok(n) => Some(Ok((0, len, cut + n))),
         Err(error) => Some(Err(error)),
     }
+}
+
+/// One complete frame in a buffer, so a deferred control write can resume after a partial take without generating a new mask.
+fn encode_frame(masked: bool, opcode: u8, payload: &[u8]) -> Option<Vec<u8>> {
+    let (head, hlen) = frame_head(opcode, payload.len(), masked);
+    if !masked {
+        let mut frame = Vec::with_capacity(hlen + payload.len());
+        frame.extend_from_slice(&head[..hlen]);
+        frame.extend_from_slice(payload);
+        return Some(frame);
+    }
+    let mask = fresh_mask()?;
+    let mut frame = Vec::with_capacity(hlen + 4 + payload.len());
+    frame.extend_from_slice(&head[..hlen]);
+    frame.extend_from_slice(&mask);
+    mask_copy(&mut frame, payload, mask);
+    Some(frame)
 }
 
 fn write_frame(
@@ -1025,13 +1179,16 @@ fn request(
     const VERSION: &str = "\r\nSec-WebSocket-Version: 13";
     const END: &str = "\r\n\r\n";
     const PROTOCOL: &str = "Sec-WebSocket-Protocol: ";
-    let early = !first.is_empty() && first.len() as u64 <= u64::from(budget);
+    let fixed = OPEN.len() + MIDDLE.len() + KEYS.len() + VERSION.len() + END.len() + 2;
+    let headroom = fixed + host.len() + path.len() + key.len() + headers.len();
+    let early = !first.is_empty()
+        && first.len() as u64 <= u64::from(budget)
+        && headroom + PROTOCOL.len() + (first.len() * 4).div_ceil(3) + 2 <= HEAD_LIMIT;
     let coded = if early {
         (first.len() * 4).div_ceil(3)
     } else {
         0
     };
-    let fixed = OPEN.len() + MIDDLE.len() + KEYS.len() + VERSION.len() + END.len() + 2;
     let room = if early { PROTOCOL.len() + coded + 2 } else { 0 };
     let mut request =
         String::with_capacity(fixed + host.len() + path.len() + key.len() + headers.len() + room);
@@ -1059,23 +1216,38 @@ fn start_heartbeat(writer: &WsWriter, period: u32) {
         return;
     }
     let shared = Arc::downgrade(&writer.shared);
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(u64::from(period)));
-        let Some(shared) = shared.upgrade() else {
-            return;
-        };
-        if shared.closed.load(Ordering::SeqCst) {
-            return;
-        }
-        let Ok(mut stream) = shared.stream.lock() else {
-            return;
-        };
-        if shared.open.load(Ordering::Relaxed) > 0 {
-            // A data frame is half on the wire: a control frame here would land inside it.
-            continue;
-        }
-        if !write_frame(&mut **stream, shared.masked, OP_PING, &[]) {
-            return;
+    let period = std::time::Duration::from_secs(u64::from(period));
+    std::thread::spawn(move || {
+        let mut left = period;
+        loop {
+            let slice = left.min(std::time::Duration::from_secs(1));
+            std::thread::sleep(slice);
+            left -= slice;
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            if shared.closed.load(Ordering::SeqCst) {
+                return;
+            }
+            if !left.is_zero() {
+                continue;
+            }
+            left = period;
+            let Ok(mut stream) = shared.stream.lock() else {
+                return;
+            };
+            if shared.open.load(Ordering::Relaxed) > 0 || shared.cut.load(Ordering::Relaxed) > 0 {
+                // A data frame is half on the wire: a control frame here would land inside it.
+                continue;
+            }
+            match shared.flush(&mut **stream) {
+                Flushed::Clear => {}
+                Flushed::Parked => continue,
+                Flushed::Lost => return,
+            }
+            if !write_frame(&mut **stream, shared.masked, OP_PING, &[]) {
+                return;
+            }
         }
     });
 }
@@ -1107,6 +1279,7 @@ pub(crate) fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
         closed: AtomicBool::new(false),
         open: AtomicUsize::new(0),
         cut: AtomicUsize::new(0),
+        pending: Mutex::new(Vec::new()),
         masked,
     });
     let reader = WsReader {
@@ -1142,6 +1315,21 @@ impl crate::proxy::CarrierSink for WsWriter {
     #[inline]
     fn push_ready(&self, bytes: &[u8]) -> crate::proxy::Push {
         self.push_ready(bytes)
+    }
+    fn settle(&self) -> crate::proxy::Settle {
+        let Ok(mut stream) = self.shared.stream.lock() else {
+            return crate::proxy::Settle::Lost;
+        };
+        if self.shared.open.load(Ordering::Relaxed) != 0
+            || self.shared.cut.load(Ordering::Relaxed) != 0
+        {
+            return crate::proxy::Settle::Clear;
+        }
+        match self.shared.flush(&mut **stream) {
+            Flushed::Clear => crate::proxy::Settle::Clear,
+            Flushed::Parked => crate::proxy::Settle::Parked,
+            Flushed::Lost => crate::proxy::Settle::Lost,
+        }
     }
     #[inline]
     fn close(&self) {
@@ -1332,6 +1520,70 @@ mod tests {
     }
 
     #[test]
+    fn a_ping_burst_keeps_one_deferred_pong() {
+        let shared = Arc::new(Shared {
+            stream: Mutex::new(Box::new(Sink::default())),
+            closed: AtomicBool::new(false),
+            masked: false,
+            open: AtomicUsize::new(1),
+            cut: AtomicUsize::new(0),
+            pending: Mutex::new(Vec::new()),
+        });
+        shared.defer(OP_PONG, b"one");
+        shared.defer(OP_PONG, b"two");
+        let pending = shared.pending.lock().expect("pending");
+        assert_eq!(pending.len(), 1, "only the latest ping owes a pong");
+        assert_eq!(pending[0].1, b"two");
+    }
+
+    #[test]
+    fn a_failed_deferred_control_write_ends_the_push() {
+        struct FailControl {
+            accepted: bool,
+        }
+
+        impl Write for FailControl {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl crate::proxy::FrameWrite for FailControl {
+            fn write_slices(&mut self, _: &[&[u8]]) -> bool {
+                false
+            }
+
+            fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+                if self.accepted {
+                    return Some(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)));
+                }
+                self.accepted = true;
+                Some(Ok(parts.iter().map(|part| part.len()).sum()))
+            }
+        }
+
+        let shared = Arc::new(Shared {
+            stream: Mutex::new(Box::new(FailControl { accepted: false })),
+            closed: AtomicBool::new(false),
+            masked: false,
+            open: AtomicUsize::new(0),
+            cut: AtomicUsize::new(0),
+            pending: Mutex::new(Vec::new()),
+        });
+        shared.defer(OP_PONG, b"p");
+        let writer = WsWriter {
+            shared,
+            masked: false,
+            keep: None,
+        };
+        assert!(matches!(writer.push_ready(&[]), crate::proxy::Push::Lost));
+    }
+
+    #[test]
     fn frames_round_trip_masked_and_plain() {
         for len in [0, 1, 125, 126, 200, 65_535, 65_536] {
             let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
@@ -1351,6 +1603,7 @@ mod tests {
                     masked: false,
                     open: AtomicUsize::new(0),
                     cut: AtomicUsize::new(0),
+                    pending: Mutex::new(Vec::new()),
                 });
                 let mut reader = WsReader {
                     read: stream,
@@ -1388,7 +1641,6 @@ mod tests {
             kept: Arc<Mutex<Vec<u8>>>,
             room: usize,
         }
-
         impl Write for Trickle {
             fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
                 let n = data.len().min(self.room);
@@ -1436,6 +1688,7 @@ mod tests {
                 masked: false,
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
             });
             let writer = WsWriter {
                 shared: Arc::clone(&shared),
@@ -1485,10 +1738,9 @@ mod tests {
             }
             assert_eq!(payload, data, "len {len} room {room}");
         };
-        check(64, 1);
-        check(64, 7);
-        check(200, 3);
-        check(70_000, 9);
+        for (len, room) in [(64, 1), (64, 7), (200, 3), (70_000, 9)] {
+            check(len, room);
+        }
     }
 
     /// RFC 6455 has two data opcodes, and the tunnel reads both: a text frame answers like a binary one, a text message reassembles over a continuation, and a binary one reaches the reader unchanged.
@@ -1511,6 +1763,7 @@ mod tests {
                 closed: AtomicBool::new(false),
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1547,6 +1800,7 @@ mod tests {
                 closed: AtomicBool::new(false),
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1616,6 +1870,7 @@ mod tests {
                 closed: AtomicBool::new(false),
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1681,6 +1936,7 @@ mod tests {
                 closed: AtomicBool::new(false),
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1802,6 +2058,7 @@ mod tests {
                 closed: AtomicBool::new(false),
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1848,6 +2105,7 @@ mod tests {
             closed: AtomicBool::new(false),
             open: AtomicUsize::new(0),
             cut: AtomicUsize::new(0),
+            pending: Mutex::new(Vec::new()),
             masked: false,
         });
         let mut reader = WsReader {
@@ -1892,6 +2150,7 @@ mod tests {
             closed: AtomicBool::new(false),
             open: AtomicUsize::new(0),
             cut: AtomicUsize::new(0),
+            pending: Mutex::new(Vec::new()),
             masked: false,
         });
         let frames = 64usize;
@@ -2142,6 +2401,7 @@ mod tests {
                 closed: AtomicBool::new(false),
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
                 masked: false,
             }),
             have_init: have.len(),

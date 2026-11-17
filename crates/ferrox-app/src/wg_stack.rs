@@ -168,9 +168,9 @@ impl FlowLease {
 
 impl Drop for FlowLease {
     fn drop(&mut self) {
-        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.active.fetch_sub(1, Ordering::SeqCst) == 1 {
             if let Some((retire, alive)) = &self.retiring {
-                if retire.load(Ordering::Acquire) {
+                if retire.load(Ordering::SeqCst) {
                     alive.store(false, Ordering::Release);
                 }
             }

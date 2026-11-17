@@ -276,7 +276,7 @@ impl Reply {
         let text = String::from_utf8_lossy(&self.body);
         let needle = format!("\"{name}\":");
         let at = text.find(&needle)? + needle.len();
-        let rest = &text[at..];
+        let rest = text[at..].trim_start();
         let value = match rest.strip_prefix('"') {
             Some(quoted) => quoted.split('"').next().unwrap_or_default(),
             None => rest
@@ -920,7 +920,7 @@ impl H2Connection {
     ) -> Result<Reply, String> {
         use crate::h2::{
             block_encode, frame_head, read_head_bounded, F_ACK, F_END, F_END_HEADERS, F_PADDED,
-            F_PRIORITY, T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS,
+            F_PRIORITY, T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW,
         };
         let mut fields: Vec<(String, String)> = Vec::with_capacity(headers.len() + 4);
         fields.push((":method".to_owned(), method.to_owned()));
@@ -1053,6 +1053,18 @@ impl H2Connection {
                         .body
                         .extend_from_slice(frame.get(at..end).unwrap_or_default());
                     ended = flags & F_END != 0;
+                    if !ended && !frame.is_empty() {
+                        let increment = u32::try_from(frame.len()).unwrap_or(u32::MAX);
+                        let mut updates = Vec::with_capacity(36);
+                        for window in [stream, 0] {
+                            updates.extend_from_slice(&frame_head(4, T_WINDOW, 0, window));
+                            updates.extend_from_slice(&increment.to_be_bytes());
+                        }
+                        self.tls
+                            .write_all(&updates)
+                            .and_then(|()| self.tls.flush())
+                            .map_err(|why| format!("crediting stream {stream}: {why}"))?;
+                    }
                 }
                 T_RST => return Err(format!("reading {} {path}: stream reset", endpoint.host)),
                 T_GOAWAY => {
@@ -1394,22 +1406,25 @@ pub(crate) fn token(
             .into_iter()
             .enumerate()
         {
-            let authorization = session_token.and_then(|session| {
-                let (id, mac) = account::hawk_credentials(session)?;
-                let nonce = nonce();
-                Some(
-                    Signed {
-                        method: "POST",
-                        path: &endpoint.url(path),
-                        host: &endpoint.origin(),
-                        port: endpoint.port,
-                        body: &body,
-                        timestamp,
-                        nonce: &nonce,
-                    }
-                    .header(&id, &mac),
-                )
-            });
+            let authorization = match session_token {
+                Some(session) => {
+                    let (id, mac) = account::hawk_credentials(session).ok_or(Denied::Token)?;
+                    let nonce = nonce().ok_or(Denied::Token)?;
+                    Some(
+                        Signed {
+                            method: "POST",
+                            path: &endpoint.url(path),
+                            host: &endpoint.origin(),
+                            port: endpoint.port,
+                            body: &body,
+                            timestamp,
+                            nonce: &nonce,
+                        }
+                        .header(&id, &mac),
+                    )
+                }
+                None => None,
+            };
             let mut headers: Vec<(&str, &str)> = vec![("Content-Type", JSON_ACCEPT)];
             if let Some(authorization) = authorization.as_deref() {
                 headers.push(("Authorization", authorization));
@@ -1989,16 +2004,15 @@ pub(crate) fn epoch() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-fn nonce() -> String {
+fn nonce() -> Option<String> {
     let mut raw = [0u8; 6];
-    getrandom::fill(&mut raw).unwrap_or_default();
-    ferrox_core::b64::encode(&raw)
+    getrandom::fill(&mut raw).ok()?;
+    Some(ferrox_core::b64::encode(&raw))
 }
 
 impl Account {
     /// Signs in, exchanges the session token, and mints the first pass.
     pub(crate) fn sign_in(&self, email: &str, password: &str) -> Result<(), Denied> {
-        let now = epoch();
         let Login {
             session,
             verified,
@@ -2015,7 +2029,7 @@ impl Account {
             self.persist();
             return Ok(());
         }
-        self.exchange(&session, now)
+        self.exchange(&session, epoch())
     }
 
     /// Exchanges a session token already minted by the sign-in page, skipping the password and its challenge.
@@ -2181,7 +2195,7 @@ impl Account {
         let mut last = Denied::Unreachable("no Firefox Accounts host".to_owned());
         for endpoint in fxa_attempts(&self.fxa) {
             let now = epoch();
-            let nonce = nonce();
+            let nonce = nonce().ok_or(Denied::Token)?;
             let authorization = Signed {
                 method: "POST",
                 path: &endpoint.url(path),
@@ -2226,8 +2240,9 @@ impl Account {
                 return Err(Denied::Token);
             }
             let now = epoch();
+            self.exchange(&session, now)?;
             *self.pending.lock().map_err(|_| Denied::Token)? = None;
-            return self.exchange(&session, now);
+            return Ok(());
         }
         Err(last)
     }

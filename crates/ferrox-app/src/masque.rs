@@ -200,6 +200,15 @@ struct Inner {
     stable: Arc<AtomicBool>,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // A retiring lane is cleared by its last flow lease.
+        if !self.retire.load(Ordering::Acquire) {
+            self.alive.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// The lane names its spec; the spec redacts the headers that carry a token and
 /// the key WARP signs with.
 impl std::fmt::Debug for MasqueOut {
@@ -298,8 +307,8 @@ impl MasqueOut {
     /// Take a lane out of the pool: an idle one stops now, a busy one stops when its
     /// last flow drops, so its stack thread and connection are never left behind.
     fn end(lane: &PoolLane) {
-        lane.inner.retire.store(true, Ordering::Release);
-        if lane.active.load(Ordering::Acquire) == 0 {
+        lane.inner.retire.store(true, Ordering::SeqCst);
+        if lane.active.load(Ordering::SeqCst) == 0 {
             lane.inner.alive.store(false, Ordering::Release);
         }
     }

@@ -244,10 +244,10 @@ fn check_request<'a>(head: &'a [u8], path: &str, host: &str) -> Option<&'a str> 
             continue;
         };
         let (name, value) = (name.trim(), value.trim());
-        if name.eq_ignore_ascii_case("upgrade") && upgrade.is_none() {
-            upgrade = Some(value.eq_ignore_ascii_case("websocket"));
-        } else if name.eq_ignore_ascii_case("connection") && connection.is_none() {
-            connection = Some(value.eq_ignore_ascii_case("upgrade"));
+        if name.eq_ignore_ascii_case("upgrade") {
+            upgrade = Some(upgrade.unwrap_or(false) || token_listed(value, "websocket"));
+        } else if name.eq_ignore_ascii_case("connection") {
+            connection = Some(connection.unwrap_or(false) || token_listed(value, "upgrade"));
         } else if name.eq_ignore_ascii_case("sec-websocket-key") && key.is_none() {
             key = Some(value);
         } else if name.eq_ignore_ascii_case("host") && request_host.is_none() {
@@ -262,6 +262,13 @@ fn check_request<'a>(head: &'a [u8], path: &str, host: &str) -> Option<&'a str> 
     } else {
         None
     }
+}
+
+/// Whether a header value carries `token`, which HTTP spells as a comma-separated list.
+fn token_listed(value: &str, token: &str) -> bool {
+    value
+        .split(',')
+        .any(|item| item.trim().eq_ignore_ascii_case(token))
 }
 
 /// `internet.IsValidHTTPHost`: the request's host, without a port, compared case-insensitively to the configured host.
@@ -397,9 +404,9 @@ fn check_response(head: &[u8]) -> Option<()> {
         };
         let (key, value) = (key.trim(), value.trim());
         if key.eq_ignore_ascii_case("connection") {
-            connection = value.eq_ignore_ascii_case("upgrade");
+            connection |= token_listed(value, "upgrade");
         } else if key.eq_ignore_ascii_case("upgrade") {
-            upgrade = value.eq_ignore_ascii_case("websocket");
+            upgrade |= token_listed(value, "websocket");
         }
     }
     if connection && upgrade {

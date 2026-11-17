@@ -62,8 +62,9 @@ pub(crate) fn edges_via(
 ) -> Vec<Candidate> {
     let now = epoch();
     let cached = CACHE.lock().map_or((0, Vec::new()), |cache| cache.clone());
+    let path = cache_path();
     let known = if cached.1.is_empty() {
-        read_at(&cache_path())
+        path.as_deref().map_or((0, Vec::new()), read_at)
     } else {
         cached
     };
@@ -74,7 +75,9 @@ pub(crate) fn edges_via(
     let (stamp, listed, fetched) = settled(known, now, fetch(roots, upstream));
     remember(&(stamp, listed.clone()));
     if fetched {
-        write_at(&cache_path(), &listed);
+        if let Some(path) = &path {
+            write_at(path, &listed);
+        }
     }
     listed
 }
@@ -85,8 +88,25 @@ fn remember(listed: &(u64, Vec<Candidate>)) {
     }
 }
 
-fn cache_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(CACHE_FILE)
+fn cache_path() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+        let uid = unsafe { libc::geteuid() };
+        let dir = std::env::temp_dir().join(format!("ferrox-{uid}"));
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+        let Ok(meta) = std::fs::symlink_metadata(&dir) else {
+            return None;
+        };
+        if !meta.is_dir() || meta.uid() != uid || meta.permissions().mode() & 0o077 != 0 {
+            return None;
+        }
+        Some(dir.join(CACHE_FILE))
+    }
+    #[cfg(not(unix))]
+    {
+        Some(std::env::temp_dir().join(CACHE_FILE))
+    }
 }
 
 /// One tab-separated line per edge, in the order the catalogue published them.
@@ -148,18 +168,16 @@ fn read_at(path: &std::path::Path) -> (u64, Vec<Candidate>) {
 /// Written beside the file it replaces and moved onto it, so a reader sees this whole list or the last one; best-effort, because a catalogue that cannot be cached is still a catalogue that was fetched.
 fn write_at(path: &std::path::Path, listed: &[Candidate]) {
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-    else {
-        return;
-    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
     }
+    let Ok(mut file) = options.open(&temp) else {
+        return;
+    };
     if file.write_all(&encode(listed)).is_err() {
         let _ = std::fs::remove_file(&temp);
         return;
