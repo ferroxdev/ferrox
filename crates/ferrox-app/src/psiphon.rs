@@ -1229,7 +1229,7 @@ impl Inner {
     fn live(&self) -> usize {
         let mut sessions = lock(&self.sessions);
         self.replay.promote(sessions.as_slice());
-        sessions.retain(|session| !session.is_closed());
+        self.replay.retain_open(&mut sessions);
         sessions.len()
     }
 
@@ -1237,7 +1237,7 @@ impl Inner {
     fn pick(&self) -> Option<Arc<Session>> {
         let mut sessions = lock(&self.sessions);
         self.replay.promote(sessions.as_slice());
-        sessions.retain(|session| !session.is_closed());
+        self.replay.retain_open(&mut sessions);
         if sessions.is_empty() {
             return None;
         }
@@ -1668,13 +1668,14 @@ impl Inner {
                         session.protocol()
                     );
                     let mut sessions = lock(&self.sessions);
-                    sessions.retain(|session| !session.is_closed());
+                    self.replay.retain_open(&mut sessions);
                     if sessions.len() >= self.settings.pool {
                         let at = self.next_session.fetch_add(1, Ordering::Relaxed) % sessions.len();
                         let existing = Arc::clone(&sessions[at]);
                         drop(sessions);
                         self.replay.promote(std::slice::from_ref(&session));
                         session.close();
+                        self.replay.forget_probe(session.id());
                         return Ok(existing);
                     }
                     sessions.push(Arc::clone(&session));
@@ -2191,6 +2192,7 @@ impl Inner {
         self.replay.promote(std::slice::from_ref(session));
         session.close();
         lock(&self.sessions).retain(|current| !Arc::ptr_eq(current, session));
+        self.replay.forget_probe(session.id());
     }
 
     fn split_tunnel_enabled(&self) -> bool {

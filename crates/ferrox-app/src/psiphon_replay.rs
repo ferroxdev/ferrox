@@ -228,6 +228,37 @@ impl Cache {
         }
     }
 
+    /// Retire closed sessions, clearing any pending probe they leave behind.
+    pub(crate) fn retain_open(&self, sessions: &mut Vec<Arc<Session>>) {
+        let closed: Vec<usize> = sessions
+            .iter()
+            .filter(|session| session.is_closed())
+            .map(|session| session.id())
+            .collect();
+        sessions.retain(|session| !session.is_closed());
+        if !closed.is_empty() {
+            self.forget_probes(&closed);
+        }
+    }
+
+    /// Clear the pending probe state for a session that leaves without promotion.
+    pub(crate) fn forget_probe(&self, session_id: usize) {
+        self.forget_probes(std::slice::from_ref(&session_id));
+    }
+
+    fn forget_probes(&self, session_ids: &[usize]) {
+        let mut state = lock(&self.state);
+        for entry in state.entries.values_mut() {
+            if entry
+                .probe_session
+                .is_some_and(|id| session_ids.contains(&id))
+            {
+                entry.next_seed = None;
+                entry.probe_session = None;
+            }
+        }
+    }
+
     /// Promote established sessions that reached the configured transfer targets.
     pub(crate) fn promote(&self, sessions: &[Arc<Session>]) {
         let mut state = lock(&self.state);
@@ -582,6 +613,45 @@ mod tests {
         let probe = cache.begin(&entry, 7);
         assert!(!probe.is_replay());
         probe.failed();
+        let active = cache.begin(&entry, 7);
+        assert!(active.is_replay());
+        assert_eq!(active.seed(), first.seed());
+    }
+
+    #[test]
+    fn a_retired_probe_releases_the_pending_seed() {
+        let cache = new_cache(Settings {
+            fronted_update_frequency: Duration::from_millis(1),
+            ..Settings::default()
+        });
+        let mut entry = server("example.test", 443);
+        entry.fronting_provider_id = Some("provider".to_owned());
+        let first = cache.begin(&entry, 7);
+        first.succeeded(1);
+        cache.mark_succeeded("example.test");
+        {
+            let mut state = lock(&cache.state);
+            state
+                .entries
+                .get_mut("example.test")
+                .expect("entry")
+                .created = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("clock");
+        }
+        let replay = cache.begin(&entry, 7);
+        assert!(replay.is_replay());
+        replay.succeeded(2);
+        let probe = cache.begin(&entry, 7);
+        assert!(!probe.is_replay());
+        probe.succeeded(3);
+        cache.forget_probe(3);
+        {
+            let state = lock(&cache.state);
+            let stored = state.entries.get("example.test").expect("entry");
+            assert_eq!(stored.probe_session, None);
+            assert_eq!(stored.next_seed, None);
+        }
         let active = cache.begin(&entry, 7);
         assert!(active.is_replay());
         assert_eq!(active.seed(), first.seed());
