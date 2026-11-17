@@ -5372,6 +5372,11 @@ fn mpint(value: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
+    test_channel_with_window(payloads, DEFAULT_CHANNEL_WINDOW)
+}
+
+#[cfg(test)]
+fn test_channel_with_window(payloads: &[&[u8]], window: u32) -> Channel {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
     let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
     let (_local, _) = listener.accept().expect("accept");
@@ -5410,7 +5415,7 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         remote: AtomicU32::new(2),
         remote_window: Mutex::new(0),
         remote_packet: AtomicU32::new(CHANNEL_PACKET),
-        window: DEFAULT_CHANNEL_WINDOW,
+        window,
         recv: Mutex::new(Recv {
             chunks: VecDeque::new(),
             eof: false,
@@ -5479,10 +5484,7 @@ mod tests {
     fn a_packet_tunnel_channel_uses_its_own_adjust_threshold() {
         let payloads = [vec![0u8; 8192], vec![0u8; 8192]];
         let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
-        let mut channel = test_channel_with_chunks(&refs);
-        Arc::get_mut(&mut channel.state)
-            .expect("unique channel state")
-            .window = 32 * 1024;
+        let channel = test_channel_with_window(&refs, 32 * 1024);
         let (_, first) = channel.take_chunk();
         assert_eq!(first, 0);
         let (_, second) = channel.take_chunk();
@@ -5492,10 +5494,7 @@ mod tests {
             "the adjust threshold followed the session window, not the channel's"
         );
 
-        let mut channel = test_channel_with_chunks(&refs);
-        Arc::get_mut(&mut channel.state)
-            .expect("unique channel state")
-            .window = 32 * 1024;
+        let mut channel = test_channel_with_window(&refs, 32 * 1024);
         let mut out = vec![0u8; 8192];
         assert_eq!(channel.read(&mut out).expect("first read"), out.len());
         let before = lock(&channel.state.recv).local_window;
@@ -5507,10 +5506,7 @@ mod tests {
             "the read path used the session window"
         );
 
-        let mut channel = test_channel_with_chunks(&refs);
-        Arc::get_mut(&mut channel.state)
-            .expect("unique channel state")
-            .window = 32 * 1024;
+        let mut channel = test_channel_with_window(&refs, 32 * 1024);
         let before = lock(&channel.state.recv).local_window;
         let mut batch = Vec::new();
         assert!(channel.next_batch(&mut batch, 2).expect("batch"));

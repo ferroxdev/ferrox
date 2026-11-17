@@ -16219,7 +16219,7 @@ mod tests {
 
     #[test]
     fn an_unfronted_limit_keeps_the_direct_candidate() {
-        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshHostKey":"AAAA","capabilities":["SSH","UNFRONTED-MEEK-HTTPS"],"meekServerPort":8443,"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk"}"#;
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshObfuscatedPort":443,"sshObfuscatedKey":"k","sshHostKey":"AAAA","capabilities":["OSSH","UNFRONTED-MEEK-HTTPS"],"meekServerPort":8443,"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk"}"#;
         let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
         let server = decode_entry(&encoded).expect("dual");
         let selected = select_protocols(
@@ -16232,7 +16232,7 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert!(selected
             .iter()
-            .any(|server| server.direct && server.meek.is_none() && server.port == 22));
+            .any(|server| server.direct && server.meek.is_none() && server.port == 443));
         assert!(selected.iter().any(|server| {
             server
                 .meek
