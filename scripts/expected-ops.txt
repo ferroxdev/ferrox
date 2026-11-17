@@ -332,14 +332,17 @@ ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47810192 psiphon_s
 ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_costs_one_walk
 # The merged hello: 256 fixed 300-octet hellos cut at widths 11 and 37 through
 # one stage with a single zero delay, over a sink that takes a whole gathered
-# write and keeps nothing. 346140 is 1352.1 per turn; the two widths and the
+# write and keeps nothing. 345889 is 1351.1 per turn; the two widths and the
 # zero delay never draw, so the probe prices the cuts and the 32-record gather.
 # The record bytes are the same as the merge-copy path this replaced.
 # Re-blessed from 317726 by main's finalmask range fix (aa2db45) and xmc write
 # and length contracts (7678f98): the zero delay still selects the low bound and
 # the cuts are unchanged, while the widened span and the added code moved this
 # test binary's thin-LTO layout. ops.yml run 44009241010.
-ferrox_core::finalmask::tests::merged_hello_probe 346140 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
+# Re-blessed 345889 by the sni-mode branch in `Fragment::write`: the width path
+# still answers 256 * whole.len and draws the same cuts, while the extra arm
+# moved this test binary's thin-LTO layout. ops.yml run 44032106261.
+ferrox_core::finalmask::tests::merged_hello_probe 345889 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
 # The client request built by `request`: one address type byte, the address and
 # the port, written in one match with the vector's room reserved exactly once,
 # through `spare_capacity_mut` and one `copy_nonoverlapping` per field so no
