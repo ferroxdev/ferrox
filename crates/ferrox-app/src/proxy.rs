@@ -19803,9 +19803,8 @@ fn relay_pool_flow(client: &Connection, mut flow: PooledFlow) {
     };
     let done = RelayPool::global().run(move || {
         let mut down = down;
-        if mux_pool_downlink(&replies, &mut down) {
-            let _ = down.shutdown(Shutdown::Write);
-        }
+        mux_pool_downlink(&replies, &mut down);
+        let _ = down.shutdown(Shutdown::Write);
     });
     let mut chunk = vec![0u8; MUX_UPLOAD_SLICE];
     let Ok(mut plain) = up.try_clone() else {
