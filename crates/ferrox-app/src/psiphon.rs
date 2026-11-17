@@ -2983,6 +2983,7 @@ fn pump_channel(
                     return true;
                 }
             }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => return false,
             _ => return true,
         }
     }
