@@ -202,7 +202,10 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        self.alive.store(false, Ordering::Release);
+        // A retiring lane is cleared by its last flow lease.
+        if !self.retire.load(Ordering::Acquire) {
+            self.alive.store(false, Ordering::Release);
+        }
     }
 }
 

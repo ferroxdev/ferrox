@@ -95,10 +95,10 @@ fn cache_path() -> Option<std::path::PathBuf> {
         let uid = unsafe { libc::geteuid() };
         let dir = std::env::temp_dir().join(format!("ferrox-{uid}"));
         let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
-        let Ok(meta) = std::fs::metadata(&dir) else {
+        let Ok(meta) = std::fs::symlink_metadata(&dir) else {
             return None;
         };
-        if meta.uid() != uid || meta.permissions().mode() & 0o077 != 0 {
+        if !meta.is_dir() || meta.uid() != uid || meta.permissions().mode() & 0o077 != 0 {
             return None;
         }
         Some(dir.join(CACHE_FILE))

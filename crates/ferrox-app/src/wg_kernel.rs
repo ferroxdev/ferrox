@@ -117,29 +117,31 @@ impl KernelWireGuard {
                     .to_owned(),
             );
         }
-        let (name, table, mark) = identity();
         let mut route = Netlink::open(libc::NETLINK_ROUTE).map_err(|error| kernel_error(&error))?;
-        let mut index = None;
-        let mut families = Vec::new();
-        if let Err(error) = setup(
-            &mut route,
-            &name,
-            table,
-            mark,
-            config,
-            &mut index,
-            &mut families,
-        ) {
-            teardown(&name, index, table, mark, &families);
-            return Err(kernel_error(&error));
+        let mut last = io::Error::other("no free kernel wireguard identity");
+        for _ in 0..IDENTITY_TRIES {
+            let (name, table, mark) = identity();
+            let mut attempt = Attempt::default();
+            match setup(&mut route, &name, table, mark, config, &mut attempt) {
+                Ok(()) => {
+                    return Ok(Self {
+                        name,
+                        index: attempt.index.unwrap_or_default(),
+                        table,
+                        mark,
+                        families: attempt.families,
+                    });
+                }
+                Err(error) => {
+                    rollback(&mut route, &name, table, mark, &attempt);
+                    if error.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(kernel_error(&error));
+                    }
+                    last = error;
+                }
+            }
         }
-        Ok(Self {
-            name,
-            index: index.unwrap_or_default(),
-            table,
-            mark,
-            families,
-        })
+        Err(kernel_error(&last))
     }
 
     /// The interface name, for diagnostics and the privileged test.
@@ -202,48 +204,82 @@ impl Drop for KernelWireGuard {
     }
 }
 
+/// What a setup attempt installed, so a failed one removes only its own objects.
+#[derive(Default)]
+struct Attempt {
+    link_created: bool,
+    index: Option<u32>,
+    families: Vec<u8>,
+    routes: Vec<u8>,
+    rules: Vec<(u8, bool)>,
+}
+
 fn setup(
     route: &mut Netlink,
     name: &str,
     table: u32,
     mark: u32,
     config: &DeviceConfig,
-    index: &mut Option<u32>,
-    families: &mut Vec<u8>,
+    attempt: &mut Attempt,
 ) -> io::Result<()> {
     route.request(link_create_message(name, config.mtu))?;
+    attempt.link_created = true;
     let ifindex = interface_index(name)?;
-    *index = Some(ifindex);
+    attempt.index = Some(ifindex);
     let mut genl = Netlink::open(libc::NETLINK_GENERIC)?;
     let family = generic_family(&mut genl, b"wireguard\0")?;
     genl.request(device_message(family, name, config))?;
     for address in &config.addresses {
         route.request(address_message(ifindex, *address))?;
         let family = if address.is_ipv4() { AF_INET } else { AF_INET6 };
-        if !families.contains(&family) {
-            families.push(family);
+        if !attempt.families.contains(&family) {
+            attempt.families.push(family);
         }
     }
     for peer in &config.peers {
         for (address, _) in &peer.allowed {
             let family = if address.is_ipv4() { AF_INET } else { AF_INET6 };
-            if !families.contains(&family) {
-                families.push(family);
+            if !attempt.families.contains(&family) {
+                attempt.families.push(family);
             }
         }
     }
     route.request(link_up_message(ifindex))?;
-    for family in families.iter().copied() {
+    for family in attempt.families.clone() {
         let source = config
             .addresses
             .iter()
             .find(|address| address.is_ipv4() == (family == AF_INET))
             .copied();
         route.request(route_message(family, table, ifindex, source))?;
+        attempt.routes.push(family);
         route.request(rule_message(family, table, mark, RULE_PRIORITY, None))?;
+        attempt.rules.push((family, false));
         route.request(rule_message(family, table, mark, IIF_PRIORITY, Some(name)))?;
+        attempt.rules.push((family, true));
     }
     Ok(())
+}
+
+/// Undo exactly the objects this attempt installed, in reverse order.
+fn rollback(route: &mut Netlink, name: &str, table: u32, mark: u32, attempt: &Attempt) {
+    for (family, iif) in attempt.rules.iter().rev() {
+        let _ = route.request(delete_rule_message(
+            *family,
+            table,
+            mark,
+            if *iif { IIF_PRIORITY } else { RULE_PRIORITY },
+            if *iif { Some(name) } else { None },
+        ));
+    }
+    if let Some(index) = attempt.index {
+        for family in attempt.routes.iter().rev() {
+            let _ = route.request(delete_route_message(*family, table, index));
+        }
+        let _ = route.request(delete_link_message(index));
+    } else if attempt.link_created {
+        let _ = route.request(delete_link_name_message(name));
+    }
 }
 
 fn domain(target: SocketAddr) -> Domain {
@@ -258,13 +294,17 @@ fn kernel_error(error: &io::Error) -> String {
     format!("kernel wireguard: {error}")
 }
 
+/// A collision is returned as `EEXIST` by netlink, so an attempt retries under a fresh random identity.
+const IDENTITY_TRIES: usize = 8;
+
 fn identity() -> (String, u32, u32) {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let token = NEXT.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let name = format!("fwg{:04x}{:04x}", pid & 0xffff, token & 0xffff);
-    let low = (pid ^ token.wrapping_mul(0x9e37_79b9)) & 0xffff;
-    let table = 0x4645_0000 | low;
+    let mut raw = [0u8; 2];
+    let _ = getrandom::fill(&mut raw);
+    let low = u16::from_ne_bytes(raw) ^ (std::process::id() as u16) ^ token as u16;
+    let name = format!("fwg{low:04x}{:04x}", token & 0xffff);
+    let table = 0x4645_0000 | u32::from(low);
     (name, table, table)
 }
 

@@ -90,6 +90,9 @@ struct PooledState {
     /// One handle per flow, shared by every burst it arrives in: a hand-off takes a refcount, not a `dup`.
     sessions: HashMap<u64, Arc<Connection>>,
     opening: HashSet<u64>,
+    /// Directions that ended while the other was still live: a flow leaves the lane only when both are done.
+    upload_done: HashSet<u64>,
+    reply_done: HashSet<u64>,
     next_id: u64,
     /// The generation of the pump thread that owns the lane's read side, or zero: a thread clears only its own, so a lane a later lease has already re-armed is left untouched.
     pump: u64,
@@ -4024,6 +4027,7 @@ fn pump(
     let buf = room.as_mut();
     // The batch lives across the turns, so a turn does not build the slots again.
     let mut batch = Batch::new();
+    let _exit = PumpExit(table);
     loop {
         let before = *local;
         if !rebind_if_moved(shared, sock, peer, net, local) {
@@ -4112,7 +4116,6 @@ fn pump(
             }
         }
         for (id, up) in ready.drain(..) {
-            let mut ended = false;
             loop {
                 let received = {
                     let Ok(mut conn) = shared.lock() else {
@@ -4125,24 +4128,21 @@ fn pump(
                     }
                 };
                 let Ok((n, fin)) = received else {
-                    ended = true;
+                    fail_session(table, id);
                     break;
                 };
                 if n == 0 && !fin {
                     break;
                 }
-                if (&*up).write_all(&chunk[..n]).is_err() {
-                    ended = true;
+                if n > 0 && (&*up).write_all(&chunk[..n]).is_err() {
+                    fail_session(table, id);
                     break;
                 }
                 if fin {
                     let _ = up.shutdown(Shutdown::Write);
-                    ended = true;
+                    finish_session(table, id, false);
                     break;
                 }
-            }
-            if ended {
-                leave_session(table, id);
             }
         }
     }
@@ -4235,11 +4235,66 @@ fn leave_session(table: &Arc<Mutex<PooledState>>, id: u64) {
     if let Ok(mut table) = table.lock() {
         table.sessions.remove(&id);
         table.opening.remove(&id);
+        table.upload_done.remove(&id);
+        table.reply_done.remove(&id);
+    }
+}
+
+/// Record one direction ending; the lane keeps the flow while the other direction still moves.
+fn finish_session(table: &Arc<Mutex<PooledState>>, id: u64, upload: bool) {
+    let Ok(mut state) = table.lock() else {
+        return;
+    };
+    if !state.sessions.contains_key(&id) {
+        return;
+    }
+    if upload {
+        state.upload_done.insert(id);
+    } else {
+        state.reply_done.insert(id);
+    }
+    if state.upload_done.contains(&id) && state.reply_done.contains(&id) {
+        state.sessions.remove(&id);
+        state.opening.remove(&id);
+        state.upload_done.remove(&id);
+        state.reply_done.remove(&id);
+    }
+}
+
+/// A failed direction ends both: the client side is shut so a blocked uplink returns, and the lane forgets the flow.
+fn fail_session(table: &Arc<Mutex<PooledState>>, id: u64) {
+    let up = table.lock().ok().and_then(|mut state| {
+        state.opening.remove(&id);
+        state.upload_done.remove(&id);
+        state.reply_done.remove(&id);
+        state.sessions.remove(&id)
+    });
+    if let Some(up) = up {
+        let _ = up.shutdown(Shutdown::Read);
+    }
+}
+
+/// Every flow a pump was serving when it left: the lane is no longer driven, so the client halves end here.
+struct PumpExit<'a>(&'a Arc<Mutex<PooledState>>);
+
+impl Drop for PumpExit<'_> {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        state.opening.clear();
+        state.upload_done.clear();
+        state.reply_done.clear();
+        let sessions = std::mem::take(&mut state.sessions);
+        drop(state);
+        for up in sessions.values() {
+            let _ = up.shutdown(Shutdown::Both);
+        }
     }
 }
 
 #[allow(clippy::too_many_lines)]
-fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection, expect_reply: bool) {
+fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
     #[cfg(test)]
     let port = pooled.key.port;
     let Ok(flush_sock) = pooled.sock.try_clone() else {
@@ -4251,15 +4306,12 @@ fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection, expect_reply
         return;
     };
     let mut chunk = crate::proxy::RelayBuf::with_len(PUMP_WINDOW).into_vec();
-    let mut half_closed = false;
     loop {
         #[cfg(test)]
         let read_at = Instant::now();
         match plain.read(&mut chunk) {
-            Ok(0) => {
-                half_closed = true;
-                break;
-            }
+            Ok(0) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
             Ok(n) => {
                 #[cfg(test)]
@@ -4339,9 +4391,7 @@ fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection, expect_reply
     }
     #[cfg(test)]
     qstage(format!("{} t={} uplink-end {id}", port, qms()));
-    if !half_closed || !expect_reply {
-        leave_session(&pooled.table, id);
-    }
+    finish_session(&pooled.table, id, true);
 }
 
 pub(crate) fn dial_pooled(
@@ -4415,7 +4465,7 @@ pub(crate) fn dial_pooled_with(
     }
     #[cfg(test)]
     qstage(format!("{} t={} graduated {id}", dial.port, qms()));
-    uplink_stream(&pooled, id, client, expect_reply);
+    uplink_stream(&pooled, id, client);
 }
 
 /// A stream on the pooled connection under the named budget; a connection the budget missed is never pooled.
@@ -4540,6 +4590,8 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
         let table = Arc::new(Mutex::new(PooledState {
             sessions: HashMap::new(),
             opening: HashSet::new(),
+            upload_done: HashSet::new(),
+            reply_done: HashSet::new(),
             next_id: 0,
             pump: 0,
             // No thread yet: only a lease whose bytes the pump can hand over starts one, so a connection nobody rode and a flow that reads its own socket cost none.

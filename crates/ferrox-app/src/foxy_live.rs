@@ -116,6 +116,15 @@ fn through_tunnel<T: Read + Write>(tunnel: &mut T, host: &str, path: &str) -> Op
             Ok(read) => head.extend_from_slice(&chunk[..read]),
         }
     }
+    // Drain the body so the next request on this flow starts after this one ended.
+    if ferrox_core::foxy::head_end_grown(&head, &mut scanned).is_some() {
+        while head.len() < 64 * 1024 && Instant::now() < deadline {
+            match tunnel.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => head.extend_from_slice(&chunk[..read]),
+            }
+        }
+    }
     String::from_utf8(head).ok()
 }
 
@@ -174,8 +183,21 @@ fn try_carrier(
         .map_err(|failure| failure.to_string())?;
     let ip = through_tunnel(&mut tunnel, PROBE_HOST, PROBE_PATH)
         .ok_or_else(|| "no answer through the tunnel".to_owned())?;
-    let seen = opened(&mut tunnel, country)
+    let _ = tunnel.finish();
+    tunnel.settle();
+    // The trace names another origin, so it needs its own CONNECT rather than a Host header on the probe's flow.
+    let quic = match carrier {
+        Carrier::H3 => {
+            crate::quic::pooled_stream_within(&quic_dial, crate::quic::HANDSHAKE_TIMEOUT)
+        }
+        _ => None,
+    };
+    let mut trace = Tunnel::open(&dial, &format!("{TRACE_HOST}:80"), quic)
+        .map_err(|failure| failure.to_string())?;
+    let seen = opened(&mut trace, country)
         .ok_or_else(|| "the exit country could not be read".to_owned())?;
+    let _ = trace.finish();
+    trace.settle();
     Ok(format!(
         "{} {} in {:?}, exit {seen}",
         ip.split_whitespace().last().unwrap_or("?"),

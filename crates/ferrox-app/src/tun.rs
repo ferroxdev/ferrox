@@ -2237,7 +2237,7 @@ impl Handler {
                 render_tcp_packet_ip(
                     flow.local,
                     flow.remote,
-                    flow.server_isn.wrapping_add(1),
+                    flow.server_isn,
                     flow.isn.wrapping_add(1),
                     FLAG_SYN | FLAG_ACK,
                     65535,
@@ -2417,7 +2417,7 @@ impl Handler {
             let rendered = render_tcp_headers_ip(
                 (local_ip, local_port),
                 (remote_ip, remote_port),
-                server_isn.wrapping_add(1),
+                server_isn,
                 syn_seq.wrapping_add(1),
                 FLAG_SYN | FLAG_ACK,
                 65535,
@@ -5796,8 +5796,7 @@ mod tests {
             .table()
             .get(&key)
             .expect("the flow")
-            .server_isn
-            .wrapping_add(1);
+            .server_isn;
         assert_eq!(syn_ack.seq, expected, "the server sequence is its own");
     }
 }
