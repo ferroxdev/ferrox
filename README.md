@@ -299,7 +299,7 @@ Today exactly one method dials per hop. The chaining engine builds stacks as an 
 | 126 | mixed (HTTP + SOCKS) inbound | implemented | — | sing-box `protocol/mixed/`; one-byte sniff between SOCKS and HTTP |
 | 127 | redirect + tproxy inbounds | planned | — | sing-box `protocol/redirect/`; Leaf `proxy/redirect/` (the origin-destination spelling, inbound and outbound) |
 | 128 | NaïveProxy | planned | — | sing-box `protocol/naive/`; LxBox `naive+https://` |
-| 129 | AnyTLS | planned | — | sing-box `protocol/anytls/`; ZeroNet `anytls.rs`. Row 23 is the link parse |
+| 129 | AnyTLS | implemented — both roles, TCP flows, session reuse; UDP-over-stream not carried | Both roles over TLS or plain TCP inbound; `sha256(password)` prologue, v2 settings, the default padding scheme, `SYN`/`PSH`/`FIN`/`SYNACK`, `UPDATE_PADDING_SCHEME`, `SERVER_SETTINGS`; outbound reads `settings.servers` or the flat settings and pools up to eight idle sessions. UoT is not carried, so UDP flows are not advertised. | sing-box `protocol/anytls/`; [page](docs/function/anytls.md). Row 23 is the link parse |
 | 130 | ShadowTLS | planned | — | sing-box `protocol/shadowtls/` |
 | 131 | Snell | planned | — | sing-box `protocol/snell/` |
 | 132 | SSH outbound | planned | — | sing-box `protocol/ssh/`; LxBox `ssh://` |

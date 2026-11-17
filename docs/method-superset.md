@@ -31,7 +31,7 @@ The shared protocol in `crates/ferrox-prompt/prompts.md` states it as "a superse
 | trojan | protocol | implemented | upstream/xray-core/proxy/trojan, upstream/sing-box/protocol/trojan, upstream/sing-box/transport/trojan, upstream/zeronet/crates/zero-protocol, docs/function/trojan.md | 56-byte SHA-224 key, commands 1/3, TCP+UDP |
 | shadowsocks | protocol | implemented | upstream/xray-core/proxy/shadowsocks, upstream/sing-box/protocol/shadowsocks, upstream/zeronet/crates/zero-protocol, docs/function/shadowsocks.md | AEAD set + `rc4-md5` + Xray spellings; MD5 chain only |
 | shadowsocks-2022 | protocol | partial | upstream/xray-core/proxy/shadowsocks_2022, upstream/zeronet/crates/zero-protocol/src/shadowsocks2022.rs, docs/function/shadowsocks-2022.md | `2022-blake3-*`, EIH identity, TCP+UDP relay; the client's handshake leaves in three writes, not the one SIP022 §3.1.4 asks for |
-| anytls | protocol | planned | upstream/sing-box/protocol/anytls, upstream/zeronet/crates/zero-protocol/src/anytls.rs | padding scheme, session pooling, client metadata |
+| anytls | protocol | implemented | upstream/sing-box/protocol/anytls, upstream/zeronet/crates/zero-protocol/src/anytls.rs, docs/function/anytls.md | both roles, TLS or plain TCP inbound, padding scheme, session pooling, client metadata; UoT is not carried |
 | shadowtls | protocol | planned | upstream/sing-box/protocol/shadowtls | versions 1–3, `wildcard_sni`, `strict_mode`, handshake detour |
 | snell | protocol | planned | upstream/sing-box/protocol/snell | v4–v6, `obfs_mode`, `mode`, userkey |
 | ssh | protocol | planned | upstream/sing-box/protocol/ssh | outbound only; also the `+SSH` chaining layer |

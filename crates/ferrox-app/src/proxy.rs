@@ -700,6 +700,20 @@ fn serve_inbounds_counted(
                             inbounds += 1;
                         }
                     }
+                    "anytls" => {
+                        if crate::anytls::serve_inbound(
+                            address,
+                            inbound,
+                            label,
+                            freedom,
+                            handler_stop.clone(),
+                        ) {
+                            if let Some(stop) = &handler_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            }
+                            inbounds += 1;
+                        }
+                    }
                     "socks" | "http" | "mixed" => {
                         let Some(out) = routed(inbound, true) else {
                             eprintln!(
@@ -906,13 +920,14 @@ fn refuse_inbound(protocol: &str, label: &str, inbound: &Json) {
 }
 
 /// Served inbounds; the `tun` device inbound opens a native interface and relays TCP flows.
-const SERVED_INBOUNDS: [&str; 15] = [
+const SERVED_INBOUNDS: [&str; 16] = [
     "vless",
     "trojan",
     "vmess",
     "shadowsocks",
     "hysteria",
     "tuic",
+    "anytls",
     "socks",
     "http",
     "mixed",
@@ -1603,6 +1618,7 @@ fn udp_lane_supported(out: &Outbound) -> bool {
         Outbound::Shadowsocks(ss) => matches!(ss.carrier, Carrier::Raw(_)),
         Outbound::Socks(socks) => socks.version != crate::socks::Version::V4,
         Outbound::Http(_)
+        | Outbound::AnyTls(_)
         | Outbound::Veepn(_)
         | Outbound::Route(_)
         | Outbound::Block(_)
@@ -2420,6 +2436,7 @@ pub(crate) enum Outbound {
     Shadowsocks(ShadowsocksOut),
     Hysteria(Box<HysteriaOut>),
     Tuic(Arc<crate::tuic::TuicOut>),
+    AnyTls(Arc<crate::anytls::AnyTlsOut>),
     Socks(SocksOut),
     Foxy(Box<FoxyOut>),
     Veepn(crate::veepn::VeepnOut),
@@ -2464,6 +2481,7 @@ impl Outbound {
             Self::Shadowsocks(ss) => resolve_outbound(&ss.address, ss.port),
             Self::Hysteria(hy) => resolve_outbound(&hy.address, hy.port),
             Self::Tuic(tuic) => tuic.edge(),
+            Self::AnyTls(anytls) => anytls.edge(),
             Self::Socks(socks) => resolve_outbound(&socks.address, socks.port),
             Self::Http(http) => resolve_outbound(&http.address, http.port),
             Self::WireGuard(wireguard) => wireguard.edge(),
@@ -3788,7 +3806,8 @@ fn chain_hop_can_dial_through(out: &Outbound) -> bool {
         | Outbound::Http(_)
         | Outbound::Psiphon(_)
         | Outbound::Freedom(_)
-        | Outbound::Masque(_) => true,
+        | Outbound::Masque(_)
+        | Outbound::AnyTls(_) => true,
         Outbound::WireGuard(_)
         | Outbound::Warp(_)
         | Outbound::Hysteria(_)
@@ -4260,7 +4279,7 @@ fn pick_script_outbound(
 fn dials_direct_inbound(protocol: &str) -> bool {
     matches!(
         canonical_protocol(protocol),
-        "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria" | "tuic"
+        "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria" | "tuic" | "anytls"
     )
 }
 
@@ -20217,6 +20236,56 @@ where
     )
 }
 
+type AnyTlsServerSession =
+    ferrox_core::tls::RustlsServerProvider<ferrox_core::tls::reality::RecordLimiter<Connection>>;
+
+pub(crate) fn anytls_dial_session(
+    server: &SocketAddr,
+    cfg: &ferrox_core::tls::TlsConfig,
+) -> Option<ferrox_core::tls::ClientSession<Connection>> {
+    dial_tls_session(server, cfg, None)
+}
+
+pub(crate) fn anytls_client_halves(
+    session: ferrox_core::tls::ClientSession<Connection>,
+) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+    let raw = session.get_ref().try_clone().ok()?;
+    let (reader, writer) = session_halves(session, raw);
+    Some((Box::new(reader), Box::new(writer)))
+}
+
+pub(crate) fn anytls_server_halves(
+    session: AnyTlsServerSession,
+) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+    let raw = session.get_ref().get_ref().try_clone().ok()?;
+    let (reader, writer) = session_halves(session, raw);
+    Some((Box::new(reader), Box::new(writer)))
+}
+
+pub(crate) fn relay_anytls_stream(
+    client: &Connection,
+    stream: crate::anytls::AnyTlsStream,
+    finish: Option<Box<dyn FnOnce() + Send>>,
+) {
+    let Some(upstream) = client.try_clone().ok() else {
+        stream.close();
+        if let Some(finish) = finish {
+            finish();
+        }
+        return;
+    };
+    let stall = Some(crate::budgets::relay_stall());
+    let _ = client.set_write_timeout(stall);
+    let _ = upstream.set_write_timeout(stall);
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+    let flow = relay_lanes_handoff(Half::socket(upstream), Half::socket(stream), &close);
+    flow.then(move || {
+        if let Some(finish) = finish {
+            finish();
+        }
+    });
+}
+
 // A dialled TLS session a carrier can drive: split into a reader and a writer over one lock, plus the raw socket the sink shuts down on teardown.
 trait Dialed:
     ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send + 'static
@@ -26052,6 +26121,7 @@ fn dial_socks_outbound(
             }
         }
         Outbound::Tuic(tuic) => tuic.dial(client, target),
+        Outbound::AnyTls(anytls) => anytls.dial(client, target),
         Outbound::Http(http) => {
             dial_http_outbound(client, server, http, target, ladder);
         }
@@ -38760,6 +38830,9 @@ fn find_outbound_with(root: &Json, test: bool) -> Result<Option<Outbound>, Strin
     }
     if let Some(tuic) = crate::tuic::outbound(root)? {
         return Ok(Some(Outbound::Tuic(Arc::new(tuic))));
+    }
+    if let Some(anytls) = crate::anytls::outbound(root)? {
+        return Ok(Some(Outbound::AnyTls(Arc::new(anytls))));
     }
     if let Some(wireguard) = find_wireguard_outbound(root)? {
         return Ok(Some(Outbound::WireGuard(Arc::new(wireguard))));

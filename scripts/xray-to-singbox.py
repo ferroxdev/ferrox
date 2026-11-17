@@ -412,6 +412,28 @@ def _server_inbound(inbound):
             "listen": inbound.get("listen", "127.0.0.1"),
             "listen_port": inbound["port"],
         }
+    if protocol == "anytls":
+        settings = inbound.get("settings") or {}
+        users = settings.get("users") or settings.get("clients")
+        if not isinstance(users, list) or not users:
+            raise ValueError("the AnyTLS server needs at least one user")
+        converted = {
+            "type": "anytls",
+            "tag": inbound.get("tag", "anytls-in"),
+            "listen": inbound.get("listen", "127.0.0.1"),
+            "listen_port": inbound["port"],
+            "users": [
+                {
+                    "name": user.get("name", f"user-{index}"),
+                    "password": user["password"],
+                }
+                for index, user in enumerate(users)
+            ],
+        }
+        tls = _server_tls(inbound.get("streamSettings") or {})
+        if tls is not None:
+            converted["tls"] = tls
+        return converted
     if protocol == "vless":
         settings = inbound.get("settings") or {}
         stream = inbound.get("streamSettings") or {}
