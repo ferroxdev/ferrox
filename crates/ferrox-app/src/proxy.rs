@@ -27838,7 +27838,7 @@ fn serve_socks_udp_portal(relay: &UdpSocket, portal: &crate::reverse::Portal) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
         };
-        if payload.is_empty() {
+        if payload.is_empty() || payload.len() > ferrox_core::mux::CHUNK_MAX {
             continue;
         }
         let sent = {

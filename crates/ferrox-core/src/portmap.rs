@@ -221,12 +221,6 @@ pub fn external_ip_body(service_type: &str, out: &mut [u8]) -> Option<usize> {
     Some(envelope.len())
 }
 
-/// Read the `NewExternalPort` an `AddPortMapping` reply names.
-#[must_use]
-pub fn parse_external_port(xml: &str) -> Option<u16> {
-    xml_tag(xml, "NewExternalPort")?.parse().ok()
-}
-
 /// Read the `NewExternalIPAddress` a `GetExternalIPAddress` reply names.
 #[must_use]
 pub fn parse_external_ip(xml: &str) -> Option<IpAddr> {
@@ -251,7 +245,7 @@ pub fn join_control(url_base: Option<&str>, control: &str) -> String {
         .map(|at| at + scheme_end + 3);
     let origin = authority_end.map_or(base, |at| &base[..at]);
     if control.starts_with('/') {
-        return format!("{origin}{control}");
+        return resolve_dot_segments(&format!("{origin}{control}"));
     }
     let directory = authority_end.map_or("/", |at| {
         let path = &base[at..];
@@ -272,22 +266,27 @@ fn resolve_dot_segments(url: &str) -> String {
         return url.to_owned();
     };
     let origin = &url[..path_start];
+    let path = &url[path_start..];
+    let absolute = path.starts_with('/');
     let mut segments: Vec<&str> = Vec::new();
-    for segment in url[path_start..].split('/') {
+    for segment in path.split('/').skip(usize::from(absolute)) {
         match segment {
-            "" | "." => {}
+            "." => {}
             ".." => {
-                segments.pop();
+                if segments.pop().is_none() && !absolute {
+                    segments.push("..");
+                }
             }
             other => segments.push(other),
         }
     }
     let mut out = String::from(origin);
-    for segment in &segments {
+    if absolute {
         out.push('/');
-        out.push_str(segment);
     }
-    if url.ends_with('/') && !segments.is_empty() {
+    out.push_str(&segments.join("/"));
+    if (path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..")) && !out.ends_with('/')
+    {
         out.push('/');
     }
     out
@@ -414,6 +413,14 @@ mod tests {
             join_control(Some("http://192.168.1.1/igd/root.xml"), "../ctl"),
             "http://192.168.1.1/ctl"
         );
+        assert_eq!(
+            join_control(Some("http://192.168.1.1/igd/root.xml"), "/igd/../ctl"),
+            "http://192.168.1.1/ctl"
+        );
+        assert_eq!(
+            join_control(Some("http://192.168.1.1/igd/root.xml"), "/igd//ctl"),
+            "http://192.168.1.1/igd//ctl"
+        );
         assert!(parse_root_desc("<root></root>").is_none());
     }
 
@@ -486,8 +493,6 @@ mod tests {
             parse_external_ip(reply),
             Some(IpAddr::V4([203, 0, 113, 7].into()))
         );
-        let port_reply = r"<s:Envelope><s:Body><u:AddPortMappingResponse><NewExternalPort>4100</NewExternalPort></u:AddPortMappingResponse></s:Body></s:Envelope>";
-        assert_eq!(parse_external_port(port_reply), Some(4100));
     }
 
     /// The URL the description or the search names is split without guessing at a bracketed host.

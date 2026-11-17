@@ -964,8 +964,10 @@ fn map_via_gateway(
     let (gateway_host, gateway_port, root_path) = ferrox_core::portmap::split_url(location)?;
     let root = http_get(&gateway_host, gateway_port, &root_path)?;
     let (url_base, service) = ferrox_core::portmap::parse_root_desc(&root)?;
-    let control = ferrox_core::portmap::join_control(url_base.as_deref(), &service.control_url);
+    let base = url_base.as_deref().unwrap_or(location);
+    let control = ferrox_core::portmap::join_control(Some(base), &service.control_url);
     let (control_host, control_port, control_path) = ferrox_core::portmap::split_url(&control)?;
+    let internal_client = reachable_client(internal_client, &gateway_host, gateway_port)?;
     let mut body = [0u8; 4096];
     let lease = u32::try_from(lifetime_secs).unwrap_or(u32::MAX);
     let written = ferrox_core::portmap::add_mapping_body(
@@ -976,7 +978,7 @@ fn map_via_gateway(
         lease,
         &mut body,
     )?;
-    let reply = soap_call(
+    soap_call(
         &control_host,
         control_port,
         &control_path,
@@ -984,7 +986,7 @@ fn map_via_gateway(
         "AddPortMapping",
         &body[..written],
     )?;
-    let external_port = ferrox_core::portmap::parse_external_port(&reply)?;
+    let external_port = internal_port;
     let mut body = [0u8; 1024];
     let written = ferrox_core::portmap::external_ip_body(&service.service_type, &mut body)?;
     let reply = soap_call(
@@ -1000,6 +1002,23 @@ fn map_via_gateway(
         return None;
     }
     Some(SocketAddr::new(ip, external_port))
+}
+
+/// The LAN address a wildcard-bound socket reaches the gateway from, so a mapping names an address
+/// the gateway can return traffic to.
+fn reachable_client(client: std::net::IpAddr, host: &str, port: u16) -> Option<std::net::IpAddr> {
+    if !client.is_unspecified() {
+        return Some(client);
+    }
+    let bind = if client.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let probe = std::net::UdpSocket::bind(bind).ok()?;
+    probe.connect((host, port)).ok()?;
+    let ip = probe.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
 }
 
 /// SSDP `M-SEARCH` discovery: one multicast search per advertised type, plus a unicast search to the
@@ -1154,9 +1173,9 @@ mod tests {
         );
     }
 
-    /// A loopback gateway that names a `WANIPConnection` control URL, maps the internal port to
-    /// 4100 and answers its external address as the TEST-NET the fixture uses. The mapping the
-    /// realm registers is the one this gateway handed out.
+    /// A loopback gateway whose description has no `URLBase`, so its relative control URL resolves
+    /// against the description location, and whose empty `AddPortMapping` reply leaves the external
+    /// port as the requested one. The mapping the realm registers is the one this gateway handed out.
     #[test]
     fn a_gateway_maps_the_port_and_names_its_external_address() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -1199,15 +1218,13 @@ mod tests {
                 let head = request;
                 let first = head.lines().next().unwrap_or_default();
                 if first.starts_with("GET ") {
-                    let body = format!(
-                        r"<root><URLBase>http://127.0.0.1:{port}</URLBase><serviceList><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><controlURL>/ctl/WANIPConnection1</controlURL></service></serviceList></root>"
-                    );
+                    let body = r"<root><serviceList><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><controlURL>../ctl/wan</controlURL></service></serviceList></root>";
                     let _ = write!(
                         stream,
                         "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
-                } else if first.starts_with("POST ") {
+                } else if first.starts_with("POST /ctl/wan ") {
                     let action = head
                         .lines()
                         .find_map(|line| line.strip_prefix("SOAPAction:"))
@@ -1215,7 +1232,7 @@ mod tests {
                         .trim()
                         .trim_matches('"');
                     let body = if action.ends_with("AddPortMapping") {
-                        r"<s:Envelope><s:Body><u:AddPortMappingResponse><NewExternalPort>4100</NewExternalPort></u:AddPortMappingResponse></s:Body></s:Envelope>".to_owned()
+                        r"<s:Envelope><s:Body><u:AddPortMappingResponse></u:AddPortMappingResponse></s:Body></s:Envelope>".to_owned()
                     } else {
                         r"<s:Envelope><s:Body><u:GetExternalIPAddressResponse><NewExternalIPAddress>203.0.113.7</NewExternalIPAddress></u:GetExternalIPAddressResponse></s:Body></s:Envelope>".to_owned()
                     };
@@ -1228,11 +1245,11 @@ mod tests {
             }
         });
         let location = format!("http://127.0.0.1:{port}/rootDesc.xml");
-        let mapped = map_via_gateway(&location, [127, 0, 0, 1].into(), 4000, 600)
+        let mapped = map_via_gateway(&location, [0, 0, 0, 0].into(), 4000, 600)
             .expect("a mapping and its external address");
         assert_eq!(
             mapped.to_string(),
-            "203.0.113.7:4100",
+            "203.0.113.7:4000",
             "the gateway's port and address are the registered ones"
         );
     }
