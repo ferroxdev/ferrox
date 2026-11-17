@@ -1903,7 +1903,7 @@ mod tests {
         session.connection_window = 0;
         let (sender, outgoing) = mpsc::sync_channel(masque::QUEUE);
         session.outgoing = Some(outgoing);
-        for _ in 0..QUEUED_CAP + 1 {
+        for _ in 0..=QUEUED_CAP {
             sender.send(udp_packet(53)).expect("a packet");
         }
         let mut wire = Wire {

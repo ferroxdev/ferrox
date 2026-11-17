@@ -6,6 +6,7 @@ SS_PASSWORD="matrix-shadowsocks-password"
 SS2022_PASSWORD="MDEyMzQ1Njc4OUFCQ0RFRg=="
 HYSTERIA_AUTH="matrix-hysteria-auth"
 HYSTERIA_V1_OBFS="matrix-hysteria-v1-xplus"
+ANYTLS_PASSWORD="matrix-anytls-password"
 VLESS_ENC_CLIENT="mlkem768x25519plus.native.1rtt.2KpP3KYKjxF9Rew2c-oAq0YdFawg9Lhc6yzMrSWfZcAzN8O2MrVQEHCAKfOVdCyDAvIEI-gcswjOvDCsZcTPiFITitJt1SGrYsjF4pc_7cua3CNgZ5qUBrZEKRGvcQkdpYswh2ozDxApJParJXa8s-h9YeEWRKG8aGhwQhBq5RVIepsFaAa2SDQA7YUn2rBWKFmJc9gngJQfDftticxhWPC0h9BMgBxx5tiU46tNu1ifyjaWOcVoIwtxfFCSv-p2btNHJJeBOAdQ61dC46qdO2CzujO4clRz0TrB2tliQBi0BKVG8mgYtxZFOGoDtre3sTYO6CS5xExmcOp9zUrHBeoFo5quBZFr5nZ84pQ0NrYBigwemDFE0htQM1YHCFESm1eY_sWSfRGkCLC2KqVXh0cClKjIF2Fazgaoy6qACttDccd0YVtVzFgyNAi1tKXKjNMhgZIyx5e_QmhjJcdDCOS0tzE-ecJRggZ31XzLlPVCeeiuliwJ_UzOWXHOJ0wYiwwtiZhQYIwF7GqHBmF6hrqbSLm0Pau5wLKSUdc3OgjGxWMs34okmnoIvTWoA1Am-IKxCISsCdy-iqFghasCdruLb7luKgMT7soJ95NY0LQOn4FSonEZPKIP_rBvmKJJWyOtl6qThFNzfYBQD2pTM4aXZKrOrYB7kbI_CPqM9dE740IM-suSyoEBCSi8NCB6feoMw5PNdTRDhnyuFPjKL3o_61gMjJwsW8Vq3CKMVByMJXq8QqCmQlyRXxhFVTcNdAYOeePA_JczfWIOGzCIc5wuuAHFxzfAfpWMtlEe3BMxYySXEBTG8meB7nYULth9XorFvYyM7giO4_h7YGqZEfe5hDxnAUpN00nLEwaWNfhaq9x4p7KkCEG6xIFzBhN__7OJUTgARjCagHAxBgSWDCY8qqHI4ZYpzxTI8qkPvTRZBylJZkOhGKdI_XCb9ulTy0cpeeAIF2Fw_UF7RKQ7IrnF1Ycza7MFQzd1i6wPE8fDgBFE1Jgfi_Fg8UsZtSS_q_xnV-pqOPAkDcK9MDt7obIejfHPaKTBZfa-_kp-67l_TRaudHCWoDQ4mtaZcTRo8kNX4BZ1ibUqytYU-IucCfnG32iOlVxCSzA_2CiQqvgiApu3KfiqekBM2YoaIoDEFzmwJVlsSvMDufCf3mo43YhkQFdEHxFLkpgS4WcGPCK59PuM8lNzlDXCvkeNY2lwN8yv7sI06YCz31Q38gqNjsmrBPRYTOQ550Ag8UoTE5dZUOUfhMMaomIYOnA2zUpU_tWy-Vq-F8AL8vVyjEtJRunGY-Q1D9qIaCI1YHmiKQLACiOwR6RDu-Ok0SmtCKeI9iNfqYgbnYyXP2VVIGcpw7uIwVeW_bVMnYqZIgzL4_kMQqGwmGImusoHKvNhRVc6wrkzCdhbXpmAK0nIhtSde4Q9JYqrTVmQBGRLLEc9tAK8-4ydcvJJ3PWCablnEASktKvInUh3g0xQ2teRoqC_fXCi--E0VySRQ7CGWmA8RxNJmvA2WakGplG5QhoK8hSNiIgXmXph_MQO6M34HQtfqyHVqeItfyOmgns747xGrPs"
 VLESS_ENC_SERVER="mlkem768x25519plus.native.600.7SIPAtLwXE0BAcgnUkP8ERcxxHc0NMa-7GE0fcqjc4b8ckDaZ2WEGg7FvAbJs_0ovWXWLWz4CYwjGoqT9TaiMw"
 
@@ -87,6 +88,7 @@ matrix_server_serves() {
     xray-core:hysteria-v1-*) return 1 ;;
     sing-box:hysteria-v1-*) return 0 ;;
     sing-box:wireguard-*) return 0 ;;
+    sing-box:anytls-*) return 0 ;;
     xray-core:*-quic-*) return 1 ;;
     sing-box:vless-quic-*) return 0 ;;
     sing-box:*) return 1 ;;
@@ -99,6 +101,14 @@ matrix_server_serves() {
 # skipped list, so a reader sees which side is behind instead of a zero.
 matrix_engine_skip_reason() {
   local engine="$1" id="$2" role="${3:-client}"
+  if [[ "$id" == anytls-* && "$engine" != ferrox && "$engine" != sing-box ]]; then
+    printf '%s\n' "$engine at this pin has no AnyTLS"
+    return 0
+  fi
+  if [[ "$id" == anytls-* && "$engine" == sing-box && "$role" == client ]]; then
+    printf '%s\n' "sing-box is the AnyTLS server comparator in this cell"
+    return 0
+  fi
   if [[ "$id" == wireguard-kernel-* ]]; then
     if [[ "$(uname -s)" != Linux ]]; then
       printf '%s\n' "the kernel WireGuard device is Linux-only"
@@ -841,6 +851,8 @@ carrier_stream() {
 
 vmess_server() { echo "\"protocol\": \"vmess\", \"settings\": {\"clients\": [{\"id\": \"$UUID\"}]}"; }
 vmess_client() { echo "\"tag\": \"proxy\", \"protocol\": \"vmess\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $1, \"users\": [{\"id\": \"$UUID\", \"security\": \"auto\"}]}]}" ; }
+anytls_server() { echo "\"protocol\": \"anytls\", \"settings\": {\"users\": [{\"password\": \"$ANYTLS_PASSWORD\"}]}"; }
+anytls_client() { echo "\"tag\": \"proxy\", \"protocol\": \"anytls\", \"settings\": {\"server\": \"127.0.0.1\", \"server_port\": $1, \"password\": \"$ANYTLS_PASSWORD\"}"; }
 trojan_server() { echo "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}"; }
 trojan_client() { echo "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $1, \"password\": \"$PASSWORD\"}]}"; }
 shadowsocks_server() { echo "\"protocol\": \"shadowsocks\", \"settings\": {\"method\": \"aes-256-gcm\", \"password\": \"$SS_PASSWORD\", \"network\": \"tcp,udp\"}"; }
@@ -894,6 +906,7 @@ scenario_config() {
   local port="$2" cover="${3:-}" inner="${4:-}" cover_json=""
   if [[ -n "$cover" ]]; then cover_json="$(cover_inbound "$cover")"; fi
   case "$1" in
+    anytls-tls-raw-*) server_config "$(anytls_server), $(tls_server_settings)" "$(anytls_client "$port"), $(tls_client_settings)" "$port" ;;
     vless-raw-routed-*) routed_server_config "$(vless_server ', "streamSettings": {"network": "tcp"}')" "$(vless_client ', "streamSettings": {"network": "tcp"}' "$port")" "$port" ;;
     vless-raw-mux-*) protocol_scenario vless raw "$port" "$cover" mux ;;
     vmess-raw-mux-*) protocol_scenario vmess raw "$port" "$cover" mux ;;
@@ -1041,6 +1054,9 @@ standard_scenarios() {
   echo "vless-quic-down-8 download 8 256 65536"
   echo "vless-hysteria-down-8 download 8 256 65536"
   echo "hysteria-v1-down-8 download 8 256 65536"
+  echo "anytls-tls-raw-down-8 download 8 256 65536"
+  echo "anytls-tls-raw-up-1 upload 1 2048 65536"
+  echo "anytls-tls-raw-duplex-8 full-duplex 8 128 65536"
   echo "wireguard-raw-down-8 download 8 256 65536"
   echo "wireguard-kernel-raw-down-8 download 8 256 65536"
   echo "shadowsocks2022-raw-down-8 download 8 256 65536"
