@@ -1423,6 +1423,22 @@ mod tests {
         failures: usize,
     }
 
+    impl Read for SlowClose {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl Write for SlowClose {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
     impl ferrox_core::tls::TlsProvider for SlowClose {
         fn name() -> &'static str {
             "slow-close"

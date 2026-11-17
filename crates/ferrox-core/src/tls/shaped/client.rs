@@ -2719,7 +2719,7 @@ mod tests {
             .seal_slices_into(&[b"late"], &mut out)
             .expect_err("closed for sealing");
         assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
-        assert!(out.is_empty());
+        assert_eq!(out.len(), 0);
         assert_eq!(subject.io.wire.len(), before);
     }
 
