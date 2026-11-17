@@ -441,7 +441,9 @@ impl<R: Read> GrpcReader<R> {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return;
         };
-        stream.write_slices(&[out]);
+        if !stream.write_slices(&[out]) {
+            self.shared.dead.store(true, Ordering::SeqCst);
+        }
     }
 
     fn refuse(&self, id: u32) {

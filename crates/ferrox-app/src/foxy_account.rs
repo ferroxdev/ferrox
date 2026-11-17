@@ -545,9 +545,25 @@ pub(crate) fn read_body<S: BufRead>(
             }
             let size = chunk_size(&line)?;
             if size == 0 {
-                let mut trailer = String::new();
-                let _ = (&mut *io).take(MAX_HEAD as u64).read_line(&mut trailer);
-                return Ok(body);
+                let mut trailer = 0usize;
+                loop {
+                    let mut line = String::new();
+                    let budget = MAX_HEAD.saturating_sub(trailer).saturating_add(1);
+                    let read = (&mut *io)
+                        .take(budget as u64)
+                        .read_line(&mut line)
+                        .map_err(|_| Failure::Stream)?;
+                    if read == 0 {
+                        return Err(Failure::Frame);
+                    }
+                    trailer += read;
+                    if trailer > MAX_HEAD {
+                        return Err(Failure::Frame);
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        return Ok(body);
+                    }
+                }
             }
             let Some(total) = body.len().checked_add(size) else {
                 return Err(Failure::Frame);
@@ -3620,9 +3636,7 @@ mod loopback {
                 "the link's target is never truncated"
             );
             assert!(
-                std::fs::symlink_metadata(&link)
-                    .map(|meta| meta.file_type().is_symlink())
-                    .unwrap_or(false),
+                std::fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()),
                 "the planted link itself is not opened for writing"
             );
             assert!(tokens.load().is_some(), "the session is written beside it");

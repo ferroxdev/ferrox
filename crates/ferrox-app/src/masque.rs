@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::connectip::{self, Assigned, Route};
@@ -137,6 +137,7 @@ const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x8;
 pub(crate) struct MasqueOut {
     spec: ClientSpec,
     inner: Mutex<Slot>,
+    dialed: Condvar,
 }
 
 #[derive(Debug)]
@@ -145,6 +146,7 @@ struct Slot {
     reconnect: Reconnect,
     target: usize,
     concurrency: usize,
+    dialing: usize,
 }
 
 /// One lane in the pool: its stack, when the reuse window retires it, and how many flows reach it.
@@ -230,7 +232,9 @@ impl MasqueOut {
                 concurrency: spec.xmux.concurrency(),
                 lanes: Vec::new(),
                 reconnect: Reconnect::new(now),
+                dialing: 0,
             }),
+            dialed: Condvar::new(),
             spec,
         })
     }
@@ -328,17 +332,24 @@ impl MasqueOut {
         now: Instant,
         dial: &mut impl FnMut() -> Result<Inner, String>,
     ) -> Result<PoolLane, String> {
-        match dial() {
+        let result = dial();
+        let mut slot = self
+            .inner
+            .lock()
+            .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
+        slot.dialing = slot.dialing.saturating_sub(1);
+        self.dialed.notify_all();
+        match result {
             Ok(inner) => Ok(Self::lane(&self.spec.xmux, now, inner)),
             Err(reason) => {
-                let mut slot = self
-                    .inner
-                    .lock()
-                    .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
                 slot.reconnect.advance(now);
                 Err(reason)
             }
         }
+    }
+
+    fn wait_dial(&self, slot: std::sync::MutexGuard<'_, Slot>) {
+        let _ = self.dialed.wait_timeout(slot, Duration::from_secs(1));
     }
 
     fn take(slot: &mut Slot, at: usize) -> (Arc<Inner>, crate::wg_stack::FlowLease) {
@@ -358,9 +369,9 @@ impl MasqueOut {
     fn ensure_at(
         &self,
         now: Instant,
-        dial: impl FnOnce() -> Result<Inner, String>,
+        mut dial: impl FnMut() -> Result<Inner, String>,
     ) -> Result<Arc<Inner>, String> {
-        {
+        loop {
             let mut slot = self
                 .inner
                 .lock()
@@ -369,6 +380,10 @@ impl MasqueOut {
             if let Some(lane) = slot.lanes.first() {
                 return Ok(Arc::clone(&lane.inner));
             }
+            if slot.dialing > 0 {
+                self.wait_dial(slot);
+                continue;
+            }
             if !slot.reconnect.due(now) {
                 let wait = slot.reconnect.next_dial.duration_since(now);
                 return Err(format!(
@@ -376,33 +391,26 @@ impl MasqueOut {
                     wait.as_secs_f64()
                 ));
             }
-        }
-        let lane = match dial() {
-            Ok(inner) => Self::lane(&self.spec.xmux, now, inner),
-            Err(reason) => {
-                let mut slot = self
-                    .inner
-                    .lock()
-                    .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
-                slot.reconnect.advance(now);
-                return Err(reason);
+            slot.dialing += 1;
+            drop(slot);
+            let lane = self.dial_lane(now, &mut dial)?;
+            let inner = Arc::clone(&lane.inner);
+            let mut slot = self
+                .inner
+                .lock()
+                .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
+            Self::prune(&mut slot, now);
+            if let Some(existing) = slot.lanes.first() {
+                Self::end(&lane);
+                return Ok(Arc::clone(&existing.inner));
             }
-        };
-        let inner = Arc::clone(&lane.inner);
-        let mut slot = self
-            .inner
-            .lock()
-            .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
-        Self::prune(&mut slot, now);
-        if let Some(existing) = slot.lanes.first() {
-            Self::end(&lane);
-            return Ok(Arc::clone(&existing.inner));
+            slot.lanes.push(lane);
+            return Ok(inner);
         }
-        slot.lanes.push(lane);
-        Ok(inner)
     }
 
     /// Choose the least-loaded lane with room, or open one while the pool is under its target.
+    #[allow(clippy::too_many_lines)]
     fn ensure_flow_at(
         &self,
         now: Instant,
@@ -441,6 +449,10 @@ impl MasqueOut {
                 Self::end(&lane);
             }
             if slot.lanes.is_empty() {
+                if slot.dialing > 0 {
+                    self.wait_dial(slot);
+                    continue;
+                }
                 if !slot.reconnect.due(now) {
                     let wait = slot.reconnect.next_dial.duration_since(now);
                     return Err(format!(
@@ -448,6 +460,7 @@ impl MasqueOut {
                         wait.as_secs_f64()
                     ));
                 }
+                slot.dialing += 1;
                 drop(slot);
                 fresh = Some((self.dial_lane(now, &mut dial)?, false));
                 continue;
@@ -458,6 +471,11 @@ impl MasqueOut {
                 && slot.lanes.len() < slot.target
                 && slot.reconnect.due(now);
             if spread {
+                if slot.dialing > 0 {
+                    self.wait_dial(slot);
+                    continue;
+                }
+                slot.dialing += 1;
                 drop(slot);
                 if let Ok(lane) = self.dial_lane(now, &mut dial) {
                     fresh = Some((lane, true));
@@ -470,10 +488,19 @@ impl MasqueOut {
                 return Ok(Self::take(&mut slot, at));
             }
             if slot.lanes.len() < slot.target && slot.reconnect.due(now) {
+                if slot.dialing > 0 {
+                    self.wait_dial(slot);
+                    continue;
+                }
+                slot.dialing += 1;
                 drop(slot);
                 if let Ok(lane) = self.dial_lane(now, &mut dial) {
                     fresh = Some((lane, false));
                 }
+                continue;
+            }
+            if slot.dialing > 0 {
+                self.wait_dial(slot);
                 continue;
             }
             return Err("masque: no lane could be opened".to_owned());
@@ -4816,7 +4843,7 @@ mod tests {
             pool.assign(),
             vec!["10.14.0.1".parse::<IpAddr>().expect("an address")]
         );
-        assert!(pool.assign().is_empty());
+        assert_eq!(pool.assign(), Vec::<IpAddr>::new());
     }
 
     #[test]
@@ -4825,7 +4852,7 @@ mod tests {
         let family = pool.v4.as_ref().expect("a v4 family");
         assert_eq!(family.first, u128::from(0x0a0e_0001u32));
         assert_eq!(family.last, family.first);
-        assert!(pool.assign().is_empty());
+        assert_eq!(pool.assign(), Vec::<IpAddr>::new());
     }
 
     #[test]
@@ -4838,7 +4865,7 @@ mod tests {
             pool.assign(),
             vec!["fd14::1".parse::<IpAddr>().expect("an address")]
         );
-        assert!(pool.assign().is_empty());
+        assert_eq!(pool.assign(), Vec::<IpAddr>::new());
     }
 
     #[test]

@@ -512,6 +512,7 @@ impl LastEdge {
         crate::json::write(&json, &mut text);
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let mut opened = None;
+        let mut last_error = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
         for _ in 0..8 {
             let mut raw = [0u8; 8];
             let _ = getrandom::fill(&mut raw);
@@ -538,16 +539,22 @@ impl LastEdge {
                     break;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => break,
+                Err(error) => {
+                    last_error = error;
+                    break;
+                }
             }
         }
         let Some((mut file, temp)) = opened else {
-            return Err(format!("warp: cannot save `{}`", path.display()));
+            return Err(format!(
+                "warp: cannot save `{}`: {last_error}",
+                path.display()
+            ));
         };
-        if file.write_all(text.as_bytes()).is_err() {
+        if let Err(error) = file.write_all(text.as_bytes()) {
             drop(file);
             let _ = std::fs::remove_file(&temp);
-            return Err(format!("warp: cannot save `{}`", path.display()));
+            return Err(format!("warp: cannot save `{}`: {error}", path.display()));
         }
         #[cfg(unix)]
         {

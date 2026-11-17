@@ -2944,8 +2944,22 @@ impl Local {
             return Err(carrier_error(format!("reserved object name: {name}")));
         }
         let mut path = self.root.clone();
+        let mut missing = false;
         for part in parts {
             path.push(part);
+            if missing {
+                continue;
+            }
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(carrier_error(format!(
+                        "object path crosses a symlink: {name}"
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => missing = true,
+                Err(error) => return Err(error),
+            }
         }
         Ok(path)
     }
@@ -5557,7 +5571,7 @@ impl Drive {
                 return Ok(found);
             }
             if !seen.insert(next.clone()) {
-                return Ok(found);
+                return Err(carrier_error("the Drive listing repeated a page token"));
             }
             page = next;
         }
@@ -6534,6 +6548,39 @@ mod tests {
                 "a reader is never handed a name that is not a file"
             );
             let _ = std::fs::remove_file(&outside);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_local_store_never_crosses_an_intermediate_symlink() {
+        #[cfg(unix)]
+        {
+            let (dir, store) = local("nested-link");
+            let outside = dir.parent().expect("parent").join(format!(
+                "ferrox-xdrive-nested-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(outside.join("a/c2s")).expect("outside folder");
+            std::fs::write(outside.join("a/c2s/000000000.seg"), b"secret").expect("outside file");
+            std::os::unix::fs::symlink(&outside, dir.join("streams")).expect("links a prefix");
+            assert!(
+                store.get("streams/a/c2s/000000000.seg").is_err(),
+                "an intermediate link is not part of the store"
+            );
+            assert!(
+                store.list("streams/a/c2s").is_err(),
+                "a listing does not follow an intermediate link"
+            );
+            assert!(
+                store.put("streams/a/c2s/000000001.seg", b"x").is_err(),
+                "a write does not follow an intermediate link"
+            );
+            let _ = std::fs::remove_dir_all(&outside);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

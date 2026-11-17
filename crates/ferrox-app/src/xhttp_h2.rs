@@ -2633,6 +2633,7 @@ fn serve_stream(
 }
 
 /// Opens one H2 request stream and hands its body to the session, choosing the frame window when the request carries no sequence.
+#[allow(clippy::too_many_lines)]
 fn open_stream(
     conn: &Arc<H2Conn>,
     settings: &XhttpSettings,
