@@ -194,10 +194,11 @@ append_pem 562
 # Re-blessed 51893400 by the ferrox-core re-land (#38, #39): the added modules moved this
 # test binary's thin-LTO layout by forty instructions; dns.rs is untouched and the five
 # decisions still walk 4096 times. ops.yml run 43806222498.
-# Re-blessed 52343960 by the KCP sockopt and ack-batch tests on main df177ae:
-# the added code moved this test binary's thin-LTO layout; dns.rs is untouched
-# and the five decisions still walk 4096 times. ops.yml run 43989485702.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 52343960 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# Re-blessed 52343912 by main's SOCKS guards and mux header initialization
+# (aa2db45, feb11e7): the added code moved this test binary's thin-LTO layout;
+# dns.rs is untouched and the five decisions still walk 4096 times. ops.yml run
+# 44015809956.
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 52343912 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
@@ -345,10 +346,10 @@ ferrox_core::finalmask::tests::merged_hello_probe 346140 finalmask::tests::the_m
 # reference is formed over uninitialized memory and no byte loop runs. The copy
 # stays one pass, a block per field; the oracle test replays the pinned Go
 # writer's bytes.
-# Re-blessed 889 by the oracle's sixth handshake line (#114 added `handshake none name
-# 192.0.2.1 443`): one more `request` carries `encode_into`'s inlined match, and every byte
-# still matches the pinned Go writer. ops.yml run 43806222498.
-ferrox_core::socks::request 889 socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
+# Re-blessed 895 by main's SOCKS name-length guards (#145): the assert in
+# `Target::Name` adds six instructions over the oracle's six lines, and every
+# byte still matches the pinned Go writer. ops.yml run 44015809956.
+ferrox_core::socks::request 895 socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
 # The sealed record write: 256 turns over a four-part Vision frame (uuid, five-byte
 # head, seven 8 KiB payload records, trailer) through an AES engine and a discard
 # sink. A record wholly inside the payload part is sealed from that part, so only
@@ -374,6 +375,9 @@ ferrox_core::mux::decode 610304 mux::tests::the_decode_probe_costs_the_frame_wal
 # The two encode probes landed with the decode change, so these rows are the
 # code they found, not a before/after pair: the first attempt to fuse the fixed
 # head and skip `clear`/`reserve` measured 884736 and 409600, 2 and 4 Ir a call
-# dearer than these, and was reverted rather than blessed.
+# dearer than these, and was reverted rather than blessed. Main's header
+# initialization (feb11e7) made `encode_header_into` a frame: the probe reads
+# 507904 (124 a call), the zero fill the safe form added, in ops.yml run
+# 44015809956.
 ferrox_core::mux::Outgoing::encode_into 876544 mux::tests::the_frame_probe_costs_the_metadata_and_payload_write_and_nothing_else
-ferrox_core::mux::Outgoing::encode_header_into UNBLESSED mux::tests::the_header_probe_costs_the_metadata_write_and_nothing_else
+ferrox_core::mux::Outgoing::encode_header_into 507904 mux::tests::the_header_probe_costs_the_metadata_write_and_nothing_else
