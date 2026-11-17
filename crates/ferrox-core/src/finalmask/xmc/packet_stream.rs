@@ -728,7 +728,7 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         partial.flush_pending_keepalive().expect("resumes");
-        let mut writer = partial.writer.lock().expect("writer");
+        let writer = partial.writer.lock().expect("writer");
         assert_eq!(*writer.bytes, expected);
 
         let flush = PacketStream::new(
