@@ -4320,6 +4320,7 @@ fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
         match plain.read(&mut chunk) {
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => {
+                stop_stream(&pooled.conn, &pooled.sock, id);
                 fail_session(&pooled.table, id);
                 return;
             }

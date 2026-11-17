@@ -579,6 +579,11 @@ impl<R: Read> WsReader<R> {
         };
         if self.shared.open.load(Ordering::Relaxed) != 0
             || self.shared.cut.load(Ordering::Relaxed) != 0
+            || self
+                .shared
+                .pending
+                .lock()
+                .map_or(true, |pending| !pending.is_empty())
         {
             drop(stream);
             self.shared.defer(opcode, payload);
@@ -756,6 +761,14 @@ impl WsWriter {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return false;
         };
+        if self.shared.open.load(Ordering::Relaxed) != 0
+            || self.shared.cut.load(Ordering::Relaxed) != 0
+        {
+            return false;
+        }
+        if !matches!(self.shared.flush(&mut **stream), Flushed::Clear) {
+            return false;
+        }
         write_frame(&mut **stream, self.masked, OP_DATA, data)
     }
 
@@ -768,6 +781,9 @@ impl WsWriter {
         {
             return false;
         }
+        if !matches!(self.shared.flush(&mut **stream), Flushed::Clear) {
+            return false;
+        }
         write_frame(&mut **stream, self.masked, OP_TEXT, data)
     }
 
@@ -776,6 +792,16 @@ impl WsWriter {
             return crate::proxy::Push::Lost;
         };
         if self.masked {
+            if self.shared.open.load(Ordering::Relaxed) != 0
+                || self.shared.cut.load(Ordering::Relaxed) != 0
+            {
+                return crate::proxy::Push::Parked;
+            }
+            match self.shared.flush(&mut **stream) {
+                Flushed::Clear => {}
+                Flushed::Parked => return crate::proxy::Push::Parked,
+                Flushed::Lost => return crate::proxy::Push::Lost,
+            }
             return if write_frame(&mut **stream, self.masked, OP_DATA, data) {
                 crate::proxy::Push::Took(data.len())
             } else {
@@ -784,6 +810,13 @@ impl WsWriter {
         }
         let mut owed = self.shared.open.load(Ordering::Relaxed);
         let mut cut = self.shared.cut.load(Ordering::Relaxed);
+        if owed == 0 && cut == 0 {
+            match self.shared.flush(&mut **stream) {
+                Flushed::Clear => {}
+                Flushed::Parked => return crate::proxy::Push::Parked,
+                Flushed::Lost => return crate::proxy::Push::Lost,
+            }
+        }
         let mut taken = 0;
         // A bare second offer starts the payload when the first only landed the head, so a full socket parks here.
         loop {
@@ -1207,6 +1240,11 @@ fn start_heartbeat(writer: &WsWriter, period: u32) {
                 // A data frame is half on the wire: a control frame here would land inside it.
                 continue;
             }
+            match shared.flush(&mut **stream) {
+                Flushed::Clear => {}
+                Flushed::Parked => continue,
+                Flushed::Lost => return,
+            }
             if !write_frame(&mut **stream, shared.masked, OP_PING, &[]) {
                 return;
             }
@@ -1279,14 +1317,14 @@ impl crate::proxy::CarrierSink for WsWriter {
         self.push_ready(bytes)
     }
     fn settle(&self) -> crate::proxy::Settle {
+        let Ok(mut stream) = self.shared.stream.lock() else {
+            return crate::proxy::Settle::Lost;
+        };
         if self.shared.open.load(Ordering::Relaxed) != 0
             || self.shared.cut.load(Ordering::Relaxed) != 0
         {
             return crate::proxy::Settle::Clear;
         }
-        let Ok(mut stream) = self.shared.stream.lock() else {
-            return crate::proxy::Settle::Lost;
-        };
         match self.shared.flush(&mut **stream) {
             Flushed::Clear => crate::proxy::Settle::Clear,
             Flushed::Parked => crate::proxy::Settle::Parked,
