@@ -775,7 +775,7 @@ impl Device {
             revents: 0,
         };
         // SAFETY: one descriptor this handler owns, one element in the array, and the call writes only `revents`.
-        unsafe { libc::poll(&raw mut row, 1, 0) > 0 && row.revents != 0 }
+        unsafe { libc::poll(&raw mut row, 1, 0) > 0 && (row.revents & libc::POLLIN) != 0 }
     }
 
     fn write_packet(&mut self, packet: &[u8]) -> io::Result<bool> {

@@ -285,6 +285,7 @@ impl Listener {
             addr: local,
         });
         let sock_r = sock;
+        sock_r.set_nonblocking(false)?;
         sock_r.set_read_timeout(Some(Duration::from_millis(50)))?;
         let weak = Arc::downgrade(&inner);
         thread::spawn(move || {

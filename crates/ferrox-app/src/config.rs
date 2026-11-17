@@ -1493,16 +1493,20 @@ pub(crate) fn kcp_config(settings: Option<&Json>) -> Option<ferrox_core::kcp::Co
     let Some(kcp) = settings.and_then(|s| s.get("kcpSettings")) else {
         return Some(base);
     };
-    let num = |camel: &str, snake: &str| {
-        kcp.get(camel)
-            .or_else(|| kcp.get(snake))
-            .and_then(Json::as_u32)
+    let field = |camel: &str, snake: &str, default: u32| -> Option<u32> {
+        match kcp.get(camel).or_else(|| kcp.get(snake)) {
+            Some(value) => value.as_u32(),
+            None => Some(default),
+        }
     };
-    let mtu = num("mtu", "mtu").unwrap_or(base.mtu);
-    let tti = num("tti", "tti").unwrap_or(base.tti);
-    let cwnd_multiplier = num("cwndMultiplier", "cwnd_multiplier").unwrap_or(base.cwnd_multiplier);
-    let max_sending_window =
-        num("maxSendingWindow", "max_sending_window").unwrap_or(base.max_sending_window);
+    let mtu = field("mtu", "mtu", base.mtu)?;
+    let tti = field("tti", "tti", base.tti)?;
+    let cwnd_multiplier = field("cwndMultiplier", "cwnd_multiplier", base.cwnd_multiplier)?;
+    let max_sending_window = field(
+        "maxSendingWindow",
+        "max_sending_window",
+        base.max_sending_window,
+    )?;
     if mtu < 21
         || !(10..=1000).contains(&tti)
         || cwnd_multiplier < 1
@@ -1510,19 +1514,26 @@ pub(crate) fn kcp_config(settings: Option<&Json>) -> Option<ferrox_core::kcp::Co
     {
         return None;
     }
+    let max_sessions = match kcp.get("maxSessions").or_else(|| kcp.get("max_sessions")) {
+        Some(value) => usize::try_from(value.as_u32()?)
+            .unwrap_or(usize::MAX)
+            .max(1),
+        None => base.max_sessions,
+    };
     Some(ferrox_core::kcp::Config {
         mtu,
         tti,
-        uplink_capacity: num("uplinkCapacity", "uplink_capacity").unwrap_or(base.uplink_capacity),
-        downlink_capacity: num("downlinkCapacity", "downlink_capacity")
-            .unwrap_or(base.downlink_capacity),
+        uplink_capacity: field("uplinkCapacity", "uplink_capacity", base.uplink_capacity)?,
+        downlink_capacity: field(
+            "downlinkCapacity",
+            "downlink_capacity",
+            base.downlink_capacity,
+        )?,
         cwnd_multiplier,
         max_sending_window,
         mask: base.mask,
         filters: base.filters,
-        max_sessions: num("maxSessions", "max_sessions").map_or(base.max_sessions, |n| {
-            usize::try_from(n).unwrap_or(usize::MAX).max(1)
-        }),
+        max_sessions,
     })
 }
 

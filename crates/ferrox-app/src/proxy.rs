@@ -68809,6 +68809,12 @@ mod tests {
             r#"{"network":"kcp","kcpSettings":{"cwndMultiplier":0}}"#,
             r#"{"network":"kcp","kcpSettings":{"maxSendingWindow":0}}"#,
             r#"{"network":"kcp","kcpSettings":{"mtu":1350,"maxSendingWindow":1349}}"#,
+            r#"{"network":"kcp","kcpSettings":{"mtu":-1}}"#,
+            r#"{"network":"kcp","kcpSettings":{"tti":-1}}"#,
+            r#"{"network":"kcp","kcpSettings":{"cwndMultiplier":-1}}"#,
+            r#"{"network":"kcp","kcpSettings":{"maxSendingWindow":-1}}"#,
+            r#"{"network":"kcp","kcpSettings":{"mtu":1350.5}}"#,
+            r#"{"network":"kcp","kcpSettings":{"uplinkCapacity":"5"}}"#,
         ] {
             let settings = crate::json::parse(doc).expect("parses");
             assert!(
