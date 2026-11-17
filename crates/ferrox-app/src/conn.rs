@@ -472,11 +472,10 @@ impl Masked {
         };
         match usize::try_from(sent) {
             Ok(sent) if sent == bytes.len() => Ok(true),
-            Ok(0) => Ok(false),
+            Ok(0) | Err(_) => Ok(false),
             Ok(_) => Err(io::Error::other(
                 "the urgent byte could not be sent whole; the connection is dropped",
             )),
-            Err(_) => Ok(false),
         }
     }
 
