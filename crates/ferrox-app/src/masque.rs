@@ -155,7 +155,7 @@ impl Drop for Dial<'_> {
     }
 }
 
-impl<'a> Dial<'a> {
+impl Dial<'_> {
     fn release(&mut self) {
         if !self.released {
             self.out.release_dial();
