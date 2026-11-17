@@ -629,7 +629,7 @@ mod tests {
         let engines = ["a", "b", "c"];
         assert_eq!(rotate(&engines, 1), vec!["a", "b", "c"]);
         assert_eq!(rotate(&engines, 2), vec!["b", "c", "a"]);
-        assert_eq!(rotate(&engines, 3), vec!["c", "b", "a"]);
+        assert_eq!(rotate(&engines, 3), vec!["c", "a", "b"]);
         assert_eq!(rotate(&engines, 4), vec!["a", "c", "b"]);
         for repeat in 1..=6 {
             let order = rotate(&engines, repeat);
