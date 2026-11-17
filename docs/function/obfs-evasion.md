@@ -85,8 +85,11 @@ settings. The stage is built in `dial_tls_session` and placed in front of the ma
 `Chain::with_front`, under the handshake, so a raw TLS dial and a TLS-carried lane (the WebSocket
 carrier) take the same cut; one zero delay merges the records into a single `writev`, with a
 record that rides behind the hello in the same gather, and a sink that refuses part of the burst
-has the remainder retained for the next write. A write that carries no server name falls back to
-the width cut instead of going out whole. Only the first handshake record is re-framed.
+has the remainder retained for the next write, with each configured delay still falling between
+the records it spaces. A write that carries no server name falls back to the width cut instead of
+going out whole. Only the first complete handshake record is re-framed: a record whose body is
+still arriving is forwarded to its declared end and closes the slot, so its continuation is never
+read as a hello of its own.
 
 The server side of the urgent byte is `Connection::read_past_mark`, armed on every TLS accept. A
 blocking read stops at an urgent mark even when bytes have arrived behind it, and the next read

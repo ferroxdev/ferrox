@@ -143,6 +143,9 @@ pub struct Fragment {
     /// The hello this stage already cut; decoy records before it spend no slot, and handshake
     /// records after it (a `KeyUpdate`) are not mistaken for a second hello.
     hello_done: bool,
+    /// The octets still to come of a handshake record whose head already went out uncut; shaping
+    /// resumes only past them, so a continuation is never read as a hello of its own.
+    hello_skip: usize,
     ent: Entropy,
     count: u64,
     gathered: Option<Gathered>,
@@ -154,6 +157,8 @@ pub struct Fragment {
 struct Gathered {
     bytes: Vec<u8>,
     at: usize,
+    /// Byte offsets where the configured delay between two retained records falls due.
+    parks: Vec<(usize, i64)>,
 }
 
 impl Fragment {
@@ -182,6 +187,7 @@ impl Fragment {
             max_split,
             sni: false,
             hello_done: false,
+            hello_skip: 0,
             ent: Entropy::new(),
             count: 0,
             gathered: None,
@@ -209,7 +215,15 @@ impl Fragment {
         }
         self.count += 1;
         if self.packets_from == 0 && self.packets_to == 1 {
-            if self.hello_done || Self::hello_shape(p).is_none() {
+            if self.hello_done {
+                return raw.write(p);
+            }
+            if self.hello_skip > 0 {
+                self.hello_skip = self.hello_skip.saturating_sub(p.len());
+                return raw.write(p);
+            }
+            if Self::hello_shape(p).is_none() {
+                self.forward_unshaped(p);
                 return raw.write(p);
             }
             self.hello_done = true;
@@ -247,7 +261,6 @@ impl Fragment {
         Some(if last || to > end { end } else { to })
     }
 
-
     /// The reference parks between pieces when its delay range can answer above zero, and so does
     /// this: a mask that cut faster would look like a different schedule to anything watching the
     /// wire. One draw of the cached supply decides both the test and the duration.
@@ -266,6 +279,23 @@ impl Fragment {
         }
         let record_len = HEADER + usize::from(u16::from_be_bytes([p[3], p[4]]));
         (p.len() >= record_len).then_some(record_len)
+    }
+
+    /// A write this stage will not cut: a decoy (the empty record, an alert) leaves the hello slot
+    /// open, while a handshake record whose body is still arriving is forwarded to its declared end
+    /// and then closed, so its continuation cannot pass for a hello.
+    fn forward_unshaped(&mut self, p: &[u8]) {
+        if p.len() < HEADER {
+            if p.first() == Some(&HANDSHAKE) {
+                self.hello_done = true;
+            }
+        } else if p[0] == HANDSHAKE && p.len() > HEADER {
+            let declared = HEADER + usize::from(u16::from_be_bytes([p[3], p[4]]));
+            self.hello_skip = declared.saturating_sub(p.len());
+            if self.hello_skip == 0 {
+                self.hello_done = true;
+            }
+        }
     }
 
     /// The `tlshello` mode: the first handshake record, once every record of it has arrived, becomes
@@ -330,6 +360,7 @@ impl Fragment {
                     self.gathered = Some(Gathered {
                         bytes: p[record_len + taken..].to_vec(),
                         at: 0,
+                        parks: Vec::new(),
                     });
                     return Ok(p.len());
                 }
@@ -343,6 +374,7 @@ impl Fragment {
                     self.gathered = Some(Gathered {
                         bytes: p[record_len..].to_vec(),
                         at: 0,
+                        parks: Vec::new(),
                     });
                     return Ok(p.len());
                 }
@@ -442,7 +474,11 @@ impl Fragment {
                     bytes.extend_from_slice(part);
                 }
                 if !bytes.is_empty() {
-                    self.gathered = Some(Gathered { bytes, at: 0 });
+                    self.gathered = Some(Gathered {
+                        bytes,
+                        at: 0,
+                        parks: Vec::new(),
+                    });
                 }
                 return Ok(p.len());
             }
@@ -463,21 +499,7 @@ impl Fragment {
                 {
                     return Err(error);
                 }
-                let mut bytes = Vec::new();
-                for part in parts.iter() {
-                    bytes.extend_from_slice(part);
-                }
-                let mut next = *to;
-                for later in &cuts[segment + 1..] {
-                    bytes.extend_from_slice(&head_of(p, later - next));
-                    bytes.extend_from_slice(&p[next..*later]);
-                    next = *later;
-                }
-                bytes.extend_from_slice(&p[record_len..]);
-                if !bytes.is_empty() {
-                    self.gathered = Some(Gathered { bytes, at: 0 });
-                }
-                return Ok(p.len());
+                return Ok(self.retain_sni(p, parts, &cuts, segment, *to, record_len));
             }
             if segment + 1 < cuts.len() {
                 self.park(self.delay_at(segment));
@@ -485,6 +507,42 @@ impl Fragment {
             from = *to;
         }
         self.finish_hello(raw, p, record_len)
+    }
+
+    /// The burst a sink refused, rebuilt as one buffer: the unsent part first, then every record
+    /// behind it, with the delay the config asked for noted where it falls so the retry keeps the
+    /// spacing instead of sending the retained burst flat out.
+    fn retain_sni(
+        &mut self,
+        p: &[u8],
+        parts: &[io::IoSlice<'_>],
+        cuts: &[usize],
+        segment: usize,
+        to: usize,
+        record_len: usize,
+    ) -> usize {
+        let mut bytes = Vec::new();
+        let mut waits = Vec::new();
+        for part in parts {
+            bytes.extend_from_slice(part);
+        }
+        let mut next = to;
+        for (offset, later) in cuts[segment + 1..].iter().enumerate() {
+            let wait = self.delay_at(segment + offset).pick_from(&mut self.ent);
+            waits.push((bytes.len(), wait.unwrap_or(0)));
+            bytes.extend_from_slice(&head_of(p, later - next));
+            bytes.extend_from_slice(&p[next..*later]);
+            next = *later;
+        }
+        bytes.extend_from_slice(&p[record_len..]);
+        if !bytes.is_empty() {
+            self.gathered = Some(Gathered {
+                bytes,
+                at: 0,
+                parks: waits,
+            });
+        }
+        p.len()
     }
 
     /// The merged hello: every record's header goes into a bounded stack scratch and each body is
@@ -549,7 +607,11 @@ impl Fragment {
                 }
                 self.gather_remaining(p, from, segment, record_len, bound, &mut bytes);
                 bytes.extend_from_slice(&p[record_len..]);
-                self.gathered = Some(Gathered { bytes, at: 0 });
+                self.gathered = Some(Gathered {
+                    bytes,
+                    at: 0,
+                    parks: Vec::new(),
+                });
                 return Ok(());
             }
         }
@@ -652,11 +714,25 @@ fn write_record<W: Write>(raw: &mut W, head: &[u8], body: &[u8]) -> io::Result<(
 
 fn flush_gathered<W: Write>(raw: &mut W, gathered: &mut Gathered) -> io::Result<()> {
     while gathered.at < gathered.bytes.len() {
-        match raw.write(&gathered.bytes[gathered.at..]) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(taken) => gathered.at += taken,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+        let end = gathered
+            .parks
+            .first()
+            .map_or(gathered.bytes.len(), |(offset, _)| {
+                (*offset).min(gathered.bytes.len())
+            });
+        while gathered.at < end {
+            match raw.write(&gathered.bytes[gathered.at..end]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(taken) => gathered.at += taken,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some((_, wait)) = gathered.parks.first().copied() {
+            gathered.parks.remove(0);
+            if wait > 0 {
+                std::thread::sleep(Duration::from_millis(wait as u64));
+            }
         }
     }
     gathered.at = 0;
@@ -1140,6 +1216,35 @@ mod tests {
                 left -= run;
             }
             Ok(take)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A sink that refuses the first call the way a nonblocking socket does, then takes it all.
+    #[derive(Default)]
+    struct RefusingOnce {
+        wire: Wire,
+        refused: bool,
+    }
+
+    impl Write for RefusingOnce {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.refused {
+                self.refused = true;
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.wire.write(buf)
+        }
+
+        fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+            if !self.refused {
+                self.refused = true;
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.wire.write_vectored(bufs)
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -1751,6 +1856,56 @@ mod tests {
     }
 
     #[test]
+    fn a_continuation_of_a_forwarded_hello_is_not_shaped_again() {
+        let mut mask =
+            Fragment::new(0, 1, vec![range(3, 3)], vec![range(0, 0)], range(0, 0)).expect("valid");
+        let mut whole = hello(40);
+        whole[HEADER + 2..HEADER + 7].copy_from_slice(&[0x16, 3, 3, 0, 2]);
+        let mut wire = Wire::default();
+        let split = HEADER + 2;
+        assert_eq!(
+            mask.write(&mut wire, &whole[..split]).expect("writes"),
+            split
+        );
+        let rest = &whole[split..];
+        assert_eq!(
+            mask.write(&mut wire, rest).expect("writes"),
+            rest.len(),
+            "the rest of the already-forwarded hello is taken"
+        );
+        assert_eq!(
+            wire.bytes, whole,
+            "the tail of a forwarded hello is finished as it came, never re-headed"
+        );
+    }
+
+    #[test]
+    fn a_retained_sni_burst_keeps_the_delays_the_config_asked_for() {
+        let whole = client_hello("alpha.beta.example");
+        let mut mask = Fragment::new(0, 1, vec![range(3, 3)], vec![range(20, 20)], range(0, 0))
+            .expect("valid")
+            .sni();
+        let mut sink = RefusingOnce::default();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            mask.write(&mut sink, &whole).expect("takes the hello"),
+            whole.len()
+        );
+        assert!(
+            sink.wire.bytes.is_empty(),
+            "the first call is refused and retained"
+        );
+        mask.flush(&mut sink).expect("the retained burst goes out");
+        let (widths, message) = records(&sink.wire.bytes);
+        assert_eq!(message, whole[HEADER..]);
+        assert!(widths.len() > 1, "the burst is several records");
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "the retained records keep the configured spacing"
+        );
+    }
+
+    #[test]
     fn a_max_split_of_one_bounds_a_name_cut_to_one_record() {
         let mut mask = Fragment::new(0, 1, vec![range(3, 3)], vec![range(0, 0)], range(1, 1))
             .expect("valid")
@@ -1876,20 +2031,21 @@ mod tests {
         assert_eq!(mask.write(&mut wire, &short).expect("writes"), short.len());
         assert_eq!(wire.bytes, short);
         wire.bytes.clear();
-        // A record whose body has not all arrived yet.
-        let partial = hello(60)[..HEADER + 20].to_vec();
+        // A record whose body is still arriving is forwarded to its declared end, continuation and all.
+        let split = hello(60);
+        let partial = split[..HEADER + 20].to_vec();
         assert_eq!(
             mask.write(&mut wire, &partial).expect("writes"),
             partial.len()
         );
         assert_eq!(wire.bytes, partial);
         wire.bytes.clear();
-        // A hello split across writes is cut once whole; the earlier fragment did not spend the slot.
         let again = hello(60);
         assert_eq!(mask.write(&mut wire, &again).expect("writes"), again.len());
-        let (widths, message) = records(&wire.bytes);
-        assert_eq!(widths, vec![11, 11, 11, 11, 11, 5]);
-        assert_eq!(message, again[HEADER..]);
+        assert_eq!(
+            wire.bytes, again,
+            "a continuation is finished as it came, never re-headed"
+        );
         wire.bytes.clear();
         let update = [0x16, 3, 3, 0, 4, 1, 2, 3, 4];
         assert_eq!(
@@ -2113,6 +2269,7 @@ mod tests {
         for _ in 0..256 {
             mask.count = 0;
             mask.hello_done = false;
+            mask.hello_skip = 0;
             total += std::hint::black_box(
                 mask.write(raw, std::hint::black_box(whole))
                     .expect("the sink always takes the whole"),
