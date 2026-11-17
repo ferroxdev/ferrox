@@ -252,24 +252,16 @@ impl<R, W: Write> PacketStream<R, W> {
     }
 
     fn flush_pending_keepalive(&self) -> io::Result<()> {
-        let Some(mut pending) = self
+        let mut slot = self
             .pending_keepalive
             .lock()
-            .map_err(|_| io::Error::other("packet stream keepalive poisoned"))?
-            .take()
-        else {
+            .map_err(|_| io::Error::other("packet stream keepalive poisoned"))?;
+        let Some(pending) = slot.as_mut() else {
             return Ok(());
         };
-        let result = self.write_keepalive(&mut pending);
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(|error| retryable(error.kind()))
-        {
-            *self
-                .pending_keepalive
-                .lock()
-                .map_err(|_| io::Error::other("packet stream keepalive poisoned"))? = Some(pending);
+        let result = self.write_keepalive(pending);
+        if !matches!(&result, Err(error) if retryable(error.kind())) {
+            *slot = None;
         }
         result
     }
