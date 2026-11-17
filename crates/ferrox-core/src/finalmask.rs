@@ -2139,6 +2139,7 @@ mod tests {
         let mut total = 0usize;
         for _ in 0..256 {
             mask.count = 0;
+            mask.hello_done = false;
             total += std::hint::black_box(
                 mask.write(raw, std::hint::black_box(whole))
                     .expect("the sink always takes the whole"),
