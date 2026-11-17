@@ -20890,7 +20890,11 @@ where
         + 'static,
 {
     let clock = transport.write_clock();
-    let out = Arc::new(Mutex::new(Sealed::new(transport)));
+    // The clock handle is the one that writes, so the transport is not duplicated a second time.
+    let out = Arc::new(Mutex::new(match clock {
+        Some(wire) => Sealed::wired(wire),
+        None => Sealed::new(transport),
+    }));
     let cipher = session.transport().and_then(|cipher| {
         cipher
             .set_read_timeout(Some(RELAY_POLL))
@@ -20911,15 +20915,12 @@ where
         None => Arc::new(Mutex::new(session)),
     };
     if cipher.is_none() {
-        if let Some(wire) = clock.as_ref() {
-            let _ = wire.set_write_timeout(Some(RELAY_POLL));
-        }
         if let Ok(mut sealed) = out.lock() {
+            if let Some(wire) = sealed.wire.as_ref() {
+                let _ = wire.set_write_timeout(Some(RELAY_POLL));
+            }
             sealed.paced = true;
         }
-    }
-    if let (Some(wire), Ok(mut sealed)) = (clock, out.lock()) {
-        sealed.wire = Some(wire);
     }
     let reader = TlsHalf {
         session: Arc::clone(&shared),
@@ -21423,6 +21424,17 @@ impl Sealed {
         Self {
             transport: Box::new(transport),
             wire: None,
+            bytes: Vec::new(),
+            paced: false,
+        }
+    }
+
+    /// A split whose transport is a socket writes through the armed handle alone, so it needs no
+    /// second descriptor to fall back to.
+    fn wired(wire: Connection) -> Self {
+        Self {
+            transport: Box::new(std::io::sink()),
+            wire: Some(wire),
             bytes: Vec::new(),
             paced: false,
         }

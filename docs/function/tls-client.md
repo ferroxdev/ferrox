@@ -89,6 +89,6 @@ The bullets above are removals against earlier Ferrox, not against the reference
 
 <!-- scope:begin -->
 - paths: -
-- symbols: dial_socks_tls_client, dial_http_outbound, dial_tls_carried_stream, kcp_tls_connect, relay_kcp_under, RelayWrite, socks_tls_outbound_parses_diallable_carriers, http_tls_outbound_parses_diallable_carriers, socks_tls_over_raw_reaches_echo, socks_tls_over_ws_reaches_echo, socks_tls_over_kcp_reaches_echo, http_tls_over_raw_reaches_echo, http_tls_over_ws_reaches_echo, http_tls_over_kcp_reaches_echo
+- symbols: dial_socks_tls_client, dial_http_outbound, dial_tls_carried_stream, kcp_tls_connect, relay_kcp_under, RelayWrite, session_halves, socks_tls_outbound_parses_diallable_carriers, http_tls_outbound_parses_diallable_carriers, socks_tls_over_raw_reaches_echo, socks_tls_over_ws_reaches_echo, socks_tls_over_kcp_reaches_echo, http_tls_over_raw_reaches_echo, http_tls_over_ws_reaches_echo, http_tls_over_kcp_reaches_echo
 - go: ./transport/internet/tls/..., ./proxy/socks/..., ./proxy/http/...
 <!-- scope:end -->
