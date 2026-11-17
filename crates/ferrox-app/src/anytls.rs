@@ -7,7 +7,7 @@ use ferrox_core::tls::{TlsConfig, TlsProvider as _};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -338,26 +338,39 @@ struct Shared {
     alive: AtomicBool,
     next_id: AtomicU32,
     settings_received: AtomicBool,
+    peer_version: AtomicU32,
     padding: Mutex<Padding>,
     pending: Mutex<Option<Vec<u8>>>,
     packet_count: AtomicU32,
     send_padding: AtomicBool,
     queue_budget: Arc<QueueBudget>,
+    shutdown: Option<Connection>,
 }
 
 impl Shared {
     fn new(writer: Writer, padding: Padding, server: bool) -> Self {
+        Self::with_shutdown(writer, padding, server, None)
+    }
+
+    fn with_shutdown(
+        writer: Writer,
+        padding: Padding,
+        server: bool,
+        shutdown: Option<Connection>,
+    ) -> Self {
         Self {
             writer: Mutex::new(Some(writer)),
             streams: Mutex::new(HashMap::new()),
             alive: AtomicBool::new(true),
             next_id: AtomicU32::new(1),
             settings_received: AtomicBool::new(false),
+            peer_version: AtomicU32::new(0),
             padding: Mutex::new(padding),
             pending: Mutex::new(None),
             packet_count: AtomicU32::new(0),
             send_padding: AtomicBool::new(!server),
             queue_budget: Arc::new(QueueBudget::new(SESSION_QUEUE_LIMIT)),
+            shutdown,
         }
     }
 
@@ -497,6 +510,9 @@ impl Shared {
             return;
         }
         self.queue_budget.close();
+        if let Some(raw) = self.shutdown.as_ref() {
+            let _ = raw.shutdown(Shutdown::Both);
+        }
         if let Some(writer) = self
             .writer
             .lock()
@@ -642,7 +658,9 @@ impl AnyTlsStream {
     }
 
     fn synack(&self, payload: &[u8]) {
-        if self.session.shared.alive() {
+        if self.session.shared.alive()
+            && self.session.shared.peer_version.load(Ordering::Relaxed) >= VERSION
+        {
             let _ = self.session.shared.write_frame(SYNACK, self.id, payload);
         }
     }
@@ -672,16 +690,22 @@ impl Write for AnyTlsStream {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let mut writer = self
-            .session
-            .shared
-            .writer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        match writer.as_mut() {
-            Some(writer) => writer.flush(),
-            None => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        let result = {
+            let mut writer = self
+                .session
+                .shared
+                .writer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match writer.as_mut() {
+                Some(writer) => writer.flush(),
+                None => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            }
+        };
+        if result.is_err() {
+            self.session.shared.shutdown("anytls session write failed");
         }
+        result
     }
 }
 
@@ -962,9 +986,14 @@ fn serve_connection(
     freedom: bool,
 ) {
     let deadline = Instant::now() + crate::budgets::handshake();
-    let raw = stream.try_clone().ok();
-    if let Some(raw) = &raw {
-        let _ = raw.set_read_timeout(Some(crate::budgets::handshake()));
+    let Ok(raw) = stream.try_clone() else {
+        return;
+    };
+    if raw
+        .set_read_timeout(Some(crate::budgets::handshake()))
+        .is_err()
+    {
+        return;
     }
     let (mut reader, writer): (Reader, Writer) = if let Some(identity) = tls {
         let Ok(mut session) = ferrox_core::tls::accept(identity.as_ref(), stream) else {
@@ -983,9 +1012,12 @@ fn serve_connection(
         };
         (Box::new(stream), Box::new(writer))
     };
-    if let Some(raw) = &raw {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let _ = raw.set_read_timeout(Some(left.max(Duration::from_millis(1))));
+    let left = deadline.saturating_duration_since(Instant::now());
+    if raw
+        .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+        .is_err()
+    {
+        return;
     }
     let mut prologue = [0u8; PASSWORD_LEN + 2];
     if read_exact_deadline(&mut *reader, &mut prologue, deadline).is_err() {
@@ -1015,11 +1047,11 @@ fn serve_connection(
             left -= take;
         }
     }
-    if let Some(raw) = raw {
-        let _ = raw.set_read_timeout(None);
+    if raw.set_read_timeout(None).is_err() {
+        return;
     }
     let session = Arc::new(Session {
-        shared: Arc::new(Shared::new(writer, padding, true)),
+        shared: Arc::new(Shared::with_shutdown(writer, padding, true, Some(raw))),
         owner: None,
     });
     let context = Arc::new(ServerContext { freedom });
@@ -1103,6 +1135,7 @@ fn read_server(reader: &mut dyn Read, session: &Arc<Session>, context: &Arc<Serv
                 }
                 if let Some(version) = settings.get("v").and_then(|text| text.parse::<u32>().ok()) {
                     if version >= VERSION {
+                        shared.peer_version.store(version, Ordering::Relaxed);
                         let answer = settings_bytes(VERSION, None, None);
                         let _ = shared.write_frame(SERVER_SETTINGS, 0, &answer);
                     }
@@ -1557,6 +1590,27 @@ mod tests {
         drop(duplicate);
         let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(bytes[0], FIN);
+        assert_eq!(bytes.len(), HEADER);
+    }
+
+    #[test]
+    fn a_synack_waits_for_a_v2_peer() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::new(Shared::new(
+            Box::new(Sink(Arc::clone(&written))),
+            Padding::new(b"stop=0").expect("parses"),
+            true,
+        ));
+        let stream = test_stream(&shared, 1);
+        stream.synack(&[]);
+        assert!(written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty());
+        shared.peer_version.store(VERSION, Ordering::Relaxed);
+        stream.synack(&[]);
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(bytes[0], SYNACK);
         assert_eq!(bytes.len(), HEADER);
     }
 
