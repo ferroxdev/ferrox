@@ -5765,7 +5765,7 @@ mod tests {
         let (_ip, body) = ipv4_head(&reply[..rn]).unwrap();
         let (syn_ack, _) = tcp_head(body).unwrap();
         assert_eq!(
-            syn_ack.ack,
+            syn_ack.ack_num,
             u32::MAX,
             "the receive cursor wraps instead of saturating"
         );

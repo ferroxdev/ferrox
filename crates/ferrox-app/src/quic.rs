@@ -4119,18 +4119,14 @@ fn pump(
                         return;
                     };
                     match conn.stream_recv(id, &mut chunk) {
-                        Ok((0, fin)) => Ok((0, fin)),
                         Err(quiche::Error::Done) => break,
                         Err(_) => Err(()),
                         Ok(found) => Ok(found),
                     }
                 };
-                let (n, fin) = match received {
-                    Ok(found) => found,
-                    Err(()) => {
-                        ended = true;
-                        break;
-                    }
+                let Ok((n, fin)) = received else {
+                    ended = true;
+                    break;
                 };
                 if n == 0 && !fin {
                     break;
