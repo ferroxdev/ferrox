@@ -720,9 +720,8 @@ impl proxy::Duplicate for AnyTlsStream {
 }
 
 impl proxy::HalfShut for AnyTlsStream {
-    fn spill(&self) {
-        self.finish_write();
-    }
+    // A FIN ends the whole stream, so only drop may send one.
+    fn spill(&self) {}
 }
 
 impl Drop for AnyTlsStream {
@@ -1591,6 +1590,24 @@ mod tests {
         let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(bytes[0], FIN);
         assert_eq!(bytes.len(), HEADER);
+    }
+
+    #[test]
+    fn a_spill_keeps_the_stream_writable() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::new(Shared::new(
+            Box::new(Sink(Arc::clone(&written))),
+            Padding::new(b"stop=0").expect("parses"),
+            false,
+        ));
+        let mut stream = test_stream(&shared, 9);
+        crate::proxy::HalfShut::spill(&stream);
+        stream.write_all(b"still open").expect("writes");
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(bytes[0], PSH);
+        assert_eq!(u16::from_be_bytes([bytes[5], bytes[6]]), 10);
+        assert_eq!(&bytes[7..17], b"still open");
+        assert!(bytes.iter().all(|byte| *byte != FIN));
     }
 
     #[test]
