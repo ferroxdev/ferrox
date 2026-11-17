@@ -1431,7 +1431,7 @@ impl<S: Stream> Session<S> {
 
     /// Send a close notification without closing the read direction.
     pub(crate) fn close_notify(&mut self) -> Result<(), TlsError> {
-        if !self.done || self.close_sent || self.version != Some(Version::Tls13) {
+        if !self.done || self.close_sent {
             return Ok(());
         }
         if self.ktls.is_some() {
@@ -1487,6 +1487,9 @@ impl<S: Stream> Session<S> {
 
     /// Seals `parts` into the session's own write buffer and sends it, so a relay write after the first costs no allocation.
     fn seal_out(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        if !self.close.is_empty() || self.close_sent {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotConnected));
+        }
         self.flush_reply()?;
         let mut out = std::mem::take(&mut self.out);
         out.clear();
@@ -2675,6 +2678,33 @@ mod tests {
         assert!(subject.close_sent);
         assert_eq!(subject.close.len(), 0);
         assert!(subject.io.bytes.len() > 5);
+    }
+
+    #[test]
+    fn a_tls12_close_notification_is_sent() {
+        let suite = Suite::EcdheAes128GcmSha256;
+        let mut subject = session_on(
+            Wire::default(),
+            Version::Tls12,
+            suite,
+            Direction::tls12(suite, &[3u8; 16], &[], &[5u8; 4]),
+            Direction::tls12(suite, &[3u8; 16], &[], &[5u8; 4]),
+        );
+        subject.done = true;
+        subject.close_notify().expect("close");
+        assert!(subject.close_sent);
+        assert!(!subject.io.wire.is_empty());
+    }
+
+    #[test]
+    fn a_write_after_a_close_notification_is_refused() {
+        let mut subject = tls13_session(Wire::default());
+        subject.done = true;
+        subject.close_notify().expect("close");
+        let before = subject.io.wire.len();
+        let error = subject.write(b"late").expect_err("closed for writing");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+        assert_eq!(subject.io.wire.len(), before);
     }
 
     #[test]
