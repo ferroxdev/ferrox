@@ -20873,6 +20873,13 @@ impl SealedWire for KcpIo {
     }
 }
 
+// A session written to nowhere, which the frame tests drive.
+impl SealedWire for std::io::Sink {
+    fn sealed(self) -> Sealed {
+        Sealed::new(self)
+    }
+}
+
 // One session, two owners: the reader drives the transport when the session exposes one, so its parked read holds no session lock.
 fn session_halves<S, W>(session: S, transport: W) -> (TlsHalf<S>, TlsHalf<S>)
 where
