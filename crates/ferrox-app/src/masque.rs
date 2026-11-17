@@ -218,6 +218,7 @@ impl std::fmt::Debug for MasqueOut {
         f.debug_struct("MasqueOut")
             .field("spec", &self.spec)
             .field("inner", &self.inner)
+            .field("dialed", &self.dialed)
             .finish()
     }
 }
