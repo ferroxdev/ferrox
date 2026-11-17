@@ -863,14 +863,10 @@ fn resolve_with_deadline(
     let mut last = io::Error::new(io::ErrorKind::NotFound, "no alternate DNS server");
     let servers = alternate_servers(config);
     let transform = if coin(config.transform_probability) {
-        let scope = if prefer_alternate {
-            servers
-                .first()
-                .map(|(server, _)| server.ip().to_string())
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+        let scope = servers
+            .first()
+            .map(|(server, _)| server.ip().to_string())
+            .unwrap_or_default();
         config.transforms.select(&scope)
     } else {
         None

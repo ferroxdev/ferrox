@@ -460,6 +460,7 @@ impl H3 {
             body: Vec::new(),
         };
         self.finished = false;
+        self.stream = None;
         let stream = self
             .http3
             .send_request(&mut self.conn, &list, body.is_empty())
@@ -502,11 +503,6 @@ impl H3 {
                 body: Vec::new(),
             },
         ))
-    }
-
-    /// Whether the server has begun answering the current request.
-    pub(crate) fn response_started(&self) -> bool {
-        self.response.status != 0 || !self.response.body.is_empty()
     }
 
     fn receive(

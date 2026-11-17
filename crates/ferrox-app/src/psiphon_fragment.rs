@@ -259,16 +259,26 @@ impl Write for FragmentStream {
         Ok(written)
     }
 
-    /// Flatten the slices once, then use the ordinary write path.
+    /// Write each slice through the ordinary path so the plan spans the batch without a copy.
     fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        if buffers.len() == 1 {
-            return self.write(&buffers[0]);
-        }
-        let mut all = Vec::new();
+        let mut written = 0;
         for buffer in buffers {
-            all.extend_from_slice(buffer);
+            if buffer.is_empty() {
+                continue;
+            }
+            match self.write(buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    written += count;
+                    if count < buffer.len() {
+                        break;
+                    }
+                }
+                Err(_) if written > 0 => break,
+                Err(error) => return Err(error),
+            }
         }
-        self.write(&all)
+        Ok(written)
     }
 
     /// Flush the underlying socket.

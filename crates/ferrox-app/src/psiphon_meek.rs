@@ -1133,13 +1133,9 @@ impl MeekHttp {
         self.profile.request_limit
     }
 
-    /// Whether a data retry can resend this body without duplicating a reply.
+    /// Whether a retry cannot resend a request that may already have reached the server.
     fn retry_safe(&self) -> bool {
-        match self.stream.as_ref() {
-            Some(MeekStream::H3(h3)) => !h3.response_started(),
-            None => self.meek.quic,
-            _ => false,
-        }
+        self.stream.is_none()
     }
 
     /// Send one request body and return the response body.
@@ -1464,6 +1460,8 @@ impl MeekHttp {
             .filter_map(|(name, value)| {
                 if name.eq_ignore_ascii_case("host") {
                     host = value;
+                    None
+                } else if name.eq_ignore_ascii_case("user-agent") && value.is_empty() {
                     None
                 } else {
                     Some((name.as_str(), value.as_str()))

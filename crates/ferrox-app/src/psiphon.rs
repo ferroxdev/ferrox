@@ -147,6 +147,54 @@ pub(crate) struct PsiphonOut {
     credential: Arc<Credential>,
     version: Version,
     loopback: bool,
+    shutdown: Option<Arc<LaneShutdown>>,
+}
+
+struct LaneShutdown {
+    stopped: Arc<AtomicBool>,
+    channels: Arc<Mutex<Vec<crate::psiphon_ssh::ChannelWaiter>>>,
+}
+
+impl LaneShutdown {
+    fn new() -> Self {
+        Self {
+            stopped: Arc::new(AtomicBool::new(false)),
+            channels: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn signal(&self) -> ShutdownSignal {
+        ShutdownSignal {
+            stopped: Arc::clone(&self.stopped),
+            channels: Arc::clone(&self.channels),
+        }
+    }
+}
+
+impl Drop for LaneShutdown {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        for channel in lock(&self.channels).iter() {
+            channel.wake();
+        }
+    }
+}
+
+struct ShutdownSignal {
+    stopped: Arc<AtomicBool>,
+    channels: Arc<Mutex<Vec<crate::psiphon_ssh::ChannelWaiter>>>,
+}
+
+impl ShutdownSignal {
+    fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stopped)
+    }
+
+    fn watch(&self, channel: crate::psiphon_ssh::ChannelWaiter) {
+        let mut channels = lock(&self.channels);
+        channels.retain(crate::psiphon_ssh::ChannelWaiter::is_live);
+        channels.push(channel);
+    }
 }
 
 struct Inner {
@@ -167,6 +215,7 @@ struct Inner {
     sessions: Mutex<Vec<Arc<Session>>>,
     next_session: AtomicUsize,
     dial_window: AtomicUsize,
+    entry_cursor: AtomicUsize,
     affinity: Mutex<Option<(String, u16)>>,
     moved_to_front: Mutex<HashSet<String>>,
     dsl_placeholders: Arc<Mutex<Vec<DslPlaceholder>>>,
@@ -929,6 +978,7 @@ impl std::fmt::Debug for PsiphonOut {
             .field("version", &self.version)
             .field("loopback", &self.loopback)
             .field("connected", &self.inner.is_some())
+            .field("shutdown", &self.shutdown.is_some())
             .finish()
     }
 }
@@ -1019,6 +1069,7 @@ impl PsiphonOut {
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             dial_window: AtomicUsize::new(0),
+            entry_cursor: AtomicUsize::new(0),
             affinity: Mutex::new(affinity),
             moved_to_front: Mutex::new(HashSet::new()),
             dsl_placeholders: Arc::new(Mutex::new(Vec::new())),
@@ -1037,14 +1088,16 @@ impl PsiphonOut {
             inproxy_limiter,
         });
         *lock(&inner.self_ref) = Arc::downgrade(&inner);
+        let shutdown = Arc::new(LaneShutdown::new());
         if let Some(fd) = inner.settings.packet_tunnel_fd {
             let device = crate::tun::Device::from_inherited(fd, crate::psiphon_packet_tunnel::MTU)
                 .map_err(|error| format!("psiphon: PacketTunnelTunFileDescriptor {fd}: {error}"))?;
             let weak = Arc::downgrade(&inner);
             let dns = inner.settings.packet_tunnel_dns;
+            let packet_shutdown = shutdown.signal();
             thread::Builder::new()
                 .name("psiphon-packet-tunnel".to_owned())
-                .spawn(move || packet_tunnel_loop(&weak, device, dns))
+                .spawn(move || packet_tunnel_loop(&weak, device, dns, &packet_shutdown))
                 .map_err(|error| format!("psiphon: packet tunnel thread: {error}"))?;
         }
         // The edge binds before a tunnel exists, so a refusal is retried, never a lane that exits.
@@ -1076,6 +1129,7 @@ impl PsiphonOut {
             credential,
             version: Version::V5,
             loopback,
+            shutdown: Some(shutdown),
         })
     }
 
@@ -1108,6 +1162,7 @@ impl PsiphonOut {
             }),
             version: Version::V5,
             loopback: endpoint.ip().is_loopback(),
+            shutdown: None,
         })
     }
 
@@ -1174,7 +1229,7 @@ impl Inner {
     fn live(&self) -> usize {
         let mut sessions = lock(&self.sessions);
         self.replay.promote(sessions.as_slice());
-        sessions.retain(|session| !session.is_closed());
+        self.replay.retain_open(&mut sessions);
         sessions.len()
     }
 
@@ -1182,7 +1237,7 @@ impl Inner {
     fn pick(&self) -> Option<Arc<Session>> {
         let mut sessions = lock(&self.sessions);
         self.replay.promote(sessions.as_slice());
-        sessions.retain(|session| !session.is_closed());
+        self.replay.retain_open(&mut sessions);
         if sessions.is_empty() {
             return None;
         }
@@ -1235,7 +1290,11 @@ impl Inner {
         let affinity = lock(&self.affinity);
         match affinity_index(&entries, affinity.as_ref()) {
             Some(base) => (base, self.settings.affinity_grace),
-            None => (0, Duration::ZERO),
+            None if self.settings.fronted_overrides.is_empty() => (0, Duration::ZERO),
+            None => (
+                self.entry_cursor.fetch_add(1, Ordering::Relaxed) % entries.len(),
+                Duration::ZERO,
+            ),
         }
     }
 
@@ -1609,13 +1668,14 @@ impl Inner {
                         session.protocol()
                     );
                     let mut sessions = lock(&self.sessions);
-                    sessions.retain(|session| !session.is_closed());
+                    self.replay.retain_open(&mut sessions);
                     if sessions.len() >= self.settings.pool {
                         let at = self.next_session.fetch_add(1, Ordering::Relaxed) % sessions.len();
                         let existing = Arc::clone(&sessions[at]);
                         drop(sessions);
                         self.replay.promote(std::slice::from_ref(&session));
                         session.close();
+                        self.replay.forget_probe(session.id());
                         return Ok(existing);
                     }
                     sessions.push(Arc::clone(&session));
@@ -1791,11 +1851,7 @@ impl Inner {
                             let Some(server) = server else {
                                 continue;
                             };
-                            let Some(server) = runtime_entry(
-                                server,
-                                &self.settings.protocols,
-                                self.settings.fronted,
-                            ) else {
+                            let Some(server) = runtime_entry(server, &self.settings) else {
                                 continue;
                             };
                             let name = server.dsl_tag();
@@ -1895,9 +1951,7 @@ impl Inner {
             else {
                 continue;
             };
-            let Some(server) =
-                runtime_entry(server, &self.settings.protocols, self.settings.fronted)
-            else {
+            let Some(server) = runtime_entry(server, &self.settings) else {
                 continue;
             };
             if !list
@@ -2138,6 +2192,7 @@ impl Inner {
         self.replay.promote(std::slice::from_ref(session));
         session.close();
         lock(&self.sessions).retain(|current| !Arc::ptr_eq(current, session));
+        self.replay.forget_probe(session.id());
     }
 
     fn split_tunnel_enabled(&self) -> bool {
@@ -2405,14 +2460,15 @@ fn packet_tunnel_loop(
     lane: &Weak<Inner>,
     mut device: crate::tun::Device,
     dns: crate::psiphon_packet_tunnel::Dns,
+    shutdown: &ShutdownSignal,
 ) {
     let mut logged: Option<Instant> = None;
     loop {
-        if lane.strong_count() == 0 {
+        if shutdown.stopped.load(Ordering::Acquire) {
             return;
         }
-        let outcome = packet_tunnel_once(lane, &mut device, dns);
-        if lane.strong_count() == 0 {
+        let outcome = packet_tunnel_once(lane, &mut device, dns, shutdown);
+        if shutdown.stopped.load(Ordering::Acquire) {
             return;
         }
         if let Err(why) = outcome {
@@ -2430,6 +2486,7 @@ fn packet_tunnel_once(
     lane: &Weak<Inner>,
     device: &mut crate::tun::Device,
     dns: crate::psiphon_packet_tunnel::Dns,
+    shutdown: &ShutdownSignal,
 ) -> Result<(), String> {
     let session = {
         let Some(inner) = lane.upgrade() else {
@@ -2440,7 +2497,9 @@ fn packet_tunnel_once(
         }
         inner.ensure()?
     };
-    let channel = session.open_packet_tunnel()?;
+    let mut channel = session.open_packet_tunnel()?;
+    channel.watch_shutdown(shutdown.flag());
+    shutdown.watch(channel.shutdown_waiter());
     let writer = device
         .clone_writer()
         .map_err(|error| format!("tun descriptor clone: {error}"))?;
@@ -2452,6 +2511,7 @@ fn packet_tunnel_once(
     thread::scope(|scope| {
         let failed_reader = &failed;
         let stop_reader = &stop;
+        let shutdown_reader = &shutdown.stopped;
         let reader_lane = lane;
         let handle = scope.spawn(move || {
             packet_tunnel_downstream(
@@ -2460,10 +2520,12 @@ fn packet_tunnel_once(
                 dns,
                 failed_reader,
                 stop_reader,
+                shutdown_reader,
                 reader_lane,
             )
         });
-        let outcome = packet_tunnel_upstream(device, &mut upstream, dns, &failed, lane);
+        let outcome =
+            packet_tunnel_upstream(device, &mut upstream, dns, &failed, &shutdown.stopped);
         stop.store(true, Ordering::Release);
         close.close();
         let read = handle
@@ -2480,7 +2542,7 @@ fn packet_tunnel_upstream(
     channel: &mut crate::psiphon_ssh::Channel,
     dns: crate::psiphon_packet_tunnel::Dns,
     failed: &AtomicBool,
-    lane: &Weak<Inner>,
+    shutdown: &AtomicBool,
 ) -> Result<(), String> {
     let fd = device.raw_fd();
     let mut packet = vec![0u8; crate::psiphon_packet_tunnel::MTU + 4];
@@ -2489,7 +2551,7 @@ fn packet_tunnel_upstream(
         if failed.load(Ordering::Acquire) {
             return Err("packet tunnel reader stopped".to_owned());
         }
-        if lane.strong_count() == 0 {
+        if shutdown.load(Ordering::Acquire) {
             return Err("psiphon: the lane is stopping".to_owned());
         }
         let ready = crate::psiphon_packet_tunnel::wait_readable(fd, PACKET_TUNNEL_POLL_MS)
@@ -2513,7 +2575,7 @@ fn packet_tunnel_upstream(
             if failed.load(Ordering::Acquire) {
                 return Err("packet tunnel reader stopped".to_owned());
             }
-            if lane.strong_count() == 0 {
+            if shutdown.load(Ordering::Acquire) {
                 return Err("psiphon: the lane is stopping".to_owned());
             }
             let ready = crate::psiphon_packet_tunnel::wait_readable(fd, 0)
@@ -2548,11 +2610,15 @@ fn packet_tunnel_downstream(
     dns: crate::psiphon_packet_tunnel::Dns,
     failed: &AtomicBool,
     stop: &AtomicBool,
+    shutdown: &AtomicBool,
     lane: &Weak<Inner>,
 ) -> Result<(), String> {
     let mut packet = Vec::with_capacity(crate::psiphon_packet_tunnel::MTU);
     loop {
-        if lane.strong_count() == 0 || stop.load(Ordering::Acquire) {
+        if shutdown.load(Ordering::Acquire)
+            || lane.strong_count() == 0
+            || stop.load(Ordering::Acquire)
+        {
             return Ok(());
         }
         let read = match crate::psiphon_packet_tunnel::read_frame(channel, &mut packet) {
@@ -7874,8 +7940,42 @@ fn entry_allowed(server: &Server, protocols: &[String], fronted: bool) -> bool {
     })
 }
 
+/// Apply every startup policy to an entry learned at runtime.
+fn runtime_entry(server: Server, settings: &Settings) -> Option<Server> {
+    let mut servers = limit_quic_versions(vec![server], settings);
+    let server = servers.pop()?;
+    let server = runtime_protocol_entry(server, &settings.protocols, settings.fronted)?;
+    if settings
+        .region
+        .as_deref()
+        .is_some_and(|region| server.region.as_deref() != Some(region))
+    {
+        return None;
+    }
+    let mut servers = vec![server];
+    if coin(settings.dial_ports_probability) {
+        let normal = shape_filter(&settings.protocols, "LimitTunnelProtocols");
+        let named_meek = settings
+            .protocols
+            .iter()
+            .any(|protocol| is_meek_protocol(protocol));
+        servers = apply_dial_port_limits(
+            servers,
+            &settings.dial_ports,
+            normal,
+            named_meek,
+            &settings.protocols,
+        );
+        if servers.is_empty() {
+            return None;
+        }
+    }
+    apply_session_settings(&mut servers, settings);
+    servers.pop()
+}
+
 /// The runtime entry to insert, converted to the CDN carrier the limit names.
-fn runtime_entry(server: Server, protocols: &[String], fronted: bool) -> Option<Server> {
+fn runtime_protocol_entry(server: Server, protocols: &[String], fronted: bool) -> Option<Server> {
     if !entry_allowed(&server, protocols, fronted) {
         return None;
     }
@@ -8439,12 +8539,14 @@ fn push_scan_variant(
         .of(server)
         .map_or((443, false), |meek| (meek.port, meek.https));
     let verify = scan_verify_server_names(candidate);
+    let disable_sni =
+        candidate.sni.is_empty() || front.of(server).is_some_and(|meek| meek.disable_sni);
     push_fronted_variant(
         server,
         &candidate.ip,
         port,
         &candidate.sni,
-        candidate.sni.is_empty(),
+        disable_sni,
         &[b"http/1.1".to_vec()],
         false,
         &verify,
@@ -8835,6 +8937,24 @@ fn select_protocols_with(
         || (initial_active && initial.is_some_and(|shape| shape.shadowsocks));
     let quic_named = normal.is_some_and(|shape| shape.quic)
         || (initial_active && initial.is_some_and(|shape| shape.quic));
+    let requested_fronted = protocols
+        .iter()
+        .chain(
+            initial_active
+                .then_some(initial_protocols)
+                .into_iter()
+                .flatten(),
+        )
+        .any(|protocol| protocol.starts_with("FRONTED-MEEK"));
+    let requested_unfronted = protocols
+        .iter()
+        .chain(
+            initial_active
+                .then_some(initial_protocols)
+                .into_iter()
+                .flatten(),
+        )
+        .any(|protocol| protocol.starts_with("UNFRONTED-MEEK"));
     if fronted {
         let all = servers;
         let mut only: Vec<Server> = all
@@ -8853,26 +8973,45 @@ fn select_protocols_with(
             servers = std::mem::take(&mut only);
         }
     } else {
+        let mut variants = Vec::new();
         servers.retain_mut(|server| {
-            if server.direct {
-                server.meek = None;
-                server.unfronted_meek = None;
-                return true;
-            }
-            if server.inproxy.is_some() {
-                server.meek = None;
-                server.unfronted_meek = None;
+            if server.direct || server.inproxy.is_some() {
+                if requested_unfronted {
+                    let unfronted = match server.unfronted_meek.take() {
+                        Some(unfronted) => Some(unfronted),
+                        None if server.meek.as_ref().is_some_and(|meek| !meek.fronted) => {
+                            server.meek.take()
+                        }
+                        None => None,
+                    };
+                    if let Some(unfronted) = unfronted {
+                        let mut variant = server.clone();
+                        variant.meek = Some(unfronted);
+                        variants.push(variant);
+                        if !requested_fronted {
+                            server.meek = None;
+                        }
+                    } else if !requested_fronted {
+                        server.meek = None;
+                    }
+                } else if !requested_fronted {
+                    server.meek = None;
+                    server.unfronted_meek = None;
+                }
                 return true;
             }
             if server.meek.as_ref().is_some_and(|meek| !meek.fronted) {
                 return true;
             }
             if let Some(unfronted) = server.unfronted_meek.take() {
-                server.meek = Some(unfronted);
+                if requested_unfronted || !requested_fronted {
+                    server.meek = Some(unfronted);
+                }
                 return true;
             }
             fronted_fallback && server.meek.as_ref().is_some_and(|meek| meek.fronted)
         });
+        servers.extend(variants);
     }
     if protocols
         .iter()
@@ -8896,6 +9035,11 @@ fn select_protocols_with(
     }
     let tls_named = normal.is_some_and(|shape| shape.tls)
         || (initial_active && initial.is_some_and(|shape| shape.tls));
+    let plain_named = normal.is_some_and(|shape| shape.plain)
+        || (initial_active && initial.is_some_and(|shape| shape.plain));
+    if plain_named {
+        add_ssh_variants(&mut servers);
+    }
     if tls_named {
         add_tls_variants(&mut servers);
     }
@@ -9282,6 +9426,12 @@ fn tls_variant(server: &Server) -> Option<Server> {
 /// Add a TLS variant for each direct entry that names a TLS port.
 fn add_tls_variants(servers: &mut Vec<Server>) {
     let variants: Vec<Server> = servers.iter().filter_map(tls_variant).collect();
+    servers.extend(variants);
+}
+
+/// Add a plain SSH variant for each entry that names an SSH port.
+fn add_ssh_variants(servers: &mut Vec<Server>) {
+    let variants: Vec<Server> = servers.iter().filter_map(ssh_variant).collect();
     servers.extend(variants);
 }
 
@@ -11071,6 +11221,8 @@ fn fetch_osl_entries(
         })
         .collect();
     let servers = filter_region(servers, settings);
+    let dial_ports =
+        coin(settings.dial_ports_probability).then_some(settings.dial_ports.as_slice());
     let mut selected = select_protocols_with(
         servers,
         &settings.protocols,
@@ -11078,7 +11230,7 @@ fn fetch_osl_entries(
         0,
         settings.fronted,
         settings.fronted_fallback,
-        None,
+        dial_ports,
     );
     apply_session_settings(&mut selected, settings);
     apply_fronting_overrides(&mut selected, settings);
@@ -11925,7 +12077,9 @@ impl UdpFlow {
     }
 
     fn close(&self) {
+        let packets = lock(&self.packets);
         self.closed.store(true, Ordering::Release);
+        drop(packets);
         self.ready.notify_all();
     }
 }
@@ -13387,7 +13541,7 @@ mod tests {
         server.cdn_protocols = CDN_PROTOCOL_HTTP | CDN_PROTOCOL_QUIC;
         server.meek.as_mut().expect("fronted").protocol = "FRONTED-MEEK-QUIC-OSSH";
         let limit = vec!["FRONTED-MEEK-CDN-HTTP-OSSH".to_owned()];
-        let selected = runtime_entry(server, &limit, true).expect("allowed");
+        let selected = runtime_protocol_entry(server, &limit, true).expect("allowed");
         assert_eq!(
             selected.meek.as_ref().expect("fronted").protocol,
             "FRONTED-MEEK-CDN-HTTP-OSSH"
@@ -15854,6 +16008,15 @@ mod tests {
     }
 
     #[test]
+    fn a_runtime_entry_takes_the_dial_port_limit() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"LimitTunnelDialPortNumbers":{"All":[80]}}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert!(runtime_entry(test_server(true), &settings).is_none());
+    }
+
+    #[test]
     fn a_runtime_entry_must_still_match_the_cdn_lane() {
         let protocols = selection_protocols(Some("cdn_fronting"));
         assert!(!entry_allowed(&test_server(true), &protocols, true));
@@ -15964,7 +16127,7 @@ mod tests {
             1,
             false,
         );
-        assert_eq!(selected.len(), 1);
+        assert_eq!(selected.len(), 3);
         assert!(selected[0].tls);
     }
 
@@ -16057,6 +16220,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unfronted_limit_keeps_the_direct_candidate() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshObfuscatedPort":443,"sshObfuscatedKey":"k","sshHostKey":"AAAA","capabilities":["OSSH","UNFRONTED-MEEK-HTTPS"],"meekServerPort":8443,"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk"}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("dual");
+        let selected = select_protocols(
+            vec![server],
+            &["UNFRONTED-MEEK-HTTPS-OSSH".to_owned(), "OSSH".to_owned()],
+            &[],
+            0,
+            false,
+        );
+        assert_eq!(selected.len(), 2);
+        assert!(selected
+            .iter()
+            .any(|server| server.direct && server.meek.is_none() && server.port == 443));
+        assert!(selected.iter().any(|server| {
+            server
+                .meek
+                .as_ref()
+                .is_some_and(|meek| !meek.fronted && meek.protocol == "UNFRONTED-MEEK-HTTPS-OSSH")
+        }));
+    }
+
+    #[test]
     fn a_protocol_limit_keeps_only_the_named_ssh_shape() {
         let servers = || vec![test_server(false), test_server(true)];
         let shapes = |selected: Vec<Server>| {
@@ -16073,7 +16260,7 @@ mod tests {
                 0,
                 false
             )),
-            [false]
+            [false, false]
         );
         assert_eq!(
             shapes(select_protocols(
@@ -16093,7 +16280,7 @@ mod tests {
                 0,
                 false
             )),
-            [false, true]
+            [false, true, false]
         );
         assert!(select_protocols(servers(), &["TLS-OSSH".to_owned()], &[], 0, false).is_empty());
         let mut capable = test_server(true);
@@ -16129,7 +16316,7 @@ mod tests {
                 2,
                 false
             )),
-            [true, true, false, false]
+            [true, true, false, false, false, false]
         );
         // An entry the initial phase skips is not lost while it matches the normal limit.
         let servers = || vec![test_server(false), test_server(true), test_server(false)];
@@ -16141,7 +16328,7 @@ mod tests {
                 1,
                 false
             )),
-            [true, false, false]
+            [true, false, false, false]
         );
         // No initial phase leaves the normal limit in force from the first entry.
         assert_eq!(
@@ -16152,7 +16339,7 @@ mod tests {
                 0,
                 false
             )),
-            [false, false]
+            [false, false, false]
         );
     }
 
@@ -17472,6 +17659,7 @@ mod tests {
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             dial_window: AtomicUsize::new(0),
+            entry_cursor: AtomicUsize::new(0),
             affinity: Mutex::new(None),
             moved_to_front: Mutex::new(HashSet::new()),
             dsl_placeholders: Arc::new(Mutex::new(Vec::new())),
@@ -17546,6 +17734,7 @@ mod tests {
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             dial_window: AtomicUsize::new(0),
+            entry_cursor: AtomicUsize::new(0),
             affinity: Mutex::new(None),
             moved_to_front: Mutex::new(HashSet::new()),
             dsl_placeholders: Arc::new(Mutex::new(Vec::new())),
@@ -18155,6 +18344,7 @@ mod tests {
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             dial_window: AtomicUsize::new(0),
+            entry_cursor: AtomicUsize::new(0),
             affinity: Mutex::new(None),
             moved_to_front: Mutex::new(HashSet::new()),
             dsl_placeholders: Arc::clone(&placeholders),
@@ -18217,6 +18407,7 @@ mod tests {
             sessions: Mutex::new(Vec::new()),
             next_session: AtomicUsize::new(0),
             dial_window: AtomicUsize::new(0),
+            entry_cursor: AtomicUsize::new(0),
             affinity: Mutex::new(Some(affinity.clone())),
             moved_to_front: Mutex::new(HashSet::new()),
             dsl_placeholders: Arc::new(Mutex::new(Vec::new())),

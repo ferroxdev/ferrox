@@ -79,11 +79,13 @@ struct State {
 struct Entry {
     server: Server,
     seed: [u8; 32],
+    next_seed: Option<[u8; 32]>,
     config_state: u64,
     server_hash: u64,
     last_used: Instant,
     created: Instant,
     session_id: usize,
+    probe_session: Option<usize>,
     established: bool,
     succeeded: bool,
 }
@@ -97,6 +99,7 @@ pub(crate) struct Lease {
     config_state: u64,
     server_hash: u64,
     is_replay: bool,
+    probe: bool,
 }
 
 impl Cache {
@@ -174,6 +177,7 @@ impl Cache {
         let mut selected = server.clone();
         let mut seed = random::<32>();
         let mut is_replay = false;
+        let mut probe = false;
         if !self.settings.disable
             && profile.ttl > Duration::ZERO
             && candidates_left
@@ -188,8 +192,16 @@ impl Cache {
                     && config_ok
                 {
                     selected = entry.server.clone();
-                    seed = entry.seed;
-                    is_replay = true;
+                    match entry.next_seed {
+                        Some(pending) if entry.probe_session.is_none() => {
+                            seed = pending;
+                            probe = true;
+                        }
+                        _ => {
+                            seed = entry.seed;
+                            is_replay = true;
+                        }
+                    }
                 }
             }
         }
@@ -202,6 +214,7 @@ impl Cache {
             config_state,
             server_hash,
             is_replay,
+            probe,
         }
     }
 
@@ -215,6 +228,37 @@ impl Cache {
         }
     }
 
+    /// Retire closed sessions, clearing any pending probe they leave behind.
+    pub(crate) fn retain_open(&self, sessions: &mut Vec<Arc<Session>>) {
+        let closed: Vec<usize> = sessions
+            .iter()
+            .filter(|session| session.is_closed())
+            .map(|session| session.id())
+            .collect();
+        sessions.retain(|session| !session.is_closed());
+        if !closed.is_empty() {
+            self.forget_probes(&closed);
+        }
+    }
+
+    /// Clear the pending probe state for a session that leaves without promotion.
+    pub(crate) fn forget_probe(&self, session_id: usize) {
+        self.forget_probes(std::slice::from_ref(&session_id));
+    }
+
+    fn forget_probes(&self, session_ids: &[usize]) {
+        let mut state = lock(&self.state);
+        for entry in state.entries.values_mut() {
+            if entry
+                .probe_session
+                .is_some_and(|id| session_ids.contains(&id))
+            {
+                entry.next_seed = None;
+                entry.probe_session = None;
+            }
+        }
+    }
+
     /// Promote established sessions that reached the configured transfer targets.
     pub(crate) fn promote(&self, sessions: &[Arc<Session>]) {
         let mut state = lock(&self.state);
@@ -224,6 +268,26 @@ impl Cache {
             let Some(entry) = state.entries.get_mut(key) else {
                 continue;
             };
+            if entry.probe_session == Some(session.id()) {
+                if entry.established
+                    && session.bytes_up() >= self.settings.target_upstream
+                    && session.bytes_down() >= self.settings.target_downstream
+                    && session.age() >= self.settings.target_duration
+                {
+                    if let Some(seed) = entry.next_seed.take() {
+                        entry.seed = seed;
+                    }
+                    entry.probe_session = None;
+                    entry.succeeded = true;
+                    entry.last_used = Instant::now();
+                    entry.created = Instant::now();
+                    entry.session_id = session.id();
+                } else if session.is_closed() {
+                    entry.next_seed = None;
+                    entry.probe_session = None;
+                }
+                continue;
+            }
             if entry.session_id != session.id() {
                 continue;
             }
@@ -236,6 +300,7 @@ impl Cache {
                 && session.age() >= self.settings.target_duration
             {
                 entry.succeeded = true;
+                entry.next_seed = None;
                 entry.last_used = Instant::now();
             } else if session.is_closed() {
                 drop.push(key.to_owned());
@@ -269,17 +334,27 @@ impl Lease {
         let profile = self.cache.settings.profile(&self.server);
         let now = Instant::now();
         let mut state = lock(&self.cache.state);
+        if self.probe {
+            if let Some(entry) = state.entries.get_mut(&self.key) {
+                if entry.next_seed == Some(self.seed) && entry.server_hash == self.server_hash {
+                    entry.probe_session = Some(session_id);
+                }
+            }
+            return;
+        }
         let entry = state
             .entries
             .entry(self.key.clone())
             .or_insert_with(|| Entry {
                 server: self.server.clone(),
                 seed: self.seed,
+                next_seed: None,
                 config_state: self.config_state,
                 server_hash: self.server_hash,
                 last_used: now,
                 created: now,
                 session_id,
+                probe_session: None,
                 established: false,
                 succeeded: false,
             });
@@ -293,17 +368,30 @@ impl Lease {
         if !self.is_replay || !replay_matches {
             entry.succeeded = false;
             entry.seed = self.seed;
+            entry.next_seed = None;
+            entry.probe_session = None;
             entry.created = now;
-        } else if profile.update_frequency > Duration::ZERO
+        } else if entry.probe_session.is_none()
+            && profile.update_frequency > Duration::ZERO
             && entry.created.elapsed() >= profile.update_frequency
         {
-            entry.seed = random::<32>();
+            entry.next_seed = Some(random::<32>());
             entry.created = now;
         }
     }
 
     /// Drop stored parameters after a failed replay, subject to the retain coin.
     pub(crate) fn failed(&self) {
+        if self.probe {
+            let mut state = lock(&self.cache.state);
+            if let Some(entry) = state.entries.get_mut(&self.key) {
+                if entry.next_seed == Some(self.seed) {
+                    entry.next_seed = None;
+                    entry.probe_session = None;
+                }
+            }
+            return;
+        }
         if !self.is_replay {
             return;
         }
@@ -395,6 +483,7 @@ mod tests {
     use crate::psiphon_ssh::{dial_random, dial_seed_scope, Server};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     fn server(host: &str, port: u16) -> Server {
         Server {
@@ -455,6 +544,117 @@ mod tests {
         assert!(replay.is_replay());
         assert_eq!(replay.server().host, entry.host);
         assert_eq!(replay.seed(), first.seed());
+    }
+
+    #[test]
+    fn a_refreshed_seed_is_probed_before_it_replaces_the_replay() {
+        let cache = new_cache(Settings {
+            fronted_update_frequency: Duration::from_millis(1),
+            ..Settings::default()
+        });
+        let mut entry = server("example.test", 443);
+        entry.fronting_provider_id = Some("provider".to_owned());
+        let first = cache.begin(&entry, 7);
+        first.succeeded(1);
+        cache.mark_succeeded("example.test");
+        {
+            let mut state = lock(&cache.state);
+            state
+                .entries
+                .get_mut("example.test")
+                .expect("entry")
+                .created = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("clock");
+        }
+        let replay = cache.begin(&entry, 7);
+        assert!(replay.is_replay());
+        replay.succeeded(2);
+        let probe = cache.begin(&entry, 7);
+        assert!(!probe.is_replay());
+        assert_ne!(probe.seed(), first.seed());
+        probe.succeeded(3);
+        {
+            let state = lock(&cache.state);
+            let stored = state.entries.get("example.test").expect("entry");
+            assert_eq!(stored.seed, first.seed());
+            assert_eq!(stored.next_seed, Some(probe.seed()));
+            assert_eq!(stored.probe_session, Some(3));
+        }
+        let active = cache.begin(&entry, 7);
+        assert!(active.is_replay());
+        assert_eq!(active.seed(), first.seed());
+    }
+
+    #[test]
+    fn a_failed_probe_restores_the_active_seed() {
+        let cache = new_cache(Settings {
+            fronted_update_frequency: Duration::from_millis(1),
+            ..Settings::default()
+        });
+        let mut entry = server("example.test", 443);
+        entry.fronting_provider_id = Some("provider".to_owned());
+        let first = cache.begin(&entry, 7);
+        first.succeeded(1);
+        cache.mark_succeeded("example.test");
+        {
+            let mut state = lock(&cache.state);
+            state
+                .entries
+                .get_mut("example.test")
+                .expect("entry")
+                .created = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("clock");
+        }
+        let replay = cache.begin(&entry, 7);
+        assert!(replay.is_replay());
+        replay.succeeded(2);
+        let probe = cache.begin(&entry, 7);
+        assert!(!probe.is_replay());
+        probe.failed();
+        let active = cache.begin(&entry, 7);
+        assert!(active.is_replay());
+        assert_eq!(active.seed(), first.seed());
+    }
+
+    #[test]
+    fn a_retired_probe_releases_the_pending_seed() {
+        let cache = new_cache(Settings {
+            fronted_update_frequency: Duration::from_millis(1),
+            ..Settings::default()
+        });
+        let mut entry = server("example.test", 443);
+        entry.fronting_provider_id = Some("provider".to_owned());
+        let first = cache.begin(&entry, 7);
+        first.succeeded(1);
+        cache.mark_succeeded("example.test");
+        {
+            let mut state = lock(&cache.state);
+            state
+                .entries
+                .get_mut("example.test")
+                .expect("entry")
+                .created = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("clock");
+        }
+        let replay = cache.begin(&entry, 7);
+        assert!(replay.is_replay());
+        replay.succeeded(2);
+        let probe = cache.begin(&entry, 7);
+        assert!(!probe.is_replay());
+        probe.succeeded(3);
+        cache.forget_probe(3);
+        {
+            let state = lock(&cache.state);
+            let stored = state.entries.get("example.test").expect("entry");
+            assert_eq!(stored.probe_session, None);
+            assert_eq!(stored.next_seed, None);
+        }
+        let active = cache.begin(&entry, 7);
+        assert!(active.is_replay());
+        assert_eq!(active.seed(), first.seed());
     }
 
     #[test]

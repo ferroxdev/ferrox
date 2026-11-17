@@ -1622,7 +1622,37 @@ struct Chunk {
 pub(crate) struct Channel {
     session: Arc<Inner>,
     state: Arc<ChannelState>,
+    #[allow(dead_code)]
+    owner: Arc<ChannelOwner>,
     deadline: Option<Instant>,
+    shutdown: Option<Arc<AtomicBool>>,
+}
+
+struct ChannelOwner {
+    session: Arc<Inner>,
+    state: Arc<ChannelState>,
+}
+
+pub(crate) struct ChannelWaiter(Weak<ChannelState>);
+
+impl ChannelWaiter {
+    pub(crate) fn is_live(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+
+    pub(crate) fn wake(&self) {
+        if let Some(state) = self.0.upgrade() {
+            let _window = lock(&state.remote_window);
+            state.window_cond.notify_all();
+        }
+    }
+}
+
+impl Drop for ChannelOwner {
+    fn drop(&mut self) {
+        let _ = lock(&self.session.channels).remove(&self.state.local);
+        self.session.close_channel(&self.state);
+    }
 }
 
 #[allow(clippy::missing_fields_in_debug)]
@@ -2193,11 +2223,19 @@ impl Session {
         }
 
         match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Ok(OpenResult::Confirmed)) => Ok(Some(Channel {
-                session: Arc::clone(&self.inner),
-                state,
-                deadline: None,
-            })),
+            Ok(Ok(OpenResult::Confirmed)) => {
+                let owner = Arc::new(ChannelOwner {
+                    session: Arc::clone(&self.inner),
+                    state: Arc::clone(&state),
+                });
+                Ok(Some(Channel {
+                    session: Arc::clone(&self.inner),
+                    state,
+                    owner,
+                    deadline: None,
+                    shutdown: None,
+                }))
+            }
             Ok(Ok(OpenResult::SplitTunnel)) => Ok(None),
             // A refusal names the target, not the tunnel, so the session stays open for other flows.
             Ok(Err(why)) => Err(why),
@@ -2551,6 +2589,20 @@ impl Channel {
 impl Channel {
     fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
+    }
+
+    pub(crate) fn watch_shutdown(&mut self, shutdown: Arc<AtomicBool>) {
+        self.shutdown = Some(shutdown);
+    }
+
+    pub(crate) fn shutdown_waiter(&self) -> ChannelWaiter {
+        ChannelWaiter(Arc::downgrade(&self.state))
+    }
+
+    fn stopping(&self) -> bool {
+        self.shutdown
+            .as_ref()
+            .is_some_and(|shutdown| shutdown.load(Ordering::Acquire))
     }
 }
 
@@ -2942,6 +2994,7 @@ impl Channel {
     fn take_window(&self, len: usize) -> io::Result<usize> {
         if self.state.remote.load(Ordering::Acquire) == NO_CHANNEL
             || self.session.closed.load(Ordering::Acquire)
+            || self.stopping()
         {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -2950,6 +3003,15 @@ impl Channel {
         }
         loop {
             let mut window = lock(&self.state.remote_window);
+            if self.state.remote.load(Ordering::Acquire) == NO_CHANNEL
+                || self.session.closed.load(Ordering::Acquire)
+                || self.stopping()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "psiphon channel closed",
+                ));
+            }
             if *window > 0 {
                 let packet = u64::from(self.state.remote_packet.load(Ordering::Relaxed));
                 let take = len.min(usize::try_from((*window).min(packet)).unwrap_or(len));
@@ -2974,6 +3036,7 @@ impl Channel {
             window = guard;
             if self.state.remote.load(Ordering::Acquire) == NO_CHANNEL
                 || self.session.closed.load(Ordering::Acquire)
+                || self.stopping()
             {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -3025,14 +3088,6 @@ impl Write for Channel {
 /// The error a liveness probe returns when its deadline passes.
 fn liveness_timeout() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "psiphon liveness deadline")
-}
-
-impl Drop for Channel {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.state) == 2 {
-            let _ = lock(&self.session.channels).remove(&self.state.local);
-        }
-    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -5327,6 +5382,11 @@ fn mpint(value: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
+    test_channel_with_window(payloads, DEFAULT_CHANNEL_WINDOW)
+}
+
+#[cfg(test)]
+fn test_channel_with_window(payloads: &[&[u8]], window: u32) -> Channel {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
     let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
     let (_local, _) = listener.accept().expect("accept");
@@ -5365,7 +5425,7 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         remote: AtomicU32::new(2),
         remote_window: Mutex::new(0),
         remote_packet: AtomicU32::new(CHANNEL_PACKET),
-        window: DEFAULT_CHANNEL_WINDOW,
+        window,
         recv: Mutex::new(Recv {
             chunks: VecDeque::new(),
             eof: false,
@@ -5394,9 +5454,14 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         recv.eof = true;
     }
     Channel {
+        owner: Arc::new(ChannelOwner {
+            session: Arc::clone(&inner),
+            state: Arc::clone(&state),
+        }),
         session: inner,
         state,
         deadline: None,
+        shutdown: None,
     }
 }
 
@@ -5404,6 +5469,19 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    fn test_channel(inner: Arc<Inner>, state: Arc<ChannelState>) -> Channel {
+        Channel {
+            owner: Arc::new(ChannelOwner {
+                session: Arc::clone(&inner),
+                state: Arc::clone(&state),
+            }),
+            session: inner,
+            state,
+            deadline: None,
+            shutdown: None,
+        }
+    }
 
     #[test]
     fn the_window_adjust_never_exceeds_half_the_configured_window() {
@@ -5416,10 +5494,7 @@ mod tests {
     fn a_packet_tunnel_channel_uses_its_own_adjust_threshold() {
         let payloads = [vec![0u8; 8192], vec![0u8; 8192]];
         let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
-        let mut channel = test_channel_with_chunks(&refs);
-        Arc::get_mut(&mut channel.state)
-            .expect("unique channel state")
-            .window = 32 * 1024;
+        let channel = test_channel_with_window(&refs, 32 * 1024);
         let (_, first) = channel.take_chunk();
         assert_eq!(first, 0);
         let (_, second) = channel.take_chunk();
@@ -5429,10 +5504,7 @@ mod tests {
             "the adjust threshold followed the session window, not the channel's"
         );
 
-        let mut channel = test_channel_with_chunks(&refs);
-        Arc::get_mut(&mut channel.state)
-            .expect("unique channel state")
-            .window = 32 * 1024;
+        let mut channel = test_channel_with_window(&refs, 32 * 1024);
         let mut out = vec![0u8; 8192];
         assert_eq!(channel.read(&mut out).expect("first read"), out.len());
         let before = lock(&channel.state.recv).local_window;
@@ -5444,10 +5516,7 @@ mod tests {
             "the read path used the session window"
         );
 
-        let mut channel = test_channel_with_chunks(&refs);
-        Arc::get_mut(&mut channel.state)
-            .expect("unique channel state")
-            .window = 32 * 1024;
+        let mut channel = test_channel_with_window(&refs, 32 * 1024);
         let before = lock(&channel.state.recv).local_window;
         let mut batch = Vec::new();
         assert!(channel.next_batch(&mut batch, 2).expect("batch"));
@@ -5774,11 +5843,7 @@ mod tests {
             last_active: Mutex::new(Instant::now()),
             pool: Arc::clone(&pool),
         });
-        let mut channel = Channel {
-            session: Arc::clone(&inner),
-            state: Arc::clone(&state),
-            deadline: None,
-        };
+        let mut channel = test_channel(Arc::clone(&inner), Arc::clone(&state));
         let mut buffer = vec![0u8; PACKET_CHUNK];
         let pointer = buffer.as_ptr();
         buffer[8..13].copy_from_slice(b"hello");
@@ -5870,11 +5935,7 @@ mod tests {
             last_active: Mutex::new(Instant::now()),
             pool: Arc::clone(&pool),
         });
-        let mut channel = Channel {
-            session: Arc::clone(&inner),
-            state: Arc::clone(&state),
-            deadline: None,
-        };
+        let mut channel = test_channel(Arc::clone(&inner), Arc::clone(&state));
         let mut buffer = vec![0u8; PACKET_CHUNK];
         let pointer = buffer.as_ptr();
         let capacity = buffer.capacity();
@@ -5985,11 +6046,7 @@ mod tests {
             ),
             Dispatch::Queued
         ));
-        let mut channel = Channel {
-            session: Arc::clone(&inner),
-            state,
-            deadline: None,
-        };
+        let mut channel = test_channel(Arc::clone(&inner), state);
         let mut out = [0u8; 2];
         channel.read_exact(&mut out).expect("read");
         assert_eq!(&out, b"hi");
@@ -6086,11 +6143,7 @@ mod tests {
             Dispatch::Recycle(_)
         ));
 
-        let mut channel = Channel {
-            session: Arc::clone(&inner),
-            state,
-            deadline: None,
-        };
+        let mut channel = test_channel(Arc::clone(&inner), state);
         let mut out = [0u8; 2];
         channel.read_exact(&mut out).expect("read the queued bytes");
         assert_eq!(&out, b"hi");
@@ -6211,11 +6264,7 @@ mod tests {
             pool: Arc::clone(&pool),
         });
         lock(&inner.channels).insert(1, Arc::clone(&state));
-        let mut channel = Channel {
-            session: Arc::clone(&inner),
-            state,
-            deadline: None,
-        };
+        let mut channel = test_channel(Arc::clone(&inner), state);
         channel.close();
         let mut head = [0u8; 4];
         wire.read_exact(&mut head).expect("packet length");
