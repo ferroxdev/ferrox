@@ -122,15 +122,29 @@ pub(crate) fn to_json_seeded(bytes: &[u8]) -> Result<(Json, Seed), String> {
 /// The tag a handler config names, so a listed handler keeps the name the seed was keyed by.
 pub(crate) fn handler_tag(bytes: &[u8]) -> String {
     let mut reader = Reader::new(bytes, "handler tag");
-    let Ok(Some((1, 2))) = reader.field() else {
-        return String::new();
-    };
-    reader
-        .bytes()
-        .ok()
-        .and_then(|tag| std::str::from_utf8(tag).ok())
-        .unwrap_or("")
-        .to_owned()
+    loop {
+        match reader.field() {
+            Ok(Some((1, 2))) => {
+                return reader
+                    .bytes()
+                    .ok()
+                    .and_then(|tag| std::str::from_utf8(tag).ok())
+                    .unwrap_or("")
+                    .to_owned();
+            }
+            Ok(Some((_, 0))) => {
+                if reader.varint().is_err() {
+                    return String::new();
+                }
+            }
+            Ok(Some((_, 2))) => {
+                if reader.bytes().is_err() {
+                    return String::new();
+                }
+            }
+            Ok(None | Some(_)) | Err(_) => return String::new(),
+        }
+    }
 }
 
 /// One inbound handler decodes to one JSON inbound per port it names: xray carries a whole

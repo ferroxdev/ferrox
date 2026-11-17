@@ -562,14 +562,10 @@ fn sniff_utp(bytes: &[u8]) -> bool {
     }
     let mut extension = bytes[1];
     let mut at = 20;
-    while extension != 0 {
-        let Some(kind) = bytes.get(at) else {
+    while at < bytes.len() {
+        let Some(next) = bytes.get(at).copied() else {
             return false;
         };
-        if *kind == 0 {
-            at += 1;
-            break;
-        }
         let Some(length) = bytes.get(at + 1).copied() else {
             return false;
         };
@@ -583,7 +579,10 @@ fn sniff_utp(bytes: &[u8]) -> bool {
         if bytes.len() < at {
             return false;
         }
-        extension = *kind;
+        if next == 0 {
+            break;
+        }
+        extension = next;
     }
     at == bytes.len()
 }
@@ -736,13 +735,13 @@ fn quic_crypto_domain(plain: &[u8]) -> Option<String> {
         match frame {
             0x00 | 0x01 => {}
             0x02 | 0x03 => {
-                for _ in 0..3 {
+                for _ in 0..2 {
                     let (_, used) = quic_varint(plain, at)?;
                     at += used;
                 }
-                let (_, used) = quic_varint(plain, at)?;
-                at += used;
                 let (ranges, used) = quic_varint(plain, at)?;
+                at += used;
+                let (_, used) = quic_varint(plain, at)?;
                 at += used;
                 for _ in 0..ranges {
                     for _ in 0..2 {
@@ -832,7 +831,7 @@ mod tests {
         assert!(sniff_bittorrent(b"\x13BitTorrent protocol"));
         assert!(!sniff_bittorrent(b"GET / HTTP/1.1\r\n"));
         assert!(sniff_utp(&[
-            0x41, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 4, 0, 0, 0, 0, 0
+            0x41, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0
         ]));
         assert!(!sniff_utp(&[0x41; 20]));
     }

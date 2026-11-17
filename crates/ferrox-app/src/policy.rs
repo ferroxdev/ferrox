@@ -153,10 +153,18 @@ fn level_row(value: &Json, name: &str) -> Result<Level, String> {
     let mut level = Level::default();
     for (key, value) in pairs {
         match key.as_str() {
-            "handshake" => level.handshake = seconds(value, "handshake")?,
-            "connIdle" => level.conn_idle = seconds(value, "connIdle")?,
-            "uplinkOnly" => level.uplink_only = seconds(value, "uplinkOnly")?,
-            "downlinkOnly" => level.downlink_only = seconds(value, "downlinkOnly")?,
+            "handshake" => {
+                level.handshake = seconds(value, "handshake")?.or(level.handshake);
+            }
+            "connIdle" => {
+                level.conn_idle = seconds(value, "connIdle")?.or(level.conn_idle);
+            }
+            "uplinkOnly" => {
+                level.uplink_only = seconds(value, "uplinkOnly")?.or(level.uplink_only);
+            }
+            "downlinkOnly" => {
+                level.downlink_only = seconds(value, "downlinkOnly")?.or(level.downlink_only);
+            }
             "statsUserUplink" => level.stats.user_uplink = boolean(value, key)?,
             "statsUserDownlink" => level.stats.user_downlink = boolean(value, key)?,
             "statsUserOnline" => level.stats.user_online = boolean(value, key)?,

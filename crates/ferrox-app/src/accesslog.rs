@@ -109,10 +109,10 @@ pub(crate) fn parse(root: &Json) -> Result<Config, String> {
     for (key, value) in pairs {
         match key.as_str() {
             "access" => {
-                config.access = value
+                let path = value
                     .as_str()
-                    .filter(|path| !path.is_empty())
-                    .map(str::to_owned);
+                    .ok_or_else(|| "`log.access` is not a string".to_owned())?;
+                config.access = (!path.is_empty()).then(|| path.to_owned());
             }
             "maskAddress" => {
                 config.mask_address = value

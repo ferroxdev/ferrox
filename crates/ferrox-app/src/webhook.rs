@@ -434,30 +434,44 @@ fn request_bytes(url: &HttpUrl, headers: &[(String, String)], body: &str) -> Vec
 fn exchange(io: &mut (impl Read + Write), request: &[u8]) -> Result<(), String> {
     io.write_all(request).map_err(|error| error.to_string())?;
     io.flush().map_err(|error| error.to_string())?;
-    let mut head = [0u8; 128];
-    let mut len = 0;
-    while len < head.len() {
-        let read = io
-            .read(&mut head[len..])
-            .map_err(|error| error.to_string())?;
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 128];
+    loop {
+        let end = head
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|at| at + 4)
+            .or_else(|| {
+                head.windows(2)
+                    .position(|window| window == b"\n\n")
+                    .map(|at| at + 2)
+            });
+        if let Some(end) = end {
+            let status = head[..end]
+                .split(|byte| *byte == b' ' || *byte == b'\n' || *byte == b'\r')
+                .find(|part| part.len() == 3 && part.iter().all(u8::is_ascii_digit))
+                .and_then(|code| std::str::from_utf8(code).ok())
+                .and_then(|code| code.parse::<u16>().ok())
+                .ok_or("the reply carries no status")?;
+            if (100..200).contains(&status) {
+                // An informational reply (103 Early Hints) is a whole head before the final one.
+                head.drain(..end);
+                continue;
+            }
+            if status >= 400 {
+                return Err(format!("POST returned status {status}"));
+            }
+            return Ok(());
+        }
+        if head.len() >= 8192 {
+            return Err("the reply head runs past 8192 bytes".to_owned());
+        }
+        let read = io.read(&mut chunk).map_err(|error| error.to_string())?;
         if read == 0 {
-            break;
+            return Err("the reply carries no status".to_owned());
         }
-        len += read;
-        if head[..len].windows(2).any(|window| window == b"\r\n") {
-            break;
-        }
+        head.extend_from_slice(&chunk[..read]);
     }
-    let status = head[..len]
-        .split(|byte| *byte == b' ')
-        .nth(1)
-        .and_then(|code| std::str::from_utf8(code).ok())
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or("the reply carries no status")?;
-    if status >= 400 {
-        return Err(format!("POST returned status {status}"));
-    }
-    Ok(())
 }
 
 /// The reference's `event` as `encoding/json` renders it: every field present in declaration order,

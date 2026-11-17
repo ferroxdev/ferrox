@@ -155,8 +155,12 @@ fn udp(
     options: Option<&SocketOptions>,
 ) -> Result<(Vec<u8>, u32), String> {
     let id = random_id()?;
-    let packet = question(name, id, false)?;
+    let packet = question(name, id, true)?;
     let response = crate::dnsnet::udp(host, port, &packet, None, options, TIMEOUT, true)?;
+    // A UDP answer over the 512-byte limit carries the truncation bit, so the question moves to TCP.
+    if response.get(2).is_some_and(|byte| byte & 0x02 != 0) {
+        return tcp(host, port, name, options);
+    }
     parse_response(&response, Some(id), name)
 }
 

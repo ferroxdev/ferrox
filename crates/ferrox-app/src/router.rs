@@ -2326,7 +2326,9 @@ impl SetRule {
             if networks.is_some()
                 || domains.is_some()
                 || ports.is_some()
+                || port_ranges.is_some()
                 || source_ports.is_some()
+                || source_port_ranges.is_some()
                 || ips.is_some()
                 || source_ips.is_some()
             {
@@ -2560,18 +2562,17 @@ impl SetRule {
             return self.source_ports.is_some() || self.source_ips.is_some();
         };
         if logical.all {
-            for rule in &logical.rules {
-                if !rule.reachable_on(network) {
-                    if rule.invert {
-                        continue;
-                    }
-                    return false;
-                }
-                if rule.needs_source(network) {
-                    return true;
-                }
+            if logical
+                .rules
+                .iter()
+                .any(|rule| !rule.reachable_on(network) && !rule.invert)
+            {
+                return false;
             }
-            return false;
+            return logical
+                .rules
+                .iter()
+                .any(|rule| rule.reachable_on(network) && rule.needs_source(network));
         }
         logical.rules.iter().any(|rule| rule.needs_source(network))
     }

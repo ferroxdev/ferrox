@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs as _, UdpSocket};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -168,7 +168,9 @@ fn read_response(flow: &mut Flow) -> Option<bool> {
     let mut head = Vec::new();
     let mut buf = [0u8; 64];
     loop {
-        if let Ok((response, _)) = wire::decode_server_response(&head) {
+        if let Ok((response, used)) = wire::decode_server_response(&head) {
+            flow.backlog = head[used..].to_vec();
+            flow.at = 0;
             return Some(response.ok);
         }
         if head.len() > HEAD_CAP || Instant::now() >= deadline {
@@ -300,16 +302,7 @@ fn evict(dial: &Dial, session: &Session) {
     let Some(entries) = pool.get_mut(&server_of(dial)) else {
         return;
     };
-    entries.retain(|entry| {
-        if Arc::ptr_eq(&entry.session.shared, &session.shared) {
-            if let Some(driver) = &entry.session.driver {
-                driver.stop();
-            }
-            false
-        } else {
-            true
-        }
-    });
+    entries.retain(|entry| !Arc::ptr_eq(&entry.session.shared, &session.shared));
 }
 
 fn keep(dial: &Dial, session: Session, next_stream: u64) {
@@ -360,6 +353,7 @@ struct Lane {
     session: Mutex<Option<u32>>,
     defrag: Mutex<Defrag>,
     source: Mutex<Option<SocketAddr>>,
+    client: Mutex<Option<std::net::IpAddr>>,
 }
 
 /// The client's UDP uplink over Hysteria v1: one connection and one datagram session per association, with a companion reader driving replies back into the socks frame.
@@ -374,6 +368,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
         session: Mutex::new(None),
         defrag: Mutex::new(Defrag::new()),
         source: Mutex::new(None),
+        client: Mutex::new(None),
     });
     let stop = Arc::new(AtomicBool::new(false));
     let reader = std::thread::spawn({
@@ -386,7 +381,6 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
     let mut wire = Vec::with_capacity(UDP_TARGET_BUF + 64);
     let mut out = Unfilled::<MAX_DATAGRAM>::new();
     let mut packet = 0u16;
-    let mut next_id = 1u32;
     let mut stream: Option<Flow> = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         let Some((dest, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
@@ -395,15 +389,25 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
         if payload.is_empty() {
             continue;
         }
+        let Ok(mut client) = lane.client.lock() else {
+            break;
+        };
+        match *client {
+            None => *client = Some(src.ip()),
+            Some(ip) if ip != src.ip() => continue,
+            Some(_) => {}
+        }
+        drop(client);
         if stream.is_none() {
-            let Some(flow) = open_udp_flow(&session, &dest.ip().to_string(), dest.port()) else {
+            let Some((flow, session_id)) =
+                open_udp_flow(&session, &dest.ip().to_string(), dest.port())
+            else {
                 break;
             };
             stream = Some(flow);
             if let Ok(mut slot) = lane.session.lock() {
-                *slot = Some(next_id);
+                *slot = Some(session_id);
             }
-            next_id = next_id.wrapping_add(1);
             if let Ok(mut reassembly) = lane.defrag.lock() {
                 *reassembly = Defrag::new();
             }
@@ -456,7 +460,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
     }
 }
 
-fn open_udp_flow(session: &Session, host: &str, port: u16) -> Option<Flow> {
+fn open_udp_flow(session: &Session, host: &str, port: u16) -> Option<(Flow, u32)> {
     let mut request = Vec::with_capacity(5 + host.len());
     wire::encode_client_request(
         &wire::ClientRequest {
@@ -477,7 +481,8 @@ fn open_udp_flow(session: &Session, host: &str, port: u16) -> Option<Flow> {
     if !response.ok {
         return None;
     }
-    Some(
+    let session_id = response.udp_session_id;
+    Some((
         Flow::from_parts(
             Arc::clone(&session.shared),
             Arc::clone(&session.sock),
@@ -488,7 +493,8 @@ fn open_udp_flow(session: &Session, host: &str, port: u16) -> Option<Flow> {
             false,
         )
         .with_session(session),
-    )
+        session_id,
+    ))
 }
 
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
@@ -630,11 +636,17 @@ fn read_request(flow: &mut Flow, deadline: Instant) -> Option<(bool, String, u16
                 if head.len().saturating_sub(prefix) >= HEAD_CAP || Instant::now() >= deadline {
                     return None;
                 }
-                let n = flow.read(room.as_mut()).ok()?;
-                if n == 0 {
-                    return None;
+                match flow.read_step(room.as_mut()) {
+                    Ok(Some(0)) | Err(_) => return None,
+                    Ok(Some(n)) => {
+                        head.extend_from_slice(&room.as_mut()[..n]);
+                    }
+                    Ok(None) => {
+                        if Instant::now() >= deadline {
+                            return None;
+                        }
+                    }
                 }
-                head.extend_from_slice(&room.as_mut()[..n]);
             }
         }
     }
@@ -646,12 +658,7 @@ fn open_udp(
     session: u32,
     peer: SocketAddr,
 ) -> Option<UdpFlow> {
-    let bind = if peer.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let target = UdpSocket::bind(bind).ok()?;
+    let target = bind_target(peer)?;
     target.set_read_timeout(Some(UDP_POLL)).ok()?;
     let target = Arc::new(target);
     let stop = Arc::new(AtomicBool::new(false));
@@ -668,6 +675,35 @@ fn open_udp(
         last: Instant::now(),
         stop,
     })
+}
+
+/// A socket that reaches both families, so one association may carry IPv4 and IPv6 destinations.
+fn bind_target(peer: SocketAddr) -> Option<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let dual = (|| {
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+        socket.set_only_v6(false).ok()?;
+        let address = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+        socket.bind(&address.into()).ok()?;
+        Some(UdpSocket::from(socket))
+    })();
+    dual.or_else(|| {
+        UdpSocket::bind(if peer.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        })
+        .ok()
+    })
+}
+
+fn target_addr(sock: &UdpSocket, peer: SocketAddr) -> SocketAddr {
+    if sock.local_addr().is_ok_and(|local| local.is_ipv6()) {
+        if let SocketAddr::V4(v4) = peer {
+            return SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port());
+        }
+    }
+    peer
 }
 
 fn udp_reader(
@@ -687,7 +723,12 @@ fn udp_reader(
         }
         let (n, from) = match target.recv_from(&mut buf) {
             Ok(found) => found,
-            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(ref error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
                 let closed = shared.lock().map_or(true, |conn| conn.is_closed());
                 if closed || stop.load(Ordering::Relaxed) {
                     break;
@@ -816,7 +857,9 @@ fn relay_datagrams(
         let forged = whole.is_err();
         match whole {
             Ok(Some(message)) => {
-                let _ = flow.target.send_to(message.payload, peer);
+                let _ = flow
+                    .target
+                    .send_to(message.payload, target_addr(&flow.target, peer));
             }
             Ok(None) => {}
             Err(_) => flow.stop.store(true, Ordering::Relaxed),
@@ -1130,6 +1173,7 @@ pub(crate) fn serve_loop(
     }
     #[cfg(target_os = "linux")]
     let mut batch = crate::quic::Batch::new();
+    let mut idle_at = Instant::now();
     loop {
         #[cfg(target_os = "linux")]
         match crate::quic::recv_batch(&router.sock, &mut batch) {
@@ -1139,6 +1183,10 @@ pub(crate) fn serve_loop(
                         continue;
                     };
                     route_packet(&mut router, &mut template, packet, from);
+                }
+                if idle_at.elapsed() >= ROUTE_POLL {
+                    router.idle();
+                    idle_at = Instant::now();
                 }
                 continue;
             }
@@ -1151,7 +1199,13 @@ pub(crate) fn serve_loop(
             crate::quic::Drain::Unreadable => return,
         }
         match router.sock.recv_from(buf.as_mut()) {
-            Ok((n, from)) => route_packet(&mut router, &mut template, &mut buf.as_mut()[..n], from),
+            Ok((n, from)) => {
+                route_packet(&mut router, &mut template, &mut buf.as_mut()[..n], from);
+                if idle_at.elapsed() >= ROUTE_POLL {
+                    router.idle();
+                    idle_at = Instant::now();
+                }
+            }
             Err(ref error) if error.kind() == std::io::ErrorKind::InvalidData => {}
             Err(ref error)
                 if matches!(

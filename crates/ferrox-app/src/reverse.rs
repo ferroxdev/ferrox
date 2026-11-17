@@ -328,8 +328,18 @@ impl Session {
             };
             loop {
                 let n = match reader.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(n) => n,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        std::thread::sleep(MONITOR);
+                        continue;
+                    }
+                    Err(_) => break,
                 };
                 if carry.is_empty() {
                     let data = &chunk[..n];
@@ -712,13 +722,18 @@ where
         let mut workers: Vec<BridgeHandle> = Vec::new();
         loop {
             workers.retain(|worker| {
-                let live = worker.state.active() && !worker.state.stale(WORKER_IDLE);
+                let state = &worker.state;
+                let live = !state.stale(WORKER_IDLE) && (state.active() || state.connections() > 0);
                 if !live {
                     worker.tunnel.close();
                 }
                 live
             });
-            let live = u32::try_from(workers.len()).unwrap_or(u32::MAX);
+            let live = workers
+                .iter()
+                .filter(|worker| worker.state.active())
+                .count();
+            let live = u32::try_from(live).unwrap_or(u32::MAX);
             let connections: u32 = workers
                 .iter()
                 .map(|worker| worker.state.connections())

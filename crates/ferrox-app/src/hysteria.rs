@@ -63,6 +63,16 @@ pub(crate) struct Session {
     pub(crate) keep_alive: Option<Duration>,
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(driver) = &self.driver {
+            if Arc::strong_count(driver) == 1 {
+                driver.stop();
+            }
+        }
+    }
+}
+
 /// One stream's latch: the pump bumps it when a datagram filled the stream, and the flow reading it parks until then instead of waiting on the shared socket with the others.
 pub(crate) struct StreamWake {
     gen: Mutex<u64>,
@@ -552,7 +562,7 @@ fn control_settings(session: &Session) -> bool {
     let mut settings = Vec::new();
     frames::quic_varint(&mut settings, 0x04);
     frames::quic_varint(&mut settings, 0);
-    send_all(session, 2, &settings, true)
+    send_all(session, 2, &settings, false)
 }
 
 const PADDING_CHARS: &[u8; 62] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -1116,6 +1126,9 @@ struct Server {
     /// A realm rendezvous is its own connection: its punch peer was negotiated through that
     /// rendezvous, so a dial through another may not ride it.
     realm: Option<Box<ferrox_core::realm::Config>>,
+    /// The mask and gecko window move the wire, so a different pair is a different connection.
+    obfs: String,
+    gecko: Option<(u16, u16)>,
     roots: Option<ferrox_core::tls::Anchors>,
     insecure: bool,
 }
@@ -1139,6 +1152,11 @@ fn server_of(dial: &Dial) -> Server {
         hop: dial.config.hop.clone(),
         quic: dial.config.quic,
         realm: dial.config.realm.clone(),
+        obfs: dial.config.obfs_password.clone(),
+        gecko: dial
+            .config
+            .gecko
+            .map(|gecko| (gecko.min_pkt, gecko.max_pkt)),
         roots: dial.roots.clone(),
         insecure: dial.config.insecure,
     }
@@ -1165,11 +1183,7 @@ fn candidates(dial: &Dial) -> Vec<(Session, u64)> {
         let live = entry.next_stream / 4 < crate::quic::MAX_STREAMS
             && now.saturating_duration_since(entry.used) < REUSE_WINDOW
             && entry.session.shared.lock().is_ok_and(|conn| usable(&conn));
-        if !live {
-            if let Some(driver) = &entry.session.driver {
-                driver.stop();
-            }
-        }
+        // A stale entry only leaves reuse eligibility: stopping its pump would strand a live flow.
         live
     });
     entries
@@ -1710,14 +1724,19 @@ fn not_found(out: &mut Vec<u8>) {
 
 /// Serves one static file under `dir` to a browser request, refusing any path that steps out of the root. A directory yields its `index.html`, else a minimal listing; an escaping, missing, or unreadable path yields the not-found.
 fn serve_file(dir: &str, request: &hysteria::H3Request, out: &mut Vec<u8>) {
-    let Some(path) = safe_path(dir, &request.path) else {
+    let Some(root) = std::fs::canonicalize(dir).ok() else {
+        return not_found(out);
+    };
+    let Some(path) = safe_path(dir, &request.path).and_then(|path| contained(&root, &path)) else {
         return not_found(out);
     };
     if path.is_dir() {
         let index = path.join("index.html");
-        if let Ok(bytes) = std::fs::read(&index) {
-            let kind = hysteria::content_type(&index.to_string_lossy());
-            return hysteria::encode_h3_response(200, &[("content-type", kind)], &bytes, out);
+        if let Some(index) = contained(&root, &index) {
+            if let Ok(bytes) = std::fs::read(&index) {
+                let kind = hysteria::content_type(&index.to_string_lossy());
+                return hysteria::encode_h3_response(200, &[("content-type", kind)], &bytes, out);
+            }
         }
         let listing = directory_listing(&path);
         return hysteria::encode_h3_response(
@@ -1732,6 +1751,12 @@ fn serve_file(dir: &str, request: &hysteria::H3Request, out: &mut Vec<u8>) {
         Ok(bytes) => hysteria::encode_h3_response(200, &[("content-type", kind)], &bytes, out),
         Err(_) => not_found(out),
     }
+}
+
+/// Resolves a real path and keeps it only when it still lies under `root`, so a symlink inside the cover directory cannot name a file outside it.
+fn contained(root: &std::path::Path, path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let real = path.canonicalize().ok()?;
+    real.starts_with(root).then_some(real)
 }
 
 /// Resolves a browser `:path` to a file under `root`, percent-decoding it and rejecting any `..` step, so the served path never climbs above the masquerade directory. A leading slash names the directory's own root, not the filesystem's.
@@ -2371,8 +2396,9 @@ enum Auth {
 }
 
 fn auth_exchange(
-    sock: &crate::quic::Datagram,
+    sock: &Arc<crate::quic::Datagram>,
     conn: &mut quiche::Connection,
+    background: Option<&Arc<Mutex<quiche::Connection>>>,
     auths: &[String],
     inbound: &mut Inbound,
     peer: SocketAddr,
@@ -2397,10 +2423,31 @@ fn auth_exchange(
         let request = hysteria::parse_h3_request(body).unwrap_or_default();
         inbound.auth_buf.clear();
         let peer = peer.to_string();
-        let mut reply = Vec::new();
-        masq_bytes(masq, &request, Some(&peer), &mut reply);
-        if !crate::quic::stream_send_all(conn, sock, AUTH_STREAM, &reply, true, Instant::now()) {
-            return None;
+        if let Some(shared) = background {
+            let shared = Arc::clone(shared);
+            let sock = Arc::clone(sock);
+            let masq = masq.clone();
+            std::thread::spawn(move || {
+                let mut reply = Vec::new();
+                masq_bytes(&masq, &request, Some(&peer), &mut reply);
+                if let Ok(mut conn) = shared.lock() {
+                    let _ = crate::quic::stream_send_all(
+                        &mut conn,
+                        &sock,
+                        AUTH_STREAM,
+                        &reply,
+                        true,
+                        Instant::now(),
+                    );
+                }
+            });
+        } else {
+            let mut reply = Vec::new();
+            masq_bytes(masq, &request, Some(&peer), &mut reply);
+            if !crate::quic::stream_send_all(conn, sock, AUTH_STREAM, &reply, true, Instant::now())
+            {
+                return None;
+            }
         }
         return Some(Auth::Cover);
     }
@@ -2546,12 +2593,12 @@ impl Router<'_> {
                 let mut settings = Vec::new();
                 frames::quic_varint(&mut settings, 0x04);
                 frames::quic_varint(&mut settings, 0);
-                let _ = conn.stream_send(3, &settings, true);
+                let _ = conn.stream_send(3, &settings, false);
                 crate::quic::flush_egress(&mut conn, sock);
                 inbound.settings_sent = true;
             }
             if inbound.standing == Standing::Pending {
-                match auth_exchange(sock, &mut conn, auths, inbound, from, masq) {
+                match auth_exchange(sock, &mut conn, Some(&shared), auths, inbound, from, masq) {
                     None => return true,
                     Some(Auth::Refused) => {
                         let _ = conn.close(false, 0, b"refused");
@@ -2817,6 +2864,7 @@ pub(crate) fn serve_prepared(
     }
     #[cfg(target_os = "linux")]
     let mut batch = crate::quic::Batch::new();
+    let mut idle_at = Instant::now();
     loop {
         #[cfg(target_os = "linux")]
         match crate::quic::recv_batch(&router.sock, &mut batch) {
@@ -2833,6 +2881,10 @@ pub(crate) fn serve_prepared(
                     route_packet(&mut router, &mut template, packet, from);
                 }
                 router.wake();
+                if idle_at.elapsed() >= ROUTE_POLL {
+                    router.idle();
+                    idle_at = Instant::now();
+                }
                 continue;
             }
             crate::quic::Drain::Empty => {
@@ -2853,6 +2905,10 @@ pub(crate) fn serve_prepared(
                 }
                 route_packet(&mut router, &mut template, &mut buf.as_mut()[..n], from);
                 router.wake();
+                if idle_at.elapsed() >= ROUTE_POLL {
+                    router.idle();
+                    idle_at = Instant::now();
+                }
             }
             Err(e)
                 if matches!(
@@ -3010,8 +3066,8 @@ mod tests {
         });
         assert_eq!(
             counts.allocs,
-            floor.allocs + 2,
-            "the path buffer and its one growth are all the answer adds to the platform's own read"
+            floor.allocs + 4,
+            "the root's resolution, the request's resolution and their joins are all the answer adds to the platform's own read"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3382,7 +3438,15 @@ mod tests {
         let masq = Masquerade::NotFound;
         let outcome = {
             let mut conn = shared.lock().expect("locks");
-            auth_exchange(&sock, &mut conn, &auths, &mut inbound, client_addr, &masq)
+            auth_exchange(
+                &sock,
+                &mut conn,
+                None,
+                &auths,
+                &mut inbound,
+                client_addr,
+                &masq,
+            )
         };
         assert!(matches!(outcome, Some(Auth::Cover)));
         assert!(

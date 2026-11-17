@@ -11,7 +11,7 @@
 use std::io::Read;
 use std::net::Shutdown;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::conn::Connection;
 use crate::json::Json;
@@ -34,17 +34,33 @@ pub(crate) fn serve(mut client: Connection, answer: &Response) {
     }
     // The peer's bytes are read to their end, so the close is a finish and not the reset an unread request earns.
     let grace = crate::budgets::sink_grace();
-    let _ = client.set_read_timeout(Some(grace));
     absorb(&mut client, Instant::now() + grace);
 }
 
 /// The peer's bytes, read to their end or to the deadline, and how many of them
 /// were read. The window is the read's own size, so an upload costs one read
 /// per window of bytes.
-fn absorb(reader: &mut impl Read, deadline: Instant) -> usize {
+trait TimedRead: Read {
+    fn arm(&mut self, after: Duration) -> bool;
+}
+
+impl TimedRead for Connection {
+    fn arm(&mut self, after: Duration) -> bool {
+        self.set_read_timeout(Some(after)).is_ok()
+    }
+}
+
+fn absorb(reader: &mut impl TimedRead, deadline: Instant) -> usize {
     let mut window = [0u8; WINDOW];
     let mut read = 0;
-    while Instant::now() < deadline {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        if !reader.arm(deadline - now) {
+            break;
+        }
         match reader.read(&mut window) {
             Ok(0) | Err(_) => break,
             Ok(n) => read += n,
@@ -71,15 +87,22 @@ pub(crate) fn answer(settings: Option<&Json>) -> Result<Response, String> {
     if !matches!(response, Json::Obj(_)) {
         return Err("blackhole response is not an object".to_owned());
     }
-    let kind = response.get("type").and_then(Json::as_str).unwrap_or("");
+    let kind = match response.get("type") {
+        None => "",
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| "blackhole response type is not a string".to_owned())?,
+    };
     match kind.to_ascii_lowercase().as_str() {
         "" | "none" => Ok(Response::None),
         "http" => Ok(Response::Http),
         "custom" => {
-            let data = response
-                .get("customResponseData")
-                .and_then(Json::as_str)
-                .unwrap_or("");
+            let data = match response.get("customResponseData") {
+                None => "",
+                Some(value) => value
+                    .as_str()
+                    .ok_or_else(|| "blackhole customResponseData is not a string".to_owned())?,
+            };
             let bytes = if data.is_empty() {
                 Vec::new()
             } else {
@@ -188,6 +211,11 @@ mod tests {
                 buf[..n].copy_from_slice(&self.left[..n]);
                 self.left.drain(..n);
                 Ok(n)
+            }
+        }
+        impl TimedRead for Windows {
+            fn arm(&mut self, _after: Duration) -> bool {
+                true
             }
         }
         // Six whole windows and a half of one.

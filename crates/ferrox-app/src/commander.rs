@@ -338,22 +338,22 @@ impl Api {
         let Some(address) = self.config.listen.clone() else {
             return;
         };
+        let target = match crate::conn::parse_target(&address) {
+            Ok(target) => target,
+            Err(error) => {
+                eprintln!("commander: cannot resolve {address}: {error}");
+                return;
+            }
+        };
+        let listener = match crate::conn::Listener::bind(&target) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("commander: cannot listen on {address}: {error}");
+                return;
+            }
+        };
         let api = Arc::clone(self);
         thread::spawn(move || {
-            let target = match crate::conn::parse_target(&address) {
-                Ok(target) => target,
-                Err(error) => {
-                    eprintln!("commander: cannot resolve {address}: {error}");
-                    return;
-                }
-            };
-            let listener = match crate::conn::Listener::bind(&target) {
-                Ok(listener) => listener,
-                Err(error) => {
-                    eprintln!("commander: cannot listen on {address}: {error}");
-                    return;
-                }
-            };
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
                 let Some(slot) = API_SLOTS.acquire() else {
@@ -824,33 +824,38 @@ impl Api {
         if tag.is_empty() {
             return Err((2, "empty handler tag".to_owned()));
         }
-        let entry = {
-            let Ok(mut state) = self.state.lock() else {
+        let stops = {
+            let Ok(state) = self.state.lock() else {
                 return Err((13, "commander state is unavailable".into()));
             };
-            let Some(index) = state.inbounds.iter().position(|entry| entry.tag == tag) else {
+            let Some(entry) = state.inbounds.iter().find(|entry| entry.tag == tag) else {
                 return Err((2, format!("inbound `{tag}` not found")));
             };
-            if state.inbounds[index].stops.is_empty() {
-                let protocol = state.inbounds[index].protocol.clone();
+            if entry.stops.is_empty() {
                 return Err((
                     12,
-                    format!("inbound `{tag}` ({protocol}) has no listener this tree can stop"),
+                    format!(
+                        "inbound `{tag}` ({}) has no listener this tree can stop",
+                        entry.protocol
+                    ),
                 ));
             }
-            state.inbounds.remove(index)
+            entry.stops.clone()
         };
-        for (stop, address) in &entry.stops {
+        for (stop, address) in &stops {
             stop.stop();
             crate::proxy::wake_listener(stop, address);
         }
-        for (stop, address) in &entry.stops {
+        for (stop, address) in &stops {
             if !stop.wait_closed() {
                 return Err((
                     13,
                     format!("inbound `{tag}` listener at {address} did not close"),
                 ));
             }
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.inbounds.retain(|entry| entry.tag != tag);
         }
         if let Ok(runtime) = self.runtime() {
             runtime.forget_server_inbound(&tag);
@@ -1489,48 +1494,49 @@ impl<'a> Pb<'a> {
     }
 
     fn next(&mut self) -> Result<Option<(u64, Value<'a>)>, String> {
-        if self.rest.is_empty() {
-            return Ok(None);
-        }
-        let (key, rest) = varint(self.rest).ok_or_else(|| "protobuf: truncated key".to_owned())?;
-        self.rest = rest;
-        let field = key >> 3;
-        let wire = (key & 7) as u8;
-        match wire {
-            0 => {
-                let (value, rest) =
-                    varint(self.rest).ok_or_else(|| "protobuf: truncated varint".to_owned())?;
-                self.rest = rest;
-                Ok(Some((field, Value::Varint(value))))
+        loop {
+            if self.rest.is_empty() {
+                return Ok(None);
             }
-            2 => {
-                let (len, rest) =
-                    varint(self.rest).ok_or_else(|| "protobuf: truncated length".to_owned())?;
-                let len =
-                    usize::try_from(len).map_err(|_| "protobuf: length overflows".to_owned())?;
-                let (body, rest) = rest
-                    .split_at_checked(len)
-                    .ok_or_else(|| "protobuf: truncated body".to_owned())?;
-                self.rest = rest;
-                Ok(Some((field, Value::Bytes(body))))
+            let (key, rest) =
+                varint(self.rest).ok_or_else(|| "protobuf: truncated key".to_owned())?;
+            self.rest = rest;
+            let field = key >> 3;
+            let wire = (key & 7) as u8;
+            match wire {
+                0 => {
+                    let (value, rest) =
+                        varint(self.rest).ok_or_else(|| "protobuf: truncated varint".to_owned())?;
+                    self.rest = rest;
+                    return Ok(Some((field, Value::Varint(value))));
+                }
+                2 => {
+                    let (len, rest) =
+                        varint(self.rest).ok_or_else(|| "protobuf: truncated length".to_owned())?;
+                    let len = usize::try_from(len)
+                        .map_err(|_| "protobuf: length overflows".to_owned())?;
+                    let (body, rest) = rest
+                        .split_at_checked(len)
+                        .ok_or_else(|| "protobuf: truncated body".to_owned())?;
+                    self.rest = rest;
+                    return Ok(Some((field, Value::Bytes(body))));
+                }
+                1 => {
+                    let (_, rest) = self
+                        .rest
+                        .split_at_checked(8)
+                        .ok_or_else(|| "protobuf: truncated fixed64".to_owned())?;
+                    self.rest = rest;
+                }
+                5 => {
+                    let (_, rest) = self
+                        .rest
+                        .split_at_checked(4)
+                        .ok_or_else(|| "protobuf: truncated fixed32".to_owned())?;
+                    self.rest = rest;
+                }
+                other => return Err(format!("protobuf: wire type {other}")),
             }
-            1 => {
-                let (_, rest) = self
-                    .rest
-                    .split_at_checked(8)
-                    .ok_or_else(|| "protobuf: truncated fixed64".to_owned())?;
-                self.rest = rest;
-                self.next()
-            }
-            5 => {
-                let (_, rest) = self
-                    .rest
-                    .split_at_checked(4)
-                    .ok_or_else(|| "protobuf: truncated fixed32".to_owned())?;
-                self.rest = rest;
-                self.next()
-            }
-            other => Err(format!("protobuf: wire type {other}")),
         }
     }
 }

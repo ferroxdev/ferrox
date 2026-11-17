@@ -5,8 +5,8 @@
 
 use crate::conn::Connection;
 use crate::h2::{
-    block_encode, frame_head, read_head, Decoder, F_ACK, F_END, F_END_HEADERS, T_CONT, T_DATA,
-    T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS,
+    block_encode, frame_head, read_head, Decoder, F_ACK, F_END, F_END_HEADERS, F_PADDED,
+    F_PRIORITY, T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS,
 };
 use crate::sockopt::SocketOptions;
 use ferrox_core::tls::TlsProvider as _;
@@ -24,8 +24,10 @@ pub(crate) fn udp(
     local: bool,
 ) -> Result<Vec<u8>, String> {
     if !local {
-        if let Some(response) = crate::proxy::dns_udp(host, port, tag, query, timeout) {
-            return Ok(response);
+        match crate::proxy::dns_udp(host, port, tag, query, timeout) {
+            Ok(Some(response)) => return Ok(response),
+            Ok(None) => {}
+            Err(error) => return Err(error),
         }
     }
     let socket = crate::sockopt::datagram(options, host, port, timeout)?;
@@ -188,8 +190,10 @@ fn connect(
     local: bool,
 ) -> Result<Connection, String> {
     if !local {
-        if let Some(stream) = crate::proxy::dns_stream(host, port, tag, timeout) {
-            return Ok(stream);
+        match crate::proxy::dns_stream(host, port, tag, timeout) {
+            Ok(Some(stream)) => return Ok(stream),
+            Ok(None) => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(Connection::Tcp(crate::sockopt::connect(
@@ -275,7 +279,15 @@ fn exchange(
                 }
             }
             T_HEADERS | T_CONT => {
-                block.extend_from_slice(&payload);
+                let payload = if kind == T_HEADERS {
+                    unframe(flags, &payload)?
+                } else {
+                    &payload
+                };
+                if block.len() + payload.len() > ferrox_core::dns::MESSAGE_MAX {
+                    return Err("dns doh headers over the message bound".to_owned());
+                }
+                block.extend_from_slice(payload);
                 if flags & F_END_HEADERS != 0 {
                     decoder
                         .decode(&block, &mut |name, value| {
@@ -292,7 +304,11 @@ fn exchange(
             }
             T_DATA => {
                 if id == 1 {
-                    body.extend_from_slice(&payload);
+                    let payload = unframe(flags, &payload)?;
+                    if body.len() + payload.len() > ferrox_core::dns::MESSAGE_MAX {
+                        return Err("dns doh answer over the message bound".to_owned());
+                    }
+                    body.extend_from_slice(payload);
                 }
                 if flags & F_END != 0 {
                     break;
@@ -307,6 +323,29 @@ fn exchange(
         Some("200") => {}
         Some(other) => return Err(format!("dns doh answered {other}")),
         None => return Err("dns doh answered no status".to_owned()),
+    }
+    Ok(body)
+}
+
+/// The payload without the padding and priority fields a frame's flags announce, so a valid
+/// padded answer is decoded rather than handed to the DNS reader as damaged bytes.
+fn unframe(flags: u8, payload: &[u8]) -> Result<&[u8], String> {
+    let mut body = payload;
+    if flags & F_PADDED != 0 {
+        let Some((&padding, rest)) = body.split_first() else {
+            return Err("dns doh padded frame is empty".to_owned());
+        };
+        let padding = usize::from(padding);
+        if padding > rest.len() {
+            return Err("dns doh padding overruns its frame".to_owned());
+        }
+        body = &rest[..rest.len() - padding];
+    }
+    if flags & F_PRIORITY != 0 {
+        if body.len() < 5 {
+            return Err("dns doh priority field is short".to_owned());
+        }
+        body = &body[5..];
     }
     Ok(body)
 }

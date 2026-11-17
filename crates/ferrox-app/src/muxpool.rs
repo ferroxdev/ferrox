@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,9 @@ const IDLE: Duration = Duration::from_secs(16);
 
 /// The reference's `Dispatch` retries a pick this many times when the last slot fills under it.
 const PICKS: usize = 16;
+
+/// One flow's reply queue; a flow that cannot keep up is ended without stalling the demux.
+const REPLIES: usize = 64;
 
 /// A carrier's two halves and the close that tears its socket down.
 pub(crate) struct Uplink {
@@ -53,10 +56,18 @@ impl Flow {
         self.replies.take()
     }
 
-    pub(crate) fn close(self) {
-        // End is on the wire before the id returns to the table; the writer lock orders every frame.
+    pub(crate) fn end_upload(&self) {
         self.carrier
             .frame(self.id, mux::Status::End, 0, None, None, &[]);
+    }
+
+    pub(crate) fn release(self) {
+        self.carrier.release(self.id);
+    }
+
+    pub(crate) fn close(self) {
+        // End is on the wire before the id returns to the table; the writer lock orders every frame.
+        self.end_upload();
         self.carrier.release(self.id);
     }
 }
@@ -97,7 +108,7 @@ pub(crate) type Deliver = Arc<dyn Fn(&[u8], Option<SocketAddr>) + Send + Sync>;
 
 #[derive(Clone)]
 enum Sink {
-    Tcp(Sender<Msg>),
+    Tcp(SyncSender<Msg>),
     Udp(Deliver, Arc<std::sync::atomic::AtomicBool>),
 }
 
@@ -278,7 +289,12 @@ impl Carrier {
         let Ok(mut writer) = self.write.lock() else {
             return false;
         };
-        writer.frame(id, status, options, target, global_id, data)
+        let written = writer.frame(id, status, options, target, global_id, data);
+        drop(writer);
+        if !written {
+            self.retire();
+        }
+        written
     }
 
     /// The client's bulk path: one head per frame-sized chunk, one vectored write for the batch.
@@ -332,7 +348,7 @@ impl Carrier {
         };
         for (_, sink) in table.sinks.drain() {
             if let Sink::Tcp(sender) = sink {
-                let _ = sender.send(Msg {
+                let _ = sender.try_send(Msg {
                     data: Vec::new(),
                     end: true,
                 });
@@ -404,10 +420,16 @@ impl Carrier {
         match sink {
             Sink::Tcp(sender) => {
                 let data = frame.data.unwrap_or(&[]);
-                let _ = sender.send(Msg {
+                let msg = Msg {
                     data: data.to_vec(),
                     end: frame.status == mux::Status::End,
-                });
+                };
+                if matches!(
+                    sender.try_send(msg),
+                    Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
+                ) {
+                    self.release(frame.id);
+                }
             }
             Sink::Udp(deliver, ended) => {
                 if frame.status == mux::Status::End {
@@ -585,7 +607,7 @@ impl Manager {
     /// One TCP session, on the first carrier with room or on a fresh one.
     pub(crate) fn dial(&self, target: &mux::Target<'_>) -> Option<Flow> {
         let (carrier, id, replies) = self.reserve(|_| {
-            let (send, replies) = channel();
+            let (send, replies) = sync_channel(REPLIES);
             (Sink::Tcp(send), replies)
         })?;
         if !carrier.frame(id, mux::Status::New, mux::DATA, Some(*target), None, &[]) {

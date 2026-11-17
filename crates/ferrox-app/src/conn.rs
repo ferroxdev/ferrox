@@ -1620,15 +1620,51 @@ impl Connection {
     }
 }
 
+/// Read a fixed-length prefix while one deadline covers every byte: a peer that drips a byte
+/// before each per-read timeout still runs out of the listener's budget.
+fn read_exact_within(
+    stream: &mut Connection,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the PROXY header outlasted its budget",
+            ));
+        }
+        stream.set_read_timeout(Some(deadline - now))?;
+        match stream.read(&mut buffer[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the PROXY header ended early",
+                ))
+            }
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Read the PROXY protocol header a listener's `acceptProxyProtocol` promised. A v1 text line or
 /// a v2 binary header is consumed in full and the source address it reports is returned; `None`
 /// means the header is valid but names no IP source (`UNKNOWN`, `LOCAL`, or a Unix/unspecified
 /// family), so the socket's own peer stays the source. A malformed or truncated header is an
 /// error, and the caller closes the connection rather than letting carrier bytes stand in for it.
-pub(crate) fn read_proxy_header(stream: &mut Connection) -> io::Result<Option<SocketAddr>> {
+pub(crate) fn read_proxy_header(
+    stream: &mut Connection,
+    budget: Duration,
+) -> io::Result<Option<SocketAddr>> {
     const V2_SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
+    let deadline = Instant::now() + budget;
     let mut first = [0u8; 12];
-    stream.read_exact(&mut first)?;
+    read_exact_within(stream, &mut first, deadline)?;
     if &first[..6] == b"PROXY " {
         let mut line = [0u8; 108];
         line[..12].copy_from_slice(&first);
@@ -1637,7 +1673,7 @@ pub(crate) fn read_proxy_header(stream: &mut Connection) -> io::Result<Option<So
             if len >= 2 && &line[len - 2..len] == b"\r\n" {
                 break;
             }
-            stream.read_exact(&mut line[len..=len])?;
+            read_exact_within(stream, &mut line[len..=len], deadline)?;
             len += 1;
         }
         if len < 2 || &line[len - 2..len] != b"\r\n" {
@@ -1653,14 +1689,14 @@ pub(crate) fn read_proxy_header(stream: &mut Connection) -> io::Result<Option<So
         ));
     }
     let mut head = [0u8; 4];
-    stream.read_exact(&mut head)?;
+    read_exact_within(stream, &mut head, deadline)?;
     if head[0] >> 4 != 2 {
         return Err(bad_proxy("the PROXY v2 header names another version"));
     }
     let command = head[0] & 0x0f;
     let length = usize::from(u16::from_be_bytes([head[2], head[3]]));
     let mut body = vec![0u8; length];
-    stream.read_exact(&mut body)?;
+    read_exact_within(stream, &mut body, deadline)?;
     if command == 0 {
         return Ok(None);
     }
@@ -1752,11 +1788,20 @@ fn set_socket_timeout(
     use std::os::fd::AsRawFd;
     let mut value: libc::timeval = unsafe { std::mem::zeroed() };
     if let Some(timeout) = timeout {
-        // Whole microseconds; the sub-microsecond remainder would only round the bound down.
+        // A zero `timeval` means "no bound", so zero is refused and a sub-microsecond wait rounds up.
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot set a zero-duration socket timeout",
+            ));
+        }
         value.tv_sec = timeout.as_secs().try_into().unwrap_or(i64::MAX);
         // `suseconds_t` is `i32` on macOS, where this conversion can fail, and `i64` on Linux, where it cannot.
         #[allow(clippy::unnecessary_fallible_conversions)]
-        let usec: libc::suseconds_t = timeout.subsec_micros().try_into().unwrap_or(0);
+        let mut usec: libc::suseconds_t = timeout.subsec_micros().try_into().unwrap_or(0);
+        if value.tv_sec == 0 && usec == 0 {
+            usec = 1;
+        }
         value.tv_usec = usec;
     }
     // SAFETY: `value` is a live `timeval`, sized as the kernel reads the option, on the stream's own descriptor.
@@ -1944,10 +1989,22 @@ impl HttpUrl {
             let (host, tail) = bracketed
                 .split_once(']')
                 .ok_or_else(|| "URL has an unclosed IPv6 host".to_owned())?;
-            let port = tail
-                .strip_prefix(':')
-                .and_then(|port| port.parse().ok())
-                .unwrap_or(if tls { 443 } else { 80 });
+            let port = if tail.is_empty() {
+                if tls {
+                    443
+                } else {
+                    80
+                }
+            } else {
+                let port = tail
+                    .strip_prefix(':')
+                    .ok_or_else(|| "URL has unexpected text after its IPv6 host".to_owned())?;
+                if port.is_empty() || !port.chars().all(|ch| ch.is_ascii_digit()) {
+                    return Err("URL has an invalid port".to_owned());
+                }
+                port.parse()
+                    .map_err(|_| "URL has an invalid port".to_owned())?
+            };
             (host.to_owned(), port)
         } else if let Some((host, port)) = authority.rsplit_once(':') {
             if port.chars().all(|ch| ch.is_ascii_digit()) {
@@ -2254,6 +2311,7 @@ fn split_permission(path: &std::path::Path) -> (&std::path::Path, Option<u32>) {
 /// directory leaves no room for a staged name, to the path itself.
 #[cfg(unix)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some((name, padded)) = abstract_name(path) {
@@ -2281,9 +2339,17 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
     // The directory leaves no room for a staged name, so the mode goes on the path itself.
     take_stale(path, stale)?;
     let listener = UnixListener::bind(path)?;
-    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
-        let _ = std::fs::remove_file(path);
-        return Err(error);
+    // SAFETY: the listener owns a live descriptor, and `mode` is the permission bits the reference accepts.
+    let changed = unsafe { libc::fchmod(listener.as_raw_fd(), mode as libc::mode_t) } == 0;
+    // macOS refuses `fchmod` on a socket, so the longest path applies the mode through its name.
+    if !changed {
+        let error = io::Error::last_os_error();
+        let unsigned = error.raw_os_error() == Some(libc::EINVAL)
+            && std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).is_ok();
+        if !unsigned {
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
     }
     Ok(listener)
 }
@@ -2364,8 +2430,16 @@ fn staged_name(path: &std::path::Path) -> std::path::PathBuf {
 
 #[cfg(windows)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
-    if std::fs::symlink_metadata(path).is_ok() {
-        std::fs::remove_file(path)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "a unix listen path names a file that is not a socket",
+            ))
+        }
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     let listener = UnixListener::bind(path)?;
     Ok(listener)

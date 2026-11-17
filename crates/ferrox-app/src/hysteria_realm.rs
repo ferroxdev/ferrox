@@ -13,8 +13,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 
 /// The socket a rendezvous exchange rides, plain or behind TLS. One trait object the plain
 /// `TcpStream` and the client TLS session both answer, so `open` hands back one shape either way.
-trait Io: Read + Write {}
-impl<T: Read + Write> Io for T {}
+trait Io: Read + Write + Send {}
+impl<T: Read + Write + Send> Io for T {}
 type DynStream = Box<dyn Io>;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
@@ -165,7 +165,7 @@ impl Client {
         let obfs_hex = realm::hex_encode(&meta.obfs);
         let body = format!(
             "{{\"addresses\":{},\"nonce\":\"{nonce_hex}\",\"obfs\":\"{obfs_hex}\"}}",
-            encode_addresses(locals)
+            encode_address_list(locals)
         );
         let reply = self.exchange("POST", &join_path(id, "connect"), &self.token, Some(&body))?;
         let addresses = json_addr_list(&reply, "addresses");
@@ -220,6 +220,7 @@ impl Client {
         if !(200..300).contains(&status) {
             return None;
         }
+        let mut chunked = false;
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line).ok()? == 0 {
@@ -228,18 +229,110 @@ impl Client {
             if line == "\r\n" || line == "\n" {
                 break;
             }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("transfer-encoding")
+                    && value.to_ascii_lowercase().contains("chunked")
+                {
+                    chunked = true;
+                }
+            }
         }
+        let source: Box<dyn Read + Send> = if chunked {
+            Box::new(ChunkedReader::new(reader))
+        } else {
+            Box::new(reader)
+        };
         Some(EventStream {
-            reader,
+            reader: BufReader::new(source),
             event: String::new(),
             data: String::new(),
         })
     }
 }
 
+/// The `Transfer-Encoding: chunked` frame around an events body: sizes and trailers are consumed
+/// here, so the SSE parser only sees the decoded event lines no matter how a chunk boundary splits them.
+struct ChunkedReader<R> {
+    inner: R,
+    remaining: usize,
+    done: bool,
+}
+
+impl<R: BufRead> ChunkedReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            remaining: 0,
+            done: false,
+        }
+    }
+
+    fn next_size(&mut self) -> std::io::Result<usize> {
+        let mut line = String::new();
+        if self.inner.read_line(&mut line)? == 0 {
+            self.done = true;
+            return Ok(0);
+        }
+        let size = line
+            .trim()
+            .split(';')
+            .next()
+            .and_then(|size| usize::from_str_radix(size, 16).ok())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size")
+            })?;
+        if size == 0 {
+            loop {
+                let mut trailer = String::new();
+                if self.inner.read_line(&mut trailer)? == 0 || trailer == "\r\n" || trailer == "\n"
+                {
+                    break;
+                }
+            }
+            self.done = true;
+        }
+        Ok(size)
+    }
+}
+
+impl<R: BufRead> Read for ChunkedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.done || buf.is_empty() {
+            return Ok(0);
+        }
+        while self.remaining == 0 {
+            self.remaining = self.next_size()?;
+            if self.done {
+                return Ok(0);
+            }
+        }
+        let want = buf.len().min(self.remaining);
+        let read = self.inner.read(&mut buf[..want])?;
+        if read == 0 {
+            self.done = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "chunk ended early",
+            ));
+        }
+        self.remaining -= read;
+        if self.remaining == 0 {
+            let mut crlf = [0u8; 2];
+            self.inner.read_exact(&mut crlf)?;
+            if crlf != *b"\r\n" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bad chunk terminator",
+                ));
+            }
+        }
+        Ok(read)
+    }
+}
+
 /// One server-sent event off a rendezvous `events` stream.
 pub(crate) struct EventStream {
-    reader: BufReader<DynStream>,
+    reader: BufReader<Box<dyn Read + Send>>,
     event: String,
     data: String,
 }
@@ -307,15 +400,19 @@ fn sanitize_id(id: &str) -> String {
 
 /// The JSON addresses object the rendezvous reads: `{"addresses":["ip:port"]}`.
 fn encode_addresses(addrs: &[SocketAddr]) -> String {
+    format!("{{\"addresses\":{}}}", encode_address_list(addrs))
+}
+
+fn encode_address_list(addrs: &[SocketAddr]) -> String {
     let mut body = String::with_capacity(16 + addrs.len() * 20);
-    body.push_str("{\"addresses\":[");
+    body.push('[');
     for (at, addr) in addrs.iter().enumerate() {
         if at > 0 {
             body.push(',');
         }
         crate::json::write(&crate::json::Json::Str(addr.to_string()), &mut body);
     }
-    body.push_str("]}");
+    body.push(']');
     body
 }
 
@@ -481,7 +578,7 @@ pub(crate) fn stun_discover(
     let mut targets: Vec<SocketAddr> = Vec::with_capacity(servers.len());
     for server in servers {
         let (host, port) = split_server(server);
-        let resolved: Vec<SocketAddr> = match format!("{host}:{port}").to_socket_addrs() {
+        let resolved: Vec<SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
             Ok(iter) => iter.collect(),
             Err(_) => continue,
         };
@@ -616,7 +713,7 @@ pub(crate) fn stun_discover_via_state(
     let mut results: Vec<SocketAddr> = Vec::new();
     for server in servers {
         let (host, port) = split_server(server);
-        let resolved: Vec<SocketAddr> = match format!("{host}:{port}").to_socket_addrs() {
+        let resolved: Vec<SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
             Ok(iter) => iter.collect(),
             Err(_) => continue,
         };
@@ -918,18 +1015,16 @@ fn heartbeat_loop(
         let Some(base) = stun_discover_via_state(&state, &sock, &servers, family) else {
             continue;
         };
-        let held = locals.lock().is_ok_and(|mut guard| {
-            if *guard == base {
-                false
-            } else {
-                guard.clone_from(&base);
-                true
-            }
-        });
-        if held {
-            let _ = client.heartbeat(id, session, Some(&base));
+        let moved = locals.lock().is_ok_and(|guard| *guard != base);
+        let sent = if moved {
+            client.heartbeat(id, session, Some(&base))
         } else {
-            let _ = client.heartbeat(id, session, None);
+            client.heartbeat(id, session, None)
+        };
+        if sent.is_some() && moved {
+            if let Ok(mut guard) = locals.lock() {
+                guard.clone_from(&base);
+            }
         }
     }
 }

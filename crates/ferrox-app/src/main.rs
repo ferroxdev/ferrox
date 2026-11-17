@@ -840,10 +840,10 @@ fn read_conf_dir(dir: &str, format: Option<&str>, out: &mut Vec<String>) {
     let entries = std::fs::read_dir(dir)
         .unwrap_or_else(|error| proxy::exit(&format!("cannot read {dir}: {error}")));
     let suffixes: &[&str] = match format.map(str::to_ascii_lowercase).as_deref() {
-        Some("json" | "jsonc") => &["json", "jsonc"],
+        Some("jsonc") => &["jsonc"],
         Some("toml") => &["toml"],
         Some("yaml" | "yml") => &["yaml", "yml"],
-        _ => &["json", "jsonc", "toml", "yaml", "yml"],
+        _ => &["json", "jsonc"],
     };
     let mut names: Vec<std::path::PathBuf> = entries
         .filter_map(Result::ok)
@@ -879,14 +879,28 @@ fn conf_dir_env() -> Option<String> {
 fn serve_files(files: &[String], format: Option<&str>) -> ! {
     let mut merged = crate::json::Json::Obj(Vec::new());
     for (at, file) in files.iter().enumerate() {
-        if matches!(source_format(format, file), SourceFormat::Protobuf) {
+        let format = source_format(format, file);
+        if matches!(format, SourceFormat::Protobuf) {
             proxy::exit("Only one protobuf config file is allowed");
         }
-        let bytes = std::fs::read(file)
-            .unwrap_or_else(|error| proxy::exit(&format!("cannot read {file}: {error}")));
+        let bytes = if file == "stdin" || file == "stdin:" {
+            let mut bytes = Vec::new();
+            if let Err(error) = std::io::stdin().read_to_end(&mut bytes) {
+                proxy::exit(&format!("cannot read stdin: {error}"));
+            }
+            bytes
+        } else {
+            std::fs::read(file)
+                .unwrap_or_else(|error| proxy::exit(&format!("cannot read {file}: {error}")))
+        };
         let body = std::str::from_utf8(&bytes)
             .unwrap_or_else(|error| proxy::exit(&format!("bad config {file}: {error}")));
-        let root = crate::json::parse(body)
+        let body = if matches!(format, SourceFormat::Jsonc) {
+            crate::json::strip_jsonc(body)
+        } else {
+            std::borrow::Cow::Borrowed(body)
+        };
+        let root = crate::json::parse(&body)
             .unwrap_or_else(|error| proxy::exit(&format!("bad config {file}: {error}")));
         if at == 0 {
             merged = root;
@@ -911,7 +925,7 @@ fn dump_config(configs: &[String]) -> ! {
     let mut merged = crate::json::Json::Obj(Vec::new());
     let mut first = true;
     for file in &files {
-        let extension = if file == "stdin:" {
+        let extension = if file == "stdin" || file == "stdin:" {
             None
         } else {
             std::path::Path::new(file)
@@ -924,10 +938,10 @@ fn dump_config(configs: &[String]) -> ! {
                 dump_fail(&format!("config format `{format}` is not carried; json is"));
             }
             Some("json" | "jsonc") => {}
-            None if file == "stdin:" => {}
+            None if file == "stdin" || file == "stdin:" => {}
             _ => continue,
         }
-        let bytes = if file == "stdin:" {
+        let bytes = if file == "stdin" || file == "stdin:" {
             let mut bytes = Vec::new();
             if let Err(error) = std::io::stdin().read_to_end(&mut bytes) {
                 dump_fail(&format!("cannot read stdin: {error}"));
@@ -962,6 +976,7 @@ fn dump_fail(message: &str) -> ! {
 #[derive(Clone, Copy)]
 enum SourceFormat {
     Json,
+    Jsonc,
     Protobuf,
 }
 
@@ -1003,7 +1018,8 @@ fn discover_config() -> String {
 fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
     match named.map(str::to_ascii_lowercase).as_deref() {
         Some("pb" | "protobuf") => SourceFormat::Protobuf,
-        Some("json" | "jsonc") => SourceFormat::Json,
+        Some("json") => SourceFormat::Json,
+        Some("jsonc") => SourceFormat::Jsonc,
         Some("auto") | None => {
             let extension = std::path::Path::new(source)
                 .extension()
@@ -1011,6 +1027,8 @@ fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
                 .unwrap_or_default();
             if extension.eq_ignore_ascii_case("pb") || extension.eq_ignore_ascii_case("protobuf") {
                 SourceFormat::Protobuf
+            } else if extension.eq_ignore_ascii_case("jsonc") {
+                SourceFormat::Jsonc
             } else {
                 SourceFormat::Json
             }
@@ -1027,10 +1045,15 @@ fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
 fn serve_source(label: &str, bytes: &[u8], format: SourceFormat) -> ! {
     match format {
         SourceFormat::Protobuf => proxy::serve_protobuf(label, bytes, test_only()),
-        SourceFormat::Json => {
+        SourceFormat::Json | SourceFormat::Jsonc => {
             let body = std::str::from_utf8(bytes)
                 .unwrap_or_else(|error| proxy::exit(&format!("bad config {label}: {error}")));
-            proxy::serve_json(label, body, test_only())
+            let body = if matches!(format, SourceFormat::Jsonc) {
+                crate::json::strip_jsonc(body)
+            } else {
+                std::borrow::Cow::Borrowed(body)
+            };
+            proxy::serve_json(label, &body, test_only())
         }
     }
 }
