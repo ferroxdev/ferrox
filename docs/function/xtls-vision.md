@@ -4,14 +4,14 @@ Vision is the one framing in this tree that *stops existing*. Once the inner TLS
 
 The framing is: the first frame is prefixed with the 16-byte user UUID; every frame is then `command(1) | length(2) | padLength(2) | content | padding`. Commands are `0` continue, `1` end, `2` direct. Padding is zero-filled and its length comes from the same seed table Xray uses (`{900, 500, 900, 256}`); the cap that follows the seed is this tree's and not the reference's, and the difference is named below. One frame carries at most 8171 content bytes — Xray's `buf.Size` of 8192 less the uuid and the header — so a longer write leaves as several frames, never as one frame the reference's reader refuses.
 
-For eight buffers in each direction the writer and the reader run a TLS filter: `0x16 0x03` means a handshake record, `0x17 0x03 0x03` means application data, and a `0x00 0x2b 0x00 0x02 0x03 0x04` window inside a 1.3 ServerHello means the inner TLS negotiated a cipher worth switching for. Until that window closes, every buffer is framed; after it, nothing is.
+For up to eight buffers in each direction the writer and the reader run a TLS filter: `0x16 0x03` means a handshake record, `0x17 0x03 0x03` means application data, and a `0x00 0x2b 0x00 0x02 0x03 0x04` window inside a 1.3 ServerHello means the inner TLS negotiated a cipher worth switching for. The eight are the filter's budget, not the switch: framing ends on the command the writer emits after that window, or on the `end`/`direct` command the reader receives, and a budget spent without the window leaves every buffer framed.
 
 ## Data path
 
 ```mermaid
 graph TD
     W1["inner TLS writes, 8 buffers"] --> W2["frame: uuid once, then<br/>cmd | len | padLen | content | padding"]
-    W2 --> W3["observe the record header<br/>budget 8 → 0 at the switch"]
+    W2 --> W3["observe the record header<br/>filter budget 8 → 0 as it is spent"]
     W3 --> W4{"switched?"}
     W4 -- no --> W5["delivery walk: socket → have → caller<br/>1 copy per byte"]
     W4 -- yes --> W6["raw write straight to the socket<br/>0 further copies"]
