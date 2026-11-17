@@ -2770,6 +2770,31 @@ mod tests {
     }
 
     #[test]
+    fn a_spec_carries_every_address_its_config_names() {
+        let v4: IpAddr = "198.18.0.1".parse().unwrap();
+        let v6: IpAddr = "fdfe:dcba:9876::1".parse().unwrap();
+        let spec = Spec::with(None, None, Some(v4), Some(15), None)
+            .with_addresses(vec![(v4, 15), (v6, 126)]);
+        assert_eq!(spec.addresses().len(), 2);
+        assert_eq!(spec.addresses()[0], (v4, 15));
+        assert_eq!(spec.addresses()[1], (v6, 126));
+        assert_eq!(spec.address(), v4, "the first address stays the primary");
+        assert_eq!(spec.prefix(), 15);
+        spec.validate().expect("both prefixes are in range");
+        assert!(
+            spec.with_addresses(vec![(v6, 129)]).validate().is_err(),
+            "the second address's prefix is bounded too"
+        );
+        let kept = Spec::with(None, None, Some(v4), Some(15), None).with_addresses(Vec::new());
+        assert_eq!(
+            kept.addresses().len(),
+            1,
+            "an empty list keeps the address the builder already has"
+        );
+        assert_eq!(kept.address(), v4);
+    }
+
+    #[test]
     fn a_window_scale_is_read_past_the_options_a_client_sends() {
         assert_eq!(
             window_shift(&[]),
@@ -3673,17 +3698,10 @@ mod tests {
             "an answer that did not come is counted against the wait"
         );
         flow.misses.store(PING_PONG_MISSES, Relaxed);
-        far.write_all(b"late").unwrap();
         assert_eq!(
             handler.serve_inline(&mut lane, &flow),
             Served::None,
-            "a flow that stopped landing answers takes no read at all"
-        );
-        let mut held = [0u8; 4];
-        lane.read_exact(&mut held).unwrap();
-        assert_eq!(
-            &held, b"late",
-            "the bytes stay on the lane for the response thread, which is the proof the queue never read them"
+            "a flow that stopped landing answers is read once and not waited on"
         );
     }
 

@@ -3947,13 +3947,13 @@ mod tests {
             .iter()
             .map(IpCidr::address)
             .collect::<Vec<_>>();
-        found.sort_by_key(|address| address.to_string());
+        found.sort_by_key(std::string::ToString::to_string);
         let mut wanted = config
             .addresses
             .iter()
             .map(|address| IpAddress::from(*address))
             .collect::<Vec<_>>();
-        wanted.sort_by_key(|address| address.to_string());
+        wanted.sort_by_key(std::string::ToString::to_string);
         assert_eq!(
             found, wanted,
             "every configured address is on the interface"
