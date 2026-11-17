@@ -108,6 +108,9 @@ const BATCH: usize = 4;
 /// The segments one batch hands the kernel: a head and a payload part for each frame.
 const BATCH_PARTS: usize = 2 * BATCH;
 
+/// The empty segment a parts list starts from, overwritten by every frame it holds.
+const NO_PART: &[u8] = &[];
+
 struct Writer {
     out: Box<dyn Write + Send>,
     header: Vec<u8>,
@@ -162,7 +165,7 @@ impl Writer {
 
     fn keep_batch(&mut self, keep: &mux::Outgoing<'_>, batch: &[u8]) -> bool {
         self.heads.clear();
-        let mut payloads: [&[u8]; BATCH] = [&[]; BATCH];
+        let mut payloads: [&[u8]; BATCH] = [NO_PART; BATCH];
         let mut spans = [(0usize, 0usize); BATCH];
         let mut frames = 0usize;
         let mut rest = batch;
@@ -181,7 +184,7 @@ impl Writer {
             }
             rest = tail;
         }
-        let mut parts: [&[u8]; BATCH_PARTS] = [&[]; BATCH_PARTS];
+        let mut parts: [&[u8]; BATCH_PARTS] = [NO_PART; BATCH_PARTS];
         for frame in 0..frames {
             let (start, end) = spans[frame];
             parts[2 * frame] = &self.heads[start..end];
