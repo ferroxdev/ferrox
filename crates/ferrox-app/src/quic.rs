@@ -4238,6 +4238,7 @@ fn leave_session(table: &Arc<Mutex<PooledState>>, id: u64) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection, expect_reply: bool) {
     #[cfg(test)]
     let port = pooled.key.port;

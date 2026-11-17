@@ -3655,7 +3655,7 @@ mod tests {
         assert_eq!(rtcp.flags, FLAG_SYN | FLAG_ACK);
         assert_eq!(rtcp.source_port, 8080);
         assert_eq!(rtcp.destination_port, 44444);
-        assert_eq!(rtcp.seq, 1001);
+        assert_eq!(rtcp.ack_num, 1001);
         assert_eq!(
             rtcp.options,
             [2, 4, 0x05, 0xb4],
@@ -4039,11 +4039,19 @@ mod tests {
             handler.flows.table().get(&key).unwrap().mss.load(Relaxed),
             (DEFAULT_MTU - IPV4_HEADER - 20) as u32
         );
+        let sent = handler
+            .flows
+            .table()
+            .get(&key)
+            .unwrap()
+            .snd_nxt
+            .load(Relaxed)
+            .wrapping_sub(1);
 
         let quoted = build_tcp_packet(
             (endpoint.0, 8080),
             (client.0, 44444),
-            1001,
+            sent,
             1001,
             FLAG_ACK,
             65535,
@@ -4108,11 +4116,19 @@ mod tests {
             handler.flows.table().get(&key).unwrap().mss.load(Relaxed),
             (DEFAULT_MTU - IPV6_HEADER - 20) as u32
         );
+        let sent = handler
+            .flows
+            .table()
+            .get(&key)
+            .unwrap()
+            .snd_nxt
+            .load(Relaxed)
+            .wrapping_sub(1);
 
         let quoted = build_ipv6_tcp_packet(
             (endpoint, 8080),
             (client, 44444),
-            1001,
+            sent,
             1001,
             FLAG_ACK,
             65535,

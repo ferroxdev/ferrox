@@ -1961,9 +1961,16 @@ mod tests {
             closed: false,
             deadline: Deadline::default(),
         };
+        session.request = Some(1);
         session.on(&mut wire, h2::T_SETTINGS, 0, 0, &initial_window(100));
-        session.on(&mut wire, h2::T_WINDOW, 0, 0, &1_000u32.to_be_bytes());
+        session.on(&mut wire, h2::T_WINDOW, 0, 1, &1_000u32.to_be_bytes());
         assert_eq!(session.send_window, 1_100, "the update grants credit");
+        session.on(&mut wire, h2::T_WINDOW, 0, 0, &1_000u32.to_be_bytes());
+        assert_eq!(
+            session.connection_window,
+            DEFAULT_WINDOW + 1_000,
+            "the connection credit is separate"
+        );
         session.on(&mut wire, h2::T_SETTINGS, 0, 0, &initial_window(50));
         assert_eq!(
             session.send_window, 1_050,
