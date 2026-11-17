@@ -2645,6 +2645,7 @@ fn open_stream(
         let mut decoder = conn.decoder.lock().unwrap_or_else(PoisonError::into_inner);
         let (mut method, mut target, mut lines) = (Vec::new(), Vec::new(), Vec::new());
         let (mut have_method, mut have_target) = (false, false);
+        let mut safe = true;
         let ok = decoder
             .decode(block, &mut |name, value| {
                 if name.first() == Some(&b':') {
@@ -2655,6 +2656,11 @@ fn open_stream(
                         have_target = true;
                         target.extend_from_slice(value);
                     }
+                } else if !crate::xhttp_h3::h1_token(name)
+                    || name.contains(&b':')
+                    || !crate::xhttp_h3::h1_safe(value)
+                {
+                    safe = false;
                 } else {
                     lines.extend_from_slice(name);
                     lines.extend_from_slice(b": ");
@@ -2664,7 +2670,13 @@ fn open_stream(
             })
             .is_some();
         drop(decoder);
-        if !ok || !have_method || !have_target {
+        if !ok
+            || !have_method
+            || !have_target
+            || !safe
+            || !crate::xhttp_h3::h1_token(&method)
+            || !crate::xhttp_h3::h1_token(&target)
+        {
             conn.reset_stream(sid);
             return false;
         }

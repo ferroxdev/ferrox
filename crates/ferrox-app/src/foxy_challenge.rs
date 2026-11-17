@@ -91,6 +91,7 @@ const HTML_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9
 
 /// Rounds of post-back before the edge is taken at its word.
 const MAX_ROUNDS: usize = 3;
+const POW_BASE_CAP: usize = 4096;
 /// How many times one account-plane call may be challenged and retried.
 pub(crate) const MAX_ATTEMPTS: usize = 5;
 /// The two characters a proof of work is asked to find, over this alphabet.
@@ -484,10 +485,16 @@ fn parse_init(script: &str) -> Option<(Json, String)> {
     let mut found = None;
     for (at, _) in script.match_indices("init(") {
         let rest = &script[at + "init(".len()..];
-        if let Some((list, tail)) = split_list(rest) {
-            let token = quoted(tail)?;
-            found = Some((json::parse(&list).ok()?, token.to_owned()));
-        }
+        let Some((list, tail)) = split_list(rest) else {
+            continue;
+        };
+        let Some(token) = quoted(tail) else {
+            continue;
+        };
+        let Ok(challenges) = json::parse(&list) else {
+            continue;
+        };
+        found = Some((challenges, token.to_owned()));
     }
     found
 }
@@ -792,6 +799,9 @@ fn fetch_pat(
 
 /// The two characters making `SHA-256(base + pair)` hit the target: one hash and no allocation per pair.
 fn solve_pow(base: &str, target: &str) -> Option<[u8; 2]> {
+    if base.len() > POW_BASE_CAP {
+        return None;
+    }
     let want = ferrox_core::foxy::account::hex_to_bytes(target);
     let want: [u8; 32] = want.as_slice().try_into().ok()?;
     let mut input = Vec::with_capacity(base.len() + 2);
@@ -999,6 +1009,12 @@ mod tests {
         assert_eq!(&found, b"5Z");
         assert_eq!(solve_pow(base, &"00".repeat(32)), None, "no such pair");
         assert_eq!(solve_pow(base, "abcd"), None, "not 32 bytes");
+        let long = "a".repeat(POW_BASE_CAP + 1);
+        assert_eq!(
+            solve_pow(&long, &"00".repeat(32)),
+            None,
+            "an oversized base is refused before any hashing"
+        );
     }
 
     #[test]
@@ -1075,6 +1091,12 @@ mod tests {
         );
         assert!(parse_init("no init here").is_none());
         assert!(parse_init("init(\"not a list\",\"t\",\"x\")").is_none());
+        let trailing = "init([{\"ty\":\"pow\"}],\"good\",\"x\"); init(\"bad\",\"t\",\"y\")";
+        assert_eq!(
+            parse_init(trailing).expect("the earlier call stands").1,
+            "good",
+            "a later malformed call does not discard an earlier valid one"
+        );
     }
 
     #[test]

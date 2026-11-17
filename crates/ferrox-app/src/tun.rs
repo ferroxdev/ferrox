@@ -377,10 +377,8 @@ fn peer_mss(options: &[u8]) -> Option<u32> {
                     return None;
                 }
                 if kind == MSS && len == 4 {
-                    return Some(u32::from(u16::from_be_bytes([
-                        options[at + 2],
-                        options[at + 3],
-                    ])));
+                    let mss = u32::from(u16::from_be_bytes([options[at + 2], options[at + 3]]));
+                    return (mss != 0).then_some(mss);
                 }
                 at = end;
             }
@@ -397,7 +395,7 @@ fn syn_ack_options(mss: u32, scale: bool) -> ([u8; 8], usize) {
     let mut options = [0u8; 8];
     options[0] = 2;
     options[1] = 4;
-    options[2..4].copy_from_slice(&u16::try_from(mss).unwrap_or(u16::MAX).to_be_bytes());
+    options[2..4].copy_from_slice(&u16::try_from(mss.max(1)).unwrap_or(u16::MAX).to_be_bytes());
     if scale {
         options[4..8].copy_from_slice(&[1, 3, 3, OUR_WINDOW_SHIFT]);
     }
@@ -454,6 +452,9 @@ struct IpHead {
 /// Walk an IPv4 or IPv6 packet, including the IPv6 extension headers this handler can skip, and hand back the transport body borrowed from the read buffer.
 fn ip_head(packet: &[u8]) -> Option<(IpHead, &[u8])> {
     if let Some((ip, body)) = ipv4_head(packet) {
+        if packet[6] & 0x3f != 0 || packet[7] != 0 {
+            return None;
+        }
         return Some((
             IpHead {
                 source: IpAddr::V4(Ipv4Addr::from(ip.source)),
@@ -2933,6 +2934,40 @@ mod tests {
     #[test]
     fn tcp_head_refuses_short_segment() {
         assert!(tcp_head(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn an_ipv4_fragment_is_not_a_flow_packet() {
+        let mut pkt = build_tcp_packet(
+            ([10, 0, 0, 2], 12345),
+            ([10, 0, 0, 1], 80),
+            1000,
+            0,
+            FLAG_SYN,
+            65535,
+            &[],
+        );
+        assert!(ip_head(&pkt).is_some());
+        pkt[6] |= 0x20;
+        assert!(ip_head(&pkt).is_none(), "more fragments");
+        pkt[6] &= !0x20;
+        pkt[6] |= 0x1f;
+        assert!(ip_head(&pkt).is_none(), "a high fragment offset");
+        pkt[6] = 0;
+        pkt[7] = 1;
+        assert!(ip_head(&pkt).is_none(), "a low fragment offset");
+    }
+
+    #[test]
+    fn an_mss_option_of_zero_is_absent() {
+        assert_eq!(peer_mss(&[2, 4, 0x05, 0xdc]), Some(1500));
+        assert_eq!(peer_mss(&[2, 4, 0, 0]), None);
+        let (options, _) = syn_ack_options(0, false);
+        assert_ne!(
+            u16::from_be_bytes([options[2], options[3]]),
+            0,
+            "the SYN-ACK never advertises MSS zero"
+        );
     }
 
     #[test]

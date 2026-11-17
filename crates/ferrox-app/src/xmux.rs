@@ -249,19 +249,22 @@ impl Manager {
 
 /// The dialer's own first session: `newXmuxClient` already spent one use when it set the count, so only a reused entry pays here.
 fn hold_dialed(entry: Arc<Entry>) -> Lease {
-    entry.left_requests.fetch_sub(1, Ordering::SeqCst);
+    decrement(&entry.left_requests);
     entry.running.fetch_add(1, Ordering::SeqCst);
     Lease { entry }
 }
 
 fn hold(entry: Arc<Entry>) -> Lease {
-    let left = entry.left_usage.load(Ordering::SeqCst);
-    if left > 0 {
-        entry.left_usage.fetch_sub(1, Ordering::SeqCst);
-    }
-    entry.left_requests.fetch_sub(1, Ordering::SeqCst);
+    decrement(&entry.left_usage);
+    decrement(&entry.left_requests);
     entry.running.fetch_add(1, Ordering::SeqCst);
     Lease { entry }
+}
+
+fn decrement(counter: &AtomicI64) {
+    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+        (left > 0).then_some(left - 1)
+    });
 }
 
 type Managers = HashMap<(Key, Xmux), Arc<Manager>>;

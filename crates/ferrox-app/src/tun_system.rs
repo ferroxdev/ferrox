@@ -434,7 +434,11 @@ fn rewrite_tcp(
 fn nat_peer(address: IpAddr, prefix: u8) -> Option<IpAddr> {
     match address {
         IpAddr::V4(address) => {
-            if prefix > 30 {
+            let local = u32::from(address);
+            if prefix == 31 {
+                return Some(IpAddr::V4(Ipv4Addr::from(local ^ 1)));
+            }
+            if prefix >= 32 {
                 return None;
             }
             let mask = if prefix == 0 {
@@ -442,15 +446,18 @@ fn nat_peer(address: IpAddr, prefix: u8) -> Option<IpAddr> {
             } else {
                 u32::MAX << (32 - u32::from(prefix))
             };
-            let network = u32::from(address) & mask;
-            let local = u32::from(address);
+            let network = local & mask;
             [network + 1, network + 2]
                 .into_iter()
                 .find(|candidate| *candidate != local)
                 .map(|candidate| IpAddr::V4(Ipv4Addr::from(candidate)))
         }
         IpAddr::V6(address) => {
-            if prefix > 126 {
+            let local = u128::from(address);
+            if prefix == 127 {
+                return Some(IpAddr::V6(Ipv6Addr::from(local ^ 1)));
+            }
+            if prefix >= 128 {
                 return None;
             }
             let mask = if prefix == 0 {
@@ -458,8 +465,7 @@ fn nat_peer(address: IpAddr, prefix: u8) -> Option<IpAddr> {
             } else {
                 u128::MAX << (128 - u32::from(prefix))
             };
-            let network = u128::from(address) & mask;
-            let local = u128::from(address);
+            let network = local & mask;
             [network + 1, network + 2]
                 .into_iter()
                 .find(|candidate| *candidate != local)
@@ -1203,7 +1209,15 @@ mod tests {
             nat_peer(Ipv4Addr::new(198, 18, 0, 1).into(), 0),
             Some(Ipv4Addr::new(0, 0, 0, 1).into())
         );
-        assert_eq!(nat_peer(Ipv4Addr::new(198, 18, 0, 1).into(), 31), None);
+        assert_eq!(
+            nat_peer(Ipv4Addr::new(198, 18, 0, 1).into(), 31),
+            Some(Ipv4Addr::new(198, 18, 0, 0).into())
+        );
         assert_eq!(nat_peer(Ipv4Addr::new(198, 18, 0, 1).into(), 32), None);
+        assert_eq!(
+            nat_peer("fdfe:dcba:9876::1".parse().unwrap(), 127),
+            Some("fdfe:dcba:9876::0".parse().unwrap())
+        );
+        assert_eq!(nat_peer("fdfe:dcba:9876::1".parse().unwrap(), 128), None);
     }
 }

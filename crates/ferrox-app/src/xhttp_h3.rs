@@ -661,12 +661,12 @@ fn decode_head(payload: &[u8], expect_request: bool) -> Option<(Option<Vec<u8>>,
 }
 
 /// Whether a field byte can ride an HTTP/1 line: a peer that smuggles `\r\n` through QPACK would write its own headers into the head `accept_core` parses.
-fn h1_safe(bytes: &[u8]) -> bool {
+pub(crate) fn h1_safe(bytes: &[u8]) -> bool {
     !bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
 }
 
 /// Whether a QPACK field can be a request-line token without `accept_core` splitting it on whitespace.
-fn h1_token(bytes: &[u8]) -> bool {
+pub(crate) fn h1_token(bytes: &[u8]) -> bool {
     !bytes.is_empty()
         && bytes
             .iter()
