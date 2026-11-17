@@ -28,6 +28,7 @@ const MAX_CONNECT_ATTEMPT: Duration = Duration::from_secs(2);
 /// candidate; a full QUIC handshake fits in this budget on a slow link.
 const MAX_HANDSHAKE_ATTEMPT: Duration = Duration::from_secs(5);
 const POLL_GROWTH: f64 = 1.5;
+static RELAY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
 
@@ -578,6 +579,12 @@ fn relay(
         .with_limit_buffer_sizes(limit_buffer_sizes);
     let mut buffer = vec![0u8; http.request_limit()];
     let mut interval = POLL;
+    let trace = std::env::var_os("AETHER_PSIPHON_TRACE_FLOWS").is_some();
+    let id = RELAY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut polls = 0u32;
+    if trace {
+        eprintln!("psiphon: relay {id} start");
+    }
     loop {
         local
             .set_read_timeout(Some(interval))
@@ -596,11 +603,22 @@ fn relay(
             Err(error) => return Err(format!("psiphon meek read: {error}")),
         };
         let reply = http.round_trip_to(body, &mut local)?;
+        if trace && (!body.is_empty() || reply > 0) {
+            eprintln!("psiphon: relay {id} in {} out {reply}", body.len());
+        } else if trace {
+            polls = polls.wrapping_add(1);
+            if polls % 100 == 0 {
+                eprintln!("psiphon: relay {id} poll {polls}");
+            }
+        }
         if body.is_empty() && reply == 0 {
             interval = interval.mul_f64(POLL_GROWTH).min(MAX_POLL);
         } else {
             interval = POLL;
         }
+    }
+    if trace {
+        eprintln!("psiphon: relay {id} end");
     }
     Ok(())
 }
