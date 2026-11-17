@@ -206,10 +206,7 @@ impl Driver {
             let mut ready = Vec::with_capacity(16);
             let mut last_sent = 0usize;
             let mut last_at = Instant::now();
-            loop {
-                let Some(pump) = pump.upgrade() else {
-                    break;
-                };
+            while let Some(pump) = pump.upgrade() {
                 if pump.stop.load(Ordering::Relaxed) {
                     break;
                 }
