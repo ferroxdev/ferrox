@@ -1476,9 +1476,10 @@ impl MeekHttp {
             ("Accept", "*/*"),
             ("Connection", "keep-alive"),
         ] {
-            if !headers
-                .iter()
-                .any(|(have, _)| have.eq_ignore_ascii_case(name))
+            if !value.is_empty()
+                && !headers
+                    .iter()
+                    .any(|(have, _)| have.eq_ignore_ascii_case(name))
             {
                 headers.push((name, value));
             }

@@ -67,6 +67,9 @@ impl Reader {
     }
 
     fn read(&mut self, io: &mut impl Read, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
         loop {
             if self.opened {
                 if self.plain_at < self.size.unwrap_or(0) {
@@ -491,6 +494,15 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_zero_length_read_does_not_wait_for_a_salt() {
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut reader = Reader::new(key);
+        let mut input = std::io::Cursor::new(Vec::new());
+        let mut out = [0u8; 0];
+        assert_eq!(reader.read(&mut input, &mut out).expect("read"), 0);
     }
 
     #[test]

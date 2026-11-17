@@ -1810,16 +1810,16 @@ impl Engine {
                 }
             }
         } else if self.crypto_pending(space) {
-            let data = &self.crypto_send[space][self.crypto_sent[space]..];
-            let len = data
-                .len()
+            let start = self.crypto_sent[space];
+            let len = (self.crypto_send[space].len() - start)
                 .min(self.max_payload_room(space, payload.len() - head));
             if len > 0 {
-                let offset = self.crypto_sent[space] as u64;
+                let offset = start as u64;
                 payload.push(0x06);
                 put_varint(&mut payload, offset);
                 put_varint(&mut payload, len as u64);
-                payload.extend_from_slice(&data[..len]);
+                payload.extend_from_slice(&self.crypto_send[space][start..start + len]);
+                self.crypto_sent[space] += len;
                 crypto_frame = Some((offset, len as u64));
                 ack_eliciting = true;
             }
@@ -3595,6 +3595,36 @@ mod tests {
             engine.stream_sent > 0,
             "the stream did not follow the probe"
         );
+    }
+
+    #[test]
+    fn a_crypto_frame_advances_its_send_cursor() {
+        let mut engine = test_engine();
+        engine.crypto_send[INITIAL] = vec![0xab; 3000];
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("timeout");
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
+        socket
+            .connect(receiver.local_addr().expect("receiver address"))
+            .expect("connect");
+        let mut udp = Udp::Plain(PacketIo::Socket(socket));
+        assert!(engine
+            .send_space(INITIAL, &mut udp, Instant::now())
+            .expect("first crypto frame"));
+        let first = engine.crypto_sent[INITIAL];
+        assert!(first > 0, "the first crypto frame sent nothing");
+        assert!(engine
+            .send_space(INITIAL, &mut udp, Instant::now())
+            .expect("second crypto frame"));
+        assert!(
+            engine.crypto_sent[INITIAL] > first,
+            "the crypto cursor did not advance, so a multi-packet handshake stalls"
+        );
+        let mut datagram = [0u8; MAX_PACKET_SIZE + 64];
+        assert!(receiver.recv(&mut datagram).is_ok());
+        assert!(receiver.recv(&mut datagram).is_ok());
     }
 
     #[test]

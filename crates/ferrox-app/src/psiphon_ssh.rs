@@ -5413,6 +5413,24 @@ mod tests {
     }
 
     #[test]
+    fn a_packet_tunnel_channel_uses_its_own_adjust_threshold() {
+        let payloads = [vec![0u8; 8192], vec![0u8; 8192]];
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let mut channel = test_channel_with_chunks(&refs);
+        Arc::get_mut(&mut channel.state)
+            .expect("unique channel state")
+            .window = 32 * 1024;
+        let (_, first) = channel.take_chunk();
+        assert_eq!(first, 0);
+        let (_, second) = channel.take_chunk();
+        assert_eq!(
+            second,
+            16 * 1024,
+            "the adjust threshold followed the session window, not the channel's"
+        );
+    }
+
+    #[test]
     fn rc4_matches_the_known_vector() {
         let mut rc4 = Rc4::new(b"Key");
         let mut data = *b"Plaintext";

@@ -225,10 +225,17 @@ impl Write for FragmentStream {
         if state.fragmented >= usize::try_from(state.bytes_to_fragment).unwrap_or(usize::MAX) {
             return self.socket.write(buffer);
         }
+        let target = usize::try_from(state.bytes_to_fragment).unwrap_or(usize::MAX);
         let mut written = 0;
         while written < buffer.len() {
+            let remaining = target.saturating_sub(state.fragmented);
+            if remaining == 0 {
+                break;
+            }
             std::thread::sleep(self.config.delay());
-            let size = self.config.write_size(buffer.len() - written);
+            let size = self
+                .config
+                .write_size((buffer.len() - written).min(remaining));
             let end = written + size;
             match self.socket.write(&buffer[written..end]) {
                 Ok(0) => {
@@ -245,7 +252,6 @@ impl Write for FragmentStream {
                 Err(_) if written > 0 => return Ok(written),
                 Err(error) => return Err(error),
             }
-            let target = usize::try_from(state.bytes_to_fragment).unwrap_or(usize::MAX);
             if state.fragmented >= target {
                 break;
             }
@@ -573,6 +579,30 @@ mod tests {
             true,
         );
         assert_eq!(config.plan(), 0);
+    }
+
+    #[test]
+    /// A fragment never overshoots the planned total.
+    fn a_fragment_never_overshoots_the_plan() {
+        let config = Fragmentor::new(
+            1.0,
+            Vec::new(),
+            16,
+            16,
+            64,
+            64,
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+        );
+        let (client, _server) = pair();
+        let mut stream = FragmentStream::new(client, config);
+        stream.write_all(&[0u8; 200]).expect("write");
+        let state = stream.state.lock().expect("state");
+        assert_eq!(
+            state.fragmented, 16,
+            "the first write ran past the planned fragment"
+        );
     }
 
     /// A minimal `ClientHello`, with one SNI name when asked.

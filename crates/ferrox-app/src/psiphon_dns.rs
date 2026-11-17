@@ -724,6 +724,9 @@ impl Config {
             return;
         }
         let ttl = ttl.saturating_add(self.cache_extension);
+        if ttl.is_zero() {
+            return;
+        }
         let Ok(mut cache) = self.cache.lock() else {
             return;
         };
@@ -737,7 +740,7 @@ impl Config {
             host.to_owned(),
             CacheEntry {
                 addresses,
-                expires: Instant::now() + ttl.max(Duration::from_secs(1)),
+                expires: Instant::now() + ttl,
             },
         );
     }
@@ -1537,6 +1540,17 @@ mod tests {
         responder.join().expect("responder");
         let second = resolve_with(&config, "psiphon.test", 443).expect("cached");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_zero_ttl_answer_is_not_cached() {
+        let config = Config::from_servers(&[]);
+        config.cache_put(
+            "psiphon.test",
+            vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))],
+            std::time::Duration::ZERO,
+        );
+        assert!(config.cache_addrs("psiphon.test", 443).is_none());
     }
 
     #[test]

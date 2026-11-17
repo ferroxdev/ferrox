@@ -328,9 +328,9 @@ impl WebRtc {
     }
 
     fn send_media(&mut self, data: &[u8]) -> Result<(), String> {
-        if data.len() > MEDIA_MAX_RTP_PAYLOAD {
+        if data.len() > MEDIA_MAX_RTP_PAYLOAD - 1 {
             return Err(format!(
-                "psiphon webrtc media write too large: {} > {MEDIA_MAX_RTP_PAYLOAD}",
+                "psiphon webrtc media write too large: {} + 1 header > {MEDIA_MAX_RTP_PAYLOAD}",
                 data.len()
             ));
         }
@@ -2177,6 +2177,16 @@ mod tests {
         assert_eq!(&byte, b"B");
         assert!(stream.read(&mut byte).is_err());
         drop(input_tx);
+    }
+
+    #[test]
+    fn a_framed_media_packet_fits_the_maximum() {
+        let mut shaping = Shaping::new(TrafficShapingParameters::media_default(), [0u8; 32]);
+        let payload = vec![0u8; MEDIA_MAX_RTP_PAYLOAD - 1];
+        assert_eq!(
+            shaping.frame_media(&payload, MEDIA_MAX_RTP_PAYLOAD).len(),
+            MEDIA_MAX_RTP_PAYLOAD
+        );
     }
 
     #[test]
