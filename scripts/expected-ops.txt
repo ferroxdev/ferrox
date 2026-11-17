@@ -331,13 +331,14 @@ ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 47810192 psiphon_s
 ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_costs_one_walk
 # The merged hello: 256 fixed 300-octet hellos cut at widths 11 and 37 through
 # one stage with a single zero delay, over a sink that takes a whole gathered
-# write and keeps nothing. 317726 is 1241.1 per turn; the two widths and the
+# write and keeps nothing. 346140 is 1352.1 per turn; the two widths and the
 # zero delay never draw, so the probe prices the cuts and the 32-record gather.
 # The record bytes are the same as the merge-copy path this replaced.
-# Re-blessed from 323610 by the KCP sockopt and ack-batch tests on main df177ae:
-# the added code moved this test binary's thin-LTO layout; finalmask.rs is
-# untouched. ops.yml run 43989485702.
-ferrox_core::finalmask::tests::merged_hello_probe 317726 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
+# Re-blessed from 317726 by main's finalmask range fix (aa2db45) and xmc write
+# and length contracts (7678f98): the zero delay still selects the low bound and
+# the cuts are unchanged, while the widened span and the added code moved this
+# test binary's thin-LTO layout. ops.yml run 44009241010.
+ferrox_core::finalmask::tests::merged_hello_probe 346140 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
 # The client request built by `request`: one address type byte, the address and
 # the port, written in one match with the vector's room reserved exactly once,
 # through `spare_capacity_mut` and one `copy_nonoverlapping` per field so no
@@ -363,11 +364,13 @@ ferrox_core::socks::request 889 socks::tests::the_client_writes_the_bytes_the_pi
 ferrox_core::vless_encryption::tests::sealed_write_probe 50874900 vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
 # The mux decode probe: 4096 decodes of one fixed New/domain frame, so the row
 # prices the frame walk and nothing else. The probe branch built from origin/main
-# read 634880 (155 a call); splitting the frame once, fusing the status with the
-# target question, and taking the target walk from the head's own remainder reads
-# 618496 (151 a call). Every status, option and target shape is held by the
-# decoder's own sweep, so the bytes do not move.
-ferrox_core::mux::decode 618496 mux::tests::the_decode_probe_costs_the_frame_walk_and_nothing_else
+# read 634880 (155 a call); splitting the frame once and fusing the status with
+# the target question read 618496 (151 a call). Main's mux identity fix (aa2db45)
+# then let `decode` ask the target alone for the UDP identity instead of also
+# requiring DATA, reading 610304 (149 a call). Every status, option and target
+# shape is held by the decoder's own sweep, so the bytes do not move.
+# Re-blessed by that fix in ops.yml run 44009241010.
+ferrox_core::mux::decode 610304 mux::tests::the_decode_probe_costs_the_frame_walk_and_nothing_else
 # The two encode probes landed with the decode change, so these rows are the
 # code they found, not a before/after pair: the first attempt to fuse the fixed
 # head and skip `clear`/`reserve` measured 884736 and 409600, 2 and 4 Ir a call

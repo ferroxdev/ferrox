@@ -171,7 +171,7 @@ xtls-vision shared-state-acquisitions-per-steady-framed-write 1 ferrox-app-visio
 xtls-vision shared-state-acquisitions-per-spent-direct-read 0 ferrox-app-vision::tests::a_spent_direct_read_takes_no_shared_state
 
 # --- Mux.Cool ---------------------------------------------------------------
-mux-cool ops-retired-instructions 618496 scripts/count-ops.sh
+mux-cool ops-retired-instructions 610304 scripts/count-ops.sh
 mux-cool seconds-per-framed-megabyte UNBLESSED CI parity.yml
 mux-cool frame-encode-ops-retired-instructions 876544 scripts/count-ops.sh
 mux-cool header-encode-ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -823,7 +823,7 @@ finalmask sudoku-entropy-getrandoms 512 ferrox-core-finalmask-sudoku::tests::the
 finalmask sudoku-encoder-capacity-growth 0 ferrox-core-finalmask-sudoku::tests::the_encoder_buffer_holds_its_capacity
 finalmask sudoku-pure-octets-per-plaintext-octet 4 ferrox-core-finalmask-sudoku::tests::the_wire_ratio_is_the_reference_shape
 finalmask sudoku-packed-octets-per-three-octets 4 ferrox-core-finalmask-sudoku::tests::the_wire_ratio_is_the_reference_shape
-finalmask ops-retired-instructions 317726 scripts/count-ops.sh
+finalmask ops-retired-instructions 346140 scripts/count-ops.sh
 finalmask pieces-restaged-per-hello 0 ferrox-core-finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies
 finalmask filter-verdicts-from-one-list 5 ferrox-app-config::tests::a_finalmask_filter_reads_both_lists
 finalmask merged-pieces-restaged-per-hello 0 ferrox-core-finalmask::tests::a_merged_run_gathers_the_callers_body_without_restaging_it
