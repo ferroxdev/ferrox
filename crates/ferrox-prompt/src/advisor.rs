@@ -620,11 +620,11 @@ run it
             ready.iter().map(|prompt| prompt.id).collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert_eq!(skipped, []);
+        assert_eq!(skipped, Vec::<Skipped>::new());
         // And with `--allow-unfilled` it was never skipped at all.
         let (ready, skipped) = handable(&library, None, &[], &[], &BTreeMap::new(), true);
         assert_eq!(ready.len(), 2);
-        assert_eq!(skipped, []);
+        assert_eq!(skipped, Vec::<Skipped>::new());
     }
 
     #[test]
@@ -655,10 +655,10 @@ run {core}
         let supplied = BTreeMap::from([("core".to_owned(), "x".to_owned())]);
         let (ready, skipped) = handable(&library, None, &[], &[], &supplied, false);
         assert_eq!(ready.len(), 1);
-        assert_eq!(skipped, []);
+        assert_eq!(skipped, Vec::<Skipped>::new());
         let (ready, skipped) =
             handable(&library, None, &[], &["extra".to_owned()], &supplied, false);
-        assert_eq!(ready, []);
+        assert_eq!(ready, Vec::<&Prompt>::new());
         assert_eq!(skipped[0].missing, vec!["extra".to_owned()]);
     }
 
