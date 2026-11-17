@@ -242,7 +242,7 @@ fn the_advisor_always_has_a_justified_answer() {
     let empty = Ledger::load(root.join(".ferrox/does-not-exist.log"));
     assert_eq!(empty.entries, []);
 
-    let (handable, skipped) = advisor::handable(&library, None, &[], &BTreeMap::new(), false);
+    let (handable, skipped) = advisor::handable(&library, None, &[], &[], &BTreeMap::new(), false);
     let ranked = advisor::ranked(&library, None);
     assert_eq!(
         handable.len() + skipped.len(),
@@ -284,14 +284,14 @@ fn the_advisor_always_has_a_justified_answer() {
         );
     }
     // And the pick is reproducible.
-    let (again, _) = advisor::handable(&library, None, &[], &BTreeMap::new(), false);
+    let (again, _) = advisor::handable(&library, None, &[], &[], &BTreeMap::new(), false);
     assert_eq!(again[0].id, top.id);
 }
 
 #[test]
 fn a_prompt_with_a_required_input_is_only_offered_when_it_is_filled() {
     let library = library();
-    let (_, skipped) = advisor::handable(&library, None, &[], &BTreeMap::new(), false);
+    let (_, skipped) = advisor::handable(&library, None, &[], &[], &BTreeMap::new(), false);
     for slice in &skipped {
         let prompt = library
             .prompt(slice.id)

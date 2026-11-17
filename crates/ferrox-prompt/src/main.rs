@@ -858,12 +858,8 @@ fn missing_input_refusal(
 
 /// `next`: fills a matrix template from its first unserved row, so repeat runs walk the matrix; `--set` still wins.
 fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
-    let _lock = match lock_state(&Ledger::path_for(root)) {
-        Ok(lock) => lock,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::from(1);
-        }
+    let Ok(_lock) = lock_state(&Ledger::path_for(root)) else {
+        return ExitCode::from(1);
     };
     let ledger = load_ledger(root);
     let state = ProjectState::load(root);
@@ -1122,12 +1118,8 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         eprintln!("{}", unknown_prompt(library, id));
         return ExitCode::from(2);
     };
-    let _lock = match lock_state(&Ledger::path_for(root)) {
-        Ok(lock) => lock,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::from(1);
-        }
+    let Ok(_lock) = lock_state(&Ledger::path_for(root)) else {
+        return ExitCode::from(1);
     };
     let ledger = load_ledger(root);
     let state = ProjectState::load(root);
@@ -1394,16 +1386,12 @@ fn load_ledger(root: &Path) -> Ledger {
 fn run_set_status(args: &Args, library: &Library) -> ExitCode {
     let id = args.id.expect("parse requires an id for set-status");
     let to = args.set_to.expect("parse requires a status for set-status");
-    let Some(prompt) = library.prompt(id) else {
+    if library.prompt(id).is_none() {
         eprintln!("{}", unknown_prompt(library, id));
         return ExitCode::from(2);
-    };
-    let _lock = match lock_state(&library.source_path) {
-        Ok(lock) => lock,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::from(1);
-        }
+    }
+    let Ok(_lock) = lock_state(&library.source_path) else {
+        return ExitCode::from(1);
     };
     let current = match std::fs::read_to_string(&library.source_path) {
         Ok(text) => text,
@@ -1910,17 +1898,19 @@ fn lock_state(path: &Path) -> Result<std::fs::File, String> {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     let lock = std::env::temp_dir().join(format!("ferrox-prompt-{hash:016x}.lock"));
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(&lock)
         .map_err(|error| {
-            format!(
+            let message = format!(
                 "could not lock {}: {error}; nothing was written",
                 lock.display()
-            )
+            );
+            eprintln!("{message}");
+            message
         })?;
     for _ in 0..200 {
         match file.try_lock() {
@@ -1929,17 +1919,21 @@ fn lock_state(path: &Path) -> Result<std::fs::File, String> {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(std::fs::TryLockError::Error(error)) => {
-                return Err(format!(
+                let message = format!(
                     "could not lock {}: {error}; nothing was written",
                     lock.display()
-                ));
+                );
+                eprintln!("{message}");
+                return Err(message);
             }
         }
     }
-    Err(format!(
+    let message = format!(
         "timed out waiting for {}; nothing was written",
         lock.display()
-    ))
+    );
+    eprintln!("{message}");
+    Err(message)
 }
 
 /// Replace a file by a same-directory rename, so a reader sees the old text or the new one, never
