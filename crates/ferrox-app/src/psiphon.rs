@@ -2495,7 +2495,7 @@ fn packet_tunnel_once(
                 reader_lane,
             )
         });
-        let outcome = packet_tunnel_upstream(device, &mut upstream, dns, &failed, lane, shutdown);
+        let outcome = packet_tunnel_upstream(device, &mut upstream, dns, &failed, shutdown);
         stop.store(true, Ordering::Release);
         close.close();
         let read = handle
@@ -2512,7 +2512,6 @@ fn packet_tunnel_upstream(
     channel: &mut crate::psiphon_ssh::Channel,
     dns: crate::psiphon_packet_tunnel::Dns,
     failed: &AtomicBool,
-    lane: &Weak<Inner>,
     shutdown: &AtomicBool,
 ) -> Result<(), String> {
     let fd = device.raw_fd();

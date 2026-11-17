@@ -3215,9 +3215,9 @@ mod tests {
         assert_eq!(engine.bytes_in_flight, 300);
         assert_eq!(engine.sent.len(), 1);
         assert_eq!(engine.sent[0].space, HANDSHAKE);
-        assert!(engine.crypto_send[INITIAL].is_empty());
-        assert!(engine.crypto_recv[INITIAL].is_empty());
-        assert!(engine.ack_seen[INITIAL].is_empty());
+        assert_eq!(engine.crypto_send[INITIAL].len(), 0);
+        assert_eq!(engine.crypto_recv[INITIAL].len(), 0);
+        assert_eq!(engine.ack_seen[INITIAL].len(), 0);
         assert!(!engine.ack_pending[INITIAL]);
     }
 

@@ -478,7 +478,9 @@ mod tests {
                 .entries
                 .get_mut("example.test")
                 .expect("entry")
-                .created = Instant::now() - Duration::from_secs(1);
+                .created = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("clock");
         }
         let replay = cache.begin(&entry, 7);
         assert!(replay.is_replay());
