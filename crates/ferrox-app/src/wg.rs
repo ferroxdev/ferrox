@@ -2955,6 +2955,11 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn a_name_races_every_routed_answer_before_the_flow() {
+        if !crate::conn::in_a_quiet_process(
+            "wg::tests::a_name_races_every_routed_answer_before_the_flow",
+        ) {
+            return;
+        }
         let dns = UdpSocket::bind("127.0.0.1:0").expect("dns");
         let dns_address = dns.local_addr().expect("dns address");
         let (answered, answer) = mpsc::channel();
