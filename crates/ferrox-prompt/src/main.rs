@@ -858,7 +858,13 @@ fn missing_input_refusal(
 
 /// `next`: fills a matrix template from its first unserved row, so repeat runs walk the matrix; `--set` still wins.
 fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
-    let _lock = lock_state(&Ledger::path_for(root));
+    let _lock = match lock_state(&Ledger::path_for(root)) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
     let ledger = load_ledger(root);
     let state = ProjectState::load(root);
 
@@ -996,6 +1002,7 @@ fn choose_slice<'p>(
         library,
         args.effort,
         suppressed,
+        &args.addons,
         supplied,
         args.allow_unfilled,
     );
@@ -1114,6 +1121,13 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
     let Some(prompt) = library.prompt(id) else {
         eprintln!("{}", unknown_prompt(library, id));
         return ExitCode::from(2);
+    };
+    let _lock = match lock_state(&Ledger::path_for(root)) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
     };
     let ledger = load_ledger(root);
     let state = ProjectState::load(root);
@@ -1384,11 +1398,13 @@ fn run_set_status(args: &Args, library: &Library) -> ExitCode {
         eprintln!("{}", unknown_prompt(library, id));
         return ExitCode::from(2);
     };
-    if prompt.status == to {
-        println!("P{id} is already {}", to.as_str());
-        return ExitCode::SUCCESS;
-    }
-    let _lock = lock_state(&library.source_path);
+    let _lock = match lock_state(&library.source_path) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
     let current = match std::fs::read_to_string(&library.source_path) {
         Ok(text) => text,
         Err(error) => {
@@ -1396,6 +1412,17 @@ fn run_set_status(args: &Args, library: &Library) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let current_prompt = Library::parse(&library.source_path, &current)
+        .prompt(id)
+        .cloned();
+    let Some(current_prompt) = current_prompt else {
+        eprintln!("{}", unknown_prompt(library, id));
+        return ExitCode::from(2);
+    };
+    if current_prompt.status == to {
+        println!("P{id} is already {}", to.as_str());
+        return ExitCode::SUCCESS;
+    }
     match set_status_text(&current, id, to) {
         Ok(updated) => {
             if let Err(error) = replace_file(&library.source_path, &updated) {
@@ -1407,13 +1434,17 @@ fn run_set_status(args: &Args, library: &Library) -> ExitCode {
                     "{}",
                     Value::object([
                         ("id", Value::text(id.to_string())),
-                        ("from", Value::text(prompt.status.as_str())),
+                        ("from", Value::text(current_prompt.status.as_str())),
                         ("to", Value::text(to.as_str())),
                     ])
                     .to_pretty()
                 );
             } else {
-                println!("P{id}: {} -> {}", prompt.status.as_str(), to.as_str());
+                println!(
+                    "P{id}: {} -> {}",
+                    current_prompt.status.as_str(),
+                    to.as_str()
+                );
             }
             ExitCode::SUCCESS
         }
@@ -1871,26 +1902,42 @@ fn deliver(rendered: &Rendered, library: &Library, id: u32, print: bool) {
 
 /// Serialise writers to one state file, so two `next` runs cannot hand out the same row or a
 /// `set-status` cannot overwrite an update it read before the lock.
-fn lock_state(path: &Path) -> Option<std::fs::File> {
+fn lock_state(path: &Path) -> Result<std::fs::File, String> {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in path.as_os_str().to_string_lossy().as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     let lock = std::env::temp_dir().join(format!("ferrox-prompt-{hash:016x}.lock"));
-    let opened = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&lock);
-    match opened.and_then(|file| file.lock().map(|()| file)) {
-        Ok(file) => Some(file),
-        Err(error) => {
-            eprintln!("warning: could not lock {}: {error}", lock.display());
-            None
+        .open(&lock)
+        .map_err(|error| {
+            format!(
+                "could not lock {}: {error}; nothing was written",
+                lock.display()
+            )
+        })?;
+    for _ in 0..200 {
+        match file.try_lock() {
+            Ok(true) => return Ok(file),
+            Ok(false) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(error) => {
+                return Err(format!(
+                    "could not lock {}: {error}; nothing was written",
+                    lock.display()
+                ));
+            }
         }
     }
+    Err(format!(
+        "timed out waiting for {}; nothing was written",
+        lock.display()
+    ))
 }
 
 /// Replace a file by a same-directory rename, so a reader sees the old text or the new one, never
@@ -1898,21 +1945,42 @@ fn lock_state(path: &Path) -> Option<std::fs::File> {
 fn replace_file(path: &Path, contents: &str) -> std::io::Result<()> {
     let temp = path.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::write(&temp, contents)?;
-    match std::fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        #[cfg(windows)]
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            std::fs::remove_file(path)?;
-            std::fs::rename(&temp, path)
+    #[cfg(not(windows))]
+    {
+        match std::fs::rename(&temp, path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp);
+                Err(error)
+            }
         }
-        Err(error) => {
+    }
+    #[cfg(windows)]
+    {
+        if !path.exists() {
+            return match std::fs::rename(&temp, path) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let _ = std::fs::remove_file(&temp);
+                    Err(error)
+                }
+            };
+        }
+        let backup = path.with_extension(format!("bak-{}", std::process::id()));
+        if let Err(error) = std::fs::rename(path, &backup) {
             let _ = std::fs::remove_file(&temp);
-            Err(error)
+            return Err(error);
+        }
+        match std::fs::rename(&temp, path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&backup);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = std::fs::rename(&backup, path);
+                let _ = std::fs::remove_file(&temp);
+                Err(error)
+            }
         }
     }
 }

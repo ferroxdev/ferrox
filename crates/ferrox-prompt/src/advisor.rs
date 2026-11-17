@@ -119,6 +119,7 @@ pub fn handable<'a>(
     library: &'a Library,
     effort: Option<Effort>,
     exclude: &[u32],
+    requested_addons: &[String],
     supplied: &BTreeMap<String, String>,
     allow_unfilled: bool,
 ) -> (Vec<&'a Prompt>, Vec<Skipped>) {
@@ -130,8 +131,13 @@ pub fn handable<'a>(
             continue;
         }
         if !allow_unfilled {
-            let missing: Vec<String> = prompt
-                .required_inputs()
+            let selected = crate::render::resolve_addons(prompt, requested_addons);
+            let inputs: Vec<&str> = match &selected {
+                Ok(addons) => prompt.required_inputs_for(addons).collect(),
+                Err(_) => prompt.required_inputs().collect(),
+            };
+            let missing: Vec<String> = inputs
+                .into_iter()
                 .filter(|name| !supplied.contains_key(*name))
                 .map(str::to_owned)
                 .collect();
@@ -292,14 +298,18 @@ impl Ledger {
                 Some((how, target)) => (how, Some(target.to_owned())),
                 None => (rest, None),
             };
-            match id.trim_start_matches(['P', 'p']).parse::<u32>() {
-                Ok(id) => ledger.entries.push(Entry {
+            let parsed = id
+                .strip_prefix('P')
+                .or_else(|| id.strip_prefix('p'))
+                .and_then(|rest| rest.parse::<u32>().ok());
+            match parsed {
+                Some(id) => ledger.entries.push(Entry {
                     at: at.to_owned(),
                     id,
                     how: how.to_owned(),
                     target,
                 }),
-                Err(_) => ledger.skipped += 1,
+                None => ledger.skipped += 1,
             }
         }
         ledger
@@ -591,7 +601,7 @@ run it
 ```
 ",
         );
-        let (ready, skipped) = handable(&library, None, &[], &BTreeMap::new(), false);
+        let (ready, skipped) = handable(&library, None, &[], &[], &BTreeMap::new(), false);
         assert_eq!(
             ready.iter().map(|prompt| prompt.id).collect::<Vec<_>>(),
             vec![2]
@@ -605,16 +615,51 @@ run it
         );
         // With the value supplied it becomes the top pick again.
         let supplied = BTreeMap::from([("scope".to_owned(), "crates/**".to_owned())]);
-        let (ready, skipped) = handable(&library, None, &[], &supplied, false);
+        let (ready, skipped) = handable(&library, None, &[], &[], &supplied, false);
         assert_eq!(
             ready.iter().map(|prompt| prompt.id).collect::<Vec<_>>(),
             vec![1, 2]
         );
         assert_eq!(skipped, []);
         // And with `--allow-unfilled` it was never skipped at all.
-        let (ready, skipped) = handable(&library, None, &[], &BTreeMap::new(), true);
+        let (ready, skipped) = handable(&library, None, &[], &[], &BTreeMap::new(), true);
         assert_eq!(ready.len(), 2);
         assert_eq!(skipped, []);
+    }
+
+    #[test]
+    fn an_unselected_addon_does_not_gate_readiness() {
+        let library = load(
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · Add-on work
+
+**When to use:** now
+**Status:** todo
+**Leverage:** 5
+**Effort:** small
+**Gates:** `cargo test`
+
+```text
+run {core}
+```
+
+**Add-on — Extra:** needs {extra}
+",
+        );
+        let supplied = BTreeMap::from([("core".to_owned(), "x".to_owned())]);
+        let (ready, skipped) = handable(&library, None, &[], &[], &supplied, false);
+        assert_eq!(ready.len(), 1);
+        assert!(skipped.is_empty());
+        let (ready, skipped) =
+            handable(&library, None, &[], &["extra".to_owned()], &supplied, false);
+        assert!(ready.is_empty());
+        assert_eq!(skipped[0].missing, vec!["extra".to_owned()]);
     }
 
     #[test]
@@ -654,7 +699,7 @@ b
 ```
 ",
         );
-        let (ready, _) = handable(&library, None, &[], &BTreeMap::new(), false);
+        let (ready, _) = handable(&library, None, &[], &[], &BTreeMap::new(), false);
         for seed in 0..30 {
             assert_eq!(rotate_among(&ready, seed).unwrap().id, 2);
         }

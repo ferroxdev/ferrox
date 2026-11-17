@@ -65,6 +65,7 @@ pub fn arm(paths: &Paths, list: &str, ports: Ports) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
+        let _lock = lock(paths)?;
         win::arm(paths, routes.socks, routes.http)
     }
     #[cfg(not(windows))]
@@ -86,30 +87,82 @@ fn owned(paths: &Paths) -> Result<bool, String> {
             ));
         }
     };
-    let owner = serde_json::from_str::<String>(&text).unwrap_or(text);
-    Ok(same_root(&owner, paths))
+    Ok(same_owner(&text, paths))
 }
 
-fn same_root(owner: &str, paths: &Paths) -> bool {
-    let root = paths.conf_dir.to_string_lossy();
+fn same_path(owner: &str, path: &std::path::Path) -> bool {
+    let path = path.to_string_lossy();
     if cfg!(windows) {
-        owner.eq_ignore_ascii_case(&root)
+        owner.eq_ignore_ascii_case(&path)
     } else {
-        owner == root
+        owner == path
     }
+}
+
+fn owner_text(paths: &Paths) -> String {
+    serde_json::json!({
+        "conf_dir": paths.conf_dir.to_string_lossy(),
+        "proxy_state": paths.proxy_state.to_string_lossy(),
+    })
+    .to_string()
+}
+
+fn same_owner(text: &str, paths: &Paths) -> bool {
+    if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(text) {
+        let conf = fields.get("conf_dir").and_then(serde_json::Value::as_str);
+        let state = fields
+            .get("proxy_state")
+            .and_then(serde_json::Value::as_str);
+        return conf.is_some_and(|conf| same_path(conf, &paths.conf_dir))
+            && state.is_some_and(|state| same_path(state, &paths.proxy_state));
+    }
+    let owner = serde_json::from_str::<String>(text).unwrap_or_else(|_| text.to_owned());
+    if same_path(&owner, &paths.proxy_state) {
+        return true;
+    }
+    same_path(&owner, &paths.conf_dir)
+        && paths
+            .proxy_state
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new("system-proxy.state"))
+}
+
+#[cfg(windows)]
+fn lock(paths: &Paths) -> Result<std::fs::File, String> {
+    let path = paths.state_dir.join("system-proxy.lock");
+    std::fs::create_dir_all(&paths.state_dir).map_err(|error| {
+        format!(
+            "system proxy: cannot create {}: {error}",
+            paths.state_dir.display()
+        )
+    })?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| format!("system proxy: cannot open {}: {error}", path.display()))?;
+    file.lock()
+        .map_err(|error| format!("system proxy: cannot lock {}: {error}", path.display()))?;
+    Ok(file)
 }
 
 #[allow(clippy::unnecessary_wraps)] // Windows restores the registry and can fail; the other targets only remove files.
 pub fn clear(paths: &Paths) -> Result<(), String> {
-    if !owned(paths)? {
-        return Ok(());
-    }
     #[cfg(windows)]
     {
+        let _lock = lock(paths)?;
+        if !owned(paths)? {
+            return Ok(());
+        }
         win::clear(paths)
     }
     #[cfg(not(windows))]
     {
+        if !owned(paths)? {
+            return Ok(());
+        }
         let _ = std::fs::remove_file(&paths.proxy_ports);
         let _ = std::fs::remove_file(&paths.proxy_state);
         let _ = std::fs::remove_file(&paths.proxy_owner);
@@ -411,7 +464,7 @@ mod win {
                 return Err(format!("system proxy: cannot record the snapshot: {error}"));
             }
         }
-        let owner = json!(paths.conf_dir.to_string_lossy()).to_string();
+        let owner = super::owner_text(paths);
         if let Err(error) = write_private(&paths.proxy_owner, &owner) {
             close(key);
             if fresh {
@@ -511,11 +564,7 @@ mod tests {
         let second = Paths::with_dirs(shared.join("second"), shared.clone(), None);
         std::fs::create_dir_all(&shared).expect("state");
         std::fs::write(&first.proxy_state, "{}").expect("snapshot");
-        crate::paths::write_private(
-            &first.proxy_owner,
-            &serde_json::to_string(&first.conf_dir).expect("owner"),
-        )
-        .expect("owner file");
+        crate::paths::write_private(&first.proxy_owner, &owner_text(&first)).expect("owner file");
         assert_eq!(owned(&first), Ok(true));
         assert_eq!(owned(&second), Ok(false));
         let _ = std::fs::remove_dir_all(&shared);
@@ -529,6 +578,36 @@ mod tests {
         crate::paths::write_private(&paths.proxy_owner, &paths.conf_dir.to_string_lossy())
             .expect("owner file");
         assert_eq!(owned(&paths), Ok(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_snapshot_owner_still_reads() {
+        let dir = workspace("legacy-snapshot");
+        let paths = Paths::with_dirs(dir.join("conf"), dir.join("state"), None);
+        std::fs::create_dir_all(&paths.state_dir).expect("state");
+        crate::paths::write_private(
+            &paths.proxy_owner,
+            &serde_json::to_string(&paths.proxy_state).expect("owner"),
+        )
+        .expect("owner file");
+        assert_eq!(owned(&paths), Ok(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_root_owner_does_not_authorize_a_named_lane() {
+        let dir = workspace("legacy-root-named");
+        let default = Paths::with_dirs(dir.join("conf"), dir.join("state"), None);
+        let named = Paths::with_dirs(dir.join("conf"), dir.join("state"), Some("work"));
+        std::fs::create_dir_all(&default.state_dir).expect("state");
+        crate::paths::write_private(
+            &default.proxy_owner,
+            &serde_json::to_string(&default.conf_dir).expect("owner"),
+        )
+        .expect("owner file");
+        assert_eq!(owned(&default), Ok(true));
+        assert_eq!(owned(&named), Ok(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

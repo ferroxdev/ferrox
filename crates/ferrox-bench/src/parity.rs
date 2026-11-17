@@ -2095,6 +2095,12 @@ fn read_connect_reply(stream: &mut TcpStream, target: SocketAddr) -> Result<(), 
             head[1]
         ));
     }
+    if head[2] != 0 {
+        return Err(format!(
+            "the socks connect reply has reserved byte {}, not 0; the sink is at {target}",
+            head[2]
+        ));
+    }
     match head[3] {
         1 => {
             let mut addr = [0u8; 4];

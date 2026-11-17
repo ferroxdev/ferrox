@@ -81,9 +81,6 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        let socks = env_port("FOXY_SOCKS_PORT", 10808);
-        let http = env_port("FOXY_HTTP_PORT", 8080);
-        let mixed = env_port("FOXY_MIXED_PORT", 10809);
         Self {
             action: Action::Up,
             outbound: None,
@@ -113,12 +110,12 @@ impl Default for Options {
             veepn_udid: String::new(),
             fronts: "socks,http,mixed".to_owned(),
             fronts_set: false,
-            socks,
-            http,
-            mixed,
-            socks_set: env_port_is_set("FOXY_SOCKS_PORT"),
-            http_set: env_port_is_set("FOXY_HTTP_PORT"),
-            mixed_set: env_port_is_set("FOXY_MIXED_PORT"),
+            socks: 10808,
+            http: 8080,
+            mixed: 10809,
+            socks_set: false,
+            http_set: false,
+            mixed_set: false,
             instance: None,
             all: false,
             vpn: false,
@@ -133,26 +130,37 @@ impl Default for Options {
     }
 }
 
-fn env_port(name: &str, fallback: u16) -> u16 {
+fn env_port(name: &str, fallback: u16, strict: bool) -> u16 {
     match std::env::var(name) {
         Err(std::env::VarError::NotPresent) => fallback,
-        Err(error) => die(&format!(
+        Err(error) if strict => die(&format!(
             "{name} is not readable as a port: {error}; nothing was started."
         )),
+        Err(_) => fallback,
         Ok(value) => match value.parse::<u16>() {
             Ok(port) if port != 0 => port,
-            _ => die(&format!(
+            _ if strict => die(&format!(
                 "{name} wants a port between 1 and 65535, got '{value}'; nothing was started."
             )),
+            _ => fallback,
         },
     }
 }
 
-fn env_port_is_set(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .is_some_and(|port| port != 0)
+fn apply_env_ports(options: &mut Options) {
+    let strict = matches!(
+        options.action,
+        Action::Up | Action::Serve | Action::Tun | Action::Supervise
+    );
+    if !options.socks_set {
+        options.socks = env_port("FOXY_SOCKS_PORT", options.socks, strict);
+    }
+    if !options.http_set {
+        options.http = env_port("FOXY_HTTP_PORT", options.http, strict);
+    }
+    if !options.mixed_set {
+        options.mixed = env_port("FOXY_MIXED_PORT", options.mixed, strict);
+    }
 }
 
 pub fn die(message: &str) -> ! {
@@ -480,6 +488,7 @@ pub fn parse() -> Options {
             "the system proxy points at one lane: run the instance without --vpn and point the app at its fronts, or arm --vpn on the unnamed lane; nothing was started.",
         );
     }
+    apply_env_ports(&mut options);
     options
 }
 

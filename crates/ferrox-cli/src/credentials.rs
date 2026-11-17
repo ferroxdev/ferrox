@@ -84,12 +84,15 @@ fn stored_grant(paths: &Paths) -> bool {
 }
 
 fn same_account(stored: &str, email: &str) -> bool {
+    fn padding(ch: char) -> bool {
+        ch.is_whitespace() || matches!(ch, '\u{200B}'..='\u{200D}' | '\u{FEFF}')
+    }
     let normalize = |value: &str| {
         value
             .chars()
-            .filter(|ch| !ch.is_whitespace())
+            .filter(|ch| !padding(*ch))
+            .flat_map(char::to_lowercase)
             .collect::<String>()
-            .to_lowercase()
     };
     let stored = normalize(stored);
     !stored.is_empty() && stored == normalize(email)
@@ -245,7 +248,7 @@ pub fn login(options: &Options, paths: &Paths) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{quote, unquote};
+    use super::{quote, same_account, unquote};
 
     #[test]
     fn the_stored_quoting_round_trips_and_a_broken_line_is_refused() {
@@ -254,5 +257,14 @@ mod tests {
         }
         assert_eq!(unquote("'unterminated"), None);
         assert_eq!(unquote(r"trailing\"), None);
+    }
+
+    #[test]
+    fn the_same_account_ignores_the_engines_padding() {
+        assert!(same_account("User@Example.com", "user@example.com"));
+        assert!(same_account("us\u{200B}er@example.com", "user@example.com"));
+        assert!(same_account("user@exam\u{FEFF}ple.com", "user@example.com"));
+        assert!(!same_account("other@example.com", "user@example.com"));
+        assert!(!same_account("   ", "user@example.com"));
     }
 }
