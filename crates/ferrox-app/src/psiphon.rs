@@ -8048,6 +8048,9 @@ fn cdn_variants(server: &Server) -> Vec<Server> {
         meek.https = https;
         meek.quic = quic;
         meek.port = port;
+        if !server.direct {
+            variant.port = port;
+        }
         if !quic {
             meek.alpn.clear();
         }
@@ -9129,9 +9132,11 @@ fn server_with_protocol(server: &Server, protocol: &str) -> Option<Server> {
                 if !uses_fronted_meek_cdn(protocol) {
                     return None;
                 }
-                cdn_variants(server)
-                    .into_iter()
-                    .find_map(|variant| fronted_with_protocol(&variant, protocol))
+                cdn_variants(server).into_iter().find_map(|variant| {
+                    let mut restored = fronted_with_protocol(&variant, protocol)?;
+                    restored.cdn_protocols = server.cdn_protocols;
+                    Some(restored)
+                })
             }),
         protocol if protocol.starts_with("UNFRONTED-MEEK") => {
             let mut variant = server.clone();
@@ -9161,7 +9166,9 @@ fn fronted_with_protocol(server: &Server, protocol: &str) -> Option<Server> {
     }
     let port = meek.port;
     meek.protocol = static_tunnel_protocol(protocol)?;
-    variant.port = port;
+    if !variant.direct {
+        variant.port = port;
+    }
     Some(variant)
 }
 
@@ -13254,17 +13261,31 @@ mod tests {
     #[test]
     fn a_stored_cdn_protocol_rebuilds_through_its_advertised_sibling() {
         let mut server = scan_test_server();
-        server.cdn_protocols = CDN_PROTOCOL_HTTP;
+        server.cdn_protocols = CDN_PROTOCOL_OSSH | CDN_PROTOCOL_HTTP | CDN_PROTOCOL_QUIC;
         let meek = server.meek.as_mut().expect("fronted");
         meek.protocol = "FRONTED-MEEK-QUIC-OSSH";
         meek.quic = true;
         let http = server_with_protocol(&server, "FRONTED-MEEK-CDN-HTTP-OSSH")
             .expect("the HTTP sibling is advertised");
+        assert_eq!(http.cdn_protocols, server.cdn_protocols);
+        assert_eq!(http.port, server.port);
         let meek = http.meek.as_ref().expect("fronted");
         assert_eq!(meek.protocol, "FRONTED-MEEK-CDN-HTTP-OSSH");
         assert!(!meek.https);
         assert!(!meek.quic);
-        assert_eq!(http.port, 80);
+        let selected = select_protocols_with(
+            vec![http],
+            &["FRONTED-MEEK-CDN-OSSH".to_owned()],
+            &[],
+            0,
+            true,
+            false,
+            None,
+        );
+        assert!(selected.iter().any(|server| server
+            .meek
+            .as_ref()
+            .is_some_and(|meek| meek.protocol == "FRONTED-MEEK-CDN-OSSH")));
         server.cdn_protocols = CDN_PROTOCOL_OSSH;
         assert!(server_with_protocol(&server, "FRONTED-MEEK-CDN-HTTP-OSSH").is_none());
     }
