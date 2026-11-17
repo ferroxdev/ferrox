@@ -1642,6 +1642,7 @@ impl ChannelWaiter {
 
     pub(crate) fn wake(&self) {
         if let Some(state) = self.0.upgrade() {
+            let _window = lock(&state.remote_window);
             state.window_cond.notify_all();
         }
     }
@@ -3002,6 +3003,15 @@ impl Channel {
         }
         loop {
             let mut window = lock(&self.state.remote_window);
+            if self.state.remote.load(Ordering::Acquire) == NO_CHANNEL
+                || self.session.closed.load(Ordering::Acquire)
+                || self.stopping()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "psiphon channel closed",
+                ));
+            }
             if *window > 0 {
                 let packet = u64::from(self.state.remote_packet.load(Ordering::Relaxed));
                 let take = len.min(usize::try_from((*window).min(packet)).unwrap_or(len));
