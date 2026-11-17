@@ -1537,10 +1537,9 @@ mod tests {
             }
             assert_eq!(payload, data, "len {len} room {room}");
         };
-        check(64, 1);
-        check(64, 7);
-        check(200, 3);
-        check(70_000, 9);
+        for (len, room) in [(64, 1), (64, 7), (200, 3), (70_000, 9)] {
+            check(len, room);
+        }
     }
 
     /// RFC 6455 has two data opcodes, and the tunnel reads both: a text frame answers like a binary one, a text message reassembles over a continuation, and a binary one reaches the reader unchanged.
