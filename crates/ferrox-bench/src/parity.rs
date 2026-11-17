@@ -1278,12 +1278,13 @@ fn measure_once(
     // The cap is enforced inside the fan-in: a stalled flow blocks `read`, so a post-hoc check here could never fire. A stall past the cap produced no number to bank, so `measure` re-measures it inside the budget rather than banking a workload fault.
     let moved = collect_flows(flows, &stop, wall + RUN_TIMEOUT)?;
     let wall_elapsed = wall.elapsed();
-    // The client's settle runs while the sink drains, so the server's window ends at the last byte the sink counted rather than at the client's last write or after the settle.
+    // The client's settle runs while the sink drains; joining before the server window closes keeps every late byte inside its measurement.
     let sink_expected = request.sink_bytes();
     let settle_until = Instant::now() + SETTLE;
     while Instant::now() < settle_until && sink_thread.received() < sink_expected {
         std::thread::sleep(Duration::from_millis(5));
     }
+    let (sink_received, sink_reasons) = sink_thread.join()?;
     let server = match server {
         Some(server) => Some(server.finish()?),
         None => None,
@@ -1301,7 +1302,6 @@ fn measure_once(
     )?);
 
     engine.reap();
-    let (sink_received, sink_reasons) = sink_thread.join()?;
 
     validate_transfer(
         &moved,

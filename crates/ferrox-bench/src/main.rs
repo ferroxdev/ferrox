@@ -108,7 +108,7 @@ fn engine_label_is_safe(label: &str) -> bool {
     matches!(
         Path::new(label).components().collect::<Vec<_>>().as_slice(),
         [Component::Normal(_)]
-    )
+    ) && !label.contains(['/', '\\'])
 }
 
 fn flag_value(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
@@ -1186,6 +1186,8 @@ mod tests {
         assert!(!engine_label_is_safe("../archive"));
         assert!(!engine_label_is_safe("/tmp/archive"));
         assert!(!engine_label_is_safe("a/b"));
+        assert!(!engine_label_is_safe("archive/"));
+        assert!(!engine_label_is_safe("a\\b"));
     }
 
     fn passes(ratios: &[f64]) -> Vec<(f64, f64)> {

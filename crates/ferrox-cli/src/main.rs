@@ -169,7 +169,7 @@ fn write_lane_config(
 
 fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
     reconcile(paths);
-    let _lifecycle = match lane::lock(paths) {
+    let lifecycle = match lane::lock(paths) {
         Ok(lock) => lock,
         Err(error) => {
             eprintln!("ferrox-cli: {error}");
@@ -216,9 +216,10 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
     let cancel = Arc::clone(&cancelled);
     let watched = paths.clone();
     let _ = ctrlc::set_handler(move || {
-        let mut cancelled = cancel
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        flag.store(true, Ordering::SeqCst);
+        let Ok(mut cancelled) = cancel.try_lock() else {
+            return;
+        };
         if *cancelled {
             return;
         }
@@ -241,7 +242,6 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
                 eprintln!("ferrox-cli: {error}");
             }
         }
-        flag.store(true, Ordering::SeqCst);
     });
 
     if !fronts(&options.fronts).is_empty() && !lane::wait_fronts(&options.fronts, ports, paths) {
@@ -271,32 +271,41 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         stop_and_forget(paths, user_config);
         return 3;
     }
+    if interrupted.load(Ordering::SeqCst) {
+        stop_and_forget(paths, user_config);
+        return 130;
+    }
     if options.vpn {
-        // Hold the cancellation lock across the arm so a Ctrl-C either owns cleanup or runs after it.
-        let armed = {
-            let cancelled = cancelled
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *cancelled {
-                None
-            } else {
-                Some(proxy::arm(paths, &options.fronts, ports))
-            }
-        };
-        if let Some(Err(error)) = armed {
+        // Hold the cancellation lock across the arm and handoff so a Ctrl-C either owns cleanup or looks at a finished start.
+        let mut cancelled = cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *cancelled || interrupted.load(Ordering::SeqCst) {
+            *cancelled = true;
+            stop_and_forget(paths, user_config);
+            drop(cancelled);
+            return 130;
+        }
+        if let Err(error) = proxy::arm(paths, &options.fronts, ports) {
+            *cancelled = true;
+            drop(cancelled);
             eprintln!("{error}");
             stop_and_forget(paths, user_config);
             return 1;
         }
-        if armed.is_none() {
-            stop_and_forget(paths, user_config);
-            return 130;
-        }
         if !serve {
             spawn_supervisor(paths, pid, options.instance.as_deref());
         }
+        if interrupted.load(Ordering::SeqCst) {
+            *cancelled = true;
+            stop_and_forget(paths, user_config);
+            drop(cancelled);
+            return 130;
+        }
+        drop(cancelled);
     }
     println!("log:  {}", paths.log.display());
+    drop(lifecycle);
     if serve {
         println!("Ctrl-C stops it.");
         while lane::running(paths) && !interrupted.load(Ordering::SeqCst) {
@@ -478,6 +487,13 @@ fn down(options: &Options, paths: &Paths) -> i32 {
 }
 
 fn stop_lane(paths: &Paths) -> i32 {
+    let _lifecycle = match lane::lock(paths) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("ferrox-cli: {error}");
+            return 1;
+        }
+    };
     let saved_pid = lane::pid(paths);
     if let Err(error) = lane::stop(paths) {
         eprintln!("ferrox-cli: {error}");

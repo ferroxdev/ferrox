@@ -87,7 +87,9 @@ fn owned(paths: &Paths) -> Result<bool, String> {
         }
     };
     let owner = serde_json::from_str::<String>(&text).unwrap_or(text);
-    Ok(owner == paths.conf_dir.to_string_lossy())
+    let snapshot = paths.proxy_state.to_string_lossy();
+    Ok(owner == snapshot
+        || (owner == paths.conf_dir.to_string_lossy() && paths.proxy_state.is_file()))
 }
 
 #[allow(clippy::unnecessary_wraps)] // Windows restores the registry and can fail; the other targets only remove files.
@@ -402,6 +404,16 @@ mod win {
                 return Err(format!("system proxy: cannot record the snapshot: {error}"));
             }
         }
+        let owner = json!(paths.proxy_state.to_string_lossy()).to_string();
+        if let Err(error) = write_private(&paths.proxy_owner, &owner) {
+            close(key);
+            if fresh {
+                let _ = std::fs::remove_file(&paths.proxy_state);
+            }
+            return Err(format!(
+                "system proxy: cannot publish ownership ({error}); nothing was armed."
+            ));
+        }
         let server = server(socks, http);
         let ok = write_dword(key, "ProxyEnable", 1)
             && write_sz(key, "ProxyServer", &server)
@@ -420,10 +432,6 @@ mod win {
                 socks.map_or_else(|| "-".to_owned(), |port| port.to_string()),
                 http.map_or_else(|| "-".to_owned(), |port| port.to_string())
             ),
-        );
-        let _ = write_private(
-            &paths.proxy_owner,
-            &json!(paths.conf_dir.to_string_lossy()).to_string(),
         );
         if let Some(port) = socks {
             println!("system proxy on: SOCKS 127.0.0.1:{port}");

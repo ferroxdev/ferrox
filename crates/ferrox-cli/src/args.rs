@@ -116,9 +116,9 @@ impl Default for Options {
             socks,
             http,
             mixed,
-            socks_set: std::env::var_os("FOXY_SOCKS_PORT").is_some(),
-            http_set: std::env::var_os("FOXY_HTTP_PORT").is_some(),
-            mixed_set: std::env::var_os("FOXY_MIXED_PORT").is_some(),
+            socks_set: env_port_is_set("FOXY_SOCKS_PORT"),
+            http_set: env_port_is_set("FOXY_HTTP_PORT"),
+            mixed_set: env_port_is_set("FOXY_MIXED_PORT"),
             instance: None,
             all: false,
             vpn: false,
@@ -139,6 +139,13 @@ fn env_port(name: &str, fallback: u16) -> u16 {
         .and_then(|v| v.parse().ok())
         .filter(|port| *port != 0)
         .unwrap_or(fallback)
+}
+
+fn env_port_is_set(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .is_some_and(|port| port != 0)
 }
 
 pub fn die(message: &str) -> ! {

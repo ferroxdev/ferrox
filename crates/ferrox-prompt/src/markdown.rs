@@ -595,22 +595,28 @@ fn single_fenced_block(
 ) -> String {
     let mut open = None;
     let mut closed = None;
+    let mut fence: Option<(char, usize)> = None;
     for (offset, section_line) in section.iter().enumerate() {
-        if is_fence(section_line) {
-            match open {
-                None => open = Some(offset),
-                Some(_) if closed.is_none() => closed = Some(offset),
-                Some(_) => {
-                    diagnostics.push(Diagnostic::error(
-                        line + offset + 1,
-                        format!(
-                            "a second fenced block in the {what} section; exactly one is read, and \
-                             which one is not a question this tool answers"
-                        ),
-                    ));
-                    return String::new();
-                }
+        if let Some((marker, width)) = fence {
+            if closes_fence(section_line, marker, width) {
+                closed = Some(offset);
+                fence = None;
             }
+            continue;
+        }
+        if let Some((marker, width)) = opens_fence(section_line) {
+            if open.is_some() {
+                diagnostics.push(Diagnostic::error(
+                    line + offset + 1,
+                    format!(
+                        "a second fenced block in the {what} section; exactly one is read, and \
+                         which one is not a question this tool answers"
+                    ),
+                ));
+                return String::new();
+            }
+            open = Some(offset);
+            fence = Some((marker, width));
         }
     }
     match (open, closed) {
@@ -632,9 +638,19 @@ fn single_fenced_block(
     }
 }
 
-/// Whether a line opens or closes a fenced block.
-fn is_fence(line: &str) -> bool {
-    line.trim_start().starts_with("```")
+/// True for a fence delimiter and for every line inside it, so callers can skip both.
+fn inside_fence(fence: &mut Option<(char, usize)>, line: &str) -> bool {
+    if let Some((marker, width)) = *fence {
+        if closes_fence(line, marker, width) {
+            *fence = None;
+        }
+        true
+    } else if let Some((marker, width)) = opens_fence(line) {
+        *fence = Some((marker, width));
+        true
+    } else {
+        false
+    }
 }
 
 /// Strip common indentation and trailing blanks, so a prompt is not pasted with four spaces per line.
@@ -765,14 +781,10 @@ fn parse_prompt(
         ));
     }
 
-    let mut in_block = false;
+    let mut fence = None;
     for (offset, section_line) in section.iter().enumerate() {
         let field_line = line + offset + 1;
-        if is_fence(section_line) {
-            in_block = !in_block;
-            continue;
-        }
-        if in_block {
+        if inside_fence(&mut fence, section_line) {
             continue;
         }
         if let Some((addon_title, body)) = addon_line(section_line) {
@@ -951,15 +963,14 @@ const REQUIRED_FIELDS: &[(&str, &str)] = &[
 
 /// Whether a field appears at all, as opposed to appearing empty.
 fn section_has_field(section: &[&str], key: &str) -> bool {
-    let mut in_block = false;
+    let mut fence = None;
     for line in section {
-        if is_fence(line) {
-            in_block = !in_block;
-        } else if !in_block {
-            if let Some((found, _)) = field(line) {
-                if found == key {
-                    return true;
-                }
+        if inside_fence(&mut fence, line) {
+            continue;
+        }
+        if let Some((found, _)) = field(line) {
+            if found == key {
+                return true;
             }
         }
     }
@@ -1290,6 +1301,17 @@ b
         assert!(!closes_fence("````text", '`', 3));
         assert!(closes_fence("~~~", '~', 3));
         assert!(closes_fence("````  ", '`', 3));
+    }
+
+    #[test]
+    fn fenced_example_metadata_cannot_change_the_real_prompt() {
+        let text = LIBRARY.replace(
+            "do the second thing with {scope}\n```",
+            "do the second thing with {scope}\n```\n\n~~~text\n## P9 · Example\n**Status:** done\n~~~",
+        );
+        let library = load(&text);
+        assert_eq!(library.prompt(2).unwrap().status, Status::Todo);
+        assert!(library.prompt(9).is_none());
     }
 
     #[test]
