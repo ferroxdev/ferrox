@@ -8908,7 +8908,7 @@ fn select_protocols_with(
         || (initial_active && initial.is_some_and(|shape| shape.shadowsocks));
     let quic_named = normal.is_some_and(|shape| shape.quic)
         || (initial_active && initial.is_some_and(|shape| shape.quic));
-    let requested_meek = protocols
+    let requested_fronted = protocols
         .iter()
         .chain(
             initial_active
@@ -8916,7 +8916,7 @@ fn select_protocols_with(
                 .into_iter()
                 .flatten(),
         )
-        .any(|protocol| is_meek_protocol(protocol));
+        .any(|protocol| protocol.starts_with("FRONTED-MEEK"));
     let requested_unfronted = protocols
         .iter()
         .chain(
@@ -8946,13 +8946,13 @@ fn select_protocols_with(
     } else {
         servers.retain_mut(|server| {
             if server.direct || server.inproxy.is_some() {
-                if requested_meek {
-                    if requested_unfronted {
-                        if let Some(unfronted) = server.unfronted_meek.take() {
-                            server.meek = Some(unfronted);
-                        }
+                if requested_unfronted {
+                    if let Some(unfronted) = server.unfronted_meek.take() {
+                        server.meek = Some(unfronted);
+                    } else if !requested_fronted {
+                        server.meek = None;
                     }
-                } else {
+                } else if !requested_fronted {
                     server.meek = None;
                     server.unfronted_meek = None;
                 }
@@ -8962,7 +8962,7 @@ fn select_protocols_with(
                 return true;
             }
             if let Some(unfronted) = server.unfronted_meek.take() {
-                if requested_unfronted || server.meek.is_none() {
+                if requested_unfronted || !requested_fronted {
                     server.meek = Some(unfronted);
                 }
                 return true;
@@ -8992,13 +8992,13 @@ fn select_protocols_with(
     }
     let tls_named = normal.is_some_and(|shape| shape.tls)
         || (initial_active && initial.is_some_and(|shape| shape.tls));
-    if tls_named {
-        add_tls_variants(&mut servers);
-    }
     let plain_named = normal.is_some_and(|shape| shape.plain)
         || (initial_active && initial.is_some_and(|shape| shape.plain));
     if plain_named {
         add_ssh_variants(&mut servers);
+    }
+    if tls_named {
+        add_tls_variants(&mut servers);
     }
     let normal_meek =
         normal.is_some() && protocols.iter().any(|protocol| is_meek_protocol(protocol));
@@ -16084,7 +16084,7 @@ mod tests {
             1,
             false,
         );
-        assert_eq!(selected.len(), 1);
+        assert_eq!(selected.len(), 3);
         assert!(selected[0].tls);
     }
 
@@ -16193,7 +16193,7 @@ mod tests {
                 0,
                 false
             )),
-            [false]
+            [false, false]
         );
         assert_eq!(
             shapes(select_protocols(
@@ -16249,7 +16249,7 @@ mod tests {
                 2,
                 false
             )),
-            [true, true, false, false]
+            [true, true, false, false, false, false]
         );
         // An entry the initial phase skips is not lost while it matches the normal limit.
         let servers = || vec![test_server(false), test_server(true), test_server(false)];
@@ -16261,7 +16261,7 @@ mod tests {
                 1,
                 false
             )),
-            [true, false, false]
+            [true, false, false, false]
         );
         // No initial phase leaves the normal limit in force from the first entry.
         assert_eq!(
@@ -16272,7 +16272,7 @@ mod tests {
                 0,
                 false
             )),
-            [false, false]
+            [false, false, false]
         );
     }
 

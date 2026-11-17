@@ -468,7 +468,8 @@ mod tests {
             fronted_update_frequency: Duration::from_millis(1),
             ..Settings::default()
         });
-        let entry = server("example.test", 443);
+        let mut entry = server("example.test", 443);
+        entry.fronting_provider_id = Some("provider".to_owned());
         let first = cache.begin(&entry, 7);
         first.succeeded(1);
         cache.mark_succeeded("example.test");
