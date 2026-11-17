@@ -262,7 +262,7 @@ fn hold(entry: Arc<Entry>) -> Lease {
 }
 
 fn decrement(counter: &AtomicI64) {
-    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+    let _ = counter.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
         (left > 0).then_some(left - 1)
     });
 }
