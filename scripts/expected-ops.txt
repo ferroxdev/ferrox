@@ -342,13 +342,7 @@ ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_co
 # Re-blessed 345889 by the sni-mode branch in `Fragment::write`: the width path
 # still answers 256 * whole.len and draws the same cuts, while the extra arm
 # moved this test binary's thin-LTO layout. ops.yml run 44032106261.
-# Re-blessed 374050 by the hello gate that cuts a hello after a decoy record and
-# the first-cut clamp that keeps one octet when a width covers the body: 256
-# turns now test `hello_done`, call `hello_shape` once more and run `first_cut`
-# on each of the nine records, and only the layout of the rest moved. The probe
-# resets both counters per turn, so it still prices one hello per stream.
-# ops.yml run 44096508065.
-ferrox_core::finalmask::tests::merged_hello_probe 374050 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
+ferrox_core::finalmask::tests::merged_hello_probe 345889 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
 # The client request built by `request`: one address type byte, the address and
 # the port, written in one match with the vector's room reserved exactly once,
 # through `spare_capacity_mut` and one `copy_nonoverlapping` per field so no

@@ -74,8 +74,8 @@ left alone and leaves the rewrite armed for the next one, so a one-byte cut cann
 instead; the decoy spends no hello slot, so a fragment stage behind it still cuts the real hello.
 
 `tlsSettings.fragment` cuts the first write at one random width in `1..=64` octets, below the
-smallest `ClientHello` body, and a drawn width that covers the body keeps one octet for the
-next record, so a config that asked for a cut never sends the hello whole unless `maxSplit` is one;
+smallest `ClientHello` body, so a config that asked for a cut gets one on the first record; a
+width that covers a shorter write ends the run there, as the reference's clamp does;
 `recordFragment` places one record boundary inside every label of the server name, one fresh
 random byte per label, the top-level label included. Both set the SNI cut, and
 `fragmentFallbackDelay` (a bare millisecond number or a string with `ms`, `s`, `m` or `h`) is the

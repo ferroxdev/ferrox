@@ -247,15 +247,6 @@ impl Fragment {
         Some(if last || to > end { end } else { to })
     }
 
-    /// The first cut is the split the config asked for: a width that covers the body keeps one
-    /// octet for the next record, unless the drawn bound asked for a single record.
-    fn first_cut(segment: usize, from: usize, to: usize, end: usize, bound: usize) -> usize {
-        if segment == 0 && bound != 1 && to == end && end - from >= 2 {
-            end - 1
-        } else {
-            to
-        }
-    }
 
     /// The reference parks between pieces when its delay range can answer above zero, and so does
     /// this: a mask that cut faster would look like a different schedule to anything watching the
@@ -310,7 +301,6 @@ impl Fragment {
                     write_record(raw, &head_of(p, record_len - from), &p[from..record_len])?;
                     break;
                 };
-                let to = Self::first_cut(segment, from, to, record_len, bound);
                 write_record(raw, &head_of(p, to - from), &p[from..to])?;
                 let delay = self.delay_at(segment);
                 self.park(delay);
@@ -521,7 +511,6 @@ impl Fragment {
                 let to = self
                     .cut(segment, from, record_len, bound)
                     .unwrap_or(record_len);
-                let to = Self::first_cut(segment, from, to, record_len, bound);
                 let head = head_of(p, to - from);
                 heads[count * HEADER..][..HEADER].copy_from_slice(&head);
                 from = to;
@@ -1829,22 +1818,6 @@ mod tests {
         mask.flush(&mut wire).expect("flushes");
         let (_, message) = records(&wire.bytes);
         assert_eq!(message, whole[HEADER..], "the retry loses no octet");
-    }
-
-    #[test]
-    fn a_width_past_the_body_still_cuts_the_first_write() {
-        let mut mask = Fragment::new(0, 1, vec![range(300, 300)], vec![range(0, 0)], range(0, 0))
-            .expect("valid");
-        let whole = hello(40);
-        let mut wire = Wire::default();
-        assert_eq!(mask.write(&mut wire, &whole).expect("writes"), whole.len());
-        let (widths, message) = records(&wire.bytes);
-        assert_eq!(
-            widths,
-            vec![39, 1],
-            "a width covering the body leaves the first cut, not the whole hello"
-        );
-        assert_eq!(message, whole[HEADER..]);
     }
 
     #[test]
