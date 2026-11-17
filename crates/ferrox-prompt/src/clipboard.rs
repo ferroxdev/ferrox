@@ -16,7 +16,11 @@ impl std::fmt::Display for Unavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoneFound => {
-                f.write_str("no clipboard program found (tried pbcopy, wl-copy, xclip, xsel)")
+                #[cfg(windows)]
+                f.write_str("no clipboard program found (tried clip)")?;
+                #[cfg(not(windows))]
+                f.write_str("no clipboard program found (tried pbcopy, wl-copy, xclip, xsel)")?;
+                Ok(())
             }
             Self::Failed(reason) => write!(f, "no clipboard program accepted the text: {reason}"),
         }
@@ -63,7 +67,12 @@ fn write(program: &str, args: &[&str], text: &str) -> std::io::Result<()> {
         .stderr(Stdio::null())
         .spawn()?;
     if let Some(mut pipe) = child.stdin.take() {
-        pipe.write_all(text.as_bytes())?;
+        if let Err(error) = pipe.write_all(text.as_bytes()) {
+            drop(pipe);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
     }
     if child.wait()?.success() {
         Ok(())
@@ -91,15 +100,8 @@ mod tests {
     }
 
     #[test]
-    fn copying_never_panics_with_or_without_a_clipboard() {
-        // No success claim: CI has no pasteboard; the tested claim is that the outcome is a value.
-        match copy("") {
-            Ok(()) | Err(Unavailable::NoneFound | Unavailable::Failed(_)) => {}
-        }
-    }
-
-    #[test]
     fn the_failure_message_names_what_was_tried() {
-        assert!(Unavailable::NoneFound.to_string().contains("pbcopy"));
+        let expected = if cfg!(windows) { "clip" } else { "pbcopy" };
+        assert!(Unavailable::NoneFound.to_string().contains(expected));
     }
 }

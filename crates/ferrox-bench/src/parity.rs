@@ -1276,7 +1276,8 @@ fn measure_once(
         std::thread::sleep(request.duration);
     }
     // The cap is enforced inside the fan-in: a stalled flow blocks `read`, so a post-hoc check here could never fire. A stall past the cap produced no number to bank, so `measure` re-measures it inside the budget rather than banking a workload fault.
-    let moved = collect_flows(flows, &stop, wall + RUN_TIMEOUT)?;
+    let cap = fan_in_cap(request);
+    let moved = collect_flows(flows, &stop, wall + cap, cap)?;
     let wall_elapsed = wall.elapsed();
     // The client's settle runs while the sink drains; joining before the server window closes keeps every late byte inside its measurement.
     let sink_expected = request.sink_bytes();
@@ -1620,10 +1621,20 @@ struct Moved {
     all_stopped: Vec<String>,
 }
 
+/// A hold's own duration is the workload, so its fan-in cap leaves room for a hold thread scheduled after the clock starts.
+fn fan_in_cap(request: &Request) -> Duration {
+    if request.traffic == Traffic::HeldOpen {
+        request.duration.saturating_add(FLOW_IO_TIMEOUT)
+    } else {
+        RUN_TIMEOUT
+    }
+}
+
 fn collect_flows(
     flows: Vec<JoinHandle<FlowResult>>,
     stop: &Arc<AtomicBool>,
     deadline: Instant,
+    cap: Duration,
 ) -> Result<Moved, Error> {
     let mut moved = Moved {
         sent: 0,
@@ -1641,7 +1652,7 @@ fn collect_flows(
             stop.store(true, Ordering::Relaxed);
             return Err(Error::Transient(format!(
                 "workload exceeded the {}s cap",
-                RUN_TIMEOUT.as_secs()
+                cap.as_secs()
             )));
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -2029,38 +2040,24 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
 
     let t2 = Instant::now();
     let mut connect = vec![5, 1, 0];
-    let reply_len = match plan.target.ip() {
+    match plan.target.ip() {
         std::net::IpAddr::V4(v4) => {
             connect.push(1);
             connect.extend_from_slice(&v4.octets());
-            10
         }
         std::net::IpAddr::V6(v6) => {
             connect.push(4);
             connect.extend_from_slice(&v6.octets());
-            22
         }
-    };
+    }
     connect.extend_from_slice(&plan.target.port().to_be_bytes());
     if let Err(e) = stream.write_all(&connect) {
         result.stopped = Some(format!("socks connect write failed: {e}"));
         return result;
     }
-    let mut reply = vec![0u8; reply_len];
-    match stream.read_exact(&mut reply) {
-        Err(e) => {
-            result.stopped = Some(format!("socks connect read failed: {e}"));
-            return result;
-        }
-        Ok(()) if reply[1] != 0 => {
-            result.stopped = Some(format!(
-                "the engine refused the socks connect with reply code {}; the sink \
-                 is at {}",
-                reply[1], plan.target
-            ));
-            return result;
-        }
-        Ok(()) => {}
+    if let Err(reason) = read_connect_reply(&mut stream, plan.target) {
+        result.stopped = Some(reason);
+        return result;
     }
     setup.socks_connect_us = t2.elapsed().as_micros();
     setup.socks_setup_us = t1.elapsed().as_micros();
@@ -2077,6 +2074,61 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
     }
     let _ = stream.shutdown(Shutdown::Both);
     result
+}
+
+/// Read a SOCKS5 CONNECT reply by its own address type, so a server that answers with a
+/// different bound family is read rather than mistaken for the family the request named.
+fn read_connect_reply(stream: &mut TcpStream, target: SocketAddr) -> Result<(), String> {
+    let mut head = [0u8; 4];
+    stream
+        .read_exact(&mut head)
+        .map_err(|e| format!("socks connect read failed: {e}"))?;
+    if head[0] != 5 {
+        return Err(format!(
+            "the engine answered the socks connect with version {}, not 5",
+            head[0]
+        ));
+    }
+    if head[1] != 0 {
+        return Err(format!(
+            "the engine refused the socks connect with reply code {}; the sink is at {target}",
+            head[1]
+        ));
+    }
+    match head[3] {
+        1 => {
+            let mut addr = [0u8; 4];
+            stream
+                .read_exact(&mut addr)
+                .map_err(|e| format!("socks connect address read failed: {e}"))?;
+        }
+        4 => {
+            let mut addr = [0u8; 16];
+            stream
+                .read_exact(&mut addr)
+                .map_err(|e| format!("socks connect address read failed: {e}"))?;
+        }
+        3 => {
+            let mut len = [0u8; 1];
+            stream
+                .read_exact(&mut len)
+                .map_err(|e| format!("socks connect domain length read failed: {e}"))?;
+            let mut name = vec![0u8; usize::from(len[0])];
+            stream
+                .read_exact(&mut name)
+                .map_err(|e| format!("socks connect domain read failed: {e}"))?;
+        }
+        other => {
+            return Err(format!(
+                "the socks connect reply has address type {other}, not IPv4, domain or IPv6"
+            ));
+        }
+    }
+    let mut port = [0u8; 2];
+    stream
+        .read_exact(&mut port)
+        .map_err(|e| format!("socks connect port read failed: {e}"))?;
+    Ok(())
 }
 
 /// The SOCKS greeting and CONNECT every workload but the idle one shares, with the setup split the
@@ -2100,32 +2152,21 @@ fn socks_tunnel(engine: SocketAddr, target: SocketAddr) -> Result<(TcpStream, Se
 
     let t2 = Instant::now();
     let mut connect = vec![5, 1, 0];
-    let reply_len = match target.ip() {
+    match target.ip() {
         std::net::IpAddr::V4(v4) => {
             connect.push(1);
             connect.extend_from_slice(&v4.octets());
-            10
         }
         std::net::IpAddr::V6(v6) => {
             connect.push(4);
             connect.extend_from_slice(&v6.octets());
-            22
         }
-    };
+    }
     connect.extend_from_slice(&target.port().to_be_bytes());
     stream
         .write_all(&connect)
         .map_err(|e| format!("socks connect write failed: {e}"))?;
-    let mut reply = vec![0u8; reply_len];
-    stream
-        .read_exact(&mut reply)
-        .map_err(|e| format!("socks connect read failed: {e}"))?;
-    if reply[1] != 0 {
-        return Err(format!(
-            "the engine refused the socks connect with reply code {}; the sink is at {target}",
-            reply[1]
-        ));
-    }
+    read_connect_reply(&mut stream, target)?;
     setup.socks_connect_us = t2.elapsed().as_micros();
     setup.socks_setup_us = t1.elapsed().as_micros();
     setup.total_us = t0.elapsed().as_micros();
@@ -3472,6 +3513,7 @@ mod tests {
             vec![stalled, landed],
             &stop,
             started + Duration::from_millis(200),
+            Duration::from_millis(200),
         );
         assert!(
             matches!(
@@ -3515,6 +3557,7 @@ mod tests {
             vec![first, second],
             &stop,
             Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(10),
         )
         .expect("flows that land within the deadline are collected");
         assert_eq!(moved.sent, 3);
@@ -3589,6 +3632,18 @@ mod tests {
         assert_eq!(r.traffic, Traffic::Upload);
         assert_eq!(r.total_bytes(), 10 * 1024);
         assert!(r.client_env.is_empty());
+    }
+
+    #[test]
+    fn a_hold_at_the_run_cap_gets_a_late_start_window() {
+        let request = Request::parse(
+            request_with(&[("traffic", quote("held-open")), ("duration_ms", "120000")]).as_bytes(),
+        )
+        .expect("the cap is accepted");
+        assert_eq!(request.duration, RUN_TIMEOUT);
+        assert_eq!(fan_in_cap(&request), RUN_TIMEOUT + FLOW_IO_TIMEOUT);
+        let above = request_with(&[("traffic", quote("held-open")), ("duration_ms", "120001")]);
+        assert!(Request::parse(above.as_bytes()).is_err());
     }
 
     #[test]

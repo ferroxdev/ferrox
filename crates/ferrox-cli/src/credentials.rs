@@ -84,13 +84,15 @@ fn stored_grant(paths: &Paths) -> bool {
 }
 
 fn same_account(stored: &str, email: &str) -> bool {
-    !stored.is_empty()
-        && stored.trim().to_lowercase()
-            == email
-                .chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect::<String>()
-                .to_lowercase()
+    let normalize = |value: &str| {
+        value
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>()
+            .to_lowercase()
+    };
+    let stored = normalize(stored);
+    !stored.is_empty() && stored == normalize(email)
 }
 
 pub fn resolve(options: &Options, paths: &Paths) -> Result<FoxyAccount, String> {
@@ -106,7 +108,7 @@ pub fn resolve(options: &Options, paths: &Paths) -> Result<FoxyAccount, String> 
     } else if let Some(email) = env_email {
         email
     } else if !file_email.is_empty() {
-        file_email
+        file_email.clone()
     } else {
         self::stored_email(paths)
     };
@@ -114,8 +116,10 @@ pub fn resolve(options: &Options, paths: &Paths) -> Result<FoxyAccount, String> 
         options.password.clone()
     } else if let Some(password) = env_password {
         password
-    } else {
+    } else if same_account(&file_email, &email) {
         file_password
+    } else {
+        String::new()
     };
     let has_grant = |email: &str| same_account(&stored_email(paths), email) && stored_grant(paths);
     if email.is_empty() || (password.is_empty() && !has_grant(&email)) {

@@ -202,10 +202,9 @@ fn country_reading(best: &BTreeMap<(String, String), Option<u64>>, country: &str
         if candidate != country {
             continue;
         }
-        let Some(ms) = reading else {
-            return None;
-        };
-        found = Some(found.map_or(*ms, |current: u64| current.min(*ms)));
+        if let Some(ms) = reading {
+            found = Some(found.map_or(*ms, |current: u64| current.min(*ms)));
+        }
     }
     found
 }
@@ -234,4 +233,17 @@ pub fn remember(paths: &Paths, country: &str, city: &str) -> Result<(), String> 
         println!("exit remembered: {country} / {city}. The next 'up --foxy' moves there.");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::country_reading;
+
+    #[test]
+    fn a_silent_city_does_not_hide_a_measured_one() {
+        let mut best = std::collections::BTreeMap::new();
+        best.insert(("US".to_owned(), "SFO".to_owned()), None);
+        best.insert(("US".to_owned(), "IAD".to_owned()), Some(21));
+        assert_eq!(country_reading(&best, "US"), Some(21));
+    }
 }

@@ -534,7 +534,7 @@ fn run_check(args: &Args, cwd: &Path) -> ExitCode {
 
 /// `list`: totals, served count and the status summary; per-prompt lines only when `--status`/`--effort` narrowed.
 fn run_list(args: &Args, library: &Library, root: &Path) -> ExitCode {
-    let ledger = Ledger::load(Ledger::path_for(root));
+    let ledger = load_ledger(root);
     let selected: Vec<&Prompt> = library
         .prompts
         .iter()
@@ -782,6 +782,7 @@ fn next_json(
     prompt: &Prompt,
     args: &Args,
     suppressed: &[u32],
+    skipped: &[advisor::Skipped],
     target: Option<&(&MethodRow, Values)>,
     ledger: &Ledger,
     rendered: &render::Rendered,
@@ -791,7 +792,7 @@ fn next_json(
         ("tag", Value::text(library.tag())),
         (
             "selection",
-            selection_json(library, prompt, args, suppressed, &[]),
+            selection_json(library, prompt, args, suppressed, skipped),
         ),
         (
             "target",
@@ -862,7 +863,8 @@ fn missing_input_refusal(
 
 /// `next`: fills a matrix template from its first unserved row, so repeat runs walk the matrix; `--set` still wins.
 fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
-    let ledger = Ledger::load(Ledger::path_for(root));
+    let _lock = lock_state(&Ledger::path_for(root));
+    let ledger = load_ledger(root);
     let state = ProjectState::load(root);
 
     // A named row is the work; the template that draws it is then the advisor's choice.
@@ -887,7 +889,7 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
     let supplied = supplied_values(args, &state);
 
     // Resolve the (template, row) pair: `forced` names one on purpose, else walk the handable set for a live target.
-    let (prompt, target) = match choose_slice(
+    let ((prompt, target), skipped) = match choose_slice(
         args,
         library,
         &state,
@@ -896,7 +898,7 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
         &supplied,
         named,
     ) {
-        Ok(offer) => offer,
+        Ok(choice) => choice,
         Err((message, code)) => {
             eprintln!("{message}");
             return ExitCode::from(code);
@@ -939,13 +941,22 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
                 prompt,
                 args,
                 &suppressed,
+                &skipped,
                 target.as_ref(),
                 &ledger,
                 &rendered
             )
         );
     } else {
-        report_next(library, prompt, &ledger, &suppressed, &[], args, &addons);
+        report_next(
+            library,
+            prompt,
+            &ledger,
+            &suppressed,
+            &skipped,
+            args,
+            &addons,
+        );
         report_target(target.as_ref(), &ledger, prompt);
         if let Some(worktree) = &rendered.worktree {
             println!("worktree    {}", worktree.brief());
@@ -972,7 +983,7 @@ fn choose_slice<'p>(
     suppressed: &[u32],
     supplied: &Values,
     named: Option<&'p MethodRow>,
-) -> Result<Offer<'p>, Refusal> {
+) -> Result<(Offer<'p>, Vec<advisor::Skipped>), Refusal> {
     if let Some(id) = args.forced {
         let Some(prompt) = library.prompt(id) else {
             return Err((unknown_prompt(library, id), 2));
@@ -982,7 +993,10 @@ fn choose_slice<'p>(
                 return Err((reason, 2));
             }
         }
-        return Ok((prompt, target_for(prompt, state, ledger, named)));
+        return Ok((
+            (prompt, target_for(prompt, state, ledger, named)),
+            Vec::new(),
+        ));
     }
     let (handable, skipped) = advisor::handable(
         library,
@@ -1006,7 +1020,7 @@ fn choose_slice<'p>(
             1,
         ));
     }
-    choose_offer(&offers, args.draw == Draw::Rotate, args.seed)
+    choose_offer(&offers, args.draw == Draw::Rotate, args.seed).map(|offer| (offer, skipped))
 }
 
 /// The row this slice draws, and whether this template was handed it before.
@@ -1107,7 +1121,7 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         eprintln!("{}", unknown_prompt(library, id));
         return ExitCode::from(2);
     };
-    let ledger = Ledger::load(Ledger::path_for(root));
+    let ledger = load_ledger(root);
     let state = ProjectState::load(root);
     let named = match &args.row {
         Some(selector) => match named_row(prompt, &state, library, selector) {
@@ -1234,7 +1248,7 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
         eprintln!("{}", unknown_prompt(library, id));
         return ExitCode::from(2);
     };
-    let ledger = Ledger::load(Ledger::path_for(root));
+    let ledger = load_ledger(root);
     let state = ProjectState::load(root);
     let named = match &args.row {
         Some(selector) => match named_row(prompt, &state, library, selector) {
@@ -1352,6 +1366,22 @@ fn report_metadata(
     }
 }
 
+/// Read the handout ledger, saying when it exists but cannot be trusted rather than treating it as empty history.
+fn load_ledger(root: &Path) -> Ledger {
+    let ledger = Ledger::load(Ledger::path_for(root));
+    if let Some(error) = &ledger.read_error {
+        eprintln!("warning: {error}; continuing with an empty history");
+    }
+    if ledger.skipped > 0 {
+        eprintln!(
+            "warning: ignored {} unreadable line(s) in {}",
+            ledger.skipped,
+            ledger.path.display()
+        );
+    }
+    ledger
+}
+
 /// Record progress by rewriting exactly the prompt's `**Status:**` line: reflowing Markdown would fight the contributor's edits.
 fn run_set_status(args: &Args, library: &Library) -> ExitCode {
     let id = args.id.expect("parse requires an id for set-status");
@@ -1364,9 +1394,17 @@ fn run_set_status(args: &Args, library: &Library) -> ExitCode {
         println!("P{id} is already {}", to.as_str());
         return ExitCode::SUCCESS;
     }
-    match set_status_text(&library.source, id, to) {
+    let _lock = lock_state(&library.source_path);
+    let current = match std::fs::read_to_string(&library.source_path) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("could not read {}: {error}", library.source_path.display());
+            return ExitCode::from(1);
+        }
+    };
+    match set_status_text(&current, id, to) {
         Ok(updated) => {
-            if let Err(error) = std::fs::write(&library.source_path, updated) {
+            if let Err(error) = replace_file(&library.source_path, &updated) {
                 eprintln!("could not write {}: {error}", library.source_path.display());
                 return ExitCode::from(1);
             }
@@ -1398,7 +1436,12 @@ fn set_status_text(source: &str, id: u32, status: Status) -> Result<String, Stri
     let mut current: Option<u32> = None;
     let mut fence: Option<(char, usize)> = None;
     let mut replaced = false;
-    for line in source.lines() {
+    for raw in source.split_inclusive('\n') {
+        let (line, ending) = match raw.strip_suffix('\n') {
+            Some(line) if line.ends_with('\r') => (&line[..line.len() - 1], "\r\n"),
+            Some(line) => (line, "\n"),
+            None => (raw, ""),
+        };
         if let Some((marker, width)) = fence {
             if closes_fence(line, marker, width) {
                 fence = None;
@@ -1408,20 +1451,17 @@ fn set_status_text(source: &str, id: u32, status: Status) -> Result<String, Stri
         } else if let Some(body) = line.strip_prefix("## ") {
             current = section_id(body.trim_end());
         } else if current == Some(id) && !replaced && line.trim_start().starts_with("**Status:**") {
-            out.push(format!("**Status:** {}", status.as_str()));
+            let indent = &line[..line.len() - line.trim_start().len()];
+            out.push(format!("{indent}**Status:** {}{ending}", status.as_str()));
             replaced = true;
             continue;
         }
-        out.push(line.to_owned());
+        out.push(format!("{line}{ending}"));
     }
     if !replaced {
         return Err(format!("P{id} has no **Status:** line to rewrite"));
     }
-    let mut text = out.join("\n");
-    if source.ends_with('\n') {
-        text.push('\n');
-    }
-    Ok(text)
+    Ok(out.concat())
 }
 
 /// `(id)` from a `P<n> · <title>` heading; the separator is permissive, same as the parser.
@@ -1831,6 +1871,54 @@ fn deliver(rendered: &Rendered, library: &Library, id: u32, print: bool) {
         Err(reason) => {
             eprintln!("clipboard unavailable ({reason}); printing instead:");
             println!("{}", rendered.text);
+        }
+    }
+}
+
+/// Serialise writers to one state file, so two `next` runs cannot hand out the same row or a
+/// `set-status` cannot overwrite an update it read before the lock.
+fn lock_state(path: &Path) -> Option<std::fs::File> {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in path.as_os_str().to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let lock = std::env::temp_dir().join(format!("ferrox-prompt-{hash:016x}.lock"));
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock);
+    match opened.and_then(|file| file.lock().map(|()| file)) {
+        Ok(file) => Some(file),
+        Err(error) => {
+            eprintln!("warning: could not lock {}: {error}", lock.display());
+            None
+        }
+    }
+}
+
+/// Replace a file by a same-directory rename, so a reader sees the old text or the new one, never
+/// a half-written file.
+fn replace_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temp, contents)?;
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        #[cfg(windows)]
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            std::fs::remove_file(path)?;
+            std::fs::rename(&temp, path)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
         }
     }
 }
@@ -2433,5 +2521,16 @@ fix issue #{issue} at {priority=P0 or P1} priority
         let updated = set_status_text(source, 2, Status::Done).expect("the real P2 is there");
         assert!(updated.contains("## P2 · Example\n**Status:** todo"));
         assert!(updated.ends_with("## P2 · Second\n\n**Status:** done\n"));
+    }
+
+    #[test]
+    fn set_status_keeps_crlf_line_endings() {
+        let source = "## P2 · Second\r\n\r\n  **Status:** todo\r\n**Leverage:** 5\r\n";
+        let updated = set_status_text(source, 2, Status::Done).expect("the field is there");
+        assert_eq!(
+            updated,
+            "## P2 · Second\r\n\r\n  **Status:** done\r\n**Leverage:** 5\r\n"
+        );
+        assert!(!updated.replace("\r\n", "").contains('\n'));
     }
 }

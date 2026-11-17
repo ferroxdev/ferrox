@@ -17,14 +17,62 @@ pub fn run(args: &[String]) -> i32 {
 fn write_pair(dir: &std::path::Path) -> Result<(), String> {
     let minted = mint()?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    for (name, pem) in [
-        ("cert.pem", minted.cert.pem()),
-        ("key.pem", minted.signing_key.serialize_pem()),
-    ] {
-        let path = dir.join(name);
-        std::fs::write(&path, pem.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    let cert_tmp = dir.join(format!(".cert.pem.{}.tmp", std::process::id()));
+    let key_tmp = dir.join(format!(".key.pem.{}.tmp", std::process::id()));
+    let result = publish(&cert, &key, &cert_tmp, &key_tmp, &minted);
+    for path in [&cert_tmp, &key_tmp] {
+        let _ = std::fs::remove_file(path);
     }
+    result
+}
+
+fn publish(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    cert_tmp: &std::path::Path,
+    key_tmp: &std::path::Path,
+    minted: &rcgen::CertifiedKey<rcgen::KeyPair>,
+) -> Result<(), String> {
+    write_temp(cert_tmp, minted.cert.pem().as_bytes(), false)?;
+    write_temp(key_tmp, minted.signing_key.serialize_pem().as_bytes(), true)?;
+    // `cert.pem` is the readiness marker; remove it before the key, so a new key never pairs with the old certificate.
+    for path in [cert, key] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    std::fs::rename(key_tmp, key).map_err(|e| format!("{}: {e}", key.display()))?;
+    std::fs::rename(cert_tmp, cert).map_err(|e| format!("{}: {e}", cert.display()))?;
     Ok(())
+}
+
+fn write_temp(path: &std::path::Path, bytes: &[u8], private: bool) -> Result<(), String> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(if private { 0o600 } else { 0o644 });
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = if private { 0o600 } else { 0o644 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    file.write_all(bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// `carrier.test` as both the subject and the one DNS alternative name, because a verifier reads

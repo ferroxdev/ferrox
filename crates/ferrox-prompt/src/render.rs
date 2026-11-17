@@ -52,7 +52,7 @@ pub fn render(
     options: Options,
 ) -> Rendered {
     let missing: Vec<String> = prompt
-        .required_inputs()
+        .required_inputs_for(addons)
         .filter(|name| !values.contains_key(*name))
         .map(str::to_owned)
         .collect();
@@ -321,7 +321,8 @@ pub fn resolve_addons(prompt: &Prompt, requests: &[String]) -> Result<Vec<Addon>
     if flat.len() == 1 && flat[0].eq_ignore_ascii_case("all") {
         return Ok(prompt.addons.clone());
     }
-    flat.dedup();
+    let mut seen = std::collections::HashSet::new();
+    flat.retain(|request| seen.insert(request.to_ascii_lowercase()));
     let mut resolved_addons = Vec::new();
     for request in flat {
         if let Some(addon) = prompt.addon(&request.to_ascii_lowercase()) {
@@ -712,9 +713,54 @@ fix issue #{issue}
             resolve_addons(prompt, &["miri,isa".into()]).unwrap().len(),
             2
         );
+        assert_eq!(
+            resolve_addons(prompt, &["miri".into(), "MIRI".into(), "isa".into()])
+                .unwrap()
+                .len(),
+            2,
+            "the same add-on is selected once, whatever the case and position"
+        );
         let missing = resolve_addons(prompt, &["nope".into()]).unwrap_err();
         assert!(missing.contains("isa-matrix"), "{missing}");
         assert!(missing.contains("no add-on matching `nope`"), "{missing}");
+    }
+
+    #[test]
+    fn only_a_selected_addons_inputs_are_required() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · One
+
+**When to use:** first
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Gates:** `cargo test`
+
+```text
+body {core}
+```
+
+**Add-on — Extra:** needs {extra}
+",
+        );
+        let prompt = library.prompt(1).unwrap();
+        assert_eq!(
+            prompt.required_inputs_for(&[]).collect::<Vec<_>>(),
+            ["core"]
+        );
+        let chosen = vec![prompt.addon("extra").unwrap().clone()];
+        assert_eq!(
+            prompt.required_inputs_for(&chosen).collect::<Vec<_>>(),
+            ["core", "extra"]
+        );
     }
 
     #[test]

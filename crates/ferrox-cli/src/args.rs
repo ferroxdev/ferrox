@@ -134,11 +134,18 @@ impl Default for Options {
 }
 
 fn env_port(name: &str, fallback: u16) -> u16 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|port| *port != 0)
-        .unwrap_or(fallback)
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => fallback,
+        Err(error) => die(&format!(
+            "{name} is not readable as a port: {error}; nothing was started."
+        )),
+        Ok(value) => match value.parse::<u16>() {
+            Ok(port) if port != 0 => port,
+            _ => die(&format!(
+                "{name} wants a port between 1 and 65535, got '{value}'; nothing was started."
+            )),
+        },
+    }
 }
 
 fn env_port_is_set(name: &str) -> bool {

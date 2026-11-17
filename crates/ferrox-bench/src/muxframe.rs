@@ -1,7 +1,9 @@
 use std::fmt::Write as _;
 
 use ferrox_core::addr::{self, Addr};
-use ferrox_core::mux::{self, decode, Network, NewTail, Outgoing, Status, DATA, GLOBAL_ID};
+use ferrox_core::mux::{
+    self, decode, Network, NewTail, Outgoing, Reflection, Status, Target, DATA, GLOBAL_ID,
+};
 
 use crate::count;
 use crate::framing::{best_of, timed_row, Row};
@@ -13,9 +15,6 @@ const ALLOC_ITERS: u64 = 64;
 #[derive(Default)]
 struct Scratch {
     meta: Vec<u8>,
-    addr0: Vec<u8>,
-    addr1: Vec<u8>,
-    addr2: Vec<u8>,
     data: Vec<u8>,
 }
 
@@ -143,9 +142,9 @@ struct Seen<'a> {
     id: u16,
     status: Status,
     options: u8,
-    target: Option<(Network, u16, &'a [u8])>,
+    target: Option<Target<'a>>,
     global_id: Option<[u8; GLOBAL_ID]>,
-    reflection: Option<(&'a [u8], Option<&'a [u8]>)>,
+    reflection: Option<Reflection<'a>>,
     data: &'a [u8],
     consumed: usize,
 }
@@ -156,17 +155,9 @@ impl<'a> Seen<'a> {
             id: frame.id,
             status: frame.status,
             options: frame.options,
-            target: frame
-                .target
-                .as_ref()
-                .map(|t| (t.network, t.port, t.addr.body())),
+            target: frame.target,
             global_id: frame.global_id,
-            reflection: frame.reflection.as_ref().map(|r| {
-                (
-                    r.source.addr.body(),
-                    r.local.as_ref().map(|l| l.addr.body()),
-                )
-            }),
+            reflection: frame.reflection,
             data: frame.data.unwrap_or(&[]),
             consumed,
         }
@@ -450,19 +441,19 @@ fn previous_decode<'a>(
     let mut target = None;
     let carried = meta.get(in_meta) == Some(&Network::Udp.byte());
     if status == Status::New || (status == Status::Keep && carried) {
-        target = Some(read_target(meta, &mut in_meta, &mut s.addr0)?);
+        target = Some(read_target(meta, &mut in_meta)?);
     }
 
     let mut global_id = None;
-    let mut reflected = false;
+    let mut reflection = None;
     if status == Status::New {
         match tail {
             NewTail::Reverse => {
-                reflected = read_reflection(meta, &mut in_meta, &mut s.addr1, &mut s.addr2)?;
+                reflection = read_reflection(meta, &mut in_meta)?;
             }
             NewTail::Forward => {
                 if options & DATA != 0
-                    && target.is_some_and(|(network, _)| network == Network::Udp)
+                    && target.is_some_and(|target| target.network == Network::Udp)
                     && meta.len() - in_meta >= GLOBAL_ID
                 {
                     let mut identity = [0u8; GLOBAL_ID];
@@ -487,14 +478,9 @@ fn previous_decode<'a>(
             id,
             status,
             options,
-            target: target.map(|(network, port)| (network, port, s.addr0.as_slice())),
+            target,
             global_id,
-            reflection: reflected.then(|| {
-                (
-                    s.addr1.as_slice(),
-                    s.addr2.first().map(|_| s.addr2.as_slice()),
-                )
-            }),
+            reflection,
             data: s.data.as_slice(),
             consumed: at,
         },
@@ -502,58 +488,58 @@ fn previous_decode<'a>(
     ))
 }
 
-fn read_target(
-    meta: &[u8],
-    at: &mut usize,
-    into: &mut Vec<u8>,
-) -> Result<(Network, u16), mux::Error> {
+fn read_target(meta: &[u8], at: &mut usize) -> Result<Target<'_>, mux::Error> {
     let network_byte = *meta.get(*at).ok_or(mux::Error::Truncated)?;
     *at += 1;
     let network = Network::from_byte(network_byte).ok_or(mux::Error::Network(network_byte))?;
     let mut pair = [0u8; 2];
     pair.copy_from_slice(read_slice(meta, at, 2)?);
     let port = u16::from_be_bytes(pair);
-    read_addr(meta, at, into)?;
-    Ok((network, port))
+    let addr = read_addr(meta, at)?;
+    Ok(Target {
+        network,
+        port,
+        addr,
+    })
 }
 
-fn read_addr(meta: &[u8], at: &mut usize, into: &mut Vec<u8>) -> Result<(), mux::Error> {
+fn read_addr(meta: &[u8], at: &mut usize) -> Result<Addr<'_>, mux::Error> {
     let family = *meta.get(*at).ok_or(mux::Error::Truncated)?;
     *at += 1;
-    into.clear();
     match family {
-        addr::IPV4 => into.extend_from_slice(read_slice(meta, at, 4)?),
-        addr::IPV6 => into.extend_from_slice(read_slice(meta, at, 16)?),
+        addr::IPV4 => {
+            let mut octets = [0u8; 4];
+            octets.copy_from_slice(read_slice(meta, at, 4)?);
+            Ok(Addr::V4(octets))
+        }
+        addr::IPV6 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(read_slice(meta, at, 16)?);
+            Ok(Addr::V6(octets))
+        }
         addr::DOMAIN => {
             let len = usize::from(*meta.get(*at).ok_or(mux::Error::Truncated)?);
             *at += 1;
-            into.extend_from_slice(read_slice(meta, at, len)?);
+            Ok(Addr::Name(read_slice(meta, at, len)?))
         }
-        other => return Err(mux::Error::Family(other)),
+        other => Err(mux::Error::Family(other)),
     }
-    Ok(())
 }
 
-fn read_reflection(
-    meta: &[u8],
-    at: &mut usize,
-    source: &mut Vec<u8>,
-    local: &mut Vec<u8>,
-) -> Result<bool, mux::Error> {
+fn read_reflection(meta: &[u8], at: &mut usize) -> Result<Option<Reflection<'_>>, mux::Error> {
     let Some(&first) = meta.get(*at) else {
-        local.clear();
-        return Ok(false);
+        return Ok(None);
     };
     if first == 0 {
-        local.clear();
-        return Ok(false);
+        return Ok(None);
     }
-    read_target(meta, at, source)?;
-    local.clear();
-    match read_target(meta, at, local) {
-        Ok(_) | Err(mux::Error::Network(0) | mux::Error::Truncated) => Ok(true),
-        Err(other) => Err(other),
-    }
+    let source = read_target(meta, at)?;
+    let local = match read_target(meta, at) {
+        Ok(target) => Some(target),
+        Err(mux::Error::Network(0) | mux::Error::Truncated) => None,
+        Err(other) => return Err(other),
+    };
+    Ok(Some(Reflection { source, local }))
 }
 
 fn read_u16(buf: &[u8], at: &mut usize) -> Result<u16, mux::Error> {

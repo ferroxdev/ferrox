@@ -87,9 +87,16 @@ fn owned(paths: &Paths) -> Result<bool, String> {
         }
     };
     let owner = serde_json::from_str::<String>(&text).unwrap_or(text);
-    let snapshot = paths.proxy_state.to_string_lossy();
-    Ok(owner == snapshot
-        || (owner == paths.conf_dir.to_string_lossy() && paths.proxy_state.is_file()))
+    Ok(same_root(&owner, paths))
+}
+
+fn same_root(owner: &str, paths: &Paths) -> bool {
+    let root = paths.conf_dir.to_string_lossy();
+    if cfg!(windows) {
+        owner.eq_ignore_ascii_case(&root)
+    } else {
+        owner == root
+    }
 }
 
 #[allow(clippy::unnecessary_wraps)] // Windows restores the registry and can fail; the other targets only remove files.
@@ -404,7 +411,7 @@ mod win {
                 return Err(format!("system proxy: cannot record the snapshot: {error}"));
             }
         }
-        let owner = json!(paths.proxy_state.to_string_lossy()).to_string();
+        let owner = json!(paths.conf_dir.to_string_lossy()).to_string();
         if let Err(error) = write_private(&paths.proxy_owner, &owner) {
             close(key);
             if fresh {
@@ -480,5 +487,56 @@ mod win {
         let _ = std::fs::remove_file(&paths.proxy_state);
         let _ = std::fs::remove_file(&paths.proxy_owner);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ferrox-proxy-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ))
+    }
+
+    #[test]
+    fn only_the_root_that_armed_owns_a_shared_snapshot() {
+        let shared = workspace("shared");
+        let first = Paths::with_dirs(shared.join("first"), shared.clone(), None);
+        let second = Paths::with_dirs(shared.join("second"), shared.clone(), None);
+        std::fs::create_dir_all(&shared).expect("state");
+        std::fs::write(&first.proxy_state, "{}").expect("snapshot");
+        crate::paths::write_private(
+            &first.proxy_owner,
+            &serde_json::to_string(&first.conf_dir).expect("owner"),
+        )
+        .expect("owner file");
+        assert_eq!(owned(&first), Ok(true));
+        assert_eq!(owned(&second), Ok(false));
+        let _ = std::fs::remove_dir_all(&shared);
+    }
+
+    #[test]
+    fn a_plain_root_owner_still_reads() {
+        let dir = workspace("plain");
+        let paths = Paths::with_dirs(dir.join("conf"), dir.join("state"), None);
+        std::fs::create_dir_all(&paths.state_dir).expect("state");
+        crate::paths::write_private(&paths.proxy_owner, &paths.conf_dir.to_string_lossy())
+            .expect("owner file");
+        assert_eq!(owned(&paths), Ok(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_absent_owner_file_is_clearable() {
+        let dir = workspace("absent");
+        let paths = Paths::with_dirs(dir.join("conf"), dir.join("state"), None);
+        assert_eq!(owned(&paths), Ok(true));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

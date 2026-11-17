@@ -242,6 +242,8 @@ pub struct Ledger {
     pub entries: Vec<Entry>,
     /// Non-entry lines, counted so a truncated or hand-edited log is visible rather than silently shortening suppression.
     pub skipped: usize,
+    /// A ledger that exists but could not be read; unlike a missing file, this is not an empty history.
+    pub read_error: Option<String>,
 }
 
 impl Ledger {
@@ -256,21 +258,40 @@ impl Ledger {
             path,
             ..Self::default()
         };
-        let Ok(bytes) = std::fs::read(&ledger.path) else {
-            return ledger;
+        let bytes = match std::fs::read(&ledger.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ledger,
+            Err(error) => {
+                ledger.read_error = Some(format!(
+                    "could not read the ledger {}: {error}",
+                    ledger.path.display()
+                ));
+                return ledger;
+            }
         };
-        let text = String::from_utf8_lossy(&bytes);
-        for line in text.lines() {
-            let mut fields = line.split_whitespace();
-            let (Some(at), Some(id), Some(how)) = (fields.next(), fields.next(), fields.next())
-            else {
-                if !line.trim().is_empty() {
-                    ledger.skipped += 1;
-                }
+        for bytes in bytes.split(|byte| *byte == b'\n') {
+            let Ok(line) = std::str::from_utf8(bytes) else {
+                ledger.skipped += 1;
                 continue;
             };
-            // Only the `t=`-prefixed fourth field is the matrix target; `--rotate` inside `how` is not.
-            let target = fields.find_map(|field| field.strip_prefix("t=").map(str::to_owned));
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut fields = line.splitn(3, ' ');
+            let (Some(at), Some(id)) = (fields.next(), fields.next()) else {
+                ledger.skipped += 1;
+                continue;
+            };
+            let Some(rest) = fields.next() else {
+                ledger.skipped += 1;
+                continue;
+            };
+            // `how` may hold spaces (`next --rotate`); only a trailing ` t=` starts the matrix target.
+            let (how, target) = match rest.rsplit_once(" t=") {
+                Some((how, target)) => (how, Some(target.to_owned())),
+                None => (rest, None),
+            };
             match id.trim_start_matches(['P', 'p']).parse::<u32>() {
                 Ok(id) => ledger.entries.push(Entry {
                     at: at.to_owned(),
@@ -689,6 +710,7 @@ b
         let reread = Ledger::load(path.clone());
         assert_eq!(reread.entries.len(), 3);
         assert_eq!(reread.skipped, 0);
+        assert!(reread.read_error.is_none());
         assert_eq!(reread.targets_for(3), vec!["A13"]);
         drop(ledger);
         drop(reread);
@@ -708,6 +730,46 @@ b
         assert_eq!(ledger.entries.len(), 1);
         assert_eq!(ledger.skipped, 2);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn the_ledger_keeps_the_whole_how_field() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ferrox-ledger-how-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut ledger = Ledger::load(path.clone());
+        ledger.record(2, "next --rotate", Some("A13")).unwrap();
+        ledger.record(3, "render --row", None).unwrap();
+        let reread = Ledger::load(path.clone());
+        assert_eq!(reread.entries[0].how, "next --rotate");
+        assert_eq!(reread.entries[1].how, "render --row");
+        assert_eq!(reread.targets_for(2), vec!["A13"]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_ledger_is_an_error_and_a_bad_line_is_counted() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("ferrox-ledger-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocked = Ledger::load(dir.clone());
+        assert!(blocked.read_error.is_some(), "a directory is not history");
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("ferrox-ledger-utf8-{}.log", std::process::id()));
+        std::fs::write(
+            &path,
+            b"2026-10-02T00:00:00Z P2 next\n\xff\n2026-10-02T00:00:01Z P3 next --rotate\n",
+        )
+        .unwrap();
+        let ledger = Ledger::load(path.clone());
+        assert_eq!(ledger.entries.len(), 2);
+        assert_eq!(ledger.skipped, 1);
+        assert!(ledger.read_error.is_none());
+        assert_eq!(ledger.entries[1].how, "next --rotate");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
