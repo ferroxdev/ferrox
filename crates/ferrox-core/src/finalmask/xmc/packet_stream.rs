@@ -977,6 +977,7 @@ mod tests {
             .expect("reader")
             .buffer
             .extend_from_slice(&wire);
+        drop(client.pending_keepalive.lock().expect("pending keepalive"));
         let mut got = vec![0; payload.len()];
         let mut first = [0u8; 4096];
         let (read, counts) = crate::alloc_count::measure(|| client.read(&mut first));
