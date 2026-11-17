@@ -130,6 +130,22 @@ pub(crate) fn serve(mut stream: Connection, users: &[SsUser], freedom: bool) {
             serve_mux_connection(&stream, accepted);
             return;
         }
+        Request::Rendezvous(header_len) => {
+            crate::accesslog::record_current(&format_args!(
+                "{}:{}",
+                crate::singmux::HOST,
+                crate::singmux::PORT
+            ));
+            let carried = chunk[header_len..].to_vec();
+            drop(head);
+            let Some(accepted) =
+                singmux_after_handshake(user, &mut stream, Recv::Ready(recv), carried)
+            else {
+                return;
+            };
+            serve_mux_connection(&stream, accepted);
+            return;
+        }
         Request::Target(target, header_len) => (target, header_len),
     };
     crate::accesslog::record_current(&target);
@@ -243,6 +259,19 @@ fn serve_stream(mut stream: Connection, user: &SsUser) {
         Request::Mux(consumed) => {
             crate::accesslog::record_current(&format_args!("{MUX_HOST}:{MUX_PORT}"));
             let Some(accepted) = stream_mux(&mut stream, &master, recv, &head[consumed..len])
+            else {
+                return;
+            };
+            serve_mux_connection(&stream, accepted);
+            return;
+        }
+        Request::Rendezvous(consumed) => {
+            crate::accesslog::record_current(&format_args!(
+                "{}:{}",
+                crate::singmux::HOST,
+                crate::singmux::PORT
+            ));
+            let Some(accepted) = singmux_stream(&mut stream, &master, recv, &head[consumed..len])
             else {
                 return;
             };
@@ -526,6 +555,15 @@ fn accept_stream(
             return stream_mux(writer, master, recv, &head[consumed..len])
                 .map(|accepted| (accepted, meter));
         }
+        Request::Rendezvous(consumed) => {
+            crate::accesslog::record_current(&format_args!(
+                "{}:{}",
+                crate::singmux::HOST,
+                crate::singmux::PORT
+            ));
+            return singmux_stream(writer, master, recv, &head[consumed..len])
+                .map(|accepted| (accepted, meter));
+        }
         Request::Target(target, consumed) => (target, consumed),
     };
     crate::accesslog::record_current(&target);
@@ -570,6 +608,16 @@ fn accept_on(
             return mux_after_handshake(user, writer, Recv::Ready(recv), carried)
                 .map(|accepted| (accepted, meter));
         }
+        Request::Rendezvous(header_len) => {
+            crate::accesslog::record_current(&format_args!(
+                "{}:{}",
+                crate::singmux::HOST,
+                crate::singmux::PORT
+            ));
+            let carried = chunk[header_len..].to_vec();
+            return singmux_after_handshake(user, writer, Recv::Ready(recv), carried)
+                .map(|accepted| (accepted, meter));
+        }
         Request::Target(target, header_len) => (target, header_len),
     };
     crate::accesslog::record_current(&target);
@@ -595,6 +643,7 @@ fn accept_on(
 /// from the raw header before resolution and never dialed.
 enum Request {
     Mux(usize),
+    Rendezvous(usize),
     Target(SocketAddr, usize),
 }
 
@@ -602,7 +651,23 @@ fn parse_request(buf: &[u8]) -> Option<Request> {
     if let Some(used) = mux_header_len(buf) {
         return Some(Request::Mux(used));
     }
+    if let Some(used) = rendezvous_header_len(buf) {
+        return Some(Request::Rendezvous(used));
+    }
     parse_addr_header(buf).map(|(target, used)| Request::Target(target, used))
+}
+
+fn rendezvous_header_len(buf: &[u8]) -> Option<usize> {
+    if buf.first() != Some(&3) {
+        return None;
+    }
+    let (crate::proxy::AddrBody::Domain(host), at) =
+        crate::proxy::parse_addr_body(buf, crate::proxy::AddrKind::Domain)?
+    else {
+        return None;
+    };
+    let port = u16::from_be_bytes([*buf.get(at)?, *buf.get(at + 1)?]);
+    crate::singmux::is_rendezvous(host, port).then_some(at + 2)
 }
 
 /// The reference compares the mux domain alone, so the port a client chose never gates the session.
@@ -639,6 +704,26 @@ fn mux_after_handshake(
     })
 }
 
+fn singmux_after_handshake(
+    user: &SsUser,
+    writer: &mut dyn Write,
+    recv: Recv,
+    carried: Vec<u8>,
+) -> Option<Accepted> {
+    match mux_after_handshake(user, writer, recv, carried)? {
+        Accepted::Mux {
+            send,
+            recv,
+            carried,
+        } => Some(Accepted::SingMux {
+            send,
+            recv,
+            carried,
+        }),
+        _ => None,
+    }
+}
+
 /// The stream rung's mux answer: the reply IV goes out in the clear and whatever rode the header enters the session.
 fn stream_mux(
     writer: &mut dyn Write,
@@ -656,6 +741,26 @@ fn stream_mux(
         recv: Recv::StreamReady(recv),
         carried: carried.to_vec(),
     })
+}
+
+fn singmux_stream(
+    writer: &mut dyn Write,
+    master: &MasterKey,
+    recv: Rc4,
+    carried: &[u8],
+) -> Option<Accepted> {
+    match stream_mux(writer, master, recv, carried)? {
+        Accepted::Mux {
+            send,
+            recv,
+            carried,
+        } => Some(Accepted::SingMux {
+            send,
+            recv,
+            carried,
+        }),
+        _ => None,
+    }
 }
 
 /// A mux session on a socket this thread owns: the reader, writer and close are the socket's own clones.
@@ -714,6 +819,17 @@ fn serve_accepted<R, W>(
             let reader = SsMuxReader::new(reader, recv);
             let writer = SsMuxWriter::new(writer, send);
             crate::proxy::serve_mux_tunnel(Box::new(reader), Box::new(writer), close, &carried);
+        }
+        Accepted::SingMux {
+            send,
+            recv,
+            carried,
+        } => {
+            let mut reader = reader;
+            reader.arm_relay_poll();
+            let reader = SsMuxReader::new(reader, recv);
+            let writer = SsMuxWriter::new(writer, send);
+            crate::proxy::serve_singmux_tunnel(Box::new(reader), Box::new(writer), close, &carried);
         }
     }
 }
@@ -903,6 +1019,11 @@ pub(crate) enum Accepted {
         recv: Recv,
     },
     Mux {
+        send: Uplink,
+        recv: Recv,
+        carried: Vec<u8>,
+    },
+    SingMux {
         send: Uplink,
         recv: Recv,
         carried: Vec<u8>,

@@ -78,6 +78,7 @@ mod router;
 mod router_script;
 mod shadowsocks;
 mod shadowsocks2022;
+mod singmux;
 mod sniff;
 mod sockopt;
 mod socks;

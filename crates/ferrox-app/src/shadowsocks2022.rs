@@ -59,13 +59,14 @@ fn padding_for(payload_len: usize) -> usize {
 fn read_request_header(stream: &mut dyn Read, recv: &mut Cipher) -> Option<(SocketAddr, Vec<u8>)> {
     match read_request(stream, recv)? {
         (Request::Target(target), early) => Some((target, early)),
-        (Request::Mux, _) => None,
+        (Request::Mux | Request::Rendezvous, _) => None,
     }
 }
 
 #[derive(Clone, Copy)]
 enum Request {
     Mux,
+    Rendezvous,
     Target(SocketAddr),
 }
 
@@ -94,6 +95,8 @@ fn read_request(stream: &mut dyn Read, recv: &mut Cipher) -> Option<(Request, Ve
     variable.truncate(var_len);
     let (target, used, mux) = if let Some(used) = mux_header_len(&variable) {
         (Request::Mux, used, true)
+    } else if let Some(used) = rendezvous_header_len(&variable) {
+        (Request::Rendezvous, used, true)
     } else {
         let (target, used) = parse_addr_header(&variable)?;
         (Request::Target(target), used, false)
@@ -108,6 +111,19 @@ fn read_request(stream: &mut dyn Read, recv: &mut Cipher) -> Option<(Request, Ve
     }
     variable.drain(..at);
     Some((target, variable))
+}
+
+fn rendezvous_header_len(buf: &[u8]) -> Option<usize> {
+    if buf.first() != Some(&3) {
+        return None;
+    }
+    let (crate::proxy::AddrBody::Domain(host), at) =
+        crate::proxy::parse_addr_body(buf, crate::proxy::AddrKind::Domain)?
+    else {
+        return None;
+    };
+    let port = u16::from_be_bytes([*buf.get(at)?, *buf.get(at + 1)?]);
+    crate::singmux::is_rendezvous(host, port).then_some(at + 2)
 }
 
 /// The reference compares the mux domain alone, so the port a client chose never gates the session.
@@ -274,6 +290,7 @@ struct Accepted {
 enum AcceptedBody {
     Direct(Connection),
     Mux(Vec<u8>),
+    SingMux(Vec<u8>),
 }
 
 fn accept_on(
@@ -353,6 +370,14 @@ fn accept_request(
             ));
             AcceptedBody::Mux(early)
         }
+        Request::Rendezvous => {
+            crate::accesslog::record_current(&format_args!(
+                "{}:{}",
+                crate::singmux::HOST,
+                crate::singmux::PORT
+            ));
+            AcceptedBody::SingMux(early)
+        }
         Request::Target(target) => {
             crate::accesslog::record_current(&target);
             let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
@@ -396,6 +421,18 @@ fn serve_accepted<R, W>(
             let writer = MuxWriter::server(writer, response);
             crate::proxy::spawn_carried(move || {
                 crate::proxy::serve_mux_tunnel(Box::new(reader), Box::new(writer), close, &carried);
+            });
+        }
+        AcceptedBody::SingMux(carried) => {
+            let reader = MuxReader::new(reader, recv);
+            let writer = MuxWriter::server(writer, response);
+            crate::proxy::spawn_carried(move || {
+                crate::proxy::serve_singmux_tunnel(
+                    Box::new(reader),
+                    Box::new(writer),
+                    close,
+                    &carried,
+                );
             });
         }
     }
