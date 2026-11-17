@@ -4027,7 +4027,7 @@ fn pump(
     let buf = room.as_mut();
     // The batch lives across the turns, so a turn does not build the slots again.
     let mut batch = Batch::new();
-    let _exit = PumpExit(table);
+    let mut exit = PumpExit { table, armed: true };
     loop {
         let before = *local;
         if !rebind_if_moved(shared, sock, peer, net, local) {
@@ -4112,6 +4112,7 @@ fn pump(
             }
             // A quiet socket and an empty lane ends the thread; the lease that follows it starts the next one on the same connection.
             if timed_out && park_if_idle(table) {
+                exit.armed = false;
                 return;
             }
         }
@@ -4275,11 +4276,18 @@ fn fail_session(table: &Arc<Mutex<PooledState>>, id: u64) {
 }
 
 /// Every flow a pump was serving when it left: the lane is no longer driven, so the client halves end here.
-struct PumpExit<'a>(&'a Arc<Mutex<PooledState>>);
+struct PumpExit<'a> {
+    table: &'a Arc<Mutex<PooledState>>,
+    /// Cleared when idle parking hands the lane to a replacement pump, whose sessions are not ours to end.
+    armed: bool,
+}
 
 impl Drop for PumpExit<'_> {
     fn drop(&mut self) {
-        let Ok(mut state) = self.0.lock() else {
+        if !self.armed {
+            return;
+        }
+        let Ok(mut state) = self.table.lock() else {
             return;
         };
         state.opening.clear();

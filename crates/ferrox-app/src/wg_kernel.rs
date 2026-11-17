@@ -222,7 +222,12 @@ fn setup(
     config: &DeviceConfig,
     attempt: &mut Attempt,
 ) -> io::Result<()> {
-    route.request(link_create_message(name, config.mtu))?;
+    if let Err(error) = route.request(link_create_message(name, config.mtu)) {
+        // A lost acknowledgement can leave the link behind; a name that resolves means this attempt may have created it.
+        attempt.link_created =
+            error.raw_os_error() != Some(libc::EEXIST) && interface_index(name).is_ok();
+        return Err(error);
+    }
     attempt.link_created = true;
     let ifindex = interface_index(name)?;
     attempt.index = Some(ifindex);

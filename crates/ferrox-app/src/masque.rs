@@ -307,8 +307,8 @@ impl MasqueOut {
     /// Take a lane out of the pool: an idle one stops now, a busy one stops when its
     /// last flow drops, so its stack thread and connection are never left behind.
     fn end(lane: &PoolLane) {
-        lane.inner.retire.store(true, Ordering::Release);
-        if lane.active.load(Ordering::Acquire) == 0 {
+        lane.inner.retire.store(true, Ordering::SeqCst);
+        if lane.active.load(Ordering::SeqCst) == 0 {
             lane.inner.alive.store(false, Ordering::Release);
         }
     }
