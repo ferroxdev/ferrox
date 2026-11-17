@@ -4079,7 +4079,13 @@ mod tests {
         }
         let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
         let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
-        writer.set_nonblocking(true)?;
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
         let chunk = [0u8; 4096];
         loop {
             match writer.write(&chunk) {
