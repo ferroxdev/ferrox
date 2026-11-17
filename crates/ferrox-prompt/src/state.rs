@@ -58,7 +58,7 @@ pub struct MethodRow {
     /// The table letter, `A` through `R`.
     pub section: char,
     /// The `#` cell, the row's stable number across the whole matrix.
-    pub index: u32,
+    pub index: String,
     /// The method name as written, minus Markdown emphasis and links.
     pub method: String,
     /// The state cell, the verdict text that decides open versus done.
@@ -141,6 +141,7 @@ pub fn is_implemented(state: &str) -> bool {
         || lower.contains("not carried")
         || lower.contains("not parsed")
         || lower.contains("not implemented")
+        || lower.contains("unimplemented")
         || lower.contains("refused");
     if lower.contains("implemented") && !negated {
         return true;
@@ -282,9 +283,15 @@ pub fn methods_from_text(text: &str) -> Vec<MethodRow> {
         }
         let row = cells(trimmed);
         let Some(first) = row.first() else { continue };
-        let Ok(index) = first.parse::<u32>() else {
+        let index = first.trim();
+        // Matrix ids grow suffixes (`61b`, `71a`), so an id is alphanumeric and starts with a digit.
+        if !index.starts_with(|character: char| character.is_ascii_digit())
+            || !index
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        {
             continue;
-        };
+        }
         let Some(name) = row.get(1) else { continue };
         let Some(state_cell) = row.get(2) else {
             continue;
@@ -303,7 +310,7 @@ pub fn methods_from_text(text: &str) -> Vec<MethodRow> {
         }
         rows.push(MethodRow {
             section: letter,
-            index,
+            index: index.to_owned(),
             method,
             implemented: is_implemented(&state),
             gap: gap_of(&state),
@@ -427,7 +434,7 @@ mod tests {
 | 76 | Foxy lane | in tree, proven | configer | — |
 ";
 
-    fn find(rows: &[MethodRow], index: u32) -> MethodRow {
+    fn find(rows: &[MethodRow], index: &str) -> MethodRow {
         rows.iter()
             .find(|row| row.index == index)
             .cloned()
@@ -438,30 +445,30 @@ mod tests {
     fn a_row_without_implemented_in_its_state_cell_is_open() {
         let rows = methods_from_text(MATRIX);
         // `server only` and `not carried` stay open despite prose beside them: the verdict lives in the state cell alone.
-        assert!(!find(&rows, 1).implemented);
-        assert!(!find(&rows, 16).implemented);
-        assert!(!find(&rows, 45).implemented);
-        assert_eq!(find(&rows, 1).gap, Gap::Partial);
-        assert_eq!(find(&rows, 16).gap, Gap::Partial);
-        assert_eq!(find(&rows, 45).gap, Gap::Planned);
-        assert_eq!(find(&rows, 46).gap, Gap::NotScheduled);
-        assert!(find(&rows, 17).high_priority);
+        assert!(!find(&rows, "1").implemented);
+        assert!(!find(&rows, "16").implemented);
+        assert!(!find(&rows, "45").implemented);
+        assert_eq!(find(&rows, "1").gap, Gap::Partial);
+        assert_eq!(find(&rows, "16").gap, Gap::Partial);
+        assert_eq!(find(&rows, "45").gap, Gap::Planned);
+        assert_eq!(find(&rows, "46").gap, Gap::NotScheduled);
+        assert!(find(&rows, "17").high_priority);
     }
 
     #[test]
     fn an_implemented_row_is_closed_and_both_roles_counts_as_shipped() {
         let rows = methods_from_text(MATRIX);
-        assert!(find(&rows, 3).implemented);
-        assert!(find(&rows, 76).implemented);
+        assert!(find(&rows, "3").implemented);
+        assert!(find(&rows, "76").implemented);
     }
 
     #[test]
     fn the_state_cell_is_the_third_column_in_every_table() {
         let rows = methods_from_text(MATRIX);
-        assert_eq!(find(&rows, 1).section, 'A');
-        assert_eq!(find(&rows, 1).state, "server only");
-        assert_eq!(find(&rows, 45).section, 'C');
-        assert_eq!(find(&rows, 45).state, "planned");
+        assert_eq!(find(&rows, "1").section, 'A');
+        assert_eq!(find(&rows, "1").state, "server only");
+        assert_eq!(find(&rows, "45").section, 'C');
+        assert_eq!(find(&rows, "45").state, "planned");
     }
 
     #[test]
@@ -479,9 +486,9 @@ mod tests {
     #[test]
     fn method_names_are_cleaned_and_pages_derived() {
         let rows = methods_from_text(MATRIX);
-        assert_eq!(find(&rows, 1).method, "VLESS TCP REALITY");
-        assert_eq!(find(&rows, 1).page, "docs/function/vless.md");
-        assert_eq!(find(&rows, 45).page, "docs/function/wireguard-udp.md");
+        assert_eq!(find(&rows, "1").method, "VLESS TCP REALITY");
+        assert_eq!(find(&rows, "1").page, "docs/function/vless.md");
+        assert_eq!(find(&rows, "45").page, "docs/function/wireguard-udp.md");
     }
 
     #[test]

@@ -20,18 +20,41 @@ fn content_tokens(text: &str) -> Vec<String> {
         "to", "too", "us", "was", "we", "were", "what", "when", "which", "who", "will", "would",
         "you", "your",
     ];
+    let bytes = text.as_bytes();
     let mut stripped = String::new();
-    let mut in_code = false;
+    let mut index = 0;
     let mut in_blank = false;
-    for character in text.chars() {
-        match character {
-            '`' => in_code = !in_code,
-            '{' => in_blank = true,
-            '}' => in_blank = false,
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' => {
+                let width = bytes[index..]
+                    .iter()
+                    .take_while(|byte| **byte == b'`')
+                    .count();
+                let Some(close) = closing_fence(bytes, index + width, width) else {
+                    // An unmatched run is literal text, not an endless span.
+                    for _ in 0..width {
+                        stripped.push('`');
+                    }
+                    index += width;
+                    continue;
+                };
+                index = close + width;
+            }
+            b'{' => {
+                in_blank = true;
+                index += 1;
+            }
+            b'}' => {
+                in_blank = false;
+                index += 1;
+            }
             _ => {
-                if !in_code && !in_blank {
+                let character = text[index..].chars().next().expect("a byte starts a char");
+                if !in_blank {
                     stripped.push(character);
                 }
+                index += character.len_utf8();
             }
         }
     }
@@ -42,6 +65,25 @@ fn content_tokens(text: &str) -> Vec<String> {
             word.len() > 2 && !word.chars().all(char::is_numeric) && !STOP.contains(&word.as_str())
         })
         .collect()
+}
+
+/// The byte offset of the next backtick run of exactly `width`, or `None` when the span never closes.
+fn closing_fence(bytes: &[u8], mut index: usize, width: usize) -> Option<usize> {
+    while index < bytes.len() {
+        if bytes[index] == b'`' {
+            let run = bytes[index..]
+                .iter()
+                .take_while(|byte| **byte == b'`')
+                .count();
+            if run == width {
+                return Some(index);
+            }
+            index += run;
+        } else {
+            index += 1;
+        }
+    }
+    None
 }
 
 /// The longest run of consecutive words `a` and `b` share, and the phrase.
@@ -245,6 +287,19 @@ fn looks_like_a_command(gate: &str) -> bool {
 /// Defaults that are empty, which render as a hole that looks like a value.
 fn check_placeholders(prompt: &Prompt, findings: &mut Vec<Diagnostic>) {
     for placeholder in &prompt.placeholders {
+        if prompt.targets.is_matrix()
+            && !crate::expand::FILLABLE.contains(&placeholder.name.as_str())
+        {
+            findings.push(Diagnostic::warning(
+                prompt.line,
+                format!(
+                    "P{}: `{{{}}}` is not a matrix-filled placeholder; a matrix template draws only {}",
+                    prompt.id,
+                    placeholder.name,
+                    crate::expand::FILLABLE.join(", ")
+                ),
+            ));
+        }
         if placeholder.default.as_deref() == Some("") {
             findings.push(Diagnostic::warning(
                 prompt.line,

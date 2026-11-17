@@ -304,6 +304,8 @@ impl Prompt {
 pub struct Library {
     /// The file it came from, for every message it prints.
     pub path: PathBuf,
+    /// The resolved file that `set-status` rewrites when the display path is root-relative.
+    pub source_path: PathBuf,
     /// The text it was parsed from, so the tag can name exactly this version.
     pub source: String,
     /// Prepended to every rendered prompt.
@@ -390,6 +392,7 @@ impl Library {
 
         let mut library = Self {
             path: path.to_path_buf(),
+            source_path: path.to_path_buf(),
             source: text.to_owned(),
             shared_protocol,
             prompts,
@@ -508,11 +511,55 @@ fn heading_body(line: &str) -> Option<&str> {
     line.strip_prefix("## ").map(str::trim_end)
 }
 
-/// Index of the next `## ` heading at or after `from`, or the line count.
+/// Index of the next `## ` heading at or after `from`, or the line count. A fence's body is
+/// prose, so a `## ` line inside one is not a section boundary.
 fn next_heading(lines: &[&str], from: usize) -> usize {
-    (from..lines.len())
-        .find(|&index| heading_body(lines[index]).is_some())
-        .unwrap_or(lines.len())
+    let mut fence: Option<(char, usize)> = None;
+    for (index, line) in lines.iter().enumerate().skip(from) {
+        if let Some((marker, width)) = fence {
+            if closes_fence(line, marker, width) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some((marker, width)) = opens_fence(line) {
+            fence = Some((marker, width));
+            continue;
+        }
+        if heading_body(line).is_some() {
+            return index;
+        }
+    }
+    lines.len()
+}
+
+/// Up to three leading spaces are indentation; four make the line code, not a fence.
+fn fence_body(line: &str) -> Option<&str> {
+    let body = line.trim_start_matches(' ');
+    (line.len() - body.len() <= 3).then_some(body)
+}
+
+/// A fence opening (` ``` ` or `~~~`, at least three) with its marker and width.
+pub fn opens_fence(line: &str) -> Option<(char, usize)> {
+    let body = fence_body(line)?;
+    let marker = body.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    let width = body.chars().take_while(|ch| *ch == marker).count();
+    if width < 3 || (marker == '`' && body[width..].contains('`')) {
+        return None;
+    }
+    Some((marker, width))
+}
+
+/// A closing fence: the same marker at the same width, with only spaces or tabs after it.
+pub fn closes_fence(line: &str, marker: char, width: usize) -> bool {
+    let Some(body) = fence_body(line) else {
+        return false;
+    };
+    let run = body.chars().take_while(|ch| *ch == marker).count();
+    run >= width && body[run..].chars().all(|ch| ch == ' ' || ch == '\t')
 }
 
 /// Case-insensitive: the one field name with no id to attach is the one people capitalise.
@@ -548,22 +595,28 @@ fn single_fenced_block(
 ) -> String {
     let mut open = None;
     let mut closed = None;
+    let mut fence: Option<(char, usize)> = None;
     for (offset, section_line) in section.iter().enumerate() {
-        if is_fence(section_line) {
-            match open {
-                None => open = Some(offset),
-                Some(_) if closed.is_none() => closed = Some(offset),
-                Some(_) => {
-                    diagnostics.push(Diagnostic::error(
-                        line + offset + 1,
-                        format!(
-                            "a second fenced block in the {what} section; exactly one is read, and \
-                             which one is not a question this tool answers"
-                        ),
-                    ));
-                    return String::new();
-                }
+        if let Some((marker, width)) = fence {
+            if closes_fence(section_line, marker, width) {
+                closed = Some(offset);
+                fence = None;
             }
+            continue;
+        }
+        if let Some((marker, width)) = opens_fence(section_line) {
+            if open.is_some() {
+                diagnostics.push(Diagnostic::error(
+                    line + offset + 1,
+                    format!(
+                        "a second fenced block in the {what} section; exactly one is read, and \
+                         which one is not a question this tool answers"
+                    ),
+                ));
+                return String::new();
+            }
+            open = Some(offset);
+            fence = Some((marker, width));
         }
     }
     match (open, closed) {
@@ -585,9 +638,19 @@ fn single_fenced_block(
     }
 }
 
-/// Whether a line opens or closes a fenced block.
-fn is_fence(line: &str) -> bool {
-    line.trim_start().starts_with("```")
+/// True for a fence delimiter and for every line inside it, so callers can skip both.
+fn inside_fence(fence: &mut Option<(char, usize)>, line: &str) -> bool {
+    if let Some((marker, width)) = *fence {
+        if closes_fence(line, marker, width) {
+            *fence = None;
+        }
+        true
+    } else if let Some((marker, width)) = opens_fence(line) {
+        *fence = Some((marker, width));
+        true
+    } else {
+        false
+    }
 }
 
 /// Strip common indentation and trailing blanks, so a prompt is not pasted with four spaces per line.
@@ -718,14 +781,10 @@ fn parse_prompt(
         ));
     }
 
-    let mut in_block = false;
+    let mut fence = None;
     for (offset, section_line) in section.iter().enumerate() {
         let field_line = line + offset + 1;
-        if is_fence(section_line) {
-            in_block = !in_block;
-            continue;
-        }
-        if in_block {
+        if inside_fence(&mut fence, section_line) {
             continue;
         }
         if let Some((addon_title, body)) = addon_line(section_line) {
@@ -904,15 +963,14 @@ const REQUIRED_FIELDS: &[(&str, &str)] = &[
 
 /// Whether a field appears at all, as opposed to appearing empty.
 fn section_has_field(section: &[&str], key: &str) -> bool {
-    let mut in_block = false;
+    let mut fence = None;
     for line in section {
-        if is_fence(line) {
-            in_block = !in_block;
-        } else if !in_block {
-            if let Some((found, _)) = field(line) {
-                if found == key {
-                    return true;
-                }
+        if inside_fence(&mut fence, line) {
+            continue;
+        }
+        if let Some((found, _)) = field(line) {
+            if found == key {
+                return true;
             }
         }
     }
@@ -932,16 +990,20 @@ fn collect_placeholders(prompt: &mut Prompt, diagnostics: &mut Vec<Diagnostic>) 
                 .find(|slot| slot.name == name)
             {
                 Some(slot) => {
-                    if slot.default != default && default.is_some() {
-                        diagnostics.push(Diagnostic::error(
-                            prompt.line,
-                            format!(
+                    if slot.default != default {
+                        let detail = match (&slot.default, &default) {
+                            (Some(first), Some(second)) => format!(
+                                "P{id}: the placeholder {{ {name} }} has two defaults, `{first}` and \
+                                 `{second}`; one value cannot be both"
+                            ),
+                            _ => format!(
                                 "P{id}: the placeholder {{ {name} }} appears both with and without a \
                                  default; one is always required or always defaulted, because a \
                                  value that is sometimes required and sometimes not is a value \
                                  nobody knows to supply"
                             ),
-                        ));
+                        };
+                        diagnostics.push(Diagnostic::error(prompt.line, detail));
                     }
                 }
                 None => prompt.placeholders.push(Placeholder { name, default }),
@@ -1218,6 +1280,49 @@ b
             first.placeholders[0].default.as_deref(),
             Some("cargo test --all")
         );
+    }
+
+    #[test]
+    fn an_indented_fence_is_code_and_does_not_hide_a_heading() {
+        let lines = [
+            "## P1 · First",
+            "    ```",
+            "    ## P2 · Second",
+            "    ```",
+            "## P2 · Second",
+        ];
+        assert_eq!(next_heading(&lines, 1), 4);
+    }
+
+    #[test]
+    fn only_a_bare_identical_marker_closes_a_fence() {
+        assert_eq!(opens_fence("```"), Some(('`', 3)));
+        assert!(!closes_fence("~~~text", '~', 3));
+        assert!(!closes_fence("````text", '`', 3));
+        assert!(closes_fence("~~~", '~', 3));
+        assert!(closes_fence("````  ", '`', 3));
+    }
+
+    #[test]
+    fn fenced_example_metadata_cannot_change_the_real_prompt() {
+        let text = LIBRARY.replace(
+            "do the second thing with {scope}\n```",
+            "do the second thing with {scope}\n```\n\n~~~text\n## P9 · Example\n**Status:** done\n~~~",
+        );
+        let library = load(&text);
+        assert_eq!(library.prompt(2).unwrap().status, Status::Todo);
+        assert!(library.prompt(9).is_none());
+    }
+
+    #[test]
+    fn two_different_defaults_are_an_error() {
+        let library = load(&LIBRARY.replace(
+            "do the second thing with {scope}",
+            "do {scope=one} and {scope=two}",
+        ));
+        assert!(library
+            .errors()
+            .any(|error| error.message.contains("two defaults")));
     }
 
     #[test]

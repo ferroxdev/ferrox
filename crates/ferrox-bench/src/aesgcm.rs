@@ -24,9 +24,9 @@ fn reference_backend() -> &'static str {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if std::is_x86_feature_detected!("aes") && std::is_x86_feature_detected!("pclmulqdq") {
-            "aes-gcm 0.10 / aes-ni + pclmulqdq"
+            "aes-gcm 0.11 / aes-ni + pclmulqdq"
         } else {
-            "aes-gcm 0.10 / soft tables"
+            "aes-gcm 0.11 / soft tables"
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -34,14 +34,14 @@ fn reference_backend() -> &'static str {
         if std::arch::is_aarch64_feature_detected!("aes")
             && std::arch::is_aarch64_feature_detected!("pmull")
         {
-            "aes-gcm 0.10 / armv8 crypto (behind the build's two cfgs)"
+            "aes-gcm 0.11 / armv8 crypto (behind the build's two cfgs)"
         } else {
-            "aes-gcm 0.10 / soft tables"
+            "aes-gcm 0.11 / soft tables"
         }
     }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        "aes-gcm 0.10 / soft tables"
+        "aes-gcm 0.11 / soft tables"
     }
 }
 

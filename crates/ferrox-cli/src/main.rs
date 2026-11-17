@@ -22,7 +22,7 @@ use std::io::{IsTerminal as _, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use args::{Action, Options, Outbound};
@@ -69,7 +69,9 @@ fn main() {
 
 fn reconcile(paths: &Paths) {
     if paths.proxy_state.exists() && !lane::running(paths) {
-        proxy::clear(paths);
+        if let Err(error) = proxy::clear(paths) {
+            eprintln!("ferrox-cli: {error}");
+        }
     }
 }
 
@@ -167,6 +169,13 @@ fn write_lane_config(
 
 fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
     reconcile(paths);
+    let lifecycle = match lane::lock(paths) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("ferrox-cli: {error}");
+            return 1;
+        }
+    };
     let (ports, user_config) = prepare(options, paths);
     if options.vpn {
         if let Err(error) = proxy::preflight(&options.fronts, ports) {
@@ -191,19 +200,48 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
                 .map_or_else(String::new, |name| format!(" '{name}'")),
             lane::pid(paths).unwrap_or_default()
         );
-        lane::stop(paths);
+        if let Err(error) = proxy::clear(paths) {
+            eprintln!("ferrox-cli: {error}");
+            return 1;
+        }
+        if let Err(error) = lane::stop(paths) {
+            eprintln!("ferrox-cli: {error}");
+            return 1;
+        }
     }
     let pid = lane::start(&bin, paths, options.debug).unwrap_or_else(|error| args::die(&error));
     let interrupted = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(Mutex::new(false));
     let flag = Arc::clone(&interrupted);
+    let cancel = Arc::clone(&cancelled);
     let watched = paths.clone();
     let _ = ctrlc::set_handler(move || {
-        lane::stop(&watched);
-        if !user_config {
-            let _ = std::fs::remove_file(&watched.cfg);
-        }
-        proxy::clear(&watched);
         flag.store(true, Ordering::SeqCst);
+        let Ok(mut cancelled) = cancel.try_lock() else {
+            return;
+        };
+        if *cancelled {
+            return;
+        }
+        *cancelled = true;
+        let stopped = match lane::stop(&watched) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("ferrox-cli: {error}");
+                eprintln!(
+                    "ferrox-cli: the lane config and supervisor files were kept so 'ferrox-cli down' can retry."
+                );
+                false
+            }
+        };
+        if stopped {
+            if !user_config {
+                let _ = std::fs::remove_file(&watched.cfg);
+            }
+            if let Err(error) = proxy::clear(&watched) {
+                eprintln!("ferrox-cli: {error}");
+            }
+        }
     });
 
     if !fronts(&options.fronts).is_empty() && !lane::wait_fronts(&options.fronts, ports, paths) {
@@ -212,11 +250,10 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             paths.log.display()
         );
         tail(&paths.log, 20);
-        stop_and_forget(paths, user_config);
-        return 3;
+        return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
     }
     if interrupted.load(Ordering::SeqCst) {
-        return 130;
+        return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
     }
     println!(
         "lane{} up (pid {pid}), fronts:",
@@ -230,11 +267,25 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         println!("carrier: {}", options.carrier);
     }
     if !fronts(&options.fronts).is_empty() && !verify_flow(options, ports, paths) {
-        stop_and_forget(paths, user_config);
-        return 3;
+        return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
+    }
+    if interrupted.load(Ordering::SeqCst) {
+        return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
     }
     if options.vpn {
+        // Hold the cancellation lock across the arm and handoff so a Ctrl-C either owns cleanup or looks at a finished start.
+        let mut cancelled = cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *cancelled || interrupted.load(Ordering::SeqCst) {
+            *cancelled = true;
+            stop_and_forget(paths, user_config);
+            drop(cancelled);
+            return 130;
+        }
         if let Err(error) = proxy::arm(paths, &options.fronts, ports) {
+            *cancelled = true;
+            drop(cancelled);
             eprintln!("{error}");
             stop_and_forget(paths, user_config);
             return 1;
@@ -242,8 +293,16 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         if !serve {
             spawn_supervisor(paths, pid, options.instance.as_deref());
         }
+        if interrupted.load(Ordering::SeqCst) {
+            *cancelled = true;
+            stop_and_forget(paths, user_config);
+            drop(cancelled);
+            return 130;
+        }
+        drop(cancelled);
     }
     println!("log:  {}", paths.log.display());
+    drop(lifecycle);
     if serve {
         println!("Ctrl-C stops it.");
         while lane::running(paths) && !interrupted.load(Ordering::SeqCst) {
@@ -255,12 +314,10 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         }
         println!("the lane exited; last lines of {}:", paths.log.display());
         tail(&paths.log, 15);
-        stop_and_forget(paths, user_config);
-        0
-    } else {
-        println!("stop: ferrox-cli down");
-        0
+        return stop_and_forget(paths, user_config);
     }
+    println!("stop: ferrox-cli down");
+    0
 }
 
 fn spawn_supervisor(paths: &Paths, pid: u32, instance: Option<&str>) {
@@ -287,12 +344,48 @@ fn spawn_supervisor(paths: &Paths, pid: u32, instance: Option<&str>) {
     }
 }
 
-fn stop_and_forget(paths: &Paths, user_config: bool) {
-    lane::stop(paths);
+/// Claim cleanup under the cancellation lock, so a Ctrl-C and a startup failure cannot both stop the lane.
+fn stop_with_cancellation(
+    cancelled: &Mutex<bool>,
+    interrupted: &AtomicBool,
+    paths: &Paths,
+    user_config: bool,
+    failure: i32,
+) -> i32 {
+    let mut cancelled = cancelled
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *cancelled {
+        return 130;
+    }
+    *cancelled = true;
+    let interrupted = interrupted.load(Ordering::SeqCst);
+    stop_and_forget(paths, user_config);
+    if interrupted {
+        130
+    } else {
+        failure
+    }
+}
+
+fn stop_and_forget(paths: &Paths, user_config: bool) -> i32 {
+    if let Err(error) = lane::stop(paths) {
+        eprintln!("ferrox-cli: {error}");
+        eprintln!(
+            "ferrox-cli: the lane config and supervisor files were kept so a later 'down' can retry."
+        );
+        return 1;
+    }
     if !user_config {
         let _ = std::fs::remove_file(&paths.cfg);
     }
-    proxy::clear(paths);
+    let restored = match proxy::clear(paths) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("ferrox-cli: {error}");
+            false
+        }
+    };
     let _ = std::fs::remove_file(&paths.supervisor_file);
     let _ = std::fs::remove_file(&paths.supervisor_pid);
     if user_config {
@@ -306,6 +399,7 @@ fn stop_and_forget(paths: &Paths, user_config: bool) {
             paths.log.display()
         );
     }
+    i32::from(!restored)
 }
 
 fn verify_flow(options: &Options, ports: Ports, paths: &Paths) -> bool {
@@ -320,6 +414,12 @@ fn verify_flow(options: &Options, ports: Ports, paths: &Paths) -> bool {
             && probe::probe_plain(&front, port, probe::trace_timeout()).contains("Example Domain")
         {
             println!("exit through {front}: a plain HTTP flow answered.");
+            return true;
+        }
+        if options.outbound == Some(Outbound::Config) {
+            println!(
+                "the custom config did not answer the probe; leaving the lane to its own routing."
+            );
             return true;
         }
         println!("NOT CONNECTED: the fronts are up, but no flow got through them.");
@@ -378,20 +478,24 @@ fn diagnose(options: &Options, paths: &Paths) {
 
 fn down(options: &Options, paths: &Paths) -> i32 {
     if options.all {
-        let rc = stop_all_lanes(paths);
-        proxy::clear(paths);
-        let _ = std::fs::remove_file(&paths.lanes_file);
-        let _ = std::fs::remove_file(&paths.proxy_owner);
+        let mut rc = stop_all_lanes(paths);
+        if let Err(error) = proxy::clear(paths) {
+            eprintln!("ferrox-cli: {error}");
+            rc = 1;
+        }
         if rc == 0 {
+            let _ = std::fs::remove_file(&paths.lanes_file);
             println!("every lane is stopped and its config removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it.");
         }
         return rc;
     }
     let rc = stop_lane(paths);
-    forget_config(paths);
+    if rc == 0 {
+        forget_config(paths);
+    }
     if rc != 0 {
         eprintln!(
-            "lane stopped, but the system proxy was not cleared; run 'ferrox-cli down' again."
+            "the lane was not fully stopped or the system proxy was not cleared; run 'ferrox-cli down' again."
         );
     } else {
         println!("lane{} stopped; the lane config is removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it.",
@@ -404,8 +508,25 @@ fn down(options: &Options, paths: &Paths) -> i32 {
 }
 
 fn stop_lane(paths: &Paths) -> i32 {
-    lane::stop(paths);
-    proxy::clear(paths);
+    let _lifecycle = match lane::lock(paths) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("ferrox-cli: {error}");
+            return 1;
+        }
+    };
+    let saved_pid = lane::pid(paths);
+    if let Err(error) = lane::stop(paths) {
+        eprintln!("ferrox-cli: {error}");
+        return 1;
+    }
+    if let Err(error) = proxy::clear(paths) {
+        eprintln!("ferrox-cli: {error}");
+        if let Some(pid) = saved_pid {
+            let _ = paths::write_private(&paths.pid_file, &format!("{pid}\n"));
+        }
+        return 1;
+    }
     0
 }
 
@@ -461,8 +582,9 @@ fn stop_all_lanes(paths: &Paths) -> i32 {
             let lane_paths = Paths::with_dirs(dir.clone(), paths.state_dir.clone(), instance);
             if stop_lane(&lane_paths) != 0 {
                 rc = 1;
+            } else {
+                forget_config(&lane_paths);
             }
-            forget_config(&lane_paths);
         }
     }
     rc
@@ -636,7 +758,16 @@ fn version(paths: &Paths) -> i32 {
 
 fn logout(paths: &Paths) -> i32 {
     let rc = stop_all_lanes(paths);
-    proxy::clear(paths);
+    if rc != 0 {
+        eprintln!(
+            "ferrox-cli: not every lane stopped; the stored session, the saved account and the lane configs were kept."
+        );
+        return rc;
+    }
+    if let Err(error) = proxy::clear(paths) {
+        eprintln!("ferrox-cli: {error}");
+        return 1;
+    }
     let _ = std::fs::remove_file(&paths.token_file);
     let _ = std::fs::remove_file(&paths.creds);
     forget_config(paths);
@@ -658,8 +789,12 @@ fn supervise(options: &Options, paths: &Paths) -> i32 {
     let pid = watched;
     let watched_paths = paths.clone();
     let _ = ctrlc::set_handler(move || {
-        lane::kill(pid);
-        proxy::clear(&watched_paths);
+        if let Err(error) = lane::kill(pid) {
+            eprintln!("ferrox-cli: {error}");
+        }
+        if let Err(error) = proxy::clear(&watched_paths) {
+            eprintln!("ferrox-cli: {error}");
+        }
         flag.store(true, Ordering::SeqCst);
     });
     while lane::alive(watched) && !stop.load(Ordering::SeqCst) {
@@ -667,7 +802,9 @@ fn supervise(options: &Options, paths: &Paths) -> i32 {
     }
     let current = lane::pid(paths);
     if current.is_none() || current == Some(watched) {
-        proxy::clear(paths);
+        if let Err(error) = proxy::clear(paths) {
+            eprintln!("ferrox-cli: {error}");
+        }
         let _ = std::fs::remove_file(&paths.pid_file);
     }
     if read_trim(&paths.supervisor_file).as_deref() == Some(watched.to_string().as_str()) {
