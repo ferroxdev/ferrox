@@ -37,7 +37,7 @@ graph TD
 | ops-retired-instructions | 618496 | scripts/count-ops.sh |
 | seconds-per-framed-megabyte | UNBLESSED | CI parity.yml |
 | frame-encode-ops-retired-instructions | 876544 | scripts/count-ops.sh |
-| header-encode-ops-retired-instructions | 393216 | scripts/count-ops.sh |
+| header-encode-ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | maximum-frame-payload-bytes | 8192 | ferrox-core-mux::tests::the_decoder_refuses_only_what_it_cannot_frame |
 | downlink-copies-per-byte-written | 0 | ferrox-app-proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer |
 | xudp-uplink-copies-per-byte-written | 0 | ferrox-app-proxy::tests::xudp_uplink_hands_the_payload_over_by_pointer |
@@ -97,7 +97,7 @@ Three things had to hold, and each has its own gate rather than one test:
 
 - **The two encoders cannot drift.** `encode_into` is now `check_meta` + `write_meta` + the payload, and `encode_header_into` is `check_meta` + `write_meta` + a zeroed length — one implementation of the metadata, not two. `a_header_plus_a_patched_length_is_the_whole_frame` then requires header-plus-payload to equal the single-buffer encoder across every status, option, target and identity combination that type will encode, at ten payload lengths.
 
-`encode_header_into` builds into the buffer's own spare capacity (`reserve_exact` + `set_len`) rather than `resize`-zeroing the `[0 .. 2 + meta]` region `write_meta` then overwrote byte for byte, so no metadata byte is written twice. The `memset` is a fill, not an allocation, so the alloc-count gate is blind to it and a byte test cannot see it either — `the_header_grows_into_its_own_capacity_and_never_reallocates` is the witness, asserting by pointer identity that the header's base does not move and its capacity does not grow across every shape the sweep encodes.
+`encode_header_into` still grows the buffer's own capacity, but it now `resize`s the header region with zeros before `write_meta` overwrites it. The earlier `reserve_exact` plus `set_len` left the metadata bytes uninitialised when `set_len` ran, which is not a valid `Vec` value even though every byte was written immediately afterwards; the zeroing is the cost of the safe form. It is a fill, not an allocation, so the alloc-count gate is blind to it and a byte test cannot see it either — `the_header_grows_into_its_own_capacity_and_never_reallocates` is the witness, asserting by pointer identity that the header's base does not move and its capacity does not grow across every shape the sweep encodes.
 - **The wiring delivers what the codec describes.** `the_mux_uplink_frames_every_relay_read_the_same_way` drives the relay over a real socket pair at seven total lengths, decodes every frame off the wire and requires the reassembled bytes to equal what was written to the client.
 - **The payload is handed over by pointer, not copied.** `a_two_part_write_hands_the_payload_over_by_pointer` asserts the second `writev` part's base address *is* the payload slice's. This is the only kind of test that can see the copy: a byte-level test cannot, because the bytes are identical either way — reverting to the copying form still passes the framing test, and that is the honest shape of this claim.
 

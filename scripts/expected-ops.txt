@@ -353,4 +353,4 @@ ferrox_core::mux::decode 618496 mux::tests::the_decode_probe_costs_the_frame_wal
 # head and skip `clear`/`reserve` measured 884736 and 409600, 2 and 4 Ir a call
 # dearer than these, and was reverted rather than blessed.
 ferrox_core::mux::Outgoing::encode_into 876544 mux::tests::the_frame_probe_costs_the_metadata_and_payload_write_and_nothing_else
-ferrox_core::mux::Outgoing::encode_header_into 393216 mux::tests::the_header_probe_costs_the_metadata_write_and_nothing_else
+ferrox_core::mux::Outgoing::encode_header_into UNBLESSED mux::tests::the_header_probe_costs_the_metadata_write_and_nothing_else

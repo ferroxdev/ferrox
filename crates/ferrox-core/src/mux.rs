@@ -251,9 +251,7 @@ impl Outgoing<'_> {
         let meta = self.check_meta();
         let len = 2 + meta + usize::from(self.has_data()) * 2;
         out.clear();
-        out.reserve_exact(len);
-        // SAFETY: `write_meta` fills `[0 .. 2 + meta]` in full and the two payload-length bytes are written below, so no grown byte is read uninitialized; the `resize` this replaces zero-filled the metadata region only for `write_meta` to overwrite every byte of it.
-        unsafe { out.set_len(len) };
+        out.resize(len, 0);
         let at = self.write_meta(out, meta);
         if self.has_data() {
             out[at..at + 2].copy_from_slice(&0u16.to_be_bytes());
