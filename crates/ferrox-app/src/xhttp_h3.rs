@@ -347,6 +347,9 @@ impl H3Reader {
             self.buf_at = at;
         }
         self.buf_at = at;
+        if !self.expect_request {
+            status_ok(self.status)?;
+        }
         Ok(())
     }
 

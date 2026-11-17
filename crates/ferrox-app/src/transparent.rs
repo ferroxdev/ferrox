@@ -77,7 +77,7 @@ fn storage_address(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
             Some(SocketAddr::V6(std::net::SocketAddrV6::new(
                 std::net::Ipv6Addr::from(address.sin6_addr.s6_addr),
                 u16::from_be(address.sin6_port),
-                u32::from_be(address.sin6_flowinfo),
+                address.sin6_flowinfo,
                 address.sin6_scope_id,
             )))
         }

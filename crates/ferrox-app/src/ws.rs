@@ -224,6 +224,8 @@ struct Shared {
     open: AtomicUsize,
     /// Head bytes a full socket cut: `open` is the payload length they announce, so the rest is rebuilt and sent first.
     cut: AtomicUsize,
+    /// Control frames that arrived while a data frame was still being written.
+    pending: Mutex<Vec<(u8, Vec<u8>)>>,
 }
 
 impl std::fmt::Debug for Shared {
@@ -347,6 +349,7 @@ impl<R: Read> WsReader<R> {
                     break 0;
                 }
                 Ok(n) => break n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) if crate::proxy::is_timeout(&error) => match self.handshake {
                     // The opening decode is the one wait a budget owns, and a silence past it is the end.
                     Some(until) if std::time::Instant::now() < until => {}
@@ -500,9 +503,20 @@ impl<R: Read> WsReader<R> {
         if opcode == OP_CLOSE && self.shared.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        if opcode != OP_CLOSE && self.shared.closed.load(Ordering::SeqCst) {
+            return;
+        }
         let Ok(mut stream) = self.shared.stream.lock() else {
             return;
         };
+        if self.shared.open.load(Ordering::Relaxed) != 0
+            || self.shared.cut.load(Ordering::Relaxed) != 0
+        {
+            if let Ok(mut pending) = self.shared.pending.lock() {
+                pending.push((opcode, payload.to_vec()));
+            }
+            return;
+        }
         let _ = write_frame(&mut **stream, self.shared.masked, opcode, payload);
     }
 
@@ -682,6 +696,11 @@ impl WsWriter {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return false;
         };
+        if self.shared.open.load(Ordering::Relaxed) != 0
+            || self.shared.cut.load(Ordering::Relaxed) != 0
+        {
+            return false;
+        }
         write_frame(&mut **stream, self.masked, OP_TEXT, data)
     }
 
@@ -740,6 +759,20 @@ impl WsWriter {
         }
         self.shared.open.store(owed, Ordering::Relaxed);
         self.shared.cut.store(cut, Ordering::Relaxed);
+        if owed == 0 && cut == 0 {
+            let queued = self
+                .shared
+                .pending
+                .lock()
+                .map(|mut pending| std::mem::take(&mut *pending))
+                .unwrap_or_default();
+            for (opcode, payload) in queued {
+                let _ = write_frame(&mut **stream, self.shared.masked, opcode, &payload);
+                if opcode == OP_CLOSE {
+                    break;
+                }
+            }
+        }
         crate::proxy::Push::Took(taken)
     }
 
@@ -750,8 +783,13 @@ impl WsWriter {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return;
         };
-        if self.shared.open.load(Ordering::Relaxed) > 0 {
+        if self.shared.open.load(Ordering::Relaxed) > 0
+            || self.shared.cut.load(Ordering::Relaxed) > 0
+        {
             // The head on the wire still owes payload: a close frame would land inside it.
+            if let Ok(mut pending) = self.shared.pending.lock() {
+                pending.push((OP_CLOSE, CLOSE_BODY.to_vec()));
+            }
             return;
         }
         let _ = write_frame(&mut **stream, self.masked, OP_CLOSE, &CLOSE_BODY);
@@ -1024,13 +1062,16 @@ fn request(
     const VERSION: &str = "\r\nSec-WebSocket-Version: 13";
     const END: &str = "\r\n\r\n";
     const PROTOCOL: &str = "Sec-WebSocket-Protocol: ";
-    let early = !first.is_empty() && first.len() as u64 <= u64::from(budget);
+    let fixed = OPEN.len() + MIDDLE.len() + KEYS.len() + VERSION.len() + END.len() + 2;
+    let headroom = fixed + host.len() + path.len() + key.len() + headers.len();
+    let early = !first.is_empty()
+        && first.len() as u64 <= u64::from(budget)
+        && headroom + PROTOCOL.len() + (first.len() * 4).div_ceil(3) + 2 <= HEAD_LIMIT;
     let coded = if early {
         (first.len() * 4).div_ceil(3)
     } else {
         0
     };
-    let fixed = OPEN.len() + MIDDLE.len() + KEYS.len() + VERSION.len() + END.len() + 2;
     let room = if early { PROTOCOL.len() + coded + 2 } else { 0 };
     let mut request =
         String::with_capacity(fixed + host.len() + path.len() + key.len() + headers.len() + room);
@@ -1078,7 +1119,7 @@ fn start_heartbeat(writer: &WsWriter, period: u32) {
             let Ok(mut stream) = shared.stream.lock() else {
                 return;
             };
-            if shared.open.load(Ordering::Relaxed) > 0 {
+            if shared.open.load(Ordering::Relaxed) > 0 || shared.cut.load(Ordering::Relaxed) > 0 {
                 // A data frame is half on the wire: a control frame here would land inside it.
                 continue;
             }
@@ -1116,6 +1157,7 @@ pub(crate) fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
         closed: AtomicBool::new(false),
         open: AtomicUsize::new(0),
         cut: AtomicUsize::new(0),
+        pending: Mutex::new(Vec::new()),
         masked,
     });
     let reader = WsReader {
@@ -1360,6 +1402,7 @@ mod tests {
                     masked: false,
                     open: AtomicUsize::new(0),
                     cut: AtomicUsize::new(0),
+                    pending: Mutex::new(Vec::new()),
                 });
                 let mut reader = WsReader {
                     read: stream,
@@ -1445,6 +1488,7 @@ mod tests {
                 masked: false,
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
             });
             let writer = WsWriter {
                 shared: Arc::clone(&shared),
@@ -1520,6 +1564,7 @@ mod tests {
                 closed: AtomicBool::new(false),
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1556,6 +1601,7 @@ mod tests {
                 closed: AtomicBool::new(false),
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1625,6 +1671,7 @@ mod tests {
                 closed: AtomicBool::new(false),
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1690,6 +1737,7 @@ mod tests {
                 closed: AtomicBool::new(false),
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1811,6 +1859,7 @@ mod tests {
                 closed: AtomicBool::new(false),
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
                 masked: false,
             }),
             have: Vec::new(),
@@ -1857,6 +1906,7 @@ mod tests {
             closed: AtomicBool::new(false),
             open: AtomicUsize::new(0),
             cut: AtomicUsize::new(0),
+            pending: Mutex::new(Vec::new()),
             masked: false,
         });
         let mut reader = WsReader {
@@ -1901,6 +1951,7 @@ mod tests {
             closed: AtomicBool::new(false),
             open: AtomicUsize::new(0),
             cut: AtomicUsize::new(0),
+            pending: Mutex::new(Vec::new()),
             masked: false,
         });
         let frames = 64usize;
@@ -2151,6 +2202,7 @@ mod tests {
                 closed: AtomicBool::new(false),
                 open: AtomicUsize::new(0),
                 cut: AtomicUsize::new(0),
+                pending: Mutex::new(Vec::new()),
                 masked: false,
             }),
             have_init: have.len(),

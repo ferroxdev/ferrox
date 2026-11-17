@@ -862,7 +862,8 @@ fn masque_settings(masque: Option<&crate::json::Json>) -> (String, u16, String, 
 }
 
 fn parse_endpoint(text: &str) -> Option<SocketAddr> {
-    text.trim().parse().ok()
+    let address: SocketAddr = text.trim().parse().ok()?;
+    (address.port() != 0).then_some(address)
 }
 
 /// The body `POST /reg` sends: a fresh Curve25519 key and the device shape the

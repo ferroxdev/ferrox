@@ -138,6 +138,7 @@ impl Jar {
             let Some((name, value)) = pair.next().unwrap_or_default().split_once('=') else {
                 continue;
             };
+            let response_host = host.to_ascii_lowercase();
             let domain = pair
                 .find_map(|attribute| {
                     let (key, value) = attribute.trim().split_once('=')?;
@@ -145,7 +146,13 @@ impl Jar {
                         .eq_ignore_ascii_case("domain")
                         .then(|| value.trim_start_matches('.').to_ascii_lowercase())
                 })
-                .unwrap_or_else(|| host.to_ascii_lowercase());
+                .unwrap_or_else(|| response_host.clone());
+            // A Domain attribute may name the response host or one of its parents, but not a public suffix like `com`.
+            if domain != response_host
+                && !(domain.contains('.') && response_host.ends_with(&format!(".{domain}")))
+            {
+                continue;
+            }
             let value = value.split('"').next().unwrap_or_default();
             self.by_name
                 .insert((name.trim().to_owned(), domain), value.to_owned());

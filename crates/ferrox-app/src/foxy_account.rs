@@ -2013,7 +2013,6 @@ fn nonce() -> Option<String> {
 impl Account {
     /// Signs in, exchanges the session token, and mints the first pass.
     pub(crate) fn sign_in(&self, email: &str, password: &str) -> Result<(), Denied> {
-        let now = epoch();
         let Login {
             session,
             verified,
@@ -2030,7 +2029,7 @@ impl Account {
             self.persist();
             return Ok(());
         }
-        self.exchange(&session, now)
+        self.exchange(&session, epoch())
     }
 
     /// Exchanges a session token already minted by the sign-in page, skipping the password and its challenge.
