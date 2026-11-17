@@ -129,13 +129,6 @@ pub struct Packet<'a> {
     pub payload: &'a [u8],
 }
 
-impl Packet<'_> {
-    #[must_use]
-    pub fn is_heartbeat(data: &[u8]) -> bool {
-        data.len() >= 2 && data[0] == VERSION && data[1] == HEARTBEAT
-    }
-}
-
 pub fn parse_packet_prefix(data: &[u8]) -> Result<(Packet<'_>, usize), FrameError> {
     if data.len() < 10 {
         return Err(FrameError::Short);
@@ -403,6 +396,24 @@ mod tests {
     }
 
     #[test]
+    fn every_truncated_packet_is_short_and_never_panics() {
+        for host in ["192.0.2.53", "2001:db8::1", "dns.example"] {
+            let address = address_port(host, 443).expect("an address");
+            for index in [0, 1] {
+                let mut frame = Vec::new();
+                encode_fragment(1, 2, 2, index, &address, &[7u8; 32], &mut frame);
+                for end in 0..frame.len() {
+                    assert_eq!(
+                        parse_packet_prefix(&frame[..end]),
+                        Err(FrameError::Short),
+                        "{host} index {index} truncated to {end}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_prefix_stops_at_the_first_frame_boundary() {
         let address = address_port("192.0.2.1", 53).expect("an address");
         let mut first = Vec::new();
@@ -451,12 +462,5 @@ mod tests {
             left = &left[take..];
         }
         assert_eq!(sent, payload.len());
-    }
-
-    #[test]
-    fn heartbeat_is_recognised_before_packet_parsing() {
-        assert!(Packet::is_heartbeat(&[VERSION, HEARTBEAT]));
-        assert!(!Packet::is_heartbeat(&[VERSION, PACKET]));
-        assert!(!Packet::is_heartbeat(&[]));
     }
 }

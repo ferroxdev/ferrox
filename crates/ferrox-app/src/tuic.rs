@@ -1091,9 +1091,6 @@ fn dispatch_client(
     let Ok(sinks) = lane.sinks.lock() else {
         return;
     };
-    if !reassembly.is_empty() {
-        reassembly.retain(|_, parts| parts.at.elapsed() < REASSEMBLY_TTL);
-    }
     for sink in sinks.iter() {
         if sink.association != packet.association {
             continue;
@@ -1161,6 +1158,12 @@ fn take_packet<'a>(
         return None;
     }
     let key = (packet.association, packet.packet);
+    if reassembly
+        .get(&key)
+        .is_some_and(|entry| entry.at.elapsed() >= REASSEMBLY_TTL)
+    {
+        reassembly.remove(&key);
+    }
     if !reassembly.contains_key(&key) {
         let mut per_assoc = 0usize;
         let mut retained = 0usize;
@@ -1257,14 +1260,19 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<TuicOut>, String> {
         .filter(|value| !value.is_empty())
         .ok_or("tuic outbound has no password")?;
     let tls = crate::config::outbound_tls(first, address)?;
+    if field("udp_over_stream")
+        .or_else(|| field("udpOverStream"))
+        .is_some_and(|value| matches!(value, Json::Bool(true)))
+    {
+        return Err("tuic udp_over_stream is not carried".to_owned());
+    }
     let mode = match field("udp_relay_mode")
         .or_else(|| field("udpRelayMode"))
         .and_then(Json::as_str)
-        .unwrap_or("native")
     {
-        "native" => RelayMode::Native,
-        "quic" => RelayMode::Quic,
-        other => return Err(format!("tuic udp_relay_mode `{other}` is not carried")),
+        Some("native") | None => RelayMode::Native,
+        Some("quic") => RelayMode::Quic,
+        Some(other) => return Err(format!("tuic udp_relay_mode `{other}` is not carried")),
     };
     let cc = field("congestion_control")
         .or_else(|| field("congestionControl"))
@@ -1885,7 +1893,7 @@ impl Server {
                             .spawn(move || serve_tcp(stream, freedom, worker));
                     }
                 }
-                2 => read_uni(&mut conn, state, &self.sock, id, self.freedom),
+                2 => read_uni(&mut conn, state, id, self.freedom),
                 _ => {}
             }
         }
@@ -1893,14 +1901,9 @@ impl Server {
         state.readable = ids;
         while let Ok(data) = conn.dgram_recv_buf() {
             if self.freedom {
-                accept_packet(
-                    &mut conn,
-                    &mut inner,
-                    &self.sock,
-                    &data,
-                    false,
-                    self.freedom,
-                );
+                if let Ok(packet) = wire::parse_packet(&data) {
+                    accept_packet(&mut inner, &packet, false);
+                }
             }
         }
         let now = Instant::now();
@@ -2277,23 +2280,16 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn read_uni(
-    conn: &mut quiche::Connection,
-    inner: &mut Inner,
-    sock: &Arc<Datagram>,
-    id: u64,
-    freedom: bool,
-) {
+fn read_uni(conn: &mut quiche::Connection, inner: &mut Inner, id: u64, freedom: bool) {
     let mut room = UNI_ROOM.with(|held| std::mem::take(&mut *held.borrow_mut()));
     room.resize(UDP_BUFFER, 0);
-    read_uni_with(conn, inner, sock, id, freedom, &mut room);
+    read_uni_with(conn, inner, id, freedom, &mut room);
     UNI_ROOM.with(|held| *held.borrow_mut() = room);
 }
 
 fn read_uni_with(
     conn: &mut quiche::Connection,
     inner: &mut Inner,
-    sock: &Arc<Datagram>,
     id: u64,
     freedom: bool,
     room: &mut [u8],
@@ -2322,11 +2318,11 @@ fn read_uni_with(
         }
         data.extend_from_slice(&room[..n]);
     }
-    if data.get(1) == Some(&wire::PACKET) {
+    if freedom && data.get(1) == Some(&wire::PACKET) {
         loop {
             match wire::parse_packet_prefix(&data) {
-                Ok((_, used)) => {
-                    accept_packet(conn, inner, sock, &data[..used], true, freedom);
+                Ok((packet, used)) => {
+                    accept_packet(inner, &packet, true);
                     data.drain(..used);
                 }
                 Err(wire::FrameError::Short) => break,
@@ -2362,38 +2358,16 @@ fn read_uni_with(
     }
 }
 
-#[allow(clippy::too_many_lines)]
-fn accept_packet(
-    conn: &mut quiche::Connection,
-    inner: &mut Inner,
-    sock: &Arc<Datagram>,
-    data: &[u8],
-    stream: bool,
-    freedom: bool,
-) {
-    if !freedom || wire::Packet::is_heartbeat(data) {
-        return;
-    }
-    let Ok(packet) = wire::parse_packet(data) else {
-        return;
-    };
-    if !inner.reassembly.is_empty() {
-        inner
-            .reassembly
-            .retain(|_, parts| parts.at.elapsed() < REASSEMBLY_TTL);
-    }
+fn accept_packet(inner: &mut Inner, packet: &wire::Packet<'_>, stream: bool) {
     let Some(generation) = select_assoc(inner, packet.association, stream) else {
         return;
     };
-    let Some((destination, payload)) = take_packet(&mut inner.reassembly, &packet) else {
+    let Some((destination, payload)) = take_packet(&mut inner.reassembly, packet) else {
         return;
     };
     match destination {
         Destination::Address(target) => {
-            let now = Instant::now();
-            deliver_udp(inner, packet.association, target, &payload, now);
-            poll_udp(conn, sock, inner, now);
-            flush_inner(conn, sock, inner);
+            deliver_udp(inner, packet.association, target, &payload, Instant::now());
         }
         Destination::Name(host, port) => {
             let job = ResolveJob {
@@ -2999,6 +2973,14 @@ mod tests {
             .expect("a tuic outbound");
         assert_eq!(out.cert_pins.len(), 1);
         assert!(out.client_config().is_some());
+    }
+
+    #[test]
+    fn a_tuic_udp_over_stream_is_refused_not_silently_mapped() {
+        let base = r#"{"outbounds":[{"protocol":"tuic","settings":{"address":"tuic.test","port":443,"uuid":"00112233-4455-6677-8899-aabbccddeeff","password":"secret"%s},"streamSettings":{"security":"tls","tlsSettings":{"allowInsecure":true}}}]}"#;
+        let config =
+            crate::json::parse(&base.replace("%s", r#","udp_over_stream":true"#)).expect("parses");
+        assert!(outbound(&config).is_err());
     }
 
     #[test]
