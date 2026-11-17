@@ -84,13 +84,18 @@ fn stored_grant(paths: &Paths) -> bool {
 }
 
 fn same_account(stored: &str, email: &str) -> bool {
-    !stored.is_empty()
-        && stored.trim().to_lowercase()
-            == email
-                .chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect::<String>()
-                .to_lowercase()
+    fn padding(ch: char) -> bool {
+        ch.is_whitespace() || matches!(ch, '\u{200B}'..='\u{200D}' | '\u{FEFF}')
+    }
+    let normalize = |value: &str| {
+        value
+            .chars()
+            .filter(|ch| !padding(*ch))
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let stored = normalize(stored);
+    !stored.is_empty() && stored == normalize(email)
 }
 
 pub fn resolve(options: &Options, paths: &Paths) -> Result<FoxyAccount, String> {
@@ -106,7 +111,7 @@ pub fn resolve(options: &Options, paths: &Paths) -> Result<FoxyAccount, String> 
     } else if let Some(email) = env_email {
         email
     } else if !file_email.is_empty() {
-        file_email
+        file_email.clone()
     } else {
         self::stored_email(paths)
     };
@@ -114,8 +119,10 @@ pub fn resolve(options: &Options, paths: &Paths) -> Result<FoxyAccount, String> 
         options.password.clone()
     } else if let Some(password) = env_password {
         password
-    } else {
+    } else if same_account(&file_email, &email) {
         file_password
+    } else {
+        String::new()
     };
     let has_grant = |email: &str| same_account(&stored_email(paths), email) && stored_grant(paths);
     if email.is_empty() || (password.is_empty() && !has_grant(&email)) {
@@ -241,7 +248,7 @@ pub fn login(options: &Options, paths: &Paths) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{quote, unquote};
+    use super::{quote, same_account, unquote};
 
     #[test]
     fn the_stored_quoting_round_trips_and_a_broken_line_is_refused() {
@@ -250,5 +257,14 @@ mod tests {
         }
         assert_eq!(unquote("'unterminated"), None);
         assert_eq!(unquote(r"trailing\"), None);
+    }
+
+    #[test]
+    fn the_same_account_ignores_the_engines_padding() {
+        assert!(same_account("User@Example.com", "user@example.com"));
+        assert!(same_account("us\u{200B}er@example.com", "user@example.com"));
+        assert!(same_account("user@exam\u{FEFF}ple.com", "user@example.com"));
+        assert!(!same_account("other@example.com", "user@example.com"));
+        assert!(!same_account("   ", "user@example.com"));
     }
 }

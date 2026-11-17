@@ -188,14 +188,17 @@ fn insert_startup_and_setup(cell: &mut Json, run: &Run) {
     setups.sort_unstable();
     cell.insert(
         "setup_median_us",
-        setups
-            .get(setups.len() / 2)
-            .map_or(Json::Null, |us| Json::Num(*us as f64)),
+        if setups.is_empty() {
+            Json::Null
+        } else {
+            Json::Num(parity::median(&setups) as f64)
+        },
     );
 }
 
 fn run_cell_json(run: &Run) -> Json {
     let mut cell = Json::object();
+    cell.insert("repeat", Json::Num(run.repeat as f64));
     cell.insert("throughput_mib_s", Json::Num(run.throughput_mib_s()));
     cell.insert("cpu_millis_per_gib", Json::Num(run.cpu_millis_per_gib()));
     cell.insert("bytes_sent", Json::Num(run.outcome.bytes_sent as f64));
@@ -468,6 +471,20 @@ impl Comparison {
                 ),
             };
             return stats::Gate::no_reference(detail);
+        }
+        if let Some((candidate, reason)) = self.gated.and_then(|candidate| {
+            self.skipped
+                .iter()
+                .find(|(engine, _)| engine.as_str() == candidate)
+                .map(|(_, reason)| (candidate, reason))
+        }) {
+            return stats::Gate {
+                passed: false,
+                lines: vec![format!(
+                    "`{candidate}` (the engine under test) was skipped: {reason}; a cell whose \
+                     gated engine did not run has no pair to judge, so it cannot pass"
+                )],
+            };
         }
         if self
             .gated
@@ -834,7 +851,7 @@ impl Comparison {
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
         );
         for entry in &self.by_engine {
-            for (i, run) in entry.runs.iter().enumerate() {
+            for run in &entry.runs {
                 let cpu = if run.outcome.traffic_samples < MIN_TRAFFIC_SAMPLES {
                     format!("**{:.2}**", run.cpu_millis_per_gib())
                 } else {
@@ -852,7 +869,7 @@ impl Comparison {
                     s,
                     "| {} | {} | {:.1} | {cpu} | {split} | {kernel} | {:.1} | {} | {:.3} | {} |",
                     entry.engine,
-                    i + 1,
+                    run.repeat,
                     run.throughput_mib_s(),
                     run.rss_mib(),
                     run.outcome
@@ -1313,11 +1330,11 @@ pub fn run(
             let Some(engine) = engines.iter().find(|e| e.name == name) else {
                 continue;
             };
-            let (output, request) = write_request(workload, engine, out_dir, name, repeat)?;
             if !cell.fits() {
                 failures.push(window_ended(&by_engine, &names, repeats));
                 break 'measures;
             }
+            let (output, request) = write_request(workload, engine, out_dir, name, repeat)?;
             match parity::measure(
                 &request,
                 engine.config_arg,
@@ -2526,6 +2543,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_skipped_gated_engine_cannot_pass() {
+        let comparison = Comparison {
+            workload: workload(),
+            repeats: 3,
+            by_engine: vec![
+                synth_engine(
+                    "xray-core",
+                    [(100, 6000, 20480), (110, 6200, 20500), (120, 6400, 20600)],
+                ),
+                EngineRuns {
+                    engine: "ferrox",
+                    dialect: parity::Dialect::Xray,
+                    runs: Vec::new(),
+                },
+            ],
+            ceilings_mib_s: vec![900.0, 950.0, 1000.0],
+            gated: Some("ferrox"),
+            failures: Vec::new(),
+            skipped: vec![("ferrox".to_owned(), "no binary".to_owned())],
+            machine: "test".into(),
+        };
+        let gate = comparison.gate();
+        assert!(!gate.passed, "the engine under test never ran");
+        assert!(
+            gate.lines
+                .iter()
+                .any(|line| line.contains("was skipped") && line.contains("no binary")),
+            "{:?}",
+            gate.lines
+        );
+    }
+
     /// The storm of a saturated runner is per-machine, so a workload fault seen on an engine other than the one under test means the candidate was starved by the machine, not bested: a gated candidate that lands nothing while a comparator took the same fault is unmeasured, not a regression.
     #[test]
     fn a_candidate_starved_by_a_machine_wide_workload_storm_is_unmeasured() {
@@ -3048,6 +3098,32 @@ mod tests {
         );
         assert_eq!(root.get("output").and_then(Json::as_str), Some("/tmp/out"));
         assert_eq!(root.get("warmup").and_then(Json::as_bool), Some(false));
+    }
+
+    #[test]
+    fn a_rerun_replaces_stale_output() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-compare-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
+        let stale = dir.join("a-run1");
+        std::fs::create_dir_all(&stale).expect("stale output");
+        std::fs::write(stale.join("sentinel"), "old").expect("sentinel");
+        let exe = std::env::current_exe().expect("a test binary has a path");
+        let (output, _) = write_request(
+            &workload(),
+            &engine("a", &exe.to_string_lossy()),
+            &dir,
+            "a",
+            1,
+        )
+        .expect("the request is writable");
+        assert_eq!(output, stale);
+        assert!(!stale.join("sentinel").exists(), "the rerun starts clean");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

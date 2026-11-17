@@ -276,9 +276,26 @@ impl Prompt {
 
     /// Placeholders with no default: the values only a contributor can supply.
     pub fn required_inputs(&self) -> impl Iterator<Item = &str> {
+        self.required_inputs_for(&self.addons)
+    }
+
+    /// Required placeholders the selected add-ons actually reach, so an add-on that was not
+    /// chosen cannot keep a handout from being rendered.
+    pub fn required_inputs_for<'a>(
+        &'a self,
+        addons: &'a [Addon],
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        let mut active = std::collections::BTreeSet::new();
+        for text in std::iter::once(self.body.as_str())
+            .chain(addons.iter().map(|addon| addon.body.as_str()))
+        {
+            active.extend(placeholders_in(text));
+        }
         self.placeholders
             .iter()
-            .filter(|placeholder| placeholder.default.is_none())
+            .filter(move |placeholder| {
+                placeholder.default.is_none() && active.contains(&placeholder.name)
+            })
             .map(|placeholder| placeholder.name.as_str())
     }
 
@@ -655,16 +672,17 @@ fn inside_fence(fence: &mut Option<(char, usize)>, line: &str) -> bool {
 
 /// Strip common indentation and trailing blanks, so a prompt is not pasted with four spaces per line.
 fn dedent(lines: &[&str]) -> String {
+    let indent = |line: &str| line.len() - line.trim_start_matches([' ', '\t']).len();
     let common = lines
         .iter()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| line.len() - line.trim_start().len())
+        .map(|line| indent(line))
         .min()
         .unwrap_or(0);
     let mut out: Vec<String> = lines
         .iter()
         .map(|line| {
-            let trimmed = if line.len() >= common {
+            let trimmed = if indent(line) >= common {
                 &line[common..]
             } else {
                 line.trim_start()

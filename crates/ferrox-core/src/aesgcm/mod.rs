@@ -776,7 +776,7 @@ impl Aes128Gcm {
             Inner::X86(_) => "aes-ni + pclmulqdq, fused 4-block, deferred reduction",
             #[cfg(target_arch = "aarch64")]
             Inner::Arm(..) => "armv8 aes + pmull, fused outside the 256..=512 B band, crate in it",
-            Inner::Crate(_) => "aes-gcm 0.10 (crate fallback)",
+            Inner::Crate(_) => "aes-gcm 0.11 (crate fallback)",
         }
     }
 
@@ -1506,7 +1506,7 @@ impl Aes256Gcm {
             Inner256::Arm(..) => {
                 "armv8 aes + pmull, fused outside the 256..=512 B band, crate in it"
             }
-            Inner256::Crate(_) => "aes-gcm 0.10 (crate fallback)",
+            Inner256::Crate(_) => "aes-gcm 0.11 (crate fallback)",
         }
     }
 

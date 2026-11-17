@@ -17,7 +17,7 @@ pub fn table() -> String {
     let _ = writeln!(s, "|---|---|---|---|");
     let _ = writeln!(
         s,
-        "| 1 | VLESS TCP REALITY `xtls-rprx-vision` | {} | `vless::tests` + header-family test; gate 1 (3600 shapes, dense not exhaustive), gate 2 (0 allocs, record + header), gate 3 (0.95x at every measured length); xray-core suite enabled |",
+        "| 1 | VLESS TCP REALITY `xtls-rprx-vision` | {} | `vless::tests` + header-family test; gate 1 (7200 shapes, dense not exhaustive), gate 2 (0 allocs, record + header), gate 3 (0.95x at every measured length); xray-core suite enabled |",
         live_support(
             "security=reality&encryption=none&type=tcp&flow=xtls-rprx-vision&fp=firefox&sni=example.com&sid=a8&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "192.0.2.1",

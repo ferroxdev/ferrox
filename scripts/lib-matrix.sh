@@ -307,9 +307,7 @@ matrix_tls_dir() {
     *) root="$(pwd)" ;;
   esac
   dir="$root/$dir"
-  if [[ ! -s "$dir/cert.pem" ]]; then
-    "${bench_bin:?no harness binary to mint the fixture}" make-tls "$dir" || return 1
-  fi
+  "${bench_bin:?no harness binary to mint the fixture}" make-tls --ensure "$dir" || return 1
   echo "$dir"
 }
 

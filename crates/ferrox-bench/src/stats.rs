@@ -47,14 +47,21 @@ pub struct Cell {
 }
 
 pub fn rotate(engines: &[&'static str], repeat: usize) -> Vec<&'static str> {
-    let mut order: Vec<&'static str> = engines.to_vec();
-    if order.len() < 2 {
-        return order;
-    }
-    let shift = repeat.saturating_sub(1) % order.len();
-    order.rotate_left(shift);
+    let Some(&first) = engines.get(repeat.saturating_sub(1) % engines.len().max(1)) else {
+        return Vec::new();
+    };
+    let mut order = Vec::with_capacity(engines.len());
+    order.push(first);
     if repeat.is_multiple_of(2) {
-        order.reverse();
+        order.extend(
+            engines
+                .iter()
+                .rev()
+                .copied()
+                .filter(|engine| *engine != first),
+        );
+    } else {
+        order.extend(engines.iter().copied().filter(|engine| *engine != first));
     }
     order
 }
@@ -618,18 +625,33 @@ mod tests {
     }
 
     #[test]
-    fn order_rotates_and_then_reverses() {
+    fn order_rotates_the_first_engine_and_alternates_direction() {
         let engines = ["a", "b", "c"];
         assert_eq!(rotate(&engines, 1), vec!["a", "b", "c"]);
-        assert_eq!(rotate(&engines, 2), vec!["a", "c", "b"]);
+        assert_eq!(rotate(&engines, 2), vec!["b", "c", "a"]);
         assert_eq!(rotate(&engines, 3), vec!["c", "a", "b"]);
-        assert_eq!(rotate(&engines, 4), vec!["c", "b", "a"]);
+        assert_eq!(rotate(&engines, 4), vec!["a", "c", "b"]);
         for repeat in 1..=6 {
             let order = rotate(&engines, repeat);
             assert_eq!(order.len(), 3);
             let mut sorted = order.clone();
             sorted.sort_unstable();
             assert_eq!(sorted, engines.to_vec(), "every engine runs every repeat");
+            if repeat > 1 {
+                assert_ne!(
+                    order[0],
+                    rotate(&engines, repeat - 1)[0],
+                    "the same engine never starts two repeats in a row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_engines_take_the_first_slot_in_turn() {
+        let engines = ["a", "b"];
+        for repeat in 1..=6 {
+            assert_eq!(rotate(&engines, repeat)[0], engines[(repeat - 1) % 2]);
         }
     }
 
