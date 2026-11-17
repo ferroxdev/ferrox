@@ -350,15 +350,20 @@ impl<R: Read> GrpcReader<R> {
     }
 
     fn emit(&self, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
-        let Ok(mut stream) = self.shared.stream.lock() else {
-            return false;
-        };
-        write_frame(&mut **stream, kind, flags, id, body)
+        let sent = self
+            .shared
+            .stream
+            .lock()
+            .is_ok_and(|mut stream| write_frame(&mut **stream, kind, flags, id, body));
+        if !sent {
+            self.shared.dead.store(true, Ordering::SeqCst);
+        }
+        sent
     }
 
-    fn settings(&self, flags: u8, body: &[u8]) {
+    fn settings(&self, flags: u8, body: &[u8]) -> bool {
         if flags & F_ACK != 0 {
-            return;
+            return true;
         }
         let mut at = 0;
         while at + 6 <= body.len() {
@@ -395,18 +400,19 @@ impl<R: Read> GrpcReader<R> {
             }
             at += 6;
         }
-        self.emit(T_SETTINGS, F_ACK, 0, &[]);
+        self.emit(T_SETTINGS, F_ACK, 0, &[])
     }
 
-    fn ping(&self, flags: u8, body: &[u8]) {
+    fn ping(&self, flags: u8, body: &[u8]) -> bool {
         if body.len() != 8 {
-            return;
+            return true;
         }
         if flags & F_ACK == 0 {
-            self.emit(T_PING, F_ACK, 0, body);
+            self.emit(T_PING, F_ACK, 0, body)
         } else {
             let seq = u64::from_be_bytes(body.try_into().unwrap());
             self.shared.pong.fetch_max(seq, Ordering::SeqCst);
+            true
         }
     }
 
@@ -881,16 +887,18 @@ impl<R: Read> GrpcReader<R> {
                 Some(())
             }
             T_SETTINGS => {
-                if id == 0 {
-                    self.settings(flags, &frame);
+                if id == 0 && !self.settings(flags, &frame) {
+                    None
+                } else {
+                    Some(())
                 }
-                Some(())
             }
             T_PING => {
-                if id == 0 {
-                    self.ping(flags, &frame);
+                if id == 0 && !self.ping(flags, &frame) {
+                    None
+                } else {
+                    Some(())
                 }
-                Some(())
             }
             T_WINDOW => {
                 self.window(id, frame.get(..4).unwrap_or(&[]));

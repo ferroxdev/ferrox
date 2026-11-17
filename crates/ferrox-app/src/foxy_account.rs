@@ -618,14 +618,35 @@ pub(crate) fn read_body_to<S: BufRead, W: Write + ?Sized>(
         let mut total = 0usize;
         loop {
             let mut line = String::new();
-            if io.read_line(&mut line).map_err(|_| Failure::Stream)? > 64 {
+            if (&mut *io)
+                .take(65)
+                .read_line(&mut line)
+                .map_err(|_| Failure::Stream)?
+                > 64
+            {
                 return Err(Failure::Frame);
             }
             let size = chunk_size(&line)?;
             if size == 0 {
-                let mut trailer = String::new();
-                let _ = io.read_line(&mut trailer);
-                return Ok(());
+                let mut trailer = 0usize;
+                loop {
+                    let mut line = String::new();
+                    let budget = MAX_HEAD.saturating_sub(trailer).saturating_add(1);
+                    let read = (&mut *io)
+                        .take(budget as u64)
+                        .read_line(&mut line)
+                        .map_err(|_| Failure::Stream)?;
+                    if read == 0 {
+                        return Err(Failure::Frame);
+                    }
+                    trailer += read;
+                    if trailer > MAX_HEAD {
+                        return Err(Failure::Frame);
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        return Ok(());
+                    }
+                }
             }
             total = total.checked_add(size).ok_or(Failure::Frame)?;
             if total > max_body {

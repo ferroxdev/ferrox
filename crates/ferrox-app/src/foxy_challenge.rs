@@ -1010,8 +1010,11 @@ mod tests {
         assert_eq!(solve_pow(base, &"00".repeat(32)), None, "no such pair");
         assert_eq!(solve_pow(base, "abcd"), None, "not 32 bytes");
         let long = "a".repeat(POW_BASE_CAP + 1);
+        let target = ferrox_core::foxy::account::hex_encode(&sha2::Sha256::digest(
+            format!("{long}aa").as_bytes(),
+        ));
         assert_eq!(
-            solve_pow(&long, &"00".repeat(32)),
+            solve_pow(&long, &target),
             None,
             "an oversized base is refused before any hashing"
         );

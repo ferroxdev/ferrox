@@ -137,7 +137,31 @@ const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x8;
 pub(crate) struct MasqueOut {
     spec: ClientSpec,
     inner: Mutex<Slot>,
+    dialing: AtomicUsize,
     dialed: Condvar,
+}
+
+/// Releases a dial reservation on every exit, including an unwind after a failed lane setup.
+struct Dial<'a> {
+    out: &'a MasqueOut,
+    released: bool,
+}
+
+impl Drop for Dial<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.out.release_dial();
+        }
+    }
+}
+
+impl<'a> Dial<'a> {
+    fn release(&mut self) {
+        if !self.released {
+            self.out.release_dial();
+            self.released = true;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -146,7 +170,6 @@ struct Slot {
     reconnect: Reconnect,
     target: usize,
     concurrency: usize,
-    dialing: usize,
 }
 
 /// One lane in the pool: its stack, when the reuse window retires it, and how many flows reach it.
@@ -218,6 +241,7 @@ impl std::fmt::Debug for MasqueOut {
         f.debug_struct("MasqueOut")
             .field("spec", &self.spec)
             .field("inner", &self.inner)
+            .field("dialing", &self.dialing)
             .field("dialed", &self.dialed)
             .finish()
     }
@@ -233,8 +257,8 @@ impl MasqueOut {
                 concurrency: spec.xmux.concurrency(),
                 lanes: Vec::new(),
                 reconnect: Reconnect::new(now),
-                dialing: 0,
             }),
+            dialing: AtomicUsize::new(0),
             dialed: Condvar::new(),
             spec,
         })
@@ -328,11 +352,20 @@ impl MasqueOut {
         }
     }
 
+    fn reserve_dial(&self) -> Dial<'_> {
+        self.dialing.fetch_add(1, Ordering::SeqCst);
+        Dial {
+            out: self,
+            released: false,
+        }
+    }
+
     /// A successful dial keeps the reservation until the caller admits or retires the lane.
     fn dial_lane(
         &self,
         now: Instant,
         dial: &mut impl FnMut() -> Result<Inner, String>,
+        reservation: &mut Dial<'_>,
     ) -> Result<PoolLane, String> {
         match dial() {
             Ok(inner) => Ok(Self::lane(&self.spec.xmux, now, inner)),
@@ -342,14 +375,14 @@ impl MasqueOut {
                     .lock()
                     .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
                 slot.reconnect.advance(now);
-                self.release_dial(&mut slot);
+                reservation.release();
                 Err(reason)
             }
         }
     }
 
-    fn release_dial(&self, slot: &mut Slot) {
-        slot.dialing = slot.dialing.saturating_sub(1);
+    fn release_dial(&self) {
+        self.dialing.fetch_sub(1, Ordering::SeqCst);
         self.dialed.notify_all();
     }
 
@@ -385,7 +418,7 @@ impl MasqueOut {
             if let Some(lane) = slot.lanes.first() {
                 return Ok(Arc::clone(&lane.inner));
             }
-            if slot.dialing > 0 {
+            if self.dialing.load(Ordering::SeqCst) > 0 {
                 self.wait_dial(slot);
                 continue;
             }
@@ -396,9 +429,9 @@ impl MasqueOut {
                     wait.as_secs_f64()
                 ));
             }
-            slot.dialing += 1;
+            let mut reservation = self.reserve_dial();
             drop(slot);
-            let lane = self.dial_lane(now, &mut dial)?;
+            let lane = self.dial_lane(now, &mut dial, &mut reservation)?;
             let inner = Arc::clone(&lane.inner);
             let mut slot = self
                 .inner
@@ -407,11 +440,11 @@ impl MasqueOut {
             Self::prune(&mut slot, now);
             if let Some(existing) = slot.lanes.first().map(|lane| Arc::clone(&lane.inner)) {
                 Self::end(&lane);
-                self.release_dial(&mut slot);
+                reservation.release();
                 return Ok(existing);
             }
             slot.lanes.push(lane);
-            self.release_dial(&mut slot);
+            reservation.release();
             return Ok(inner);
         }
     }
@@ -423,7 +456,7 @@ impl MasqueOut {
         now: Instant,
         mut dial: impl FnMut() -> Result<Inner, String>,
     ) -> Result<(Arc<Inner>, crate::wg_stack::FlowLease), String> {
-        let mut fresh: Option<(PoolLane, bool)> = None;
+        let mut fresh: Option<(PoolLane, bool, Dial<'_>)> = None;
         loop {
             let mut slot = self
                 .inner
@@ -439,7 +472,7 @@ impl MasqueOut {
                 }
             });
             let concurrency = slot.concurrency;
-            if let Some((lane, spread)) = fresh.take() {
+            if let Some((lane, spread, mut reservation)) = fresh.take() {
                 let keep = if spread {
                     slot.lanes.len() < slot.target
                 } else {
@@ -451,14 +484,14 @@ impl MasqueOut {
                 if keep {
                     let at = slot.lanes.len();
                     slot.lanes.push(lane);
-                    self.release_dial(&mut slot);
+                    reservation.release();
                     return Ok(Self::take(&mut slot, at));
                 }
                 Self::end(&lane);
-                self.release_dial(&mut slot);
+                reservation.release();
             }
             if slot.lanes.is_empty() {
-                if slot.dialing > 0 {
+                if self.dialing.load(Ordering::SeqCst) > 0 {
                     self.wait_dial(slot);
                     continue;
                 }
@@ -469,9 +502,13 @@ impl MasqueOut {
                         wait.as_secs_f64()
                     ));
                 }
-                slot.dialing += 1;
+                let mut reservation = self.reserve_dial();
                 drop(slot);
-                fresh = Some((self.dial_lane(now, &mut dial)?, false));
+                fresh = Some((
+                    self.dial_lane(now, &mut dial, &mut reservation)?,
+                    false,
+                    reservation,
+                ));
                 continue;
             }
             let spread = self.spec.xmux.max_connections.high > 0
@@ -480,14 +517,14 @@ impl MasqueOut {
                 && slot.lanes.len() < slot.target
                 && slot.reconnect.due(now);
             if spread {
-                if slot.dialing > 0 {
+                if self.dialing.load(Ordering::SeqCst) > 0 {
                     self.wait_dial(slot);
                     continue;
                 }
-                slot.dialing += 1;
+                let mut reservation = self.reserve_dial();
                 drop(slot);
-                if let Ok(lane) = self.dial_lane(now, &mut dial) {
-                    fresh = Some((lane, true));
+                if let Ok(lane) = self.dial_lane(now, &mut dial, &mut reservation) {
+                    fresh = Some((lane, true, reservation));
                 }
                 continue;
             }
@@ -497,18 +534,18 @@ impl MasqueOut {
                 return Ok(Self::take(&mut slot, at));
             }
             if slot.lanes.len() < slot.target && slot.reconnect.due(now) {
-                if slot.dialing > 0 {
+                if self.dialing.load(Ordering::SeqCst) > 0 {
                     self.wait_dial(slot);
                     continue;
                 }
-                slot.dialing += 1;
+                let mut reservation = self.reserve_dial();
                 drop(slot);
-                if let Ok(lane) = self.dial_lane(now, &mut dial) {
-                    fresh = Some((lane, false));
+                if let Ok(lane) = self.dial_lane(now, &mut dial, &mut reservation) {
+                    fresh = Some((lane, false, reservation));
                 }
                 continue;
             }
-            if slot.dialing > 0 {
+            if self.dialing.load(Ordering::SeqCst) > 0 {
                 self.wait_dial(slot);
                 continue;
             }
