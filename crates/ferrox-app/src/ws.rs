@@ -349,7 +349,7 @@ impl<R: Read> WsReader<R> {
                     break 0;
                 }
                 Ok(n) => break n,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) if crate::proxy::is_timeout(&error) => match self.handshake {
                     // The opening decode is the one wait a budget owns, and a silence past it is the end.
                     Some(until) if std::time::Instant::now() < until => {}
@@ -1440,7 +1440,6 @@ mod tests {
             kept: Arc<Mutex<Vec<u8>>>,
             room: usize,
         }
-
         impl Write for Trickle {
             fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
                 let n = data.len().min(self.room);
