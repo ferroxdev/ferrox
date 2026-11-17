@@ -19193,7 +19193,7 @@ fn relay_pool_flow(client: &Connection, mut flow: crate::muxpool::Flow) {
             let _ = down.shutdown(Shutdown::Write);
         }
     });
-    let mut chunk = [0u8; MUX_UPLOAD_SLICE];
+    let mut chunk = vec![0u8; MUX_UPLOAD_SLICE];
     let Ok(mut plain) = up.try_clone() else {
         flow.close();
         join(&done);
