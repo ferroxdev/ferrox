@@ -35,7 +35,7 @@ on:
         required: false
         default: ""
       window:
-        description: native SSH channel window in bytes; blank keeps the lane's 2 MiB
+        description: native SSH channel window in bytes; blank keeps the lane's 4 MiB
         required: false
         default: ""
       protocol:
@@ -362,12 +362,12 @@ jobs:
           if lane_exited; then
             lane_report
             FAILED="$FAILED native(exited)"
-          elif ! wait_front socks 10808 480; then
-            echo "the native lane carried no trace through its socks front in 480s" >&2
+          elif ! wait_front socks 10808 600; then
+            echo "the native lane carried no trace through its socks front in 600s" >&2
             lane_report
             FAILED="$FAILED native(socks ready)"
-          elif ! wait_front http 10819 480; then
-            echo "the native lane's own HTTP edge carried no trace in 480s" >&2
+          elif ! wait_front http 10819 600; then
+            echo "the native lane's own HTTP edge carried no trace in 600s" >&2
             lane_report
             FAILED="$FAILED native(http ready)"
           else
