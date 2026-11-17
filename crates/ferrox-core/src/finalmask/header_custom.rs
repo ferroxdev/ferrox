@@ -187,7 +187,28 @@ fn valid_var(name: &str) -> bool {
 }
 
 fn validate_expr(expr: &Expr) -> Option<()> {
-    (expr_kind(expr)? == ExprKind::Bytes).then_some(())
+    if expr_kind(expr)? != ExprKind::Bytes {
+        return None;
+    }
+    validate_lengths(expr)
+}
+
+fn validate_lengths(expr: &Expr) -> Option<()> {
+    let length = match expr.op.as_str() {
+        "slice" => expr.args.get(2),
+        "pad" => expr.args.get(1),
+        "truncate" => expr.args.get(1),
+        _ => None,
+    };
+    if length.is_some_and(reads_metadata) {
+        return None;
+    }
+    for arg in &expr.args {
+        if let ExprArg::Expr(inner) = arg {
+            validate_lengths(inner)?;
+        }
+    }
+    Some(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1068,22 +1089,49 @@ mod tests {
 
     #[test]
     fn a_length_a_peer_could_measure_differently_is_refused() {
-        let ctx = Context::new(None, None, Vars::default());
+        let local: SocketAddr = "127.0.0.1:1".parse().expect("local");
+        let ctx = Context::new(Some(local), None, Vars::default());
+        let metadata_length = ExprArg::Expr(Expr {
+            op: "add".to_owned(),
+            args: vec![
+                ExprArg::Metadata("src_port_u16".to_owned()),
+                ExprArg::U64(1),
+            ],
+        });
         let truncate = Expr {
             op: "truncate".to_owned(),
-            args: vec![
-                ExprArg::Bytes(vec![1, 2, 3, 4]),
-                ExprArg::Expr(Expr {
-                    op: "add".to_owned(),
-                    args: vec![ExprArg::Metadata("local_port".to_owned()), ExprArg::U64(1)],
-                }),
-            ],
+            args: vec![ExprArg::Bytes(vec![1, 2, 3, 4]), metadata_length.clone()],
         };
         assert_eq!(
             measure_expr(&truncate, &ctx)
                 .expect_err("metadata differs on each side")
                 .kind(),
             io::ErrorKind::InvalidData
+        );
+
+        let nested = Expr {
+            op: "concat".to_owned(),
+            args: vec![
+                ExprArg::Expr(Expr {
+                    op: "truncate".to_owned(),
+                    args: vec![ExprArg::Bytes(vec![1, 2, 3, 4]), metadata_length],
+                }),
+                ExprArg::Bytes(vec![0]),
+            ],
+        };
+        assert!(
+            HeaderCustom::new(
+                vec![Sequence {
+                    items: vec![Item {
+                        transform: Some(nested),
+                        ..Item::default()
+                    }],
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_none(),
+            "a nested length is validated at load"
         );
     }
 

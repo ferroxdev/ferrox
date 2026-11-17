@@ -3,7 +3,7 @@ use super::protocol::write_long;
 #[cfg(test)]
 use super::protocol::Packet;
 use super::protocol::{
-    read_long, read_varint, read_varint_with_length, varint_size, write_packet, write_string,
+    encode_packet, read_long, read_varint, read_varint_with_length, varint_size, write_string,
     write_varint, MAX_PACKET_BODY_LENGTH, MAX_PACKET_DATA_LENGTH, MAX_STRING_LENGTH,
 };
 use std::io::{self, Read, Write};
@@ -27,6 +27,12 @@ fn retryable(kind: io::ErrorKind) -> bool {
         kind,
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
     )
+}
+
+fn queue_keepalive(frame: &mut WriteBuffer, id: i64) -> io::Result<()> {
+    frame.bytes = encode_packet(KEEPALIVE_PACKET, &id.to_be_bytes())?;
+    frame.pos = 0;
+    Ok(())
 }
 
 pub struct PacketStream<R, W> {
@@ -277,7 +283,10 @@ impl<R, W: Write> PacketStream<R, W> {
             .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
         flush_frame(&mut *writer, &mut frame)
             .map_err(|error| io::Error::new(error.kind(), format!("flush frame: {error}")))?;
-        write_packet(&mut *writer, KEEPALIVE_PACKET, &id.to_be_bytes()).map_err(|error| {
+        queue_keepalive(&mut frame, id).map_err(|error| {
+            io::Error::new(error.kind(), format!("write minecraft keep-alive: {error}"))
+        })?;
+        flush_frame(&mut *writer, &mut frame).map_err(|error| {
             io::Error::new(error.kind(), format!("write minecraft keep-alive: {error}"))
         })?;
         writer.flush().map_err(|error| {
@@ -393,11 +402,9 @@ impl<R, W: Write> Write for &PacketStream<R, W> {
             write_string(&mut frame.bytes, CHANNEL)?;
             frame.bytes.extend_from_slice(&input[written..end]);
             if let Err(error) = flush_frame(&mut *writer, &mut frame) {
-                if retryable(error.kind()) {
+                if frame.pos > 0 || retryable(error.kind()) {
                     return Ok(end);
                 }
-                frame.bytes.clear();
-                frame.pos = 0;
                 return if written > 0 { Ok(written) } else { Err(error) };
             }
             written = end;
@@ -527,7 +534,10 @@ fn spawn_keepalive<W: Write + Send + 'static>(
                 return;
             }
             let value = id.fetch_add(1, Ordering::Relaxed) + 1;
-            if let Err(error) = write_packet(&mut *writer, KEEPALIVE_PACKET, &value.to_be_bytes()) {
+            if queue_keepalive(&mut frame, value).is_err() {
+                return;
+            }
+            if let Err(error) = flush_frame(&mut *writer, &mut frame) {
                 if retryable(error.kind()) {
                     continue;
                 }
