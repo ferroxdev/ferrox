@@ -1,7 +1,7 @@
 // xHTTP over HTTP/3: one QUIC connection carries the same request streams the H2 lane does, so stream-one, stream-up and packet-up keep their shapes and only the framing under them changes.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1007,9 +1007,9 @@ impl H3Client {
         let cc = quic::lane_controller(quic_params.and_then(|params| params.cc), default_bbr);
         quic::apply_lane_congestion(&mut config, cc, quic_params)?;
         let sock = if peer.is_ipv6() {
-            UdpSocket::bind("[::]:0").ok()?
+            quic::bind_datagram("[::]:0").ok()?
         } else {
-            UdpSocket::bind("0.0.0.0:0").ok()?
+            quic::bind_datagram("0.0.0.0:0").ok()?
         };
         let local = sock.local_addr().ok()?;
         let net = quic::network_generation();
@@ -1197,6 +1197,59 @@ impl H3Client {
     }
 }
 
+/// Answer one run of queued datagrams under one connection lock: a burst costs one lock, one timer sweep and
+/// one egress sweep for the run rather than one of each per packet.
+#[cfg(target_os = "linux")]
+fn drain_batch(
+    conn: &Arc<Mutex<quiche::Connection>>,
+    sock: &Datagram,
+    local: SocketAddr,
+    batch: &mut quic::Batch,
+    moved: bool,
+) -> bool {
+    let Ok(mut conn) = conn.lock() else {
+        return false;
+    };
+    for at in 0..batch.len() {
+        let Some((bytes, from)) = batch.at(at) else {
+            continue;
+        };
+        let _ = conn.recv(bytes, quiche::RecvInfo { from, to: local });
+    }
+    if conn.is_closed() {
+        return false;
+    }
+    conn.on_timeout();
+    quic::flush_egress(&mut conn, sock);
+    if moved && quic::path_failed(&mut conn, local) {
+        let _ = conn.close(false, 0, b"rebind");
+        return false;
+    }
+    true
+}
+
+/// Run the connection's timers and answer what they queued, once the sock has nothing left to read.
+fn sweep(
+    conn: &Arc<Mutex<quiche::Connection>>,
+    sock: &Datagram,
+    local: SocketAddr,
+    moved: bool,
+) -> bool {
+    let Ok(mut conn) = conn.lock() else {
+        return false;
+    };
+    if conn.is_closed() {
+        return false;
+    }
+    conn.on_timeout();
+    quic::flush_egress(&mut conn, sock);
+    if moved && quic::path_failed(&mut conn, local) {
+        let _ = conn.close(false, 0, b"rebind");
+        return false;
+    }
+    true
+}
+
 fn pump_connection(
     conn: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<Datagram>,
@@ -1209,6 +1262,8 @@ fn pump_connection(
     let mut generation = generation;
     let mut moved = false;
     let mut buf = vec![0u8; 65535];
+    #[cfg(target_os = "linux")]
+    let mut batch = quic::Batch::new();
     loop {
         let now = quic::network_generation();
         if now != generation {
@@ -1233,8 +1288,32 @@ fn pump_connection(
             .lock()
             .ok()
             .and_then(|conn| conn.timeout())
-            .map_or(TICK, |left| left.min(TICK));
-        let _ = sock.set_read_timeout(Some(wait.max(Duration::from_millis(1))));
+            .map_or(TICK, |left| left.min(TICK))
+            .max(Duration::from_millis(1));
+        // A Linux lane takes the whole queue per wake, one lock and one timer sweep per burst.
+        #[cfg(target_os = "linux")]
+        {
+            if !sock.refresh_read_timeout(wait) {
+                break;
+            }
+            match quic::recv_batch(sock, &mut batch) {
+                quic::Drain::Read => {
+                    if drain_batch(conn, sock, local, &mut batch, moved) {
+                        continue;
+                    }
+                    break;
+                }
+                quic::Drain::Empty => {
+                    if sweep(conn, sock, local, moved) {
+                        continue;
+                    }
+                    break;
+                }
+                quic::Drain::Unbatchable => {}
+                quic::Drain::Unreadable => break,
+            }
+        }
+        let _ = sock.set_read_timeout(Some(wait));
         match sock.recv_from(&mut buf) {
             Ok((n, from)) => {
                 if let Ok(mut conn) = conn.lock() {
@@ -1248,16 +1327,7 @@ fn pump_connection(
                 ) => {}
             Err(_) => break,
         }
-        let Ok(mut conn) = conn.lock() else {
-            break;
-        };
-        if conn.is_closed() {
-            break;
-        }
-        conn.on_timeout();
-        quic::flush_egress(&mut conn, sock);
-        if moved && quic::path_failed(&mut conn, local) {
-            let _ = conn.close(false, 0, b"rebind");
+        if !sweep(conn, sock, local, moved) {
             break;
         }
     }

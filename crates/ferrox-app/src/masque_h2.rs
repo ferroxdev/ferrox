@@ -30,6 +30,7 @@ const SETTINGS_ENABLE_CONNECT: u16 = 0x8;
 const FRAME_CAP: usize = 1 << 20;
 const FRAME_HEAD: usize = 9;
 const QUEUED_CAP: usize = 64;
+const CREDIT_BATCH: usize = 64 * 1024;
 const DEFAULT_WINDOW: i64 = 65_535;
 const H2_CONNECTIONS: usize = 256;
 
@@ -489,6 +490,7 @@ pub(crate) struct Client {
     connection_window: i64,
     queued: VecDeque<Vec<u8>>,
     queued_at: usize,
+    credit: usize,
     capsules: Vec<u8>,
     capsule_at: usize,
     pub(crate) addresses: Vec<IpAddr>,
@@ -589,6 +591,7 @@ fn handshake(
         connection_window: DEFAULT_WINDOW,
         queued: VecDeque::new(),
         queued_at: 0,
+        credit: 0,
         capsules: Vec::new(),
         capsule_at: 0,
         addresses: Vec::new(),
@@ -935,7 +938,11 @@ impl Client {
             h2::T_DATA if id == self.stream => {
                 let length = body.len();
                 let data = strip_padding(flags, body, false);
-                self.window(length);
+                self.credit += length;
+                if self.credit >= CREDIT_BATCH {
+                    self.window(self.credit);
+                    self.credit = 0;
+                }
                 self.capsules(data);
                 if flags & h2::F_END != 0 {
                     self.end = true;
@@ -973,9 +980,18 @@ impl Client {
         if length == 0 {
             return;
         }
-        let length = u32::try_from(length).unwrap_or(u32::MAX).to_be_bytes();
-        self.wire.send(h2::T_WINDOW, 0, 0, &length);
-        self.wire.send(h2::T_WINDOW, 0, self.stream, &length);
+        let inc = u32::try_from(length).unwrap_or(u32::MAX).to_be_bytes();
+        let mut pair = [0u8; 26];
+        pair[..FRAME_HEAD].copy_from_slice(&h2::frame_head(4, h2::T_WINDOW, 0, 0));
+        pair[FRAME_HEAD..FRAME_HEAD + 4].copy_from_slice(&inc);
+        pair[FRAME_HEAD + 4..2 * FRAME_HEAD + 4].copy_from_slice(&h2::frame_head(
+            4,
+            h2::T_WINDOW,
+            0,
+            self.stream,
+        ));
+        pair[2 * FRAME_HEAD + 4..].copy_from_slice(&inc);
+        self.wire.send_frame(&pair);
     }
 
     fn capsules(&mut self, bytes: &[u8]) {
@@ -1758,6 +1774,7 @@ mod tests {
             connection_window: DEFAULT_WINDOW,
             queued: std::collections::VecDeque::new(),
             queued_at: 0,
+            credit: 0,
             capsules: Vec::new(),
             capsule_at: 0,
             addresses: Vec::new(),
@@ -2042,6 +2059,30 @@ mod tests {
             client.send_window, 1_050,
             "the new initial value moves the window by its difference"
         );
+    }
+
+    #[test]
+    fn a_download_credits_a_batch_of_frames_in_one_write() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut client = bare_client();
+        client.wire.stream = Box::new(Recorder {
+            out: Arc::clone(&out),
+        });
+        let stream = client.stream;
+        let frame = vec![0u8; 16 * 1024];
+        for _ in 0..4 {
+            client.on(h2::T_DATA, 0, stream, &frame);
+        }
+        let written = out.lock().expect("a recorder");
+        assert_eq!(
+            written.len(),
+            26,
+            "one pair of WINDOW_UPDATE frames per 64 KiB"
+        );
+        assert_eq!(&written[..9], &[0, 0, 4, h2::T_WINDOW, 0, 0, 0, 0, 0]);
+        assert_eq!(&written[9..13], &(64 * 1024u32).to_be_bytes());
+        assert_eq!(&written[13..22], &[0, 0, 4, h2::T_WINDOW, 0, 0, 0, 0, 1]);
+        assert_eq!(&written[22..], &(64 * 1024u32).to_be_bytes());
     }
 
     #[test]
