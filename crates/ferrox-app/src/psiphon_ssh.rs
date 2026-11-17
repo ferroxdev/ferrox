@@ -1622,6 +1622,7 @@ struct Chunk {
 pub(crate) struct Channel {
     session: Arc<Inner>,
     state: Arc<ChannelState>,
+    #[allow(dead_code)]
     owner: Arc<ChannelOwner>,
     deadline: Option<Instant>,
     shutdown: Option<Arc<AtomicBool>>,
