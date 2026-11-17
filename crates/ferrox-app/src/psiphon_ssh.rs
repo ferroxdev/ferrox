@@ -5438,9 +5438,14 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         recv.eof = true;
     }
     Channel {
+        owner: Arc::new(ChannelOwner {
+            session: Arc::clone(&inner),
+            state: Arc::clone(&state),
+        }),
         session: inner,
         state,
         deadline: None,
+        shutdown: None,
     }
 }
 
@@ -5819,9 +5824,14 @@ mod tests {
             pool: Arc::clone(&pool),
         });
         let mut channel = Channel {
+            owner: Arc::new(ChannelOwner {
+                session: Arc::clone(&inner),
+                state: Arc::clone(&state),
+            }),
             session: Arc::clone(&inner),
             state: Arc::clone(&state),
             deadline: None,
+            shutdown: None,
         };
         let mut buffer = vec![0u8; PACKET_CHUNK];
         let pointer = buffer.as_ptr();
@@ -5915,9 +5925,14 @@ mod tests {
             pool: Arc::clone(&pool),
         });
         let mut channel = Channel {
+            owner: Arc::new(ChannelOwner {
+                session: Arc::clone(&inner),
+                state: Arc::clone(&state),
+            }),
             session: Arc::clone(&inner),
             state: Arc::clone(&state),
             deadline: None,
+            shutdown: None,
         };
         let mut buffer = vec![0u8; PACKET_CHUNK];
         let pointer = buffer.as_ptr();
@@ -6030,9 +6045,14 @@ mod tests {
             Dispatch::Queued
         ));
         let mut channel = Channel {
+            owner: Arc::new(ChannelOwner {
+                session: Arc::clone(&inner),
+                state: Arc::clone(&state),
+            }),
             session: Arc::clone(&inner),
             state,
             deadline: None,
+            shutdown: None,
         };
         let mut out = [0u8; 2];
         channel.read_exact(&mut out).expect("read");
@@ -6131,9 +6151,14 @@ mod tests {
         ));
 
         let mut channel = Channel {
+            owner: Arc::new(ChannelOwner {
+                session: Arc::clone(&inner),
+                state: Arc::clone(&state),
+            }),
             session: Arc::clone(&inner),
             state,
             deadline: None,
+            shutdown: None,
         };
         let mut out = [0u8; 2];
         channel.read_exact(&mut out).expect("read the queued bytes");
@@ -6256,9 +6281,14 @@ mod tests {
         });
         lock(&inner.channels).insert(1, Arc::clone(&state));
         let mut channel = Channel {
+            owner: Arc::new(ChannelOwner {
+                session: Arc::clone(&inner),
+                state: Arc::clone(&state),
+            }),
             session: Arc::clone(&inner),
             state,
             deadline: None,
+            shutdown: None,
         };
         channel.close();
         let mut head = [0u8; 4];
