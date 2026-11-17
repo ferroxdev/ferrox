@@ -2135,6 +2135,7 @@ impl Inner {
     }
 
     fn retire(&self, session: &Arc<Session>) {
+        self.replay.promote(std::slice::from_ref(session));
         session.close();
         lock(&self.sessions).retain(|current| !Arc::ptr_eq(current, session));
     }
