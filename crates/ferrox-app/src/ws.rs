@@ -15,6 +15,8 @@ const OP_DATA: u8 = 0x02;
 const OP_CLOSE: u8 = 0x08;
 const OP_PING: u8 = 0x09;
 const OP_PONG: u8 = 0x0A;
+/// A deferred control frame whose head and payload are already encoded, so a partial write resumes without a fresh mask.
+const OP_RAW: u8 = 0xFF;
 const CLOSE_BODY: [u8; 2] = [0x03, 0xE8];
 
 /// The accept key the server answers with: twenty-eight bytes of base64, on the stack.
@@ -234,6 +236,72 @@ impl std::fmt::Debug for Shared {
             .field("closed", &self.closed)
             .field("masked", &self.masked)
             .finish_non_exhaustive()
+    }
+}
+
+enum Flushed {
+    Clear,
+    Parked,
+    Lost,
+}
+
+impl Shared {
+    /// Defer a control frame that cannot interleave a data frame whose head is already on the wire; a later Pong replaces an unsent one, so a ping flood cannot grow the queue.
+    fn defer(&self, opcode: u8, payload: &[u8]) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        if opcode == OP_PONG {
+            if let Some((_, queued)) = pending
+                .iter_mut()
+                .rev()
+                .find(|(opcode, _)| *opcode == OP_PONG)
+            {
+                queued.clear();
+                queued.extend_from_slice(payload);
+                return;
+            }
+        }
+        pending.push((opcode, payload.to_vec()));
+    }
+
+    /// Write deferred control frames without waiting: an encoded frame stays in the queue until the socket takes it, and a partial take resumes at the next byte.
+    fn flush(&self, stream: &mut dyn crate::proxy::FrameWrite) -> Flushed {
+        let Ok(mut pending) = self.pending.lock() else {
+            return Flushed::Lost;
+        };
+        loop {
+            let Some((opcode, payload)) = pending.first() else {
+                return Flushed::Clear;
+            };
+            if *opcode != OP_RAW {
+                let Some(frame) = encode_frame(self.masked, *opcode, payload) else {
+                    return Flushed::Lost;
+                };
+                pending[0] = (OP_RAW, frame);
+            }
+            let len = pending[0].1.len();
+            match stream.write_ready(&[&pending[0].1]) {
+                Some(Ok(0)) => return Flushed::Lost,
+                Some(Ok(n)) if n >= len => {
+                    pending.remove(0);
+                }
+                Some(Ok(n)) => {
+                    pending[0].1.drain(..n);
+                    return Flushed::Parked;
+                }
+                Some(Err(error)) if crate::proxy::is_descriptor_wait(&error) => {
+                    return Flushed::Parked;
+                }
+                Some(Err(_)) => return Flushed::Lost,
+                None => {
+                    if !stream.write_slices(&[&pending[0].1]) {
+                        return Flushed::Lost;
+                    }
+                    pending.remove(0);
+                }
+            }
+        }
     }
 }
 
@@ -512,9 +580,8 @@ impl<R: Read> WsReader<R> {
         if self.shared.open.load(Ordering::Relaxed) != 0
             || self.shared.cut.load(Ordering::Relaxed) != 0
         {
-            if let Ok(mut pending) = self.shared.pending.lock() {
-                pending.push((opcode, payload.to_vec()));
-            }
+            drop(stream);
+            self.shared.defer(opcode, payload);
             return;
         }
         let _ = write_frame(&mut **stream, self.shared.masked, opcode, payload);
@@ -732,10 +799,13 @@ impl WsWriter {
             };
             match offer {
                 None => {
-                    return if write_frame(&mut **stream, self.masked, OP_DATA, data) {
-                        crate::proxy::Push::Took(data.len())
-                    } else {
+                    if !write_frame(&mut **stream, self.masked, OP_DATA, data) {
+                        return crate::proxy::Push::Lost;
+                    }
+                    return if matches!(self.shared.flush(&mut **stream), Flushed::Lost) {
                         crate::proxy::Push::Lost
+                    } else {
+                        crate::proxy::Push::Took(data.len())
                     };
                 }
                 Some(Ok((n, left_owed, left_cut))) => {
@@ -759,19 +829,8 @@ impl WsWriter {
         }
         self.shared.open.store(owed, Ordering::Relaxed);
         self.shared.cut.store(cut, Ordering::Relaxed);
-        if owed == 0 && cut == 0 {
-            let queued = self
-                .shared
-                .pending
-                .lock()
-                .map(|mut pending| std::mem::take(&mut *pending))
-                .unwrap_or_default();
-            for (opcode, payload) in queued {
-                let _ = write_frame(&mut **stream, self.shared.masked, opcode, &payload);
-                if opcode == OP_CLOSE {
-                    break;
-                }
-            }
+        if owed == 0 && cut == 0 && matches!(self.shared.flush(&mut **stream), Flushed::Lost) {
+            return crate::proxy::Push::Lost;
         }
         crate::proxy::Push::Took(taken)
     }
@@ -787,10 +846,18 @@ impl WsWriter {
             || self.shared.cut.load(Ordering::Relaxed) > 0
         {
             // The head on the wire still owes payload: a close frame would land inside it.
-            if let Ok(mut pending) = self.shared.pending.lock() {
-                pending.push((OP_CLOSE, CLOSE_BODY.to_vec()));
-            }
+            drop(stream);
+            self.shared.defer(OP_CLOSE, &CLOSE_BODY);
             return;
+        }
+        match self.shared.flush(&mut **stream) {
+            Flushed::Clear => {}
+            Flushed::Parked => {
+                drop(stream);
+                self.shared.defer(OP_CLOSE, &CLOSE_BODY);
+                return;
+            }
+            Flushed::Lost => return,
         }
         let _ = write_frame(&mut **stream, self.masked, OP_CLOSE, &CLOSE_BODY);
     }
@@ -865,6 +932,23 @@ fn write_cut_ready(
         Ok(n) => Some(Ok((0, len, cut + n))),
         Err(error) => Some(Err(error)),
     }
+}
+
+/// One complete frame in a buffer, so a deferred control write can resume after a partial take without generating a new mask.
+fn encode_frame(masked: bool, opcode: u8, payload: &[u8]) -> Option<Vec<u8>> {
+    let (head, hlen) = frame_head(opcode, payload.len(), masked);
+    if !masked {
+        let mut frame = Vec::with_capacity(hlen + payload.len());
+        frame.extend_from_slice(&head[..hlen]);
+        frame.extend_from_slice(payload);
+        return Some(frame);
+    }
+    let mask = fresh_mask()?;
+    let mut frame = Vec::with_capacity(hlen + 4 + payload.len());
+    frame.extend_from_slice(&head[..hlen]);
+    frame.extend_from_slice(&mask);
+    mask_copy(&mut frame, payload, mask);
+    Some(frame)
 }
 
 fn write_frame(
@@ -1194,6 +1278,21 @@ impl crate::proxy::CarrierSink for WsWriter {
     fn push_ready(&self, bytes: &[u8]) -> crate::proxy::Push {
         self.push_ready(bytes)
     }
+    fn settle(&self) -> crate::proxy::Settle {
+        if self.shared.open.load(Ordering::Relaxed) != 0
+            || self.shared.cut.load(Ordering::Relaxed) != 0
+        {
+            return crate::proxy::Settle::Clear;
+        }
+        let Ok(mut stream) = self.shared.stream.lock() else {
+            return crate::proxy::Settle::Lost;
+        };
+        match self.shared.flush(&mut **stream) {
+            Flushed::Clear => crate::proxy::Settle::Clear,
+            Flushed::Parked => crate::proxy::Settle::Parked,
+            Flushed::Lost => crate::proxy::Settle::Lost,
+        }
+    }
     #[inline]
     fn close(&self) {
         self.close();
@@ -1380,6 +1479,70 @@ mod tests {
         fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
             parts.iter().all(|part| self.write_all(part).is_ok())
         }
+    }
+
+    #[test]
+    fn a_ping_burst_keeps_one_deferred_pong() {
+        let shared = Arc::new(Shared {
+            stream: Mutex::new(Box::new(Sink::default())),
+            closed: AtomicBool::new(false),
+            masked: false,
+            open: AtomicUsize::new(1),
+            cut: AtomicUsize::new(0),
+            pending: Mutex::new(Vec::new()),
+        });
+        shared.defer(OP_PONG, b"one");
+        shared.defer(OP_PONG, b"two");
+        let pending = shared.pending.lock().expect("pending");
+        assert_eq!(pending.len(), 1, "only the latest ping owes a pong");
+        assert_eq!(pending[0].1, b"two");
+    }
+
+    #[test]
+    fn a_failed_deferred_control_write_ends_the_push() {
+        struct FailControl {
+            accepted: bool,
+        }
+
+        impl Write for FailControl {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl crate::proxy::FrameWrite for FailControl {
+            fn write_slices(&mut self, _: &[&[u8]]) -> bool {
+                false
+            }
+
+            fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+                if self.accepted {
+                    return Some(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)));
+                }
+                self.accepted = true;
+                Some(Ok(parts.iter().map(|part| part.len()).sum()))
+            }
+        }
+
+        let shared = Arc::new(Shared {
+            stream: Mutex::new(Box::new(FailControl { accepted: false })),
+            closed: AtomicBool::new(false),
+            masked: false,
+            open: AtomicUsize::new(0),
+            cut: AtomicUsize::new(0),
+            pending: Mutex::new(Vec::new()),
+        });
+        shared.defer(OP_PONG, b"p");
+        let writer = WsWriter {
+            shared,
+            masked: false,
+            keep: None,
+        };
+        assert!(matches!(writer.push_ready(&[]), crate::proxy::Push::Lost));
     }
 
     #[test]

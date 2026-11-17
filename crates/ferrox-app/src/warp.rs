@@ -1296,6 +1296,7 @@ fn parse_config(root: &crate::json::Json) -> Result<DeviceConfig, RegisterError>
                 .iter()
                 .filter_map(crate::json::Json::as_u32)
                 .filter_map(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
                 .collect()
         })
         .unwrap_or_default();
@@ -3425,6 +3426,10 @@ mod tests {
     }
 
     fn sample_reply(peer_key: &str) -> Reply {
+        reply_with_ports(peer_key, &[500, 2408])
+    }
+
+    fn reply_with_ports(peer_key: &str, ports: &[u16]) -> Reply {
         let peer = obj_pairs(vec![
             ("public_key", string(peer_key)),
             (
@@ -3433,10 +3438,12 @@ mod tests {
                     ("v4", string("192.0.2.1:0")),
                     (
                         "ports",
-                        crate::json::Json::Arr(vec![
-                            crate::json::Json::Num(500.0),
-                            crate::json::Json::Num(2408.0),
-                        ]),
+                        crate::json::Json::Arr(
+                            ports
+                                .iter()
+                                .map(|port| crate::json::Json::Num(f64::from(*port)))
+                                .collect(),
+                        ),
                     ),
                 ]),
             ),
@@ -3463,6 +3470,26 @@ mod tests {
             headers: Vec::new(),
             body: json_bytes(&root),
         }
+    }
+
+    #[test]
+    fn a_zero_port_reply_keeps_a_dialable_endpoint() {
+        let named = reply_with_ports(&b64(&[0x42; 32]), &[0, 443]);
+        assert_eq!(
+            parse_registration(&named)
+                .expect("a registration")
+                .endpoint
+                .port(),
+            443
+        );
+        let empty = reply_with_ports(&b64(&[0x42; 32]), &[0]);
+        assert_eq!(
+            parse_registration(&empty)
+                .expect("a registration")
+                .endpoint
+                .port(),
+            WIREGUARD_PORT
+        );
     }
 
     #[test]

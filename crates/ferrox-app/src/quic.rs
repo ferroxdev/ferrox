@@ -4319,7 +4319,11 @@ fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
         let read_at = Instant::now();
         match plain.read(&mut chunk) {
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Ok(0) | Err(_) => break,
+            Err(_) => {
+                fail_session(&pooled.table, id);
+                return;
+            }
+            Ok(0) => break,
             Ok(n) => {
                 #[cfg(test)]
                 qstage(format!(

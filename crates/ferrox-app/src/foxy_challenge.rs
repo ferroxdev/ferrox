@@ -111,6 +111,7 @@ pub(crate) struct Jar {
 impl Jar {
     #[must_use]
     pub(crate) fn header(&self, host: &str) -> Option<String> {
+        let host = host.to_ascii_lowercase();
         let mut out = String::new();
         for ((name, domain), value) in &self.by_name {
             if host != domain.as_str() && !host.ends_with(&format!(".{domain}")) {
@@ -875,6 +876,19 @@ mod tests {
         );
         assert_eq!(jar.header("vpn.mozilla.org").as_deref(), Some("edge=x1"));
         assert_eq!(jar.header("example.org"), None);
+    }
+
+    #[test]
+    fn a_cookie_set_for_a_mixed_case_host_answers_that_host() {
+        let mut jar = Jar::default();
+        jar.absorb(
+            "API.Accounts.Firefox.com",
+            &reply(&[("Set-Cookie", "edge=abc; Path=/")], ""),
+        );
+        assert_eq!(
+            jar.header("API.Accounts.Firefox.com").as_deref(),
+            Some("edge=abc")
+        );
     }
 
     #[test]
