@@ -314,6 +314,7 @@ impl<R: Read, W: Write> Read for &PacketStream<R, W> {
             .reader
             .lock()
             .map_err(|_| io::Error::other("packet stream reader poisoned"))?;
+        self.flush_pending_keepalive()?;
         if reader.pending_end > reader.pending_start {
             let taken = output.len().min(reader.pending_end - reader.pending_start);
             output[..taken].copy_from_slice(
