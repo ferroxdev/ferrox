@@ -1750,7 +1750,7 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
             last.record("masque", edge, None);
         }
         if let Err(error) = last.save(&cache_path) {
-            eprintln!("warp: {error}");
+            eprintln!("{error}");
         }
     }
     Ok(())
@@ -1849,7 +1849,7 @@ fn resolve_classic_edges(
         last.record("classic-outer", outer_edge, None);
         last.record("classic-inner", inner_edge, None);
         if let Err(error) = last.save(&cache_path) {
-            eprintln!("warp: {error}");
+            eprintln!("{error}");
         }
     }
     Ok(())

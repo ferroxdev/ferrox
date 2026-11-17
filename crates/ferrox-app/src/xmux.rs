@@ -134,11 +134,7 @@ impl Entry {
             conn,
             running: AtomicUsize::new(0),
             left_usage: AtomicI64::new(if usage > 0 { usage - 1 } else { -1 }),
-            left_requests: AtomicI64::new(if requests > 0 {
-                requests
-            } else {
-                i64::from(i32::MAX)
-            }),
+            left_requests: AtomicI64::new(if requests > 0 { requests } else { -1 }),
             unreusable_at: (secs > 0).then(|| Instant::now() + Duration::from_secs(secs as u64)),
             retired: AtomicBool::new(false),
         }
@@ -152,7 +148,7 @@ impl Entry {
             || !self.conn.reusable()
             || (self.running() == 0 && self.conn.pending())
             || self.left_usage.load(Ordering::SeqCst) == 0
-            || self.left_requests.load(Ordering::SeqCst) <= 0
+            || self.left_requests.load(Ordering::SeqCst) == 0
             || self.unreusable_at.is_some_and(|at| Instant::now() > at)
     }
 
@@ -249,19 +245,22 @@ impl Manager {
 
 /// The dialer's own first session: `newXmuxClient` already spent one use when it set the count, so only a reused entry pays here.
 fn hold_dialed(entry: Arc<Entry>) -> Lease {
-    entry.left_requests.fetch_sub(1, Ordering::SeqCst);
+    decrement(&entry.left_requests);
     entry.running.fetch_add(1, Ordering::SeqCst);
     Lease { entry }
 }
 
 fn hold(entry: Arc<Entry>) -> Lease {
-    let left = entry.left_usage.load(Ordering::SeqCst);
-    if left > 0 {
-        entry.left_usage.fetch_sub(1, Ordering::SeqCst);
-    }
-    entry.left_requests.fetch_sub(1, Ordering::SeqCst);
+    decrement(&entry.left_usage);
+    decrement(&entry.left_requests);
     entry.running.fetch_add(1, Ordering::SeqCst);
     Lease { entry }
+}
+
+fn decrement(counter: &AtomicI64) {
+    let _ = counter.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+        (left > 0).then_some(left - 1)
+    });
 }
 
 type Managers = HashMap<(Key, Xmux), Arc<Manager>>;
@@ -471,6 +470,13 @@ mod tests {
             dialed.load(Ordering::SeqCst),
             1,
             "an absent block normalizes to zeros, one connection with no caps"
+        );
+        assert_eq!(
+            manager.entries.lock().unwrap()[0]
+                .left_requests
+                .load(Ordering::SeqCst),
+            -1,
+            "zero request times is the unlimited sentinel, not a large finite count"
         );
         let mut ids: Vec<usize> = leased
             .iter()

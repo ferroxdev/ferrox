@@ -3,6 +3,7 @@
 //! quick reconnect offers first.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -428,12 +429,21 @@ pub(crate) struct LastEdge {
 }
 
 const RECENT_CAP: usize = 8;
+const LAST_EDGE_CAP: usize = 64 * 1024;
 
 impl LastEdge {
     pub(crate) fn load(path: &Path) -> Self {
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let Ok(file) = std::fs::File::open(path) else {
             return Self::default();
         };
+        let mut text = String::new();
+        if file
+            .take(LAST_EDGE_CAP as u64)
+            .read_to_string(&mut text)
+            .is_err()
+        {
+            return Self::default();
+        }
         let Ok(json) = crate::json::parse(&text) else {
             return Self::default();
         };
@@ -500,8 +510,62 @@ impl LastEdge {
             crate::json::Json::Obj(vec![("recent".to_owned(), crate::json::Json::Arr(rows))]);
         let mut text = String::new();
         crate::json::write(&json, &mut text);
-        std::fs::write(path, text)
-            .map_err(|error| format!("warp: cannot save `{}`: {error}", path.display()))
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut opened = None;
+        let mut last_error = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        for _ in 0..8 {
+            let mut raw = [0u8; 8];
+            let _ = getrandom::fill(&mut raw);
+            let mut name = path.file_name().map_or_else(
+                || std::ffi::OsString::from("lastconn"),
+                std::ffi::OsStr::to_os_string,
+            );
+            name.push(format!(
+                ".{}.{}.tmp",
+                std::process::id(),
+                ferrox_core::foxy::account::hex_encode(&raw)
+            ));
+            let temp = dir.join(name);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            match options.open(&temp) {
+                Ok(file) => {
+                    opened = Some((file, temp));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    last_error = error;
+                    break;
+                }
+            }
+        }
+        let Some((mut file, temp)) = opened else {
+            return Err(format!(
+                "warp: cannot save `{}`: {last_error}",
+                path.display()
+            ));
+        };
+        if let Err(error) = file.write_all(text.as_bytes()) {
+            drop(file);
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("warp: cannot save `{}`: {error}", path.display()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        drop(file);
+        std::fs::rename(&temp, path).map_err(|error| {
+            let _ = std::fs::remove_file(&temp);
+            format!("warp: cannot save `{}`: {error}", path.display())
+        })
     }
 
     pub(crate) fn get(&self, carrier: &str) -> Option<(SocketAddr, Option<&str>)> {
@@ -695,6 +759,45 @@ mod tests {
             );
         }
         assert_eq!(recent.recent.len(), RECENT_CAP);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_last_edge_load_is_bounded_and_a_save_never_truncates_a_link_target() {
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-lastconn-bound-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let path = dir.join("lastconn.json");
+        std::fs::write(&path, "x".repeat(LAST_EDGE_CAP + 1)).expect("an oversized file");
+        assert_eq!(
+            LastEdge::load(&path),
+            LastEdge::default(),
+            "an oversized file is not a listing"
+        );
+        #[cfg(unix)]
+        {
+            let outside = dir.join("outside.json");
+            std::fs::write(&outside, "keep me").expect("an outside file");
+            let link = dir.join("link.json");
+            std::os::unix::fs::symlink(&outside, &link).expect("a link");
+            let mut recent = LastEdge::default();
+            recent.record(
+                "wireguard",
+                "192.0.2.9:2408".parse().expect("an edge"),
+                None,
+            );
+            recent.save(&link).expect("saves over the link");
+            assert_eq!(
+                std::fs::read_to_string(&outside).expect("reads"),
+                "keep me",
+                "the link's target is never truncated"
+            );
+            assert_eq!(
+                LastEdge::load(&link),
+                recent,
+                "the link is replaced by the listing"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

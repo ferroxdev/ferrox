@@ -350,15 +350,20 @@ impl<R: Read> GrpcReader<R> {
     }
 
     fn emit(&self, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
-        let Ok(mut stream) = self.shared.stream.lock() else {
-            return false;
-        };
-        write_frame(&mut **stream, kind, flags, id, body)
+        let sent = self
+            .shared
+            .stream
+            .lock()
+            .is_ok_and(|mut stream| write_frame(&mut **stream, kind, flags, id, body));
+        if !sent {
+            self.shared.dead.store(true, Ordering::SeqCst);
+        }
+        sent
     }
 
-    fn settings(&self, flags: u8, body: &[u8]) {
+    fn settings(&self, flags: u8, body: &[u8]) -> bool {
         if flags & F_ACK != 0 {
-            return;
+            return true;
         }
         let mut at = 0;
         while at + 6 <= body.len() {
@@ -389,22 +394,25 @@ impl<R: Read> GrpcReader<R> {
                     .max_frame
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                *max = usize::try_from(value).unwrap_or(FRAME_CAP).min(FRAME_CAP);
+                *max = usize::try_from(value)
+                    .unwrap_or(FRAME_CAP)
+                    .clamp(16_384, FRAME_CAP);
             }
             at += 6;
         }
-        self.emit(T_SETTINGS, F_ACK, 0, &[]);
+        self.emit(T_SETTINGS, F_ACK, 0, &[])
     }
 
-    fn ping(&self, flags: u8, body: &[u8]) {
+    fn ping(&self, flags: u8, body: &[u8]) -> bool {
         if body.len() != 8 {
-            return;
+            return true;
         }
         if flags & F_ACK == 0 {
-            self.emit(T_PING, F_ACK, 0, body);
+            self.emit(T_PING, F_ACK, 0, body)
         } else {
             let seq = u64::from_be_bytes(body.try_into().unwrap());
             self.shared.pong.fetch_max(seq, Ordering::SeqCst);
+            true
         }
     }
 
@@ -439,7 +447,9 @@ impl<R: Read> GrpcReader<R> {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return;
         };
-        stream.write_slices(&[out]);
+        if !stream.write_slices(&[out]) {
+            self.shared.dead.store(true, Ordering::SeqCst);
+        }
     }
 
     fn refuse(&self, id: u32) {
@@ -877,16 +887,18 @@ impl<R: Read> GrpcReader<R> {
                 Some(())
             }
             T_SETTINGS => {
-                if id == 0 {
-                    self.settings(flags, &frame);
+                if id == 0 && !self.settings(flags, &frame) {
+                    None
+                } else {
+                    Some(())
                 }
-                Some(())
             }
             T_PING => {
-                if id == 0 {
-                    self.ping(flags, &frame);
+                if id == 0 && !self.ping(flags, &frame) {
+                    None
+                } else {
+                    Some(())
                 }
-                Some(())
             }
             T_WINDOW => {
                 self.window(id, frame.get(..4).unwrap_or(&[]));
@@ -2952,8 +2964,8 @@ impl std::io::Write for Tail {
 }
 
 impl crate::proxy::FrameWrite for Tail {
-    /// A control frame ordered behind bytes the peer has not read still has to be accepted: the
-    /// demux writes it while no lane may wait, so it appends past the cap instead of being refused.
+    /// A control frame behind bytes the peer has not read is refused rather than grown past `MOST`,
+    /// so the demux closes the connection instead of letting the queue run unbounded.
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
         if self.lost {
             return false;
@@ -2961,7 +2973,12 @@ impl crate::proxy::FrameWrite for Tail {
         if matches!(self.drain(), Settle::Lost) {
             return false;
         }
-        if self.at < self.bytes.len() {
+        let pending = self.bytes.len() - self.at;
+        let offered: usize = parts.iter().map(|part| part.len()).sum();
+        if pending >= Self::MOST || offered > Self::MOST - pending {
+            return false;
+        }
+        if pending > 0 {
             self.keep(parts, 0);
             return true;
         }
@@ -4934,6 +4951,46 @@ mod tests {
         assert!(matches!(tail.offer_slices(&[&over]), Accepted::Full));
         let fits = vec![0x33u8; 1];
         assert!(matches!(tail.offer_slices(&[&fits]), Accepted::All));
+    }
+
+    /// Control frames behind a blocked socket stop at the cap: every accepted write stays within
+    /// `MOST`, and the first one the retained suffix cannot hold is refused instead of queued.
+    #[test]
+    fn the_tail_refuses_control_writes_past_the_cap() {
+        struct Blocked;
+        impl std::io::Write for Blocked {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::proxy::FrameWrite for Blocked {
+            fn write_slices(&mut self, _: &[&[u8]]) -> bool {
+                false
+            }
+        }
+        let mut tail = Tail::new(Box::new(Blocked));
+        let frame = vec![0x44u8; 16 * 1024];
+        let mut accepted = 0;
+        let mut refused = false;
+        for _ in 0..64 {
+            if tail.write_slices(&[&frame]) {
+                accepted += 1;
+            } else {
+                refused = true;
+                break;
+            }
+            assert!(tail.bytes.len() - tail.at <= Tail::MOST);
+        }
+        assert!(
+            refused,
+            "the tail never refused a control write past the cap"
+        );
+        assert!(accepted > 0);
+        assert!(tail.bytes.len() - tail.at <= Tail::MOST);
+        assert!(tail.bytes.len() - tail.at > Tail::MOST - frame.len());
     }
 
     /// A peer that advertises a one-byte frame cannot overflow the eight batch slots: `try_send`

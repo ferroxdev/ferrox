@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::connectip::{self, Assigned, Route};
@@ -137,6 +137,31 @@ const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x8;
 pub(crate) struct MasqueOut {
     spec: ClientSpec,
     inner: Mutex<Slot>,
+    dialing: AtomicUsize,
+    dialed: Condvar,
+}
+
+/// Releases a dial reservation on every exit, including an unwind after a failed lane setup.
+struct Dial<'a> {
+    out: &'a MasqueOut,
+    released: bool,
+}
+
+impl Drop for Dial<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.out.release_dial();
+        }
+    }
+}
+
+impl Dial<'_> {
+    fn release(&mut self) {
+        if !self.released {
+            self.out.release_dial();
+            self.released = true;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -216,6 +241,8 @@ impl std::fmt::Debug for MasqueOut {
         f.debug_struct("MasqueOut")
             .field("spec", &self.spec)
             .field("inner", &self.inner)
+            .field("dialing", &self.dialing)
+            .field("dialed", &self.dialed)
             .finish()
     }
 }
@@ -231,6 +258,8 @@ impl MasqueOut {
                 lanes: Vec::new(),
                 reconnect: Reconnect::new(now),
             }),
+            dialing: AtomicUsize::new(0),
+            dialed: Condvar::new(),
             spec,
         })
     }
@@ -323,58 +352,76 @@ impl MasqueOut {
         }
     }
 
+    fn reserve_dial(&self) -> Dial<'_> {
+        self.dialing.fetch_add(1, Ordering::SeqCst);
+        Dial {
+            out: self,
+            released: false,
+        }
+    }
+
+    /// A successful dial keeps the reservation until the caller admits or retires the lane.
+    fn dial_lane(
+        &self,
+        now: Instant,
+        dial: &mut impl FnMut() -> Result<Inner, String>,
+        reservation: &mut Dial<'_>,
+    ) -> Result<PoolLane, String> {
+        match dial() {
+            Ok(inner) => Ok(Self::lane(&self.spec.xmux, now, inner)),
+            Err(reason) => {
+                let mut slot = self
+                    .inner
+                    .lock()
+                    .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
+                slot.reconnect.advance(now);
+                reservation.release();
+                Err(reason)
+            }
+        }
+    }
+
+    fn release_dial(&self) {
+        self.dialing.fetch_sub(1, Ordering::SeqCst);
+        self.dialed.notify_all();
+    }
+
+    fn wait_dial(&self, slot: std::sync::MutexGuard<'_, Slot>) {
+        let _ = self.dialed.wait_timeout(slot, Duration::from_secs(1));
+    }
+
+    fn take(slot: &mut Slot, at: usize) -> (Arc<Inner>, crate::wg_stack::FlowLease) {
+        let lane = &mut slot.lanes[at];
+        lane.requests = lane.requests.saturating_add(1);
+        lane.active.fetch_add(1, Ordering::AcqRel);
+        (
+            Arc::clone(&lane.inner),
+            crate::wg_stack::FlowLease::retiring(
+                Arc::clone(&lane.active),
+                Arc::clone(&lane.inner.retire),
+                Arc::clone(&lane.inner.alive),
+            ),
+        )
+    }
+
     fn ensure_at(
         &self,
         now: Instant,
-        dial: impl FnOnce() -> Result<Inner, String>,
-    ) -> Result<Arc<Inner>, String> {
-        let mut slot = self
-            .inner
-            .lock()
-            .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
-        Self::prune(&mut slot, now);
-        if let Some(lane) = slot.lanes.first() {
-            return Ok(Arc::clone(&lane.inner));
-        }
-        if !slot.reconnect.due(now) {
-            let wait = slot.reconnect.next_dial.duration_since(now);
-            return Err(format!(
-                "masque: reconnecting in {:.1}s",
-                wait.as_secs_f64()
-            ));
-        }
-        let lane = match dial() {
-            Ok(inner) => Self::lane(&self.spec.xmux, now, inner),
-            Err(reason) => {
-                slot.reconnect.advance(now);
-                return Err(reason);
-            }
-        };
-        let inner = Arc::clone(&lane.inner);
-        slot.lanes.push(lane);
-        Ok(inner)
-    }
-
-    /// Choose the least-loaded lane with room, or open one while the pool is under its target.
-    fn ensure_flow_at(
-        &self,
-        now: Instant,
         mut dial: impl FnMut() -> Result<Inner, String>,
-    ) -> Result<(Arc<Inner>, crate::wg_stack::FlowLease), String> {
-        let mut slot = self
-            .inner
-            .lock()
-            .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
-        Self::prune(&mut slot, now);
-        slot.lanes.retain(|lane| {
-            if lane.requests < lane.cap {
-                true
-            } else {
-                Self::end(lane);
-                false
+    ) -> Result<Arc<Inner>, String> {
+        loop {
+            let mut slot = self
+                .inner
+                .lock()
+                .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
+            Self::prune(&mut slot, now);
+            if let Some(lane) = slot.lanes.first() {
+                return Ok(Arc::clone(&lane.inner));
             }
-        });
-        if slot.lanes.is_empty() {
+            if self.dialing.load(Ordering::SeqCst) > 0 {
+                self.wait_dial(slot);
+                continue;
+            }
             if !slot.reconnect.due(now) {
                 let wait = slot.reconnect.next_dial.duration_since(now);
                 return Err(format!(
@@ -382,65 +429,128 @@ impl MasqueOut {
                     wait.as_secs_f64()
                 ));
             }
-            match dial() {
-                Ok(inner) => {
-                    let lane = Self::lane(&self.spec.xmux, now, inner);
-                    slot.lanes.push(lane);
-                }
-                Err(reason) => {
-                    slot.reconnect.advance(now);
-                    return Err(reason);
-                }
+            let mut reservation = self.reserve_dial();
+            drop(slot);
+            let lane = self.dial_lane(now, &mut dial, &mut reservation)?;
+            let inner = Arc::clone(&lane.inner);
+            let mut slot = self
+                .inner
+                .lock()
+                .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
+            Self::prune(&mut slot, now);
+            if let Some(existing) = slot.lanes.first().map(|lane| Arc::clone(&lane.inner)) {
+                Self::end(&lane);
+                reservation.release();
+                return Ok(existing);
             }
+            slot.lanes.push(lane);
+            reservation.release();
+            return Ok(inner);
         }
-        let concurrency = slot.concurrency;
-        let spread = self.spec.xmux.max_connections.high > 0
-            && concurrency == usize::MAX
-            && slot.lanes.iter().all(|lane| lane.requests > 0)
-            && slot.lanes.len() < slot.target
-            && slot.reconnect.due(now);
-        let fresh = if spread {
-            if let Ok(inner) = dial() {
-                slot.lanes.push(Self::lane(&self.spec.xmux, now, inner));
-                Some(slot.lanes.len() - 1)
-            } else {
-                slot.reconnect.advance(now);
-                None
-            }
-        } else {
-            None
-        };
-        let eligible = fresh
-            .or_else(|| {
-                slot.lanes.iter().position(|lane| {
-                    lane.active.load(Ordering::Acquire) < concurrency && lane.requests < lane.cap
-                })
-            })
-            .or_else(|| {
-                if slot.lanes.len() < slot.target && slot.reconnect.due(now) {
-                    if let Ok(inner) = dial() {
-                        slot.lanes.push(Self::lane(&self.spec.xmux, now, inner));
-                        Some(slot.lanes.len() - 1)
-                    } else {
-                        slot.reconnect.advance(now);
-                        None
-                    }
+    }
+
+    /// Choose the least-loaded lane with room, or open one while the pool is under its target.
+    #[allow(clippy::too_many_lines)]
+    fn ensure_flow_at(
+        &self,
+        now: Instant,
+        mut dial: impl FnMut() -> Result<Inner, String>,
+    ) -> Result<(Arc<Inner>, crate::wg_stack::FlowLease), String> {
+        let mut fresh: Option<(PoolLane, bool, Dial<'_>)> = None;
+        loop {
+            let mut slot = self
+                .inner
+                .lock()
+                .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
+            Self::prune(&mut slot, now);
+            slot.lanes.retain(|lane| {
+                if lane.requests < lane.cap {
+                    true
                 } else {
-                    None
+                    Self::end(lane);
+                    false
                 }
-            })
-            .ok_or_else(|| "masque: no lane could be opened".to_owned())?;
-        let lane = &mut slot.lanes[eligible];
-        lane.requests = lane.requests.saturating_add(1);
-        lane.active.fetch_add(1, Ordering::AcqRel);
-        Ok((
-            Arc::clone(&lane.inner),
-            crate::wg_stack::FlowLease::retiring(
-                Arc::clone(&lane.active),
-                Arc::clone(&lane.inner.retire),
-                Arc::clone(&lane.inner.alive),
-            ),
-        ))
+            });
+            let concurrency = slot.concurrency;
+            if let Some((lane, spread, mut reservation)) = fresh.take() {
+                let keep = if spread {
+                    slot.lanes.len() < slot.target
+                } else {
+                    !slot.lanes.iter().any(|lane| {
+                        lane.active.load(Ordering::Acquire) < concurrency
+                            && lane.requests < lane.cap
+                    })
+                };
+                if keep {
+                    let at = slot.lanes.len();
+                    slot.lanes.push(lane);
+                    reservation.release();
+                    return Ok(Self::take(&mut slot, at));
+                }
+                Self::end(&lane);
+                reservation.release();
+            }
+            if slot.lanes.is_empty() {
+                if self.dialing.load(Ordering::SeqCst) > 0 {
+                    self.wait_dial(slot);
+                    continue;
+                }
+                if !slot.reconnect.due(now) {
+                    let wait = slot.reconnect.next_dial.duration_since(now);
+                    return Err(format!(
+                        "masque: reconnecting in {:.1}s",
+                        wait.as_secs_f64()
+                    ));
+                }
+                let mut reservation = self.reserve_dial();
+                drop(slot);
+                fresh = Some((
+                    self.dial_lane(now, &mut dial, &mut reservation)?,
+                    false,
+                    reservation,
+                ));
+                continue;
+            }
+            let spread = self.spec.xmux.max_connections.high > 0
+                && concurrency == usize::MAX
+                && slot.lanes.iter().all(|lane| lane.requests > 0)
+                && slot.lanes.len() < slot.target
+                && slot.reconnect.due(now);
+            if spread {
+                if self.dialing.load(Ordering::SeqCst) > 0 {
+                    self.wait_dial(slot);
+                    continue;
+                }
+                let mut reservation = self.reserve_dial();
+                drop(slot);
+                if let Ok(lane) = self.dial_lane(now, &mut dial, &mut reservation) {
+                    fresh = Some((lane, true, reservation));
+                }
+                continue;
+            }
+            if let Some(at) = slot.lanes.iter().position(|lane| {
+                lane.active.load(Ordering::Acquire) < concurrency && lane.requests < lane.cap
+            }) {
+                return Ok(Self::take(&mut slot, at));
+            }
+            if slot.lanes.len() < slot.target && slot.reconnect.due(now) {
+                if self.dialing.load(Ordering::SeqCst) > 0 {
+                    self.wait_dial(slot);
+                    continue;
+                }
+                let mut reservation = self.reserve_dial();
+                drop(slot);
+                if let Ok(lane) = self.dial_lane(now, &mut dial, &mut reservation) {
+                    fresh = Some((lane, false, reservation));
+                }
+                continue;
+            }
+            if self.dialing.load(Ordering::SeqCst) > 0 {
+                self.wait_dial(slot);
+                continue;
+            }
+            return Err("masque: no lane could be opened".to_owned());
+        }
     }
 
     pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination, prefix: &[u8]) {
@@ -3219,14 +3329,20 @@ pub(crate) fn test_spec() -> ServerSpec {
 impl Family {
     /// A family whose free runs are the usable range minus the server's own address.
     fn new(server: u128, prefix: u8, bits: u8) -> Result<Self, String> {
-        let mask = if prefix == 0 {
-            u128::MAX
+        let mask = if prefix >= bits {
+            0
+        } else if bits == 32 {
+            u128::from(u32::MAX) >> prefix
         } else {
-            (1u128 << (bits - prefix)) - 1
+            u128::MAX >> prefix
         };
         let network = server & !mask;
         let span = mask;
-        let first = network.saturating_add(1);
+        let first = if prefix.saturating_add(1) >= bits {
+            network
+        } else {
+            network.saturating_add(1)
+        };
         // A v4 pool gives up its broadcast address; a v6 one has no broadcast, so the last host stays assignable exactly as the reference leaves it.
         let last = if prefix == bits {
             network
@@ -3783,14 +3899,16 @@ fn parse_head(tunnel: &mut Tunnel, spec: &ServerSpec) -> bool {
         let Some(payload) = tunnel.buf.get(at..end) else {
             return false;
         };
-        tunnel.at = end;
         if frame.kind == frames::H3_HEADERS {
-            break payload;
+            break (payload, end);
         }
+        tunnel.at = end;
     };
+    let (block, end) = block;
     let Some(fields) = hpack::qpack_fields(block) else {
         return false;
     };
+    tunnel.at = end;
     tunnel.buf.drain(..tunnel.at);
     tunnel.buf.shrink_to_fit();
     tunnel.at = 0;
@@ -4749,6 +4867,51 @@ mod tests {
             vec!["fd14::3".parse::<IpAddr>().expect("an address")]
         );
         assert_eq!(pool.assign().len(), 0);
+    }
+
+    #[test]
+    fn a_v4_default_route_pool_stays_inside_32_bits() {
+        let mut pool = AddressPool::from_prefixes(&["0.0.0.1/0".to_owned()]).expect("a pool");
+        let family = pool.v4.as_ref().expect("a v4 family");
+        assert_eq!(family.network, 0);
+        assert_eq!(family.first, 1);
+        assert_eq!(family.last, u128::from(u32::MAX) - 1);
+        assert_eq!(pool.assign(), vec![IpAddr::V4(Ipv4Addr::from(2))]);
+    }
+
+    #[test]
+    fn a_v4_point_to_point_pool_keeps_both_addresses() {
+        let mut pool = AddressPool::from_prefixes(&["10.14.0.0/31".to_owned()]).expect("a pool");
+        let family = pool.v4.as_ref().expect("a v4 family");
+        assert_eq!(family.first, u128::from(0x0a0e_0000u32));
+        assert_eq!(family.last, u128::from(0x0a0e_0001u32));
+        assert_eq!(
+            pool.assign(),
+            vec!["10.14.0.1".parse::<IpAddr>().expect("an address")]
+        );
+        assert_eq!(pool.assign(), Vec::<IpAddr>::new());
+    }
+
+    #[test]
+    fn a_v4_single_address_pool_has_one_address() {
+        let mut pool = AddressPool::from_prefixes(&["10.14.0.1/32".to_owned()]).expect("a pool");
+        let family = pool.v4.as_ref().expect("a v4 family");
+        assert_eq!(family.first, u128::from(0x0a0e_0001u32));
+        assert_eq!(family.last, family.first);
+        assert_eq!(pool.assign(), Vec::<IpAddr>::new());
+    }
+
+    #[test]
+    fn a_v6_point_to_point_pool_keeps_both_addresses() {
+        let mut pool = AddressPool::from_prefixes(&["fd14::/127".to_owned()]).expect("a pool");
+        let family = pool.v6.as_ref().expect("a v6 family");
+        assert_eq!(family.first, family.network);
+        assert_eq!(family.last, family.network + 1);
+        assert_eq!(
+            pool.assign(),
+            vec!["fd14::1".parse::<IpAddr>().expect("an address")]
+        );
+        assert_eq!(pool.assign(), Vec::<IpAddr>::new());
     }
 
     #[test]

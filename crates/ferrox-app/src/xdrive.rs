@@ -2902,6 +2902,26 @@ impl Local {
     pub(crate) fn new(root: &str) -> io::Result<Self> {
         let path = PathBuf::from(root);
         create_dir(&path)?;
+        let meta = std::fs::symlink_metadata(&path)?;
+        if !meta.file_type().is_dir() {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!("the store root is not a directory: {root}"),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            if meta.uid() != unsafe { libc::geteuid() } {
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    format!("the store root is owned by another user: {root}"),
+                ));
+            }
+            if meta.permissions().mode() & 0o777 != 0o700 {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
         Ok(Self { root: path })
     }
 
@@ -2924,8 +2944,22 @@ impl Local {
             return Err(carrier_error(format!("reserved object name: {name}")));
         }
         let mut path = self.root.clone();
+        let mut missing = false;
         for part in parts {
             path.push(part);
+            if missing {
+                continue;
+            }
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(carrier_error(format!(
+                        "object path crosses a symlink: {name}"
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => missing = true,
+                Err(error) => return Err(error),
+            }
         }
         Ok(path)
     }
@@ -2973,7 +3007,27 @@ impl Storage for Local {
     }
 
     fn get(&self, name: &str) -> io::Result<Vec<u8>> {
-        std::fs::read(self.resolve(name)?)
+        let path = self.resolve(name)?;
+        if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
+            return Err(carrier_error(format!(
+                "the object {name} is not a regular file"
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)?;
+            let mut data = Vec::new();
+            file.read_to_end(&mut data)?;
+            Ok(data)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::read(path)
+        }
     }
 
     fn delete(&self, name: &str) -> io::Result<()> {
@@ -2994,10 +3048,16 @@ impl Storage for Local {
             return Ok(Vec::new());
         };
         let mut found = Vec::new();
-        for name in readable
-            .flatten()
-            .filter_map(|entry| entry.file_name().into_string().ok())
-        {
+        for entry in readable.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if !kind.is_file() && !kind.is_dir() {
+                continue;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
             if name.starts_with(TEMP_PREFIX) {
                 continue;
             }
@@ -3014,7 +3074,6 @@ impl Storage for Local {
 /// The separator a flattened name uses where the folder step would be a slash.
 const FLAT_SEP: &str = "~";
 const DRIVE_INLINE_LIMIT: usize = 12_000;
-const DRIVE_BOUNDARY: &str = "xdrive-boundary";
 const DRIVE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const DRIVE_FILES_URL: &str = "https://www.googleapis.com/drive/v3/files";
 const DRIVE_UPLOAD_URL: &str =
@@ -3027,6 +3086,7 @@ const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 const LINE_CAP: usize = 8 * 1024;
 const HEAD_CAP: usize = 16 * 1024;
+const TRAILER_CAP: usize = 64 * 1024;
 const ERROR_BODY_CAP: usize = 64 * 1024;
 const TOKEN_CAP: usize = 1 << 20;
 const TOKEN_SKEW: Duration = Duration::from_secs(60);
@@ -3047,6 +3107,49 @@ fn under<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
 /// The first step of a flattened name, which is what a listing of one folder level reports.
 fn first_step(rest: &str) -> &str {
     rest.split(FLAT_SEP).next().unwrap_or(rest)
+}
+
+/// A boundary chosen per request, so a payload cannot carry its own delimiter and split the body.
+fn drive_boundary() -> io::Result<String> {
+    let mut raw = [0u8; 16];
+    getrandom::fill(&mut raw).map_err(|error| io::Error::other(error.to_string()))?;
+    let mut hex = String::with_capacity(32);
+    for byte in raw {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
+}
+
+/// A random boundary whose delimiter does not occur in either part of the body.
+fn pick_boundary(text: &[u8], data: &[u8]) -> io::Result<String> {
+    for _ in 0..8 {
+        let boundary = drive_boundary()?;
+        let needle = format!("\r\n--{boundary}");
+        let needle = needle.as_bytes();
+        if !text.windows(needle.len()).any(|window| window == needle)
+            && !data.windows(needle.len()).any(|window| window == needle)
+        {
+            return Ok(boundary);
+        }
+    }
+    Err(carrier_error("could not choose a multipart boundary"))
+}
+
+/// The multipart body the reference sends: metadata first, then the payload, framed by the chosen boundary.
+fn multipart(boundary: &str, text: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(text.len() + data.len() + 128);
+    let _ = write!(
+        body,
+        "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+    );
+    body.extend_from_slice(text);
+    let _ = write!(
+        body,
+        "\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n"
+    );
+    body.extend_from_slice(data);
+    let _ = write!(body, "\r\n--{boundary}--\r\n");
+    body
 }
 
 /// A bound on how many requests one service answers at once, which is also its connection cap: a lane is held for exactly as long as its holder lives.
@@ -3326,8 +3429,17 @@ impl Lane {
                 return Err(carrier_error("the service framed a chunk badly"));
             };
             if want == 0 {
-                while !self.line()?.is_empty() {}
-                return Ok(());
+                let mut trailer = 0usize;
+                loop {
+                    let line = self.line()?;
+                    if line.is_empty() {
+                        return Ok(());
+                    }
+                    trailer = trailer.saturating_add(line.len());
+                    if trailer > TRAILER_CAP {
+                        return Err(carrier_error("the service trailer is too long"));
+                    }
+                }
             }
             guard(out.len() + want, limit)?;
             self.append_body(want, out)?;
@@ -5390,7 +5502,13 @@ impl Drive {
     fn query(&self, condition: &str) -> io::Result<HashMap<String, Found>> {
         let mut found: HashMap<String, Found> = HashMap::new();
         let mut page = String::new();
+        let mut seen = HashSet::new();
+        let mut pages = 0usize;
         loop {
+            pages += 1;
+            if pages > MAX_LIST_PAGES {
+                return Err(carrier_error("the Drive listing did not end"));
+            }
             let mut pairs = vec![
                 (
                     "fields",
@@ -5451,6 +5569,9 @@ impl Drive {
                 .to_owned();
             if next.is_empty() {
                 return Ok(found);
+            }
+            if !seen.insert(next.clone()) {
+                return Err(carrier_error("the Drive listing repeated a page token"));
             }
             page = next;
         }
@@ -5532,21 +5653,11 @@ impl Drive {
                 text.into_bytes(),
             )
         } else {
-            let mut body = Vec::with_capacity(text.len() + data.len() + 128);
-            let _ = write!(
-                body,
-                "--{DRIVE_BOUNDARY}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
-            );
-            body.extend_from_slice(text.as_bytes());
-            let _ = write!(
-                body,
-                "\r\n--{DRIVE_BOUNDARY}\r\nContent-Type: application/octet-stream\r\n\r\n"
-            );
-            body.extend_from_slice(data);
-            let _ = write!(body, "\r\n--{DRIVE_BOUNDARY}--\r\n");
+            let boundary = pick_boundary(text.as_bytes(), data)?;
+            let body = multipart(&boundary, text.as_bytes(), data);
             (
                 self.upload_url.clone(),
-                format!("multipart/related; boundary={DRIVE_BOUNDARY}"),
+                format!("multipart/related; boundary={boundary}"),
                 body,
             )
         };
@@ -5718,18 +5829,8 @@ impl SlotStore for Drive {
             &mut metadata,
         );
         let (target, content, payload) = if let Some(body) = body {
-            let mut multipart = Vec::with_capacity(metadata.len() + body.len() + 128);
-            let _ = write!(
-                multipart,
-                "--{DRIVE_BOUNDARY}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
-            );
-            multipart.extend_from_slice(metadata.as_bytes());
-            let _ = write!(
-                multipart,
-                "\r\n--{DRIVE_BOUNDARY}\r\nContent-Type: application/octet-stream\r\n\r\n"
-            );
-            multipart.extend_from_slice(body);
-            let _ = write!(multipart, "\r\n--{DRIVE_BOUNDARY}--\r\n");
+            let boundary = pick_boundary(metadata.as_bytes(), body)?;
+            let multipart = multipart(&boundary, metadata.as_bytes(), body);
             let upload = self
                 .upload_url
                 .split_once('?')
@@ -5739,7 +5840,7 @@ impl SlotStore for Drive {
                     "{upload}/{id}?uploadType=multipart&fields=id&supportsAllDrives=true",
                     id = path_escape(id)
                 ),
-                format!("multipart/related; boundary={DRIVE_BOUNDARY}"),
+                format!("multipart/related; boundary={boundary}"),
                 multipart,
             )
         } else {
@@ -6418,6 +6519,107 @@ mod tests {
             "an absent folder lists empty rather than failing the poll"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_local_store_never_reads_through_a_symlink_or_lists_one() {
+        #[cfg(unix)]
+        {
+            let (dir, store) = local("symlink");
+            let outside = dir.parent().expect("parent").join(format!(
+                "ferrox-xdrive-outside-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::write(&outside, b"secret").expect("writes outside");
+            std::fs::create_dir_all(dir.join("streams/a/c2s")).expect("folder");
+            std::os::unix::fs::symlink(&outside, dir.join("streams/a/c2s/000000000.seg"))
+                .expect("links");
+            assert!(
+                store.get("streams/a/c2s/000000000.seg").is_err(),
+                "a symlink is not an object the store wrote"
+            );
+            let listed = store.list("streams/a/c2s").expect("lists");
+            assert!(
+                listed.is_empty(),
+                "a reader is never handed a name that is not a file"
+            );
+            let _ = std::fs::remove_file(&outside);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_local_store_never_crosses_an_intermediate_symlink() {
+        #[cfg(unix)]
+        {
+            let (dir, store) = local("nested-link");
+            let outside = dir.parent().expect("parent").join(format!(
+                "ferrox-xdrive-nested-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(outside.join("a/c2s")).expect("outside folder");
+            std::fs::write(outside.join("a/c2s/000000000.seg"), b"secret").expect("outside file");
+            std::os::unix::fs::symlink(&outside, dir.join("streams")).expect("links a prefix");
+            assert!(
+                store.get("streams/a/c2s/000000000.seg").is_err(),
+                "an intermediate link is not part of the store"
+            );
+            assert!(
+                store.list("streams/a/c2s").is_err(),
+                "a listing does not follow an intermediate link"
+            );
+            assert!(
+                store.put("streams/a/c2s/000000001.seg", b"x").is_err(),
+                "a write does not follow an intermediate link"
+            );
+            let _ = std::fs::remove_dir_all(&outside);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_local_store_tightens_an_existing_root_to_owner_only() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = scratch("rootmode");
+            std::fs::create_dir_all(&dir).expect("creates");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                .expect("loosens");
+            Local::new(dir.to_str().expect("utf-8")).expect("opens and tightens");
+            assert_eq!(
+                std::fs::metadata(&dir).expect("reads").permissions().mode() & 0o777,
+                0o700,
+                "an existing root is tightened, not refused"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_multipart_boundary_is_random_and_frames_the_metadata_and_payload() {
+        let first = drive_boundary().expect("entropy");
+        let second = drive_boundary().expect("entropy");
+        assert_eq!(first.len(), 32, "a boundary is 16 bytes of hex");
+        assert_ne!(first, second, "each request names its own boundary");
+        let body = multipart("abc123", b"{\"name\":\"x\"}", b"payload");
+        let text = String::from_utf8(body).expect("utf-8 framing");
+        assert!(text.starts_with("--abc123\r\nContent-Type: application/json"));
+        assert!(text.contains("\r\n--abc123\r\nContent-Type: application/octet-stream"));
+        assert!(text.ends_with("\r\n--abc123--\r\n"));
+        let chosen = pick_boundary(b"plain", b"\r\n--not-the-boundary").expect("chooses");
+        let needle = format!("\r\n--{chosen}");
+        assert!(!b"plain"
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes()));
     }
 
     #[test]
@@ -7696,14 +7898,6 @@ mod tests {
             .map(|at| b'a' + (at % 26) as u8)
             .collect();
         let metadata = r#"{"name":"streams~a~c2s~000000000.seg","parents":["root"]}"#;
-        let mut want = format!(
-            "--{DRIVE_BOUNDARY}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n--{DRIVE_BOUNDARY}\r\nContent-Type: application/octet-stream\r\n\r\n"
-        )
-        .into_bytes();
-        want.extend_from_slice(&data);
-        want.extend_from_slice(b"\r\n--");
-        want.extend_from_slice(DRIVE_BOUNDARY.as_bytes());
-        want.extend_from_slice(b"--\r\n");
         fake.push(200, r#"{"access_token":"atok","expires_in":3600}"#);
         fake.push(200, r#"{"id":"big"}"#);
         drive
@@ -7711,14 +7905,23 @@ mod tests {
             .expect("uploads");
         let request = fake.taken()[1].clone();
         let head = head_end(&request).expect("a head");
-        assert_eq!(
-            &request[..head],
-            format!(
-                "POST /upload/files?uploadType=multipart HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer atok\r\nContent-Type: multipart/related; boundary={DRIVE_BOUNDARY}\r\nContent-Length: {}\r\n\r\n",
-                fake.port,
+        let text = String::from_utf8_lossy(&request[..head]);
+        let boundary = text
+            .split_once("boundary=")
+            .and_then(|(_, rest)| rest.split_once("\r\n"))
+            .map(|(boundary, _)| boundary.to_owned())
+            .expect("a boundary");
+        let mut want = format!(
+            "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .into_bytes();
+        want.extend_from_slice(&data);
+        want.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        assert!(
+            text.contains(&format!(
+                "Content-Type: multipart/related; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
                 want.len()
-            )
-            .as_bytes(),
+            )),
             "the metadata part carries no description, because the payload did not fit in one"
         );
         assert_eq!(

@@ -5,7 +5,7 @@ use crate::foxy_challenge::{self, Jar};
 use ferrox_core::foxy::account::{self, Signed};
 use ferrox_core::foxy::{edge_peer, Failure, Pass};
 use ferrox_core::tls::{TlsConfig, TlsProvider as _};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -14,6 +14,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const USER_AGENT: &str = "MozillaVPN/2.35.0 (sys:linux; iap:true)";
 pub(crate) const JSON_ACCEPT: &str = "application/json";
 const MAX_HEAD: usize = 16 * 1024;
+const TOKEN_FILE_CAP: usize = 64 * 1024;
 /// The one-shot reply body cap; the relay streams its body instead.
 pub(crate) const MAX_BODY: usize = 1024 * 1024;
 /// The default response body read chunk when the caller does not limit it.
@@ -133,7 +134,16 @@ impl TokenFile {
 
     /// A file for another account, an unreadable file and a file with neither a grant nor a pending sign-in all read as no session.
     pub(crate) fn load(&self) -> Option<Session> {
-        let text = std::fs::read_to_string(&self.path).ok()?;
+        let mut raw = Vec::new();
+        std::fs::File::open(&self.path)
+            .ok()?
+            .take((TOKEN_FILE_CAP + 1) as u64)
+            .read_to_end(&mut raw)
+            .ok()?;
+        if raw.len() > TOKEN_FILE_CAP {
+            return None;
+        }
+        let text = String::from_utf8(raw).ok()?;
         let doc = crate::json::parse(&text).ok()?;
         let field = |key: &str| {
             doc.get(key)
@@ -201,22 +211,40 @@ impl TokenFile {
         let mut text = String::new();
         json::write(&Json::Obj(pairs), &mut text);
         // A lane beside this one may read the file at any moment: a rename shows it the old grant or the new one, never half of either.
-        let mut temp = self.path.clone().into_os_string();
-        temp.push(format!(".{}.tmp", std::process::id()));
-        let temp = std::path::PathBuf::from(temp);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
+        let mut opened = None;
+        for _ in 0..8 {
+            let mut raw = [0u8; 8];
+            let _ = getrandom::fill(&mut raw);
+            let mut temp = self.path.clone().into_os_string();
+            temp.push(format!(
+                ".{}.{}.tmp",
+                std::process::id(),
+                account::hex_encode(&raw)
+            ));
+            let temp = std::path::PathBuf::from(temp);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            match options.open(&temp) {
+                Ok(file) => {
+                    opened = Some((file, temp));
+                    break;
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(_) => break,
+            }
         }
-        let Ok(mut file) = options.open(&temp) else {
+        let Some((mut file, temp)) = opened else {
             eprintln!("foxy: cannot write the session to {}", self.path.display());
             return;
         };
         if file.write_all(text.as_bytes()).is_err() {
             eprintln!("foxy: cannot write the session to {}", self.path.display());
+            drop(file);
             let _ = std::fs::remove_file(&temp);
             return;
         }
@@ -420,7 +448,11 @@ pub(crate) fn read_head<S: BufRead>(io: &mut S) -> Result<Reply, Failure> {
     let mut total = 0usize;
     loop {
         let mut line = String::new();
-        let read = io.read_line(&mut line).map_err(|_| Failure::Stream)?;
+        let budget = MAX_HEAD.saturating_sub(total).saturating_add(1);
+        let read = (&mut *io)
+            .take(budget as u64)
+            .read_line(&mut line)
+            .map_err(|_| Failure::Stream)?;
         if read == 0 {
             return Err(Failure::Frame);
         }
@@ -503,14 +535,35 @@ pub(crate) fn read_body<S: BufRead>(
         let mut body = Vec::new();
         loop {
             let mut line = String::new();
-            if io.read_line(&mut line).map_err(|_| Failure::Stream)? > 64 {
+            if (&mut *io)
+                .take(65)
+                .read_line(&mut line)
+                .map_err(|_| Failure::Stream)?
+                > 64
+            {
                 return Err(Failure::Frame);
             }
             let size = chunk_size(&line)?;
             if size == 0 {
-                let mut trailer = String::new();
-                let _ = io.read_line(&mut trailer);
-                return Ok(body);
+                let mut trailer = 0usize;
+                loop {
+                    let mut line = String::new();
+                    let budget = MAX_HEAD.saturating_sub(trailer).saturating_add(1);
+                    let read = (&mut *io)
+                        .take(budget as u64)
+                        .read_line(&mut line)
+                        .map_err(|_| Failure::Stream)?;
+                    if read == 0 {
+                        return Err(Failure::Frame);
+                    }
+                    trailer += read;
+                    if trailer > MAX_HEAD {
+                        return Err(Failure::Frame);
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        return Ok(body);
+                    }
+                }
             }
             let Some(total) = body.len().checked_add(size) else {
                 return Err(Failure::Frame);
@@ -565,14 +618,35 @@ pub(crate) fn read_body_to<S: BufRead, W: Write + ?Sized>(
         let mut total = 0usize;
         loop {
             let mut line = String::new();
-            if io.read_line(&mut line).map_err(|_| Failure::Stream)? > 64 {
+            if (&mut *io)
+                .take(65)
+                .read_line(&mut line)
+                .map_err(|_| Failure::Stream)?
+                > 64
+            {
                 return Err(Failure::Frame);
             }
             let size = chunk_size(&line)?;
             if size == 0 {
-                let mut trailer = String::new();
-                let _ = io.read_line(&mut trailer);
-                return Ok(());
+                let mut trailer = 0usize;
+                loop {
+                    let mut line = String::new();
+                    let budget = MAX_HEAD.saturating_sub(trailer).saturating_add(1);
+                    let read = (&mut *io)
+                        .take(budget as u64)
+                        .read_line(&mut line)
+                        .map_err(|_| Failure::Stream)?;
+                    if read == 0 {
+                        return Err(Failure::Frame);
+                    }
+                    trailer += read;
+                    if trailer > MAX_HEAD {
+                        return Err(Failure::Frame);
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        return Ok(());
+                    }
+                }
             }
             total = total.checked_add(size).ok_or(Failure::Frame)?;
             if total > max_body {
@@ -1752,6 +1826,20 @@ mod tests {
                 "{raw:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_unterminated_head_stops_allocating_at_its_cap() {
+        let raw = vec![b'a'; MAX_HEAD * 64];
+        let (answer, counts) = ferrox_core::alloc_count::measure(|| {
+            read_reply(&mut raw.as_slice(), DEFAULT_READ_CHUNK)
+        });
+        assert!(answer.is_err(), "a head with no terminator is refused");
+        assert!(
+            counts.bytes < MAX_HEAD * 8,
+            "the head is bounded before it is buffered: {} bytes",
+            counts.bytes
+        );
     }
 
     #[test]
@@ -3531,6 +3619,52 @@ mod loopback {
             "no account is no binding"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file too large to be a session is not parsed at all, rather than read without bound.
+    #[test]
+    fn a_token_file_larger_than_its_cap_reads_as_no_session() {
+        let path = token_path("oversized");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+        std::fs::write(&path, "x".repeat(TOKEN_FILE_CAP + 1)).expect("an oversized file");
+        assert!(
+            tokens.load().is_none(),
+            "an oversized file is not a session"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A temp name is created fresh, so a link planted at the predictable old name is never followed or truncated.
+    #[test]
+    fn a_session_write_never_follows_a_temp_link() {
+        #[cfg(unix)]
+        {
+            let path = token_path("temp-link");
+            let _ = std::fs::remove_file(&path);
+            let outside = token_path("temp-link-outside");
+            std::fs::write(&outside, "keep me").expect("an outside file");
+            let link =
+                std::path::PathBuf::from(format!("{}.{}.tmp", path.display(), std::process::id()));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&outside, &link).expect("a link");
+            let tokens =
+                TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+            tokens.save(None, Some("session"));
+            assert_eq!(
+                std::fs::read_to_string(&outside).expect("reads"),
+                "keep me",
+                "the link's target is never truncated"
+            );
+            assert!(
+                std::fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()),
+                "the planted link itself is not opened for writing"
+            );
+            assert!(tokens.load().is_some(), "the session is written beside it");
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&link);
+            let _ = std::fs::remove_file(&outside);
+        }
     }
 
     /// A refused grant is cleared, but one another process rotated in over it is not: forgetting is not allowed to erase a live session.
