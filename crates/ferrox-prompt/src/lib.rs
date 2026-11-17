@@ -88,6 +88,7 @@ pub fn load_library(explicit: Option<&Path>, cwd: &Path) -> Result<Library, Unre
         Some(path) => path.to_path_buf(),
         None => root.join(LIBRARY_RELATIVE),
     };
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
     let text = std::fs::read_to_string(&path).map_err(|source| Unreadable {
         path: path.clone(),
         message: source.to_string(),
@@ -103,6 +104,29 @@ pub fn load_library(explicit: Option<&Path>, cwd: &Path) -> Result<Library, Unre
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_library_resolves_to_its_target() {
+        use std::os::unix::fs::symlink;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-prompt-link-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let target = dir.join("prompts.md");
+        std::fs::write(&target, "## P1 · x\n\n**Status:** todo\n").expect("target");
+        let link = dir.join("link.md");
+        symlink(&target, &link).expect("link");
+        let library = load_library(Some(&link), &dir).expect("loads");
+        assert_eq!(
+            library.source_path,
+            std::fs::canonicalize(&target).expect("target path")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_tag_is_stable_and_input_sensitive() {

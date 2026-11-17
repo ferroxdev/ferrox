@@ -130,20 +130,30 @@ impl Default for Options {
     }
 }
 
-fn env_port(name: &str, fallback: u16, strict: bool) -> u16 {
+fn env_port(name: &str, strict: bool) -> Option<u16> {
     match std::env::var(name) {
-        Err(std::env::VarError::NotPresent) => fallback,
+        Err(std::env::VarError::NotPresent) => None,
         Err(error) if strict => die(&format!(
             "{name} is not readable as a port: {error}; nothing was started."
         )),
-        Err(_) => fallback,
+        Err(_) => None,
         Ok(value) => match value.parse::<u16>() {
-            Ok(port) if port != 0 => port,
+            Ok(port) if port != 0 => Some(port),
             _ if strict => die(&format!(
                 "{name} wants a port between 1 and 65535, got '{value}'; nothing was started."
             )),
-            _ => fallback,
+            _ => None,
         },
+    }
+}
+
+fn apply_env_port(name: &str, strict: bool, value: &mut u16, set: &mut bool) {
+    if *set {
+        return;
+    }
+    if let Some(port) = env_port(name, strict) {
+        *value = port;
+        *set = true;
     }
 }
 
@@ -152,15 +162,24 @@ fn apply_env_ports(options: &mut Options) {
         options.action,
         Action::Up | Action::Serve | Action::Tun | Action::Supervise
     );
-    if !options.socks_set {
-        options.socks = env_port("FOXY_SOCKS_PORT", options.socks, strict);
-    }
-    if !options.http_set {
-        options.http = env_port("FOXY_HTTP_PORT", options.http, strict);
-    }
-    if !options.mixed_set {
-        options.mixed = env_port("FOXY_MIXED_PORT", options.mixed, strict);
-    }
+    apply_env_port(
+        "FOXY_SOCKS_PORT",
+        strict,
+        &mut options.socks,
+        &mut options.socks_set,
+    );
+    apply_env_port(
+        "FOXY_HTTP_PORT",
+        strict,
+        &mut options.http,
+        &mut options.http_set,
+    );
+    apply_env_port(
+        "FOXY_MIXED_PORT",
+        strict,
+        &mut options.mixed,
+        &mut options.mixed_set,
+    );
 }
 
 pub fn die(message: &str) -> ! {
