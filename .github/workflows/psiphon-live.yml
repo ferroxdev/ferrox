@@ -35,7 +35,7 @@ on:
         required: false
         default: ""
       window:
-        description: native SSH channel window in bytes; blank keeps the reference's 2 MiB
+        description: native SSH channel window in bytes; blank is 2 MiB (the reference uses 128 KiB)
         required: false
         default: ""
       protocol:
@@ -208,6 +208,9 @@ jobs:
                 return 1
               fi
               if via "$front" "$port" --max-time 30 https://www.cloudflare.com/cdn-cgi/trace -o trace.txt 2>/dev/null && grep -q '^loc=' trace.txt; then
+                return 0
+              fi
+              if via "$front" "$port" -f --max-time 30 'https://speed.cloudflare.com/__down?bytes=1' -o /dev/null 2>/dev/null; then
                 return 0
               fi
               sleep 2
