@@ -79,6 +79,7 @@ struct State {
 struct Entry {
     server: Server,
     seed: [u8; 32],
+    next_seed: Option<[u8; 32]>,
     config_state: u64,
     server_hash: u64,
     last_used: Instant,
@@ -188,8 +189,8 @@ impl Cache {
                     && config_ok
                 {
                     selected = entry.server.clone();
-                    seed = entry.seed;
-                    is_replay = true;
+                    seed = entry.next_seed.unwrap_or(entry.seed);
+                    is_replay = entry.next_seed.is_none();
                 }
             }
         }
@@ -236,6 +237,7 @@ impl Cache {
                 && session.age() >= self.settings.target_duration
             {
                 entry.succeeded = true;
+                entry.next_seed = None;
                 entry.last_used = Instant::now();
             } else if session.is_closed() {
                 drop.push(key.to_owned());
@@ -275,6 +277,7 @@ impl Lease {
             .or_insert_with(|| Entry {
                 server: self.server.clone(),
                 seed: self.seed,
+                next_seed: None,
                 config_state: self.config_state,
                 server_hash: self.server_hash,
                 last_used: now,
@@ -293,11 +296,12 @@ impl Lease {
         if !self.is_replay || !replay_matches {
             entry.succeeded = false;
             entry.seed = self.seed;
+            entry.next_seed = None;
             entry.created = now;
         } else if profile.update_frequency > Duration::ZERO
             && entry.created.elapsed() >= profile.update_frequency
         {
-            entry.seed = random::<32>();
+            entry.next_seed = Some(random::<32>());
             entry.created = now;
         }
     }
@@ -395,6 +399,7 @@ mod tests {
     use crate::psiphon_ssh::{dial_random, dial_seed_scope, Server};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     fn server(host: &str, port: u16) -> Server {
         Server {
@@ -455,6 +460,37 @@ mod tests {
         assert!(replay.is_replay());
         assert_eq!(replay.server().host, entry.host);
         assert_eq!(replay.seed(), first.seed());
+    }
+
+    #[test]
+    fn a_refreshed_seed_is_probed_before_it_replaces_the_replay() {
+        let cache = new_cache(Settings {
+            fronted_update_frequency: Duration::from_millis(1),
+            ..Settings::default()
+        });
+        let entry = server("example.test", 443);
+        let first = cache.begin(&entry, 7);
+        first.succeeded(1);
+        cache.mark_succeeded("example.test");
+        {
+            let mut state = lock(&cache.state);
+            state
+                .entries
+                .get_mut("example.test")
+                .expect("entry")
+                .created = Instant::now() - Duration::from_secs(1);
+        }
+        let replay = cache.begin(&entry, 7);
+        assert!(replay.is_replay());
+        replay.succeeded(2);
+        let probe = cache.begin(&entry, 7);
+        assert!(!probe.is_replay());
+        assert_ne!(probe.seed(), first.seed());
+        probe.succeeded(3);
+        cache.mark_succeeded("example.test");
+        let replay = cache.begin(&entry, 7);
+        assert!(replay.is_replay());
+        assert_eq!(replay.seed(), probe.seed());
     }
 
     #[test]

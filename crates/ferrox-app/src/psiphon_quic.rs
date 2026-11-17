@@ -1234,7 +1234,7 @@ struct SentPacket {
 
 struct Engine {
     tls: ClientConnection,
-    initial: Keys,
+    initial: Option<Keys>,
     handshake: Option<Keys>,
     one_rtt: Option<Keys>,
     zero_rtt: Option<DirectionalKeys>,
@@ -1256,6 +1256,7 @@ struct Engine {
     level: usize,
     dcid: Vec<u8>,
     scid: Vec<u8>,
+    dcid_locked: bool,
     next_pn: [u64; 3],
     largest: [u64; 3],
     ack_seen: [Vec<u64>; 3],
@@ -1366,7 +1367,7 @@ impl Engine {
         let initial = suite.keys(&dcid, Side::Client, Version::V1);
         let mut engine = Self {
             tls,
-            initial,
+            initial: Some(initial),
             handshake: None,
             one_rtt: None,
             zero_rtt: if early { zero_rtt } else { None },
@@ -1388,6 +1389,7 @@ impl Engine {
             level: INITIAL,
             dcid,
             scid,
+            dcid_locked: false,
             next_pn: [0; 3],
             largest: [0; 3],
             ack_seen: std::array::from_fn(|_| Vec::new()),
@@ -1434,7 +1436,7 @@ impl Engine {
 
     fn keys(&self, space: usize) -> Option<&Keys> {
         match space {
-            INITIAL => Some(&self.initial),
+            INITIAL => self.initial.as_ref(),
             HANDSHAKE => self.handshake.as_ref(),
             ONE_RTT => self.one_rtt.as_ref(),
             _ => None,
@@ -1471,6 +1473,7 @@ impl Engine {
                 Some(KeyChange::Handshake { keys }) => {
                     self.handshake = Some(keys);
                     self.level = HANDSHAKE;
+                    self.discard_space(INITIAL);
                 }
                 Some(KeyChange::OneRtt { keys, next }) => {
                     self.one_rtt = Some(keys);
@@ -1498,6 +1501,43 @@ impl Engine {
             self.remember();
         }
         Ok(())
+    }
+
+    /// Drop a packet number space once the handshake has moved past it.
+    fn discard_space(&mut self, space: usize) {
+        match space {
+            INITIAL => self.initial = None,
+            HANDSHAKE => self.handshake = None,
+            ONE_RTT => self.one_rtt = None,
+            _ => return,
+        }
+        let mut kept = Vec::with_capacity(self.sent.len());
+        for packet in self.sent.drain(..) {
+            if packet.space == space {
+                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.size);
+            } else {
+                kept.push(packet);
+            }
+        }
+        self.sent = kept;
+        self.crypto_send[space].clear();
+        self.crypto_sent[space] = 0;
+        self.crypto_recv[space].clear();
+        self.crypto_next[space] = 0;
+        self.ack_seen[space].clear();
+        self.ack_pending[space] = false;
+    }
+
+    /// Accept the server's source CID once; a later packet cannot redirect the connection.
+    fn accept_server_cid(&mut self, scid: &[u8]) {
+        if self.dcid_locked {
+            return;
+        }
+        if !scid.is_empty() {
+            self.dcid.clear();
+            self.dcid.extend_from_slice(scid);
+        }
+        self.dcid_locked = true;
     }
 
     /// Store the handshake's initial grants once for the next 0-RTT dial.
@@ -2089,10 +2129,12 @@ impl Engine {
                     datagram[at + 4],
                 ]);
                 if version == 0 {
-                    return Err("psiphon quic: version negotiation".to_owned());
+                    return Err("psiphon quic header: version negotiation".to_owned());
                 }
                 if version != QUIC_VERSION {
-                    return Err(format!("psiphon quic: unsupported version {version}"));
+                    return Err(format!(
+                        "psiphon quic header: unsupported version {version}"
+                    ));
                 }
                 let dcid_len = usize::from(datagram[at + 5]);
                 let mut cursor = at + 6;
@@ -2109,7 +2151,7 @@ impl Engine {
                 cursor += scid_len;
                 let packet_type = (first >> 4) & 0x03;
                 if packet_type == 3 {
-                    return Err("psiphon quic: retry is not supported".to_owned());
+                    return Err("psiphon quic header: retry is not supported".to_owned());
                 }
                 if packet_type == 0 {
                     let Some(token_len) = get_varint(datagram, &mut cursor) else {
@@ -2135,11 +2177,8 @@ impl Engine {
                     _ => break,
                 };
                 let pn_offset = cursor - at;
-                if self.open(space, &mut datagram[at..end], pn_offset, now)?
-                    && !scid.is_empty()
-                    && scid != self.dcid
-                {
-                    self.dcid = scid;
+                if self.open(space, &mut datagram[at..end], pn_offset, now)? {
+                    self.accept_server_cid(&scid);
                 }
                 at = end;
             } else {
@@ -2248,7 +2287,8 @@ impl Engine {
                 break;
             };
             match kind {
-                0x00 | 0x01 | 0x1e => {}
+                0x00 | 0x01 => {}
+                0x1e => self.discard_space(HANDSHAKE),
                 0x02 | 0x03 => {
                     let Some(largest) = get_varint(payload, &mut at) else {
                         break;
@@ -3085,10 +3125,10 @@ fn long_header_len(initial: bool, dcid_len: usize, scid_len: usize, pn_len: usiz
 #[cfg(test)]
 mod tests {
     use super::{
-        get_varint, get_varint_byte, lock, mint_obfuscated_sessions, noise_expand,
+        discardable, get_varint, get_varint_byte, lock, mint_obfuscated_sessions, noise_expand,
         quic_server_name, randomize_cipher_suites, randomize_kx_groups, sessions, transport_params,
-        Engine, ObfuscatedUdp, PacketIo, QuicNoise, SentPacket, Udp, INITIAL, INITIAL_CWND,
-        INPROXY_PACKET_ADJUSTMENT, MAX_PACKET_SIZE, MAX_PAYLOAD, MIN_DATAGRAM,
+        Engine, ObfuscatedUdp, PacketIo, QuicNoise, SentPacket, Udp, HANDSHAKE, INITIAL,
+        INITIAL_CWND, INPROXY_PACKET_ADJUSTMENT, MAX_PACKET_SIZE, MAX_PAYLOAD, MIN_DATAGRAM,
         OBFUSCATION_OVERHEAD, ONE_RTT, PASSTHROUGH_RANDOM, PENDING_ORDER_SEED, PMTU_BACKOFF,
         PMTU_MIN_STEP, PMTU_STEP,
     };
@@ -3115,19 +3155,104 @@ mod tests {
         .expect("engine")
     }
 
-    fn ready_engine() -> Engine {
-        let mut engine = test_engine();
+    fn client_keys(engine: &Engine) -> rustls::quic::Keys {
         let suite = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
             .tls13()
             .and_then(rustls::Tls13CipherSuite::quic_suite)
             .expect("quic suite");
-        let dcid = engine.dcid.clone();
-        engine.one_rtt = Some(suite.keys(&dcid, rustls::Side::Client, rustls::quic::Version::V1));
+        suite.keys(
+            &engine.dcid,
+            rustls::Side::Client,
+            rustls::quic::Version::V1,
+        )
+    }
+
+    fn ready_engine() -> Engine {
+        let mut engine = test_engine();
+        engine.one_rtt = Some(client_keys(&engine));
         engine.opened = true;
         engine.disable_path_mtu = false;
         engine.max_datagram = 1200;
         engine.packet_limit = MAX_PACKET_SIZE;
         engine
+    }
+
+    #[test]
+    fn discarding_a_space_releases_its_keys_and_flight() {
+        let mut engine = ready_engine();
+        engine.initial = Some(client_keys(&engine));
+        engine.handshake = Some(client_keys(&engine));
+        engine.bytes_in_flight = 1500;
+        engine.sent.push(SentPacket {
+            pn: 1,
+            space: INITIAL,
+            sent_at: Instant::now(),
+            size: 1200,
+            crypto: None,
+            stream: None,
+            window: false,
+            early: false,
+            probe: None,
+        });
+        engine.sent.push(SentPacket {
+            pn: 2,
+            space: HANDSHAKE,
+            sent_at: Instant::now(),
+            size: 300,
+            crypto: None,
+            stream: None,
+            window: false,
+            early: false,
+            probe: None,
+        });
+        engine.crypto_send[INITIAL].extend_from_slice(b"unsent");
+        engine.crypto_recv[INITIAL].insert(0, b"seen".to_vec());
+        engine.ack_seen[INITIAL].push(1);
+        engine.ack_pending[INITIAL] = true;
+        engine.discard_space(INITIAL);
+        assert!(engine.initial.is_none());
+        assert!(engine.handshake.is_some());
+        assert_eq!(engine.bytes_in_flight, 300);
+        assert_eq!(engine.sent.len(), 1);
+        assert_eq!(engine.sent[0].space, HANDSHAKE);
+        assert!(engine.crypto_send[INITIAL].is_empty());
+        assert!(engine.crypto_recv[INITIAL].is_empty());
+        assert!(engine.ack_seen[INITIAL].is_empty());
+        assert!(!engine.ack_pending[INITIAL]);
+    }
+
+    #[test]
+    fn a_server_cid_is_accepted_once() {
+        let mut engine = test_engine();
+        engine.accept_server_cid(b"server");
+        assert_eq!(engine.dcid.as_slice(), &b"server"[..]);
+        engine.accept_server_cid(b"forged");
+        assert_eq!(engine.dcid.as_slice(), &b"server"[..]);
+    }
+
+    #[test]
+    fn an_unauthenticated_long_header_is_discardable() {
+        let mut engine = test_engine();
+        let mut version_negotiation = vec![0x80, 0, 0, 0, 0, 0, 0];
+        let error = engine
+            .receive(&mut version_negotiation, Instant::now())
+            .expect_err("version negotiation");
+        assert!(discardable(&error), "{error}");
+        let mut retry = vec![0xf0, 0, 0, 0, 1, 0, 0];
+        let error = engine
+            .receive(&mut retry, Instant::now())
+            .expect_err("retry");
+        assert!(discardable(&error), "{error}");
+    }
+
+    #[test]
+    fn handshake_done_discards_the_handshake_space() {
+        let mut engine = ready_engine();
+        engine.handshake = Some(client_keys(&engine));
+        engine
+            .handle_frames(ONE_RTT, &[0x1e], Instant::now())
+            .expect("handshake done");
+        assert!(engine.handshake.is_none());
     }
 
     #[test]

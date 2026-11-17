@@ -3031,6 +3031,7 @@ impl Drop for Channel {
     fn drop(&mut self) {
         if Arc::strong_count(&self.state) == 2 {
             let _ = lock(&self.session.channels).remove(&self.state.local);
+            self.session.close_channel(&self.state);
         }
     }
 }
