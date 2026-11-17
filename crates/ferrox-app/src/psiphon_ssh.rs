@@ -1587,6 +1587,7 @@ struct ChannelState {
     remote: AtomicU32,
     remote_window: Mutex<u64>,
     remote_packet: AtomicU32,
+    window: u32,
     recv: Mutex<Recv>,
     cond: Condvar,
     window_cond: Condvar,
@@ -1607,6 +1608,7 @@ struct Recv {
     closed: bool,
     pending_adjust: u64,
     local_window: u64,
+    queued: u64,
 }
 
 /// One received SSH packet, held open at the bytes the dispatcher has already named.
@@ -2159,12 +2161,14 @@ impl Session {
             remote: AtomicU32::new(NO_CHANNEL),
             remote_window: Mutex::new(0),
             remote_packet: AtomicU32::new(CHANNEL_PACKET),
+            window: channel_window,
             recv: Mutex::new(Recv {
                 chunks: VecDeque::new(),
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
                 local_window: u64::from(channel_window),
+                queued: 0,
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -2554,9 +2558,11 @@ impl ferrox_core::tls::RecordAlignment for Channel {}
 
 impl ChannelState {
     fn touch(&self) {
+        let _recv = lock(&self.recv);
         *lock(&self.last_active) = Instant::now();
     }
 
+    /// Remaining idle time; the caller holds the receive lock that `touch` takes.
     fn idle_wait(&self) -> Duration {
         CHANNEL_IDLE.saturating_sub(lock(&self.last_active).elapsed())
     }
@@ -2587,6 +2593,7 @@ impl ChannelState {
         let mut recv = lock(&self.recv);
         recv.eof = true;
         recv.closed = true;
+        recv.queued = 0;
         let mut pool = lock(&self.pool);
         while let Some(chunk) = recv.chunks.pop_front() {
             if pool.len() < PACKET_POOL {
@@ -2657,6 +2664,7 @@ impl Channel {
                     continue;
                 }
                 recv.pending_adjust += (end - start) as u64;
+                recv.queued = recv.queued.saturating_sub((end - start) as u64);
                 if recv.pending_adjust >= adjust_at {
                     adjust += recv.pending_adjust;
                     recv.local_window += recv.pending_adjust;
@@ -2709,7 +2717,11 @@ impl Channel {
                 .unwrap_or_else(PoisonError::into_inner);
             recv = guard;
             if timeout.timed_out() {
+                let idle = self.state.idle_wait().is_zero();
                 drop(recv);
+                if !idle {
+                    continue;
+                }
                 self.close();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -2775,7 +2787,11 @@ impl Channel {
                 .unwrap_or_else(PoisonError::into_inner);
             recv = guard;
             if timeout.timed_out() {
+                let idle = self.state.idle_wait().is_zero();
                 drop(recv);
+                if !idle {
+                    continue;
+                }
                 self.close();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -2824,6 +2840,7 @@ fn take_batch(
         }
         let take = (chunk.end - chunk.start) as u64;
         recv.pending_adjust += take;
+        recv.queued = recv.queued.saturating_sub(take);
         bytes += take;
         if recv.pending_adjust >= adjust_at {
             adjust += recv.pending_adjust;
@@ -2857,7 +2874,9 @@ impl Read for Channel {
                     let start = chunk.start + take;
                     let spent = start == chunk.end;
                     chunk.start = start;
-                    recv.pending_adjust += u64::try_from(take).unwrap_or(0);
+                    let taken = u64::try_from(take).unwrap_or(0);
+                    recv.pending_adjust += taken;
+                    recv.queued = recv.queued.saturating_sub(taken);
                     if recv.pending_adjust >= adjust_at {
                         adjust += recv.pending_adjust;
                         recv.local_window += recv.pending_adjust;
@@ -5087,7 +5106,16 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
                 return Dispatch::Recycle(packet.buffer);
             };
             let mut recv = lock(&state.recv);
+            let allowance = u64::from(state.window) + u64::from(CHANNEL_PACKET);
+            if recv.queued.saturating_add(data_len as u64) > allowance {
+                drop(recv);
+                lock(&inner.channels).remove(&local);
+                inner.close_channel(&state);
+                state.fail("psiphon ssh peer exceeded the channel window");
+                return Dispatch::Recycle(packet.buffer);
+            }
             recv.local_window = recv.local_window.saturating_sub(data_len as u64);
+            recv.queued += data_len as u64;
             let was_empty = recv.chunks.is_empty();
             recv.chunks.push_back(Chunk {
                 buffer: packet.buffer,
@@ -5322,12 +5350,14 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         remote: AtomicU32::new(2),
         remote_window: Mutex::new(0),
         remote_packet: AtomicU32::new(CHANNEL_PACKET),
+        window: DEFAULT_CHANNEL_WINDOW,
         recv: Mutex::new(Recv {
             chunks: VecDeque::new(),
             eof: false,
             closed: false,
             pending_adjust: 0,
             local_window: u64::from(DEFAULT_CHANNEL_WINDOW),
+            queued: 0,
         }),
         cond: Condvar::new(),
         window_cond: Condvar::new(),
@@ -5667,12 +5697,14 @@ mod tests {
             remote: AtomicU32::new(2),
             remote_window: Mutex::new(0),
             remote_packet: AtomicU32::new(CHANNEL_PACKET),
+            window: DEFAULT_CHANNEL_WINDOW,
             recv: Mutex::new(Recv {
                 chunks: VecDeque::new(),
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
                 local_window: u64::from(DEFAULT_CHANNEL_WINDOW),
+                queued: 0,
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -5761,12 +5793,14 @@ mod tests {
             remote: AtomicU32::new(2),
             remote_window: Mutex::new(0),
             remote_packet: AtomicU32::new(CHANNEL_PACKET),
+            window: DEFAULT_CHANNEL_WINDOW,
             recv: Mutex::new(Recv {
                 chunks: VecDeque::new(),
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
                 local_window: u64::from(DEFAULT_CHANNEL_WINDOW),
+                queued: 0,
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -5842,12 +5876,14 @@ mod tests {
             remote: AtomicU32::new(NO_CHANNEL),
             remote_window: Mutex::new(0),
             remote_packet: AtomicU32::new(CHANNEL_PACKET),
+            window: DEFAULT_CHANNEL_WINDOW,
             recv: Mutex::new(Recv {
                 chunks: VecDeque::new(),
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
                 local_window: u64::from(DEFAULT_CHANNEL_WINDOW),
+                queued: 0,
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -5946,12 +5982,14 @@ mod tests {
             remote: AtomicU32::new(2),
             remote_window: Mutex::new(0),
             remote_packet: AtomicU32::new(CHANNEL_PACKET),
+            window: DEFAULT_CHANNEL_WINDOW,
             recv: Mutex::new(Recv {
                 chunks: VecDeque::new(),
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
                 local_window: u64::from(DEFAULT_CHANNEL_WINDOW),
+                queued: 0,
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -6100,12 +6138,14 @@ mod tests {
             remote: AtomicU32::new(2),
             remote_window: Mutex::new(u64::from(DEFAULT_CHANNEL_WINDOW)),
             remote_packet: AtomicU32::new(CHANNEL_PACKET),
+            window: DEFAULT_CHANNEL_WINDOW,
             recv: Mutex::new(Recv {
                 chunks: VecDeque::new(),
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
                 local_window: u64::from(DEFAULT_CHANNEL_WINDOW),
+                queued: 0,
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -6146,7 +6186,7 @@ mod tests {
     }
 
     #[test]
-    fn a_data_packet_past_the_window_keeps_the_channel() {
+    fn a_data_packet_past_the_window_keeps_the_channel_within_the_allowance() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
         let (_local, _) = listener.accept().expect("accept");
@@ -6189,12 +6229,14 @@ mod tests {
             remote: AtomicU32::new(2),
             remote_window: Mutex::new(u64::from(DEFAULT_CHANNEL_WINDOW)),
             remote_packet: AtomicU32::new(CHANNEL_PACKET),
+            window: 1024,
             recv: Mutex::new(Recv {
                 chunks: VecDeque::new(),
                 eof: false,
                 closed: false,
                 pending_adjust: 0,
                 local_window: 1024,
+                queued: 0,
             }),
             cond: Condvar::new(),
             window_cond: Condvar::new(),
@@ -6220,7 +6262,26 @@ mod tests {
         ));
         let queued = lock(&state.recv);
         assert_eq!(queued.local_window, 0);
+        assert_eq!(queued.queued, 2048);
         assert_eq!(queued.chunks.len(), 1);
+        drop(queued);
+        let mut packet = vec![MSG_CHANNEL_DATA];
+        put_u32(&mut packet, 1);
+        put_str(&mut packet, &[b'x'; 34000]);
+        let end = packet.len();
+        assert!(matches!(
+            dispatch(
+                &inner,
+                Packet {
+                    buffer: packet,
+                    start: 0,
+                    end,
+                }
+            ),
+            Dispatch::Recycle(_)
+        ));
+        assert!(lock(&inner.channels).is_empty());
+        assert!(lock(&state.recv).closed);
         assert!(!inner.closed.load(Ordering::Acquire));
     }
 

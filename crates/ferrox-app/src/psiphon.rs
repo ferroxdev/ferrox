@@ -13454,7 +13454,7 @@ mod tests {
         let path = dir.join("entries");
         let mut text = String::new();
         for entry in [
-            r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","region":"US"}"#,
+            r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshHostKey":"AAAA","region":"US"}"#,
             r#"{"ipAddress":"192.0.2.2","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK"],"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example"],"meekFrontingHosts":["cdn.example"],"region":"CA"}"#,
         ] {
             text.push_str(&hex(format!("0 0 0 0 {entry}").as_bytes()));
@@ -13463,7 +13463,7 @@ mod tests {
         std::fs::write(&path, text).expect("entries");
         let config = format!(
             r#"{{"serverEntries":{:?},"region":"US",
-                "LimitTunnelProtocols":["FRONTED-MEEK"],"cdnSets":["fastly","bunny"]}}"#,
+                "LimitTunnelProtocols":["FRONTED-MEEK-OSSH"],"cdnSets":["fastly","bunny"]}}"#,
             path.to_string_lossy()
         );
         let settings =
@@ -13472,6 +13472,9 @@ mod tests {
         assert!(servers
             .iter()
             .any(|server| server.region.as_deref() == Some("CA")));
+        assert!(servers
+            .iter()
+            .all(|server| server.region.as_deref() != Some("US")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
