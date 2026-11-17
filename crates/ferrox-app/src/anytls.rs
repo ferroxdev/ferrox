@@ -30,6 +30,8 @@ const MAX_FRAME: usize = 0xffff;
 const PASSWORD_LEN: usize = 32;
 const POLL: Duration = Duration::from_millis(100);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+const STREAM_QUEUE_LIMIT: usize = 64 * 1024;
+const SESSION_QUEUE_LIMIT: usize = 8 * 1024 * 1024;
 
 const DEFAULT_PADDING: &[u8] = b"stop=8
 0=30-30
@@ -153,6 +155,63 @@ enum Terminal {
     Failed(String),
 }
 
+struct QueueUsage {
+    bytes: usize,
+    closed: bool,
+}
+
+struct QueueBudget {
+    limit: usize,
+    used: Mutex<QueueUsage>,
+    wake: Condvar,
+}
+
+impl QueueBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            used: Mutex::new(QueueUsage {
+                bytes: 0,
+                closed: false,
+            }),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn reserve(&self, bytes: usize, alive: &AtomicBool) -> bool {
+        let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+        while used.bytes.saturating_add(bytes) > self.limit
+            && !used.closed
+            && alive.load(Ordering::Relaxed)
+        {
+            used = self
+                .wake
+                .wait_timeout(used, POLL)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        if used.closed || !alive.load(Ordering::Relaxed) {
+            return false;
+        }
+        used.bytes += bytes;
+        true
+    }
+
+    fn release(&self, bytes: usize) {
+        let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+        used.bytes = used.bytes.saturating_sub(bytes);
+        drop(used);
+        self.wake.notify_all();
+    }
+
+    fn close(&self) {
+        let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+        used.closed = true;
+        drop(used);
+        self.wake.notify_all();
+    }
+}
+
 struct StreamInner {
     queue: VecDeque<u8>,
     terminal: Option<Terminal>,
@@ -162,10 +221,11 @@ struct StreamState {
     inner: Mutex<StreamInner>,
     wake: Condvar,
     armed: AtomicBool,
+    budget: Arc<QueueBudget>,
 }
 
 impl StreamState {
-    fn new() -> Self {
+    fn new(budget: Arc<QueueBudget>) -> Self {
         Self {
             inner: Mutex::new(StreamInner {
                 queue: VecDeque::new(),
@@ -173,17 +233,34 @@ impl StreamState {
             }),
             wake: Condvar::new(),
             armed: AtomicBool::new(false),
+            budget,
         }
     }
 
-    fn push(&self, data: &[u8]) {
+    fn push(&self, data: &[u8], alive: &AtomicBool) {
         if data.is_empty() {
             return;
         }
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        if inner.terminal.is_none() {
-            inner.queue.extend(data.iter().copied());
+        if !self.budget.reserve(data.len(), alive) {
+            return;
         }
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        while inner.terminal.is_none()
+            && inner.queue.len().saturating_add(data.len()) > STREAM_QUEUE_LIMIT
+            && alive.load(Ordering::Relaxed)
+        {
+            inner = self
+                .wake
+                .wait_timeout(inner, POLL)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        if inner.terminal.is_some() || !alive.load(Ordering::Relaxed) {
+            drop(inner);
+            self.budget.release(data.len());
+            return;
+        }
+        inner.queue.extend(data.iter().copied());
         drop(inner);
         self.wake.notify_all();
     }
@@ -210,6 +287,9 @@ impl StreamState {
                 for slot in &mut buf[..len] {
                     *slot = inner.queue.pop_front().expect("the queue is not empty");
                 }
+                drop(inner);
+                self.budget.release(len);
+                self.wake.notify_all();
                 return Ok(len);
             }
             if let Some(terminal) = &inner.terminal {
@@ -240,6 +320,18 @@ impl StreamState {
     }
 }
 
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        let bytes = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .queue
+            .len();
+        self.budget.release(bytes);
+    }
+}
+
 struct Shared {
     writer: Mutex<Option<Writer>>,
     streams: Mutex<HashMap<u32, Arc<StreamState>>>,
@@ -250,6 +342,7 @@ struct Shared {
     pending: Mutex<Option<Vec<u8>>>,
     packet_count: AtomicU32,
     send_padding: AtomicBool,
+    queue_budget: Arc<QueueBudget>,
 }
 
 impl Shared {
@@ -264,7 +357,12 @@ impl Shared {
             pending: Mutex::new(None),
             packet_count: AtomicU32::new(0),
             send_padding: AtomicBool::new(!server),
+            queue_budget: Arc::new(QueueBudget::new(SESSION_QUEUE_LIMIT)),
         }
+    }
+
+    fn stream_state(&self) -> StreamState {
+        StreamState::new(Arc::clone(&self.queue_budget))
     }
 
     fn alive(&self) -> bool {
@@ -293,6 +391,14 @@ impl Shared {
     }
 
     fn write_packet(&self, packet: &[u8]) -> std::io::Result<()> {
+        let result = self.write_packet_locked(packet);
+        if result.is_err() {
+            self.shutdown("anytls session write failed");
+        }
+        result
+    }
+
+    fn write_packet_locked(&self, packet: &[u8]) -> std::io::Result<()> {
         let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(writer) = writer.as_mut() else {
             return Err(std::io::Error::new(
@@ -390,6 +496,7 @@ impl Shared {
         if !self.alive.swap(false, Ordering::SeqCst) {
             return;
         }
+        self.queue_budget.close();
         if let Some(writer) = self
             .writer
             .lock()
@@ -423,7 +530,7 @@ impl Session {
             return None;
         }
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let state = Arc::new(StreamState::new());
+        let state = Arc::new(self.shared.stream_state());
         self.shared.insert_stream(id, &state);
         let syn = frame_bytes(SYN, id, &[]);
         let mut address = Vec::new();
@@ -521,6 +628,17 @@ impl AnyTlsStream {
                 Ok(n) => return Ok(n),
             }
         }
+    }
+
+    fn read_exact(&self, buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
+        let mut at = 0;
+        while at < buf.len() {
+            match self.read_until(&mut buf[at..], deadline)? {
+                0 => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+                n => at += n,
+            }
+        }
+        Ok(())
     }
 
     fn synack(&self, payload: &[u8]) {
@@ -843,6 +961,11 @@ fn serve_connection(
     padding: Padding,
     freedom: bool,
 ) {
+    let deadline = Instant::now() + crate::budgets::handshake();
+    let raw = stream.try_clone().ok();
+    if let Some(raw) = &raw {
+        let _ = raw.set_read_timeout(Some(crate::budgets::handshake()));
+    }
     let (mut reader, writer): (Reader, Writer) = if let Some(identity) = tls {
         let Ok(mut session) = ferrox_core::tls::accept(identity.as_ref(), stream) else {
             return;
@@ -860,7 +983,10 @@ fn serve_connection(
         };
         (Box::new(stream), Box::new(writer))
     };
-    let deadline = Instant::now() + crate::budgets::handshake();
+    if let Some(raw) = &raw {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let _ = raw.set_read_timeout(Some(left.max(Duration::from_millis(1))));
+    }
     let mut prologue = [0u8; PASSWORD_LEN + 2];
     if read_exact_deadline(&mut *reader, &mut prologue, deadline).is_err() {
         return;
@@ -889,6 +1015,9 @@ fn serve_connection(
             left -= take;
         }
     }
+    if let Some(raw) = raw {
+        let _ = raw.set_read_timeout(None);
+    }
     let session = Arc::new(Session {
         shared: Arc::new(Shared::new(writer, padding, true)),
         owner: None,
@@ -916,7 +1045,7 @@ fn read_server(reader: &mut dyn Read, session: &Arc<Session>, context: &Arc<Serv
                     .get(&frame.stream)
                     .cloned()
                 {
-                    state.push(&frame.payload);
+                    state.push(&frame.payload, &shared.alive);
                 }
             }
             SYN => {
@@ -933,7 +1062,7 @@ fn read_server(reader: &mut dyn Read, session: &Arc<Session>, context: &Arc<Serv
                 {
                     continue;
                 }
-                let state = Arc::new(StreamState::new());
+                let state = Arc::new(shared.stream_state());
                 shared.insert_stream(frame.stream, &state);
                 let stream = AnyTlsStream {
                     session: Arc::clone(session),
@@ -1028,7 +1157,7 @@ fn read_loop(reader: &mut dyn Read, shared: &Arc<Shared>) {
                     .get(&frame.stream)
                     .cloned()
                 {
-                    state.push(&frame.payload);
+                    state.push(&frame.payload, &shared.alive);
                 }
             }
             FIN => {
@@ -1236,32 +1365,34 @@ fn encode_address(destination: &Destination, out: &mut Vec<u8>) -> Result<(), ()
     Ok(())
 }
 
-fn read_address_stream(stream: &AnyTlsStream, deadline: Instant) -> std::io::Result<Address> {
+fn read_address_from(
+    mut read: impl FnMut(&mut [u8]) -> std::io::Result<()>,
+) -> std::io::Result<Address> {
     let mut kind = [0u8; 1];
-    stream.read_until(&mut kind, deadline)?;
+    read(&mut kind)?;
     let host = match kind[0] {
         1 => {
             let mut octets = [0u8; 4];
-            stream.read_until(&mut octets, deadline)?;
+            read(&mut octets)?;
             std::net::IpAddr::V4(octets.into()).to_string()
         }
         4 => {
             let mut octets = [0u8; 16];
-            stream.read_until(&mut octets, deadline)?;
+            read(&mut octets)?;
             std::net::IpAddr::V6(octets.into()).to_string()
         }
         3 => {
             let mut len = [0u8; 1];
-            stream.read_until(&mut len, deadline)?;
+            read(&mut len)?;
             let mut name = vec![0u8; usize::from(len[0])];
-            stream.read_until(&mut name, deadline)?;
+            read(&mut name)?;
             String::from_utf8(name)
                 .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?
         }
         _ => return Err(std::io::Error::from(std::io::ErrorKind::InvalidData)),
     };
     let mut port = [0u8; 2];
-    stream.read_until(&mut port, deadline)?;
+    read(&mut port)?;
     let port = u16::from_be_bytes(port);
     if kind[0] == 3 {
         return Ok(Address::Name(host, port));
@@ -1272,41 +1403,13 @@ fn read_address_stream(stream: &AnyTlsStream, deadline: Instant) -> std::io::Res
     Ok(Address::Address(SocketAddr::new(ip, port)))
 }
 
+fn read_address_stream(stream: &AnyTlsStream, deadline: Instant) -> std::io::Result<Address> {
+    read_address_from(|buf| stream.read_exact(buf, deadline))
+}
+
 #[cfg(test)]
 fn read_address(reader: &mut dyn Read, deadline: Instant) -> std::io::Result<Address> {
-    let mut kind = [0u8; 1];
-    read_exact_deadline(reader, &mut kind, deadline)?;
-    let host = match kind[0] {
-        1 => {
-            let mut octets = [0u8; 4];
-            read_exact_deadline(reader, &mut octets, deadline)?;
-            std::net::IpAddr::V4(octets.into()).to_string()
-        }
-        4 => {
-            let mut octets = [0u8; 16];
-            read_exact_deadline(reader, &mut octets, deadline)?;
-            std::net::IpAddr::V6(octets.into()).to_string()
-        }
-        3 => {
-            let mut len = [0u8; 1];
-            read_exact_deadline(reader, &mut len, deadline)?;
-            let mut name = vec![0u8; usize::from(len[0])];
-            read_exact_deadline(reader, &mut name, deadline)?;
-            String::from_utf8(name)
-                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?
-        }
-        _ => return Err(std::io::Error::from(std::io::ErrorKind::InvalidData)),
-    };
-    let mut port = [0u8; 2];
-    read_exact_deadline(reader, &mut port, deadline)?;
-    let port = u16::from_be_bytes(port);
-    if kind[0] == 3 {
-        return Ok(Address::Name(host, port));
-    }
-    let ip = host
-        .parse()
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-    Ok(Address::Address(SocketAddr::new(ip, port)))
+    read_address_from(|buf| read_exact_deadline(reader, buf, deadline))
 }
 
 fn password_hash(password: &str) -> [u8; PASSWORD_LEN] {
@@ -1365,6 +1468,22 @@ mod tests {
 
     struct Sink(Arc<Mutex<Vec<u8>>>);
 
+    struct OneByte {
+        bytes: Vec<u8>,
+        at: usize,
+    }
+
+    impl Read for OneByte {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.at == self.bytes.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = self.bytes[self.at];
+            self.at += 1;
+            Ok(1)
+        }
+    }
+
     impl Write for Sink {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0
@@ -1376,6 +1495,20 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    fn test_stream(shared: &Arc<Shared>, id: u32) -> AnyTlsStream {
+        AnyTlsStream {
+            session: Arc::new(Session {
+                shared: Arc::clone(shared),
+                owner: None,
+            }),
+            id,
+            state: Arc::new(shared.stream_state()),
+            fin_sent: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
+            holders: Arc::new(AtomicUsize::new(1)),
         }
     }
 
@@ -1410,7 +1543,7 @@ mod tests {
         let stream = AnyTlsStream {
             session,
             id: 7,
-            state: Arc::new(StreamState::new()),
+            state: Arc::new(shared.stream_state()),
             fin_sent: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             holders: Arc::new(AtomicUsize::new(1)),
@@ -1482,6 +1615,61 @@ mod tests {
         assert_eq!(parsed.address, "b.test");
         assert_eq!(parsed.port, 8443);
         assert_eq!(parsed.client, "");
+    }
+
+    #[test]
+    fn addresses_survive_split_reads() {
+        let destination = Destination::Name("example.com".to_owned(), 443);
+        let mut encoded = Vec::new();
+        encode_address(&destination, &mut encoded).expect("encodes");
+        let mut reader = OneByte {
+            bytes: encoded.clone(),
+            at: 0,
+        };
+        assert!(matches!(
+            read_address(&mut reader, Instant::now() + OPEN_TIMEOUT),
+            Ok(Address::Name(host, 443)) if host == "example.com"
+        ));
+        encoded.pop();
+        let mut reader = OneByte {
+            bytes: encoded,
+            at: 0,
+        };
+        let error = read_address(&mut reader, Instant::now() + OPEN_TIMEOUT)
+            .err()
+            .expect("short address");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn stream_addresses_survive_split_frames() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::new(Shared::new(
+            Box::new(Sink(Arc::clone(&written))),
+            Padding::default_scheme(),
+            false,
+        ));
+        let destination = Destination::Name("example.com".to_owned(), 443);
+        let mut encoded = Vec::new();
+        encode_address(&destination, &mut encoded).expect("encodes");
+        let stream = test_stream(&shared, 1);
+        for byte in &encoded {
+            stream.state.push(std::slice::from_ref(byte), &shared.alive);
+        }
+        assert!(matches!(
+            read_address_stream(&stream, Instant::now() + OPEN_TIMEOUT),
+            Ok(Address::Name(host, 443)) if host == "example.com"
+        ));
+        drop(stream);
+
+        let short = test_stream(&shared, 2);
+        encoded.pop();
+        short.state.push(&encoded, &shared.alive);
+        short.state.end(Terminal::Eof);
+        let error = read_address_stream(&short, Instant::now() + OPEN_TIMEOUT)
+            .err()
+            .expect("short address");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
