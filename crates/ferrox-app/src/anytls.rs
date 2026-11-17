@@ -516,8 +516,9 @@ impl AnyTlsStream {
                 .state
                 .read(buf, Some(left.min(POLL)), &self.session.shared.alive)
             {
-                Err(error) if is_wait(&error) => continue,
-                result => return result,
+                Err(error) if !is_wait(&error) => return Err(error),
+                Err(_) => {}
+                Ok(n) => return Ok(n),
             }
         }
     }
@@ -664,7 +665,7 @@ impl AnyTlsOut {
             owner: Some(Arc::downgrade(self)),
         });
         let read_shared = Arc::clone(&shared);
-        std::thread::spawn(move || read_loop(&mut *reader, read_shared));
+        std::thread::spawn(move || read_loop(&mut *reader, &read_shared));
         Some(session)
     }
 
@@ -772,12 +773,11 @@ pub(crate) fn serve_inbound(
     }
     let security = crate::config::stream_security(inbound);
     let tls = if security == "tls" {
-        match crate::config::inbound_tls_identity(inbound) {
-            Some(identity) => Some(identity),
-            None => {
-                eprintln!("unreadable anytls tls identity in {path}: serves nothing");
-                return false;
-            }
+        if let Some(identity) = crate::config::inbound_tls_identity(inbound) {
+            Some(identity)
+        } else {
+            eprintln!("unreadable anytls tls identity in {path}: serves nothing");
+            return false;
         }
     } else if security.is_empty() || security == "none" {
         None
@@ -843,25 +843,22 @@ fn serve_connection(
     padding: Padding,
     freedom: bool,
 ) {
-    let (mut reader, writer): (Reader, Writer) = match tls {
-        Some(identity) => {
-            let Ok(mut session) = ferrox_core::tls::accept(identity.as_ref(), stream) else {
-                return;
-            };
-            if session.handshake().is_err() {
-                return;
-            }
-            let Some(halves) = proxy::anytls_server_halves(session) else {
-                return;
-            };
-            halves
+    let (mut reader, writer): (Reader, Writer) = if let Some(identity) = tls {
+        let Ok(mut session) = ferrox_core::tls::accept(identity.as_ref(), stream) else {
+            return;
+        };
+        if session.handshake().is_err() {
+            return;
         }
-        None => {
-            let Ok(writer) = stream.try_clone() else {
-                return;
-            };
-            (Box::new(stream), Box::new(writer))
-        }
+        let Some(halves) = proxy::anytls_server_halves(session) else {
+            return;
+        };
+        halves
+    } else {
+        let Ok(writer) = stream.try_clone() else {
+            return;
+        };
+        (Box::new(stream), Box::new(writer))
     };
     let deadline = Instant::now() + crate::budgets::handshake();
     let mut prologue = [0u8; PASSWORD_LEN + 2];
@@ -897,20 +894,19 @@ fn serve_connection(
         owner: None,
     });
     let context = Arc::new(ServerContext { freedom });
-    read_server(&mut *reader, session, context);
+    read_server(&mut *reader, &session, &context);
 }
 
 struct ServerContext {
     freedom: bool,
 }
 
-fn read_server(reader: &mut dyn Read, session: Arc<Session>, context: Arc<ServerContext>) {
+fn read_server(reader: &mut dyn Read, session: &Arc<Session>, context: &Arc<ServerContext>) {
     let shared = Arc::clone(&session.shared);
     loop {
         let frame = match read_frame(reader, &shared.alive) {
             Ok(Some(frame)) => frame,
-            Ok(None) => break,
-            Err(_) => break,
+            Ok(None) | Err(_) => break,
         };
         if !shared.alive() {
             break;
@@ -944,15 +940,15 @@ fn read_server(reader: &mut dyn Read, session: Arc<Session>, context: Arc<Server
                 let state = Arc::new(StreamState::new());
                 shared.insert_stream(frame.stream, &state);
                 let stream = AnyTlsStream {
-                    session: Arc::clone(&session),
+                    session: Arc::clone(session),
                     id: frame.stream,
                     state,
                     fin_sent: Arc::new(AtomicBool::new(false)),
                     closed: Arc::new(AtomicBool::new(false)),
                     holders: Arc::new(AtomicUsize::new(1)),
                 };
-                let context = Arc::clone(&context);
-                std::thread::spawn(move || serve_stream(stream, context));
+                let context = Arc::clone(context);
+                std::thread::spawn(move || serve_stream(stream, &context));
             }
             FIN => {
                 let state = shared
@@ -997,15 +993,12 @@ fn read_server(reader: &mut dyn Read, session: Arc<Session>, context: Arc<Server
     shared.shutdown("anytls session ended");
 }
 
-fn serve_stream(stream: AnyTlsStream, context: Arc<ServerContext>) {
+fn serve_stream(stream: AnyTlsStream, context: &ServerContext) {
     let deadline = Instant::now() + OPEN_TIMEOUT;
-    let destination = match read_address_stream(&stream, deadline) {
-        Ok(destination) => destination,
-        Err(_) => {
-            stream.synack(b"anytls: bad destination");
-            stream.close();
-            return;
-        }
+    let Ok(destination) = read_address_stream(&stream, deadline) else {
+        stream.synack(b"anytls: bad destination");
+        stream.close();
+        return;
     };
     if !context.freedom {
         stream.synack(b"anytls: freedom is disabled");
@@ -1025,12 +1018,11 @@ fn serve_stream(stream: AnyTlsStream, context: Arc<ServerContext>) {
     proxy::relay_anytls_stream(&upstream, stream, None);
 }
 
-fn read_loop(reader: &mut dyn Read, shared: Arc<Shared>) {
+fn read_loop(reader: &mut dyn Read, shared: &Arc<Shared>) {
     while shared.alive() {
         let frame = match read_frame(reader, &shared.alive) {
             Ok(Some(frame)) => frame,
-            Ok(None) => break,
-            Err(_) => break,
+            Ok(None) | Err(_) => break,
         };
         match frame.command {
             PSH => {
@@ -1087,7 +1079,6 @@ fn read_loop(reader: &mut dyn Read, shared: Arc<Shared>) {
             HEART_REQUEST => {
                 let _ = shared.write_frame(HEART_RESPONSE, frame.stream, &[]);
             }
-            SYN | SETTINGS | SERVER_SETTINGS | WASTE | HEART_RESPONSE => {}
             _ => {}
         }
     }
@@ -1137,8 +1128,11 @@ fn read_frame(reader: &mut dyn Read, alive: &AtomicBool) -> std::io::Result<Opti
                 return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
             }
             Ok(n) => at += n,
-            Err(error) if is_wait(&error) => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                if !is_wait(&error) {
+                    return Err(error);
+                }
+            }
         }
     }
     let command = header[0];
@@ -1153,8 +1147,11 @@ fn read_frame(reader: &mut dyn Read, alive: &AtomicBool) -> std::io::Result<Opti
         match reader.read(&mut payload[at..]) {
             Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
             Ok(n) => at += n,
-            Err(error) if is_wait(&error) => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                if !is_wait(&error) {
+                    return Err(error);
+                }
+            }
         }
     }
     Ok(Some(Frame {
@@ -1177,8 +1174,11 @@ fn read_exact_deadline(
         match reader.read(&mut buf[at..]) {
             Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
             Ok(n) => at += n,
-            Err(error) if is_wait(&error) => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                if !is_wait(&error) {
+                    return Err(error);
+                }
+            }
         }
     }
     Ok(())
@@ -1189,8 +1189,11 @@ fn write_all_retry(writer: &mut dyn Write, mut buf: &[u8]) -> std::io::Result<()
         match writer.write(buf) {
             Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
             Ok(n) => buf = &buf[n..],
-            Err(error) if is_wait(&error) => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                if !is_wait(&error) {
+                    return Err(error);
+                }
+            }
         }
     }
     writer.flush()

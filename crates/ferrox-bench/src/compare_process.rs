@@ -1173,6 +1173,7 @@ const SCENARIO_PROTOCOLS: &[&str] = &[
     "tun",
     "masque",
     "warp",
+    "anytls",
 ];
 
 fn protocol_of(scenario: &str) -> Option<&str> {
