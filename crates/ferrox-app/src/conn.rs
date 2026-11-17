@@ -4441,6 +4441,7 @@ mod tests {
         assert!(!state.done.load(std::sync::atomic::Ordering::Acquire));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_drain_only_wrap_keeps_the_write_path_plain() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
