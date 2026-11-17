@@ -2344,7 +2344,11 @@ fn add_addresses(iface: &mut Interface, addresses: &[IpAddr]) {
         for address in addresses {
             let prefix = if address.is_ipv4() { 24 } else { 64 };
             let cidr = IpCidr::new(IpAddress::from(*address), prefix);
-            let _ = slots.push(cidr);
+            if slots.push(cidr).is_err() {
+                eprintln!(
+                    "userspace stack: its eight address slots are full; {address}/{prefix} is not on the interface"
+                );
+            }
         }
     });
 }
@@ -3929,6 +3933,32 @@ mod tests {
             large_segments: false,
             dns: Vec::new(),
         }
+    }
+
+    /// The interface holds eight addresses, so a config that names more than one per family keeps them instead of losing the tail to a refused slot.
+    #[test]
+    fn every_configured_address_reaches_the_userspace_interface() {
+        let config = device(&["10.0.0.1", "10.0.0.2", "fd00::1", "fd00::2"], true);
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let stack = ClientStack::new(&config, to_tunnel, 0);
+        let mut found = stack
+            .iface
+            .ip_addrs()
+            .iter()
+            .map(IpCidr::address)
+            .collect::<Vec<_>>();
+        found.sort_by_key(std::string::ToString::to_string);
+        let mut wanted = config
+            .addresses
+            .iter()
+            .map(|address| IpAddress::from(*address))
+            .collect::<Vec<_>>();
+        wanted.sort_by_key(std::string::ToString::to_string);
+        assert_eq!(
+            found, wanted,
+            "every configured address is on the interface"
+        );
+        drop(packets);
     }
 
     /// An echo to the client's own address is answered on the tunnel.
