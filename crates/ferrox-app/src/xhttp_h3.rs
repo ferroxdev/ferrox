@@ -246,6 +246,9 @@ impl H3Reader {
                 continue;
             }
             self.parse()?;
+            if !self.expect_request {
+                status_ok(self.status)?;
+            }
             if self.expect_request && self.head.is_some() {
                 return Ok(());
             }
@@ -347,9 +350,6 @@ impl H3Reader {
             self.buf_at = at;
         }
         self.buf_at = at;
-        if !self.expect_request {
-            status_ok(self.status)?;
-        }
         Ok(())
     }
 
