@@ -36714,8 +36714,8 @@ impl Pump {
 /// The VLESS answer is stripped on the first read, not before the relay starts: a server may hold `[0, 0]` until it sees payload, and the upload then moves through the relay itself instead of a pump thread.
 struct ReplyReader<R> {
     inner: R,
-    head: [u8; 2],
-    filled: u8,
+    head: [u8; 2 + 255],
+    filled: usize,
     answered: bool,
 }
 
@@ -36723,7 +36723,7 @@ impl<R> ReplyReader<R> {
     fn new(inner: R) -> Self {
         Self {
             inner,
-            head: [0u8; 2],
+            head: [0u8; 2 + 255],
             filled: 0,
             answered: false,
         }
@@ -36735,17 +36735,28 @@ impl<R> ReplyReader<R> {
 }
 
 impl<R: Read> ReplyReader<R> {
+    /// Reads the version and add-on length, then the add-ons the header declares, without taking a byte of the stream behind them.
     fn ensure_answered(&mut self) -> std::io::Result<()> {
         while self.filled < 2 {
-            match self.inner.read(&mut self.head[usize::from(self.filled)..]) {
+            match self.inner.read(&mut self.head[self.filled..2]) {
                 Ok(0) => {
                     return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
                 }
-                Ok(n) => self.filled += n as u8,
+                Ok(n) => self.filled += n,
                 Err(error) => return Err(error),
             }
         }
-        if ferrox_core::vless::VlessLink::decode_response_header(&self.head).is_err() {
+        let want = 2 + usize::from(self.head[1]);
+        while self.filled < want {
+            match self.inner.read(&mut self.head[self.filled..want]) {
+                Ok(0) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                Ok(n) => self.filled += n,
+                Err(error) => return Err(error),
+            }
+        }
+        if ferrox_core::vless::VlessLink::decode_response_header(&self.head[..want]).is_err() {
             return Err(std::io::Error::other("vless answer refused"));
         }
         if echo_trace_on() {
@@ -51942,6 +51953,22 @@ mod tests {
         drop(uplink);
         budgets::clear();
         server.join().expect("joins");
+    }
+
+    /// A legal answer header that declares add-ons is consumed whole, so no add-on byte reaches the relay as payload.
+    #[test]
+    fn a_vless_answer_with_addons_is_stripped_whole() {
+        let mut reader = ReplyReader::new(std::io::Cursor::new(vec![0, 2, 8, 1, b'o', b'k']));
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).expect("reads the body");
+        assert_eq!(&body, b"ok");
+
+        let mut short = ReplyReader::new(std::io::Cursor::new(vec![0, 2, 8]));
+        let mut body = Vec::new();
+        assert!(
+            short.read_to_end(&mut body).is_err(),
+            "a truncated add-on block is refused"
+        );
     }
 
     /// A server that holds its `[0, 0]` until the first payload arrives — xray with padding and zeronet both do — must not deadlock the client: the client has to start the upload before it waits on the response.
