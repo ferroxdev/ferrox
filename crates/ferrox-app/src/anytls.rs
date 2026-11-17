@@ -1714,7 +1714,6 @@ mod tests {
             read_address_stream(&stream, Instant::now() + OPEN_TIMEOUT),
             Ok(Address::Name(host, 443)) if host == "example.com"
         ));
-        drop(stream);
 
         let short = test_stream(&shared, 2);
         encoded.pop();
