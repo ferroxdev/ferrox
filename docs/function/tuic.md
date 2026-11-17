@@ -37,7 +37,7 @@ graph TD
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | syscalls-per-connect | UNBLESSED | scripts/count-ops.sh |
 | single-fragment-payload-copies-per-packet | 0 | ferrox-app-tuic::tests::a_single_fragment_packet_payload_is_not_copied |
-| nanoseconds-per-packet | UNBLESSED | .github/workflows/bench.yml |
+| nanoseconds-per-packet | 13.8 | .github/workflows/bench.yml |
 | address-families | 3 | ferrox-core-tuic::tests::the_three_address_families_match_the_wire |
 | outbound-spellings-parsed | 1 | ferrox-app-tuic::tests::a_tuic_outbound_reads_the_reference_spellings |
 <!-- counts:end -->
@@ -46,11 +46,13 @@ graph TD
 
 Against sing-box and ZeroNet this is a rewrite, not a port: no upstream line or test enters this tree. One wire codec and one association table serve both roles, where the references keep separate inbound and outbound framing. Against Xray-core no removal is claimed: the pinned tree carries no TUIC transport to compare with.
 
+- **The stream lane's second parse.** A uni-stream PACKET was parsed for its prefix and then parsed again as a packet. The prefix parse now yields the packet the dispatch uses, so a stream PACKET takes one parse rather than two; the stream rows in `## Time` are the counterfactual that prices the removed pass, and the relay bytes are unchanged.
+
 What is not removed: QUIC still encrypts every datagram, the sending side still writes a native PACKET into a reusable frame before quiche encrypts it, reassembly still copies each fragment and then the assembled payload, authentication still follows the handshake, and the dial still reads xray-style TLS settings. A cancelled TUIC flow still resets its QUIC stream; only a graceful FIN skips the reset. `a_single_fragment_packet_payload_is_not_copied` gates the zero-copy single-fragment receive row by pointer identity and a zero allocation delta, including the direct `Destination` build that keeps a numeric address from a string round-trip; a fragmented packet pays one copy per fragment plus the reassembly copy, which no row claims. The server's UDP sweep queues every reply and flushes egress only when the datagram queue cannot hold the next packet, so a 32-reply association no longer overruns the 64-frame queue; the client hands the SOCKS head and payload to `send_to_two` as two parts instead of joining them, and both roles build a destination into a stack buffer with no `Vec`.
 
 ## Time
 
-UNBLESSED: no local duration is a measurement of this code, and the CI matrix has not run this row yet.
+CI's `bench.yml` run `43998600542` (`23ef3f4`) measured the PACKET parse at **13.8 ns** on linux x86_64, **18.5 ns** on linux aarch64, **9.5 ns** on macos aarch64 and **24.0 ns** on windows x86_64. The same run's stream section prices the removed second pass: one parse against two read **4.1** against **14.7 ns** on linux x86_64, **6.1** against **19.4** on linux aarch64, **4.0** against **10.5** on macos aarch64 and **7.7** against **27.8** on windows, so the one-parse path saves **10.6**, **13.3**, **6.5** and **20.1 ns** per packet. These are the codec's dispatch costs, not the QUIC/TLS relay; no local duration is quoted.
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/tuic.rs, crates/ferrox-core/src/tuic.rs
