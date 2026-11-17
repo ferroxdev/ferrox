@@ -196,8 +196,7 @@ fn validate_expr(expr: &Expr) -> Option<()> {
 fn validate_lengths(expr: &Expr) -> Option<()> {
     let length = match expr.op.as_str() {
         "slice" => expr.args.get(2),
-        "pad" => expr.args.get(1),
-        "truncate" => expr.args.get(1),
+        "pad" | "truncate" => expr.args.get(1),
         _ => None,
     };
     if length.is_some_and(reads_metadata) {
