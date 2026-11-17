@@ -119,11 +119,12 @@ impl Range {
 
     /// The same draw off a cached supply; the span test and the modulo are `pick`'s unchanged.
     fn pick_from(&self, ent: &mut Entropy) -> Option<i64> {
-        let span = self.high - self.low;
+        let span = i128::from(self.high) - i128::from(self.low);
         if span < 2 {
             return Some(self.low);
         }
-        Some(self.low + i64::try_from(ent.draw()? % span as u64).ok()?)
+        let step = i128::from(ent.draw()? % span as u64);
+        i64::try_from(i128::from(self.low) + step).ok()
     }
 }
 
@@ -1650,6 +1651,16 @@ mod tests {
             range(11, 37),
             "a swapped pair is ordered"
         );
+    }
+
+    #[test]
+    fn a_range_spanning_the_whole_i64_does_not_overflow() {
+        let whole = Range::ordered(i64::MIN, i64::MAX);
+        for _ in 0..64 {
+            let drawn = whole.pick().expect("entropy");
+            assert!((i64::MIN..i64::MAX).contains(&drawn));
+        }
+        assert!(Range::ordered(-i64::MAX, 1).pick().is_some());
     }
 
     #[test]
