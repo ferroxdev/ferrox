@@ -1038,13 +1038,13 @@ fn read_server(reader: &mut dyn Read, session: &Arc<Session>, context: &Arc<Serv
         }
         match frame.command {
             PSH => {
-                if let Some(state) = shared
+                let state = shared
                     .streams
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .get(&frame.stream)
-                    .cloned()
-                {
+                    .cloned();
+                if let Some(state) = state {
                     state.push(&frame.payload, &shared.alive);
                 }
             }
@@ -1150,13 +1150,13 @@ fn read_loop(reader: &mut dyn Read, shared: &Arc<Shared>) {
         };
         match frame.command {
             PSH => {
-                if let Some(state) = shared
+                let state = shared
                     .streams
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .get(&frame.stream)
-                    .cloned()
-                {
+                    .cloned();
+                if let Some(state) = state {
                     state.push(&frame.payload, &shared.alive);
                 }
             }
