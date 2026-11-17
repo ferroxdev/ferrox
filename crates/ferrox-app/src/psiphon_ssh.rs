@@ -25,6 +25,8 @@ pub(crate) const MIN_PADDING: usize = 32;
 pub(crate) const MAX_PADDING: usize = 8192;
 const MAX_PACKET: usize = 256 * 1024;
 pub(crate) const DEFAULT_CHANNEL_WINDOW: u32 = 4 * 1024 * 1024;
+/// The control channels stay at the reference's window so readiness is not delayed.
+const API_CHANNEL_WINDOW: u32 = 2 * 1024 * 1024;
 pub(crate) const CHANNEL_PACKET: u32 = 32 * 1024;
 /// The reference's packet tunnel window is counted in 32 KiB packets; 0, or a
 /// value outside 1..=128, uses its default of 16.
@@ -2013,7 +2015,12 @@ impl Session {
         put_u32(&mut extra, u32::from(port));
         put_str(&mut extra, b"127.0.0.1");
         put_u32(&mut extra, 0);
-        self.open_payload(channel_type, &extra, &format!("{host}:{port}"))
+        self.open_payload_with_window(
+            channel_type,
+            &extra,
+            &format!("{host}:{port}"),
+            self.inner.channel_window,
+        )
     }
 
     /// Send a Psiphon API request through the tunnel and wait for its success payload.
@@ -2132,7 +2139,7 @@ impl Session {
         extra: &[u8],
         target: &str,
     ) -> Result<Option<Channel>, String> {
-        self.open_payload_with_window(channel_type, extra, target, self.inner.channel_window)
+        self.open_payload_with_window(channel_type, extra, target, API_CHANNEL_WINDOW)
     }
 
     fn open_payload_with_window(
