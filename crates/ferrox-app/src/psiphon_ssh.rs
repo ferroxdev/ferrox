@@ -5310,15 +5310,11 @@ fn mpint(value: &[u8]) -> Vec<u8> {
 pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
     let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
-    let _ = listener.accept().expect("accept");
+    let (_local, _) = listener.accept().expect("accept");
+    let writer = peer.try_clone().expect("clone");
     let pool = Arc::new(Mutex::new(Vec::new()));
     let inner = Arc::new(Inner {
-        writer: Mutex::new(PacketWriter::new(
-            peer.try_clone().expect("clone"),
-            None,
-            None,
-            None,
-        )),
+        writer: Mutex::new(PacketWriter::new(writer, None, None, None)),
         channels: Mutex::new(HashMap::new()),
         pool: Arc::clone(&pool),
         channel_window: DEFAULT_CHANNEL_WINDOW,
@@ -5836,14 +5832,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
         let (_local, _) = listener.accept().expect("accept");
+        let writer = peer.try_clone().expect("clone");
         let pool = Arc::new(Mutex::new(Vec::new()));
         let inner = Arc::new(Inner {
-            writer: Mutex::new(PacketWriter::new(
-                peer.try_clone().expect("clone"),
-                None,
-                None,
-                None,
-            )),
+            writer: Mutex::new(PacketWriter::new(writer, None, None, None)),
             channels: Mutex::new(HashMap::new()),
             pool: Arc::clone(&pool),
             channel_window: DEFAULT_CHANNEL_WINDOW,
