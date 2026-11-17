@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use ferrox_core::kcp::{dial, Config, Listener};
@@ -18,7 +17,9 @@ fn main() {
 
     match mode.as_str() {
         "server" => {
-            let port: u16 = peer_arg.parse().unwrap();
+            let Ok(port) = peer_arg.parse() else {
+                usage();
+            };
             let listener =
                 Listener::bind(([127, 0, 0, 1], port).into(), Config::default()).expect("bind");
             loop {
@@ -40,7 +41,9 @@ fn main() {
             let Some(payload) = args.get(3) else {
                 usage();
             };
-            let peer: SocketAddr = peer_arg.parse().unwrap();
+            let Ok(peer) = peer_arg.parse() else {
+                usage();
+            };
             let conn = dial(peer, Config::default(), 7).expect("dial");
             conn.write(payload.as_bytes()).unwrap();
             conn.set_read_deadline(Instant::now() + Duration::from_secs(10));
