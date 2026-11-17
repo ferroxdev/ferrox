@@ -658,7 +658,7 @@ run {core}
         assert_eq!(skipped, Vec::<Skipped>::new());
         let (ready, skipped) =
             handable(&library, None, &[], &["extra".to_owned()], &supplied, false);
-        assert_eq!(ready, Vec::<&Prompt>::new());
+        assert_eq!(ready.len(), 0);
         assert_eq!(skipped[0].missing, vec!["extra".to_owned()]);
     }
 
