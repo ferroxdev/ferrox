@@ -488,7 +488,7 @@ fn previous_decode<'a>(
     ))
 }
 
-fn read_target(meta: &[u8], at: &mut usize) -> Result<Target<'_>, mux::Error> {
+fn read_target<'a>(meta: &'a [u8], at: &mut usize) -> Result<Target<'a>, mux::Error> {
     let network_byte = *meta.get(*at).ok_or(mux::Error::Truncated)?;
     *at += 1;
     let network = Network::from_byte(network_byte).ok_or(mux::Error::Network(network_byte))?;
@@ -503,7 +503,7 @@ fn read_target(meta: &[u8], at: &mut usize) -> Result<Target<'_>, mux::Error> {
     })
 }
 
-fn read_addr(meta: &[u8], at: &mut usize) -> Result<Addr<'_>, mux::Error> {
+fn read_addr<'a>(meta: &'a [u8], at: &mut usize) -> Result<Addr<'a>, mux::Error> {
     let family = *meta.get(*at).ok_or(mux::Error::Truncated)?;
     *at += 1;
     match family {
@@ -526,7 +526,10 @@ fn read_addr(meta: &[u8], at: &mut usize) -> Result<Addr<'_>, mux::Error> {
     }
 }
 
-fn read_reflection(meta: &[u8], at: &mut usize) -> Result<Option<Reflection<'_>>, mux::Error> {
+fn read_reflection<'a>(
+    meta: &'a [u8],
+    at: &mut usize,
+) -> Result<Option<Reflection<'a>>, mux::Error> {
     let Some(&first) = meta.get(*at) else {
         return Ok(None);
     };

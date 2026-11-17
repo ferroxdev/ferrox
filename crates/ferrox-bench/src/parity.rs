@@ -3637,12 +3637,12 @@ mod tests {
     #[test]
     fn a_hold_at_the_run_cap_gets_a_late_start_window() {
         let request = Request::parse(
-            request_with(&[("traffic", quote("held-open")), ("duration_ms", "120000")]).as_bytes(),
+            request_with(&[("traffic", &quote("held-open")), ("duration_ms", "120000")]).as_bytes(),
         )
         .expect("the cap is accepted");
         assert_eq!(request.duration, RUN_TIMEOUT);
         assert_eq!(fan_in_cap(&request), RUN_TIMEOUT + FLOW_IO_TIMEOUT);
-        let above = request_with(&[("traffic", quote("held-open")), ("duration_ms", "120001")]);
+        let above = request_with(&[("traffic", &quote("held-open")), ("duration_ms", "120001")]);
         assert!(Request::parse(above.as_bytes()).is_err());
     }
 

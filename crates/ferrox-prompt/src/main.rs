@@ -780,20 +780,15 @@ fn slice_worktree(
 fn next_json(
     library: &Library,
     prompt: &Prompt,
-    args: &Args,
-    suppressed: &[u32],
-    skipped: &[advisor::Skipped],
     target: Option<&(&MethodRow, Values)>,
     ledger: &Ledger,
     rendered: &render::Rendered,
+    selection: Value,
 ) -> String {
     Value::object([
         ("library", Value::text(library.path.display().to_string())),
         ("tag", Value::text(library.tag())),
-        (
-            "selection",
-            selection_json(library, prompt, args, suppressed, skipped),
-        ),
+        ("selection", selection),
         (
             "target",
             target.map_or(Value::Null, |(row, _)| Value::text(row.key())),
@@ -934,17 +929,16 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
 
     let target_key = target.as_ref().map(|(row, _)| row.key());
     if args.output == Output::Json {
+        let selection = selection_json(library, prompt, args, &suppressed, &skipped);
         println!(
             "{}",
             next_json(
                 library,
                 prompt,
-                args,
-                &suppressed,
-                &skipped,
                 target.as_ref(),
                 &ledger,
-                &rendered
+                &rendered,
+                selection
             )
         );
     } else {
