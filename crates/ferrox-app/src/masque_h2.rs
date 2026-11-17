@@ -28,6 +28,7 @@ const PREFACE: usize = 24;
 const SETTINGS_INITIAL_WINDOW: u16 = 0x4;
 const SETTINGS_ENABLE_CONNECT: u16 = 0x8;
 const FRAME_CAP: usize = 1 << 20;
+const FRAME_HEAD: usize = 9;
 const QUEUED_CAP: usize = 64;
 const DEFAULT_WINDOW: i64 = 65_535;
 const H2_CONNECTIONS: usize = 256;
@@ -421,6 +422,25 @@ impl Wire {
         }
         true
     }
+
+    /// One write for a frame whose head and body are already one buffer.
+    fn send_frame(&mut self, frame: &[u8]) -> bool {
+        if self.stream.write_all(frame).is_err() {
+            self.closed = true;
+            return false;
+        }
+        true
+    }
+}
+
+/// Builds one DATA frame in `buffer`: its head, then whatever `body` appends.
+fn data_frame(buffer: &mut Vec<u8>, id: u32, body: impl FnOnce(&mut Vec<u8>)) -> usize {
+    buffer.clear();
+    buffer.resize(FRAME_HEAD, 0);
+    body(buffer);
+    let length = buffer.len() - FRAME_HEAD;
+    buffer[..FRAME_HEAD].copy_from_slice(&h2::frame_head(length, h2::T_DATA, 0, id));
+    length
 }
 
 struct Frame {
@@ -788,28 +808,33 @@ impl Client {
                     ping_at = Some(now);
                 }
             }
-            self.flush();
+            let mut wrote = self.flush();
             if self.wire.closed || self.end {
                 break;
             }
             for _ in 0..QUEUED_CAP {
-                if self.end || self.wire.closed {
+                if self.end || self.wire.closed || self.queued.len() >= QUEUED_CAP {
                     break;
                 }
                 let Ok(packet) = from_tunnel.try_recv() else {
                     break;
                 };
-                capsule.clear();
-                if self.warp {
-                    connectip::packet_encode_bare(&packet, &mut capsule);
-                } else {
-                    datagram(&packet, &mut capsule);
-                }
-                self.capsule(&capsule);
+                data_frame(&mut capsule, self.stream, |out| {
+                    if self.warp {
+                        connectip::packet_encode_bare(&packet, out);
+                    } else {
+                        datagram(&packet, out);
+                    }
+                });
+                wrote |= self.send(&capsule);
             }
-            self.flush();
+            wrote |= self.flush();
             if self.wire.closed || self.end {
                 break;
+            }
+            // A turn that moved bytes does not wait on the socket: the window updates it needs are already queued for the next read.
+            if wrote {
+                continue;
             }
             if !self.wire.fill() {
                 break;
@@ -1051,7 +1076,26 @@ impl Client {
         }
     }
 
-    /// Sends within peer credit or queues up to the cap; terminated sessions accept nothing.
+    /// Sends a built DATA frame within peer credit in one write, or queues its body up to the cap, and reports whether it wrote.
+    fn send(&mut self, frame: &[u8]) -> bool {
+        if self.end || self.wire.closed {
+            return false;
+        }
+        let body = &frame[FRAME_HEAD..];
+        let length = i64::try_from(body.len()).unwrap_or(i64::MAX);
+        if self.queued.is_empty() && length <= self.send_window.min(self.connection_window) {
+            if self.wire.send_frame(frame) {
+                self.send_window -= length;
+                self.connection_window -= length;
+                return true;
+            }
+            return false;
+        }
+        self.capsule(body);
+        false
+    }
+
+    /// Sends a control capsule within peer credit or queues it up to the cap; terminated sessions accept nothing.
     fn capsule(&mut self, capsule: &[u8]) {
         if self.end || self.wire.closed {
             return;
@@ -1069,25 +1113,27 @@ impl Client {
         }
     }
 
-    /// Drains queued capsule bytes within peer credit while preserving a partial front capsule.
-    fn flush(&mut self) {
+    /// Drains queued capsule bytes within peer credit while preserving a partial front capsule, and reports whether it wrote.
+    fn flush(&mut self) -> bool {
         if self.end || self.wire.closed {
-            return;
+            return false;
         }
+        let mut wrote = false;
         while let Some(answer) = self.queued.pop_front() {
             let start = self.queued_at;
             let room = self.send_window.min(self.connection_window);
             if room <= 0 {
                 self.queued.push_front(answer);
-                return;
+                return wrote;
             }
             let take = (answer.len() - start).min(usize::try_from(room).unwrap_or(usize::MAX));
             if !self
                 .wire
                 .send(h2::T_DATA, 0, self.stream, &answer[start..start + take])
             {
-                return;
+                return wrote;
             }
+            wrote = true;
             self.send_window -= i64::try_from(take).unwrap_or(i64::MAX);
             self.connection_window -= i64::try_from(take).unwrap_or(i64::MAX);
             self.queued_at = start + take;
@@ -1097,6 +1143,7 @@ impl Client {
                 self.queued_at = 0;
             }
         }
+        wrote
     }
 }
 
@@ -1106,6 +1153,7 @@ struct Session {
     decoder: Decoder,
     capsules: Vec<u8>,
     capsule_at: usize,
+    frame: Vec<u8>,
     request: Option<u32>,
     continuation: Option<(u32, Vec<u8>, u8)>,
     outgoing: Option<Receiver<Vec<u8>>>,
@@ -1129,6 +1177,7 @@ impl Session {
             decoder: Decoder::default(),
             capsules: Vec::new(),
             capsule_at: 0,
+            frame: Vec::new(),
             request: None,
             continuation: None,
             outgoing: None,
@@ -1198,7 +1247,10 @@ impl Session {
                 self.end = true;
                 break;
             }
-            self.flush(wire);
+            // A turn that moved bytes does not wait on the socket: the window updates it needs are already queued for the next read.
+            if self.flush(wire) {
+                continue;
+            }
             if wire.closed || self.end {
                 break;
             }
@@ -1473,6 +1525,25 @@ impl Session {
         }
     }
 
+    /// Sends a built DATA frame in one write when it fits the window, otherwise queues its body, and reports whether it wrote.
+    fn send(&mut self, wire: &mut Wire, frame: &[u8]) -> bool {
+        if self.end || wire.closed || self.request.is_none() {
+            return false;
+        }
+        let body = &frame[FRAME_HEAD..];
+        let length = i64::try_from(body.len()).unwrap_or(i64::MAX);
+        if self.queued.is_empty() && length <= self.send_window.min(self.connection_window) {
+            if wire.send_frame(frame) {
+                self.send_window -= length;
+                self.connection_window -= length;
+                return true;
+            }
+            return false;
+        }
+        self.capsule(wire, body);
+        false
+    }
+
     /// Sends or bounds queued reply capsules only while the request and wire remain live.
     fn capsule(&mut self, wire: &mut Wire, capsule: &[u8]) {
         if self.end || wire.closed {
@@ -1494,15 +1565,16 @@ impl Session {
         }
     }
 
-    /// Drains live reply capsules in order, preserving any suffix blocked by peer credit.
-    fn flush(&mut self, wire: &mut Wire) {
+    /// Drains live reply capsules in order, preserving any suffix blocked by peer credit, and reports whether it wrote.
+    fn flush(&mut self, wire: &mut Wire) -> bool {
         if self.end || wire.closed {
-            return;
+            return false;
         }
+        let mut wrote = false;
         while let Some(answer) = self.queued.pop_front() {
             let Some(id) = self.request else {
                 self.queued.push_front(answer);
-                return;
+                return wrote;
             };
             let start = self.queued_at;
             let room = self.send_window.min(self.connection_window);
@@ -1512,8 +1584,9 @@ impl Session {
             }
             let take = (answer.len() - start).min(usize::try_from(room).unwrap_or(usize::MAX));
             if !wire.send(h2::T_DATA, 0, id, &answer[start..start + take]) {
-                return;
+                return wrote;
             }
+            wrote = true;
             let sent = i64::try_from(take).unwrap_or(i64::MAX);
             self.send_window -= sent;
             self.connection_window -= sent;
@@ -1524,8 +1597,10 @@ impl Session {
                 self.queued_at = 0;
             }
         }
+        let mut frame = std::mem::take(&mut self.frame);
         for _ in 0..QUEUED_CAP {
-            if wire.closed || self.end {
+            // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
+            if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
                 break;
             }
             let Some(packet) = (if let Some(udp) = &self.udp {
@@ -1537,17 +1612,23 @@ impl Session {
             }) else {
                 break;
             };
-            let mut capsule = Vec::with_capacity(packet.len() + 8);
-            if self.warp {
-                bare_datagram(&packet, &mut capsule);
-            } else {
-                datagram(&packet, &mut capsule);
-            }
-            self.capsule(wire, &capsule);
+            let Some(id) = self.request else {
+                break;
+            };
+            data_frame(&mut frame, id, |out| {
+                if self.warp {
+                    bare_datagram(&packet, out);
+                } else {
+                    datagram(&packet, out);
+                }
+            });
+            wrote |= self.send(wire, &frame);
         }
+        self.frame = frame;
         if self.request.is_some() && !wire.closed && self.queued.is_empty() {
             wire.deadline.clear();
         }
+        wrote
     }
 }
 
@@ -1811,9 +1892,9 @@ mod tests {
         assert!(client.early_bytes <= masque::EARLY_BYTES);
     }
 
-    /// Each exhausted window independently enforces the documented 64-capsule limit and overflow termination.
+    /// Each exhausted window independently enforces the documented 64-capsule limit, and only a control answer arriving past it ends the session.
     #[test]
-    fn a_stalled_send_window_bounds_the_queued_capsules() {
+    fn a_stalled_client_window_bounds_its_answers() {
         for (stream, connection) in [(0, 0), (0, DEFAULT_WINDOW), (DEFAULT_WINDOW, 0)] {
             let mut client = bare_client();
             client.send_window = stream;
@@ -1832,51 +1913,79 @@ mod tests {
     }
 
     #[test]
-    fn a_stalled_server_send_window_bounds_the_queued_capsules() {
+    fn a_stalled_send_window_bounds_the_queued_capsules() {
         let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
         session.request = Some(1);
         session.send_window = 0;
         session.connection_window = 0;
+        let (sender, outgoing) = mpsc::sync_channel(masque::QUEUE);
+        session.outgoing = Some(outgoing);
+        for _ in 0..QUEUED_CAP + 1 {
+            sender.send(udp_packet(53)).expect("a packet");
+        }
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             closed: false,
             deadline: Deadline::default(),
         };
-        let mut capsule = Vec::new();
-        datagram(&udp_packet(53), &mut capsule);
-        for _ in 0..=QUEUED_CAP {
-            session.capsule(&mut wire, &capsule);
-        }
+        session.flush(&mut wire);
         assert_eq!(
             session.queued.len(),
             QUEUED_CAP,
             "a stalled window keeps at most {QUEUED_CAP} capsules"
         );
-        assert!(session.end, "the capsule past the cap ends the session");
+        assert!(
+            !session.end,
+            "a stalled window parks the tunnel instead of ending it"
+        );
     }
 
+    /// One DATA frame leaves in one write, and the server reuses one frame buffer instead of allocating per packet.
     #[test]
-    fn a_blocked_queue_head_still_drains_outgoing_to_the_cap() {
+    fn a_data_frame_leaves_the_wire_in_one_write() {
+        struct Counting(Arc<Mutex<Vec<u8>>>, Arc<AtomicUsize>);
+        impl Read for Counting {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl Write for Counting {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                self.0.lock().expect("a wire").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
         let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
         session.request = Some(1);
-        session.send_window = 0;
         let (sender, outgoing) = mpsc::sync_channel(masque::QUEUE);
         session.outgoing = Some(outgoing);
+        sender.send(udp_packet(53)).expect("a packet");
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
         let mut wire = Wire {
-            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            stream: Box::new(Counting(Arc::clone(&out), Arc::clone(&writes))),
             pending: Vec::new(),
             closed: false,
             deadline: Deadline::default(),
         };
-        let mut capsule = Vec::new();
-        datagram(&udp_packet(53), &mut capsule);
-        for _ in 0..QUEUED_CAP {
-            session.capsule(&mut wire, &capsule);
-        }
-        sender.send(udp_packet(53)).expect("a packet");
         session.flush(&mut wire);
-        assert!(session.end, "a full queue ends the session");
+        assert_eq!(
+            writes.load(Ordering::Relaxed),
+            1,
+            "the head and its capsule are one write"
+        );
+        let bytes = out.lock().expect("a wire");
+        assert_eq!(
+            &bytes[..FRAME_HEAD],
+            &h2::frame_head(bytes.len() - FRAME_HEAD, h2::T_DATA, 0, 1)
+        );
+        assert_eq!(bytes[FRAME_HEAD], 0, "the capsule leads with its type");
     }
 
     #[test]
@@ -2314,7 +2423,7 @@ mod tests {
         assert!(!wire.closed);
     }
 
-    /// Overflow terminates a bounded batch without consuming the next tunnel or reply packet.
+    /// A full queue stops the pull without consuming the next tunnel or reply packet, and the session survives it.
     #[test]
     fn an_overflow_stops_draining_the_packet_channels() {
         let (sender, receiver) = mpsc::sync_channel(masque::QUEUE);
@@ -2328,9 +2437,16 @@ mod tests {
         let (to_stack, _) = mpsc::channel();
         let routes = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         client.run(&receiver, &to_stack, &routes, None, &AtomicBool::new(true));
-        assert!(client.end);
+        assert!(
+            !client.end,
+            "a full queue parks the client instead of ending it"
+        );
         assert_eq!(client.queued.len(), QUEUED_CAP);
-        assert_eq!(receiver.try_iter().count(), 1);
+        assert_eq!(
+            receiver.try_iter().count(),
+            2,
+            "no packet is pulled while the queue is full"
+        );
 
         let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
         session.request = Some(1);
@@ -2344,7 +2460,10 @@ mod tests {
             session.capsule(&mut wire, &[0, 2, 0, 42]);
         }
         session.flush(&mut wire);
-        assert!(session.end);
+        assert!(
+            !session.end,
+            "a full queue parks the session instead of ending it"
+        );
         assert_eq!(session.queued.len(), QUEUED_CAP);
         assert_eq!(
             session
@@ -2353,7 +2472,8 @@ mod tests {
                 .expect("receiver")
                 .try_iter()
                 .count(),
-            1
+            2,
+            "no packet is pulled while the queue is full"
         );
     }
 
