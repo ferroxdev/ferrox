@@ -2646,7 +2646,7 @@ impl Channel {
     /// One queued chunk and the window credit it releases, without waiting.
     #[cfg(test)]
     fn take_chunk(&self) -> (Option<ChannelChunk>, u64) {
-        let adjust_at = window_adjust_at(self.session.channel_window);
+        let adjust_at = window_adjust_at(self.state.window);
         let mut adjust = 0u64;
         let chunk = {
             let mut recv = lock(&self.state.recv);
@@ -2741,7 +2741,7 @@ impl Channel {
         limit: usize,
     ) -> io::Result<bool> {
         let started = self.session.burst_started();
-        let adjust_at = window_adjust_at(self.session.channel_window);
+        let adjust_at = window_adjust_at(self.state.window);
         loop {
             let (adjust, spent, bytes, eof) = {
                 let mut recv = lock(&self.state.recv);
@@ -2863,7 +2863,7 @@ impl Read for Channel {
         }
         let started = self.session.burst_started();
         let mut adjust = 0u64;
-        let adjust_at = window_adjust_at(self.session.channel_window);
+        let adjust_at = window_adjust_at(self.state.window);
         let mut drained = None;
         let take = loop {
             let mut recv = lock(&self.state.recv);
@@ -5015,12 +5015,31 @@ enum Dispatch {
 
 #[allow(clippy::needless_pass_by_value)]
 fn read_loop(inner: Arc<Inner>, mut reader: PacketReader) {
-    while let Ok(packet) = reader.recv() {
+    let trace = std::env::var_os("AETHER_PSIPHON_TRACE_FLOWS").is_some();
+    loop {
+        let packet = match reader.recv() {
+            Ok(packet) => packet,
+            Err(error) => {
+                if trace {
+                    eprintln!("psiphon: ssh reader stopped: {error}");
+                }
+                break;
+            }
+        };
         inner.touch();
+        let kind = packet.kind();
         match dispatch(&inner, packet) {
             Dispatch::Recycle(buffer) => reader.recycle(buffer),
             Dispatch::Queued => {}
-            Dispatch::Stop => break,
+            Dispatch::Stop => {
+                if trace {
+                    eprintln!(
+                        "psiphon: ssh reader stopped at message {}",
+                        kind.unwrap_or(0)
+                    );
+                }
+                break;
+            }
         }
     }
     inner.close();
@@ -5122,8 +5141,8 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
                 start: offset,
                 end,
             });
+            *lock(&state.last_active) = Instant::now();
             drop(recv);
-            state.touch();
             // A reader already draining does not need a wake per packet; only the transition does.
             if was_empty {
                 state.cond.notify_one();
