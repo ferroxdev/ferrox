@@ -95,19 +95,27 @@ fn same_account(stored: &str, email: &str) -> bool {
 
 pub fn resolve(options: &Options, paths: &Paths) -> Result<FoxyAccount, String> {
     let (file_email, file_password) = read(&paths.creds);
-    let mut email = if options.email.is_empty() {
-        if file_email.is_empty() {
-            self::stored_email(paths)
-        } else {
-            file_email
-        }
-    } else {
+    let env_email = std::env::var("FOXY_EMAIL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let env_password = std::env::var("FOXY_PASS")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let mut email = if !options.email.is_empty() {
         options.email.clone()
-    };
-    let mut password = if options.password.is_empty() {
-        file_password
+    } else if let Some(email) = env_email {
+        email
+    } else if !file_email.is_empty() {
+        file_email
     } else {
+        self::stored_email(paths)
+    };
+    let mut password = if !options.password.is_empty() {
         options.password.clone()
+    } else if let Some(password) = env_password {
+        password
+    } else {
+        file_password
     };
     let has_grant = |email: &str| same_account(&stored_email(paths), email) && stored_grant(paths);
     if email.is_empty() || (password.is_empty() && !has_grant(&email)) {

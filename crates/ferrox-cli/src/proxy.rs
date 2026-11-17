@@ -73,16 +73,27 @@ pub fn arm(paths: &Paths, list: &str, ports: Ports) -> Result<(), String> {
     }
 }
 
-pub fn clear(paths: &Paths) {
+/// Only the lane that armed the proxy may clear it; a second configuration root sharing the
+/// state directory must not restore or delete the first lane's snapshot.
+fn owned(paths: &Paths) -> bool {
+    read_trim(&paths.proxy_owner).is_none_or(|owner| owner == paths.conf_dir.to_string_lossy())
+}
+
+#[allow(clippy::unnecessary_wraps)] // Windows restores the registry and can fail; the other targets only remove files.
+pub fn clear(paths: &Paths) -> Result<(), String> {
+    if !owned(paths) {
+        return Ok(());
+    }
     #[cfg(windows)]
     {
-        win::clear(paths);
+        win::clear(paths)
     }
     #[cfg(not(windows))]
     {
         let _ = std::fs::remove_file(&paths.proxy_ports);
         let _ = std::fs::remove_file(&paths.proxy_state);
         let _ = std::fs::remove_file(&paths.proxy_owner);
+        Ok(())
     }
 }
 
@@ -245,7 +256,8 @@ mod win {
         Ok(Value::Object(object))
     }
 
-    fn restore(key: HKEY, snapshot: &Value) {
+    fn restore(key: HKEY, snapshot: &Value) -> bool {
+        let mut ok = true;
         for name in NAMES {
             match snapshot.get(name) {
                 Some(Value::Object(value)) => {
@@ -262,22 +274,23 @@ mod win {
                         });
                     match (kind, bytes) {
                         (Some(kind), Some(bytes)) => {
-                            write_raw(key, name, kind, &bytes);
+                            ok &= write_raw(key, name, kind, &bytes);
                         }
                         _ => delete(key, name),
                     }
                 }
                 Some(Value::String(text)) => {
-                    write_sz(key, name, text);
+                    ok &= write_sz(key, name, text);
                 }
                 Some(Value::Number(number)) => {
                     if let Some(value) = number.as_u64() {
-                        write_dword(key, name, value as u32);
+                        ok &= write_dword(key, name, value as u32);
                     }
                 }
                 _ => delete(key, name),
             }
         }
+        ok
     }
 
     fn notify() -> bool {
@@ -387,7 +400,7 @@ mod win {
         delete(key, "AutoConfigURL");
         unsafe { RegCloseKey(key) };
         if !ok || !notify() {
-            clear(paths);
+            let _ = clear(paths);
             return Err("system proxy: the arm did not stick; nothing was armed.".to_owned());
         }
         let _ = write_private(
@@ -409,18 +422,33 @@ mod win {
         Ok(())
     }
 
-    pub fn clear(paths: &Paths) {
-        if let Some(text) = read_trim(&paths.proxy_state) {
-            if let Ok(snapshot) = serde_json::from_str::<Value>(&text) {
-                if let Ok(key) = open() {
-                    restore(key, &snapshot);
-                    unsafe { RegCloseKey(key) };
-                    notify();
-                }
-            }
+    pub fn clear(paths: &Paths) -> Result<(), String> {
+        let Some(text) = read_trim(&paths.proxy_state) else {
+            let _ = std::fs::remove_file(&paths.proxy_ports);
+            let _ = std::fs::remove_file(&paths.proxy_owner);
+            return Ok(());
+        };
+        let snapshot: Value = serde_json::from_str(&text).map_err(|error| {
+            format!(
+                "system proxy: cannot read the saved settings ({error}); the snapshot was kept."
+            )
+        })?;
+        let key = open().map_err(|error| {
+            format!(
+                "system proxy: cannot open the registry to restore the saved settings ({error}); the snapshot was kept."
+            )
+        })?;
+        let restored = restore(key, &snapshot);
+        unsafe { RegCloseKey(key) };
+        if !restored || !notify() {
+            return Err(
+                "system proxy: the saved settings were not fully restored; the snapshot was kept."
+                    .to_owned(),
+            );
         }
         let _ = std::fs::remove_file(&paths.proxy_ports);
         let _ = std::fs::remove_file(&paths.proxy_state);
         let _ = std::fs::remove_file(&paths.proxy_owner);
+        Ok(())
     }
 }

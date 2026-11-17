@@ -1321,7 +1321,6 @@ pub fn run(
                 &request,
                 engine.config_arg,
                 engine.dialect,
-                engine.name == "xray-rust",
                 &cell,
                 workload.server_pid,
                 repeat,
@@ -1383,6 +1382,13 @@ fn write_request(
         action: format!("creating {}", out_dir.display()),
         source,
     })?;
+    // A rerun replaces last run's output, which the harness would refuse as stale.
+    if output.exists() {
+        std::fs::remove_dir_all(&output).map_err(|source| Error::Io {
+            action: format!("removing stale {}", output.display()),
+            source,
+        })?;
+    }
     let request_path = out_dir.join(format!("{name}-run{repeat}.json"));
     std::fs::write(&request_path, workload.request(engine, &output)).map_err(|source| {
         Error::Io {

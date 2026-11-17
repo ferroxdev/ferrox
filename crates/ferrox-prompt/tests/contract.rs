@@ -369,7 +369,7 @@ fn a_row_is_picked_by_key_by_number_or_by_name_and_fills_the_template() {
         template.id
     );
     assert!(
-        rendered.text.contains(&open.index.to_string()),
+        rendered.text.contains(open.index.as_str()),
         "P{} did not name the row's number",
         template.id
     );

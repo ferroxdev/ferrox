@@ -90,13 +90,7 @@ impl Dialect {
         }
     }
 
-    fn socks_inbound(
-        self,
-        listen: Ipv4Addr,
-        port: u16,
-        allow_unauthenticated_lan: bool,
-        udp: bool,
-    ) -> Json {
+    fn socks_inbound(self, listen: Ipv4Addr, port: u16, udp: bool) -> Json {
         let mut inbound = Json::object();
         match self {
             Self::Xray => {
@@ -129,9 +123,6 @@ impl Dialect {
         settings.insert("udp", Json::Bool(udp));
         match self {
             Self::Xray => {
-                if allow_unauthenticated_lan {
-                    settings.insert("allowUnauthenticatedLan", Json::Bool(true));
-                }
                 inbound.insert("settings", settings);
             }
             Self::SingBox => {
@@ -543,19 +534,22 @@ impl Request {
                 RUN_TIMEOUT.as_secs()
             )));
         }
-        if self.traffic == Traffic::TcpLatency {
-            if !(1..=MAX_ITERATIONS).contains(&self.tcp_latency_iterations) {
-                return Err(Error::Invalid(format!(
-                    "tcp_latency_iterations {} is outside 1..={MAX_ITERATIONS}",
-                    self.tcp_latency_iterations
-                )));
-            }
-            if self.payload_size > 65_536 {
-                return Err(Error::Invalid(format!(
-                    "payload_size {} is outside 1..=65536",
-                    self.payload_size
-                )));
-            }
+        if let Some(ceiling) = self
+            .udp_payload_ceiling()
+            .filter(|ceiling| self.payload_size > *ceiling)
+        {
+            return Err(Error::Invalid(format!(
+                "payload_size {} does not fit a SOCKS UDP frame: the ceiling is {ceiling}",
+                self.payload_size
+            )));
+        }
+        if self.traffic == Traffic::TcpLatency
+            && !(1..=MAX_ITERATIONS).contains(&self.tcp_latency_iterations)
+        {
+            return Err(Error::Invalid(format!(
+                "tcp_latency_iterations {} is outside 1..={MAX_ITERATIONS}",
+                self.tcp_latency_iterations
+            )));
         }
         if self.flow_bytes() > MAX_FLOW_BYTES {
             return Err(Error::Invalid(format!(
@@ -618,6 +612,28 @@ impl Request {
                     .saturating_mul(flows)
                     .saturating_mul(directions)
             }
+        }
+    }
+
+    /// The largest payload this traffic can carry in one SOCKS UDP frame, or `None` without UDP.
+    fn udp_payload_ceiling(&self) -> Option<usize> {
+        matches!(self.traffic, Traffic::Udp | Traffic::Mixed).then_some(crate::MAX_UDP_PAYLOAD_SIZE)
+    }
+
+    /// The bytes the sink must have read before a run can be banked: an upload the engine never
+    /// delivered still counts as client-side sent bytes, so the client totals alone cannot see it.
+    pub fn sink_bytes(&self) -> u64 {
+        let flows = u64::try_from(self.connections).unwrap_or(0);
+        let datagrams = u64::try_from(self.iterations).unwrap_or(0);
+        let latency = u64::try_from(self.tcp_latency_iterations).unwrap_or(0);
+        let payload = u64::try_from(self.payload_size).unwrap_or(0);
+        match self.traffic {
+            Traffic::Upload | Traffic::FullDuplex => self.flow_bytes().saturating_mul(flows),
+            Traffic::Udp | Traffic::Mixed => {
+                flows.saturating_mul(datagrams).saturating_mul(payload)
+            }
+            Traffic::TcpLatency => flows.saturating_mul(latency).saturating_mul(payload),
+            Traffic::Idle | Traffic::HeldOpen | Traffic::Reconnect | Traffic::Download => 0,
         }
     }
 }
@@ -1120,20 +1136,12 @@ pub fn measure(
     request: &Request,
     config_arg: ConfigArg,
     dialect: Dialect,
-    allow_unauthenticated_lan: bool,
     cell: &Cell,
     server_pid: Option<u32>,
     repeat: usize,
 ) -> Result<Run, Error> {
     remeasure_disturbed(REMEASURE_ATTEMPTS, cell.budget(), || {
-        measure_once(
-            request,
-            config_arg,
-            dialect,
-            allow_unauthenticated_lan,
-            server_pid,
-            repeat,
-        )
+        measure_once(request, config_arg, dialect, server_pid, repeat)
     })
 }
 
@@ -1190,7 +1198,6 @@ fn measure_once(
     request: &Request,
     config_arg: ConfigArg,
     dialect: Dialect,
-    allow_unauthenticated_lan: bool,
     server_pid: Option<u32>,
     repeat: usize,
 ) -> Result<Run, Error> {
@@ -1211,7 +1218,8 @@ fn measure_once(
     sink_ports.extend(&udp_ports);
     let tcp_targets = sink_targets(ip, &tcp_ports);
     let udp_targets = sink_targets(ip, &udp_ports);
-    let probe = allocate_port_excluding(ip, &sink_ports)?;
+    // The SOCKS door is loopback: the sinks stay on the non-loopback path, and no unauthenticated proxy is exposed on a LAN address.
+    let probe = allocate_port_excluding(Ipv4Addr::LOCALHOST, &sink_ports)?;
     let engine_port = bound_port(&probe)?;
 
     std::fs::create_dir_all(&request.output).map_err(io("creating the output directory"))?;
@@ -1223,10 +1231,9 @@ fn measure_once(
     let sink_thread = spawn_sink(tcp_sink, udp_sink, request, &desync)?;
     let config_text = inject_inbound(
         &request.config,
-        ip,
+        Ipv4Addr::LOCALHOST,
         engine_port,
         dialect,
-        allow_unauthenticated_lan,
         request.traffic.udp(),
     )?;
     std::fs::write(&config_path, &config_text).map_err(io("writing the engine config"))?;
@@ -1241,7 +1248,7 @@ fn measure_once(
         &stderr_path,
     )?;
     let pid = engine.child.id();
-    let socks = SocketAddr::from((ip, engine_port));
+    let socks = SocketAddr::from((Ipv4Addr::LOCALHOST, engine_port));
     if let Err(e) = wait_for_listener(&mut engine.child, socks, &stderr_path) {
         return Err(Error::Engine {
             message: format!("{e}; stderr tail: {}", tail(&stderr_path)),
@@ -1272,8 +1279,9 @@ fn measure_once(
     let moved = collect_flows(flows, &stop, wall + RUN_TIMEOUT)?;
     let wall_elapsed = wall.elapsed();
     // The client's settle runs while the sink drains, so the server's window ends at the last byte the sink counted rather than at the client's last write or after the settle.
+    let sink_expected = request.sink_bytes();
     let settle_until = Instant::now() + SETTLE;
-    while Instant::now() < settle_until && sink_thread.received() < moved.sent {
+    while Instant::now() < settle_until && sink_thread.received() < sink_expected {
         std::thread::sleep(Duration::from_millis(5));
     }
     let server = match server {
@@ -1293,10 +1301,16 @@ fn measure_once(
     )?);
 
     engine.reap();
-    let sink_reasons = sink_thread.reasons();
-    sink_thread.join()?;
+    let (sink_received, sink_reasons) = sink_thread.join()?;
 
-    validate_transfer(&moved, request.total_bytes(), &sink_reasons, &desync)?;
+    validate_transfer(
+        &moved,
+        request.total_bytes(),
+        sink_received,
+        sink_expected,
+        &sink_reasons,
+        &desync,
+    )?;
 
     let summary = summarise(&samples, &moved, startup_cpu_millis);
     Ok(Run {
@@ -1325,9 +1339,12 @@ fn measure_once(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_transfer(
     moved: &Moved,
     expected: u64,
+    sink_received: u64,
+    sink_expected: u64,
     sink_reasons: &[String],
     desync: &Desync,
 ) -> Result<(), Error> {
@@ -1335,7 +1352,11 @@ fn validate_transfer(
     if let Some(forged) = desync.lock().ok().and_then(|slot| slot.as_ref().cloned()) {
         return Err(Error::Desync(forged));
     }
-    if moved.sent + moved.received == expected {
+    // A flow that reported why it stopped is a fault even when its byte totals look whole.
+    if !moved.all_stopped.is_empty() {
+        return short_transfer(moved, expected, sink_received, sink_expected, sink_reasons);
+    }
+    if moved.sent + moved.received == expected && sink_received == sink_expected {
         if let Some(tail) = straggler_tail(&moved.flow_windows) {
             return Err(Error::Transient(format!(
                 "the slowest of {} flows finished {:.0} ms after the median: a runner straggler, not a number",
@@ -1345,26 +1366,38 @@ fn validate_transfer(
         }
         return Ok(());
     }
+    short_transfer(moved, expected, sink_received, sink_expected, sink_reasons)
+}
+
+fn short_transfer(
+    moved: &Moved,
+    expected: u64,
+    sink_received: u64,
+    sink_expected: u64,
+    sink_reasons: &[String],
+) -> Result<(), Error> {
     let mut why = if moved.all_stopped.is_empty() {
         vec!["no flow reported why it stopped".to_owned()]
     } else {
         moved.all_stopped.clone()
     };
+    if sink_received != sink_expected {
+        why.push(format!(
+            "the sink read {sink_received} of {sink_expected} bytes"
+        ));
+    }
     why.extend(sink_reasons.iter().cloned());
     let joined = why.join("; ");
     // A short transfer explained by socket-layer transience - a saturated runner, every engine alike - is re-measured like a forged byte, never banked; one that carries no such signature is a real workload fault and stays one.
+    let detail = format!(
+        "moved {} of {expected} bytes; sink {sink_received} of {sink_expected}: {joined}",
+        moved.sent + moved.received
+    );
     if is_transient_io(&joined) {
-        return Err(Error::Transient(format!(
-            "moved {} of {expected} bytes: {}",
-            moved.sent + moved.received,
-            joined
-        )));
+        return Err(Error::Transient(detail));
     }
     Err(Error::Workload(format!(
-        "moved {} of {expected} bytes: a short transfer is a fault in the \
-         workload, not a number to report. {}",
-        moved.sent + moved.received,
-        joined
+        "{detail}: a short transfer is a fault in the workload, not a number to report"
     )))
 }
 
@@ -1619,7 +1652,7 @@ fn collect_flows(
             .map_err(|_| Error::Workload("a flow thread panicked".into()))?;
         moved.sent += result.bytes_sent;
         moved.received += result.bytes_received;
-        moved.setup.push(result.setup);
+        moved.setup.extend(result.setup);
         moved.latency_us.extend(result.latency_us);
         if let Some(reason) = result.stopped {
             moved.stopped.get_or_insert(reason.clone());
@@ -1728,7 +1761,7 @@ struct FlowResult {
     bytes_sent: u64,
     bytes_received: u64,
     window: Option<(Instant, Instant)>,
-    setup: Setup,
+    setup: Vec<Setup>,
     latency_us: Vec<u128>,
     stopped: Option<String>,
 }
@@ -1739,7 +1772,7 @@ impl FlowResult {
             bytes_sent: 0,
             bytes_received: 0,
             window: None,
-            setup: Setup::default(),
+            setup: Vec::new(),
             latency_us: Vec::new(),
             stopped: None,
         }
@@ -1759,19 +1792,23 @@ struct FlowPlan {
 }
 
 struct SinkThread {
-    accept: JoinHandle<()>,
+    accept: Option<JoinHandle<()>>,
     reasons: Arc<std::sync::Mutex<Vec<String>>>,
     done: Arc<AtomicBool>,
     received: Arc<AtomicU64>,
 }
 
 impl SinkThread {
-    fn join(self) -> Result<(), Error> {
+    /// Stop the workers, join them, and read what they counted, so a drain that finished after the
+    /// settle still contributes every byte and every reason before validation.
+    fn join(mut self) -> Result<(u64, Vec<String>), Error> {
         self.done.store(true, Ordering::Relaxed);
-        self.accept
-            .join()
-            .map_err(|_| Error::Workload("the sink thread panicked".into()))?;
-        Ok(())
+        if let Some(accept) = self.accept.take() {
+            accept
+                .join()
+                .map_err(|_| Error::Workload("the sink thread panicked".into()))?;
+        }
+        Ok((self.received(), self.reasons()))
     }
 
     /// Every byte the client counts has reached the sink, so the engine's window can close there.
@@ -1781,6 +1818,15 @@ impl SinkThread {
 
     fn reasons(&self) -> Vec<String> {
         self.reasons.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+}
+
+impl Drop for SinkThread {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(accept) = self.accept.take() {
+            let _ = accept.join();
+        }
     }
 }
 
@@ -1969,14 +2015,17 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
         result.stopped = Some(format!("could not bound the flow's send window: {e}"));
         return result;
     }
-    result.setup.tcp_connect_us = t0.elapsed().as_micros();
+    let mut setup = Setup {
+        tcp_connect_us: t0.elapsed().as_micros(),
+        ..Setup::default()
+    };
 
     let t1 = Instant::now();
     if let Err(reason) = socks_greet(&mut stream) {
         result.stopped = Some(reason);
         return result;
     }
-    result.setup.socks_method_us = t1.elapsed().as_micros();
+    setup.socks_method_us = t1.elapsed().as_micros();
 
     let t2 = Instant::now();
     let mut connect = vec![5, 1, 0];
@@ -2013,9 +2062,10 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
         }
         Ok(()) => {}
     }
-    result.setup.socks_connect_us = t2.elapsed().as_micros();
-    result.setup.socks_setup_us = t1.elapsed().as_micros();
-    result.setup.total_us = t0.elapsed().as_micros();
+    setup.socks_connect_us = t2.elapsed().as_micros();
+    setup.socks_setup_us = t1.elapsed().as_micros();
+    setup.total_us = t0.elapsed().as_micros();
+    result.setup.push(setup);
 
     let window_start = Instant::now();
     let (sent, received, stopped) = exchange(plan, &mut stream);
@@ -2082,20 +2132,14 @@ fn socks_tunnel(engine: SocketAddr, target: SocketAddr) -> Result<(TcpStream, Se
     Ok((stream, setup))
 }
 
-fn add_setup(total: &mut Setup, one: Setup) {
-    total.tcp_connect_us = total.tcp_connect_us.saturating_add(one.tcp_connect_us);
-    total.socks_method_us = total.socks_method_us.saturating_add(one.socks_method_us);
-    total.socks_connect_us = total.socks_connect_us.saturating_add(one.socks_connect_us);
-    total.socks_setup_us = total.socks_setup_us.saturating_add(one.socks_setup_us);
-    total.total_us = total.total_us.saturating_add(one.total_us);
-}
-
 fn run_hold_flow(plan: &HoldPlan, index: usize) -> FlowResult {
     let mut result = FlowResult::empty();
     match socks_tunnel(plan.engine, plan.target) {
         Ok((stream, setup)) => {
-            result.setup = setup;
-            std::thread::sleep(plan.duration);
+            result.setup.push(setup);
+            std::thread::sleep(plan.duration.saturating_sub(Duration::from_micros(
+                u64::try_from(setup.total_us).unwrap_or(u64::MAX),
+            )));
             let _ = stream.shutdown(Shutdown::Both);
         }
         Err(reason) => result.stopped = Some(format!("flow {index}: {reason}")),
@@ -2108,7 +2152,7 @@ fn run_reconnect_flow(plan: &ReconnectPlan, index: usize) -> FlowResult {
     for _ in 0..plan.iterations {
         match socks_tunnel(plan.engine, plan.target) {
             Ok((stream, setup)) => {
-                add_setup(&mut result.setup, setup);
+                result.setup.push(setup);
                 let _ = stream.shutdown(Shutdown::Both);
             }
             Err(reason) => {
@@ -2129,7 +2173,7 @@ fn run_latency_flow(plan: &LatencyPlan) -> FlowResult {
             return result;
         }
     };
-    result.setup = setup;
+    result.setup.push(setup);
     let mut echo = vec![0u8; plan.pattern.len()];
     let window_start = Instant::now();
     for _ in 0..plan.iterations {
@@ -2291,7 +2335,7 @@ fn run_udp_flow(plan: &UdpPlan) -> FlowResult {
             return result;
         }
     };
-    result.setup = setup;
+    result.setup.push(setup);
     let socket = match UdpSocket::bind((plan.engine.ip(), 0)) {
         Ok(socket) => socket,
         Err(e) => {
@@ -2587,11 +2631,15 @@ impl FlowPlan {
     }
 
     fn stream_up(&self, stream: &mut TcpStream, sent: &mut u64) -> std::io::Result<()> {
-        let mut chunk: Vec<u8> = Vec::with_capacity(UPLOAD_CHUNK);
-        while chunk.len() < UPLOAD_CHUNK {
+        if self.pattern.is_empty() {
+            return Err(std::io::Error::other("the upload pattern is empty"));
+        }
+        // Whole periods keep the phase at zero across chunks, so a chunk boundary is not a pattern restart.
+        let mut chunk: Vec<u8> = Vec::with_capacity(UPLOAD_CHUNK.max(self.pattern.len()));
+        let periods = (UPLOAD_CHUNK / self.pattern.len()).max(1);
+        for _ in 0..periods {
             chunk.extend_from_slice(&self.pattern);
         }
-        chunk.truncate(UPLOAD_CHUNK);
         while *sent < self.bytes {
             if self.abort.load(Ordering::Relaxed) {
                 return Err(std::io::Error::other("the download leg ended the flow"));
@@ -2706,7 +2754,7 @@ fn spawn_sink(
         }
     });
     Ok(SinkThread {
-        accept,
+        accept: Some(accept),
         reasons,
         done,
         received,
@@ -2910,12 +2958,11 @@ pub fn inject_inbound(
     listen: Ipv4Addr,
     port: u16,
     dialect: Dialect,
-    allow_unauthenticated_lan: bool,
     udp: bool,
 ) -> Result<String, Error> {
     let mut root = json::parse(config)
         .map_err(|e| Error::Invalid(format!("config is not valid json: {e}")))?;
-    let inbound = dialect.socks_inbound(listen, port, allow_unauthenticated_lan, udp);
+    let inbound = dialect.socks_inbound(listen, port, udp);
 
     let mut list = match root.get("inbounds") {
         Some(Json::Arr(existing)) => existing.clone(),
@@ -3198,16 +3245,20 @@ pub fn harness_ceiling(connections: usize, payload_size: usize, bytes: u64) -> R
     }
 
     let mut measured = Vec::with_capacity(flows.len());
+    let mut stopped = None;
     for (index, flow) in flows {
-        let Ok((read, elapsed, why)) = flow.join() else {
-            continue;
-        };
-        if let Some(why) = why {
-            eprintln!("harness ceiling flow {index}: {why}");
+        match flow.join() {
+            Ok((_, _, Some(why))) => stopped = Some(format!("flow {index}: {why}")),
+            Ok((read, elapsed, None)) => measured.push((read, elapsed)),
+            Err(_) => stopped = Some(format!("flow {index} panicked")),
         }
-        measured.push((read, elapsed));
     }
     let _ = sink.join();
+    if let Some(reason) = stopped {
+        return Err(Error::Workload(format!(
+            "the harness ceiling stopped a flow ({reason}); a partial rate would understate the host, so the row is reported as unmeasured"
+        )));
+    }
     ceiling_rate(&measured).ok_or_else(|| {
         Error::Workload(
             "the harness ceiling moved no bytes; a row compared against it would \
@@ -3403,7 +3454,7 @@ mod tests {
                     bytes_received: 0,
                     latency_us: Vec::new(),
                     window: None,
-                    setup: Setup::default(),
+                    setup: Vec::new(),
                     stopped: None,
                 }
             })
@@ -3413,7 +3464,7 @@ mod tests {
             bytes_received: 0,
             latency_us: Vec::new(),
             window: None,
-            setup: Setup::default(),
+            setup: Vec::new(),
             stopped: None,
         });
         let started = Instant::now();
@@ -3443,10 +3494,10 @@ mod tests {
             bytes_received: 0,
             latency_us: Vec::new(),
             window: None,
-            setup: Setup {
+            setup: vec![Setup {
                 total_us: 11,
                 ..Setup::default()
-            },
+            }],
             stopped: None,
         });
         let second = std::thread::spawn(|| FlowResult {
@@ -3454,10 +3505,10 @@ mod tests {
             bytes_received: 5,
             latency_us: Vec::new(),
             window: None,
-            setup: Setup {
+            setup: vec![Setup {
                 total_us: 22,
                 ..Setup::default()
-            },
+            }],
             stopped: Some("peer closed".to_owned()),
         });
         let moved = collect_flows(
@@ -3837,7 +3888,7 @@ mod tests {
         };
         let mut one_late = vec![Duration::from_millis(80); 7];
         one_late.push(Duration::from_millis(280));
-        let straggled = validate_transfer(&moved(one_late.clone()), expected, &[], &desync);
+        let straggled = validate_transfer(&moved(one_late.clone()), expected, 0, 0, &[], &desync);
         assert!(
             matches!(&straggled, Err(Error::Transient(m)) if m.contains("runner straggler")),
             "one flow an RTO behind the rest is re-measured: {straggled:?}"
@@ -3845,7 +3896,7 @@ mod tests {
         let mut calls = 0usize;
         let storm = remeasure_disturbed(REMEASURE_ATTEMPTS, REMEASURE_BUDGET, || {
             calls += 1;
-            validate_transfer(&moved(one_late.clone()), expected, &[], &desync)
+            validate_transfer(&moved(one_late.clone()), expected, 0, 0, &[], &desync)
         });
         assert!(
             matches!(&storm, Err(Error::Workload(m))
@@ -3856,6 +3907,8 @@ mod tests {
         let uniform = validate_transfer(
             &moved(vec![Duration::from_millis(280); 8]),
             expected,
+            0,
+            0,
             &[],
             &desync,
         );
@@ -3873,14 +3926,14 @@ mod tests {
             Duration::from_millis(280),
             Duration::from_millis(280),
         ];
-        let split = validate_transfer(&moved(half_slow), expected, &[], &desync);
+        let split = validate_transfer(&moved(half_slow), expected, 0, 0, &[], &desync);
         assert!(
             split.is_ok(),
             "half the flows slow is not an isolated straggler: {split:?}"
         );
         let mut stalled = vec![Duration::from_millis(80); 7];
         stalled.push(Duration::from_millis(1_500));
-        let beyond = validate_transfer(&moved(stalled), expected, &[], &desync);
+        let beyond = validate_transfer(&moved(stalled), expected, 0, 0, &[], &desync);
         assert!(
             beyond.is_ok(),
             "a tail past the retransmit band is banked, not re-measured: {beyond:?}"
@@ -4326,7 +4379,6 @@ mod tests {
             1080,
             Dialect::Xray,
             false,
-            false,
         )
         .expect("injectable");
         let root = json::parse(&out).expect("valid json");
@@ -4359,38 +4411,12 @@ mod tests {
             Some(1),
             "the request's own outbounds must survive"
         );
-        assert!(
+        assert_eq!(
             inbounds[0]
                 .get("settings")
-                .and_then(|s| s.get("allowUnauthenticatedLan"))
-                .is_none(),
-            "only an engine that refuses a non-loopback listener is asked to allow one"
-        );
-    }
-
-    #[test]
-    fn a_refusing_engine_is_told_to_allow_the_non_loopback_listener() {
-        let base = Dialect::Xray.base_config().to_string().expect("serialises");
-        let out = inject_inbound(
-            &base,
-            Ipv4Addr::new(192, 0, 2, 7),
-            1080,
-            Dialect::Xray,
-            true,
-            false,
-        )
-        .expect("injectable");
-        let root = json::parse(&out).expect("valid json");
-        let inbound = &root
-            .get("inbounds")
-            .and_then(Json::as_arr)
-            .expect("inbounds")[0];
-        assert_eq!(
-            inbound
-                .get("settings")
-                .and_then(|s| s.get("allowUnauthenticatedLan"))
-                .and_then(Json::as_bool),
-            Some(true)
+                .and_then(|s| s.get("auth"))
+                .and_then(Json::as_str),
+            Some("noauth")
         );
     }
 
@@ -4398,15 +4424,8 @@ mod tests {
     fn each_dialect_writes_the_fields_that_engine_actually_reads() {
         for dialect in [Dialect::Xray, Dialect::SingBox, Dialect::Leaf] {
             let base = dialect.base_config().to_string().expect("serialises");
-            let out = inject_inbound(
-                &base,
-                Ipv4Addr::new(192, 0, 2, 7),
-                1080,
-                dialect,
-                false,
-                false,
-            )
-            .expect("injectable");
+            let out = inject_inbound(&base, Ipv4Addr::new(192, 0, 2, 7), 1080, dialect, false)
+                .expect("injectable");
             let root = json::parse(&out).expect("valid json");
             let outbound = &root
                 .get("outbounds")
@@ -4502,7 +4521,6 @@ mod tests {
             1,
             Dialect::Xray,
             false,
-            false,
         )
         .expect("injectable");
         let root = json::parse(&out).expect("valid json");
@@ -4521,7 +4539,6 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             1,
             Dialect::Xray,
-            false,
             false,
         )
         .is_err());
@@ -4622,5 +4639,24 @@ mod tests {
                 .expect("valid");
         assert_eq!(r.flow_bytes(), 21);
         assert_eq!(r.total_bytes(), 21);
+    }
+
+    #[test]
+    fn the_sink_expects_the_payload_the_engine_forwards_and_not_its_socks_header() {
+        let upload =
+            Request::parse(request_with(&[("connections", "2"), ("iterations", "3")]).as_bytes())
+                .expect("valid upload");
+        assert_eq!(upload.sink_bytes(), 2 * 3 * 1024);
+
+        let udp = Request::parse(
+            request_with(&[
+                ("traffic", "\"udp\""),
+                ("connections", "2"),
+                ("iterations", "3"),
+            ])
+            .as_bytes(),
+        )
+        .expect("valid udp");
+        assert_eq!(udp.sink_bytes(), 2 * 3 * 1024);
     }
 }

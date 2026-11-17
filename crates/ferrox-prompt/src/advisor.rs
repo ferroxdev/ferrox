@@ -256,9 +256,10 @@ impl Ledger {
             path,
             ..Self::default()
         };
-        let Ok(text) = std::fs::read_to_string(&ledger.path) else {
+        let Ok(bytes) = std::fs::read(&ledger.path) else {
             return ledger;
         };
+        let text = String::from_utf8_lossy(&bytes);
         for line in text.lines() {
             let mut fields = line.split_whitespace();
             let (Some(at), Some(id), Some(how)) = (fields.next(), fields.next(), fields.next())

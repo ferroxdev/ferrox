@@ -87,6 +87,9 @@ struct Args {
 const DEFAULT_REPEATS: usize = 3;
 pub(crate) const DEFAULT_CONNECTIONS: usize = 1;
 pub(crate) const DEFAULT_PAYLOAD_SIZE: usize = 65_536;
+/// The largest payload a SOCKS UDP frame can carry inside one IPv4 datagram: `65_507` minus the
+/// 10-byte frame header.
+pub(crate) const MAX_UDP_PAYLOAD_SIZE: usize = 65_497;
 pub(crate) const DEFAULT_ITERATIONS: usize = 8192;
 
 const GATE5_ENGINE: &str = "ferrox";
@@ -155,6 +158,7 @@ fn parse_args() -> Args {
     let mut repeats = DEFAULT_REPEATS;
     let mut connections = DEFAULT_CONNECTIONS;
     let mut payload_size = DEFAULT_PAYLOAD_SIZE;
+    let mut payload_size_set = false;
     let mut iterations = DEFAULT_ITERATIONS;
     let mut duration_ms = 0u64;
     let mut tcp_latency_iterations = 0usize;
@@ -208,7 +212,10 @@ fn parse_args() -> Args {
             }
             "--repeats" => repeats = flag_count(&mut args, "--repeats"),
             "--connections" => connections = flag_count(&mut args, "--connections"),
-            "--payload-size" => payload_size = flag_count(&mut args, "--payload-size"),
+            "--payload-size" => {
+                payload_size = flag_count(&mut args, "--payload-size");
+                payload_size_set = true;
+            }
             "--iterations" => iterations = flag_count(&mut args, "--iterations"),
             "--duration-ms" => duration_ms = flag_number(&mut args, "--duration-ms"),
             "--tcp-latency-iterations" => {
@@ -260,6 +267,17 @@ fn parse_args() -> Args {
                 eprintln!("unknown argument: {other}");
                 std::process::exit(2);
             }
+        }
+    }
+    if matches!(traffic.as_str(), "udp" | "mixed") {
+        if !payload_size_set {
+            payload_size = MAX_UDP_PAYLOAD_SIZE;
+        }
+        if payload_size > MAX_UDP_PAYLOAD_SIZE {
+            eprintln!(
+                "--payload-size {payload_size} does not fit a SOCKS UDP frame: the ceiling is {MAX_UDP_PAYLOAD_SIZE}"
+            );
+            std::process::exit(2);
         }
     }
     Args {
@@ -1075,10 +1093,12 @@ fn main() {
             best.len
         );
     }
-    assert_gate5(&gate5, shapes, args.keep_going, codec);
+    if !assert_gate5(&gate5, shapes, args.keep_going, codec) {
+        std::process::exit(1);
+    }
 }
 
-fn assert_gate5(gate5: &Gate5, shapes: usize, keep_going: bool, codec: bool) {
+fn assert_gate5(gate5: &Gate5, shapes: usize, keep_going: bool, codec: bool) -> bool {
     if let Some(comparison) = &gate5.comparison {
         let gate = comparison.gate();
         // A lost repeat is not a measured regression: when rows are unproven because runs never landed, the panic names that, beside the rows, so the claim matches what ran.
@@ -1108,9 +1128,9 @@ fn assert_gate5(gate5: &Gate5, shapes: usize, keep_going: bool, codec: bool) {
             );
             if keep_going {
                 eprintln!("{message}\n--keep-going: the cell is reported, not aborted");
-            } else {
-                panic!("{message}");
+                return false;
             }
+            panic!("{message}");
         }
         for line in &gate.lines {
             println!("gate 5: {line}");
@@ -1127,6 +1147,7 @@ fn assert_gate5(gate5: &Gate5, shapes: usize, keep_going: bool, codec: bool) {
             "PASS: bit-identical at {shapes} shapes and no discarded work or allocation; the codec's ratios are a bare run's to read, and this leg decided on gate 5"
         );
     }
+    true
 }
 
 struct Row {

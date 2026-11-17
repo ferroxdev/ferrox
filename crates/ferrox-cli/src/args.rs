@@ -137,6 +137,7 @@ fn env_port(name: &str, fallback: u16) -> u16 {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse().ok())
+        .filter(|port| *port != 0)
         .unwrap_or(fallback)
 }
 

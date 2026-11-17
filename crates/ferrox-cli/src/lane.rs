@@ -1,9 +1,9 @@
 //! One lane is one child process. The pid file is the truth about whether it is
 //! alive; a log beside the config is where the engine says what it is doing.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write as _;
-use std::net::{SocketAddr, TcpStream};
+use std::net::{Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -195,19 +195,21 @@ fn is_ferrox(pid: u32) -> bool {
     same_exe(&actual, &expected_bin())
 }
 
-pub fn kill(pid: u32) {
+pub fn kill(pid: u32) -> Result<(), String> {
     if !is_ferrox(pid) {
-        eprintln!(
-            "ferrox-cli: process {pid} is not ferrox-app; it was not stopped. If the binary was renamed, set FERROX_BIN."
-        );
-        return;
+        return Err(format!(
+            "process {pid} is not ferrox-app; it was not stopped. If the binary was renamed, set FERROX_BIN."
+        ));
     }
     #[cfg(unix)]
     {
-        let Ok(pid) = i32::try_from(pid) else {
-            return;
-        };
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let pid = i32::try_from(pid).map_err(|_| "the pid does not fit a process id".to_owned())?;
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("cannot stop process {pid}: {error}"));
+            }
+        }
         std::thread::sleep(Duration::from_secs(1));
         if unsafe { libc::kill(pid, 0) } == 0 {
             unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -220,13 +222,45 @@ pub fn kill(pid: u32) {
             OpenProcess, TerminateProcess, PROCESS_TERMINATE,
         };
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if !handle.is_null() {
-            unsafe {
-                TerminateProcess(handle, 1);
-                CloseHandle(handle);
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            // ERROR_INVALID_PARAMETER: the pid left between `alive` and here, so there is nothing to stop.
+            if error.raw_os_error() == Some(87) {
+                return Ok(());
             }
+            return Err(format!("cannot open process {pid} to stop it: {error}"));
+        }
+        let stopped = unsafe { TerminateProcess(handle, 1) };
+        unsafe { CloseHandle(handle) };
+        if stopped == 0 {
+            return Err(format!(
+                "cannot stop process {pid}: {}",
+                std::io::Error::last_os_error()
+            ));
         }
     }
+    Ok(())
+}
+
+/// Hold the per-lane lifecycle lock across config writes, the running check, replacement and pid
+/// publication, so two `up` calls cannot race to publish the same pid file.
+pub fn lock(paths: &Paths) -> Result<File, String> {
+    secure_dir(&paths.conf_dir)
+        .map_err(|error| format!("cannot create the config dir: {error}"))?;
+    secure_dir(&paths.state_dir)
+        .map_err(|error| format!("cannot create the state dir: {error}"))?;
+    let path = paths.pid_file.with_extension("lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    file.try_lock().map_err(|error| {
+        format!("another ferrox-cli up is starting this lane ({error}); nothing was started.")
+    })?;
+    Ok(file)
 }
 
 fn register(paths: &Paths) -> Result<(), String> {
@@ -304,27 +338,45 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
         use std::os::windows::process::CommandExt as _;
         command.creation_flags(0x0800_0000);
     }
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|error| format!("cannot start {}: {error}", bin.display()))?;
     let pid = child.id();
-    write_private(&paths.pid_file, &format!("{pid}\n"))
-        .map_err(|error| format!("cannot write the pid file: {error}"))?;
+    if let Err(error) = write_private(&paths.pid_file, &format!("{pid}\n")) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("cannot write the pid file: {error}"));
+    }
+    // Reap the engine when it exits, so `serve` sees it leave instead of looping on a zombie.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(pid)
 }
 
-pub fn stop(paths: &Paths) {
+pub fn stop(paths: &Paths) -> Result<(), String> {
     if let Some(pid) = pid(paths) {
         if alive(pid) {
-            kill(pid);
+            kill(pid)?;
         }
     }
-    let _ = std::fs::remove_file(&paths.pid_file);
+    match std::fs::remove_file(&paths.pid_file) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot remove {}: {error}",
+            paths.pid_file.display()
+        )),
+    }
 }
 
 pub fn port_open(port: u16) -> bool {
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
-    TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok()
+    let v4 = SocketAddr::from(([127, 0, 0, 1], port));
+    if TcpStream::connect_timeout(&v4, Duration::from_millis(300)).is_ok() {
+        return true;
+    }
+    let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+    TcpStream::connect_timeout(&v6, Duration::from_millis(300)).is_ok()
 }
 
 pub fn wait_fronts(list: &str, ports: Ports, paths: &Paths) -> bool {

@@ -21,7 +21,7 @@ pub const RSS_TOLERANCE: f64 = 0.05;
 /// has to be a smaller change than the tolerance this harness decides at, or the row measures the
 /// tick rather than the engine.
 pub fn cpu_span_is_pricable(cpu_millis: u64) -> bool {
-    cpu_millis as f64 * TOLERANCE >= crate::parity::cpu_resolution_floor_millis() as f64
+    cpu_millis as f64 * TOLERANCE > crate::parity::cpu_resolution_floor_millis() as f64
 }
 
 /// The shortest span [`cpu_span_is_pricable`] accepts, so a report can name it. Walked from the

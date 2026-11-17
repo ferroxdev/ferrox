@@ -722,23 +722,18 @@ fn build_offers<'p>(
 }
 
 /// Top-ranked offer, or a weighted draw under `--rotate`; the clone frees the borrow from the slice.
-fn choose_offer<'p>(offers: &[Offer<'p>], rotate: bool, seed: u64) -> Offer<'p> {
+fn choose_offer<'p>(offers: &[Offer<'p>], rotate: bool, seed: u64) -> Result<Offer<'p>, Refusal> {
     if !rotate {
         let (prompt, target) = &offers[0];
-        return (*prompt, target.clone());
+        return Ok((*prompt, target.clone()));
     }
     let refs: Vec<&Prompt> = offers.iter().map(|(prompt, _)| *prompt).collect();
-    // A draw fails only when every weight is zero, which prompts.md forbids; the fallback is belt-and-braces.
-    match advisor::rotate_among(&refs, seed) {
-        Ok(prompt) => {
-            let (candidate, target) = offers
-                .iter()
-                .find(|(p, _)| p.id == prompt.id)
-                .expect("a rotated prompt is one of the offers");
-            (*candidate, target.clone())
-        }
-        Err(_) => (offers[0].0, offers[0].1.clone()),
-    }
+    let prompt = advisor::rotate_among(&refs, seed).map_err(|reason| (reason, 1))?;
+    let (candidate, target) = offers
+        .iter()
+        .find(|(p, _)| p.id == prompt.id)
+        .expect("a rotated prompt is one of the offers");
+    Ok((*candidate, target.clone()))
 }
 
 /// Fold `--set` over the state-filled row; `{references}` falls back to the core pins even for a `none` class.
@@ -838,6 +833,32 @@ fn worktree_json(worktree: Option<&Worktree>) -> Value {
     ])
 }
 
+/// Refuse a handout whose required blanks the library does not supply, unless `--allow-unfilled`.
+fn missing_input_refusal(
+    prompt: &Prompt,
+    rendered: &render::Rendered,
+    args: &Args,
+) -> Option<ExitCode> {
+    if rendered.missing.is_empty() || args.allow_unfilled {
+        return None;
+    }
+    eprintln!(
+        "P{} needs a value for {}",
+        prompt.id,
+        rendered
+            .missing
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    eprintln!(
+        "{}",
+        render::suggested_command(prompt, &rendered.missing, &args.addons)
+    );
+    Some(ExitCode::from(2))
+}
+
 /// `next`: fills a matrix template from its first unserved row, so repeat runs walk the matrix; `--set` still wins.
 fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
     let ledger = Ledger::load(Ledger::path_for(root));
@@ -881,6 +902,14 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
         }
     };
 
+    // A forced matrix template whose class is spent has no row to fill, and a hole is worse than the reason.
+    if target.is_none()
+        && expand::is_fillable(prompt, &state)
+        && !state.candidates(prompt.targets).is_empty()
+    {
+        eprintln!("{}", class_spent(library, prompt, &state, &ledger));
+        return ExitCode::from(2);
+    }
     let addons = match render::resolve_addons(prompt, &args.addons) {
         Ok(addons) => addons,
         Err(reason) => {
@@ -896,6 +925,9 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
         ..Options::default()
     };
     let rendered = render::render(library, prompt, &values, &addons, Some(&worktree), options);
+    if let Some(code) = missing_input_refusal(prompt, &rendered, args) {
+        return code;
+    }
 
     let target_key = target.as_ref().map(|(row, _)| row.key());
     if args.output == Output::Json {
@@ -973,7 +1005,7 @@ fn choose_slice<'p>(
             1,
         ));
     }
-    Ok(choose_offer(&offers, args.draw == Draw::Rotate, args.seed))
+    choose_offer(&offers, args.draw == Draw::Rotate, args.seed)
 }
 
 /// The row this slice draws, and whether this template was handed it before.
@@ -1109,21 +1141,8 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         ..Options::default()
     };
     let rendered = render::render(library, prompt, &values, &addons, Some(&worktree), options);
-    if !rendered.missing.is_empty() && !args.allow_unfilled {
-        eprintln!(
-            "P{id} needs a value for {}",
-            rendered
-                .missing
-                .iter()
-                .map(|name| format!("`{name}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        eprintln!(
-            "{}",
-            render::suggested_command(prompt, &rendered.missing, &args.addons)
-        );
-        return ExitCode::from(2);
+    if let Some(code) = missing_input_refusal(prompt, &rendered, args) {
+        return code;
     }
     let target_key = target.as_ref().map(|(row, _)| row.key());
     if args.output == Output::Json {
@@ -1346,8 +1365,8 @@ fn run_set_status(args: &Args, library: &Library) -> ExitCode {
     }
     match set_status_text(&library.source, id, to) {
         Ok(updated) => {
-            if let Err(error) = std::fs::write(&library.path, updated) {
-                eprintln!("could not write {}: {error}", library.path.display());
+            if let Err(error) = std::fs::write(&library.source_path, updated) {
+                eprintln!("could not write {}: {error}", library.source_path.display());
                 return ExitCode::from(1);
             }
             if args.output == Output::Json {
@@ -2148,10 +2167,10 @@ fix issue #{issue} at {priority=P0 or P1} priority
         Library::parse(Path::new("prompts.md"), LIBRARY)
     }
 
-    fn row(section: char, index: u32, method: &str, implemented: bool) -> MethodRow {
+    fn row(section: char, index: &str, method: &str, implemented: bool) -> MethodRow {
         MethodRow {
             section,
-            index,
+            index: index.to_owned(),
             method: method.to_owned(),
             state: if implemented {
                 "implemented"
@@ -2239,8 +2258,8 @@ fix issue #{issue} at {priority=P0 or P1} priority
         let open = library.prompt(1).unwrap();
         let shipped = library.prompt(2).unwrap();
         let fixed = library.prompt(3).unwrap();
-        let shipped_row = row('A', 3, "VLESS TCP none", true);
-        let open_row = row('A', 13, "VLESS over QUIC", false);
+        let shipped_row = row('A', "3", "VLESS TCP none", true);
+        let open_row = row('A', "13", "VLESS over QUIC", false);
 
         // The template that wants the row takes it.
         assert!(row_fits_template(shipped, &shipped_row, &library).is_ok());
@@ -2271,7 +2290,7 @@ fix issue #{issue} at {priority=P0 or P1} priority
     fn a_spent_class_says_so_and_names_a_row_to_render() {
         let library = library();
         let state = ferrox_prompt::expand::ProjectState {
-            methods: vec![row('A', 13, "VLESS over QUIC", false)],
+            methods: vec![row('A', "13", "VLESS over QUIC", false)],
             pins: Vec::new(),
         };
         let mut path = std::env::temp_dir();

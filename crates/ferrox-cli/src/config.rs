@@ -371,11 +371,13 @@ fn vless_outbound(link: &str) -> Result<Value, String> {
     let mode = get("mode");
     let flow = get("flow");
 
+    let network = match kind.as_str() {
+        "raw" => "tcp",
+        "websocket" => "ws",
+        other => other,
+    };
     let mut stream = Map::new();
-    stream.insert(
-        "network".to_owned(),
-        json!(if kind == "raw" { "tcp" } else { kind.as_str() }),
-    );
+    stream.insert("network".to_owned(), json!(network));
     match kind.as_str() {
         "ws" | "websocket" => {
             let mut ws = Map::new();
@@ -701,23 +703,25 @@ pub fn config_fronts(
                 "the config serves no socks, http or mixed inbound; --vpn needs one".to_owned(),
             );
         }
-        let mut checked: Vec<String> = Vec::new();
         if let Some(inbounds) = document.get("inbounds").and_then(Value::as_array) {
             for inbound in inbounds {
                 let Some(name) = inbound.get("protocol").and_then(Value::as_str) else {
                     continue;
                 };
-                if !order.iter().any(|front| front == name) || checked.iter().any(|c| c == name) {
+                if !order.iter().any(|front| front == name) {
                     continue;
                 }
-                checked.push(name.to_owned());
                 let listen = inbound.get("listen").and_then(Value::as_str);
-                let loopback = listen.is_some_and(|listen| {
-                    listen == "::1" || listen == "localhost" || listen.starts_with("127.")
-                });
+                if listen == Some("::1") {
+                    return Err(format!(
+                        "inbound `{name}` listens on ::1; --vpn points the Windows proxy at 127.0.0.1, so use 127.0.0.1"
+                    ));
+                }
+                let loopback = listen
+                    .is_some_and(|listen| listen == "localhost" || listen.starts_with("127."));
                 if !loopback {
                     return Err(format!(
-                        "inbound `{name}` listens on {}, not loopback; --vpn needs 127.0.0.1 or ::1",
+                        "inbound `{name}` listens on {}, not loopback; --vpn needs 127.0.0.1",
                         listen.unwrap_or("all interfaces")
                     ));
                 }

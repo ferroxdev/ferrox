@@ -304,6 +304,8 @@ impl Prompt {
 pub struct Library {
     /// The file it came from, for every message it prints.
     pub path: PathBuf,
+    /// The resolved file that `set-status` rewrites when the display path is root-relative.
+    pub source_path: PathBuf,
     /// The text it was parsed from, so the tag can name exactly this version.
     pub source: String,
     /// Prepended to every rendered prompt.
@@ -390,6 +392,7 @@ impl Library {
 
         let mut library = Self {
             path: path.to_path_buf(),
+            source_path: path.to_path_buf(),
             source: text.to_owned(),
             shared_protocol,
             prompts,
@@ -508,11 +511,38 @@ fn heading_body(line: &str) -> Option<&str> {
     line.strip_prefix("## ").map(str::trim_end)
 }
 
-/// Index of the next `## ` heading at or after `from`, or the line count.
+/// Index of the next `## ` heading at or after `from`, or the line count. A fence's body is
+/// prose, so a `## ` line inside one is not a section boundary.
 fn next_heading(lines: &[&str], from: usize) -> usize {
-    (from..lines.len())
-        .find(|&index| heading_body(lines[index]).is_some())
-        .unwrap_or(lines.len())
+    let mut fence: Option<(char, usize)> = None;
+    for (index, line) in lines.iter().enumerate().skip(from) {
+        let trimmed = line.trim_start();
+        if let Some((marker, width)) = fence {
+            let closing = trimmed.chars().take_while(|ch| *ch == marker).count();
+            if closing >= width {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some((marker, width)) = fence_marker(trimmed) {
+            fence = Some((marker, width));
+            continue;
+        }
+        if heading_body(line).is_some() {
+            return index;
+        }
+    }
+    lines.len()
+}
+
+/// A fence opening (` ``` ` or `~~~`, at least three) with its marker and width.
+fn fence_marker(trimmed: &str) -> Option<(char, usize)> {
+    let marker = trimmed.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    let width = trimmed.chars().take_while(|ch| *ch == marker).count();
+    (width >= 3).then_some((marker, width))
 }
 
 /// Case-insensitive: the one field name with no id to attach is the one people capitalise.
@@ -932,7 +962,7 @@ fn collect_placeholders(prompt: &mut Prompt, diagnostics: &mut Vec<Diagnostic>) 
                 .find(|slot| slot.name == name)
             {
                 Some(slot) => {
-                    if slot.default != default && default.is_some() {
+                    if slot.default != default {
                         diagnostics.push(Diagnostic::error(
                             prompt.line,
                             format!(

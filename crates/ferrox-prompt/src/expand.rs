@@ -66,7 +66,7 @@ pub fn fill(prompt: &Prompt, row: &MethodRow, pins: &[Pin]) -> BTreeMap<String, 
     for placeholder in &prompt.placeholders {
         let value = match placeholder.name.as_str() {
             "method" => row.method.clone(),
-            "index" => row.index.to_string(),
+            "index" => row.index.clone(),
             "section" => row.section.to_string(),
             "page" => row.page.clone(),
             "state" => row.state.clone(),
@@ -106,18 +106,24 @@ pub fn matching_rows<'a>(state: &'a ProjectState, selector: &str) -> Vec<&'a Met
         let keyed: Vec<&MethodRow> = state
             .methods
             .iter()
-            .filter(|row| row.section.eq_ignore_ascii_case(&section) && row.index == index)
+            .filter(|row| {
+                row.section.eq_ignore_ascii_case(&section) && row.index.eq_ignore_ascii_case(index)
+            })
             .collect();
         if !keyed.is_empty() {
             return keyed;
         }
     }
-    // Then the number on its own: `13`.
-    if let Ok(index) = text.parse::<u32>() {
+    // Then the id on its own: `13` or `61b`.
+    if text.starts_with(|character: char| character.is_ascii_digit())
+        && text
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
         let numbered: Vec<&MethodRow> = state
             .methods
             .iter()
-            .filter(|row| row.index == index)
+            .filter(|row| row.index.eq_ignore_ascii_case(text))
             .collect();
         if !numbered.is_empty() {
             return numbered;
@@ -170,14 +176,20 @@ pub fn row_fits(row: &MethodRow, targets: Targets) -> bool {
     }
 }
 
-/// `A13` — a table letter and a row number.
-fn key_parts(text: &str) -> Option<(char, u32)> {
+/// `A13` — a table letter and a row id.
+fn key_parts(text: &str) -> Option<(char, &str)> {
     let mut chars = text.chars();
     let section = chars.next()?.to_ascii_uppercase();
     if !section.is_ascii_alphabetic() {
         return None;
     }
-    Some((section, chars.as_str().parse().ok()?))
+    let index = chars.as_str();
+    (!index.is_empty()
+        && index.starts_with(|character: char| character.is_ascii_digit())
+        && index
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()))
+    .then_some((section, index))
 }
 
 /// The candidates on one line, so an ambiguous selector is answerable without a second command.
@@ -262,7 +274,7 @@ update the pins, nothing per-method here
             methods: vec![
                 MethodRow {
                     section: 'A',
-                    index: 3,
+                    index: "3".to_owned(),
                     method: "VLESS TCP none".to_owned(),
                     state: "implemented".to_owned(),
                     implemented: true,
@@ -274,7 +286,7 @@ update the pins, nothing per-method here
                 },
                 MethodRow {
                     section: 'A',
-                    index: 13,
+                    index: "13".to_owned(),
                     method: "VLESS over QUIC".to_owned(),
                     state: "client only".to_owned(),
                     implemented: false,
@@ -288,7 +300,7 @@ update the pins, nothing per-method here
                 },
                 MethodRow {
                     section: 'C',
-                    index: 45,
+                    index: "45".to_owned(),
                     method: "WireGuard".to_owned(),
                     state: "planned".to_owned(),
                     implemented: false,
@@ -362,7 +374,7 @@ update the pins, nothing per-method here
         let mut made = state();
         made.methods.push(MethodRow {
             section: 'A',
-            index: 2,
+            index: "2".to_owned(),
             method: "A greenfield row".to_owned(),
             state: "planned".to_owned(),
             implemented: false,
@@ -384,7 +396,7 @@ update the pins, nothing per-method here
         let mut made = state();
         made.methods.push(MethodRow {
             section: 'D',
-            index: 1,
+            index: "1".to_owned(),
             method: "A high-priority half-wired row".to_owned(),
             state: "partial — high priority".to_owned(),
             implemented: false,
@@ -396,7 +408,7 @@ update the pins, nothing per-method here
         });
         made.methods.push(MethodRow {
             section: 'D',
-            index: 2,
+            index: "2".to_owned(),
             method: "A parked row".to_owned(),
             state: "not-scheduled".to_owned(),
             implemented: false,
@@ -492,7 +504,7 @@ update the pins, nothing per-method here
         let mut made = state();
         made.methods.push(MethodRow {
             section: 'B',
-            index: 7,
+            index: "7".to_owned(),
             method: "VLESS over QUIC, second spelling".to_owned(),
             state: "planned".to_owned(),
             implemented: false,

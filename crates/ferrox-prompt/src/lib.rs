@@ -95,7 +95,9 @@ pub fn load_library(explicit: Option<&Path>, cwd: &Path) -> Result<Library, Unre
     let display = path
         .strip_prefix(&root)
         .map_or_else(|_| path.clone(), Path::to_path_buf);
-    Ok(Library::parse(&display, &text))
+    let mut library = Library::parse(&display, &text);
+    library.source_path = path;
+    Ok(library)
 }
 
 #[cfg(test)]
