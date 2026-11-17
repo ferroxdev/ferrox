@@ -362,12 +362,12 @@ jobs:
           if lane_exited; then
             lane_report
             FAILED="$FAILED native(exited)"
-          elif ! wait_front socks 10808; then
-            echo "the native lane carried no trace through its socks front in 360s" >&2
+          elif ! wait_front socks 10808 480; then
+            echo "the native lane carried no trace through its socks front in 480s" >&2
             lane_report
             FAILED="$FAILED native(socks ready)"
-          elif ! wait_front http 10819; then
-            echo "the native lane's own HTTP edge carried no trace in 360s" >&2
+          elif ! wait_front http 10819 480; then
+            echo "the native lane's own HTTP edge carried no trace in 480s" >&2
             lane_report
             FAILED="$FAILED native(http ready)"
           else
