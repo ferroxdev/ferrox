@@ -74,10 +74,12 @@ fn storage_address(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
         libc::AF_INET6 => {
             // SAFETY: the family says these bytes are a `sockaddr_in6`.
             let address = unsafe { &*std::ptr::from_ref(storage).cast::<libc::sockaddr_in6>() };
-            Some(SocketAddr::new(
-                std::net::Ipv6Addr::from(address.sin6_addr.s6_addr).into(),
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(address.sin6_addr.s6_addr),
                 u16::from_be(address.sin6_port),
-            ))
+                u32::from_be(address.sin6_flowinfo),
+                u32::from_be(address.sin6_scope_id),
+            )))
         }
         _ => None,
     }

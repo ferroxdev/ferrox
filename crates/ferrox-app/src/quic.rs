@@ -4112,23 +4112,41 @@ fn pump(
             }
         }
         for (id, up) in ready.drain(..) {
+            let mut ended = false;
             loop {
-                let (n, fin) = {
+                let received = {
                     let Ok(mut conn) = shared.lock() else {
                         return;
                     };
                     match conn.stream_recv(id, &mut chunk) {
-                        Ok((0, _)) | Err(_) => break,
-                        Ok(found) => found,
+                        Ok((0, fin)) => Ok((0, fin)),
+                        Err(quiche::Error::Done) => break,
+                        Err(_) => Err(()),
+                        Ok(found) => Ok(found),
                     }
                 };
+                let (n, fin) = match received {
+                    Ok(found) => found,
+                    Err(()) => {
+                        ended = true;
+                        break;
+                    }
+                };
+                if n == 0 && !fin {
+                    break;
+                }
                 if (&*up).write_all(&chunk[..n]).is_err() {
+                    ended = true;
                     break;
                 }
                 if fin {
                     let _ = up.shutdown(Shutdown::Write);
+                    ended = true;
                     break;
                 }
+            }
+            if ended {
+                leave_session(table, id);
             }
         }
     }
@@ -4224,7 +4242,7 @@ fn leave_session(table: &Arc<Mutex<PooledState>>, id: u64) {
     }
 }
 
-fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
+fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection, expect_reply: bool) {
     #[cfg(test)]
     let port = pooled.key.port;
     let Ok(flush_sock) = pooled.sock.try_clone() else {
@@ -4236,11 +4254,16 @@ fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
         return;
     };
     let mut chunk = crate::proxy::RelayBuf::with_len(PUMP_WINDOW).into_vec();
+    let mut half_closed = false;
     loop {
         #[cfg(test)]
         let read_at = Instant::now();
         match plain.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                half_closed = true;
+                break;
+            }
+            Err(_) => break,
             Ok(n) => {
                 #[cfg(test)]
                 qstage(format!(
@@ -4319,7 +4342,9 @@ fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
     }
     #[cfg(test)]
     qstage(format!("{} t={} uplink-end {id}", port, qms()));
-    leave_session(&pooled.table, id);
+    if !half_closed || !expect_reply {
+        leave_session(&pooled.table, id);
+    }
 }
 
 pub(crate) fn dial_pooled(
@@ -4393,7 +4418,7 @@ pub(crate) fn dial_pooled_with(
     }
     #[cfg(test)]
     qstage(format!("{} t={} graduated {id}", dial.port, qms()));
-    uplink_stream(&pooled, id, client);
+    uplink_stream(&pooled, id, client, expect_reply);
 }
 
 /// A stream on the pooled connection under the named budget; a connection the budget missed is never pooled.

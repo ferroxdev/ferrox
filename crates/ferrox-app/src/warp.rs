@@ -435,10 +435,15 @@ impl WarpSpec {
             .and_then(crate::json::Json::as_str)
             .filter(|address| !address.is_empty())
             .map(str::to_owned);
-        let endpoint = settings
-            .get("endpoint")
-            .and_then(crate::json::Json::as_str)
-            .and_then(parse_endpoint);
+        let endpoint = match settings.get("endpoint") {
+            None | Some(crate::json::Json::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .and_then(parse_endpoint)
+                    .ok_or_else(|| "warp: `endpoint` is not host:port".to_owned())?,
+            ),
+        };
         let mtu = settings
             .get("mtu")
             .and_then(crate::json::Json::as_u32)

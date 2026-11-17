@@ -200,6 +200,12 @@ struct Inner {
     stable: Arc<AtomicBool>,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
 /// The lane names its spec; the spec redacts the headers that carry a token and
 /// the key WARP signs with.
 impl std::fmt::Debug for MasqueOut {

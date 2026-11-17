@@ -169,8 +169,20 @@ fn peer_from_json(peer: &Json) -> Result<PeerConfig, String> {
         Some(_) => return Err("wireguard peer: keepAlive is not a number".to_owned()),
         None => 0,
     };
-    let mut allowed = strings(account.get("allowedIPs"))
-        .unwrap_or_else(|| DEFAULT_ALLOWED.map(str::to_owned).to_vec());
+    let mut allowed = match account.get("allowedIPs") {
+        None | Some(Json::Null) => DEFAULT_ALLOWED.map(str::to_owned).to_vec(),
+        Some(Json::Arr(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(prefix) = item.as_str() else {
+                    return Err("wireguard peer: allowedIPs entry is not a string".to_owned());
+                };
+                out.push(prefix.to_owned());
+            }
+            out
+        }
+        Some(_) => return Err("wireguard peer: allowedIPs is not an array".to_owned()),
+    };
     if allowed.is_empty() {
         allowed = DEFAULT_ALLOWED.map(str::to_owned).to_vec();
     }

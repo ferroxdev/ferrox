@@ -138,18 +138,14 @@ unsafe fn mask_narrow(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
         for lane in 0..4 {
             let off = at + lane * 16;
             // SAFETY: `off..off + 16` sits inside the whole 64-byte blocks of both ranges.
-            let chunk = unsafe { core::slice::from_raw_parts(src.add(off), 16) };
-            let out = unsafe { core::slice::from_raw_parts_mut(dst.add(off), 16) };
-            xor_block(chunk, &wide, out);
+            unsafe { xor_block(src.add(off), &wide, dst.add(off)) };
         }
     }
     let chunks = (len - blocks * 64) / 16;
     for c in 0..chunks {
         let at = blocks * 64 + c * 16;
         // SAFETY: `at..at + 16` sits inside the whole 16-byte chunks past the blocks.
-        let chunk = unsafe { core::slice::from_raw_parts(src.add(at), 16) };
-        let out = unsafe { core::slice::from_raw_parts_mut(dst.add(at), 16) };
-        xor_block(chunk, &wide, out);
+        unsafe { xor_block(src.add(at), &wide, dst.add(at)) };
     }
     let tail_at = blocks * 64 + chunks * 16;
     for i in tail_at..len {
@@ -166,29 +162,32 @@ unsafe fn mask_narrow(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
     reason = "load-bearing: keeps the vector op inlined at every call site"
 )]
 #[inline(always)]
-fn xor_block(chunk: &[u8], wide: &[u8; 16], out: &mut [u8]) {
+unsafe fn xor_block(src: *const u8, wide: &[u8; 16], dst: *mut u8) {
     #[cfg(target_arch = "x86_64")]
     {
         use core::arch::x86_64::{_mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128};
         unsafe {
-            let data = _mm_loadu_si128(chunk.as_ptr().cast());
+            let data = _mm_loadu_si128(src.cast());
             let key = _mm_loadu_si128(wide.as_ptr().cast());
-            _mm_storeu_si128(out.as_mut_ptr().cast(), _mm_xor_si128(data, key));
+            _mm_storeu_si128(dst.cast(), _mm_xor_si128(data, key));
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
         use core::arch::aarch64::{veorq_u8, vld1q_u8, vst1q_u8};
         unsafe {
-            let data = vld1q_u8(chunk.as_ptr());
+            let data = vld1q_u8(src);
             let key = vld1q_u8(wide.as_ptr());
-            vst1q_u8(out.as_mut_ptr(), veorq_u8(data, key));
+            vst1q_u8(dst, veorq_u8(data, key));
         }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        for ((out, &byte), &key) in out.iter_mut().zip(chunk).zip(wide.iter()) {
-            *out = byte ^ key;
+        for (at, &key) in wide.iter().enumerate() {
+            unsafe {
+                let byte = src.add(at).read();
+                dst.add(at).write(byte ^ key);
+            }
         }
     }
 }
@@ -1059,23 +1058,33 @@ fn start_heartbeat(writer: &WsWriter, period: u32) {
         return;
     }
     let shared = Arc::downgrade(&writer.shared);
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(u64::from(period)));
-        let Some(shared) = shared.upgrade() else {
-            return;
-        };
-        if shared.closed.load(Ordering::SeqCst) {
-            return;
-        }
-        let Ok(mut stream) = shared.stream.lock() else {
-            return;
-        };
-        if shared.open.load(Ordering::Relaxed) > 0 {
-            // A data frame is half on the wire: a control frame here would land inside it.
-            continue;
-        }
-        if !write_frame(&mut **stream, shared.masked, OP_PING, &[]) {
-            return;
+    let period = std::time::Duration::from_secs(u64::from(period));
+    std::thread::spawn(move || {
+        let mut left = period;
+        loop {
+            let slice = left.min(std::time::Duration::from_secs(1));
+            std::thread::sleep(slice);
+            left -= slice;
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            if shared.closed.load(Ordering::SeqCst) {
+                return;
+            }
+            if !left.is_zero() {
+                continue;
+            }
+            left = period;
+            let Ok(mut stream) = shared.stream.lock() else {
+                return;
+            };
+            if shared.open.load(Ordering::Relaxed) > 0 {
+                // A data frame is half on the wire: a control frame here would land inside it.
+                continue;
+            }
+            if !write_frame(&mut **stream, shared.masked, OP_PING, &[]) {
+                return;
+            }
         }
     });
 }

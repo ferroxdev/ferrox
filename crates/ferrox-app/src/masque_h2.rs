@@ -1112,6 +1112,7 @@ struct Session {
     queued: VecDeque<Vec<u8>>,
     queued_at: usize,
     send_window: i64,
+    connection_window: i64,
     peer_window: i64,
     granted: Option<Granted>,
     addrs: Vec<IpAddr>,
@@ -1134,6 +1135,7 @@ impl Session {
             queued: VecDeque::new(),
             queued_at: 0,
             send_window: DEFAULT_WINDOW,
+            connection_window: DEFAULT_WINDOW,
             peer_window: DEFAULT_WINDOW,
             granted: None,
             addrs: Vec::new(),
@@ -1230,7 +1232,9 @@ impl Session {
             h2::T_WINDOW if body.len() == 4 => {
                 let increment =
                     u32::from_be_bytes(body.try_into().expect("four bytes")) & 0x7fff_ffff;
-                if id == 0 || Some(id) == self.request {
+                if id == 0 {
+                    self.connection_window += i64::from(increment);
+                } else if Some(id) == self.request {
                     self.send_window += i64::from(increment);
                 }
             }
@@ -1477,11 +1481,11 @@ impl Session {
         let Some(id) = self.request else {
             return;
         };
-        if self.queued.is_empty()
-            && i64::try_from(capsule.len()).unwrap_or(i64::MAX) <= self.send_window
-        {
+        let length = i64::try_from(capsule.len()).unwrap_or(i64::MAX);
+        if self.queued.is_empty() && length <= self.send_window.min(self.connection_window) {
             if wire.send(h2::T_DATA, 0, id, capsule) {
-                self.send_window -= i64::try_from(capsule.len()).unwrap_or(i64::MAX);
+                self.send_window -= length;
+                self.connection_window -= length;
             }
         } else if self.queued.len() < QUEUED_CAP {
             self.queued.push_back(capsule.to_vec());
@@ -1501,16 +1505,18 @@ impl Session {
                 return;
             };
             let start = self.queued_at;
-            if self.send_window <= 0 {
+            let room = self.send_window.min(self.connection_window);
+            if room <= 0 {
                 self.queued.push_front(answer);
                 break;
             }
-            let take =
-                (answer.len() - start).min(usize::try_from(self.send_window).unwrap_or(usize::MAX));
+            let take = (answer.len() - start).min(usize::try_from(room).unwrap_or(usize::MAX));
             if !wire.send(h2::T_DATA, 0, id, &answer[start..start + take]) {
                 return;
             }
-            self.send_window -= i64::try_from(take).unwrap_or(i64::MAX);
+            let sent = i64::try_from(take).unwrap_or(i64::MAX);
+            self.send_window -= sent;
+            self.connection_window -= sent;
             self.queued_at = start + take;
             if self.queued_at < answer.len() {
                 self.queued.push_front(answer);
@@ -1830,6 +1836,7 @@ mod tests {
         let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
         session.request = Some(1);
         session.send_window = 0;
+        session.connection_window = 0;
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
@@ -2262,6 +2269,7 @@ mod tests {
         let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
         session.request = Some(1);
         session.send_window = 0;
+        session.connection_window = 0;
         let mut wire = bare_client().wire;
         wire.deadline.arm(Instant::now() + Duration::from_secs(1));
         for _ in 0..QUEUED_CAP {
@@ -2279,6 +2287,7 @@ mod tests {
         client.flush();
         assert_eq!(client.queued.len(), QUEUED_CAP, "stream is still blocked");
         client.on(h2::T_WINDOW, 0, 1, &window);
+        session.on(&mut wire, h2::T_WINDOW, 0, 0, &window);
         session.on(&mut wire, h2::T_WINDOW, 0, 1, &window);
         client.flush();
         session.flush(&mut wire);
@@ -2291,6 +2300,7 @@ mod tests {
         assert_eq!(client.send_window, 0);
         assert_eq!(client.connection_window, 0);
         assert_eq!(session.send_window, 0);
+        assert_eq!(session.connection_window, 0);
         assert!(!client.end);
         assert!(!session.end);
         assert!(!client.wire.closed);

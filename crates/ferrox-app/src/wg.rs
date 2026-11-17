@@ -908,8 +908,11 @@ impl WireGuardOut {
             let Some(answer) = parse_answer(payload) else {
                 continue;
             };
-            if answer.id != id || answer.rcode != 0 {
+            if answer.id != id {
                 continue;
+            }
+            if answer.rcode != 0 {
+                break None;
             }
             break addresses(&answer, qtype);
         };

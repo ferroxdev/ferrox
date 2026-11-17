@@ -111,6 +111,12 @@ impl KernelWireGuard {
         if !config.peers.iter().any(|peer| peer.endpoint.is_some()) {
             return Err("kernel wireguard: no peer has an `endpoint`".to_owned());
         }
+        if config.peers.iter().any(|peer| peer.endpoints.len() > 1) {
+            return Err(
+                "kernel wireguard carries one endpoint per peer; the userspace stack tries the rest"
+                    .to_owned(),
+            );
+        }
         let (name, table, mark) = identity();
         let mut route = Netlink::open(libc::NETLINK_ROUTE).map_err(|error| kernel_error(&error))?;
         let mut index = None;
@@ -218,14 +224,21 @@ fn setup(
             families.push(family);
         }
     }
+    for peer in &config.peers {
+        for (address, _) in &peer.allowed {
+            let family = if address.is_ipv4() { AF_INET } else { AF_INET6 };
+            if !families.contains(&family) {
+                families.push(family);
+            }
+        }
+    }
     route.request(link_up_message(ifindex))?;
     for family in families.iter().copied() {
         let source = config
             .addresses
             .iter()
             .find(|address| address.is_ipv4() == (family == AF_INET))
-            .copied()
-            .ok_or_else(|| io::Error::other("kernel wireguard: no source address"))?;
+            .copied();
         route.request(route_message(family, table, ifindex, source))?;
         route.request(rule_message(family, table, mark, RULE_PRIORITY, None))?;
         route.request(rule_message(family, table, mark, IIF_PRIORITY, Some(name)))?;
@@ -250,7 +263,8 @@ fn identity() -> (String, u32, u32) {
     let token = NEXT.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let name = format!("fwg{:04x}{:04x}", pid & 0xffff, token & 0xffff);
-    let table = 0x4645_0000 | ((pid & 0xff) << 8) | (token & 0xff);
+    let low = (pid ^ token.wrapping_mul(0x9e37_79b9)) & 0xffff;
+    let table = 0x4645_0000 | low;
     (name, table, table)
 }
 
@@ -417,7 +431,7 @@ fn address_message(index: u32, address: IpAddr) -> Vec<u8> {
     msg.finish()
 }
 
-fn route_message(family: u8, table: u32, index: u32, source: IpAddr) -> Vec<u8> {
+fn route_message(family: u8, table: u32, index: u32, source: Option<IpAddr>) -> Vec<u8> {
     let mut msg = Msg::new(
         RTM_NEWROUTE,
         NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
@@ -425,7 +439,9 @@ fn route_message(family: u8, table: u32, index: u32, source: IpAddr) -> Vec<u8> 
     msg.payload(&rtmsg(family));
     msg.attr(RTA_TABLE, &table.to_ne_bytes());
     msg.attr(RTA_OIF, &index.to_ne_bytes());
-    msg.attr(RTA_PREFSRC, &ip_bytes(source));
+    if let Some(source) = source {
+        msg.attr(RTA_PREFSRC, &ip_bytes(source));
+    }
     msg.finish()
 }
 
@@ -884,7 +900,7 @@ mod tests {
 
     #[test]
     fn the_route_sends_the_table_to_the_link() {
-        let message = route_message(AF_INET, 0x4645_0001, 7, "192.0.2.1".parse().unwrap());
+        let message = route_message(AF_INET, 0x4645_0001, 7, Some("192.0.2.1".parse().unwrap()));
         let (kind, _) = header(&message);
         assert_eq!(kind, RTM_NEWROUTE);
         let payload = &message[28..];

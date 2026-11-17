@@ -174,13 +174,13 @@ fn try_carrier(
         .map_err(|failure| failure.to_string())?;
     let ip = through_tunnel(&mut tunnel, PROBE_HOST, PROBE_PATH)
         .ok_or_else(|| "no answer through the tunnel".to_owned())?;
-    let seen = opened(&mut tunnel, country);
+    let seen = opened(&mut tunnel, country)
+        .ok_or_else(|| "the exit country could not be read".to_owned())?;
     Ok(format!(
-        "{} {} in {:?}, exit {}",
+        "{} {} in {:?}, exit {seen}",
         ip.split_whitespace().last().unwrap_or("?"),
         edge.authority(),
         started.elapsed(),
-        seen.unwrap_or_else(|| "unread".to_owned())
     ))
 }
 

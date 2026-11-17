@@ -11,9 +11,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use ferrox_core::foxy::connectip::{
-    checksum_update, ipv4_head, ipv6_head, IPV4_HEADER, IPV6_HEADER,
-};
+use ferrox_core::foxy::connectip::{checksum_update, ipv6_head, IPV4_HEADER, IPV6_HEADER};
 
 const FLAG_FIN: u8 = 0x01;
 const FLAG_SYN: u8 = 0x02;
@@ -299,16 +297,28 @@ fn tcp_view(packet: &[u8]) -> Option<TcpView> {
     let first = *packet.first()?;
     let (source, destination, l4, total, protocol) = match first >> 4 {
         4 => {
-            let (head, _) = ipv4_head(packet)?;
-            if *packet.get(6)? & 0x3f != 0 || *packet.get(7)? != 0 {
+            let header = usize::from(first & 0x0f) * 4;
+            if header < IPV4_HEADER {
                 return None;
             }
+            let total = usize::from(u16::from_be_bytes([*packet.get(2)?, *packet.get(3)?]));
+            if total < header
+                || total > packet.len()
+                || *packet.get(6)? & 0x3f != 0
+                || *packet.get(7)? != 0
+            {
+                return None;
+            }
+            let mut source = [0u8; 4];
+            let mut destination = [0u8; 4];
+            source.copy_from_slice(packet.get(12..16)?);
+            destination.copy_from_slice(packet.get(16..20)?);
             (
-                IpAddr::V4(Ipv4Addr::from(head.source)),
-                IpAddr::V4(Ipv4Addr::from(head.destination)),
-                IPV4_HEADER,
-                usize::from(head.length),
-                head.protocol,
+                IpAddr::V4(Ipv4Addr::from(source)),
+                IpAddr::V4(Ipv4Addr::from(destination)),
+                header,
+                total,
+                *packet.get(9)?,
             )
         }
         6 => {
@@ -346,7 +356,7 @@ fn rewrite_tcp(
     source_port: u16,
     destination_port: u16,
 ) -> bool {
-    // `tcp_view` returns `l4` as 20 or 40 only after the IP length fits the packet.
+    // `tcp_view` returns `l4` as the IP header length only after the IP length fits the packet.
     let Some(l4_end) = view.l4.checked_add(20) else {
         return false;
     };

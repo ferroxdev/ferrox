@@ -328,6 +328,50 @@ fn window_shift(options: &[u8]) -> Option<u8> {
     None
 }
 
+/// A server initial sequence no peer can predict, with the clock as the fallback when the OS has no entropy.
+fn initial_sequence(client: u32) -> u32 {
+    let mut raw = [0u8; 4];
+    if getrandom::fill(&mut raw).is_ok() {
+        return u32::from_ne_bytes(raw);
+    }
+    let clock = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
+    client ^ clock.rotate_left(13) ^ std::process::id().rotate_left(7)
+}
+
+/// The MSS a SYN offers, or `None` when it carries none or a malformed one.
+fn peer_mss(options: &[u8]) -> Option<u32> {
+    const END: u8 = 0;
+    const NOP: u8 = 1;
+    const MSS: u8 = 2;
+    let mut at = 0;
+    while at < options.len() {
+        match options[at] {
+            END => break,
+            NOP => at += 1,
+            kind => {
+                let len = usize::from(*options.get(at + 1)?);
+                if len < 2 {
+                    return None;
+                }
+                let end = at.checked_add(len)?;
+                if end > options.len() {
+                    return None;
+                }
+                if kind == MSS && len == 4 {
+                    return Some(u32::from(u16::from_be_bytes([
+                        options[at + 2],
+                        options[at + 3],
+                    ])));
+                }
+                at = end;
+            }
+        }
+    }
+    None
+}
+
 /// The windows we advertise are scaled by this shift: five turns the sixteen-bit field into two mebibytes, past the band-delay product of the fastest link the bench drives and no further than the upstream socket holds.
 const OUR_WINDOW_SHIFT: u8 = 5;
 
@@ -992,12 +1036,12 @@ fn inherited_framing(_handle: &std::fs::File) -> Framing {
 
 fn inherited_handle() -> Option<std::fs::File> {
     let fd_str = std::env::var_os("FERROX_TUN_FD")?;
-    let fd: i64 = fd_str.to_str()?.parse().ok()?;
+    let fd: i32 = fd_str.to_str()?.parse().ok()?;
     if fd < 3 {
         return None;
     }
     #[cfg(unix)]
-    return Some(unsafe { std::fs::File::from_raw_fd(fd as RawFd) });
+    return Some(unsafe { std::fs::File::from_raw_fd(fd) });
     #[cfg(not(unix))]
     {
         let _ = fd;
@@ -1468,6 +1512,8 @@ struct Flow {
     id: u64,
     /// The client's initial sequence, so a retransmitted SYN replays the handshake instead of minting a second flow.
     isn: u32,
+    /// The server's initial sequence, drawn independently of the client's so a blind forger cannot predict it.
+    server_isn: u32,
     /// The shift the peer offered for its own receive window in the SYN, so each ACK's window field is read in bytes.
     peer_shift: u8,
     /// Answers in a row that did not arrive inside the queue's wait, so an upload whose peer speaks once a segment stops paying it and a ping-pong keeps it.
@@ -1599,10 +1645,24 @@ impl Association {
 }
 
 /// The flow table every queue reads: one entry per tuple, so a segment that lands on a queue other than the one the handshake opened still finds its flow instead of stalling it.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Flows {
     table: Arc<Mutex<HashMap<FlowKey, Arc<Flow>>>>,
     ids: Arc<AtomicU64>,
+    ended_tx: mpsc::Sender<Ended>,
+    ended_rx: Arc<Mutex<mpsc::Receiver<Ended>>>,
+}
+
+impl Default for Flows {
+    fn default() -> Self {
+        let (ended_tx, ended_rx) = mpsc::channel();
+        Self {
+            table: Arc::default(),
+            ids: Arc::default(),
+            ended_tx,
+            ended_rx: Arc::new(Mutex::new(ended_rx)),
+        }
+    }
 }
 
 impl Flows {
@@ -1614,6 +1674,28 @@ impl Flows {
 
     fn next_id(&self) -> u64 {
         self.ids.fetch_add(1, Relaxed)
+    }
+
+    fn reap(&self, legs: &Legs) {
+        let Ok(rx) = self.ended_rx.lock() else {
+            return;
+        };
+        while let Ok(ended) = rx.try_recv() {
+            match ended {
+                Ended::Stream(key, id) => {
+                    let mut table = self.table();
+                    if table.get(&key).is_some_and(|flow| flow.id == id) {
+                        table.remove(&key);
+                    }
+                }
+                Ended::Datagram(key, id) => {
+                    let mut table = legs.table();
+                    if table.get(&key).is_some_and(|leg| leg.id == id) {
+                        table.remove(&key);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1685,8 +1767,6 @@ pub(crate) struct Handler {
     /// Set by the watcher parked on the direct lane's control: the relay ended the association, so
     /// the lane and its legs are dropped before the next datagram frames at a dead address.
     direct_dead: Arc<AtomicBool>,
-    ended_tx: mpsc::Sender<Ended>,
-    ended_rx: mpsc::Receiver<Ended>,
     udp_idle: std::time::Duration,
     endpoint_independent_nat: bool,
 }
@@ -1738,7 +1818,6 @@ impl Handler {
         legs: Legs,
         spec: &Spec,
     ) -> Self {
-        let (ended_tx, ended_rx) = mpsc::channel();
         let emit = Vec::with_capacity(device.mtu + 64);
         Self {
             device,
@@ -1756,8 +1835,6 @@ impl Handler {
             opening: None,
             datagram_retry: None,
             direct_dead: Arc::new(AtomicBool::new(false)),
-            ended_tx,
-            ended_rx,
             udp_idle: spec.udp_idle(),
             endpoint_independent_nat: spec.endpoint_independent_nat(),
         }
@@ -1778,22 +1855,7 @@ impl Handler {
 
     fn dispatch(&mut self, packet: &[u8]) -> io::Result<()> {
         // Threads that left their flow report here, so neither table keeps a dead entry or the socket inside it.
-        while let Ok(ended) = self.ended_rx.try_recv() {
-            match ended {
-                Ended::Stream(key, id) => {
-                    let mut table = self.flows.table();
-                    if table.get(&key).is_some_and(|flow| flow.id == id) {
-                        table.remove(&key);
-                    }
-                }
-                Ended::Datagram(key, id) => {
-                    let mut table = self.legs.table();
-                    if table.get(&key).is_some_and(|leg| leg.id == id) {
-                        table.remove(&key);
-                    }
-                }
-            }
-        }
+        self.flows.reap(&self.legs);
         let Some((ip, body)) = ip_head(packet) else {
             return Ok(());
         };
@@ -1875,7 +1937,7 @@ impl Handler {
                         self.udp_idle,
                         key,
                         id,
-                        &self.ended_tx,
+                        &self.flows.ended_tx,
                     )?);
                     vacant.insert(Leg {
                         id,
@@ -2171,12 +2233,11 @@ impl Handler {
                     return Ok(());
                 }
                 let mut emit = std::mem::take(&mut self.emit);
-                let (options, len) =
-                    syn_ack_options(self.device.mss(flow.remote.0), peer_shift.is_some());
+                let (options, len) = syn_ack_options(flow.mss.load(Relaxed), peer_shift.is_some());
                 render_tcp_packet_ip(
                     flow.local,
                     flow.remote,
-                    flow.isn.wrapping_add(1),
+                    flow.server_isn.wrapping_add(1),
                     flow.isn.wrapping_add(1),
                     FLAG_SYN | FLAG_ACK,
                     65535,
@@ -2196,7 +2257,12 @@ impl Handler {
         let local_port = tcp.destination_port;
         let remote_port = tcp.source_port;
         let syn_seq = tcp.seq;
-        let mss = Arc::new(AtomicU32::new(self.device.mss(remote_ip)));
+        let server_isn = initial_sequence(syn_seq);
+        let offered_mss = peer_mss(tcp.options);
+        let device_mss = self.device.mss(remote_ip);
+        let mss = Arc::new(AtomicU32::new(
+            offered_mss.map_or(device_mss, |offered| offered.min(device_mss)),
+        ));
 
         // The lane comes first and the SYN-ACK follows it, so a refused edge never opens a half handshake and no segment outruns the pipe that carries it.
         let target = SocketAddr::new(ip.destination, tcp.destination_port);
@@ -2206,23 +2272,24 @@ impl Handler {
 
         let mut dev_writer = self.device.clone_writer()?;
         let rcv_nxt = Arc::new(AtomicU32::new(syn_seq.wrapping_add(1)));
-        let snd_nxt = Arc::new(AtomicU32::new(syn_seq.wrapping_add(2)));
+        let snd_nxt = Arc::new(AtomicU32::new(server_isn.wrapping_add(1)));
         let busy = Arc::new(AtomicBool::new(false));
         let signaled = Arc::new(AtomicBool::new(false));
         let send = Arc::new(SendWindow::new(
-            syn_seq.wrapping_add(2),
+            server_isn.wrapping_add(1),
             u32::from(tcp.window),
         ));
         let id = self.flows.next_id();
         let flow = Arc::new(Flow {
             id,
             isn: syn_seq,
+            server_isn,
             peer_shift: peer_shift.unwrap_or(0),
             write_half: Mutex::new(None),
             rcv_nxt: Arc::clone(&rcv_nxt),
             snd_nxt: Arc::clone(&snd_nxt),
             busy: Arc::clone(&busy),
-            last_acked: AtomicU32::new(syn_seq.wrapping_add(1)),
+            last_acked: AtomicU32::new(server_isn.wrapping_add(1)),
             local: (local_ip, local_port),
             remote: (remote_ip, remote_port),
             mss: Arc::clone(&mss),
@@ -2248,7 +2315,7 @@ impl Handler {
             self.retire(&displaced, Some(FLAG_RST | FLAG_ACK));
         }
 
-        let ended_tx = self.ended_tx.clone();
+        let ended_tx = self.flows.ended_tx.clone();
         let flow = response_flow;
         budgets::spawn(move || {
             let _ = send.thread.set(std::thread::current());
@@ -2350,7 +2417,7 @@ impl Handler {
             let rendered = render_tcp_headers_ip(
                 (local_ip, local_port),
                 (remote_ip, remote_port),
-                syn_seq.wrapping_add(1),
+                server_isn.wrapping_add(1),
                 syn_seq.wrapping_add(1),
                 FLAG_SYN | FLAG_ACK,
                 65535,
@@ -3603,6 +3670,7 @@ mod tests {
         Flow {
             id: 1,
             isn: 999,
+            server_isn: 1000,
             peer_shift: 0,
             write_half: Mutex::new(None),
             rcv_nxt: Arc::new(AtomicU32::new(rcv)),
@@ -5697,9 +5765,23 @@ mod tests {
         let (_ip, body) = ipv4_head(&reply[..rn]).unwrap();
         let (syn_ack, _) = tcp_head(body).unwrap();
         assert_eq!(
-            syn_ack.seq,
+            syn_ack.ack,
             u32::MAX,
-            "the reply sequence wraps instead of saturating"
+            "the receive cursor wraps instead of saturating"
         );
+        let key = FlowKey {
+            source: IpAddr::V4(Ipv4Addr::from([10, 0, 0, 2])),
+            source_port: 44444,
+            destination: IpAddr::V4(Ipv4Addr::from([10, 0, 0, 1])),
+            destination_port: 80,
+        };
+        let expected = handler
+            .flows
+            .table()
+            .get(&key)
+            .expect("the flow")
+            .server_isn
+            .wrapping_add(1);
+        assert_eq!(syn_ack.seq, expected, "the server sequence is its own");
     }
 }

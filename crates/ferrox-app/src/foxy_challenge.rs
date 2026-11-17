@@ -105,15 +105,15 @@ const FALLBACKS: [&str; 3] = [
 /// Cookies kept by domain, so a challenge solved on one host does not travel to another.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Jar {
-    by_name: BTreeMap<String, (String, String)>,
+    by_name: BTreeMap<(String, String), String>,
 }
 
 impl Jar {
     #[must_use]
     pub(crate) fn header(&self, host: &str) -> Option<String> {
         let mut out = String::new();
-        for (name, (domain, value)) in &self.by_name {
-            if host != domain && !host.ends_with(&format!(".{domain}")) {
+        for ((name, domain), value) in &self.by_name {
+            if host != domain.as_str() && !host.ends_with(&format!(".{domain}")) {
                 continue;
             }
             if !out.is_empty() {
@@ -140,15 +140,15 @@ impl Jar {
             };
             let domain = pair
                 .find_map(|attribute| {
-                    attribute
-                        .trim()
-                        .strip_prefix("Domain=")
-                        .map(|domain| domain.trim_start_matches('.').to_ascii_lowercase())
+                    let (key, value) = attribute.trim().split_once('=')?;
+                    key.trim()
+                        .eq_ignore_ascii_case("domain")
+                        .then(|| value.trim_start_matches('.').to_ascii_lowercase())
                 })
                 .unwrap_or_else(|| host.to_ascii_lowercase());
             let value = value.split('"').next().unwrap_or_default();
             self.by_name
-                .insert(name.trim().to_owned(), (domain, value.to_owned()));
+                .insert((name.trim().to_owned(), domain), value.to_owned());
         }
     }
 }
@@ -733,8 +733,9 @@ fn ask_human(image: &[u8], extension: &str) -> Option<String> {
     print!("captcha characters: ");
     std::io::stdout().flush().ok()?;
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line).ok()?;
+    let read = std::io::stdin().read_line(&mut line);
     let _ = std::fs::remove_file(&path);
+    read.ok()?;
     sanitize_captcha(&line)
 }
 

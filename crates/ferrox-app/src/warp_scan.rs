@@ -358,6 +358,7 @@ where
             found.push((edge, rtt));
             if strategy.target > 0 && found.len() >= strategy.target {
                 if strategy.quiet.is_zero() {
+                    done.store(true, Ordering::Relaxed);
                     break;
                 }
                 if quiet_until.is_none() {
