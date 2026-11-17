@@ -9124,17 +9124,15 @@ fn server_with_protocol(server: &Server, protocol: &str) -> Option<Server> {
             }
             server.shadowsocks_variant()
         }
-        protocol if protocol.starts_with("FRONTED-MEEK") => {
-            let mut variant = server.clone();
-            let meek = variant.meek.as_mut()?;
-            if !meek.fronted || !meek_protocol_shape(protocol, meek.https, meek.quic) {
-                return None;
-            }
-            let port = meek.port;
-            meek.protocol = static_tunnel_protocol(protocol)?;
-            variant.port = port;
-            Some(variant)
-        }
+        protocol if protocol.starts_with("FRONTED-MEEK") => fronted_with_protocol(server, protocol)
+            .or_else(|| {
+                if !uses_fronted_meek_cdn(protocol) {
+                    return None;
+                }
+                cdn_variants(server)
+                    .into_iter()
+                    .find_map(|variant| fronted_with_protocol(&variant, protocol))
+            }),
         protocol if protocol.starts_with("UNFRONTED-MEEK") => {
             let mut variant = server.clone();
             let meek = if variant.unfronted_meek.is_some() {
@@ -9152,6 +9150,19 @@ fn server_with_protocol(server: &Server, protocol: &str) -> Option<Server> {
         }
         _ => None,
     }
+}
+
+/// The entry rebuilt as a fronted-meek protocol when its front has that shape.
+fn fronted_with_protocol(server: &Server, protocol: &str) -> Option<Server> {
+    let mut variant = server.clone();
+    let meek = variant.meek.as_mut()?;
+    if !meek.fronted || !meek_protocol_shape(protocol, meek.https, meek.quic) {
+        return None;
+    }
+    let port = meek.port;
+    meek.protocol = static_tunnel_protocol(protocol)?;
+    variant.port = port;
+    Some(variant)
 }
 
 /// Whether a protocol's HTTPS/QUIC shape matches the front this entry already carries.
@@ -13238,6 +13249,24 @@ mod tests {
             meeks.iter().map(|meek| meek.quic).collect::<Vec<_>>(),
             vec![false, false, true]
         );
+    }
+
+    #[test]
+    fn a_stored_cdn_protocol_rebuilds_through_its_advertised_sibling() {
+        let mut server = scan_test_server();
+        server.cdn_protocols = CDN_PROTOCOL_HTTP;
+        let meek = server.meek.as_mut().expect("fronted");
+        meek.protocol = "FRONTED-MEEK-QUIC-OSSH";
+        meek.quic = true;
+        let http = server_with_protocol(&server, "FRONTED-MEEK-CDN-HTTP-OSSH")
+            .expect("the HTTP sibling is advertised");
+        let meek = http.meek.as_ref().expect("fronted");
+        assert_eq!(meek.protocol, "FRONTED-MEEK-CDN-HTTP-OSSH");
+        assert!(!meek.https);
+        assert!(!meek.quic);
+        assert_eq!(http.port, 80);
+        server.cdn_protocols = CDN_PROTOCOL_OSSH;
+        assert!(server_with_protocol(&server, "FRONTED-MEEK-CDN-HTTP-OSSH").is_none());
     }
 
     #[test]
