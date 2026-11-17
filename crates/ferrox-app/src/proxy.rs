@@ -18002,10 +18002,9 @@ fn vless_mux_plain(server: &SocketAddr, vless: &VlessOut) -> Option<MuxUplink> {
                 let close = connection_closer(&uplink);
                 let mut sealed = encryption.handshake(uplink).ok()?;
                 sealed.write_all(&header).ok()?;
-                read_vless_response(&mut sealed)?;
                 let (reader, writer) = sealed.into_split()?;
                 return Some(MuxUplink {
-                    read: Box::new(reader),
+                    read: Box::new(ReplyReader::new(reader)),
                     write: Box::new(writer),
                     close,
                 });
@@ -18014,14 +18013,9 @@ fn vless_mux_plain(server: &SocketAddr, vless: &VlessOut) -> Option<MuxUplink> {
             let mut write = uplink.try_clone().ok()?;
             let close = connection_closer(&uplink);
             write.write_all(&header).ok()?;
-            let mut read = read;
-            let previous_timeout = read.read_timeout().ok()?;
-            read.set_read_timeout(Some(RELAY_POLL)).ok()?;
-            let response = read_vless_response(&mut read);
-            read.set_read_timeout(previous_timeout).ok()?;
-            response?;
+            // The answer head rides the first reply frame, so the demux strips it instead of the opener.
             Some(MuxUplink {
-                read: Box::new(read),
+                read: Box::new(ReplyReader::new(read)),
                 write: Box::new(write),
                 close,
             })
@@ -18109,24 +18103,22 @@ where
                         return None;
                     }
                 };
-                if sealed.write_all(&header).is_err() || read_vless_response(&mut sealed).is_none()
-                {
+                if sealed.write_all(&header).is_err() {
                     close();
                     return None;
                 }
                 let shared: Arc<Mutex<Box<dyn ReadWrite + Send>>> =
                     Arc::new(Mutex::new(Box::new(sealed)));
                 return Some(MuxUplink {
-                    read: Box::new(SharedRead(Arc::clone(&shared))),
+                    read: Box::new(ReplyReader::new(SharedRead(Arc::clone(&shared)))),
                     write: Box::new(SharedWrite(shared)),
                     close,
                 });
             }
             session.write_all(&header).ok()?;
-            read_vless_response(&mut session)?;
             let (read, write, _) = session.into_halves()?;
             Some(MuxUplink {
-                read: Box::new(read),
+                read: Box::new(ReplyReader::new(read)),
                 write: Box::new(write),
                 close,
             })
@@ -18212,7 +18204,7 @@ where
                 return None;
             }
         };
-        if sealed.write_all(header).is_err() || read_vless_response(&mut sealed).is_none() {
+        if sealed.write_all(header).is_err() {
             close();
             return None;
         }
@@ -18221,19 +18213,18 @@ where
             return None;
         };
         return Some(MuxUplink {
-            read: Box::new(reader),
+            read: Box::new(ReplyReader::new(reader)),
             write: Box::new(writer),
             close,
         });
     }
-    let mut read = read;
     let mut write = write;
-    if write.write_all(header).is_err() || read_vless_response(&mut read).is_none() {
+    if write.write_all(header).is_err() {
         close();
         return None;
     }
     Some(MuxUplink {
-        read: Box::new(read),
+        read: Box::new(ReplyReader::new(read)),
         write: Box::new(write),
         close,
     })
@@ -19111,13 +19102,7 @@ fn open_vless_mux_quic(vless: &VlessOut) -> Option<MuxUplink> {
                 }
             };
             sealed.get_mut().rearm(budgets::dial());
-            if sealed.write_all(&header).is_err()
-                || read_vless_response(&mut HandshakeDeadline {
-                    inner: &mut sealed,
-                    until: Instant::now() + budgets::dial(),
-                })
-                .is_none()
-            {
+            if sealed.write_all(&header).is_err() {
                 pooled.cancel();
                 return None;
             }
@@ -19125,20 +19110,17 @@ fn open_vless_mux_quic(vless: &VlessOut) -> Option<MuxUplink> {
                 pooled.cancel();
                 return None;
             };
-            (Box::new(reader), Box::new(writer))
+            (Box::new(ReplyReader::new(reader)), Box::new(writer))
         } else {
             let mut stream = pooled.stream_handle();
-            if stream.write_all(&header).is_err()
-                || read_vless_response(&mut HandshakeDeadline {
-                    inner: &mut stream,
-                    until: Instant::now() + budgets::dial(),
-                })
-                .is_none()
-            {
+            if stream.write_all(&header).is_err() {
                 pooled.cancel();
                 return None;
             }
-            (Box::new(pooled.stream_handle()), Box::new(stream))
+            (
+                Box::new(ReplyReader::new(pooled.stream_handle())),
+                Box::new(stream),
+            )
         };
     let close_stream = pooled.stream_handle();
     let pooled = Mutex::new(Some(pooled));
@@ -19182,6 +19164,10 @@ fn dial_pooled_mux(
     true
 }
 
+/// A bulk mux upload read: four frame-sized chunks, so 32 KiB costs one read and one vectored write
+/// where an 8 KiB slice cost four of each.
+const MUX_UPLOAD_SLICE: usize = 4 * ferrox_core::mux::CHUNK_MAX;
+
 fn relay_pool_flow(client: &Connection, mut flow: crate::muxpool::Flow) {
     let Ok(up) = client.try_clone() else {
         flow.close();
@@ -19201,7 +19187,7 @@ fn relay_pool_flow(client: &Connection, mut flow: crate::muxpool::Flow) {
             let _ = down.shutdown(Shutdown::Write);
         }
     });
-    let mut chunk = [0u8; READ_SLICE];
+    let mut chunk = vec![0u8; MUX_UPLOAD_SLICE];
     let Ok(mut plain) = up.try_clone() else {
         flow.close();
         join(&done);
@@ -36722,8 +36708,8 @@ impl Pump {
 /// The VLESS answer is stripped on the first read, not before the relay starts: a server may hold `[0, 0]` until it sees payload, and the upload then moves through the relay itself instead of a pump thread.
 struct ReplyReader<R> {
     inner: R,
-    head: [u8; 2],
-    filled: u8,
+    head: [u8; 2 + 255],
+    filled: usize,
     answered: bool,
 }
 
@@ -36731,7 +36717,7 @@ impl<R> ReplyReader<R> {
     fn new(inner: R) -> Self {
         Self {
             inner,
-            head: [0u8; 2],
+            head: [0u8; 2 + 255],
             filled: 0,
             answered: false,
         }
@@ -36743,17 +36729,28 @@ impl<R> ReplyReader<R> {
 }
 
 impl<R: Read> ReplyReader<R> {
+    /// Reads the version and add-on length, then the add-ons the header declares, without taking a byte of the stream behind them.
     fn ensure_answered(&mut self) -> std::io::Result<()> {
         while self.filled < 2 {
-            match self.inner.read(&mut self.head[usize::from(self.filled)..]) {
+            match self.inner.read(&mut self.head[self.filled..2]) {
                 Ok(0) => {
                     return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
                 }
-                Ok(n) => self.filled += n as u8,
+                Ok(n) => self.filled += n,
                 Err(error) => return Err(error),
             }
         }
-        if ferrox_core::vless::VlessLink::decode_response_header(&self.head).is_err() {
+        let want = 2 + usize::from(self.head[1]);
+        while self.filled < want {
+            match self.inner.read(&mut self.head[self.filled..want]) {
+                Ok(0) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                Ok(n) => self.filled += n,
+                Err(error) => return Err(error),
+            }
+        }
+        if ferrox_core::vless::VlessLink::decode_response_header(&self.head[..want]).is_err() {
             return Err(std::io::Error::other("vless answer refused"));
         }
         if echo_trace_on() {
@@ -51893,6 +51890,85 @@ mod tests {
         returned.expect("the bounded password read returns instead of pinning the thread");
         drop(peer);
         serving.join().expect("joins");
+    }
+
+    /// A mux carrier's `[0, 0]` rides the first reply frame (xray flushes them together), so the opener must hand the carrier over before the answer head exists.
+    #[test]
+    fn vless_mux_opener_does_not_wait_for_the_answer_head() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(300)),
+            ..Default::default()
+        });
+        let id = [0x27u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let server = crate::budgets::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut header = [0u8; 19];
+            stream.read_exact(&mut header).expect("reads a mux header");
+            assert_eq!(&header[1..17], &id);
+            assert_eq!(header[18], 3);
+            let mut frame = [0u8; 9];
+            stream.read_exact(&mut frame).expect("reads a frame first");
+            stream.write_all(&[0, 0]).expect("answers");
+            stream.write_all(b"pong").expect("replies");
+        });
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let mut uplink =
+            vless_mux_plain(&addr, &vless).expect("opens before the answer head arrives");
+        let frame = ferrox_core::mux::Outgoing::bare(
+            1,
+            ferrox_core::mux::Status::Keep,
+            ferrox_core::mux::DATA,
+        );
+        let mut bytes = vec![0u8; frame.frame_len(1)];
+        frame.encode_into(Some(&[0u8][..]), &mut bytes);
+        uplink.write.write_all(&bytes).expect("writes a frame");
+        let mut back = [0u8; 4];
+        uplink
+            .read
+            .read_exact(&mut back)
+            .expect("reads past the head");
+        assert_eq!(&back, b"pong");
+        drop(uplink);
+        budgets::clear();
+        server.join().expect("joins");
+    }
+
+    /// A legal answer header that declares add-ons is consumed whole, so no add-on byte reaches the relay as payload.
+    #[test]
+    fn a_vless_answer_with_addons_is_stripped_whole() {
+        let mut reader = ReplyReader::new(std::io::Cursor::new(vec![0, 2, 8, 1, b'o', b'k']));
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).expect("reads the body");
+        assert_eq!(&body, b"ok");
+
+        let mut short = ReplyReader::new(std::io::Cursor::new(vec![0, 2, 8]));
+        let mut body = Vec::new();
+        assert!(
+            short.read_to_end(&mut body).is_err(),
+            "a truncated add-on block is refused"
+        );
     }
 
     /// A server that holds its `[0, 0]` until the first payload arrives — xray with padding and zeronet both do — must not deadlock the client: the client has to start the upload before it waits on the response.
