@@ -99,6 +99,7 @@ graph TD
 | xmc-payload-copies-in-the-parse | 0 | ferrox-core-finalmask-xmc::packet_stream::tests::a_custom_payload_is_a_slice_of_its_frame |
 | xmc-writer-capacity-growth | 0 | ferrox-core-finalmask-xmc::packet_stream::tests::the_frame_buffer_holds_its_capacity |
 | header-custom-handshake-time | UNBLESSED | not measured |
+| fragment-time | UNBLESSED | CI bench.yml (no cell yet) |
 <!-- counts:end -->
 
 ## Ops
@@ -124,7 +125,7 @@ A sudoku write pays four table lookups and one shuffle draw per plaintext octet 
 
 ## Time
 
-**No row measures this lane.** `header-custom-handshake-time` is `UNBLESSED` by `not measured`. `bench.yml` and `parity.yml` both ran for this slice and were read: every row in them is a cipher or record-layer throughput lane, and neither has a masked-connection case, so there is no duration to quote for the mask here. `xmc-time` is `UNBLESSED` for the same reason: the startup padding's sleeps are the config's schedule, so timing the handshake would price the schedule and the tunnel, not the code. A `header-custom` handshake has no duration either: its `delay` and `rand` items are the config's schedule and entropy, so a measurement would price the config, not the code. What the slice is gated on instead is byte-identity — the record reassembly in `a_configured_fragment_chain_cuts_the_hello_on_the_wire` and the two pinned conformance rows. A masked hello's `delays` are sleeps the config asked for, so any timing on that lane measures the schedule, not the code, which is the other reason none is claimed here.
+**No row measures this lane.** `header-custom-handshake-time` is `UNBLESSED` by `not measured`. `fragment-time` is `UNBLESSED` for the same reason, with no `bench.yml` cell that cuts a hello: its configured delays are sleeps, so a duration would price the config's schedule. `bench.yml` and `parity.yml` both ran for this slice and were read: every row in them is a cipher or record-layer throughput lane, and neither has a masked-connection case, so there is no duration to quote for the mask here. `xmc-time` is `UNBLESSED` for the same reason: the startup padding's sleeps are the config's schedule, so timing the handshake would price the schedule and the tunnel, not the code. A `header-custom` handshake has no duration either: its `delay` and `rand` items are the config's schedule and entropy, so a measurement would price the config, not the code. What the slice is gated on instead is byte-identity — the record reassembly in `a_configured_fragment_chain_cuts_the_hello_on_the_wire` and the two pinned conformance rows. A masked hello's `delays` are sleeps the config asked for, so any timing on that lane measures the schedule, not the code, which is the other reason none is claimed here.
 
 ## What each reference gave
 

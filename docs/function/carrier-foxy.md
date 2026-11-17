@@ -31,8 +31,9 @@ One shape for all of them, and it is the whole design: open a stream, send seven
 graph TD
     S["SOCKS front, no Mux"] --> V{"exit pinned and a probe set?"}
     V -- "once per lane, off the flow's clock" --> P["verify_exit: disposable H3 probes, every stage on the probe budget, until one exits in the pin"]
-    P --> O["dial_order: verified edge, then stored, then the country's"]
+    P -- "verdict held: the verified edge replaces the stored one" --> O["dial_order: the verified edge, else the stored edge when present, then the pin's candidates in list order"]
     V -- "no pin / already verified" --> O
+    V -- "pinned, probe still running: the stored edge first when present, then the pin's candidates" --> O
     O --> T{"which carrier?"}
     O -. "the order is held, not built: no copy of an edge per flow" .-> ON["DialOrder: a fixed array of borrowed edges"]
     T -- "auto: h2, h1, h3" --> G
