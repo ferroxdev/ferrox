@@ -147,7 +147,7 @@ impl StateStore {
         remote: Option<SocketAddr>,
         now: Duration,
     ) -> Option<Vars> {
-        if local.is_none() && remote.is_none() {
+        if local.is_none() || remote.is_none() {
             return None;
         }
         self.prune(now);
@@ -163,7 +163,7 @@ impl StateStore {
         vars: &Vars,
         now: Duration,
     ) {
-        if local.is_none() && remote.is_none() {
+        if local.is_none() || remote.is_none() {
             return;
         }
         self.prune(now);
@@ -906,6 +906,19 @@ mod tests {
         let second = header.open(MaskRole::Client, Some(local), Some(remote), Duration::ZERO);
         assert_eq!(second.vars.len(), 1);
         assert_eq!(second.vars.get("tx"), Some(&vec![7, 7]));
+        let mut partial = header.open(MaskRole::Client, Some(local), None, Duration::ZERO);
+        partial
+            .handshake(&mut Wire::new(Vec::new()), Duration::ZERO)
+            .expect("the first handshake does not read");
+        let partial_again = header.open(MaskRole::Client, Some(local), None, Duration::ZERO);
+        assert!(
+            partial_again.vars.is_empty(),
+            "a half-addressed run shares no state"
+        );
+        let mut unaddressed = header.open(MaskRole::Client, None, None, Duration::ZERO);
+        unaddressed
+            .handshake(&mut Wire::new(Vec::new()), Duration::ZERO)
+            .expect("the first handshake does not read");
         let unrelated = header.open(MaskRole::Client, None, None, Duration::ZERO);
         assert!(
             unrelated.vars.is_empty(),

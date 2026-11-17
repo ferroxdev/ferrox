@@ -537,6 +537,9 @@ fn spawn_keepalive<W: Write + Send + 'static>(
                 }
                 return;
             }
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             let value = id.fetch_add(1, Ordering::Relaxed) + 1;
             if queue_keepalive(&mut frame, value).is_err() {
                 return;
