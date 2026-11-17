@@ -328,25 +328,29 @@ impl MasqueOut {
         }
     }
 
+    /// A successful dial keeps the reservation until the caller admits or retires the lane.
     fn dial_lane(
         &self,
         now: Instant,
         dial: &mut impl FnMut() -> Result<Inner, String>,
     ) -> Result<PoolLane, String> {
-        let result = dial();
-        let mut slot = self
-            .inner
-            .lock()
-            .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
-        slot.dialing = slot.dialing.saturating_sub(1);
-        self.dialed.notify_all();
-        match result {
+        match dial() {
             Ok(inner) => Ok(Self::lane(&self.spec.xmux, now, inner)),
             Err(reason) => {
+                let mut slot = self
+                    .inner
+                    .lock()
+                    .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
                 slot.reconnect.advance(now);
+                self.release_dial(&mut slot);
                 Err(reason)
             }
         }
+    }
+
+    fn release_dial(&self, slot: &mut Slot) {
+        slot.dialing = slot.dialing.saturating_sub(1);
+        self.dialed.notify_all();
     }
 
     fn wait_dial(&self, slot: std::sync::MutexGuard<'_, Slot>) {
@@ -401,11 +405,13 @@ impl MasqueOut {
                 .lock()
                 .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
             Self::prune(&mut slot, now);
-            if let Some(existing) = slot.lanes.first() {
+            if let Some(existing) = slot.lanes.first().map(|lane| Arc::clone(&lane.inner)) {
                 Self::end(&lane);
-                return Ok(Arc::clone(&existing.inner));
+                self.release_dial(&mut slot);
+                return Ok(existing);
             }
             slot.lanes.push(lane);
+            self.release_dial(&mut slot);
             return Ok(inner);
         }
     }
@@ -445,9 +451,11 @@ impl MasqueOut {
                 if keep {
                     let at = slot.lanes.len();
                     slot.lanes.push(lane);
+                    self.release_dial(&mut slot);
                     return Ok(Self::take(&mut slot, at));
                 }
                 Self::end(&lane);
+                self.release_dial(&mut slot);
             }
             if slot.lanes.is_empty() {
                 if slot.dialing > 0 {
