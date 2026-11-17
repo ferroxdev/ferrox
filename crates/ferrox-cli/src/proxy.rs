@@ -3,7 +3,7 @@
 //! A snapshot is taken before the first arm and restored on `down`.
 
 use crate::config::{fronts, Ports};
-use crate::paths::{read_trim, Paths};
+use crate::paths::{read_trim, read_trim_checked, Paths};
 
 pub struct Routes {
     pub socks: Option<u16>,
@@ -75,13 +75,24 @@ pub fn arm(paths: &Paths, list: &str, ports: Ports) -> Result<(), String> {
 
 /// Only the lane that armed the proxy may clear it; a second configuration root sharing the
 /// state directory must not restore or delete the first lane's snapshot.
-fn owned(paths: &Paths) -> bool {
-    read_trim(&paths.proxy_owner).is_none_or(|owner| owner == paths.conf_dir.to_string_lossy())
+fn owned(paths: &Paths) -> Result<bool, String> {
+    let text = match read_trim_checked(&paths.proxy_owner) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(format!(
+                "system proxy: cannot read {}: {error}; the snapshot was kept.",
+                paths.proxy_owner.display()
+            ));
+        }
+    };
+    let owner = serde_json::from_str::<String>(&text).unwrap_or(text);
+    Ok(owner == paths.conf_dir.to_string_lossy())
 }
 
 #[allow(clippy::unnecessary_wraps)] // Windows restores the registry and can fail; the other targets only remove files.
 pub fn clear(paths: &Paths) -> Result<(), String> {
-    if !owned(paths) {
+    if !owned(paths)? {
         return Ok(());
     }
     #[cfg(windows)]
@@ -120,7 +131,7 @@ mod win {
         HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
     };
 
-    use crate::paths::{read_trim, write_private, Paths};
+    use crate::paths::{read_trim_checked, write_private, Paths};
 
     const SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
     const MAX_VALUE: u32 = 1024 * 1024;
@@ -239,11 +250,10 @@ mod win {
         write_raw(key, name, REG_DWORD, &value.to_le_bytes())
     }
 
-    fn delete(key: HKEY, name: &str) {
+    fn delete(key: HKEY, name: &str) -> bool {
         let name = wide(name);
-        unsafe {
-            RegDeleteValueW(key, name.as_ptr());
-        }
+        let status = unsafe { RegDeleteValueW(key, name.as_ptr()) };
+        status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND
     }
 
     fn snapshot(key: HKEY) -> Result<Value, String> {
@@ -276,7 +286,7 @@ mod win {
                         (Some(kind), Some(bytes)) => {
                             ok &= write_raw(key, name, kind, &bytes);
                         }
-                        _ => delete(key, name),
+                        _ => ok &= delete(key, name),
                     }
                 }
                 Some(Value::String(text)) => {
@@ -287,7 +297,7 @@ mod win {
                         ok &= write_dword(key, name, value as u32);
                     }
                 }
-                _ => delete(key, name),
+                _ => ok &= delete(key, name),
             }
         }
         ok
@@ -397,9 +407,9 @@ mod win {
             && write_sz(key, "ProxyServer", &server)
             && write_sz(key, "ProxyOverride", &bypass)
             && write_dword(key, "AutoDetect", 0);
-        delete(key, "AutoConfigURL");
+        let cleared = delete(key, "AutoConfigURL");
         unsafe { RegCloseKey(key) };
-        if !ok || !notify() {
+        if !ok || !cleared || !notify() {
             let _ = clear(paths);
             return Err("system proxy: the arm did not stick; nothing was armed.".to_owned());
         }
@@ -411,7 +421,10 @@ mod win {
                 http.map_or_else(|| "-".to_owned(), |port| port.to_string())
             ),
         );
-        let _ = write_private(&paths.proxy_owner, &paths.conf_dir.to_string_lossy());
+        let _ = write_private(
+            &paths.proxy_owner,
+            &json!(paths.conf_dir.to_string_lossy()).to_string(),
+        );
         if let Some(port) = socks {
             println!("system proxy on: SOCKS 127.0.0.1:{port}");
         }
@@ -423,10 +436,19 @@ mod win {
     }
 
     pub fn clear(paths: &Paths) -> Result<(), String> {
-        let Some(text) = read_trim(&paths.proxy_state) else {
-            let _ = std::fs::remove_file(&paths.proxy_ports);
-            let _ = std::fs::remove_file(&paths.proxy_owner);
-            return Ok(());
+        let text = match read_trim_checked(&paths.proxy_state) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_file(&paths.proxy_ports);
+                let _ = std::fs::remove_file(&paths.proxy_owner);
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "system proxy: cannot read {} ({error}); the snapshot was kept.",
+                    paths.proxy_state.display()
+                ));
+            }
         };
         let snapshot: Value = serde_json::from_str(&text).map_err(|error| {
             format!(

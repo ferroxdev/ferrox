@@ -717,8 +717,8 @@ pub fn config_fronts(
                         "inbound `{name}` listens on ::1; --vpn points the Windows proxy at 127.0.0.1, so use 127.0.0.1"
                     ));
                 }
-                let loopback = listen
-                    .is_some_and(|listen| listen == "localhost" || listen.starts_with("127."));
+                let loopback =
+                    listen.is_some_and(|listen| listen == "localhost" || listen == "127.0.0.1");
                 if !loopback {
                     return Err(format!(
                         "inbound `{name}` listens on {}, not loopback; --vpn needs 127.0.0.1",
@@ -901,6 +901,19 @@ mod tests {
         std::fs::write(
             &file,
             r#"{"inbounds":[{"protocol":"socks","listen":"0.0.0.0","port":1080}]}"#,
+        )
+        .unwrap();
+        let error = config_fronts(file.to_str().unwrap(), true, false, "").unwrap_err();
+        assert!(error.contains("not loopback"));
+    }
+
+    #[test]
+    fn config_fronts_refuses_a_loopback_the_system_proxy_does_not_target() {
+        let dir = scratch("fronts-alias");
+        let file = dir.join("mine.json");
+        std::fs::write(
+            &file,
+            r#"{"inbounds":[{"protocol":"socks","listen":"127.0.0.2","port":1080}]}"#,
         )
         .unwrap();
         let error = config_fronts(file.to_str().unwrap(), true, false, "").unwrap_err();

@@ -516,15 +516,13 @@ fn heading_body(line: &str) -> Option<&str> {
 fn next_heading(lines: &[&str], from: usize) -> usize {
     let mut fence: Option<(char, usize)> = None;
     for (index, line) in lines.iter().enumerate().skip(from) {
-        let trimmed = line.trim_start();
         if let Some((marker, width)) = fence {
-            let closing = trimmed.chars().take_while(|ch| *ch == marker).count();
-            if closing >= width {
+            if closes_fence(line, marker, width) {
                 fence = None;
             }
             continue;
         }
-        if let Some((marker, width)) = fence_marker(trimmed) {
+        if let Some((marker, width)) = opens_fence(line) {
             fence = Some((marker, width));
             continue;
         }
@@ -535,14 +533,33 @@ fn next_heading(lines: &[&str], from: usize) -> usize {
     lines.len()
 }
 
+/// Up to three leading spaces are indentation; four make the line code, not a fence.
+fn fence_body(line: &str) -> Option<&str> {
+    let body = line.trim_start_matches(' ');
+    (line.len() - body.len() <= 3).then_some(body)
+}
+
 /// A fence opening (` ``` ` or `~~~`, at least three) with its marker and width.
-fn fence_marker(trimmed: &str) -> Option<(char, usize)> {
-    let marker = trimmed.chars().next()?;
+pub fn opens_fence(line: &str) -> Option<(char, usize)> {
+    let body = fence_body(line)?;
+    let marker = body.chars().next()?;
     if marker != '`' && marker != '~' {
         return None;
     }
-    let width = trimmed.chars().take_while(|ch| *ch == marker).count();
-    (width >= 3).then_some((marker, width))
+    let width = body.chars().take_while(|ch| *ch == marker).count();
+    if width < 3 || (marker == '`' && body[width..].contains('`')) {
+        return None;
+    }
+    Some((marker, width))
+}
+
+/// A closing fence: the same marker at the same width, with only spaces or tabs after it.
+pub fn closes_fence(line: &str, marker: char, width: usize) -> bool {
+    let Some(body) = fence_body(line) else {
+        return false;
+    };
+    let run = body.chars().take_while(|ch| *ch == marker).count();
+    run >= width && body[run..].chars().all(|ch| ch == ' ' || ch == '\t')
 }
 
 /// Case-insensitive: the one field name with no id to attach is the one people capitalise.
@@ -963,15 +980,19 @@ fn collect_placeholders(prompt: &mut Prompt, diagnostics: &mut Vec<Diagnostic>) 
             {
                 Some(slot) => {
                     if slot.default != default {
-                        diagnostics.push(Diagnostic::error(
-                            prompt.line,
-                            format!(
+                        let detail = match (&slot.default, &default) {
+                            (Some(first), Some(second)) => format!(
+                                "P{id}: the placeholder {{ {name} }} has two defaults, `{first}` and \
+                                 `{second}`; one value cannot be both"
+                            ),
+                            _ => format!(
                                 "P{id}: the placeholder {{ {name} }} appears both with and without a \
                                  default; one is always required or always defaulted, because a \
                                  value that is sometimes required and sometimes not is a value \
                                  nobody knows to supply"
                             ),
-                        ));
+                        };
+                        diagnostics.push(Diagnostic::error(prompt.line, detail));
                     }
                 }
                 None => prompt.placeholders.push(Placeholder { name, default }),
@@ -1248,6 +1269,38 @@ b
             first.placeholders[0].default.as_deref(),
             Some("cargo test --all")
         );
+    }
+
+    #[test]
+    fn an_indented_fence_is_code_and_does_not_hide_a_heading() {
+        let lines = [
+            "## P1 · First",
+            "    ```",
+            "    ## P2 · Second",
+            "    ```",
+            "## P2 · Second",
+        ];
+        assert_eq!(next_heading(&lines, 1), 4);
+    }
+
+    #[test]
+    fn only_a_bare_identical_marker_closes_a_fence() {
+        assert_eq!(opens_fence("```"), Some(('`', 3)));
+        assert!(!closes_fence("~~~text", '~', 3));
+        assert!(!closes_fence("````text", '`', 3));
+        assert!(closes_fence("~~~", '~', 3));
+        assert!(closes_fence("````  ", '`', 3));
+    }
+
+    #[test]
+    fn two_different_defaults_are_an_error() {
+        let library = load(&LIBRARY.replace(
+            "do the second thing with {scope}",
+            "do {scope=one} and {scope=two}",
+        ));
+        assert!(library
+            .errors()
+            .any(|error| error.message.contains("two defaults")));
     }
 
     #[test]

@@ -223,14 +223,23 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             return;
         }
         *cancelled = true;
-        if let Err(error) = lane::stop(&watched) {
-            eprintln!("ferrox-cli: {error}");
-        }
-        if !user_config {
-            let _ = std::fs::remove_file(&watched.cfg);
-        }
-        if let Err(error) = proxy::clear(&watched) {
-            eprintln!("ferrox-cli: {error}");
+        let stopped = match lane::stop(&watched) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("ferrox-cli: {error}");
+                eprintln!(
+                    "ferrox-cli: the lane config and supervisor files were kept so 'ferrox-cli down' can retry."
+                );
+                false
+            }
+        };
+        if stopped {
+            if !user_config {
+                let _ = std::fs::remove_file(&watched.cfg);
+            }
+            if let Err(error) = proxy::clear(&watched) {
+                eprintln!("ferrox-cli: {error}");
+            }
         }
         flag.store(true, Ordering::SeqCst);
     });
@@ -299,12 +308,10 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         }
         println!("the lane exited; last lines of {}:", paths.log.display());
         tail(&paths.log, 15);
-        stop_and_forget(paths, user_config);
-        0
-    } else {
-        println!("stop: ferrox-cli down");
-        0
+        return stop_and_forget(paths, user_config);
     }
+    println!("stop: ferrox-cli down");
+    0
 }
 
 fn spawn_supervisor(paths: &Paths, pid: u32, instance: Option<&str>) {
@@ -331,16 +338,24 @@ fn spawn_supervisor(paths: &Paths, pid: u32, instance: Option<&str>) {
     }
 }
 
-fn stop_and_forget(paths: &Paths, user_config: bool) {
+fn stop_and_forget(paths: &Paths, user_config: bool) -> i32 {
     if let Err(error) = lane::stop(paths) {
         eprintln!("ferrox-cli: {error}");
+        eprintln!(
+            "ferrox-cli: the lane config and supervisor files were kept so a later 'down' can retry."
+        );
+        return 1;
     }
     if !user_config {
         let _ = std::fs::remove_file(&paths.cfg);
     }
-    if let Err(error) = proxy::clear(paths) {
-        eprintln!("ferrox-cli: {error}");
-    }
+    let restored = match proxy::clear(paths) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("ferrox-cli: {error}");
+            false
+        }
+    };
     let _ = std::fs::remove_file(&paths.supervisor_file);
     let _ = std::fs::remove_file(&paths.supervisor_pid);
     if user_config {
@@ -354,6 +369,7 @@ fn stop_and_forget(paths: &Paths, user_config: bool) {
             paths.log.display()
         );
     }
+    i32::from(!restored)
 }
 
 fn verify_flow(options: &Options, ports: Ports, paths: &Paths) -> bool {
@@ -462,12 +478,16 @@ fn down(options: &Options, paths: &Paths) -> i32 {
 }
 
 fn stop_lane(paths: &Paths) -> i32 {
+    let saved_pid = lane::pid(paths);
     if let Err(error) = lane::stop(paths) {
         eprintln!("ferrox-cli: {error}");
         return 1;
     }
     if let Err(error) = proxy::clear(paths) {
         eprintln!("ferrox-cli: {error}");
+        if let Some(pid) = saved_pid {
+            let _ = paths::write_private(&paths.pid_file, &format!("{pid}\n"));
+        }
         return 1;
     }
     0

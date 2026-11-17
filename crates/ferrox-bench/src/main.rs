@@ -22,6 +22,7 @@ mod tuicbench;
 
 use count::Counting;
 use std::fmt::Write as _;
+use std::path::{Component, Path};
 
 fn lengths() -> Vec<usize> {
     let mut v: Vec<usize> = (0..=256).collect();
@@ -99,6 +100,15 @@ fn protocols_for(label: &str) -> &'static [&'static str] {
         "xray-rust" => &["vless", "vmess", "trojan", "shadowsocks2022", "hysteria"],
         _ => &[],
     }
+}
+
+/// A label becomes a directory name under `--output-dir`, so it may be one plain component and
+/// nothing that walks up or out.
+fn engine_label_is_safe(label: &str) -> bool {
+    matches!(
+        Path::new(label).components().collect::<Vec<_>>().as_slice(),
+        [Component::Normal(_)]
+    )
 }
 
 fn flag_value(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
@@ -206,6 +216,10 @@ fn parse_args() -> Args {
                 };
                 if label.is_empty() || path.is_empty() {
                     eprintln!("--engine needs a non-empty label and a non-empty path");
+                    std::process::exit(2);
+                }
+                if !engine_label_is_safe(label) {
+                    eprintln!("--engine label `{label}` is not a single file name");
                     std::process::exit(2);
                 }
                 engines.push((label.to_owned(), path.to_owned()));
@@ -840,7 +854,7 @@ fn gate5_section(args: &Args) -> Result<Gate5, String> {
         &engines,
         &workload,
         args.repeats,
-        std::path::Path::new(&args.output_dir),
+        Path::new(&args.output_dir),
         !args.no_ceiling,
     )
     .map_err(|e| e.to_string())?;
@@ -1161,6 +1175,18 @@ struct Row {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_engine_label_may_not_walk_out_of_the_output_directory() {
+        assert!(engine_label_is_safe("ferrox"));
+        assert!(engine_label_is_safe("xray-core"));
+        assert!(!engine_label_is_safe(""));
+        assert!(!engine_label_is_safe("."));
+        assert!(!engine_label_is_safe(".."));
+        assert!(!engine_label_is_safe("../archive"));
+        assert!(!engine_label_is_safe("/tmp/archive"));
+        assert!(!engine_label_is_safe("a/b"));
+    }
 
     fn passes(ratios: &[f64]) -> Vec<(f64, f64)> {
         ratios.iter().map(|r| (250.0, 250.0 / r)).collect()

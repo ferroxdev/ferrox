@@ -10,7 +10,8 @@ use ferrox_prompt::check;
 use ferrox_prompt::expand::{self, ProjectState};
 use ferrox_prompt::json::Value;
 use ferrox_prompt::markdown::{
-    Addon, Diagnostic, Effort, Library, Prompt, Severity, Status, Targets, Touch,
+    closes_fence, opens_fence, Addon, Diagnostic, Effort, Library, Prompt, Severity, Status,
+    Targets, Touch,
 };
 use ferrox_prompt::render::{self, Options, Rendered};
 use ferrox_prompt::state::{Gap, MethodRow};
@@ -1395,22 +1396,21 @@ fn run_set_status(args: &Args, library: &Library) -> ExitCode {
 fn set_status_text(source: &str, id: u32, status: Status) -> Result<String, String> {
     let mut out = Vec::new();
     let mut current: Option<u32> = None;
-    let mut in_block = false;
+    let mut fence: Option<(char, usize)> = None;
     let mut replaced = false;
     for line in source.lines() {
-        if line.trim_start().starts_with("```") {
-            in_block = !in_block;
-        } else if !in_block {
-            if let Some(body) = line.strip_prefix("## ") {
-                current = section_id(body.trim_end());
-            } else if current == Some(id)
-                && !replaced
-                && line.trim_start().starts_with("**Status:**")
-            {
-                out.push(format!("**Status:** {}", status.as_str()));
-                replaced = true;
-                continue;
+        if let Some((marker, width)) = fence {
+            if closes_fence(line, marker, width) {
+                fence = None;
             }
+        } else if let Some((marker, width)) = opens_fence(line) {
+            fence = Some((marker, width));
+        } else if let Some(body) = line.strip_prefix("## ") {
+            current = section_id(body.trim_end());
+        } else if current == Some(id) && !replaced && line.trim_start().starts_with("**Status:**") {
+            out.push(format!("**Status:** {}", status.as_str()));
+            replaced = true;
+            continue;
         }
         out.push(line.to_owned());
     }
@@ -2425,5 +2425,13 @@ fix issue #{issue} at {priority=P0 or P1} priority
             "## Shared protocol\n\n```text\n**Status:** not a field here\n```\n\n## P2 · Second\n\n**Status:** done\n**Leverage:** 5\n"
         );
         assert!(set_status_text(source, 9, Status::Done).is_err());
+    }
+
+    #[test]
+    fn set_status_follows_the_parser_for_tilde_fences_and_example_headings() {
+        let source = "## P1 · First\n\n~~~text\n## P2 · Example\n**Status:** todo\n~~~\n\n## P2 · Second\n\n**Status:** todo\n";
+        let updated = set_status_text(source, 2, Status::Done).expect("the real P2 is there");
+        assert!(updated.contains("## P2 · Example\n**Status:** todo"));
+        assert!(updated.ends_with("## P2 · Second\n\n**Status:** done\n"));
     }
 }
