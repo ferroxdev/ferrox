@@ -99,6 +99,7 @@ fn same_path(owner: &str, path: &std::path::Path) -> bool {
     }
 }
 
+#[cfg(any(windows, test))]
 fn owner_text(paths: &Paths) -> String {
     serde_json::json!({
         "conf_dir": paths.conf_dir.to_string_lossy(),

@@ -7,7 +7,7 @@ static TEMP: AtomicU64 = AtomicU64::new(0);
 /// private key in the tree is a leak surface `check-fixture-safety.sh` refuses.
 pub fn run(args: &[String]) -> i32 {
     let ensure = args.iter().any(|arg| arg == "--ensure");
-    let Some(dir) = args.iter().find(|arg| *arg != "--ensure").copied() else {
+    let Some(dir) = args.iter().find(|arg| *arg != "--ensure") else {
         eprintln!("make-tls needs one argument: the directory for cert.pem and key.pem");
         return 2;
     };
