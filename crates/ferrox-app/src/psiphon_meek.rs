@@ -607,7 +607,7 @@ fn relay(
             eprintln!("psiphon: relay {id} in {} out {reply}", body.len());
         } else if trace {
             polls = polls.wrapping_add(1);
-            if polls % 100 == 0 {
+            if polls.is_multiple_of(100) {
                 eprintln!("psiphon: relay {id} poll {polls}");
             }
         }
