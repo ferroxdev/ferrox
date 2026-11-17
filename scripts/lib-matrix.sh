@@ -1014,6 +1014,8 @@ scenario_config() {
     warp-mim-*) nested_server_config "$port" "$inner" "$(masque_server_settings)" "$(masque_inner_server_settings)" "$(warp_mim_client_settings "$port" "$inner")" "127.0.0.2" ;;
     socks-raw-*) server_config "$(socks_server)" "$(socks_client "$port")" "$port" ;;
     http-raw-*) server_config "$(http_server)" "$(http_client "$port")" "$port" ;;
+    socks-tls-raw-*) server_config "$(socks_server), $(tls_server_settings)" "$(socks_client "$port"), $(tls_client_settings)" "$port" ;;
+    http-tls-raw-*) server_config "$(http_server), $(tls_server_settings)" "$(http_client "$port"), $(tls_client_settings)" "$port" ;;
     vmess-*) dispatch_protocol vmess "$1" "$port" "$cover" ;;
     trojan-*) dispatch_protocol trojan "$1" "$port" "$cover" ;;
     shadowsocks2022-*) dispatch_protocol shadowsocks2022 "$1" "$port" "$cover" ;;
@@ -1179,6 +1181,11 @@ standard_scenarios() {
   echo "shadowsocks2022-kcp-down-8 download 8 256 65536"
   echo "socks-raw-down-8 download 8 256 65536"
   echo "http-raw-down-8 download 8 256 65536"
+  # The two front protocols that read `tlsSettings` on their own outbound: the
+  # client leg here is the TLS split row 40 owns, not a section underneath VLESS.
+  echo "socks-tls-raw-down-8 download 8 256 65536"
+  echo "socks-tls-raw-up-1 upload 1 2048 65536"
+  echo "http-tls-raw-down-8 download 8 256 65536"
   # Mux.Cool is a client-side carrier above every protocol, so one raw lane per
   # family prices the shared session; the up/duplex/udp lanes show the same pool
   # carrying each direction. `xmux` is the separate xHTTP stream-one H2 pool.
