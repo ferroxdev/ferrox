@@ -402,9 +402,10 @@ impl<R, W: Write> Write for &PacketStream<R, W> {
             write_string(&mut frame.bytes, CHANNEL)?;
             frame.bytes.extend_from_slice(&input[written..end]);
             if let Err(error) = flush_frame(&mut *writer, &mut frame) {
-                if frame.pos > 0 || retryable(error.kind()) {
+                if retryable(error.kind()) || frame.pos > 0 {
                     return Ok(end);
                 }
+                frame.bytes.clear();
                 return if written > 0 { Ok(written) } else { Err(error) };
             }
             written = end;
@@ -628,6 +629,64 @@ mod tests {
                 .kind(),
             io::ErrorKind::TimedOut
         );
+    }
+
+    struct FailsBeforeTheSecondFrame {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl Write for FailsBeforeTheSecondFrame {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            let mut calls = self.calls.lock().expect("calls");
+            *calls += 1;
+            if *calls == 2 {
+                return Err(io::ErrorKind::Other.into());
+            }
+            self.bytes.lock().expect("bytes").extend_from_slice(input);
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_unaccepted_frame_is_not_replayed_with_the_next_write() {
+        let sink = FailsBeforeTheSecondFrame {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+            calls: Arc::new(Mutex::new(0)),
+        };
+        let observed = Arc::clone(&sink.bytes);
+        let stream = PacketStream::new(std::io::Cursor::new(Vec::<u8>::new()), sink, true);
+        let payload: Vec<u8> = (0..MAX_PACKET_DATA + 9).map(|index| index as u8).collect();
+        let mut write = &stream;
+        assert_eq!(
+            write.write(&payload).expect("the first frame is accepted"),
+            MAX_PACKET_DATA
+        );
+        assert_eq!(write.write(&payload[MAX_PACKET_DATA..]).expect("retry"), 9);
+
+        let bytes = observed.lock().expect("bytes");
+        let mut wire = bytes.as_slice();
+        let mut recovered = Vec::new();
+        while !wire.is_empty() {
+            let (length, _) = read_varint_with_length(&mut wire).expect("length");
+            let body = &wire[..length as usize];
+            wire = &wire[length as usize..];
+            let mut body_reader = body;
+            let _ = read_varint_with_length(&mut body_reader).expect("id");
+            let packet = Packet {
+                id: body[0] as i32,
+                data: body[1..].to_vec(),
+            };
+            let payload = parse_custom_payload(&packet)
+                .expect("payload")
+                .expect("channel");
+            recovered.extend_from_slice(payload);
+        }
+        assert_eq!(recovered, payload, "the nine-byte tail is sent once");
     }
 
     #[test]
