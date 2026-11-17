@@ -460,6 +460,7 @@ impl H3 {
             body: Vec::new(),
         };
         self.finished = false;
+        self.stream = None;
         let stream = self
             .http3
             .send_request(&mut self.conn, &list, body.is_empty())

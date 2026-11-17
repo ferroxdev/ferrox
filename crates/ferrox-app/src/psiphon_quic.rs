@@ -1473,7 +1473,6 @@ impl Engine {
                 Some(KeyChange::Handshake { keys }) => {
                     self.handshake = Some(keys);
                     self.level = HANDSHAKE;
-                    self.discard_space(INITIAL);
                 }
                 Some(KeyChange::OneRtt { keys, next }) => {
                     self.one_rtt = Some(keys);
@@ -1523,7 +1522,6 @@ impl Engine {
         self.crypto_send[space].clear();
         self.crypto_sent[space] = 0;
         self.crypto_recv[space].clear();
-        self.crypto_next[space] = 0;
         self.ack_seen[space].clear();
         self.ack_pending[space] = false;
     }
@@ -1533,10 +1531,8 @@ impl Engine {
         if self.dcid_locked {
             return;
         }
-        if !scid.is_empty() {
-            self.dcid.clear();
-            self.dcid.extend_from_slice(scid);
-        }
+        self.dcid.clear();
+        self.dcid.extend_from_slice(scid);
         self.dcid_locked = true;
     }
 
@@ -1960,6 +1956,9 @@ impl Engine {
         self.last_send = now;
         udp.send(&packet)
             .map_err(|error| format!("psiphon quic send failed: {error}"))?;
+        if space == HANDSHAKE {
+            self.discard_space(INITIAL);
+        }
         Ok(true)
     }
 
@@ -2288,7 +2287,7 @@ impl Engine {
             };
             match kind {
                 0x00 | 0x01 => {}
-                0x1e => self.discard_space(HANDSHAKE),
+                0x1e if space == ONE_RTT => self.discard_space(HANDSHAKE),
                 0x02 | 0x03 => {
                     let Some(largest) = get_varint(payload, &mut at) else {
                         break;
@@ -3228,6 +3227,9 @@ mod tests {
         assert_eq!(engine.dcid.as_slice(), &b"server"[..]);
         engine.accept_server_cid(b"forged");
         assert_eq!(engine.dcid.as_slice(), &b"server"[..]);
+        let mut empty = test_engine();
+        empty.accept_server_cid(b"");
+        assert!(empty.dcid.is_empty());
     }
 
     #[test]

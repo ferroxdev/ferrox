@@ -1622,7 +1622,35 @@ struct Chunk {
 pub(crate) struct Channel {
     session: Arc<Inner>,
     state: Arc<ChannelState>,
+    owner: Arc<ChannelOwner>,
     deadline: Option<Instant>,
+    shutdown: Option<Arc<AtomicBool>>,
+}
+
+struct ChannelOwner {
+    session: Arc<Inner>,
+    state: Arc<ChannelState>,
+}
+
+pub(crate) struct ChannelWaiter(Weak<ChannelState>);
+
+impl ChannelWaiter {
+    pub(crate) fn is_live(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+
+    pub(crate) fn wake(&self) {
+        if let Some(state) = self.0.upgrade() {
+            state.window_cond.notify_all();
+        }
+    }
+}
+
+impl Drop for ChannelOwner {
+    fn drop(&mut self) {
+        let _ = lock(&self.session.channels).remove(&self.state.local);
+        self.session.close_channel(&self.state);
+    }
 }
 
 #[allow(clippy::missing_fields_in_debug)]
@@ -2193,11 +2221,19 @@ impl Session {
         }
 
         match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Ok(OpenResult::Confirmed)) => Ok(Some(Channel {
-                session: Arc::clone(&self.inner),
-                state,
-                deadline: None,
-            })),
+            Ok(Ok(OpenResult::Confirmed)) => {
+                let owner = Arc::new(ChannelOwner {
+                    session: Arc::clone(&self.inner),
+                    state: Arc::clone(&state),
+                });
+                Ok(Some(Channel {
+                    session: Arc::clone(&self.inner),
+                    state,
+                    owner,
+                    deadline: None,
+                    shutdown: None,
+                }))
+            }
             Ok(Ok(OpenResult::SplitTunnel)) => Ok(None),
             // A refusal names the target, not the tunnel, so the session stays open for other flows.
             Ok(Err(why)) => Err(why),
@@ -2551,6 +2587,20 @@ impl Channel {
 impl Channel {
     fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
+    }
+
+    pub(crate) fn watch_shutdown(&mut self, shutdown: Arc<AtomicBool>) {
+        self.shutdown = Some(shutdown);
+    }
+
+    pub(crate) fn shutdown_waiter(&self) -> ChannelWaiter {
+        ChannelWaiter(Arc::downgrade(&self.state))
+    }
+
+    fn stopping(&self) -> bool {
+        self.shutdown
+            .as_ref()
+            .is_some_and(|shutdown| shutdown.load(Ordering::Acquire))
     }
 }
 
@@ -2942,6 +2992,7 @@ impl Channel {
     fn take_window(&self, len: usize) -> io::Result<usize> {
         if self.state.remote.load(Ordering::Acquire) == NO_CHANNEL
             || self.session.closed.load(Ordering::Acquire)
+            || self.stopping()
         {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -2974,6 +3025,7 @@ impl Channel {
             window = guard;
             if self.state.remote.load(Ordering::Acquire) == NO_CHANNEL
                 || self.session.closed.load(Ordering::Acquire)
+                || self.stopping()
             {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -3025,15 +3077,6 @@ impl Write for Channel {
 /// The error a liveness probe returns when its deadline passes.
 fn liveness_timeout() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "psiphon liveness deadline")
-}
-
-impl Drop for Channel {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.state) == 2 {
-            let _ = lock(&self.session.channels).remove(&self.state.local);
-            self.session.close_channel(&self.state);
-        }
-    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

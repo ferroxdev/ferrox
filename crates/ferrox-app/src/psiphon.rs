@@ -152,23 +152,34 @@ pub(crate) struct PsiphonOut {
 
 struct LaneShutdown {
     stopped: Arc<AtomicBool>,
+    channels: Mutex<Vec<crate::psiphon_ssh::ChannelWaiter>>,
 }
 
 impl LaneShutdown {
     fn new() -> Self {
         Self {
             stopped: Arc::new(AtomicBool::new(false)),
+            channels: Mutex::new(Vec::new()),
         }
     }
 
     fn flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stopped)
     }
+
+    fn watch(&self, channel: crate::psiphon_ssh::ChannelWaiter) {
+        let mut channels = lock(&self.channels);
+        channels.retain(crate::psiphon_ssh::ChannelWaiter::is_live);
+        channels.push(channel);
+    }
 }
 
 impl Drop for LaneShutdown {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        for channel in lock(&self.channels).iter() {
+            channel.wake();
+        }
     }
 }
 
@@ -1069,10 +1080,10 @@ impl PsiphonOut {
                 .map_err(|error| format!("psiphon: PacketTunnelTunFileDescriptor {fd}: {error}"))?;
             let weak = Arc::downgrade(&inner);
             let dns = inner.settings.packet_tunnel_dns;
-            let stopped = shutdown.flag();
+            let packet_shutdown = Arc::clone(&shutdown);
             thread::Builder::new()
                 .name("psiphon-packet-tunnel".to_owned())
-                .spawn(move || packet_tunnel_loop(&weak, device, dns, &stopped))
+                .spawn(move || packet_tunnel_loop(&weak, device, dns, packet_shutdown))
                 .map_err(|error| format!("psiphon: packet tunnel thread: {error}"))?;
         }
         // The edge binds before a tunnel exists, so a refusal is retried, never a lane that exits.
@@ -2433,15 +2444,15 @@ fn packet_tunnel_loop(
     lane: &Weak<Inner>,
     mut device: crate::tun::Device,
     dns: crate::psiphon_packet_tunnel::Dns,
-    shutdown: &AtomicBool,
+    shutdown: Arc<LaneShutdown>,
 ) {
     let mut logged: Option<Instant> = None;
     loop {
-        if shutdown.load(Ordering::Acquire) {
+        if shutdown.stopped.load(Ordering::Acquire) {
             return;
         }
-        let outcome = packet_tunnel_once(lane, &mut device, dns, shutdown);
-        if shutdown.load(Ordering::Acquire) {
+        let outcome = packet_tunnel_once(lane, &mut device, dns, &shutdown);
+        if shutdown.stopped.load(Ordering::Acquire) {
             return;
         }
         if let Err(why) = outcome {
@@ -2459,7 +2470,7 @@ fn packet_tunnel_once(
     lane: &Weak<Inner>,
     device: &mut crate::tun::Device,
     dns: crate::psiphon_packet_tunnel::Dns,
-    shutdown: &AtomicBool,
+    shutdown: &LaneShutdown,
 ) -> Result<(), String> {
     let session = {
         let Some(inner) = lane.upgrade() else {
@@ -2470,7 +2481,9 @@ fn packet_tunnel_once(
         }
         inner.ensure()?
     };
-    let channel = session.open_packet_tunnel()?;
+    let mut channel = session.open_packet_tunnel()?;
+    channel.watch_shutdown(shutdown.flag());
+    shutdown.watch(channel.shutdown_waiter());
     let writer = device
         .clone_writer()
         .map_err(|error| format!("tun descriptor clone: {error}"))?;
@@ -2482,7 +2495,7 @@ fn packet_tunnel_once(
     thread::scope(|scope| {
         let failed_reader = &failed;
         let stop_reader = &stop;
-        let shutdown_reader = shutdown;
+        let shutdown_reader = &shutdown.stopped;
         let reader_lane = lane;
         let handle = scope.spawn(move || {
             packet_tunnel_downstream(
@@ -2495,7 +2508,8 @@ fn packet_tunnel_once(
                 reader_lane,
             )
         });
-        let outcome = packet_tunnel_upstream(device, &mut upstream, dns, &failed, shutdown);
+        let outcome =
+            packet_tunnel_upstream(device, &mut upstream, dns, &failed, &shutdown.stopped);
         stop.store(true, Ordering::Release);
         close.close();
         let read = handle
@@ -7912,6 +7926,8 @@ fn entry_allowed(server: &Server, protocols: &[String], fronted: bool) -> bool {
 
 /// Apply every startup policy to an entry learned at runtime.
 fn runtime_entry(server: Server, settings: &Settings) -> Option<Server> {
+    let mut servers = limit_quic_versions(vec![server], settings);
+    let server = servers.pop()?;
     let server = runtime_protocol_entry(server, &settings.protocols, settings.fronted)?;
     if settings
         .region
@@ -7920,10 +7936,7 @@ fn runtime_entry(server: Server, settings: &Settings) -> Option<Server> {
     {
         return None;
     }
-    let mut servers = limit_quic_versions(vec![server], settings);
-    if servers.is_empty() {
-        return None;
-    }
+    let mut servers = vec![server];
     if coin(settings.dial_ports_probability) {
         let normal = shape_filter(&settings.protocols, "LimitTunnelProtocols");
         let named_meek = settings
@@ -8944,11 +8957,24 @@ fn select_protocols_with(
             servers = std::mem::take(&mut only);
         }
     } else {
+        let mut variants = Vec::new();
         servers.retain_mut(|server| {
             if server.direct || server.inproxy.is_some() {
                 if requested_unfronted {
-                    if let Some(unfronted) = server.unfronted_meek.take() {
-                        server.meek = Some(unfronted);
+                    let unfronted = match server.unfronted_meek.take() {
+                        Some(unfronted) => Some(unfronted),
+                        None if server.meek.as_ref().is_some_and(|meek| !meek.fronted) => {
+                            server.meek.take()
+                        }
+                        None => None,
+                    };
+                    if let Some(unfronted) = unfronted {
+                        let mut variant = server.clone();
+                        variant.meek = Some(unfronted);
+                        variants.push(variant);
+                        if !requested_fronted {
+                            server.meek = None;
+                        }
                     } else if !requested_fronted {
                         server.meek = None;
                     }
@@ -8969,6 +8995,7 @@ fn select_protocols_with(
             }
             fronted_fallback && server.meek.as_ref().is_some_and(|meek| meek.fronted)
         });
+        servers.extend(variants);
     }
     if protocols
         .iter()
@@ -16177,6 +16204,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unfronted_limit_keeps_the_direct_candidate() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshHostKey":"AAAA","capabilities":["SSH","UNFRONTED-MEEK-HTTPS"],"meekServerPort":8443,"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk"}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("dual");
+        let selected = select_protocols(
+            vec![server],
+            &["UNFRONTED-MEEK-HTTPS-OSSH".to_owned(), "OSSH".to_owned()],
+            &[],
+            0,
+            false,
+        );
+        assert_eq!(selected.len(), 2);
+        assert!(selected
+            .iter()
+            .any(|server| server.direct && server.meek.is_none() && server.port == 22));
+        assert!(selected.iter().any(|server| {
+            server
+                .meek
+                .as_ref()
+                .is_some_and(|meek| !meek.fronted && meek.protocol == "UNFRONTED-MEEK-HTTPS-OSSH")
+        }));
+    }
+
+    #[test]
     fn a_protocol_limit_keeps_only_the_named_ssh_shape() {
         let servers = || vec![test_server(false), test_server(true)];
         let shapes = |selected: Vec<Server>| {
@@ -16213,7 +16264,7 @@ mod tests {
                 0,
                 false
             )),
-            [false, true]
+            [false, true, false]
         );
         assert!(select_protocols(servers(), &["TLS-OSSH".to_owned()], &[], 0, false).is_empty());
         let mut capable = test_server(true);
