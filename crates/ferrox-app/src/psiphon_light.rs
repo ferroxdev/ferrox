@@ -687,10 +687,7 @@ impl<T: ferrox_core::tls::TlsProvider> HalfClose for LightStream<T> {
                 "psiphon light: upload is still pending",
             ));
         }
-        match self.inner.close_notify() {
-            Ok(()) | Err(ferrox_core::tls::TlsError::Timeout) => Ok(()),
-            Err(error) => Err(io::Error::other(error)),
-        }
+        self.inner.close_notify().map_err(io::Error::other)
     }
 }
 
@@ -702,10 +699,11 @@ fn half_close<T: HalfClose>(
     half_closed: &mut bool,
 ) -> bool {
     if peer_eof && !upload_blocked && !*half_closed {
-        if stream.shutdown_write().is_err() {
-            return false;
+        match stream.shutdown_write() {
+            Ok(()) => *half_closed = true,
+            Err(error) if idle(&error) => return true,
+            Err(_) => return false,
         }
-        *half_closed = true;
     }
     true
 }
@@ -1418,6 +1416,70 @@ mod tests {
         stream.shutdown_write().expect("half close");
         assert_eq!(stream.inner.written, [0xaa, 0xbb]);
         assert_eq!(stream.inner.closed, 1);
+    }
+
+    struct SlowClose {
+        inner: FakeTls,
+        failures: usize,
+    }
+
+    impl Read for SlowClose {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl Write for SlowClose {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl ferrox_core::tls::TlsProvider for SlowClose {
+        fn name() -> &'static str {
+            "slow-close"
+        }
+
+        fn suites(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn handshake(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+            Ok(())
+        }
+
+        fn alpn(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn close_notify(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+            if self.failures > 0 {
+                self.failures -= 1;
+                return Err(ferrox_core::tls::TlsError::Timeout);
+            }
+            self.inner.close_notify()
+        }
+    }
+
+    #[test]
+    fn a_half_close_retries_a_timed_out_notification() {
+        let mut stream = LightStream::new(
+            SlowClose {
+                inner: FakeTls::default(),
+                failures: 1,
+            },
+            Vec::new(),
+        );
+        let mut half_closed = false;
+        assert!(half_close(&mut stream, true, false, &mut half_closed));
+        assert!(!half_closed);
+        assert!(half_close(&mut stream, true, false, &mut half_closed));
+        assert!(half_closed);
+        assert_eq!(stream.inner.inner.closed, 1);
     }
 
     /// A writer that reports one timeout before accepting bytes.

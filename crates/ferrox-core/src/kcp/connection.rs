@@ -715,7 +715,12 @@ impl Connection {
                     Self::wake_update();
                     pushed = false;
                 }
-                self.wait_for_data_output(snap)?;
+                if let Err(error) = self.wait_for_data_output(snap) {
+                    if offset == 0 {
+                        return Err(error);
+                    }
+                    return Ok(offset);
+                }
                 continue;
             }
             pushed = true;
@@ -1086,6 +1091,30 @@ mod tests {
         );
         assert_eq!(conn.write(b"x"), Err(super::ConnError::MtuTooSmall));
         assert_eq!(conn.write(b""), Ok(0));
+    }
+
+    #[test]
+    fn a_partial_write_reports_the_bytes_it_queued_before_a_timeout() {
+        let local = ([127, 0, 0, 1], 1).into();
+        let conn = Connection::new_unstarted(
+            ConnMetadata {
+                local,
+                remote: local,
+                conversation: 4,
+            },
+            Box::new(|_| Ok(())),
+            Box::new(|| {}),
+            Config {
+                mtu: 100,
+                max_sending_window: 1,
+                ..Config::default()
+            },
+        );
+        conn.set_write_deadline(std::time::Instant::now());
+        let data = vec![0u8; 200];
+        let queued = conn.write(&data).expect("the queued prefix");
+        assert_eq!(queued, conn.mss as usize);
+        assert!(queued < data.len());
     }
 
     #[test]

@@ -12768,10 +12768,13 @@ impl Write for KcpIo {
         if buf.is_empty() {
             return Ok(0);
         }
-        let n = self
-            .conn
-            .write(buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+        let n = match self.conn.write(buf) {
+            Ok(n) => n,
+            Err(ferrox_core::kcp::ConnError::IoTimeout) => {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            Err(error) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, error)),
+        };
         self.meter.write(n);
         Ok(n)
     }
