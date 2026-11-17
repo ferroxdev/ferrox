@@ -1495,8 +1495,8 @@ pub(crate) fn kcp_config(settings: Option<&Json>) -> Option<ferrox_core::kcp::Co
     };
     let field = |camel: &str, snake: &str, default: u32| -> Option<u32> {
         match kcp.get(camel).or_else(|| kcp.get(snake)) {
-            Some(value) => value.as_u32(),
-            None => Some(default),
+            Some(value) if !matches!(value, Json::Null) => value.as_u32(),
+            _ => Some(default),
         }
     };
     let mtu = field("mtu", "mtu", base.mtu)?;
@@ -1515,10 +1515,10 @@ pub(crate) fn kcp_config(settings: Option<&Json>) -> Option<ferrox_core::kcp::Co
         return None;
     }
     let max_sessions = match kcp.get("maxSessions").or_else(|| kcp.get("max_sessions")) {
-        Some(value) => usize::try_from(value.as_u32()?)
+        Some(value) if !matches!(value, Json::Null) => usize::try_from(value.as_u32()?)
             .unwrap_or(usize::MAX)
             .max(1),
-        None => base.max_sessions,
+        _ => base.max_sessions,
     };
     Some(ferrox_core::kcp::Config {
         mtu,

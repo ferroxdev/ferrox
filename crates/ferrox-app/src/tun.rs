@@ -3669,7 +3669,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_refused_inline_answer_ends_the_flow() {
-        let (device_end, peer) = unix_socketpair().unwrap();
+        let (device_end, _reader) = full_pipe().unwrap();
         let device = Device::from_handle(device_end, DEFAULT_MTU);
         let mut handler = Handler::new(device, Arc::new(|_, _, _| Ok(())), no_associate());
         let (lane, mut far) = UnixStream::pair().unwrap();
@@ -3677,7 +3677,6 @@ mod tests {
         far.write_all(b"answer").unwrap();
         let flow = test_flow(5_000, 2_000);
         flow.misses.store(PING_PONG_MISSES, Relaxed);
-        drop(peer);
         assert_eq!(
             handler.serve_inline(&mut lane, &flow),
             Served::Failed,
@@ -4069,6 +4068,28 @@ mod tests {
             handler.flows.table().get(&key).unwrap().mss.load(Relaxed),
             1220
         );
+    }
+
+    /// A full pipe with its read end open: a device that refuses a write without a hangup for `poll`.
+    #[cfg(unix)]
+    fn full_pipe() -> io::Result<(std::fs::File, std::fs::File)> {
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        writer.set_nonblocking(true)?;
+        let chunk = [0u8; 4096];
+        loop {
+            match writer.write(&chunk) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok((writer, reader))
     }
 
     #[cfg(unix)]

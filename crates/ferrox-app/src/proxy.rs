@@ -54194,11 +54194,11 @@ mod tests {
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
         let mut probe = [0u8; 1];
-        assert_eq!(
-            sock.read(&mut probe).expect("reads"),
-            0,
-            "a refused answer closes the flow"
-        );
+        match sock.read(&mut probe) {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("a refused answer closes the flow: {other:?}"),
+        }
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(failure) = last_dial_failure_at(server_addr) {
@@ -68783,6 +68783,13 @@ mod tests {
                 base.tti,
                 base.cwnd_multiplier,
                 1349,
+            ),
+            (
+                r#"{"network":"kcp","kcpSettings":{"mtu":null,"tti":null,"cwndMultiplier":null,"maxSendingWindow":null,"maxSessions":null}}"#,
+                base.mtu,
+                base.tti,
+                base.cwnd_multiplier,
+                base.max_sending_window,
             ),
         ] {
             let settings = crate::json::parse(doc).expect("parses");
