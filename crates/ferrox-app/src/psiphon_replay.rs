@@ -192,12 +192,15 @@ impl Cache {
                     && config_ok
                 {
                     selected = entry.server.clone();
-                    if entry.next_seed.is_some() && entry.probe_session.is_none() {
-                        seed = entry.next_seed.expect("pending seed");
-                        probe = true;
-                    } else {
-                        seed = entry.seed;
-                        is_replay = true;
+                    match entry.next_seed {
+                        Some(pending) if entry.probe_session.is_none() => {
+                            seed = pending;
+                            probe = true;
+                        }
+                        _ => {
+                            seed = entry.seed;
+                            is_replay = true;
+                        }
                     }
                 }
             }

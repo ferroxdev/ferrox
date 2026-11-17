@@ -152,25 +152,22 @@ pub(crate) struct PsiphonOut {
 
 struct LaneShutdown {
     stopped: Arc<AtomicBool>,
-    channels: Mutex<Vec<crate::psiphon_ssh::ChannelWaiter>>,
+    channels: Arc<Mutex<Vec<crate::psiphon_ssh::ChannelWaiter>>>,
 }
 
 impl LaneShutdown {
     fn new() -> Self {
         Self {
             stopped: Arc::new(AtomicBool::new(false)),
-            channels: Mutex::new(Vec::new()),
+            channels: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.stopped)
-    }
-
-    fn watch(&self, channel: crate::psiphon_ssh::ChannelWaiter) {
-        let mut channels = lock(&self.channels);
-        channels.retain(crate::psiphon_ssh::ChannelWaiter::is_live);
-        channels.push(channel);
+    fn signal(&self) -> ShutdownSignal {
+        ShutdownSignal {
+            stopped: Arc::clone(&self.stopped),
+            channels: Arc::clone(&self.channels),
+        }
     }
 }
 
@@ -180,6 +177,23 @@ impl Drop for LaneShutdown {
         for channel in lock(&self.channels).iter() {
             channel.wake();
         }
+    }
+}
+
+struct ShutdownSignal {
+    stopped: Arc<AtomicBool>,
+    channels: Arc<Mutex<Vec<crate::psiphon_ssh::ChannelWaiter>>>,
+}
+
+impl ShutdownSignal {
+    fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stopped)
+    }
+
+    fn watch(&self, channel: crate::psiphon_ssh::ChannelWaiter) {
+        let mut channels = lock(&self.channels);
+        channels.retain(crate::psiphon_ssh::ChannelWaiter::is_live);
+        channels.push(channel);
     }
 }
 
@@ -1080,7 +1094,7 @@ impl PsiphonOut {
                 .map_err(|error| format!("psiphon: PacketTunnelTunFileDescriptor {fd}: {error}"))?;
             let weak = Arc::downgrade(&inner);
             let dns = inner.settings.packet_tunnel_dns;
-            let packet_shutdown = Arc::clone(&shutdown);
+            let packet_shutdown = shutdown.signal();
             thread::Builder::new()
                 .name("psiphon-packet-tunnel".to_owned())
                 .spawn(move || packet_tunnel_loop(&weak, device, dns, packet_shutdown))
@@ -2444,7 +2458,7 @@ fn packet_tunnel_loop(
     lane: &Weak<Inner>,
     mut device: crate::tun::Device,
     dns: crate::psiphon_packet_tunnel::Dns,
-    shutdown: Arc<LaneShutdown>,
+    shutdown: ShutdownSignal,
 ) {
     let mut logged: Option<Instant> = None;
     loop {
@@ -2470,7 +2484,7 @@ fn packet_tunnel_once(
     lane: &Weak<Inner>,
     device: &mut crate::tun::Device,
     dns: crate::psiphon_packet_tunnel::Dns,
-    shutdown: &LaneShutdown,
+    shutdown: &ShutdownSignal,
 ) -> Result<(), String> {
     let session = {
         let Some(inner) = lane.upgrade() else {
