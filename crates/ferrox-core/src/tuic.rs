@@ -1,6 +1,6 @@
 //! TUIC v5 framing: the authentication header, CONNECT streams, and fragmented PACKET datagrams.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 pub const VERSION: u8 = 5;
 pub const ALPN: &[u8] = b"h3";
@@ -43,11 +43,11 @@ impl<'a> Address<'a> {
         if bytes.is_empty() {
             return None;
         }
-        if let Ok(ip) = host.parse::<Ipv4Addr>() {
-            return Some(Self::V4(ip.octets()));
-        }
-        if let Ok(ip) = host.parse::<Ipv6Addr>() {
-            return Some(Self::V6(ip.octets()));
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Some(match ip {
+                IpAddr::V4(ip) => Self::V4(ip.octets()),
+                IpAddr::V6(ip) => Self::V6(ip.octets()),
+            });
         }
         (bytes.len() <= MAX_ADDRESS).then_some(Self::Name(bytes))
     }
@@ -127,13 +127,6 @@ pub struct Packet<'a> {
     pub index: u8,
     pub destination: Option<(Address<'a>, u16)>,
     pub payload: &'a [u8],
-}
-
-impl Packet<'_> {
-    #[must_use]
-    pub fn is_heartbeat(data: &[u8]) -> bool {
-        data.len() >= 2 && data[0] == VERSION && data[1] == HEARTBEAT
-    }
 }
 
 pub fn parse_packet_prefix(data: &[u8]) -> Result<(Packet<'_>, usize), FrameError> {
@@ -279,6 +272,11 @@ pub fn address_port(host: &str, port: u16) -> Option<Vec<u8>> {
 /// Writes one address and its port into a caller's buffer, so a packet that already holds the
 /// destination needs no `Vec` behind it. The returned length is what `encode_fragment` takes.
 pub fn address_port_into(address: Address<'_>, port: u16, out: &mut [u8]) -> Option<usize> {
+    if let Address::Name(bytes) = address {
+        if bytes.is_empty() || bytes.len() > MAX_ADDRESS {
+            return None;
+        }
+    }
     let len = address.wire_len();
     let total = len.checked_add(2)?;
     if out.len() < total {
@@ -321,6 +319,10 @@ mod tests {
             address_port_into(Address::V4([192, 0, 2, 1]), 1, &mut [0u8; 4]),
             None
         );
+        let mut out = [0u8; MAX_ADDRESS + 4];
+        assert_eq!(address_port_into(Address::Name(&[]), 1, &mut out), None);
+        let long = [b'a'; MAX_ADDRESS + 1];
+        assert_eq!(address_port_into(Address::Name(&long), 1, &mut out), None);
     }
 
     #[test]
@@ -394,6 +396,24 @@ mod tests {
     }
 
     #[test]
+    fn every_truncated_packet_is_short_and_never_panics() {
+        for host in ["192.0.2.53", "2001:db8::1", "dns.example"] {
+            let address = address_port(host, 443).expect("an address");
+            for index in [0, 1] {
+                let mut frame = Vec::new();
+                encode_fragment(1, 2, 2, index, &address, &[7u8; 32], &mut frame);
+                for end in 0..frame.len() {
+                    assert_eq!(
+                        parse_packet_prefix(&frame[..end]),
+                        Err(FrameError::Short),
+                        "{host} index {index} truncated to {end}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_prefix_stops_at_the_first_frame_boundary() {
         let address = address_port("192.0.2.1", 53).expect("an address");
         let mut first = Vec::new();
@@ -442,12 +462,5 @@ mod tests {
             left = &left[take..];
         }
         assert_eq!(sent, payload.len());
-    }
-
-    #[test]
-    fn heartbeat_is_recognised_before_packet_parsing() {
-        assert!(Packet::is_heartbeat(&[VERSION, HEARTBEAT]));
-        assert!(!Packet::is_heartbeat(&[VERSION, PACKET]));
-        assert!(!Packet::is_heartbeat(&[]));
     }
 }
