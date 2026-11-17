@@ -1250,6 +1250,11 @@ impl WebRtcStream {
         })
     }
 
+    /// The largest datagram a media track carries, once its framing header is reserved.
+    pub(crate) fn media_payload_limit(&self) -> Option<usize> {
+        self.media.then_some(MEDIA_MAX_RTP_PAYLOAD - 1)
+    }
+
     /// Set or clear the read and write timeout.
     pub(crate) fn set_timeout(&self, timeout: Option<Duration>) {
         *lock(&self.read_timeout) = timeout;

@@ -443,6 +443,9 @@ impl Stream<crate::psiphon_quic::QuicStream> {
 
 impl<T: Read + Write> Read for Stream<T> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         lock(&self.reader).read(&mut self.io, buf)
     }
 }
@@ -496,13 +499,46 @@ mod tests {
         }
     }
 
+    struct Watch {
+        reads: usize,
+    }
+
+    impl Read for Watch {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            Ok(0)
+        }
+    }
+
+    impl Write for Watch {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
-    fn a_zero_length_read_does_not_wait_for_a_salt() {
+    fn a_zero_length_read_does_not_wait_for_the_reader_lock() {
         let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-        let mut reader = Reader::new(key);
-        let mut input = std::io::Cursor::new(Vec::new());
-        let mut out = [0u8; 0];
-        assert_eq!(reader.read(&mut input, &mut out).expect("read"), 0);
+        let mut stream = Stream::new(Watch { reads: 0 }, key, &[]);
+        let reader = Arc::clone(&stream.reader);
+        let guard = reader.lock().expect("reader lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut out = [0u8; 0];
+            let result = stream.read(&mut out).map(|count| (count, stream.io.reads));
+            tx.send(result).expect("send");
+        });
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        drop(guard);
+        let result = result
+            .expect("empty read waited for the reader lock")
+            .expect("read");
+        handle.join().expect("join");
+        assert_eq!(result, (0, 0));
     }
 
     #[test]

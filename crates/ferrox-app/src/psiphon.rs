@@ -2510,6 +2510,12 @@ fn packet_tunnel_upstream(
             Err(error) => return Err(format!("tun read: {error}")),
         }
         while batch.len() < PACKET_TUNNEL_BATCH {
+            if failed.load(Ordering::Acquire) {
+                return Err("packet tunnel reader stopped".to_owned());
+            }
+            if lane.strong_count() == 0 {
+                return Err("psiphon: the lane is stopping".to_owned());
+            }
             let ready = crate::psiphon_packet_tunnel::wait_readable(fd, 0)
                 .map_err(|error| format!("tun poll: {error}"))?;
             if !ready {
