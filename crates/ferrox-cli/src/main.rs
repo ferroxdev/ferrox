@@ -250,11 +250,10 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             paths.log.display()
         );
         tail(&paths.log, 20);
-        stop_and_forget(paths, user_config);
-        return 3;
+        return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
     }
     if interrupted.load(Ordering::SeqCst) {
-        return 130;
+        return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
     }
     println!(
         "lane{} up (pid {pid}), fronts:",
@@ -268,12 +267,10 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         println!("carrier: {}", options.carrier);
     }
     if !fronts(&options.fronts).is_empty() && !verify_flow(options, ports, paths) {
-        stop_and_forget(paths, user_config);
-        return 3;
+        return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
     }
     if interrupted.load(Ordering::SeqCst) {
-        stop_and_forget(paths, user_config);
-        return 130;
+        return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
     }
     if options.vpn {
         // Hold the cancellation lock across the arm and handoff so a Ctrl-C either owns cleanup or looks at a finished start.
@@ -344,6 +341,30 @@ fn spawn_supervisor(paths: &Paths, pid: u32, instance: Option<&str>) {
     }
     if let Ok(child) = command.spawn() {
         let _ = paths::write_private(&paths.supervisor_pid, &format!("{}\n", child.id()));
+    }
+}
+
+/// Claim cleanup under the cancellation lock, so a Ctrl-C and a startup failure cannot both stop the lane.
+fn stop_with_cancellation(
+    cancelled: &Mutex<bool>,
+    interrupted: &AtomicBool,
+    paths: &Paths,
+    user_config: bool,
+    failure: i32,
+) -> i32 {
+    let mut cancelled = cancelled
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *cancelled {
+        return 130;
+    }
+    *cancelled = true;
+    let interrupted = interrupted.load(Ordering::SeqCst);
+    stop_and_forget(paths, user_config);
+    if interrupted {
+        130
+    } else {
+        failure
     }
 }
 
