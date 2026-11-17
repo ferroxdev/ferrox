@@ -2311,7 +2311,6 @@ fn split_permission(path: &std::path::Path) -> (&std::path::Path, Option<u32>) {
 /// directory leaves no room for a staged name, to the path itself.
 #[cfg(unix)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
-    use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some((name, padded)) = abstract_name(path) {
@@ -2339,17 +2338,34 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
     // The directory leaves no room for a staged name, so the mode goes on the path itself.
     take_stale(path, stale)?;
     let listener = UnixListener::bind(path)?;
-    // SAFETY: the listener owns a live descriptor, and `mode` is the permission bits the reference accepts.
-    let changed = unsafe { libc::fchmod(listener.as_raw_fd(), mode as libc::mode_t) } == 0;
-    // macOS refuses `fchmod` on a socket, so the longest path applies the mode through its name.
-    if !changed {
-        let error = io::Error::last_os_error();
-        let unsigned = error.raw_os_error() == Some(libc::EINVAL)
-            && std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).is_ok();
-        if !unsigned {
-            let _ = std::fs::remove_file(path);
-            return Err(error);
-        }
+    let bound = std::fs::symlink_metadata(path)?;
+    if !bound.file_type().is_socket() {
+        let _ = std::fs::remove_file(path);
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "a unix listen path names a file that is not a socket",
+        ));
+    }
+    let applied =
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).and_then(|()| {
+            let after = std::fs::symlink_metadata(path)?;
+            if (after.dev(), after.ino()) != (bound.dev(), bound.ino()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "the unix listen path was replaced before its mode applied",
+                ));
+            }
+            if after.mode() & 0o7777 != mode & 0o7777 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the unix listen path did not take its mode",
+                ));
+            }
+            Ok(())
+        });
+    if let Err(error) = applied {
+        let _ = std::fs::remove_file(path);
+        return Err(error);
     }
     Ok(listener)
 }
@@ -2430,8 +2446,13 @@ fn staged_name(path: &std::path::Path) -> std::path::PathBuf {
 
 #[cfg(windows)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
+    use std::os::windows::fs::MetadataExt as _;
+    let is_socket = |meta: &std::fs::Metadata| {
+        let kind = meta.file_type();
+        meta.file_attributes() & 0x400 != 0 && !kind.is_symlink() && !kind.is_dir()
+    };
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_file() => {
+        Ok(meta) if !is_socket(&meta) => {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "a unix listen path names a file that is not a socket",

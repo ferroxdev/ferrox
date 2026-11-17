@@ -489,9 +489,7 @@ pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
             at += 1;
         }
     }
-    if !changed {
-        return std::borrow::Cow::Borrowed(text);
-    }
+    let comments = changed;
     let mut kept = Vec::with_capacity(out.len());
     let mut at = 0;
     let mut quoted = false;
@@ -530,7 +528,7 @@ pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
         kept.push(byte);
         at += 1;
     }
-    if !trimmed {
+    if !comments && !trimmed {
         return std::borrow::Cow::Borrowed(text);
     }
     std::borrow::Cow::Owned(String::from_utf8_lossy(&kept).into_owned())
@@ -1032,6 +1030,13 @@ mod tests {
             .as_str()
             .expect("string");
         assert_eq!(id, "b831381d-6324-4d53-ad4f-8cda48b30811");
+    }
+
+    #[test]
+    fn a_trailing_comma_without_a_comment_still_goes() {
+        assert_eq!(strip_jsonc(r#"{"a":[1,2,],}"#), r#"{"a":[1,2]}"#);
+        let quoted = r#"{"a":",}"}"#;
+        assert_eq!(strip_jsonc(quoted), quoted);
     }
 
     #[test]

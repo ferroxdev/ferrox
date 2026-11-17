@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -187,7 +187,7 @@ impl Driver {
         let net = Arc::clone(&session.net);
         let migrated = Arc::clone(&session.migrated);
         let keep_alive = session.keep_alive;
-        let pump = Arc::clone(self);
+        let pump = Arc::downgrade(self);
         self.alive.store(true, Ordering::Relaxed);
         std::thread::spawn(move || {
             let session = Session {
@@ -206,7 +206,13 @@ impl Driver {
             let mut ready = Vec::with_capacity(16);
             let mut last_sent = 0usize;
             let mut last_at = Instant::now();
-            while !pump.stop.load(Ordering::Relaxed) {
+            loop {
+                let Some(pump) = pump.upgrade() else {
+                    break;
+                };
+                if pump.stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 if !drive_once(&session, STREAM_POLL) {
                     let closed = match session.shared.lock() {
                         Ok(conn) => conn.is_closed(),
@@ -257,7 +263,9 @@ impl Driver {
                     }
                 }
             }
-            pump.alive.store(false, Ordering::Relaxed);
+            if let Some(pump) = pump.upgrade() {
+                pump.alive.store(false, Ordering::Relaxed);
+            }
         });
     }
 }
@@ -2395,6 +2403,30 @@ enum Auth {
     Refused,
 }
 
+/// Cover replies read a file, so a flood of unauthenticated requests gets a bounded worker set instead of a thread each.
+const COVER_WORKERS_MAX: usize = 64;
+
+static COVER_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+struct CoverSlot;
+
+impl CoverSlot {
+    fn acquire() -> Option<Self> {
+        COVER_WORKERS
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |workers| {
+                (workers < COVER_WORKERS_MAX).then_some(workers + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for CoverSlot {
+    fn drop(&mut self) {
+        COVER_WORKERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn auth_exchange(
     sock: &Arc<crate::quic::Datagram>,
     conn: &mut quiche::Connection,
@@ -2424,10 +2456,14 @@ fn auth_exchange(
         inbound.auth_buf.clear();
         let peer = peer.to_string();
         if let Some(shared) = background {
+            let Some(slot) = CoverSlot::acquire() else {
+                return Some(Auth::Refused);
+            };
             let shared = Arc::clone(shared);
             let sock = Arc::clone(sock);
             let masq = masq.clone();
             std::thread::spawn(move || {
+                let _slot = slot;
                 let mut reply = Vec::new();
                 masq_bytes(&masq, &request, Some(&peer), &mut reply);
                 if let Ok(mut conn) = shared.lock() {
@@ -3064,9 +3100,10 @@ mod tests {
             out.clear();
             serve_file(std::hint::black_box(&root), &request, &mut out);
         });
+        // Windows' canonicalize opens two more for its verbatim prefix; the rest is this tree's.
         assert_eq!(
             counts.allocs,
-            floor.allocs + 4,
+            floor.allocs + if cfg!(windows) { 6 } else { 4 },
             "the root's resolution, the request's resolution and their joins are all the answer adds to the platform's own read"
         );
         let _ = std::fs::remove_dir_all(&dir);

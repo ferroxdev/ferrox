@@ -577,8 +577,14 @@ fn server_config(
 struct UdpFlow {
     target: Arc<UdpSocket>,
     defrag: Defrag,
-    last: Instant,
+    last: Arc<Mutex<Instant>>,
     stop: Arc<AtomicBool>,
+}
+
+fn touch(last: &Arc<Mutex<Instant>>) {
+    if let Ok(mut last) = last.lock() {
+        *last = Instant::now();
+    }
 }
 
 #[derive(Default)]
@@ -662,17 +668,19 @@ fn open_udp(
     target.set_read_timeout(Some(UDP_POLL)).ok()?;
     let target = Arc::new(target);
     let stop = Arc::new(AtomicBool::new(false));
+    let last = Arc::new(Mutex::new(Instant::now()));
     std::thread::spawn({
         let shared = Arc::clone(shared);
         let sock = Arc::clone(sock);
         let target = Arc::clone(&target);
+        let last = Arc::clone(&last);
         let stop = Arc::clone(&stop);
-        move || udp_reader(&shared, &sock, &target, &stop, session)
+        move || udp_reader(&shared, &sock, &target, &last, &stop, session)
     });
     Some(UdpFlow {
         target,
         defrag: Defrag::new(),
-        last: Instant::now(),
+        last,
         stop,
     })
 }
@@ -710,6 +718,7 @@ fn udp_reader(
     shared: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<crate::quic::Datagram>,
     target: &Arc<UdpSocket>,
+    last: &Arc<Mutex<Instant>>,
     stop: &AtomicBool,
     session: u32,
 ) {
@@ -740,6 +749,7 @@ fn udp_reader(
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        touch(last);
         let Ok(mut conn) = shared.lock() else {
             break;
         };
@@ -853,7 +863,7 @@ fn relay_datagrams(
         };
         let mut assembled = Vec::new();
         let whole = flow.defrag.feed(&message, &mut assembled);
-        flow.last = Instant::now();
+        touch(&flow.last);
         let forged = whole.is_err();
         match whole {
             Ok(Some(message)) => {
@@ -1089,7 +1099,11 @@ impl Router<'_> {
             inbound.send.bump();
             if let Ok(mut lane) = inbound.udp.lock() {
                 lane.flows.retain(|_, flow| {
-                    if now.duration_since(flow.last) > *udp_idle {
+                    let idle = flow
+                        .last
+                        .lock()
+                        .is_ok_and(|last| now.duration_since(*last) > *udp_idle);
+                    if idle {
                         flow.stop.store(true, Ordering::Relaxed);
                         false
                     } else {
@@ -1383,9 +1397,11 @@ mod tests {
                 UdpFlow {
                     target: Arc::new(target),
                     defrag: Defrag::new(),
-                    last: Instant::now()
-                        .checked_sub(Duration::from_secs(6))
-                        .expect("six seconds ago"),
+                    last: Arc::new(Mutex::new(
+                        Instant::now()
+                            .checked_sub(Duration::from_secs(6))
+                            .expect("six seconds ago"),
+                    )),
                     stop: Arc::clone(&stop),
                 },
             );
@@ -1548,11 +1564,12 @@ mod tests {
             .expect("queues a datagram");
 
         let stop = AtomicBool::new(true);
+        let last = Arc::new(Mutex::new(Instant::now()));
         let reader = std::thread::spawn({
             let shared = Arc::clone(&shared);
             let sock = Arc::clone(&sock);
             let target = Arc::clone(&target);
-            move || udp_reader(&shared, &sock, &target, &stop, 7)
+            move || udp_reader(&shared, &sock, &target, &last, &stop, 7)
         });
         reader.join().expect("the reader ends");
 
@@ -1586,12 +1603,14 @@ mod tests {
         let sender = UdpSocket::bind("127.0.0.1:0").expect("binds the sender");
 
         let stop = Arc::new(AtomicBool::new(false));
+        let last = Arc::new(Mutex::new(Instant::now()));
         let reader = std::thread::spawn({
             let shared = Arc::clone(&shared);
             let sock = Arc::clone(&sock);
             let target = Arc::clone(&target);
+            let last = Arc::clone(&last);
             let stop = Arc::clone(&stop);
-            move || udp_reader(&shared, &sock, &target, stop.as_ref(), 7)
+            move || udp_reader(&shared, &sock, &target, &last, stop.as_ref(), 7)
         });
         std::thread::sleep(Duration::from_millis(100));
         assert!(!reader.is_finished(), "the reader should be waiting");

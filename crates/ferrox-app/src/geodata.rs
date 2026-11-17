@@ -646,6 +646,10 @@ pub(crate) fn start(
                 ) {
                     eprintln!("geodata: scheduled reload failed: {reason}");
                 }
+                let now = SystemTime::now();
+                if now > anchor {
+                    anchor = now;
+                }
             }
         });
 }
@@ -1126,7 +1130,8 @@ fn resolve_location(base: &str, location: &str) -> Result<String, String> {
     }
     let url = HttpUrl::parse(base)?;
     if location.starts_with(['?', '#']) {
-        return Ok(format!("https://{}{}{}", url.authority, url.path, location));
+        let path = url.path.split('?').next().unwrap_or("/");
+        return Ok(format!("https://{}{}{}", url.authority, path, location));
     }
     let path = if location.starts_with('/') {
         location.to_owned()
@@ -1516,6 +1521,14 @@ mod tests {
         );
         let error = parse(&root, &[dir]).expect_err("only the rules dataset carries .dat.gz");
         assert!(error.contains(".dat"), "{error}");
+    }
+
+    #[test]
+    fn a_query_redirect_replaces_the_query_it_names() {
+        assert_eq!(
+            resolve_location("https://example.test/a?old=1", "?new=2").expect("joined"),
+            "https://example.test/a?new=2"
+        );
     }
 
     #[test]

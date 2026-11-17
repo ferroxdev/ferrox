@@ -280,7 +280,7 @@ fn exchange(
             }
             T_HEADERS | T_CONT => {
                 let payload = if kind == T_HEADERS {
-                    unframe(flags, &payload)?
+                    unframe(flags, &payload, true)?
                 } else {
                     &payload
                 };
@@ -304,7 +304,7 @@ fn exchange(
             }
             T_DATA => {
                 if id == 1 {
-                    let payload = unframe(flags, &payload)?;
+                    let payload = unframe(flags, &payload, false)?;
                     if body.len() + payload.len() > ferrox_core::dns::MESSAGE_MAX {
                         return Err("dns doh answer over the message bound".to_owned());
                     }
@@ -329,7 +329,7 @@ fn exchange(
 
 /// The payload without the padding and priority fields a frame's flags announce, so a valid
 /// padded answer is decoded rather than handed to the DNS reader as damaged bytes.
-fn unframe(flags: u8, payload: &[u8]) -> Result<&[u8], String> {
+fn unframe(flags: u8, payload: &[u8], priority: bool) -> Result<&[u8], String> {
     let mut body = payload;
     if flags & F_PADDED != 0 {
         let Some((&padding, rest)) = body.split_first() else {
@@ -341,7 +341,7 @@ fn unframe(flags: u8, payload: &[u8]) -> Result<&[u8], String> {
         }
         body = &rest[..rest.len() - padding];
     }
-    if flags & F_PRIORITY != 0 {
+    if priority && flags & F_PRIORITY != 0 {
         if body.len() < 5 {
             return Err("dns doh priority field is short".to_owned());
         }
@@ -383,6 +383,20 @@ mod tests {
             (counts.zeroed, counts.zeroed_bytes),
             (1, 12),
             "the room is zeroed once: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn a_priority_flag_does_not_apply_to_data() {
+        let data = [0, 0, 0, 0, 1, b'd', b'n', b's'];
+        assert_eq!(
+            super::unframe(crate::h2::F_PRIORITY, &data, false),
+            Ok(&data[..])
+        );
+        let headers = [0, 0, 0, 0, 1, b':', b' ', b'a'];
+        assert_eq!(
+            super::unframe(crate::h2::F_PRIORITY, &headers, true),
+            Ok(&headers[5..])
         );
     }
 

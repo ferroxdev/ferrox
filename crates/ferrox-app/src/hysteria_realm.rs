@@ -267,12 +267,25 @@ impl<R: BufRead> ChunkedReader<R> {
         }
     }
 
-    fn next_size(&mut self) -> std::io::Result<usize> {
+    fn line(&mut self) -> std::io::Result<Option<String>> {
         let mut line = String::new();
-        if self.inner.read_line(&mut line)? == 0 {
+        if (&mut self.inner).take(1024).read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        if !line.ends_with('\n') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk line too long",
+            ));
+        }
+        Ok(Some(line))
+    }
+
+    fn next_size(&mut self) -> std::io::Result<usize> {
+        let Some(line) = self.line()? else {
             self.done = true;
             return Ok(0);
-        }
+        };
         let size = line
             .trim()
             .split(';')
@@ -282,10 +295,8 @@ impl<R: BufRead> ChunkedReader<R> {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size")
             })?;
         if size == 0 {
-            loop {
-                let mut trailer = String::new();
-                if self.inner.read_line(&mut trailer)? == 0 || trailer == "\r\n" || trailer == "\n"
-                {
+            while let Some(trailer) = self.line()? {
+                if trailer == "\r\n" || trailer == "\n" {
                     break;
                 }
             }
@@ -1253,6 +1264,13 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn a_chunk_size_line_is_bounded() {
+        let mut reader = ChunkedReader::new(std::io::Cursor::new(vec![b'a'; 1100]));
+        let error = reader.read(&mut [0u8; 8]).expect_err("too long");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     /// A malformed peer is dropped before the walk, so it can never become a punch destination;
     /// the valid peers the same response names still reach the candidate list.

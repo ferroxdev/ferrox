@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -338,19 +339,41 @@ impl Api {
         let Some(address) = self.config.listen.clone() else {
             return;
         };
-        let target = match crate::conn::parse_target(&address) {
-            Ok(target) => target,
-            Err(error) => {
-                eprintln!("commander: cannot resolve {address}: {error}");
-                return;
+        let targets = if address.starts_with("unix:") {
+            match crate::conn::parse_target(&address) {
+                Ok(target) => vec![target],
+                Err(error) => {
+                    eprintln!("commander: cannot resolve {address}: {error}");
+                    return;
+                }
+            }
+        } else {
+            match address.to_socket_addrs() {
+                Ok(addrs) => addrs.map(crate::conn::Target::Ip).collect(),
+                Err(error) => {
+                    eprintln!("commander: cannot resolve {address}: {error}");
+                    return;
+                }
             }
         };
-        let listener = match crate::conn::Listener::bind(&target) {
-            Ok(listener) => listener,
-            Err(error) => {
-                eprintln!("commander: cannot listen on {address}: {error}");
-                return;
+        let mut last = None;
+        let mut listener = None;
+        for target in &targets {
+            match crate::conn::Listener::bind(target) {
+                Ok(bound) => {
+                    listener = Some(bound);
+                    break;
+                }
+                Err(error) => last = Some(error),
             }
+        }
+        let Some(listener) = listener else {
+            let error = last.map_or_else(
+                || "address resolved to nothing".to_owned(),
+                |e| e.to_string(),
+            );
+            eprintln!("commander: cannot listen on {address}: {error}");
+            return;
         };
         let api = Arc::clone(self);
         thread::spawn(move || {

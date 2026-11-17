@@ -42,12 +42,16 @@ pub(crate) struct Flow {
     carrier: Arc<Carrier>,
     id: u16,
     replies: Option<Receiver<Msg>>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Flow {
     /// One bulk `Keep`; the carrier's writer lock keeps concurrent sessions from interleaving and
     /// the whole payload leaves in one vectored write.
     pub(crate) fn send(&self, data: &[u8]) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
         self.carrier.keep(self.id, data)
     }
 
@@ -57,6 +61,9 @@ impl Flow {
     }
 
     pub(crate) fn end_upload(&self) {
+        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         self.carrier
             .frame(self.id, mux::Status::End, 0, None, None, &[]);
     }
@@ -108,7 +115,7 @@ pub(crate) type Deliver = Arc<dyn Fn(&[u8], Option<SocketAddr>) + Send + Sync>;
 
 #[derive(Clone)]
 enum Sink {
-    Tcp(SyncSender<Msg>),
+    Tcp(SyncSender<Msg>, Arc<std::sync::atomic::AtomicBool>),
     Udp(Deliver, Arc<std::sync::atomic::AtomicBool>),
 }
 
@@ -347,7 +354,7 @@ impl Carrier {
             Err(poisoned) => poisoned.into_inner(),
         };
         for (_, sink) in table.sinks.drain() {
-            if let Sink::Tcp(sender) = sink {
+            if let Sink::Tcp(sender, _) = sink {
                 let _ = sender.try_send(Msg {
                     data: Vec::new(),
                     end: true,
@@ -418,7 +425,7 @@ impl Carrier {
         };
         let target = frame.target.as_ref().and_then(sockaddr);
         match sink {
-            Sink::Tcp(sender) => {
+            Sink::Tcp(sender, closed) => {
                 let data = frame.data.unwrap_or(&[]);
                 let msg = Msg {
                     data: data.to_vec(),
@@ -428,6 +435,8 @@ impl Carrier {
                     sender.try_send(msg),
                     Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
                 ) {
+                    closed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.frame(frame.id, mux::Status::End, 0, None, None, &[]);
                     self.release(frame.id);
                 }
             }
@@ -606,9 +615,10 @@ impl Manager {
 
     /// One TCP session, on the first carrier with room or on a fresh one.
     pub(crate) fn dial(&self, target: &mux::Target<'_>) -> Option<Flow> {
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (carrier, id, replies) = self.reserve(|_| {
             let (send, replies) = sync_channel(REPLIES);
-            (Sink::Tcp(send), replies)
+            (Sink::Tcp(send, Arc::clone(&closed)), replies)
         })?;
         if !carrier.frame(id, mux::Status::New, mux::DATA, Some(*target), None, &[]) {
             carrier.release(id);
@@ -618,6 +628,7 @@ impl Manager {
             carrier,
             id,
             replies: Some(replies),
+            closed,
         })
     }
 

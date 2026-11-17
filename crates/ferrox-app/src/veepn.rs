@@ -353,10 +353,12 @@ impl VeepnOut {
             silence,
         });
         if let Ok(mut plane) = self.plane.lock() {
-            plane.lists.insert(
-                region.to_owned(),
-                (Arc::clone(&list), now.saturating_add(veepn::SERVERS_TTL)),
-            );
+            if plane.generation == generation {
+                plane.lists.insert(
+                    region.to_owned(),
+                    (Arc::clone(&list), now.saturating_add(veepn::SERVERS_TTL)),
+                );
+            }
         }
         Ok(list)
     }

@@ -718,7 +718,7 @@ impl Flow {
         &self.nonce
     }
     fn seal_onto(&mut self, plain: &[u8], out: &mut Vec<u8>) -> bool {
-        if self.counter == u16::MAX {
+        if !matches!(self.aead, Aead::Plain) && self.counter == u16::MAX {
             return false;
         }
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
@@ -755,7 +755,7 @@ impl Flow {
         true
     }
     fn open_chunk(&mut self, chunk: &mut [u8]) -> Option<usize> {
-        if self.counter == u16::MAX {
+        if !matches!(self.aead, Aead::Plain) && self.counter == u16::MAX {
             return None;
         }
         let plain_len = match &self.aead {
