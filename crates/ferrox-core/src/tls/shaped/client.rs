@@ -1697,6 +1697,9 @@ impl<S: Stream> TlsProvider for Session<S> {
         if !self.done {
             return Err(std::io::Error::other("shaped: handshake incomplete"));
         }
+        if !self.close.is_empty() || self.close_sent {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotConnected));
+        }
         if let Some(layer) = &mut self.ktls {
             return layer.seal_into(&[plaintext], out);
         }
@@ -1708,6 +1711,9 @@ impl<S: Stream> TlsProvider for Session<S> {
     fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
         if !self.done {
             return Err(std::io::Error::other("shaped: handshake incomplete"));
+        }
+        if !self.close.is_empty() || self.close_sent {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotConnected));
         }
         if let Some(layer) = &mut self.ktls {
             layer.seal_into(parts, out)?;
@@ -2693,7 +2699,7 @@ mod tests {
         subject.done = true;
         subject.close_notify().expect("close");
         assert!(subject.close_sent);
-        assert!(!subject.io.wire.is_empty());
+        assert_ne!(subject.io.wire.len(), 0);
     }
 
     #[test]
@@ -2704,6 +2710,16 @@ mod tests {
         let before = subject.io.wire.len();
         let error = subject.write(b"late").expect_err("closed for writing");
         assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+        let mut out = Vec::new();
+        let error = subject
+            .seal_into(b"late", &mut out)
+            .expect_err("closed for sealing");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+        let error = subject
+            .seal_slices_into(&[b"late"], &mut out)
+            .expect_err("closed for sealing");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+        assert!(out.is_empty());
         assert_eq!(subject.io.wire.len(), before);
     }
 
