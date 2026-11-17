@@ -195,7 +195,7 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: crates/ferrox-core/src/tls/mod.rs, crates/ferrox-core/src/tls/reality.rs, crates/ferrox-core/src/tls/rustls_backend.rs, crates/ferrox-core/src/tls/cipher_suites.rs
-- symbols: reality, dial_tls_session, session_halves, TlsHalf, Sealed, Drivable, FrameWrite, WriteClock, arm_write, json_path, an_outbound_trusts_the_certificates_its_config_names, a_named_anchor_joins_the_platform_store, a_certificate_list_serves_the_name_its_sni_asks_for, an_entry_xray_cannot_load_is_skipped_not_refused, a_file_backed_listener_reloads_the_certificate_it_serves, a_file_backed_listener_rereads_on_its_ticker
+- symbols: reality, dial_tls_session, session_halves, TlsHalf, Sealed, Drivable, FrameWrite, SealedWire, arm_write, json_path, an_outbound_trusts_the_certificates_its_config_names, a_named_anchor_joins_the_platform_store, a_certificate_list_serves_the_name_its_sni_asks_for, an_entry_xray_cannot_load_is_skipped_not_refused, a_file_backed_listener_reloads_the_certificate_it_serves, a_file_backed_listener_rereads_on_its_ticker
 - oracle: reality
 - scenarios: vless-tls-raw, vless-reality
 - go: ./transport/internet/tls/...

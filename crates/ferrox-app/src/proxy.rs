@@ -20856,19 +20856,19 @@ fn dial_tls_session(
     Some(session)
 }
 
-// The handle a split's writer puts its records on: a socket becomes the sealed wire itself, so the write clock lives on the handle that sends and the split buys no second descriptor for it.
-trait WriteClock: Write + Send + Sized + 'static {
-    fn into_sealed(self) -> Sealed;
+// The handle a split's writer puts its records on: a socket becomes the sealed wire itself, so the clock lives on the handle that sends and the split buys no second descriptor for it.
+trait SealedWire: Write + Send + Sized + 'static {
+    fn sealed(self) -> Sealed;
 }
 
-impl WriteClock for Connection {
-    fn into_sealed(self) -> Sealed {
+impl SealedWire for Connection {
+    fn sealed(self) -> Sealed {
         Sealed::wired(self)
     }
 }
 
-impl WriteClock for KcpIo {
-    fn into_sealed(self) -> Sealed {
+impl SealedWire for KcpIo {
+    fn sealed(self) -> Sealed {
         Sealed::new(self)
     }
 }
@@ -20876,7 +20876,7 @@ impl WriteClock for KcpIo {
 // One session, two owners: the reader drives the transport when the session exposes one, so its parked read holds no session lock.
 fn session_halves<S, W>(session: S, transport: W) -> (TlsHalf<S>, TlsHalf<S>)
 where
-    W: WriteClock,
+    W: SealedWire,
     S: ferrox_core::tls::TlsProvider
         + ferrox_core::tls::RecordAlignment
         + Drivable
@@ -20884,7 +20884,7 @@ where
         + 'static,
 {
     // A socket's writer sends on the handle it was handed, so the split spends no second duplicate on a clock.
-    let out = Arc::new(Mutex::new(transport.into_sealed()));
+    let out = Arc::new(Mutex::new(transport.sealed()));
     let cipher = session.transport().and_then(|cipher| {
         cipher
             .set_read_timeout(Some(RELAY_POLL))
@@ -65690,8 +65690,8 @@ mod tests {
         }
     }
 
-    impl WriteClock for CountedTransport {
-        fn into_sealed(self) -> Sealed {
+    impl SealedWire for CountedTransport {
+        fn sealed(self) -> Sealed {
             Sealed::new(self)
         }
     }
