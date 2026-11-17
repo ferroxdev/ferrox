@@ -903,11 +903,7 @@ struct ServerContext {
 
 fn read_server(reader: &mut dyn Read, session: &Arc<Session>, context: &Arc<ServerContext>) {
     let shared = Arc::clone(&session.shared);
-    loop {
-        let frame = match read_frame(reader, &shared.alive) {
-            Ok(Some(frame)) => frame,
-            Ok(None) | Err(_) => break,
-        };
+    while let Ok(Some(frame)) = read_frame(reader, &shared.alive) {
         if !shared.alive() {
             break;
         }
@@ -1020,9 +1016,8 @@ fn serve_stream(stream: AnyTlsStream, context: &ServerContext) {
 
 fn read_loop(reader: &mut dyn Read, shared: &Arc<Shared>) {
     while shared.alive() {
-        let frame = match read_frame(reader, &shared.alive) {
-            Ok(Some(frame)) => frame,
-            Ok(None) | Err(_) => break,
+        let Ok(Some(frame)) = read_frame(reader, &shared.alive) else {
+            break;
         };
         match frame.command {
             PSH => {
