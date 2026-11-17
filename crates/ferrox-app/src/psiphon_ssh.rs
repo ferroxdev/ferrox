@@ -24,7 +24,7 @@ pub(crate) const KEY_LENGTH: usize = 16;
 pub(crate) const MIN_PADDING: usize = 32;
 pub(crate) const MAX_PADDING: usize = 8192;
 const MAX_PACKET: usize = 256 * 1024;
-pub(crate) const DEFAULT_CHANNEL_WINDOW: u32 = 2 * 1024 * 1024;
+pub(crate) const DEFAULT_CHANNEL_WINDOW: u32 = 4 * 1024 * 1024;
 pub(crate) const CHANNEL_PACKET: u32 = 32 * 1024;
 /// The reference's packet tunnel window is counted in 32 KiB packets; 0, or a
 /// value outside 1..=128, uses its default of 16.
@@ -44,6 +44,8 @@ fn window_adjust_at(window: u32) -> u64 {
     WINDOW_ADJUST_AT.min(u64::from(window) / 2)
 }
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
+/// A flow's channel retires its session after this long without a payload.
+const CHANNEL_IDLE: Duration = Duration::from_secs(60);
 
 /// The reference's `SSHKeepAlive*` window: a jittered period, random padding,
 /// an inactivity gate, and a reply deadline.
@@ -2674,12 +2676,20 @@ impl Channel {
             if recv.eof || recv.closed || self.session.closed.load(Ordering::Acquire) {
                 return Ok(None);
             }
-            let (guard, _) = self
+            let (guard, timeout) = self
                 .state
                 .cond
-                .wait_timeout(recv, IO_TIMEOUT)
+                .wait_timeout(recv, CHANNEL_IDLE)
                 .unwrap_or_else(PoisonError::into_inner);
             recv = guard;
+            if timeout.timed_out() {
+                drop(recv);
+                self.session.close();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "psiphon channel idle",
+                ));
+            }
             if recv.chunks.is_empty() && (recv.eof || recv.closed) {
                 return Ok(None);
             }
@@ -2723,12 +2733,20 @@ impl Channel {
             if recv.eof || recv.closed || self.session.closed.load(Ordering::Acquire) {
                 return Ok(false);
             }
-            let (guard, _) = self
+            let (guard, timeout) = self
                 .state
                 .cond
-                .wait_timeout(recv, IO_TIMEOUT)
+                .wait_timeout(recv, CHANNEL_IDLE)
                 .unwrap_or_else(PoisonError::into_inner);
             recv = guard;
+            if timeout.timed_out() {
+                drop(recv);
+                self.session.close();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "psiphon channel idle",
+                ));
+            }
             if recv.chunks.is_empty() && (recv.eof || recv.closed) {
                 return Ok(false);
             }

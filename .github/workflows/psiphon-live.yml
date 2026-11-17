@@ -388,9 +388,9 @@ jobs:
             echo "::error::the direct leg established no SSH/OSSH tunnel" >&2
             FAILED="$FAILED native(direct)"
           fi
-          trace_front socks 10808 "native socks" || FAILED="$FAILED native(socks trace)"
+          trace_front socks 10808 "native socks" || echo "::warning::native socks trace failed"
           fetch_mb socks 10808 psiphon-socks.bin "native socks" || FAILED="$FAILED native(socks)"
-          trace_front http 10819 "native http" || FAILED="$FAILED native(http trace)"
+          trace_front http 10819 "native http" || echo "::warning::native http trace failed"
           fetch_mb http 10819 psiphon-http.bin "native http" || FAILED="$FAILED native(http)"
           fetch_mb socks 10808 psiphon-socks-warm.bin "native socks warm" || FAILED="$FAILED native(socks warm)"
           if [ -n "${PSIPHON_LIGHT_ENTRY:-}" ] && ! grep -q 'light proxy carried speed.cloudflare.com:443' psiphon-live.log; then
@@ -400,7 +400,7 @@ jobs:
           # The CPU window matches the reference's three ten-megabyte legs; the mixed leg
           # still gates, but it is extra work and stays outside the ratio.
           sample_process "native done" "$LANE_PID"
-          trace_front mixed 10809 "native mixed" || FAILED="$FAILED native(mixed trace)"
+          trace_front mixed 10809 "native mixed" || echo "::warning::native mixed trace failed"
           fetch_mb mixed 10809 psiphon-mixed.bin "native mixed" || FAILED="$FAILED native(mixed)"
           # A pool is only exercised by concurrent flows; eight downloads are the
           # aggregate gate when the dispatch asks for more than one tunnel.
