@@ -482,17 +482,21 @@ fn validate_delay(delay: DelayRange) -> io::Result<()> {
     Ok(())
 }
 
-fn random_delay(delay: DelayRange) -> io::Result<Duration> {
+fn delay_span(delay: DelayRange) -> io::Result<u64> {
     validate_delay(delay)?;
-    if delay.min == delay.max {
+    u64::try_from(delay.max.saturating_sub(delay.min).as_nanos())
+        .ok()
+        .and_then(|nanos| nanos.checked_add(1))
+        .ok_or_else(|| io::Error::other("select padding delay: span too large"))
+}
+
+fn random_delay(delay: DelayRange) -> io::Result<Duration> {
+    let span = delay_span(delay)?;
+    if span == 1 {
         return Ok(delay.min);
     }
-    let span = u64::try_from(delay.max.saturating_sub(delay.min).as_millis())
-        .ok()
-        .and_then(|millis| millis.checked_add(1))
-        .ok_or_else(|| io::Error::other("select padding delay: span too large"))?;
     let offset = random_below(span)?;
-    Ok(delay.min + Duration::from_millis(offset))
+    Ok(delay.min + Duration::from_nanos(offset))
 }
 
 pub(crate) fn random_index(length: usize) -> io::Result<usize> {
@@ -590,6 +594,16 @@ mod tests {
             max_length,
             ..Turn::default()
         }
+    }
+
+    #[test]
+    fn a_sub_millisecond_delay_span_keeps_its_nanoseconds() {
+        let delay = DelayRange {
+            min: Duration::ZERO,
+            max: Duration::from_nanos(1),
+        };
+        assert_eq!(delay_span(delay).expect("span"), 2);
+        assert!(random_delay(delay).expect("delay") <= delay.max);
     }
 
     #[test]
