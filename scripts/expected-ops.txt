@@ -346,7 +346,11 @@ ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_co
 # `hello_shape` once before the dispatch, so the cuts, the gather and the bytes
 # are unchanged and the probe still resets both counters per turn. The probe
 # times one hello per stream, as the gate intends. ops.yml run 44120794571.
-ferrox_core::finalmask::tests::merged_hello_probe 348194 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
+# Re-blessed 349989 by `hello_skip`, the counter that keeps a forwarded record's
+# continuation out of the cutter: one branch per turn, no new draw, copy or
+# write, and the probe still resets every counter it uses. ops.yml run
+# 44130371666.
+ferrox_core::finalmask::tests::merged_hello_probe 349989 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
 # The client request built by `request`: one address type byte, the address and
 # the port, written in one match with the vector's room reserved exactly once,
 # through `spare_capacity_mut` and one `copy_nonoverlapping` per field so no
