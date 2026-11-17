@@ -44,6 +44,7 @@ pub struct PacketStream<R, W> {
     keepalive: Option<JoinHandle<()>>,
     /// A keep-alive answer whose frame drain was refused, kept so the next read retries it.
     pending_keepalive: Mutex<Option<PendingKeepalive>>,
+    has_pending_keepalive: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -213,6 +214,7 @@ where
             stop,
             keepalive,
             pending_keepalive: Mutex::new(None),
+            has_pending_keepalive: AtomicBool::new(false),
         }
     }
 }
@@ -252,16 +254,21 @@ impl<R, W: Write> PacketStream<R, W> {
     }
 
     fn flush_pending_keepalive(&self) -> io::Result<()> {
+        if !self.has_pending_keepalive.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let mut slot = self
             .pending_keepalive
             .lock()
             .map_err(|_| io::Error::other("packet stream keepalive poisoned"))?;
         let Some(pending) = slot.as_mut() else {
+            self.has_pending_keepalive.store(false, Ordering::Release);
             return Ok(());
         };
         let result = self.write_keepalive(pending);
         if !matches!(&result, Err(error) if retryable(error.kind())) {
             *slot = None;
+            self.has_pending_keepalive.store(false, Ordering::Release);
         }
         result
     }
@@ -307,6 +314,7 @@ impl<R: Read, W: Write> Read for &PacketStream<R, W> {
             .reader
             .lock()
             .map_err(|_| io::Error::other("packet stream reader poisoned"))?;
+        self.flush_pending_keepalive()?;
         if reader.pending_end > reader.pending_start {
             let taken = output.len().min(reader.pending_end - reader.pending_start);
             output[..taken].copy_from_slice(
@@ -341,6 +349,7 @@ impl<R: Read, W: Write> Read for &PacketStream<R, W> {
                             .lock()
                             .map_err(|_| io::Error::other("packet stream keepalive poisoned"))? =
                             Some(PendingKeepalive { id, queued: false });
+                        self.has_pending_keepalive.store(true, Ordering::Release);
                         self.flush_pending_keepalive()?;
                     }
                 }
@@ -721,6 +730,7 @@ mod tests {
             id: 7,
             queued: false,
         });
+        partial.has_pending_keepalive.store(true, Ordering::Release);
         assert_eq!(
             partial
                 .flush_pending_keepalive()
@@ -744,6 +754,7 @@ mod tests {
             id: 7,
             queued: false,
         });
+        flush.has_pending_keepalive.store(true, Ordering::Release);
         assert_eq!(
             flush
                 .flush_pending_keepalive()
@@ -986,7 +997,6 @@ mod tests {
             .expect("reader")
             .buffer
             .extend_from_slice(&wire);
-        drop(client.pending_keepalive.lock().expect("pending keepalive"));
         let mut got = vec![0; payload.len()];
         let mut first = [0u8; 4096];
         let (read, counts) = crate::alloc_count::measure(|| client.read(&mut first));
@@ -1026,6 +1036,35 @@ mod tests {
             "the tail drains before another event is parsed"
         );
         client.shutdown();
+    }
+
+    #[test]
+    fn a_read_does_not_wait_for_an_empty_keepalive_slot() {
+        let mut body = Vec::new();
+        write_string(&mut body, CHANNEL).expect("channel");
+        body.extend_from_slice(b"hello");
+        let wire = frame(CLIENTBOUND_CUSTOM_PAYLOAD, &body);
+        let stream = PacketStream::new(std::io::Cursor::new(wire), Pipe::new(), true);
+        let reader_stream = &stream;
+
+        let result = std::thread::scope(|scope| {
+            let pending = stream.pending_keepalive.lock().expect("pending");
+            let (sender, receiver) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let mut output = [0u8; 5];
+                let mut reader = reader_stream;
+                let _ = sender.send(reader.read(&mut output).map(|read| (read, output)));
+            });
+            let result = receiver.recv_timeout(Duration::from_secs(1));
+            drop(pending);
+            result
+        });
+
+        let (read, output) = result
+            .expect("a read waited on an empty keepalive slot")
+            .expect("the read succeeds");
+        assert_eq!(read, 5);
+        assert_eq!(&output[..read], b"hello");
     }
 
     #[test]
