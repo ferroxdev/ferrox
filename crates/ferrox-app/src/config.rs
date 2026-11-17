@@ -1355,8 +1355,8 @@ pub(crate) fn outbound_tls(
 /// The `ClientHello` cut a TLS outbound arms. `evasion.fragment` is the same stage the raw carrier's
 /// `finalmask.tcp` names; sing-box's `tlsSettings.fragment` cuts the first write at a random byte and
 /// `recordFragment` puts one record boundary inside every server-name label, with
-/// `fragmentFallbackDelay` between the pieces. A stage that cannot advance is refused, never sent
-/// whole, because a config that asked for a cut and got none is the silent no-op this row fixes.
+/// `fragmentFallbackDelay` between the pieces. A stage that cannot be built is refused, because a
+/// config that asked for a cut and got none is the silent no-op this row fixes.
 fn outbound_tls_fragment(
     tls: Option<&Json>,
     outbound: &Json,
