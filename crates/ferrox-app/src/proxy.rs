@@ -16179,16 +16179,15 @@ fn tun_addresses<'a>(inbound: &'a Json, key: &str) -> Result<Vec<&'a str>, Strin
     }
 }
 
-/// The configured addresses from the first key that carries any: `address`, else the deprecated `inet4_address`/`inet6_address`, with `prefix` filling a missing CIDR.
+/// The configured addresses: the `address` list when it carries any, else both deprecated `inet4_address` and `inet6_address`, with `prefix` filling a missing CIDR.
 fn tun_device_addresses(inbound: &Json) -> Result<(Vec<&str>, Option<u32>), String> {
     let prefix = tun_u32(inbound, "prefix")?;
-    for key in ["address", "inet4_address", "inet6_address"] {
-        let found = tun_addresses(inbound, key)?;
-        if !found.is_empty() {
-            return Ok((found, prefix));
-        }
+    let mut found = tun_addresses(inbound, "address")?;
+    if found.is_empty() {
+        found.extend(tun_addresses(inbound, "inet4_address")?);
+        found.extend(tun_addresses(inbound, "inet6_address")?);
     }
-    Ok((Vec::new(), prefix))
+    Ok((found, prefix))
 }
 
 /// An optional boolean, refusing a non-boolean.
@@ -16335,13 +16334,6 @@ fn warn_unapplied_tun_options(inbound: &Json, native: bool) {
             unapplied.join(", ")
         );
     }
-    let addresses: usize = ["address", "inet4_address", "inet6_address"]
-        .iter()
-        .map(|key| tun_addresses(inbound, key).map_or(0, |found| found.len()))
-        .sum();
-    if addresses > 1 {
-        eprintln!("tun inbound: the device carries the first of {addresses} configured addresses");
-    }
     // The two datagram switches configure this handler's leg table; the userspace and hybrid engines keep their own.
     if !native
         && (tun_field(inbound, "udp_timeout").is_some()
@@ -16358,20 +16350,22 @@ fn tun_spec(inbound: &Json) -> Result<crate::tun::Spec, String> {
     let name = tun_string(inbound, "name")?.or(tun_string(inbound, "interface_name")?);
     let _ = tun_string(inbound, "stack")?;
     let mtu = tun_u32(inbound, "mtu")?.map(|mtu| mtu as usize);
-    // Every listed prefix is parsed, so a malformed second address is refused rather than dropped; the device carries the first.
     let (listed, prefix) = tun_device_addresses(inbound)?;
-    let mut first = None;
+    let mut addresses = Vec::with_capacity(listed.len());
     for text in &listed {
-        let found = crate::tun::parse_address(Some(text), prefix)?;
-        if first.is_none() {
-            first = Some(found);
+        if let (Some(address), found) = crate::tun::parse_address(Some(text), prefix)? {
+            addresses.push((
+                address,
+                found.unwrap_or_else(|| crate::tun::default_prefix(address)),
+            ));
         }
     }
-    let (address, prefix) = match first {
-        Some(found) => found,
+    let (address, prefix) = match addresses.first() {
+        Some((address, prefix)) => (Some(*address), Some(*prefix)),
         None => crate::tun::parse_address(None, prefix)?,
     };
-    let mut spec = crate::tun::Spec::with(name, mtu, address, prefix, tun_queues(inbound)?);
+    let mut spec = crate::tun::Spec::with(name, mtu, address, prefix, tun_queues(inbound)?)
+        .with_addresses(addresses);
     if let Some(idle) = tun_udp_timeout(inbound)? {
         spec = spec.with_udp_idle(idle);
     }
@@ -41946,6 +41940,7 @@ mod tests {
             r#"{"endpoint_independent_nat":"yes"}"#,
             r#"{"gso":"off"}"#,
             r#"{"address":["10.0.0.1/30","nonsense"]}"#,
+            r#"{"address":["10.0.0.1/30","fd00::1/129"]}"#,
             r#"{"udp_timeout":"5x"}"#,
             r#"{"udp_timeout":"1m30x"}"#,
         ] {
@@ -41971,11 +41966,16 @@ mod tests {
             "10.0.0.1".parse::<std::net::IpAddr>().unwrap()
         );
         assert_eq!(wanted.prefix(), 30);
+        let listed = spec(r#"{"address":["10.1.0.1/30","fd00::1/126"]}"#).expect("an address list");
         assert_eq!(
-            spec(r#"{"address":["10.1.0.1/30","fd00::1/126"]}"#)
-                .expect("an address list")
-                .address(),
+            listed.address(),
             "10.1.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(listed.addresses().len(), 2);
+        assert_eq!(
+            listed.addresses()[1],
+            ("fd00::1".parse::<std::net::IpAddr>().unwrap(), 126),
+            "the device is opened with every address the config names"
         );
         assert_eq!(
             spec(r#"{"udp_timeout":"5m"}"#)

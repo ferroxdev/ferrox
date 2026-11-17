@@ -134,20 +134,72 @@ pub(crate) fn build(
     if !spec.name().is_empty() {
         builder = builder.name(spec.name());
     }
-    builder = match spec.address() {
-        IpAddr::V4(address) => builder.ipv4(address, spec.prefix(), None),
-        IpAddr::V6(address) => builder.ipv6(address, spec.prefix()),
-    };
+    // The builder carries the first IPv4 and nothing else, so an address it refuses is a line from `attach_addresses` rather than a failed open.
+    let mut extra = Vec::new();
+    let mut primary = false;
+    for (address, prefix) in spec.addresses() {
+        match address {
+            IpAddr::V4(address) if !primary => {
+                builder = builder.ipv4(*address, *prefix, None);
+                primary = true;
+            }
+            IpAddr::V4(address) => extra.push((IpAddr::V4(*address), *prefix)),
+            IpAddr::V6(address) => extra.push((IpAddr::V6(*address), *prefix)),
+        }
+    }
     #[cfg(target_os = "linux")]
     let builder = builder.offload(offload).multi_queue(multi);
     #[cfg(not(target_os = "linux"))]
     let builder = builder;
     let device = builder.build_sync()?;
+    attach_addresses(&device, &extra);
     #[cfg(target_os = "linux")]
     let offload = device.tcp_gso();
     #[cfg(not(target_os = "linux"))]
     let _ = (multi, offload);
     Ok((device, offload, multi))
+}
+
+/// Attach the addresses the builder's single IPv4 slot cannot carry: the device is already up with its primary address, so a platform that refuses one says so in a line rather than taking the inbound down.
+fn attach_addresses(device: &SyncDevice, extra: &[(IpAddr, u8)]) {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        for (address, prefix) in extra {
+            let attached = match address {
+                IpAddr::V4(address) => device.add_address_v4(*address, *prefix).is_ok(),
+                IpAddr::V6(address) => device.add_address_v6(*address, *prefix).is_ok(),
+            };
+            if !attached {
+                eprintln!("tun inbound: the device refused the address {address}/{prefix}");
+            }
+        }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    {
+        let _ = device;
+        if !extra.is_empty() {
+            eprintln!(
+                "tun inbound: this platform carries one IPv4 address; {} more left off the device",
+                extra.len()
+            );
+        }
+    }
 }
 
 /// The kernel offers UDP segment offload with the TCP offloads, but this handler dispatches one datagram per read and does not split an aggregate, so the device is narrowed back to the TCP mask the reference takes.
@@ -210,7 +262,11 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
 pub(crate) fn device_config(spec: &Spec) -> DeviceConfig {
     DeviceConfig {
         secret: [0; 32],
-        addresses: vec![spec.address()],
+        addresses: spec
+            .addresses()
+            .iter()
+            .map(|(address, _)| *address)
+            .collect(),
         peers: Vec::new(),
         mtu: spec.mtu(),
         reserved: [0; 3],

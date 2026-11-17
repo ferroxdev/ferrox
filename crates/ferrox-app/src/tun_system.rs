@@ -502,6 +502,12 @@ pub(crate) fn serve(
             ),
         )
     })?;
+    if spec.addresses().len() > 1 {
+        eprintln!(
+            "tun inbound: the system stack NATs the first of {} addresses",
+            spec.addresses().len()
+        );
+    }
     let device = Arc::new(tun_stack::build(spec, false, false)?.0);
     let listener = std::net::TcpListener::bind(listener_address(local, &device.name()?)?)?;
     listener.set_nonblocking(true)?;
