@@ -89,7 +89,6 @@ matrix_server_serves() {
     sing-box:hysteria-v1-*) return 0 ;;
     sing-box:wireguard-*) return 0 ;;
     sing-box:anytls-*) return 0 ;;
-    xray-core:anytls-*|xray-core-rust:anytls-*|xray-rust:anytls-*|zeronet:anytls-*|leaf:anytls-*) return 1 ;;
     xray-core:*-quic-*) return 1 ;;
     sing-box:vless-quic-*) return 0 ;;
     sing-box:*) return 1 ;;
