@@ -43,7 +43,13 @@ pub struct PacketStream<R, W> {
     stop: Arc<AtomicBool>,
     keepalive: Option<JoinHandle<()>>,
     /// A keep-alive answer whose frame drain was refused, kept so the next read retries it.
-    pending_keepalive: Mutex<Option<i64>>,
+    pending_keepalive: Mutex<Option<PendingKeepalive>>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingKeepalive {
+    id: i64,
+    queued: bool,
 }
 
 #[derive(Default)]
@@ -246,33 +252,29 @@ impl<R, W: Write> PacketStream<R, W> {
     }
 
     fn flush_pending_keepalive(&self) -> io::Result<()> {
-        let id = *self
+        let Some(mut pending) = self
             .pending_keepalive
             .lock()
-            .map_err(|_| io::Error::other("packet stream keepalive poisoned"))?;
-        let Some(id) = id else {
+            .map_err(|_| io::Error::other("packet stream keepalive poisoned"))?
+            .take()
+        else {
             return Ok(());
         };
-        match self.write_keepalive(id) {
-            Ok(()) => {
-                *self
-                    .pending_keepalive
-                    .lock()
-                    .map_err(|_| io::Error::other("packet stream keepalive poisoned"))? = None;
-                Ok(())
-            }
-            Err(error) if retryable(error.kind()) => Err(error),
-            Err(error) => {
-                *self
-                    .pending_keepalive
-                    .lock()
-                    .map_err(|_| io::Error::other("packet stream keepalive poisoned"))? = None;
-                Err(error)
-            }
+        let result = self.write_keepalive(&mut pending);
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| retryable(error.kind()))
+        {
+            *self
+                .pending_keepalive
+                .lock()
+                .map_err(|_| io::Error::other("packet stream keepalive poisoned"))? = Some(pending);
         }
+        result
     }
 
-    fn write_keepalive(&self, id: i64) -> io::Result<()> {
+    fn write_keepalive(&self, pending: &mut PendingKeepalive) -> io::Result<()> {
         let mut writer = self
             .writer
             .lock()
@@ -283,9 +285,12 @@ impl<R, W: Write> PacketStream<R, W> {
             .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
         flush_frame(&mut *writer, &mut frame)
             .map_err(|error| io::Error::new(error.kind(), format!("flush frame: {error}")))?;
-        queue_keepalive(&mut frame, id).map_err(|error| {
-            io::Error::new(error.kind(), format!("write minecraft keep-alive: {error}"))
-        })?;
+        if !pending.queued {
+            queue_keepalive(&mut frame, pending.id).map_err(|error| {
+                io::Error::new(error.kind(), format!("write minecraft keep-alive: {error}"))
+            })?;
+            pending.queued = true;
+        }
         flush_frame(&mut *writer, &mut frame).map_err(|error| {
             io::Error::new(error.kind(), format!("write minecraft keep-alive: {error}"))
         })?;
@@ -296,7 +301,7 @@ impl<R, W: Write> PacketStream<R, W> {
 
     #[cfg(test)]
     pub(crate) fn send_keepalive(&self, id: i64) -> io::Result<()> {
-        self.write_keepalive(id)
+        self.write_keepalive(&mut PendingKeepalive { id, queued: false })
     }
 }
 
@@ -343,7 +348,7 @@ impl<R: Read, W: Write> Read for &PacketStream<R, W> {
                             .pending_keepalive
                             .lock()
                             .map_err(|_| io::Error::other("packet stream keepalive poisoned"))? =
-                            Some(id);
+                            Some(PendingKeepalive { id, queued: false });
                         self.flush_pending_keepalive()?;
                     }
                 }
@@ -650,6 +655,104 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    struct PartialThenStall {
+        bytes: Vec<u8>,
+        calls: usize,
+    }
+
+    impl Write for PartialThenStall {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            match self.calls {
+                1 => {
+                    let take = input.len().min(3);
+                    self.bytes.extend_from_slice(&input[..take]);
+                    Ok(take)
+                }
+                2 => Err(io::ErrorKind::WouldBlock.into()),
+                _ => {
+                    self.bytes.extend_from_slice(input);
+                    Ok(input.len())
+                }
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FlushTimesOutOnce {
+        bytes: Vec<u8>,
+        failed: bool,
+    }
+
+    impl Write for FlushTimesOutOnce {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(input);
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.failed {
+                return Ok(());
+            }
+            self.failed = true;
+            Err(io::ErrorKind::TimedOut.into())
+        }
+    }
+
+    #[test]
+    fn a_retried_keepalive_resumes_instead_of_replying_twice() {
+        let expected = frame(KEEPALIVE_PACKET, &7i64.to_be_bytes());
+
+        let partial = PacketStream::new(
+            std::io::Cursor::new(Vec::<u8>::new()),
+            PartialThenStall {
+                bytes: Vec::new(),
+                calls: 0,
+            },
+            true,
+        );
+        *partial.pending_keepalive.lock().expect("pending") = Some(PendingKeepalive {
+            id: 7,
+            queued: false,
+        });
+        assert_eq!(
+            partial
+                .flush_pending_keepalive()
+                .expect_err("the frame stalls")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        partial.flush_pending_keepalive().expect("resumes");
+        let mut writer = partial.writer.lock().expect("writer");
+        assert_eq!(*writer.bytes, expected);
+
+        let flush = PacketStream::new(
+            std::io::Cursor::new(Vec::<u8>::new()),
+            FlushTimesOutOnce {
+                bytes: Vec::new(),
+                failed: false,
+            },
+            true,
+        );
+        *flush.pending_keepalive.lock().expect("pending") = Some(PendingKeepalive {
+            id: 7,
+            queued: false,
+        });
+        assert_eq!(
+            flush
+                .flush_pending_keepalive()
+                .expect_err("the flush stalls")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        flush.flush_pending_keepalive().expect("flushes");
+        let writer = flush.writer.lock().expect("writer");
+        assert_eq!(writer.bytes, expected);
     }
 
     #[test]
