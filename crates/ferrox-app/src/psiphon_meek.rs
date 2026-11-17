@@ -12,7 +12,7 @@ use crypto_box::{PublicKey, SalsaBox, SecretKey};
 use ferrox_core::tls::{ClientSession, RecordAlignment as _, TlsConfig, TlsProvider as _};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,7 @@ const MAX_CONNECT_ATTEMPT: Duration = Duration::from_secs(2);
 /// candidate; a full QUIC handshake fits in this budget on a slow link.
 const MAX_HANDSHAKE_ATTEMPT: Duration = Duration::from_secs(5);
 const POLL_GROWTH: f64 = 1.5;
+static RELAY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
 
@@ -578,6 +579,12 @@ fn relay(
         .with_limit_buffer_sizes(limit_buffer_sizes);
     let mut buffer = vec![0u8; http.request_limit()];
     let mut interval = POLL;
+    let trace = std::env::var_os("AETHER_PSIPHON_TRACE_FLOWS").is_some();
+    let id = RELAY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut polls = 0u32;
+    if trace {
+        eprintln!("psiphon: relay {id} start");
+    }
     loop {
         local
             .set_read_timeout(Some(interval))
@@ -595,17 +602,23 @@ fn relay(
             }
             Err(error) => return Err(format!("psiphon meek read: {error}")),
         };
-        let reply = http.round_trip(body)?;
-        if body.is_empty() && reply.is_empty() {
+        let reply = http.round_trip_to(body, &mut local)?;
+        if trace && (!body.is_empty() || reply > 0) {
+            eprintln!("psiphon: relay {id} in {} out {reply}", body.len());
+        } else if trace {
+            polls = polls.wrapping_add(1);
+            if polls.is_multiple_of(100) {
+                eprintln!("psiphon: relay {id} poll {polls}");
+            }
+        }
+        if body.is_empty() && reply == 0 {
             interval = interval.mul_f64(POLL_GROWTH).min(MAX_POLL);
         } else {
             interval = POLL;
         }
-        if !reply.is_empty() {
-            local
-                .write_all(&reply)
-                .map_err(|error| format!("psiphon meek write: {error}"))?;
-        }
+    }
+    if trace {
+        eprintln!("psiphon: relay {id} end");
     }
     Ok(())
 }
@@ -642,16 +655,11 @@ fn relay_stream(
             }
             Err(error) => return Err(format!("psiphon meek read: {error}")),
         };
-        let reply = http.round_trip(body)?;
-        if body.is_empty() && reply.is_empty() {
+        let reply = http.round_trip_to(body, &mut local)?;
+        if body.is_empty() && reply == 0 {
             interval = interval.mul_f64(POLL_GROWTH).min(MAX_POLL);
         } else {
             interval = POLL;
-        }
-        if !reply.is_empty() {
-            local
-                .write_all(&reply)
-                .map_err(|error| format!("psiphon meek write: {error}"))?;
         }
     }
     Ok(())
@@ -881,6 +889,24 @@ impl Write for DeadlineStream<'_> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.arm()?;
         self.stream.flush().map_err(expired_as_timed_out)
+    }
+}
+
+/// A reply sink that knows whether any byte reached it, so a retry cannot duplicate a body.
+struct CountingWriter<'a, W: Write + ?Sized> {
+    inner: &'a mut W,
+    written: usize,
+}
+
+impl<W: Write + ?Sized> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.written += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -1118,6 +1144,27 @@ impl MeekHttp {
 
     /// Send one request body and return the response body.
     pub(crate) fn round_trip(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
+        let mut reply = Vec::new();
+        self.round_trip_into(body, &mut reply, crate::foxy_account::MAX_BODY)?;
+        Ok(reply)
+    }
+
+    /// Send one request body and stream the response body into `sink`.
+    pub(crate) fn round_trip_to<W: Write + ?Sized>(
+        &mut self,
+        body: &[u8],
+        sink: &mut W,
+    ) -> Result<usize, String> {
+        self.round_trip_into(body, sink, usize::MAX)
+    }
+
+    /// One request, a sink for the reply body and the body bound that sink allows.
+    fn round_trip_into<W: Write + ?Sized>(
+        &mut self,
+        body: &[u8],
+        sink: &mut W,
+        max_body: usize,
+    ) -> Result<usize, String> {
         if self.stream.is_none() {
             self.open()?;
         }
@@ -1129,22 +1176,27 @@ impl MeekHttp {
         } else {
             body
         };
-        let reply = match self.exchange(body) {
-            Ok(reply) => reply,
-            Err(why) if !self.preconnected && (poll || self.retry_safe()) => {
+        let mut sink = CountingWriter {
+            inner: sink,
+            written: 0,
+        };
+        match self.exchange_into(body, &mut sink, max_body) {
+            Ok(()) => {}
+            Err(why) if !self.preconnected && sink.written == 0 && (poll || self.retry_safe()) => {
                 self.stream = None;
                 self.open()?;
-                self.exchange(body).map_err(|_| why)?
+                self.exchange_into(body, &mut sink, max_body)
+                    .map_err(|_| why)?;
             }
             Err(why) => {
                 self.stream = None;
                 return Err(why);
             }
-        };
+        }
         if coin_probability(self.profile.redial_tls) && !self.preconnected {
             self.stream = None;
         }
-        Ok(reply)
+        Ok(sink.written)
     }
 
     /// Try each front and each resolved address until one handshakes. A single
@@ -1386,8 +1438,13 @@ impl MeekHttp {
         self.stream.as_ref().is_none_or(MeekStream::peer_closed)
     }
 
-    /// Exchange one request, rotating to a fresh front after a failure.
-    fn exchange(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
+    /// Exchange one request, writing the response body to the sink.
+    fn exchange_into<W: Write + ?Sized>(
+        &mut self,
+        body: &[u8],
+        sink: &mut W,
+        max_body: usize,
+    ) -> Result<(), String> {
         if self.stream.is_none() {
             self.open()?;
         }
@@ -1461,7 +1518,9 @@ impl MeekHttp {
             if let Some(receiver) = self.response_padding.as_mut() {
                 body = receiver.strip(&body)?;
             }
-            return Ok(body);
+            sink.write_all(&body)
+                .map_err(|error| format!("psiphon meek write: {error}"))?;
+            return Ok(());
         }
         let mut head =
             crate::foxy_account::request_head("POST", host, self.path, &headers, body.len());
@@ -1470,35 +1529,53 @@ impl MeekHttp {
                 .map_err(|error| format!("psiphon meek transform: {error}"))?;
         }
         let deadline = request_deadline(timeout);
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| "psiphon meek has no connection".to_owned())?;
-        let mut stream = DeadlineStream { stream, deadline };
-        stream
-            .write_parts(&[&head, body])
-            .and_then(|()| stream.flush())
-            .map_err(|error| format!("psiphon meek request: {error}"))?;
-        let reply = crate::foxy_account::read_reply(
-            &mut stream,
-            response_read_chunk(self.limit_buffer_sizes),
-        )
-        .map_err(|_| "psiphon meek response".to_owned())?;
-        if reply.status != 200 {
-            return Err(format!("psiphon meek status {}", reply.status));
+        let chunk = response_read_chunk(self.limit_buffer_sizes);
+        let connection_close;
+        let reply;
+        {
+            let stream = self
+                .stream
+                .as_mut()
+                .ok_or_else(|| "psiphon meek has no connection".to_owned())?;
+            let mut stream = DeadlineStream { stream, deadline };
+            stream
+                .write_parts(&[&head, body])
+                .and_then(|()| stream.flush())
+                .map_err(|error| format!("psiphon meek request: {error}"))?;
+            let mut reader = BufReader::with_capacity(1024, &mut stream);
+            reply = crate::foxy_account::read_head(&mut reader)
+                .map_err(|_| "psiphon meek response".to_owned())?;
+            if reply.status != 200 {
+                return Err(format!("psiphon meek status {}", reply.status));
+            }
+            connection_close = crate::foxy_account::connection_closes(&reply.headers);
+            if let Some(receiver) = self.response_padding.as_mut() {
+                let body = crate::foxy_account::read_body(
+                    &mut reader,
+                    &reply.headers,
+                    chunk,
+                    max_body.min(crate::foxy_account::MAX_BODY),
+                )
+                .map_err(|_| "psiphon meek response".to_owned())?;
+                let body = receiver.strip(&body)?;
+                sink.write_all(&body)
+                    .map_err(|error| format!("psiphon meek write: {error}"))?;
+            } else {
+                crate::foxy_account::read_body_to(
+                    &mut reader,
+                    &reply.headers,
+                    chunk,
+                    max_body,
+                    sink,
+                )
+                .map_err(|_| "psiphon meek response".to_owned())?;
+            }
         }
         self.absorb_cookie(&reply.headers);
-        if reply
-            .header("connection")
-            .is_some_and(|value| value.eq_ignore_ascii_case("close"))
-        {
+        if connection_close {
             self.stream = None;
         }
-        let mut body = reply.body;
-        if let Some(receiver) = self.response_padding.as_mut() {
-            body = receiver.strip(&body)?;
-        }
-        Ok(body)
+        Ok(())
     }
 
     /// Take a renewed meek cookie from a response.
@@ -1702,6 +1779,57 @@ mod tests {
         assert!(http.budget().expect("budget") <= Duration::from_secs(1));
         http.set_deadline(Some(Instant::now()));
         assert!(http.budget().is_err());
+    }
+
+    /// A reply body larger than the one-shot cap streams whole into the relay.
+    #[test]
+    fn a_large_response_body_streams_without_the_one_mib_cap() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a front");
+        let port = listener.local_addr().expect("front address").port();
+        let body_len = 2 * 1024 * 1024;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut seen = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !seen.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).expect("request");
+                if read == 0 {
+                    return;
+                }
+                seen.extend_from_slice(&buffer[..read]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\nConnection: keep-alive\r\n\r\n"
+            )
+            .expect("head");
+            let block = vec![b'x'; 64 * 1024];
+            let mut left = body_len;
+            while left > 0 {
+                let take = left.min(block.len());
+                stream.write_all(&block[..take]).expect("body");
+                left -= take;
+            }
+            stream.flush().expect("flush");
+        });
+        let meek = Meek {
+            dial: "127.0.0.1".to_owned(),
+            port,
+            fronts: vec![(Ipv4Addr::LOCALHOST.to_string(), port)],
+            hosts: vec!["cdn.example".to_owned()],
+            https: false,
+            quic: false,
+            ..entry()
+        };
+        let mut http = MeekHttp::new_plain(meek, None, Duration::from_secs(8), "/");
+        let mut reply = Vec::new();
+        let read = http
+            .round_trip_to(b"", &mut reply)
+            .expect("the body streams");
+        assert_eq!(read, body_len);
+        assert_eq!(reply.len(), body_len);
+        assert!(reply.iter().all(|byte| *byte == b'x'));
+        server.join().expect("server");
     }
 
     #[test]

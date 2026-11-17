@@ -421,6 +421,7 @@ mod tests {
             web_server_certificate: String::new(),
             configuration_version: 0,
             scan_cdn: true,
+            cdn_protocols: 0,
             ssh_api: true,
             direct: true,
             tls: false,

@@ -4663,6 +4663,9 @@ mod tests {
     #[test]
     fn wireguard_rides_inside_masque() {
         use ferrox_core::wireguard::device::public_key;
+        if !crate::conn::in_a_quiet_process("warp::tests::wireguard_rides_inside_masque") {
+            return;
+        }
 
         let client_private = [0x11; 32];
         let allowed = public_key(&client_private);
@@ -4827,6 +4830,9 @@ mod tests {
 
     #[test]
     fn wireguard_rides_inside_wireguard() {
+        if !crate::conn::in_a_quiet_process("warp::tests::wireguard_rides_inside_wireguard") {
+            return;
+        }
         let deadline = Duration::from_secs(60);
         let started = Instant::now();
         let mut last = None;

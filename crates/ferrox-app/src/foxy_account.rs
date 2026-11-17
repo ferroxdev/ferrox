@@ -14,7 +14,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const USER_AGENT: &str = "MozillaVPN/2.35.0 (sys:linux; iap:true)";
 pub(crate) const JSON_ACCEPT: &str = "application/json";
 const MAX_HEAD: usize = 16 * 1024;
-const MAX_BODY: usize = 1024 * 1024;
+/// The one-shot reply body cap; the relay streams its body instead.
+pub(crate) const MAX_BODY: usize = 1024 * 1024;
 /// The default response body read chunk when the caller does not limit it.
 pub(crate) const DEFAULT_READ_CHUNK: usize = 64 * 1024;
 
@@ -393,6 +394,7 @@ pub(crate) fn request(
 }
 
 /// Head to the blank line, then the declared body shape; a TLS record costs a syscall, so the head is buffered.
+#[cfg(test)]
 pub(crate) fn read_reply<S: Read>(io: &mut S, chunk: usize) -> Result<Reply, Failure> {
     read_reply_limited(io, chunk, MAX_BODY)
 }
@@ -405,12 +407,15 @@ pub(crate) fn read_reply_limited<S: Read>(
 ) -> Result<Reply, Failure> {
     let mut io = BufReader::with_capacity(1024, io);
     let mut reply = read_head(&mut io)?;
+    if matches!(reply.status, 204 | 304) || (100..200).contains(&reply.status) {
+        return Ok(reply);
+    }
     reply.body = read_body(&mut io, &reply.headers, chunk, max_body)?;
     Ok(reply)
 }
 
 /// Read the status line and headers and leave the body unread, for a HEAD or a streamed GET.
-fn read_head<S: BufRead>(io: &mut S) -> Result<Reply, Failure> {
+pub(crate) fn read_head<S: BufRead>(io: &mut S) -> Result<Reply, Failure> {
     let mut lines: Vec<String> = Vec::with_capacity(12);
     let mut total = 0usize;
     loop {
@@ -464,8 +469,20 @@ fn chunk_size(line: &str) -> Result<usize, Failure> {
     usize::from_str_radix(size.trim(), 16).map_err(|_| Failure::Frame)
 }
 
+/// Whether a response's `Connection` header names `close` as one option.
+pub(crate) fn connection_closes(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("connection"))
+        .any(|(_, value)| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("close"))
+        })
+}
+
 /// Read the declared body shape in bounded pieces.
-fn read_body<S: BufRead>(
+pub(crate) fn read_body<S: BufRead>(
     io: &mut S,
     headers: &[(String, String)],
     chunk: usize,
@@ -478,7 +495,11 @@ fn read_body<S: BufRead>(
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
     };
-    if header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
+    if header("transfer-encoding").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
+    }) {
         let mut body = Vec::new();
         loop {
             let mut line = String::new();
@@ -504,9 +525,15 @@ fn read_body<S: BufRead>(
             io.read_exact(&mut tail).map_err(|_| Failure::Stream)?;
         }
     }
-    let len = header("content-length")
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
+    let close = connection_closes(headers);
+    let Some(len) = header("content-length").and_then(|value| value.trim().parse::<usize>().ok())
+    else {
+        let mut body = Vec::new();
+        if close {
+            read_to_eof(io, &mut body, chunk, max_body)?;
+        }
+        return Ok(body);
+    };
     if len > max_body {
         return Err(Failure::Frame);
     }
@@ -515,13 +542,13 @@ fn read_body<S: BufRead>(
     Ok(body)
 }
 
-/// Read the declared body shape into a file, bounded by the active limit.
-fn read_body_to_file<S: BufRead>(
+/// Read the declared body shape into a sink, bounded by the active limit.
+pub(crate) fn read_body_to<S: BufRead, W: Write + ?Sized>(
     io: &mut S,
     headers: &[(String, String)],
     chunk: usize,
     max_body: usize,
-    sink: &mut std::fs::File,
+    sink: &mut W,
 ) -> Result<(), Failure> {
     let chunk = chunk.max(1);
     let header = |name: &str| {
@@ -530,7 +557,11 @@ fn read_body_to_file<S: BufRead>(
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
     };
-    if header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
+    if header("transfer-encoding").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
+    }) {
         let mut total = 0usize;
         loop {
             let mut line = String::new();
@@ -552,13 +583,42 @@ fn read_body_to_file<S: BufRead>(
             io.read_exact(&mut tail).map_err(|_| Failure::Stream)?;
         }
     }
-    let len = header("content-length")
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
+    let close = connection_closes(headers);
+    let Some(len) = header("content-length").and_then(|value| value.trim().parse::<usize>().ok())
+    else {
+        return if close {
+            read_to_eof(io, sink, chunk, max_body)
+        } else {
+            Ok(())
+        };
+    };
     if len > max_body {
         return Err(Failure::Frame);
     }
     write_exact_chunked(io, sink, len, chunk)
+}
+
+/// Read a close-delimited body, bounded by the active limit.
+fn read_to_eof<S: Read, W: Write + ?Sized>(
+    io: &mut S,
+    sink: &mut W,
+    chunk: usize,
+    max_body: usize,
+) -> Result<(), Failure> {
+    let mut buffer = vec![0u8; chunk.max(1)];
+    let mut total = 0usize;
+    loop {
+        let read = io.read(&mut buffer).map_err(|_| Failure::Stream)?;
+        if read == 0 {
+            return Ok(());
+        }
+        total = total.checked_add(read).ok_or(Failure::Frame)?;
+        if total > max_body {
+            return Err(Failure::Frame);
+        }
+        sink.write_all(&buffer[..read])
+            .map_err(|_| Failure::Stream)?;
+    }
 }
 
 /// Fill a body slice in bounded pieces so the read buffer matches the active limit.
@@ -576,10 +636,10 @@ fn read_exact_chunked<S: Read>(
     Ok(())
 }
 
-/// Move a body into a file in bounded pieces so the read buffer matches the active limit.
-fn write_exact_chunked<S: Read>(
+/// Move a body into a sink in bounded pieces so the read buffer matches the active limit.
+fn write_exact_chunked<S: Read, W: Write + ?Sized>(
     io: &mut S,
-    sink: &mut std::fs::File,
+    sink: &mut W,
     mut len: usize,
     chunk: usize,
 ) -> Result<(), Failure> {
@@ -1129,7 +1189,7 @@ pub(crate) fn ask_to_file(
     let mut file = options
         .open(destination)
         .map_err(|why| format!("writing {}: {why}", destination.display()))?;
-    read_body_to_file(
+    read_body_to(
         &mut io,
         &reply.headers,
         DEFAULT_READ_CHUNK,
@@ -1635,10 +1695,24 @@ mod tests {
             .expect("part file");
         let headers = vec![("Transfer-Encoding".to_owned(), "chunked".to_owned())];
         let mut raw = &b"5;foo=bar\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"[..];
-        read_body_to_file(&mut raw, &headers, 3, 64, &mut file).expect("reads");
+        read_body_to(&mut raw, &headers, 3, 64, &mut file).expect("reads");
         file.flush().expect("flush");
         assert_eq!(std::fs::read(&path).expect("body"), b"hello world");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_body_without_a_length_is_read_to_eof() {
+        let mut raw = &b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello world"[..];
+        let reply = read_reply(&mut raw, 3).expect("reads");
+        assert_eq!(reply.body, b"hello world");
+    }
+
+    #[test]
+    fn a_close_token_inside_a_connection_list_reads_to_eof() {
+        let mut raw = &b"HTTP/1.1 200 OK\r\nConnection: keep-alive, close\r\n\r\nhello world"[..];
+        let reply = read_reply(&mut raw, 3).expect("reads");
+        assert_eq!(reply.body, b"hello world");
     }
 
     #[test]
