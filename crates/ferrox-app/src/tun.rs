@@ -2289,7 +2289,7 @@ impl Handler {
             rcv_nxt: Arc::clone(&rcv_nxt),
             snd_nxt: Arc::clone(&snd_nxt),
             busy: Arc::clone(&busy),
-            last_acked: AtomicU32::new(server_isn.wrapping_add(1)),
+            last_acked: AtomicU32::new(syn_seq.wrapping_add(1)),
             local: (local_ip, local_port),
             remote: (remote_ip, remote_port),
             mss: Arc::clone(&mss),
