@@ -42,10 +42,10 @@ pub(crate) struct Flow {
 }
 
 impl Flow {
-    /// One `Keep` frame; the carrier's writer lock keeps concurrent sessions from interleaving.
+    /// One bulk `Keep`; the carrier's writer lock keeps concurrent sessions from interleaving and
+    /// the whole payload leaves in one vectored write.
     pub(crate) fn send(&self, data: &[u8]) -> bool {
-        self.carrier
-            .frame(self.id, mux::Status::Keep, mux::DATA, None, None, data)
+        self.carrier.keep(self.id, data)
     }
 
     /// Hands the reply lane to the downlink worker while this handle keeps the writer.
@@ -101,9 +101,17 @@ enum Sink {
     Udp(Deliver, Arc<std::sync::atomic::AtomicBool>),
 }
 
+/// Frames one bulk `Keep` leaves in a single vectored write: a 32 KiB upload read is four frames
+/// and one syscall where it used to be four writes, and no payload byte moves.
+const BATCH: usize = 4;
+
+/// The segments one batch hands the kernel: a head and a payload part for each frame.
+const BATCH_PARTS: usize = 2 * BATCH;
+
 struct Writer {
     out: Box<dyn Write + Send>,
     header: Vec<u8>,
+    heads: Vec<u8>,
 }
 
 impl Writer {
@@ -131,6 +139,55 @@ impl Writer {
         }
         frame.patch_payload_len(&mut self.header, at, data.len());
         crate::proxy::write_all_parts::<2>(&mut *self.out, &[&self.header[..], data]).is_ok()
+    }
+
+    /// A bulk `Keep`: the payload split into frame-sized chunks, every head encoded ahead of the
+    /// write so the chunks leave as one vectored call. The heads are eight bytes each; the payload
+    /// goes to the kernel from where it was read, never through `heads`.
+    fn keep(&mut self, id: u16, data: &[u8]) -> bool {
+        let keep = mux::Outgoing::bare(id, mux::Status::Keep, mux::DATA);
+        let mut rest = data;
+        loop {
+            let take = rest.len().min(BATCH * mux::CHUNK_MAX);
+            let (batch, tail) = rest.split_at(take);
+            if !self.keep_batch(&keep, batch) {
+                return false;
+            }
+            if tail.is_empty() {
+                return true;
+            }
+            rest = tail;
+        }
+    }
+
+    fn keep_batch(&mut self, keep: &mux::Outgoing<'_>, batch: &[u8]) -> bool {
+        self.heads.clear();
+        let mut payloads: [&[u8]; BATCH] = [&[]; BATCH];
+        let mut spans = [(0usize, 0usize); BATCH];
+        let mut frames = 0usize;
+        let mut rest = batch;
+        loop {
+            let take = rest.len().min(mux::CHUNK_MAX);
+            let (chunk, tail) = rest.split_at(take);
+            let at = keep.encode_header_into(&mut self.header);
+            keep.patch_payload_len(&mut self.header, at, chunk.len());
+            let start = self.heads.len();
+            self.heads.extend_from_slice(&self.header);
+            spans[frames] = (start, self.heads.len());
+            payloads[frames] = chunk;
+            frames += 1;
+            if tail.is_empty() {
+                break;
+            }
+            rest = tail;
+        }
+        let mut parts: [&[u8]; BATCH_PARTS] = [&[]; BATCH_PARTS];
+        for frame in 0..frames {
+            let (start, end) = spans[frame];
+            parts[2 * frame] = &self.heads[start..end];
+            parts[2 * frame + 1] = payloads[frame];
+        }
+        crate::proxy::write_all_parts::<BATCH_PARTS>(&mut *self.out, &parts[..2 * frames]).is_ok()
     }
 }
 
@@ -166,6 +223,7 @@ impl Carrier {
             write: Mutex::new(Writer {
                 out: uplink.write,
                 header: Vec::with_capacity(64),
+                heads: Vec::with_capacity(BATCH * 8),
             }),
             table: Mutex::new(Table {
                 ids: mux::Ids::new(0),
@@ -218,6 +276,17 @@ impl Carrier {
             return false;
         };
         writer.frame(id, status, options, target, global_id, data)
+    }
+
+    /// The client's bulk path: one head per frame-sized chunk, one vectored write for the batch.
+    fn keep(&self, id: u16, data: &[u8]) -> bool {
+        if self.dead() {
+            return false;
+        }
+        let Ok(mut writer) = self.write.lock() else {
+            return false;
+        };
+        writer.keep(id, data)
     }
 
     /// The id is released only after its End frame is written, and `Ids` never reissues one.
@@ -786,6 +855,79 @@ mod tests {
             ],
             "a frame for a reused id never crosses the old session's End"
         );
+        assert_eq!(
+            peers.lock().map_or(0, |peers| peers.len()),
+            1,
+            "the carrier's peer stays open so its demux does not retire"
+        );
+    }
+
+    struct Calls(Arc<Mutex<(Vec<u8>, usize)>>);
+
+    impl Write for Calls {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.write_vectored(&[std::io::IoSlice::new(buf)])
+        }
+
+        fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+            let mut seen = self.0.lock().expect("the recorded stream");
+            for buf in bufs {
+                seen.0.extend_from_slice(buf);
+            }
+            seen.1 += 1;
+            Ok(bufs.iter().map(|buf| buf.len()).sum())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The gate for `uplink-frames-per-write`: a 32 KiB send leaves as four frames under one call,
+    /// and every payload byte reaches the wire.
+    #[test]
+    fn a_bulk_uplink_frames_four_keeps_in_one_write() {
+        let seen: Arc<Mutex<(Vec<u8>, usize)>> = Arc::new(Mutex::new((Vec::new(), 0)));
+        let sink = Arc::clone(&seen);
+        let peers: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let held = Arc::clone(&peers);
+        let manager = Manager::with_lifetime(4, LIFETIME, move || {
+            let (mine, peer) = UnixStream::pair().ok()?;
+            let read = mine.try_clone().ok()?;
+            held.lock().ok()?.push(peer);
+            Some(Uplink {
+                read: Box::new(read),
+                write: Box::new(Calls(Arc::clone(&sink))),
+                close: Arc::new(|| {}),
+            })
+        });
+        let flow = manager.dial(&target()).expect("a flow");
+        let payload: Vec<u8> = (0..4 * mux::CHUNK_MAX).map(|at| at as u8).collect();
+        assert!(flow.send(&payload));
+        let (bytes, calls) = {
+            let seen = seen.lock().expect("the recorded stream");
+            (seen.0.clone(), seen.1)
+        };
+        assert_eq!(
+            calls, 2,
+            "the New frame and the four-frame batch are one call each"
+        );
+        assert_eq!(
+            frames(&bytes)
+                .iter()
+                .filter(|(_, status)| *status == mux::Status::Keep)
+                .count(),
+            4,
+            "32 KiB leaves as four 8 KiB keeps",
+        );
+        let mut at = 0;
+        let mut kept = Vec::new();
+        while at < bytes.len() {
+            let (frame, used) = mux::decode(&bytes[at..], NewTail::Forward).expect("a frame");
+            kept.extend_from_slice(frame.data.unwrap_or(&[]));
+            at += used;
+        }
+        assert_eq!(kept, payload, "every payload byte reaches the wire");
         assert_eq!(
             peers.lock().map_or(0, |peers| peers.len()),
             1,

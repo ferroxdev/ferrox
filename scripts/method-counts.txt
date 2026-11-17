@@ -189,6 +189,7 @@ mux-cool carrier-staging-header-reallocations 0 ferrox-app-muxpool::tests::the_f
 mux-cool datagram-sessions-freed-on-peer-end 1 ferrox-app-muxpool::tests::a_peer_end_frees_a_datagram_session
 mux-cool id-reuses-before-end 0 ferrox-app-muxpool::tests::an_id_is_not_reused_before_its_end_is_written
 mux-cool answer-head-reads-before-the-first-frame 0 ferrox-app-proxy::tests::vless_mux_opener_does_not_wait_for_the_answer_head
+mux-cool uplink-frames-per-write 4 ferrox-app-muxpool::tests::a_bulk_uplink_frames_four_keeps_in_one_write
 
 # --- carriers ---------------------------------------------------------------
 carrier-websocket ops-retired-instructions UNBLESSED scripts/count-ops.sh

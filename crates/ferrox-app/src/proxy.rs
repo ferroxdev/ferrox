@@ -19170,6 +19170,10 @@ fn dial_pooled_mux(
     true
 }
 
+/// A bulk mux upload read: four frame-sized chunks, so 32 KiB costs one read and one vectored write
+/// where an 8 KiB slice cost four of each.
+const MUX_UPLOAD_SLICE: usize = 4 * ferrox_core::mux::CHUNK_MAX;
+
 fn relay_pool_flow(client: &Connection, mut flow: crate::muxpool::Flow) {
     let Ok(up) = client.try_clone() else {
         flow.close();
@@ -19189,7 +19193,7 @@ fn relay_pool_flow(client: &Connection, mut flow: crate::muxpool::Flow) {
             let _ = down.shutdown(Shutdown::Write);
         }
     });
-    let mut chunk = [0u8; READ_SLICE];
+    let mut chunk = [0u8; MUX_UPLOAD_SLICE];
     let Ok(mut plain) = up.try_clone() else {
         flow.close();
         join(&done);
