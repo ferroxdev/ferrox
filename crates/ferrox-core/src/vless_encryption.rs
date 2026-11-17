@@ -2249,7 +2249,7 @@ mod tests {
     fn direct_mode_carries_the_first_flight_before_its_first_write() {
         let key = Vec::from([0x11u8; 64]);
         let mut stream = EncryptedStream::new(
-            Recorder::default(),
+            Vec::new(),
             key.clone(),
             Aead::new(b"direct", &key),
             None,
@@ -2258,7 +2258,7 @@ mod tests {
         stream.set_pre_write(b"first flight".to_vec());
         stream.enter_direct_mode();
         stream.write_all(b"data").unwrap();
-        assert_eq!(stream.get_ref().wire, b"first flightdata");
+        assert_eq!(stream.get_ref().as_slice(), b"first flightdata");
     }
 
     #[cfg(unix)]
