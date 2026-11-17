@@ -808,7 +808,7 @@ impl Client {
                     ping_at = Some(now);
                 }
             }
-            let mut wrote = self.flush();
+            self.flush();
             if self.wire.closed || self.end {
                 break;
             }
@@ -826,15 +826,11 @@ impl Client {
                         datagram(&packet, out);
                     }
                 });
-                wrote |= self.send(&capsule);
+                self.send(&capsule);
             }
-            wrote |= self.flush();
+            self.flush();
             if self.wire.closed || self.end {
                 break;
-            }
-            // A turn that moved bytes does not wait on the socket: the window updates it needs are already queued for the next read.
-            if wrote {
-                continue;
             }
             if !self.wire.fill() {
                 break;
@@ -1076,10 +1072,10 @@ impl Client {
         }
     }
 
-    /// Sends a built DATA frame within peer credit in one write, or queues its body up to the cap, and reports whether it wrote.
-    fn send(&mut self, frame: &[u8]) -> bool {
+    /// Sends a built DATA frame within peer credit in one write, or queues its body up to the cap.
+    fn send(&mut self, frame: &[u8]) {
         if self.end || self.wire.closed {
-            return false;
+            return;
         }
         let body = &frame[FRAME_HEAD..];
         let length = i64::try_from(body.len()).unwrap_or(i64::MAX);
@@ -1087,12 +1083,10 @@ impl Client {
             if self.wire.send_frame(frame) {
                 self.send_window -= length;
                 self.connection_window -= length;
-                return true;
             }
-            return false;
+            return;
         }
         self.capsule(body);
-        false
     }
 
     /// Sends a control capsule within peer credit or queues it up to the cap; terminated sessions accept nothing.
@@ -1113,27 +1107,25 @@ impl Client {
         }
     }
 
-    /// Drains queued capsule bytes within peer credit while preserving a partial front capsule, and reports whether it wrote.
-    fn flush(&mut self) -> bool {
+    /// Drains queued capsule bytes within peer credit while preserving a partial front capsule.
+    fn flush(&mut self) {
         if self.end || self.wire.closed {
-            return false;
+            return;
         }
-        let mut wrote = false;
         while let Some(answer) = self.queued.pop_front() {
             let start = self.queued_at;
             let room = self.send_window.min(self.connection_window);
             if room <= 0 {
                 self.queued.push_front(answer);
-                return wrote;
+                return;
             }
             let take = (answer.len() - start).min(usize::try_from(room).unwrap_or(usize::MAX));
             if !self
                 .wire
                 .send(h2::T_DATA, 0, self.stream, &answer[start..start + take])
             {
-                return wrote;
+                return;
             }
-            wrote = true;
             self.send_window -= i64::try_from(take).unwrap_or(i64::MAX);
             self.connection_window -= i64::try_from(take).unwrap_or(i64::MAX);
             self.queued_at = start + take;
@@ -1143,7 +1135,6 @@ impl Client {
                 self.queued_at = 0;
             }
         }
-        wrote
     }
 }
 
@@ -1247,10 +1238,7 @@ impl Session {
                 self.end = true;
                 break;
             }
-            // A turn that moved bytes does not wait on the socket: the window updates it needs are already queued for the next read.
-            if self.flush(wire) {
-                continue;
-            }
+            self.flush(wire);
             if wire.closed || self.end {
                 break;
             }
@@ -1525,10 +1513,10 @@ impl Session {
         }
     }
 
-    /// Sends a built DATA frame in one write when it fits the window, otherwise queues its body, and reports whether it wrote.
-    fn send(&mut self, wire: &mut Wire, frame: &[u8]) -> bool {
+    /// Sends a built DATA frame in one write when it fits the window, otherwise queues its body.
+    fn send(&mut self, wire: &mut Wire, frame: &[u8]) {
         if self.end || wire.closed || self.request.is_none() {
-            return false;
+            return;
         }
         let body = &frame[FRAME_HEAD..];
         let length = i64::try_from(body.len()).unwrap_or(i64::MAX);
@@ -1536,12 +1524,10 @@ impl Session {
             if wire.send_frame(frame) {
                 self.send_window -= length;
                 self.connection_window -= length;
-                return true;
             }
-            return false;
+            return;
         }
         self.capsule(wire, body);
-        false
     }
 
     /// Sends or bounds queued reply capsules only while the request and wire remain live.
@@ -1565,16 +1551,15 @@ impl Session {
         }
     }
 
-    /// Drains live reply capsules in order, preserving any suffix blocked by peer credit, and reports whether it wrote.
-    fn flush(&mut self, wire: &mut Wire) -> bool {
+    /// Drains live reply capsules in order, preserving any suffix blocked by peer credit.
+    fn flush(&mut self, wire: &mut Wire) {
         if self.end || wire.closed {
-            return false;
+            return;
         }
-        let mut wrote = false;
         while let Some(answer) = self.queued.pop_front() {
             let Some(id) = self.request else {
                 self.queued.push_front(answer);
-                return wrote;
+                return;
             };
             let start = self.queued_at;
             let room = self.send_window.min(self.connection_window);
@@ -1584,9 +1569,8 @@ impl Session {
             }
             let take = (answer.len() - start).min(usize::try_from(room).unwrap_or(usize::MAX));
             if !wire.send(h2::T_DATA, 0, id, &answer[start..start + take]) {
-                return wrote;
+                return;
             }
-            wrote = true;
             let sent = i64::try_from(take).unwrap_or(i64::MAX);
             self.send_window -= sent;
             self.connection_window -= sent;
@@ -1622,13 +1606,12 @@ impl Session {
                     datagram(&packet, out);
                 }
             });
-            wrote |= self.send(wire, &frame);
+            self.send(wire, &frame);
         }
         self.frame = frame;
         if self.request.is_some() && !wire.closed && self.queued.is_empty() {
             wire.deadline.clear();
         }
-        wrote
     }
 }
 
