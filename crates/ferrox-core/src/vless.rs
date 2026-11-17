@@ -930,7 +930,10 @@ fn validate_uuid(uuid: &str) -> Result<(), VlessError> {
     if b.len() != 36 || b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
         return Err(VlessError::Uuid);
     }
-    if !b.iter().all(|c| *c == b'-' || c.is_ascii_hexdigit()) {
+    if b.iter()
+        .enumerate()
+        .any(|(at, c)| !matches!(at, 8 | 13 | 18 | 23) && !c.is_ascii_hexdigit())
+    {
         return Err(VlessError::Uuid);
     }
     Ok(())
@@ -1594,6 +1597,11 @@ mod tests {
         );
         assert_eq!(
             VlessLink::parse("vless://not-a-uuid@example.com:443").unwrap_err(),
+            VlessError::Uuid
+        );
+        assert_eq!(
+            VlessLink::parse("vless://-aaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@example.com:443")
+                .unwrap_err(),
             VlessError::Uuid
         );
         assert_eq!(

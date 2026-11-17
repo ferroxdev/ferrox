@@ -519,16 +519,25 @@ fn spawn_keepalive<W: Write + Send + 'static>(
                 }
                 thread::sleep(KEEPALIVE_POLL);
             }
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             let Ok(mut writer) = writer.lock() else {
                 return;
             };
             let Ok(mut frame) = frame.lock() else {
                 return;
             };
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             if let Err(error) = flush_frame(&mut *writer, &mut frame) {
                 if retryable(error.kind()) {
                     continue;
                 }
+                return;
+            }
+            if stop.load(Ordering::Relaxed) {
                 return;
             }
             let value = id.fetch_add(1, Ordering::Relaxed) + 1;

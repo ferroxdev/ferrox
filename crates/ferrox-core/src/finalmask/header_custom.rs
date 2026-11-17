@@ -148,6 +148,9 @@ impl StateStore {
         now: Duration,
     ) -> Option<Vars> {
         self.prune(now);
+        if local.is_none() || remote.is_none() {
+            return None;
+        }
         self.entries
             .get(&(local, remote))
             .map(|(vars, _)| vars.clone())
@@ -161,6 +164,9 @@ impl StateStore {
         now: Duration,
     ) {
         self.prune(now);
+        if local.is_none() || remote.is_none() {
+            return;
+        }
         let key = (local, remote);
         if vars.is_empty() {
             self.entries.remove(&key);
@@ -416,7 +422,7 @@ fn invalid(message: &str) -> io::Error {
 fn write_sequence<W: Write>(raw: &mut W, sequence: &Sequence, ctx: &mut Context) -> io::Result<()> {
     let mut merged = Vec::new();
     for item in &sequence.items {
-        if item.delay.1 > 0 {
+        if item.delay.0.max(item.delay.1) > 0 {
             flush(raw, &mut merged)?;
             park(item.delay);
         }
@@ -891,13 +897,33 @@ mod tests {
             Vec::new(),
         )
         .expect("config is valid");
-        let mut first = header.open(MaskRole::Client, None, None, Duration::ZERO);
+        let local = "127.0.0.1:1000".parse().expect("local");
+        let remote = "127.0.0.2:2000".parse().expect("remote");
+        let mut first = header.open(MaskRole::Client, Some(local), Some(remote), Duration::ZERO);
         first
             .handshake(&mut Wire::new(Vec::new()), Duration::ZERO)
             .expect("the first handshake does not read");
-        let second = header.open(MaskRole::Client, None, None, Duration::ZERO);
+        let second = header.open(MaskRole::Client, Some(local), Some(remote), Duration::ZERO);
         assert_eq!(second.vars.len(), 1);
         assert_eq!(second.vars.get("tx"), Some(&vec![7, 7]));
+        let mut partial = header.open(MaskRole::Client, Some(local), None, Duration::ZERO);
+        partial
+            .handshake(&mut Wire::new(Vec::new()), Duration::ZERO)
+            .expect("the first handshake does not read");
+        let partial_again = header.open(MaskRole::Client, Some(local), None, Duration::ZERO);
+        assert!(
+            partial_again.vars.is_empty(),
+            "a half-addressed run shares no state"
+        );
+        let mut unaddressed = header.open(MaskRole::Client, None, None, Duration::ZERO);
+        unaddressed
+            .handshake(&mut Wire::new(Vec::new()), Duration::ZERO)
+            .expect("the first handshake does not read");
+        let unrelated = header.open(MaskRole::Client, None, None, Duration::ZERO);
+        assert!(
+            unrelated.vars.is_empty(),
+            "an unaddressed run shares no state"
+        );
     }
 
     #[test]
@@ -915,16 +941,18 @@ mod tests {
             Vec::new(),
         )
         .expect("config is valid");
-        let mut first = header.open(MaskRole::Client, None, None, Duration::ZERO);
+        let local = "127.0.0.1:3000".parse().expect("local");
+        let remote = "127.0.0.2:4000".parse().expect("remote");
+        let mut first = header.open(MaskRole::Client, Some(local), Some(remote), Duration::ZERO);
         first
             .handshake(&mut Wire::new(Vec::new()), Duration::ZERO)
             .expect("the first handshake does not read");
-        let live = header.open(MaskRole::Client, None, None, STATE_TTL);
+        let live = header.open(MaskRole::Client, Some(local), Some(remote), STATE_TTL);
         assert_eq!(live.vars.get("tx"), Some(&vec![7]));
         let expired = header.open(
             MaskRole::Client,
-            None,
-            None,
+            Some(local),
+            Some(remote),
             STATE_TTL + Duration::from_millis(1),
         );
         assert!(expired.vars.is_empty());
