@@ -1223,35 +1223,6 @@ mod tests {
         }
     }
 
-    /// A sink that refuses the first call the way a nonblocking socket does, then takes it all.
-    #[derive(Default)]
-    struct RefusingOnce {
-        wire: Wire,
-        refused: bool,
-    }
-
-    impl Write for RefusingOnce {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            if !self.refused {
-                self.refused = true;
-                return Err(io::ErrorKind::WouldBlock.into());
-            }
-            self.wire.write(buf)
-        }
-
-        fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-            if !self.refused {
-                self.refused = true;
-                return Err(io::ErrorKind::WouldBlock.into());
-            }
-            self.wire.write_vectored(bufs)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
     #[test]
     fn a_reversed_set_does_not_match_the_other_family() {
         let v4 = |start: &str, end: &str| {
@@ -1876,32 +1847,6 @@ mod tests {
         assert_eq!(
             wire.bytes, whole,
             "the tail of a forwarded hello is finished as it came, never re-headed"
-        );
-    }
-
-    #[test]
-    fn a_retained_sni_burst_keeps_the_delays_the_config_asked_for() {
-        let whole = client_hello("alpha.beta.example");
-        let mut mask = Fragment::new(0, 1, vec![range(3, 3)], vec![range(20, 20)], range(0, 0))
-            .expect("valid")
-            .sni();
-        let mut sink = RefusingOnce::default();
-        let started = std::time::Instant::now();
-        assert_eq!(
-            mask.write(&mut sink, &whole).expect("takes the hello"),
-            whole.len()
-        );
-        assert!(
-            sink.wire.bytes.is_empty(),
-            "the first call is refused and retained"
-        );
-        mask.flush(&mut sink).expect("the retained burst goes out");
-        let (widths, message) = records(&sink.wire.bytes);
-        assert_eq!(message, whole[HEADER..]);
-        assert!(widths.len() > 1, "the burst is several records");
-        assert!(
-            started.elapsed() >= Duration::from_millis(40),
-            "the retained records keep the configured spacing"
         );
     }
 

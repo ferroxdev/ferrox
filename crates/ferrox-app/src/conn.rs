@@ -4464,6 +4464,87 @@ mod tests {
         );
     }
 
+    /// A burst the socket refuses comes back with the config's spacing, not flat out.
+    #[test]
+    fn a_retained_sni_burst_keeps_the_delays_the_config_asked_for() {
+        struct Once {
+            bytes: Vec<u8>,
+            refused: bool,
+        }
+
+        impl std::io::Write for Once {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if !self.refused {
+                    self.refused = true;
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+                if !self.refused {
+                    self.refused = true;
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                for part in bufs {
+                    self.bytes.extend_from_slice(part);
+                }
+                Ok(bufs.iter().map(|part| part.len()).sum())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        use ferrox_core::finalmask::{Fragment, Range};
+        let whole = client_hello("alpha.beta.example");
+        let mut mask = Fragment::new(
+            0,
+            1,
+            vec![Range::ordered(3, 3)],
+            vec![Range::ordered(20, 20)],
+            Range::ordered(0, 0),
+        )
+        .expect("valid")
+        .sni();
+        let mut sink = Once {
+            bytes: Vec::new(),
+            refused: false,
+        };
+        let began = std::time::Instant::now();
+        assert_eq!(
+            mask.write(&mut sink, &whole).expect("takes the hello"),
+            whole.len()
+        );
+        assert!(
+            sink.bytes.is_empty(),
+            "the first call is refused and retained"
+        );
+        assert_eq!(
+            mask.write(&mut sink, &[]).expect("flushes"),
+            0,
+            "an empty write only drains what the socket refused"
+        );
+        let mut message = Vec::new();
+        let mut at = 0;
+        while at < sink.bytes.len() {
+            let length = usize::from(u16::from_be_bytes([sink.bytes[at + 3], sink.bytes[at + 4]]));
+            message.extend_from_slice(&sink.bytes[at + 5..at + 5 + length]);
+            at += 5 + length;
+        }
+        assert_eq!(
+            message,
+            whole[5..],
+            "the reassembled hello is the one the caller wrote"
+        );
+        assert!(
+            began.elapsed() >= Duration::from_millis(40),
+            "the retained records keep the configured spacing"
+        );
+    }
+
     /// A write that does not open a TLS record leaves the state armed, so a later record still
     /// gets the shape instead of the shape being spent on a fragment.
     #[test]
