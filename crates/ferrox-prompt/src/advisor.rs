@@ -655,10 +655,10 @@ run {core}
         let supplied = BTreeMap::from([("core".to_owned(), "x".to_owned())]);
         let (ready, skipped) = handable(&library, None, &[], &[], &supplied, false);
         assert_eq!(ready.len(), 1);
-        assert!(skipped.is_empty());
+        assert_eq!(skipped, []);
         let (ready, skipped) =
             handable(&library, None, &[], &["extra".to_owned()], &supplied, false);
-        assert!(ready.is_empty());
+        assert_eq!(ready, []);
         assert_eq!(skipped[0].missing, vec!["extra".to_owned()]);
     }
 
