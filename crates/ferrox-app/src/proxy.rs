@@ -67450,18 +67450,11 @@ mod tests {
             u16::from_be_bytes(reply[8..10].try_into().expect("port")),
         );
         let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
-        udp.set_read_timeout(Some(QUIC_TEST_TIMEOUT))
-            .expect("timeout");
         let mut datagram = vec![0u8, 0, 0];
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         push_socks_addr(&mut datagram, &target);
         datagram.extend_from_slice(b"ping");
-        udp.send_to(&datagram, relay).expect("sends");
-        let mut back = vec![0u8; UDP_BUF];
-        let (n, _) = udp.recv_from(&mut back).expect("echoes");
-        let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
-        assert_eq!(source, target);
-        assert_eq!(payload, b"ping");
+        assert_eq!(udp_roundtrip(&udp, relay, &datagram, b"ping"), target);
         drop(client);
         stop.store(true, Ordering::Relaxed);
         driver.join().expect("joins");

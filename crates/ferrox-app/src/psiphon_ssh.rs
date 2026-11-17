@@ -24,7 +24,7 @@ pub(crate) const KEY_LENGTH: usize = 16;
 pub(crate) const MIN_PADDING: usize = 32;
 pub(crate) const MAX_PADDING: usize = 8192;
 const MAX_PACKET: usize = 256 * 1024;
-pub(crate) const DEFAULT_CHANNEL_WINDOW: u32 = 4 * 1024 * 1024;
+pub(crate) const DEFAULT_CHANNEL_WINDOW: u32 = 2 * 1024 * 1024;
 /// The control channels stay at the reference's window so readiness is not delayed.
 const API_CHANNEL_WINDOW: u32 = 2 * 1024 * 1024;
 pub(crate) const CHANNEL_PACKET: u32 = 32 * 1024;
@@ -1591,6 +1591,7 @@ struct ChannelState {
     cond: Condvar,
     window_cond: Condvar,
     open: Mutex<Option<mpsc::Sender<Result<OpenResult, String>>>>,
+    last_active: Mutex<Instant>,
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
@@ -2168,6 +2169,7 @@ impl Session {
             cond: Condvar::new(),
             window_cond: Condvar::new(),
             open: Mutex::new(None),
+            last_active: Mutex::new(Instant::now()),
             pool: Arc::clone(&self.inner.pool),
         });
         let (tx, rx) = mpsc::channel();
@@ -2551,6 +2553,14 @@ impl Channel {
 impl ferrox_core::tls::RecordAlignment for Channel {}
 
 impl ChannelState {
+    fn touch(&self) {
+        *lock(&self.last_active) = Instant::now();
+    }
+
+    fn idle_wait(&self) -> Duration {
+        CHANNEL_IDLE.saturating_sub(lock(&self.last_active).elapsed())
+    }
+
     /// The peer ended the channel: refuse further writes, but let queued data drain to the reader.
     fn peer_closed(&self) {
         if let Some(tx) = lock(&self.open).take() {
@@ -2683,15 +2693,24 @@ impl Channel {
             if recv.eof || recv.closed || self.session.closed.load(Ordering::Acquire) {
                 return Ok(None);
             }
+            let wait = self.state.idle_wait();
+            if wait.is_zero() {
+                drop(recv);
+                self.close();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "psiphon channel idle",
+                ));
+            }
             let (guard, timeout) = self
                 .state
                 .cond
-                .wait_timeout(recv, CHANNEL_IDLE)
+                .wait_timeout(recv, wait)
                 .unwrap_or_else(PoisonError::into_inner);
             recv = guard;
             if timeout.timed_out() {
                 drop(recv);
-                self.session.close();
+                self.close();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "psiphon channel idle",
@@ -2740,15 +2759,24 @@ impl Channel {
             if recv.eof || recv.closed || self.session.closed.load(Ordering::Acquire) {
                 return Ok(false);
             }
+            let wait = self.state.idle_wait();
+            if wait.is_zero() {
+                drop(recv);
+                self.close();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "psiphon channel idle",
+                ));
+            }
             let (guard, timeout) = self
                 .state
                 .cond
-                .wait_timeout(recv, CHANNEL_IDLE)
+                .wait_timeout(recv, wait)
                 .unwrap_or_else(PoisonError::into_inner);
             recv = guard;
             if timeout.timed_out() {
                 drop(recv);
-                self.session.close();
+                self.close();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "psiphon channel idle",
@@ -2947,6 +2975,8 @@ impl Channel {
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
         self.session
             .record_up(started, u64::try_from(take).unwrap_or(0));
+        self.state.touch();
+        self.state.cond.notify_all();
         Ok(take)
     }
 }
@@ -2963,6 +2993,8 @@ impl Write for Channel {
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
         self.session
             .record_up(started, u64::try_from(take).unwrap_or(0));
+        self.state.touch();
+        self.state.cond.notify_all();
         Ok(take)
     }
 
@@ -5055,10 +5087,7 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
                 return Dispatch::Recycle(packet.buffer);
             };
             let mut recv = lock(&state.recv);
-            if data_len as u64 > recv.local_window {
-                return Dispatch::Stop;
-            }
-            recv.local_window -= data_len as u64;
+            recv.local_window = recv.local_window.saturating_sub(data_len as u64);
             let was_empty = recv.chunks.is_empty();
             recv.chunks.push_back(Chunk {
                 buffer: packet.buffer,
@@ -5066,6 +5095,7 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
                 end,
             });
             drop(recv);
+            state.touch();
             // A reader already draining does not need a wake per packet; only the transition does.
             if was_empty {
                 state.cond.notify_one();
@@ -5302,6 +5332,7 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         cond: Condvar::new(),
         window_cond: Condvar::new(),
         open: Mutex::new(None),
+        last_active: Mutex::new(Instant::now()),
         pool,
     });
     {
@@ -5646,6 +5677,7 @@ mod tests {
             cond: Condvar::new(),
             window_cond: Condvar::new(),
             open: Mutex::new(None),
+            last_active: Mutex::new(Instant::now()),
             pool: Arc::clone(&pool),
         });
         let mut channel = Channel {
@@ -5739,6 +5771,7 @@ mod tests {
             cond: Condvar::new(),
             window_cond: Condvar::new(),
             open: Mutex::new(None),
+            last_active: Mutex::new(Instant::now()),
             pool: Arc::clone(&pool),
         });
         let mut channel = Channel {
@@ -5819,6 +5852,7 @@ mod tests {
             cond: Condvar::new(),
             window_cond: Condvar::new(),
             open: Mutex::new(Some(tx)),
+            last_active: Mutex::new(Instant::now()),
             pool: Arc::clone(&pool),
         });
         lock(&inner.channels).insert(1, Arc::clone(&state));
@@ -5922,6 +5956,7 @@ mod tests {
             cond: Condvar::new(),
             window_cond: Condvar::new(),
             open: Mutex::new(None),
+            last_active: Mutex::new(Instant::now()),
             pool: Arc::clone(&pool),
         });
         lock(&inner.channels).insert(1, Arc::clone(&state));
@@ -6075,6 +6110,7 @@ mod tests {
             cond: Condvar::new(),
             window_cond: Condvar::new(),
             open: Mutex::new(None),
+            last_active: Mutex::new(Instant::now()),
             pool: Arc::clone(&pool),
         });
         lock(&inner.channels).insert(1, Arc::clone(&state));
@@ -6107,6 +6143,85 @@ mod tests {
                 "{error}"
             ),
         }
+    }
+
+    #[test]
+    fn a_data_packet_past_the_window_keeps_the_channel() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
+        let (_local, _) = listener.accept().expect("accept");
+        let pool = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::new(Inner {
+            writer: Mutex::new(PacketWriter::new(
+                peer.try_clone().expect("clone"),
+                None,
+                None,
+                None,
+            )),
+            channels: Mutex::new(HashMap::new()),
+            pool: Arc::clone(&pool),
+            channel_window: DEFAULT_CHANNEL_WINDOW,
+            next_channel: AtomicU32::new(2),
+            closed: AtomicBool::new(false),
+            closed_at: AtomicU64::new(u64::MAX),
+            socket: Stream::Tcp(peer),
+            relay: Mutex::new(None),
+            opened_at: Instant::now(),
+            last_read: AtomicU64::new(0),
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
+            burst: Mutex::new(crate::psiphon_burst::Burst::default()),
+            burst_enabled: false,
+            pending_request: Mutex::new(None),
+            pending_api: Mutex::new(None),
+            api_timed_out: AtomicBool::new(false),
+            request_lock: Mutex::new(()),
+            requests: None,
+            server: "test".to_owned(),
+            protocol: "SSH",
+            provider_id: None,
+            region: None,
+            fronting_provider_id: None,
+            handshake: HandshakeState::default().into(),
+        });
+        let state = Arc::new(ChannelState {
+            local: 1,
+            remote: AtomicU32::new(2),
+            remote_window: Mutex::new(u64::from(DEFAULT_CHANNEL_WINDOW)),
+            remote_packet: AtomicU32::new(CHANNEL_PACKET),
+            recv: Mutex::new(Recv {
+                chunks: VecDeque::new(),
+                eof: false,
+                closed: false,
+                pending_adjust: 0,
+                local_window: 1024,
+            }),
+            cond: Condvar::new(),
+            window_cond: Condvar::new(),
+            open: Mutex::new(None),
+            last_active: Mutex::new(Instant::now()),
+            pool: Arc::clone(&pool),
+        });
+        lock(&inner.channels).insert(1, Arc::clone(&state));
+        let mut packet = vec![MSG_CHANNEL_DATA];
+        put_u32(&mut packet, 1);
+        put_str(&mut packet, &[b'x'; 2048]);
+        let end = packet.len();
+        assert!(matches!(
+            dispatch(
+                &inner,
+                Packet {
+                    buffer: packet,
+                    start: 0,
+                    end,
+                }
+            ),
+            Dispatch::Queued
+        ));
+        let queued = lock(&state.recv);
+        assert_eq!(queued.local_window, 0);
+        assert_eq!(queued.chunks.len(), 1);
+        assert!(!inner.closed.load(Ordering::Acquire));
     }
 
     #[test]

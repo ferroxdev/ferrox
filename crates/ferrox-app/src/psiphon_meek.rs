@@ -1548,13 +1548,15 @@ impl MeekHttp {
             if reply.status != 200 {
                 return Err(format!("psiphon meek status {}", reply.status));
             }
-            connection_close = reply
-                .header("connection")
-                .is_some_and(|value| value.eq_ignore_ascii_case("close"));
+            connection_close = crate::foxy_account::connection_closes(&reply.headers);
             if let Some(receiver) = self.response_padding.as_mut() {
-                let body =
-                    crate::foxy_account::read_body(&mut reader, &reply.headers, chunk, max_body)
-                        .map_err(|_| "psiphon meek response".to_owned())?;
+                let body = crate::foxy_account::read_body(
+                    &mut reader,
+                    &reply.headers,
+                    chunk,
+                    max_body.min(crate::foxy_account::MAX_BODY),
+                )
+                .map_err(|_| "psiphon meek response".to_owned())?;
                 let body = receiver.strip(&body)?;
                 sink.write_all(&body)
                     .map_err(|error| format!("psiphon meek write: {error}"))?;

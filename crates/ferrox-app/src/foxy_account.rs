@@ -469,6 +469,18 @@ fn chunk_size(line: &str) -> Result<usize, Failure> {
     usize::from_str_radix(size.trim(), 16).map_err(|_| Failure::Frame)
 }
 
+/// Whether a response's `Connection` header names `close` as one option.
+pub(crate) fn connection_closes(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("connection"))
+        .any(|(_, value)| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("close"))
+        })
+}
+
 /// Read the declared body shape in bounded pieces.
 pub(crate) fn read_body<S: BufRead>(
     io: &mut S,
@@ -513,7 +525,7 @@ pub(crate) fn read_body<S: BufRead>(
             io.read_exact(&mut tail).map_err(|_| Failure::Stream)?;
         }
     }
-    let close = header("connection").is_some_and(|value| value.eq_ignore_ascii_case("close"));
+    let close = connection_closes(headers);
     let Some(len) = header("content-length").and_then(|value| value.trim().parse::<usize>().ok())
     else {
         let mut body = Vec::new();
@@ -571,7 +583,7 @@ pub(crate) fn read_body_to<S: BufRead, W: Write + ?Sized>(
             io.read_exact(&mut tail).map_err(|_| Failure::Stream)?;
         }
     }
-    let close = header("connection").is_some_and(|value| value.eq_ignore_ascii_case("close"));
+    let close = connection_closes(headers);
     let Some(len) = header("content-length").and_then(|value| value.trim().parse::<usize>().ok())
     else {
         return if close {
@@ -1692,6 +1704,13 @@ mod tests {
     #[test]
     fn a_body_without_a_length_is_read_to_eof() {
         let mut raw = &b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello world"[..];
+        let reply = read_reply(&mut raw, 3).expect("reads");
+        assert_eq!(reply.body, b"hello world");
+    }
+
+    #[test]
+    fn a_close_token_inside_a_connection_list_reads_to_eof() {
+        let mut raw = &b"HTTP/1.1 200 OK\r\nConnection: keep-alive, close\r\n\r\nhello world"[..];
         let reply = read_reply(&mut raw, 3).expect("reads");
         assert_eq!(reply.body, b"hello world");
     }

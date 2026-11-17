@@ -7364,44 +7364,43 @@ fn filter_region(mut servers: Vec<Server>, settings: &Settings) -> Vec<Server> {
 }
 
 fn load_all_entries(settings: &Settings, regional: bool) -> Result<Vec<Server>, String> {
-    let servers = load_source_entries(settings, true, settings.conduit)?;
-    let servers = if regional {
-        filter_region(servers, settings)
+    let all = load_source_entries(settings, true, settings.conduit)?;
+    let regional_servers = regional.then(|| filter_region(all.clone(), settings));
+    let servers = regional_servers.clone().unwrap_or_else(|| all.clone());
+    let protocols: &[String] = if coin(settings.limit_protocols_probability) {
+        &settings.protocols
     } else {
-        servers
+        &[]
     };
-    let servers: Vec<Server> = servers
-        .into_iter()
-        .filter(|server| {
-            server.direct
-                || server.meek.is_some()
-                || server.unfronted_meek.is_some()
-                || (settings.conduit && server.inproxy.is_some())
-        })
-        .collect();
-    let mut servers = if settings.target.is_some() {
-        servers
+    let initial: &[String] = if coin(settings.initial_limit_probability) {
+        &settings.initial_protocols
     } else {
-        let protocols: &[String] = if coin(settings.limit_protocols_probability) {
-            &settings.protocols
-        } else {
-            &[]
-        };
-        let initial: &[String] = if coin(settings.initial_limit_probability) {
-            &settings.initial_protocols
-        } else {
-            &[]
-        };
-        let initial_count = if initial.is_empty() {
-            0
-        } else {
-            settings.initial_count
-        };
-        let dial_ports = if coin(settings.dial_ports_probability) {
-            Some(settings.dial_ports.as_slice())
-        } else {
-            None
-        };
+        &[]
+    };
+    let initial_count = if initial.is_empty() {
+        0
+    } else {
+        settings.initial_count
+    };
+    let dial_ports = if coin(settings.dial_ports_probability) {
+        Some(settings.dial_ports.as_slice())
+    } else {
+        None
+    };
+    let prioritize = coin(settings.prioritize_probability);
+    let choose = |servers: Vec<Server>| {
+        let servers: Vec<Server> = servers
+            .into_iter()
+            .filter(|server| {
+                server.direct
+                    || server.meek.is_some()
+                    || server.unfronted_meek.is_some()
+                    || (settings.conduit && server.inproxy.is_some())
+            })
+            .collect();
+        if settings.target.is_some() {
+            return servers;
+        }
         let mut selected = select_protocols_with(
             servers,
             protocols,
@@ -7411,7 +7410,7 @@ fn load_all_entries(settings: &Settings, regional: bool) -> Result<Vec<Server>, 
             settings.fronted_fallback,
             dial_ports,
         );
-        if coin(settings.prioritize_probability) {
+        if prioritize {
             prioritize_servers(
                 &mut selected,
                 &settings.prioritize_protocols,
@@ -7420,6 +7419,19 @@ fn load_all_entries(settings: &Settings, regional: bool) -> Result<Vec<Server>, 
         }
         selected
     };
+    let mut selected = choose(servers);
+    if selected.is_empty() {
+        if let Some(regional_servers) = regional_servers {
+            if regional_servers.len() < all.len() {
+                eprintln!(
+                    "psiphon: no server in region {} matches the protocol limit, using the whole list",
+                    settings.region.as_deref().unwrap_or("")
+                );
+                selected = choose(all);
+            }
+        }
+    }
+    let mut servers = selected;
     apply_session_settings(&mut servers, settings);
     apply_fronting_overrides_selected(&mut servers, settings);
     if servers.is_empty() {
@@ -13429,6 +13441,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_region_falls_back_when_its_entries_miss_the_protocol_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-psiphon-region-fallback-{}-{}",
+            std::process::id(),
+            hex(&random::<8>())
+        ));
+        std::fs::create_dir_all(&dir).expect("state");
+        let path = dir.join("entries");
+        let mut text = String::new();
+        for entry in [
+            r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","region":"US"}"#,
+            r#"{"ipAddress":"192.0.2.2","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK"],"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example"],"meekFrontingHosts":["cdn.example"],"region":"CA"}"#,
+        ] {
+            text.push_str(&hex(format!("0 0 0 0 {entry}").as_bytes()));
+            text.push('\n');
+        }
+        std::fs::write(&path, text).expect("entries");
+        let config = format!(
+            r#"{{"serverEntries":{:?},"region":"US",
+                "LimitTunnelProtocols":["FRONTED-MEEK"],"cdnSets":["fastly","bunny"]}}"#,
+            path.to_string_lossy()
+        );
+        let settings =
+            Settings::from_json(Some(&json::parse(&config).expect("settings"))).expect("settings");
+        let servers = load_entries(&settings).expect("entries");
+        assert!(servers
+            .iter()
+            .any(|server| server.region.as_deref() == Some("CA")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
