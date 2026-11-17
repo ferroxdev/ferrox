@@ -187,7 +187,27 @@ fn valid_var(name: &str) -> bool {
 }
 
 fn validate_expr(expr: &Expr) -> Option<()> {
-    (expr_kind(expr)? == ExprKind::Bytes).then_some(())
+    if expr_kind(expr)? != ExprKind::Bytes {
+        return None;
+    }
+    validate_lengths(expr)
+}
+
+fn validate_lengths(expr: &Expr) -> Option<()> {
+    let length = match expr.op.as_str() {
+        "slice" => expr.args.get(2),
+        "pad" | "truncate" => expr.args.get(1),
+        _ => None,
+    };
+    if length.is_some_and(reads_metadata) {
+        return None;
+    }
+    for arg in &expr.args {
+        if let ExprArg::Expr(inner) = arg {
+            validate_lengths(inner)?;
+        }
+    }
+    Some(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -731,8 +751,19 @@ fn measure_expr(expr: &Expr, ctx: &Context) -> io::Result<usize> {
 }
 
 fn length_arg(arg: &ExprArg, ctx: &Context) -> io::Result<usize> {
+    if reads_metadata(arg) {
+        return Err(invalid("expression length depends on metadata"));
+    }
     usize::try_from(evaluate_arg(arg, ctx)?.u64()?)
         .map_err(|_| invalid("expression length too long"))
+}
+
+fn reads_metadata(arg: &ExprArg) -> bool {
+    match arg {
+        ExprArg::Metadata(_) => true,
+        ExprArg::Expr(expr) => expr.args.iter().any(reads_metadata),
+        ExprArg::Bytes(_) | ExprArg::U64(_) | ExprArg::Var(_) => false,
+    }
 }
 
 fn measure_arg(arg: &ExprArg, ctx: &Context) -> io::Result<usize> {
@@ -1053,6 +1084,54 @@ mod tests {
             ],
         };
         assert_eq!(measure_expr(&pad, &ctx).expect("measures"), 3);
+    }
+
+    #[test]
+    fn a_length_a_peer_could_measure_differently_is_refused() {
+        let local: SocketAddr = "127.0.0.1:1".parse().expect("local");
+        let ctx = Context::new(Some(local), None, Vars::default());
+        let metadata_length = ExprArg::Expr(Expr {
+            op: "add".to_owned(),
+            args: vec![
+                ExprArg::Metadata("src_port_u16".to_owned()),
+                ExprArg::U64(1),
+            ],
+        });
+        let truncate = Expr {
+            op: "truncate".to_owned(),
+            args: vec![ExprArg::Bytes(vec![1, 2, 3, 4]), metadata_length.clone()],
+        };
+        assert_eq!(
+            measure_expr(&truncate, &ctx)
+                .expect_err("metadata differs on each side")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let nested = Expr {
+            op: "concat".to_owned(),
+            args: vec![
+                ExprArg::Expr(Expr {
+                    op: "truncate".to_owned(),
+                    args: vec![ExprArg::Bytes(vec![1, 2, 3, 4]), metadata_length],
+                }),
+                ExprArg::Bytes(vec![0]),
+            ],
+        };
+        assert!(
+            HeaderCustom::new(
+                vec![Sequence {
+                    items: vec![Item {
+                        transform: Some(nested),
+                        ..Item::default()
+                    }],
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_none(),
+            "a nested length is validated at load"
+        );
     }
 
     #[test]

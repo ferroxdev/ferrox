@@ -46,6 +46,7 @@ const RESOLVE_WORKERS: usize = 4;
 const UDP_BUFFER: usize = 65_535;
 const UDP_PACKETS_PER_SWEEP: usize = 256;
 const UDP_PACKETS_PER_ASSOC: usize = 32;
+const DGRAM_SEND_QUEUE: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayMode {
@@ -231,7 +232,7 @@ enum Sent {
 
 struct Resolving {
     generation: u64,
-    payloads: Vec<(Vec<u8>, bool)>,
+    payloads: Vec<Vec<u8>>,
 }
 
 struct ResolveJob {
@@ -239,7 +240,6 @@ struct ResolveJob {
     host: String,
     port: u16,
     payload: Vec<u8>,
-    stream: bool,
     generation: u64,
     options: Option<Arc<crate::sockopt::SocketOptions>>,
     reply: Sender<ResolveDone>,
@@ -251,7 +251,6 @@ struct ResolveDone {
     port: u16,
     target: Option<SocketAddr>,
     payload: Vec<u8>,
-    stream: bool,
     generation: u64,
 }
 
@@ -290,7 +289,6 @@ impl ResolverPool {
                             port: job.port,
                             target,
                             payload: job.payload,
-                            stream: job.stream,
                             generation: job.generation,
                         });
                     });
@@ -449,7 +447,7 @@ impl TuicOut {
             quic::quiche_config_alpn(roots, self.cc.as_deref(), &[wire::ALPN])?
         };
         quic::tune_transport(&mut config);
-        config.enable_dgram(true, quic::MAX_DATAGRAM, 64);
+        config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
         if self.zero_rtt {
             config.enable_early_data();
         }
@@ -597,6 +595,7 @@ impl TuicOut {
                     let max = conn.dgram_max_writable_len();
                     send_message(
                         &mut conn,
+                        &lane.sock,
                         self.mode,
                         association,
                         packet,
@@ -645,6 +644,20 @@ fn destination_wire(destination: &Destination) -> Option<(wire::Address<'_>, u16
                 IpAddr::V4(ip) => Some((wire::Address::V4(ip.octets()), port)),
                 IpAddr::V6(ip) => Some((wire::Address::V6(ip.octets()), port)),
             }
+        }
+    }
+}
+
+fn destination_of(address: wire::Address<'_>, port: u16) -> Destination {
+    match address {
+        wire::Address::V4(octets) => {
+            Destination::Address(SocketAddr::new(IpAddr::V4(octets.into()), port))
+        }
+        wire::Address::V6(octets) => {
+            Destination::Address(SocketAddr::new(IpAddr::V6(octets.into()), port))
+        }
+        wire::Address::Name(bytes) => {
+            Destination::Name(String::from_utf8_lossy(bytes).into_owned(), port)
         }
     }
 }
@@ -751,6 +764,7 @@ fn export_token(
 #[allow(clippy::too_many_arguments)]
 fn send_message(
     conn: &mut quiche::Connection,
+    sock: &Datagram,
     mode: RelayMode,
     association: u16,
     packet: u16,
@@ -778,6 +792,14 @@ fn send_message(
         queue_stream(pending, association, packet, address, payload);
         return;
     };
+    let fragments = usize::from(plan.total);
+    if conn.dgram_send_queue_len() + fragments > DGRAM_SEND_QUEUE {
+        quic::flush_egress(conn, sock);
+        if conn.dgram_send_queue_len() + fragments > DGRAM_SEND_QUEUE {
+            queue_stream(pending, association, packet, address, payload);
+            return;
+        }
+    }
     frame.clear();
     if frame.capacity() < max {
         frame.reserve(max - frame.capacity());
@@ -799,7 +821,10 @@ fn send_message(
             frame,
         );
         if conn.dgram_send(&frame[..]).is_err() {
-            break;
+            quic::flush_egress(conn, sock);
+            if conn.dgram_send(&frame[..]).is_err() {
+                break;
+            }
         }
         left = &left[take..];
     }
@@ -927,6 +952,7 @@ fn reply_worker(weak: &std::sync::Weak<Lane>) -> std::sync::mpsc::SyncSender<Vec
     let worker = weak.clone();
     thread::spawn(move || {
         let mut reassembly = HashMap::new();
+        let mut head = Vec::with_capacity(22);
         while let Ok(data) = backlog.recv() {
             let Some(owner) = worker.upgrade() else {
                 break;
@@ -934,18 +960,20 @@ fn reply_worker(weak: &std::sync::Weak<Lane>) -> std::sync::mpsc::SyncSender<Vec
             if owner.stop.load(Ordering::Relaxed) {
                 break;
             }
-            dispatch_client(&data, &owner, &mut reassembly);
+            dispatch_client(&data, &owner, &mut reassembly, &mut head);
         }
     });
     replies
 }
 
+#[allow(clippy::too_many_lines)]
 fn drive_client(weak: &std::sync::Weak<Lane>) {
     if weak.upgrade().is_none() {
         return;
     }
     let replies = reply_worker(weak);
     let mut buf = vec![0u8; 65535];
+    let mut ids = Vec::new();
     let mut uni: HashMap<u64, Vec<u8>> = HashMap::new();
     while let Some(lane) = weak.upgrade() {
         if lane.stop.load(Ordering::Relaxed) {
@@ -978,8 +1006,9 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                 while let Ok(data) = conn.dgram_recv_buf() {
                     let _ = replies.try_send(data);
                 }
-                let ids: Vec<u64> = conn.readable().collect();
-                for id in ids {
+                ids.clear();
+                ids.extend(conn.readable());
+                for &id in &ids {
                     if id % 4 != 3 {
                         continue;
                     }
@@ -1050,44 +1079,57 @@ fn flush_lane(lane: &Lane, conn: &mut quiche::Connection) {
     }
 }
 
-fn dispatch_client(data: &[u8], lane: &Lane, reassembly: &mut HashMap<(u16, u16), Parts>) {
+fn dispatch_client(
+    data: &[u8],
+    lane: &Lane,
+    reassembly: &mut HashMap<(u16, u16), Parts>,
+    head: &mut Vec<u8>,
+) {
+    let Ok(packet) = wire::parse_packet(data) else {
+        return;
+    };
     let Ok(sinks) = lane.sinks.lock() else {
         return;
     };
     for sink in sinks.iter() {
+        if sink.association != packet.association {
+            continue;
+        }
         client_reply(
-            data,
-            sink.association,
+            &packet,
             reassembly,
             &sink.source,
             &sink.last,
             &sink.reply,
+            head,
         );
     }
 }
 
 fn client_reply(
-    data: &[u8],
-    association: u16,
+    packet: &wire::Packet<'_>,
     reassembly: &mut HashMap<(u16, u16), Parts>,
     source: &Mutex<Option<SocketAddr>>,
     last: &Mutex<Instant>,
     reply: &UdpSocket,
+    head: &mut Vec<u8>,
 ) {
-    if !reassembly.is_empty() {
-        reassembly.retain(|_, parts| parts.at.elapsed() < REASSEMBLY_TTL);
-    }
-    let Some((host, port, payload)) = assemble(data, association, reassembly) else {
+    let Some((destination, payload)) = take_packet(reassembly, packet) else {
         return;
     };
     let Some(source) = source.lock().ok().and_then(|slot| *slot) else {
         return;
     };
-    let Some(target) = proxy::resolve_outbound(&host, port) else {
-        return;
+    let target = match destination {
+        Destination::Address(target) => target,
+        Destination::Name(host, port) => {
+            let Some(target) = proxy::resolve_outbound(&host, port) else {
+                return;
+            };
+            target
+        }
     };
-    let mut head = Vec::with_capacity(22);
-    let (head, payload) = proxy::socks_udp_parts(&mut head, &target, &payload);
+    let (head, payload) = proxy::socks_udp_parts(head, &target, &payload);
     if proxy::send_to_two(reply, head, payload, source).is_ok() {
         touch(last);
     }
@@ -1103,40 +1145,32 @@ fn idle(last: &Mutex<Instant>) -> bool {
     last.lock().is_ok_and(|last| last.elapsed() >= UDP_IDLE)
 }
 
-fn assemble<'a>(
-    data: &'a [u8],
-    association: u16,
-    reassembly: &mut HashMap<(u16, u16), Parts>,
-) -> Option<(String, u16, Cow<'a, [u8]>)> {
-    if wire::Packet::is_heartbeat(data) {
-        return None;
-    }
-    let packet = wire::parse_packet(data).ok()?;
-    if packet.association != association {
-        return None;
-    }
-    take_packet(reassembly, &packet)
-}
-
 fn take_packet<'a>(
     reassembly: &mut HashMap<(u16, u16), Parts>,
     packet: &wire::Packet<'a>,
-) -> Option<(String, u16, Cow<'a, [u8]>)> {
+) -> Option<(Destination, Cow<'a, [u8]>)> {
     let size = packet.payload.len();
     if packet.total == 1 {
         let (address, port) = packet.destination?;
-        return Some((address_host(address), port, Cow::Borrowed(packet.payload)));
+        return Some((destination_of(address, port), Cow::Borrowed(packet.payload)));
     }
     if size > MAX_PACKET_PAYLOAD {
         return None;
     }
     let key = (packet.association, packet.packet);
+    if reassembly
+        .get(&key)
+        .is_some_and(|entry| entry.at.elapsed() >= REASSEMBLY_TTL)
+    {
+        reassembly.remove(&key);
+    }
     if !reassembly.contains_key(&key) {
-        let per_assoc = reassembly
-            .keys()
-            .filter(|(assoc, _)| *assoc == packet.association)
-            .count();
-        let retained = reassembly.values().map(|parts| parts.bytes).sum::<usize>();
+        let mut per_assoc = 0usize;
+        let mut retained = 0usize;
+        for ((assoc, _), parts) in &*reassembly {
+            per_assoc += usize::from(*assoc == packet.association);
+            retained += parts.bytes;
+        }
         if reassembly.len() >= MAX_REASSEMBLIES
             || per_assoc >= MAX_REASSEMBLIES_PER_ASSOC
             || retained.saturating_add(size) > MAX_REASSEMBLY_BYTES
@@ -1162,7 +1196,7 @@ fn take_packet<'a>(
         at: Instant::now(),
     });
     if let Some((address, port)) = packet.destination {
-        entry.address = Some((address_host(address), port));
+        entry.address = Some(destination_of(address, port));
     }
     entry.payload[usize::from(packet.index)] = Some(packet.payload.to_vec());
     entry.received += 1;
@@ -1171,29 +1205,21 @@ fn take_packet<'a>(
         return None;
     }
     let entry = reassembly.remove(&key)?;
-    let (host, port) = entry.address?;
+    let destination = entry.address?;
     let mut payload = Vec::with_capacity(entry.bytes);
     for part in entry.payload {
         payload.extend_from_slice(part.as_deref()?);
     }
-    Some((host, port, Cow::Owned(payload)))
+    Some((destination, Cow::Owned(payload)))
 }
 
 struct Parts {
     total: u8,
-    address: Option<(String, u16)>,
+    address: Option<Destination>,
     payload: Vec<Option<Vec<u8>>>,
     received: u8,
     bytes: usize,
     at: Instant,
-}
-
-fn address_host(address: wire::Address<'_>) -> String {
-    match address {
-        wire::Address::V4(octets) => std::net::Ipv4Addr::from(octets).to_string(),
-        wire::Address::V6(octets) => std::net::Ipv6Addr::from(octets).to_string(),
-        wire::Address::Name(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-    }
 }
 
 pub(crate) fn outbound(root: &Json) -> Result<Option<TuicOut>, String> {
@@ -1234,14 +1260,19 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<TuicOut>, String> {
         .filter(|value| !value.is_empty())
         .ok_or("tuic outbound has no password")?;
     let tls = crate::config::outbound_tls(first, address)?;
+    if field("udp_over_stream")
+        .or_else(|| field("udpOverStream"))
+        .is_some_and(|value| matches!(value, Json::Bool(true)))
+    {
+        return Err("tuic udp_over_stream is not carried".to_owned());
+    }
     let mode = match field("udp_relay_mode")
         .or_else(|| field("udpRelayMode"))
         .and_then(Json::as_str)
-        .unwrap_or("native")
     {
-        "native" => RelayMode::Native,
-        "quic" => RelayMode::Quic,
-        other => return Err(format!("tuic udp_relay_mode `{other}` is not carried")),
+        Some("native") | None => RelayMode::Native,
+        Some("quic") => RelayMode::Quic,
+        Some(other) => return Err(format!("tuic udp_relay_mode `{other}` is not carried")),
     };
     let cc = field("congestion_control")
         .or_else(|| field("congestionControl"))
@@ -1431,7 +1462,7 @@ pub(crate) fn serve_inbound(
             return false;
         }
     }
-    template.enable_dgram(true, quic::MAX_DATAGRAM, 64);
+    template.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
     if inbound.get("settings").is_some_and(|node| {
         bool_field(node, "zero_rtt_handshake") || bool_field(node, "zeroRttHandshake")
     }) {
@@ -1568,6 +1599,9 @@ struct Inner {
     resolved: Receiver<ResolveDone>,
     udp_sockets: Arc<AtomicUsize>,
     udp_buf: Vec<u8>,
+    udp_frame: Vec<u8>,
+    readable: Vec<u64>,
+    expired: Vec<u16>,
 }
 
 struct UdpAssoc {
@@ -1660,9 +1694,8 @@ impl Server {
         if header.ty != quiche::Type::Short && header.version != quiche::PROTOCOL_VERSION {
             return;
         }
-        let dcid = header.dcid.as_ref().to_vec();
         let initial = header.ty == quiche::Type::Initial;
-        let found = self.conns.get(&dcid).cloned();
+        let found = self.conns.get(header.dcid.as_ref()).cloned();
         let session = match found {
             Some(session) => Some(session),
             None if initial => {
@@ -1755,6 +1788,9 @@ impl Server {
                 resolved,
                 udp_sockets: Arc::clone(&self.udp_sockets),
                 udp_buf: Vec::new(),
+                udp_frame: Vec::new(),
+                readable: Vec::new(),
+                expired: Vec::new(),
             }),
         });
         self.conns.insert(scid.to_vec(), Arc::clone(&session));
@@ -1828,17 +1864,20 @@ impl Server {
                 return;
             }
         }
-        inner.seen.retain(|id| !conn.stream_closed(*id));
-        let mut ids: Vec<u64> = conn.readable().collect();
-        for id in inner.uni.keys() {
-            if !ids.contains(id) {
-                ids.push(*id);
+        let state = &mut *inner;
+        state.seen.retain(|id| !conn.stream_closed(*id));
+        state.readable.clear();
+        state.readable.extend(conn.readable());
+        for id in state.uni.keys() {
+            if !state.readable.contains(id) {
+                state.readable.push(*id);
             }
         }
-        for id in ids {
+        let mut ids = std::mem::take(&mut state.readable);
+        for &id in &ids {
             match id % 4 {
                 0 => {
-                    if inner.seen.insert(id) {
+                    if state.seen.insert(id) {
                         let stream = QuicStream::new(
                             Arc::clone(&session.conn),
                             Arc::clone(&self.sock),
@@ -1854,25 +1893,22 @@ impl Server {
                             .spawn(move || serve_tcp(stream, freedom, worker));
                     }
                 }
-                2 => read_uni(&mut conn, &mut inner, &self.sock, id, self.freedom),
+                2 => read_uni(&mut conn, state, id, self.freedom),
                 _ => {}
             }
         }
+        ids.clear();
+        state.readable = ids;
         while let Ok(data) = conn.dgram_recv_buf() {
             if self.freedom {
-                accept_packet(
-                    &mut conn,
-                    &mut inner,
-                    &self.sock,
-                    &data,
-                    false,
-                    self.freedom,
-                );
+                if let Ok(packet) = wire::parse_packet(&data) {
+                    accept_packet(&mut inner, &packet, false);
+                }
             }
         }
-        drain_resolved(&mut inner);
-        poll_udp(&mut conn, &mut inner);
         let now = Instant::now();
+        drain_resolved(&mut inner, now);
+        poll_udp(&mut conn, &self.sock, &mut inner, now);
         inner
             .reassembly
             .retain(|_, parts| now.duration_since(parts.at) < REASSEMBLY_TTL);
@@ -1941,12 +1977,12 @@ impl Server {
                 continue;
             };
             inner.seen.retain(|id| !conn.stream_closed(*id));
+            drain_resolved(&mut inner, now);
+            poll_udp(&mut conn, &self.sock, &mut inner, now);
             expire_udp(&mut inner, now, self.udp_timeout);
             inner
                 .reassembly
                 .retain(|_, parts| now.duration_since(parts.at) < REASSEMBLY_TTL);
-            drain_resolved(&mut inner);
-            poll_udp(&mut conn, &mut inner);
             flush_inner(&mut conn, &self.sock, &mut inner);
             quic::flush_egress(&mut conn, &self.sock);
         }
@@ -2239,12 +2275,24 @@ fn read_stream_address(stream: &mut QuicStream, deadline: Instant) -> Option<(St
     Some((host, u16::from_be_bytes(port)))
 }
 
-fn read_uni(
+thread_local! {
+    static UNI_ROOM: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn read_uni(conn: &mut quiche::Connection, inner: &mut Inner, id: u64, freedom: bool) {
+    let mut room = UNI_ROOM.with(|held| std::mem::take(&mut *held.borrow_mut()));
+    room.resize(UDP_BUFFER, 0);
+    read_uni_with(conn, inner, id, freedom, &mut room);
+    UNI_ROOM.with(|held| *held.borrow_mut() = room);
+}
+
+fn read_uni_with(
     conn: &mut quiche::Connection,
     inner: &mut Inner,
-    sock: &Arc<Datagram>,
     id: u64,
     freedom: bool,
+    room: &mut [u8],
 ) {
     if inner.auth_id == Some(id) {
         let mut room = [0u8; 512];
@@ -2259,9 +2307,8 @@ fn read_uni(
         }
         return;
     }
-    let mut room = vec![0u8; 65535];
     let mut data = inner.uni.remove(&id).unwrap_or_default();
-    while let Ok((n, _)) = conn.stream_recv(id, &mut room) {
+    while let Ok((n, _)) = conn.stream_recv(id, &mut *room) {
         if n == 0 {
             break;
         }
@@ -2271,11 +2318,11 @@ fn read_uni(
         }
         data.extend_from_slice(&room[..n]);
     }
-    if data.get(1) == Some(&wire::PACKET) {
+    if freedom && data.get(1) == Some(&wire::PACKET) {
         loop {
             match wire::parse_packet_prefix(&data) {
-                Ok((_, used)) => {
-                    accept_packet(conn, inner, sock, &data[..used], true, freedom);
+                Ok((packet, used)) => {
+                    accept_packet(inner, &packet, true);
                     data.drain(..used);
                 }
                 Err(wire::FrameError::Short) => break,
@@ -2311,54 +2358,29 @@ fn read_uni(
     }
 }
 
-#[allow(clippy::too_many_lines)]
-fn accept_packet(
-    conn: &mut quiche::Connection,
-    inner: &mut Inner,
-    sock: &Arc<Datagram>,
-    data: &[u8],
-    stream: bool,
-    freedom: bool,
-) {
-    if !freedom || wire::Packet::is_heartbeat(data) {
-        return;
-    }
-    let Ok(packet) = wire::parse_packet(data) else {
-        return;
-    };
-    if !inner.reassembly.is_empty() {
-        inner
-            .reassembly
-            .retain(|_, parts| parts.at.elapsed() < REASSEMBLY_TTL);
-    }
-    let Some((host, port, payload)) = take_packet(&mut inner.reassembly, &packet) else {
-        return;
-    };
+fn accept_packet(inner: &mut Inner, packet: &wire::Packet<'_>, stream: bool) {
     let Some(generation) = select_assoc(inner, packet.association, stream) else {
         return;
     };
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        deliver_udp(
-            inner,
-            packet.association,
-            SocketAddr::new(ip, port),
-            &payload,
-            stream,
-        );
-        poll_udp(conn, inner);
-        flush_inner(conn, sock, inner);
-    } else {
-        let job = ResolveJob {
-            association: packet.association,
-            host,
-            port,
-            payload: payload.into_owned(),
-            stream,
-            generation,
-            options: proxy::dial_options(),
-            reply: inner.resolve_done.clone(),
-        };
-        queue_resolve(inner, job);
+    let Some((destination, payload)) = take_packet(&mut inner.reassembly, packet) else {
+        return;
+    };
+    match destination {
+        Destination::Address(target) => {
+            deliver_udp(inner, packet.association, target, &payload, Instant::now());
+        }
+        Destination::Name(host, port) => {
+            let job = ResolveJob {
+                association: packet.association,
+                host,
+                port,
+                payload: payload.into_owned(),
+                generation,
+                options: proxy::dial_options(),
+                reply: inner.resolve_done.clone(),
+            };
+            queue_resolve(inner, job);
+        }
     }
 }
 
@@ -2366,7 +2388,7 @@ fn queue_resolve(inner: &mut Inner, job: ResolveJob) {
     let key = (job.association, job.host.clone(), job.port);
     if let Some(pending) = inner.resolving.get_mut(&key) {
         if pending.payloads.len() < MAX_RESOLVE_PAYLOADS {
-            pending.payloads.push((job.payload, job.stream));
+            pending.payloads.push(job.payload);
         }
         return;
     }
@@ -2385,7 +2407,7 @@ fn queue_resolve(inner: &mut Inner, job: ResolveJob) {
     }
 }
 
-fn drain_resolved(inner: &mut Inner) {
+fn drain_resolved(inner: &mut Inner, now: Instant) {
     while let Ok(done) = inner.resolved.try_recv() {
         let key = (done.association, done.host.clone(), done.port);
         let Some(held) = inner.resolving.get(&key) else {
@@ -2406,9 +2428,9 @@ fn drain_resolved(inner: &mut Inner) {
             continue;
         };
         if let Some(target) = done.target {
-            deliver_udp(inner, done.association, target, &done.payload, done.stream);
-            for (payload, stream) in pending.payloads {
-                deliver_udp(inner, done.association, target, &payload, stream);
+            deliver_udp(inner, done.association, target, &done.payload, now);
+            for payload in pending.payloads {
+                deliver_udp(inner, done.association, target, &payload, now);
             }
         }
     }
@@ -2436,17 +2458,21 @@ fn select_assoc(inner: &mut Inner, association: u16, stream: bool) -> Option<u64
 /// Expire idle associations with everything that belonged to them, so a lookup that lands after the
 /// expiry cannot recreate the association it was resolved for.
 fn expire_udp(inner: &mut Inner, now: Instant, timeout: Duration) {
-    let expired: Vec<u16> = inner
-        .udp
-        .iter()
-        .filter(|(_, assoc)| now.duration_since(assoc.last) >= timeout)
-        .map(|(association, _)| *association)
-        .collect();
-    for association in expired {
+    let mut expired = std::mem::take(&mut inner.expired);
+    expired.clear();
+    expired.extend(
+        inner
+            .udp
+            .iter()
+            .filter(|(_, assoc)| now.duration_since(assoc.last) >= timeout)
+            .map(|(association, _)| *association),
+    );
+    for association in expired.drain(..) {
         inner.udp.remove(&association);
         inner.reassembly.retain(|key, _| key.0 != association);
         inner.resolving.retain(|key, _| key.0 != association);
     }
+    inner.expired = expired;
 }
 
 fn deliver_udp(
@@ -2454,12 +2480,8 @@ fn deliver_udp(
     association: u16,
     target: SocketAddr,
     payload: &[u8],
-    stream: bool,
+    now: Instant,
 ) {
-    if select_assoc(inner, association, stream).is_none() {
-        return;
-    }
-    let now = Instant::now();
     let Some(entry) = inner.udp.get_mut(&association) else {
         return;
     };
@@ -2476,12 +2498,12 @@ fn flush_inner(conn: &mut quiche::Connection, sock: &Arc<Datagram>, inner: &mut 
     inner.pending = pending;
 }
 
-fn poll_udp(conn: &mut quiche::Connection, inner: &mut Inner) {
+fn poll_udp(conn: &mut quiche::Connection, sock: &Datagram, inner: &mut Inner, now: Instant) {
     let max = conn.dgram_max_writable_len();
     let mut buf = std::mem::take(&mut inner.udp_buf);
     buf.resize(UDP_BUFFER, 0);
     let mut pending = std::mem::take(&mut inner.pending);
-    let mut frame = Vec::new();
+    let mut frame = std::mem::take(&mut inner.udp_frame);
     let mut swept = 0usize;
     let cursor = inner.udp_cursor;
     let mut after = cursor.is_none_or(|key| !inner.udp.contains_key(&key));
@@ -2524,10 +2546,11 @@ fn poll_udp(conn: &mut quiche::Connection, inner: &mut Inner) {
                             IpAddr::V4(ip) => wire::Address::V4(ip.octets()),
                             IpAddr::V6(ip) => wire::Address::V6(ip.octets()),
                         };
-                        *last = Instant::now();
+                        *last = now;
                         *packet = next_packet(*packet);
                         send_message(
                             conn,
+                            sock,
                             mode,
                             *association,
                             *packet,
@@ -2553,6 +2576,7 @@ fn poll_udp(conn: &mut quiche::Connection, inner: &mut Inner) {
     inner.udp_cursor = if exhausted { last_serviced } else { None };
     inner.pending = pending;
     inner.udp_buf = buf;
+    inner.udp_frame = frame;
 }
 
 #[cfg(test)]
@@ -2748,6 +2772,9 @@ mod tests {
                 resolved,
                 udp_sockets: Arc::new(AtomicUsize::new(0)),
                 udp_buf: Vec::new(),
+                udp_frame: Vec::new(),
+                readable: Vec::new(),
+                expired: Vec::new(),
             },
             done,
         )
@@ -2822,7 +2849,7 @@ mod tests {
             key.clone(),
             Resolving {
                 generation,
-                payloads: vec![(vec![1], false)],
+                payloads: vec![vec![1]],
             },
         );
         inner.udp.remove(&7);
@@ -2832,11 +2859,10 @@ mod tests {
             port: 53,
             target: None,
             payload: vec![2],
-            stream: false,
             generation,
         })
         .expect("the channel is open");
-        drain_resolved(&mut inner);
+        drain_resolved(&mut inner, Instant::now());
         assert!(!inner.resolving.contains_key(&key));
         assert!(
             inner.udp.is_empty(),
@@ -2853,7 +2879,7 @@ mod tests {
             key.clone(),
             Resolving {
                 generation,
-                payloads: vec![(vec![1], false)],
+                payloads: vec![vec![1]],
             },
         );
         expire_udp(
@@ -2872,11 +2898,10 @@ mod tests {
             port: 53,
             target: None,
             payload: vec![2],
-            stream: false,
             generation,
         })
         .expect("the channel is open");
-        drain_resolved(&mut inner);
+        drain_resolved(&mut inner, Instant::now());
         assert!(
             inner.udp.is_empty(),
             "an expired lookup does not recreate the association"
@@ -2926,8 +2951,11 @@ mod tests {
         let source = payload.as_ptr();
         let (taken, counts) =
             ferrox_core::alloc_count::measure(|| take_packet(&mut HashMap::new(), &packet));
-        let (host, port, copied) = taken.expect("one packet");
-        assert_eq!((host.as_str(), port), ("192.0.2.1", 53));
+        let (destination, copied) = taken.expect("one packet");
+        assert_eq!(
+            destination,
+            Destination::Address(SocketAddr::new(IpAddr::V4([192, 0, 2, 1].into()), 53))
+        );
         assert_eq!(copied.as_ref(), payload);
         assert_eq!(copied.as_ptr(), source);
         assert_eq!(counts.allocs - base.allocs, 0);
@@ -2945,6 +2973,14 @@ mod tests {
             .expect("a tuic outbound");
         assert_eq!(out.cert_pins.len(), 1);
         assert!(out.client_config().is_some());
+    }
+
+    #[test]
+    fn a_tuic_udp_over_stream_is_refused_not_silently_mapped() {
+        let base = r#"{"outbounds":[{"protocol":"tuic","settings":{"address":"tuic.test","port":443,"uuid":"00112233-4455-6677-8899-aabbccddeeff","password":"secret"%s},"streamSettings":{"security":"tls","tlsSettings":{"allowInsecure":true}}}]}"#;
+        let config =
+            crate::json::parse(&base.replace("%s", r#","udp_over_stream":true"#)).expect("parses");
+        assert!(outbound(&config).is_err());
     }
 
     #[test]
@@ -3007,7 +3043,16 @@ mod tests {
         let address = wire::address_port("127.0.0.1", 9).expect("an address");
         let mut frame = Vec::new();
         wire::encode_fragment(1, 2, 1, 0, &address, b"hello", &mut frame);
-        client_reply(&frame, 1, &mut HashMap::new(), &source, &last, &sink);
+        let packet = wire::parse_packet(&frame).expect("a packet");
+        let mut head = Vec::new();
+        client_reply(
+            &packet,
+            &mut HashMap::new(),
+            &source,
+            &last,
+            &sink,
+            &mut head,
+        );
         let mut buf = [0u8; 64];
         client
             .set_read_timeout(Some(Duration::from_secs(1)))

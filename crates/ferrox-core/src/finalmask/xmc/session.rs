@@ -6,7 +6,7 @@ use super::profile::{find_profile, profiles_from_config, read_login_success, Pro
 use super::protocol::{
     read_bytes, read_packet, read_packet_with_length, read_string, read_unsigned_short, read_uuid,
     read_varint, write_boolean, write_bytes, write_packet, write_packet_with_length, write_string,
-    write_unsigned_short, write_uuid, write_varint,
+    write_unsigned_short, write_uuid, write_varint, MAX_STRING_LENGTH,
 };
 use boring::pkey::PKey;
 use boring::rsa::{Padding, Rsa};
@@ -54,6 +54,11 @@ impl Config {
         profiles_from_config(&profiles)?;
         if password.is_empty() {
             return Err(invalid_input("xmc: empty password"));
+        }
+        if hostname.len() > usize::try_from(MAX_STRING_LENGTH).unwrap_or(usize::MAX) {
+            return Err(invalid_input(
+                "xmc: hostname is longer than the protocol carries",
+            ));
         }
         if private_key_der.is_empty() || public_key_der.is_empty() {
             return Err(invalid_input("xmc: empty key"));
@@ -619,6 +624,23 @@ mod tests {
 
     fn pair() -> (Pipe, Pipe) {
         (Pipe::new(), Pipe::new())
+    }
+
+    #[test]
+    fn a_hostname_the_writer_would_refuse_is_rejected_before_dialing() {
+        let key = derive_rsa_key("shared-password").expect("key");
+        let hostname = "x".repeat(
+            usize::try_from(crate::finalmask::xmc::protocol::MAX_STRING_LENGTH).expect("limit") + 1,
+        );
+        let error = Config::new(
+            vec![profile("SignedUser")],
+            "shared-password".to_owned(),
+            hostname,
+            private_key_der(&key).expect("private"),
+            public_key_der(&key).expect("public"),
+        )
+        .expect_err("hostname too long");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
