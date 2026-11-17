@@ -20768,7 +20768,7 @@ fn arm_sni(cfg: &ferrox_core::tls::TlsConfig, uplink: Connection) -> Connection 
             SniShape::Record
         }
     };
-    uplink.with_sni(fallback, sni.mixed_case)
+    uplink.with_sni(fallback)
 }
 
 fn warn_sni(message: &str) {

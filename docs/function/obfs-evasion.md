@@ -36,10 +36,11 @@ the entry's wait.
 methods that need no decoy, where `?`, `#` and `*` draw a letter, a digit or either once per
 dial; `sequence` is the decoy segment's sequence number; `fooling` is `auto`, `md5` or `ttl`, and
 a `ttl` fooling takes `ttl` (default 8, and zero is refused). `mixedCase` (also `mixed_case` and
-`mixedCaseSni`) rewrites the real hello's name before the shape is chosen: the first letter of
-each label is upper case and every other letter draws its case, so the name is the same string
+`mixedCaseSni`) hands the dial's TLS backend a case-altered name to serialize: the first letter
+of each label is upper case and every other letter draws its case, so the name is the same string
 to the server (DNS is case-insensitive), keeps its length, and is a fresh string to a filter that
-matches a lower-case name. The decoy is a fixed 517-byte `ClientHello` naming `fakeSni`, built
+matches a lower-case name. The rewrite happens before the backend builds the hello, never in the
+record below it, because the peer's handshake check covers the bytes the backend hashes. The decoy is a fixed 517-byte `ClientHello` naming `fakeSni`, built
 with five cipher suites and the SNI, groups, point formats, signature algorithms, supported
 versions and a key-share extension, then padded; the IPv4 packet and TCP checksums are computed
 over the segment, and it leaves a fresh `AF_INET`/`IPPROTO_RAW` socket that copies the dialled
@@ -70,9 +71,10 @@ of an `xmc` session's payload write, and pads the version in the first TLS recor
 `03 01`/`03 03` to `03 04` once per stream; a write that does not open a TLS handshake record is
 left alone and leaves the rewrite armed for the next one, so a one-byte cut cannot spend it. The
 `empty` method writes one five-byte empty handshake record (`16 03 03 00 00`) ahead of the hello
-instead.
+instead; the decoy spends no hello slot, so a fragment stage behind it still cuts the real hello.
 
-`tlsSettings.fragment` cuts the first write at one random width in `1..=32768` octets;
+`tlsSettings.fragment` cuts the first write at one random width in `1..=64` octets, below the
+smallest `ClientHello` body, so a config that asked for a cut never sends the hello whole;
 `recordFragment` places one record boundary inside every label of the server name, one fresh
 random byte per label, the top-level label included. Both set the SNI cut, and
 `fragmentFallbackDelay` (a bare millisecond number or a string with `ms`, `s`, `m` or `h`) is the
@@ -94,10 +96,11 @@ comparison, so bulk traffic is untouched. This is zeronet's `ReadPastMark` polic
 applied to every accepted TCP connection because the server cannot know which client used the
 method.
 
-The rewrite lives in `Connection::Masked` (`crates/ferrox-app/src/conn.rs`) as an `Arc<SniState>`
-shared by every handle of the stream. The record is shaped before the chain — or an `xmc`
-session — sees it, so a stage that cuts the hello still sends the patched header, and a relay leg
-that cloned the mask keeps the same one-shot state. A config naming no `finalmask` still gets the
+The record shape lives in `Connection::Masked` (`crates/ferrox-app/src/conn.rs`) as an
+`Arc<SniState>` shared by every handle of the stream. The record is shaped before the chain — or
+an `xmc` session — sees it, so a stage that cuts the hello still sends the patched header, and a
+relay leg that cloned the mask keeps the same one-shot state. The mixed-case name is the one
+exception: it rides in `TlsConfig.server_name`, because the backend hashes the hello it builds. A config naming no `finalmask` still gets the
 wrapper, with an empty chain, because the rewrite is a property of the dial rather than of a
 mask.
 
@@ -119,7 +122,7 @@ graph TD
     D --> R["relay the payload"]
     C --> S{"evasion.sniSpoof"}
     S -- absent --> H["TLS connect writes the hello as-is"]
-    S -- "mixedCase" --> MC["rewrite each label's case in place"]
+    S -- "mixedCase" --> MC["backend serializes the case-altered name"]
     S -- "record / empty / urgent" --> A["Connection::with_sni"]
     S -- "decoy / auto" --> I{"CAP_NET_RAW available?"}
     I -- yes --> J["build_fake_client_hello (517 bytes)"]

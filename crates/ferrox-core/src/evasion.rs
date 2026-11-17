@@ -598,6 +598,9 @@ pub fn server_name_range(record: &[u8]) -> Option<std::ops::Range<usize>> {
     while at + 4 <= end {
         let (kind, length) = (u16_at(at)?, u16_at(at + 2)?);
         at += 4;
+        if length > end - at {
+            return None;
+        }
         if kind == 0 {
             let name_len = u16_at(at + 3)?;
             let start = at + 5;
@@ -633,18 +636,16 @@ pub fn label_cuts(name: &[u8]) -> Vec<usize> {
     cuts
 }
 
-/// Rewrite a `ClientHello`'s server name in mixed case, the way `LxBox` 016 does: the first letter
-/// of each label is upper case and every other letter draws its case, so the name is the same to
-/// the server (DNS names are case-insensitive) and a fresh string to a filter. `false` means the
-/// write carried no name, which the caller sends as it is.
-pub fn mixed_case_sni(record: &mut [u8]) -> bool {
-    let Some(range) = server_name_range(record) else {
-        return false;
-    };
+/// The server name a dial hands its TLS backend in mixed case, the way `LxBox` 016 does: the first
+/// letter of each label is upper case and every other letter draws its case. The backend hashes the
+/// hello it builds, so the name must be rewritten before the transcript, not below it; DNS names are
+/// case-insensitive, so the peer still routes the same host.
+pub fn mixed_case_name(name: &str) -> String {
+    let mut bytes = name.as_bytes().to_vec();
     let mut draw = [0u8; 32];
     let mut left = 0usize;
     let mut first = true;
-    for byte in &mut record[range] {
+    for byte in &mut bytes {
         if *byte == b'.' {
             first = true;
             continue;
@@ -667,7 +668,7 @@ pub fn mixed_case_sni(record: &mut [u8]) -> bool {
             first = false;
         }
     }
-    true
+    String::from_utf8(bytes).unwrap_or_else(|_| name.to_owned())
 }
 
 #[cfg(test)]
@@ -867,14 +868,33 @@ mod tests {
 
     #[test]
     fn a_mixed_case_name_is_the_same_name_to_the_server() {
+        for _ in 0..16 {
+            let name = mixed_case_name("www.example.com");
+            assert_eq!(name.len(), 15);
+            assert!(name.eq_ignore_ascii_case("www.example.com"));
+            for label in name.split('.') {
+                assert!(
+                    label.starts_with(|first: char| first.is_ascii_uppercase()),
+                    "{name}: every label opens upper case"
+                );
+            }
+        }
+        assert_eq!(mixed_case_name(""), "");
+        assert_eq!(mixed_case_name("192.0.2.1"), "192.0.2.1");
+    }
+
+    #[test]
+    fn an_extension_length_past_the_record_is_refused_not_returned() {
         let mut record = hello("www.example.com");
-        assert!(mixed_case_sni(&mut record));
         let range = server_name_range(&record).expect("a name");
-        assert_eq!(record[range.clone()].len(), 15);
-        assert!(record[range].eq_ignore_ascii_case(b"www.example.com"));
-        let mut bare = hello("");
-        assert!(!mixed_case_sni(&mut bare));
-        assert!(!mixed_case_sni(&mut [0x16, 0x03, 0x01, 0, 0]));
+        let mut at = 43;
+        at += 1 + usize::from(record[at]);
+        at += 2 + usize::from(u16::from_be_bytes([record[at], record[at + 1]]));
+        at += 1 + usize::from(record[at]);
+        at += 2;
+        record[at + 2..at + 4].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(server_name_range(&record), None);
+        assert!(range.end <= record.len());
     }
 
     #[test]

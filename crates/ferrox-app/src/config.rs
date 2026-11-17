@@ -1256,7 +1256,7 @@ pub(crate) fn outbound_tls(
         tls.and_then(|s| s.get("allowInsecure")),
         Some(Json::Bool(true))
     );
-    let server_name = tls
+    let mut server_name = tls
         .and_then(|s| s.get("serverName"))
         .and_then(Json::as_str)
         .filter(|s| !s.is_empty())
@@ -1264,6 +1264,12 @@ pub(crate) fn outbound_tls(
         .to_owned();
     if server_name.is_empty() {
         return Err("no serverName".to_owned());
+    }
+    let ech_config_list = tls_ech_config(tls, &server_name)?;
+    let sni = outbound_sni_spoof(outbound)?;
+    // The backend hashes the hello, so the name is rewritten before the transcript, not below it.
+    if sni.as_ref().is_some_and(|sni| sni.mixed_case) {
+        server_name = ferrox_core::evasion::mixed_case_name(&server_name);
     }
     let alpn = tls_alpn(tls);
     // The reference pins comma-separated hex, colons stripped, one SHA-256 over a whole certificate; a pin is the whole contract, so no root and no name check follows a leaf pin.
@@ -1290,7 +1296,6 @@ pub(crate) fn outbound_tls(
                 .to_owned(),
         );
     }
-    let ech_config_list = tls_ech_config(tls, &server_name)?;
     // xray's empty name is Chrome; a name no table knows is the config refusal it makes, not a stock hello.
     let fingerprint = match tls
         .and_then(|s| s.get("fingerprint"))
@@ -1321,7 +1326,6 @@ pub(crate) fn outbound_tls(
         server_name,
         alpn: alpn.into(),
         roots,
-        pins: ferrox_core::foxy::pin::Pins::default(),
         cert_pins: std::sync::Arc::from(cert_pins),
         verify_names: tls_verify_names(tls),
         cipher_suites: tls_cipher_suites(tls).into(),
@@ -1342,7 +1346,7 @@ pub(crate) fn outbound_tls(
         padding: None,
         kernel_tx: tls_kernel(tls, "kernel_tx"),
         kernel_rx: tls_kernel(tls, "kernel_rx"),
-        sni: outbound_sni_spoof(outbound)?,
+        sni,
         fragment: outbound_tls_fragment(tls, outbound)?,
         ..Default::default()
     }))
@@ -1387,7 +1391,7 @@ fn outbound_tls_fragment(
     let stage = Fragment::new(
         u64::from(!records),
         1,
-        vec![Range::ordered(1, 32_768)],
+        vec![Range::ordered(1, 64)],
         vec![Range::ordered(wait, wait)],
         Range::ordered(0, 0),
     )
@@ -5133,6 +5137,15 @@ mod tests {
         assert_eq!(sni.fooling, DecoyFooling::Ttl);
         assert_eq!(sni.ttl, 4);
         assert!(sni.mixed_case);
+        assert_eq!(tls.server_name.len(), "tls.test".len());
+        assert!(tls.server_name.eq_ignore_ascii_case("tls.test"));
+        assert!(
+            tls.server_name
+                .split('.')
+                .all(|label| label.starts_with(|first: char| first.is_ascii_uppercase())),
+            "{}: the backend serializes the mixed name",
+            tls.server_name
+        );
         assert!(!outbound_tls(&outbound(""), "127.0.0.1")
             .expect("builds")
             .sni

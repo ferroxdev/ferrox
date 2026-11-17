@@ -140,6 +140,9 @@ pub struct Fragment {
     /// Cut inside every label of the hello's server name, one record per piece. The widths are
     /// unused here; `tlsSettings.recordFragment` is what arms it.
     sni: bool,
+    /// The hello this stage already cut; decoy records before it spend no slot, and handshake
+    /// records after it (a `KeyUpdate`) are not mistaken for a second hello.
+    hello_done: bool,
     ent: Entropy,
     count: u64,
     gathered: Option<Gathered>,
@@ -178,6 +181,7 @@ impl Fragment {
             delays,
             max_split,
             sni: false,
+            hello_done: false,
             ent: Entropy::new(),
             count: 0,
             gathered: None,
@@ -205,6 +209,10 @@ impl Fragment {
         }
         self.count += 1;
         if self.packets_from == 0 && self.packets_to == 1 {
+            if self.hello_done || Self::hello_shape(p).is_none() {
+                return raw.write(p);
+            }
+            self.hello_done = true;
             return if self.sni {
                 self.write_sni(raw, p)
             } else {
@@ -249,22 +257,22 @@ impl Fragment {
         std::thread::sleep(Duration::from_millis(ms as u64));
     }
 
-    /// Why this write is not a hello the mask may cut: not the first write, too short for a header,
-    /// not a handshake record, or a record whose body has not all arrived.
-    fn hello_shape(&self, p: &[u8]) -> Option<usize> {
-        if self.count != 1 || p.len() <= HEADER || p[0] != HANDSHAKE {
+    /// Why this write is not a hello the mask may cut: too short for a header, not a handshake
+    /// record, or a record whose body has not all arrived.
+    fn hello_shape(p: &[u8]) -> Option<usize> {
+        if p.len() <= HEADER || p[0] != HANDSHAKE {
             return None;
         }
         let record_len = HEADER + usize::from(u16::from_be_bytes([p[3], p[4]]));
         (p.len() >= record_len).then_some(record_len)
     }
 
-    /// The `tlshello` mode: the first write, when it holds a whole handshake record, becomes records
-    /// of its own — the original type, version and this piece's width in the header. One draw of
+    /// The `tlshello` mode: the first handshake record, once every record of it has arrived, becomes
+    /// records of its own — the original type, version and this piece's width in the header. One draw of
     /// `max_split` bounds the run, and a single zero delay merges the records into one write, which
     /// is what makes the run a single burst on the socket.
     fn write_hello<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
-        let Some(record_len) = self.hello_shape(p) else {
+        let Some(record_len) = Self::hello_shape(p) else {
             return raw.write(p);
         };
         let Some(bound) = self.max_split.pick_from(&mut self.ent) else {
@@ -379,7 +387,7 @@ impl Fragment {
     /// handshake record and the server reassembles the handshake exactly as it would any hello.
     /// A write with no name falls back to the width cut, which still splits the record.
     fn write_sni<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
-        let Some(record_len) = self.hello_shape(p) else {
+        let Some(record_len) = Self::hello_shape(p) else {
             return raw.write(p);
         };
         let Some(name) = crate::evasion::server_name_range(&p[..record_len]) else {
@@ -393,7 +401,7 @@ impl Fragment {
         let Some(bound) = self.max_split.pick_from(&mut self.ent) else {
             return write_progress(raw, p);
         };
-        if bound > 1 {
+        if bound > 0 {
             cuts.truncate(usize::try_from(bound - 1).unwrap_or(usize::MAX));
         }
         cuts.push(record_len);
@@ -441,7 +449,35 @@ impl Fragment {
         }
         let mut from = HEADER;
         for (segment, to) in cuts.iter().enumerate() {
-            write_record(raw, &head_of(p, to - from), &p[from..*to])?;
+            let head = head_of(p, to - from);
+            let mut parts = [io::IoSlice::new(&head), io::IoSlice::new(&p[from..*to])];
+            let mut parts = &mut parts[..];
+            if let Err(error) = write_iovecs(raw, &mut parts) {
+                let progressed = parts.len() < 2;
+                if !progressed
+                    && !matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    )
+                {
+                    return Err(error);
+                }
+                let mut bytes = Vec::new();
+                for part in parts.iter() {
+                    bytes.extend_from_slice(part);
+                }
+                let mut next = *to;
+                for later in &cuts[segment + 1..] {
+                    bytes.extend_from_slice(&head_of(p, later - next));
+                    bytes.extend_from_slice(&p[next..*later]);
+                    next = *later;
+                }
+                bytes.extend_from_slice(&p[record_len..]);
+                if !bytes.is_empty() {
+                    self.gathered = Some(Gathered { bytes, at: 0 });
+                }
+                return Ok(p.len());
+            }
             if segment + 1 < cuts.len() {
                 self.park(self.delay_at(segment));
             }
@@ -1684,6 +1720,106 @@ mod tests {
     }
 
     #[test]
+    fn a_decoy_record_ahead_of_the_hello_spends_no_hello_slot() {
+        let mut mask =
+            Fragment::new(0, 1, vec![range(3, 3)], vec![range(0, 0)], range(0, 0)).expect("valid");
+        let decoy = [0x16, 3, 3, 0, 0];
+        let whole = hello(30);
+        let mut wire = Wire::default();
+        assert_eq!(mask.write(&mut wire, &decoy).expect("writes"), decoy.len());
+        assert_eq!(wire.bytes, decoy, "the decoy goes out untouched");
+        assert_eq!(mask.write(&mut wire, &whole).expect("writes"), whole.len());
+        let (widths, message) = records(&wire.bytes[decoy.len()..]);
+        assert_eq!(
+            widths,
+            vec![3; 10],
+            "the hello behind the decoy is still cut"
+        );
+        assert_eq!(message, whole[HEADER..]);
+        let update = [0x16, 3, 3, 0, 4, 9, 9, 9, 9];
+        let before = wire.bytes.len();
+        assert_eq!(
+            mask.write(&mut wire, &update).expect("writes"),
+            update.len()
+        );
+        assert_eq!(
+            &wire.bytes[before..],
+            &update,
+            "a handshake record after the hello is not cut a second time"
+        );
+    }
+
+    #[test]
+    fn a_max_split_of_one_bounds_a_name_cut_to_one_record() {
+        let mut mask = Fragment::new(0, 1, vec![range(3, 3)], vec![range(0, 0)], range(1, 1))
+            .expect("valid")
+            .sni();
+        let whole = client_hello("www.example.com");
+        let mut wire = Wire::default();
+        assert_eq!(mask.write(&mut wire, &whole).expect("writes"), whole.len());
+        let (widths, message) = records(&wire.bytes);
+        assert_eq!(
+            widths.len(),
+            1,
+            "a bound of one is one record, not every label"
+        );
+        assert_eq!(message, whole[HEADER..]);
+    }
+
+    #[test]
+    fn a_refused_delayed_record_keeps_the_rest_for_the_next_write() {
+        struct RefusingOnce {
+            refused: bool,
+            bytes: Vec<u8>,
+        }
+        impl Write for RefusingOnce {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if !self.refused {
+                    self.refused = true;
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+                if !self.refused {
+                    self.refused = true;
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                let mut taken = 0;
+                for part in bufs {
+                    self.bytes.extend_from_slice(part);
+                    taken += part.len();
+                }
+                Ok(taken)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut mask = Fragment::new(
+            0,
+            1,
+            vec![range(3, 3)],
+            vec![range(0, 0), range(0, 0)],
+            range(0, 0),
+        )
+        .expect("valid")
+        .sni();
+        let whole = client_hello("www.example.com");
+        let mut wire = RefusingOnce {
+            refused: false,
+            bytes: Vec::new(),
+        };
+        assert_eq!(mask.write(&mut wire, &whole).expect("writes"), whole.len());
+        assert!(wire.bytes.is_empty(), "the sink took nothing");
+        assert!(mask.gathered.is_some(), "the unsent records are kept");
+        mask.flush(&mut wire).expect("flushes");
+        let (_, message) = records(&wire.bytes);
+        assert_eq!(message, whole[HEADER..], "the retry loses no octet");
+    }
+
+    #[test]
     fn the_last_configured_width_governs_every_later_segment() {
         let mut mask = Fragment::new(
             1,
@@ -1725,7 +1861,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_the_mask_does_not_own_goes_out_as_it_came() {
+    fn a_write_that_is_not_a_whole_hello_leaves_the_slot_open() {
         let mut mask = Fragment::new(0, 1, vec![range(11, 11)], vec![range(0, 0)], range(24, 24))
             .expect("valid");
         let mut wire = Wire::default();
@@ -1747,10 +1883,22 @@ mod tests {
         );
         assert_eq!(wire.bytes, partial);
         wire.bytes.clear();
-        // A later write is not the hello, whatever it holds.
+        // A hello split across writes is cut once whole; the earlier fragment did not spend the slot.
         let again = hello(60);
         assert_eq!(mask.write(&mut wire, &again).expect("writes"), again.len());
-        assert_eq!(wire.bytes, again, "only the first write is cut");
+        let (widths, message) = records(&wire.bytes);
+        assert_eq!(widths, vec![11, 11, 11, 11, 11, 5]);
+        assert_eq!(message, again[HEADER..]);
+        wire.bytes.clear();
+        let update = [0x16, 3, 3, 0, 4, 1, 2, 3, 4];
+        assert_eq!(
+            mask.write(&mut wire, &update).expect("writes"),
+            update.len()
+        );
+        assert_eq!(
+            wire.bytes, update,
+            "a record after the hello keeps its own bytes"
+        );
     }
 
     #[test]
