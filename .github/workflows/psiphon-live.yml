@@ -35,7 +35,7 @@ on:
         required: false
         default: ""
       window:
-        description: native SSH channel window in bytes; blank keeps the lane's 4 MiB
+        description: native SSH channel window in bytes; blank keeps the reference's 2 MiB
         required: false
         default: ""
       protocol:
