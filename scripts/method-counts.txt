@@ -198,6 +198,18 @@ mux-cool id-reuses-before-end 0 ferrox-app-muxpool::tests::an_id_is_not_reused_b
 mux-cool answer-head-reads-before-the-first-frame 0 ferrox-app-proxy::tests::vless_mux_opener_does_not_wait_for_the_answer_head
 mux-cool uplink-frames-per-write 4 ferrox-app-muxpool::tests::a_bulk_uplink_frames_four_keeps_in_one_write
 
+# --- Mux variants (smux/yamux/h2mux) ----------------------------------------
+mux-variants ops-retired-instructions UNBLESSED scripts/count-ops.sh
+mux-variants syscalls-per-session UNBLESSED scripts/count-ops.sh
+mux-variants user-space-copies-per-byte-written UNBLESSED no copy checker yet
+mux-variants seconds-per-megabyte UNBLESSED CI parity.yml (no cell yet)
+mux-variants tcp-protocols-round-trip 3 ferrox-app-singmux::tests::streams_round_trip_over_each_protocol
+mux-variants udp-protocols-round-trip 3 ferrox-app-singmux::tests::datagrams_round_trip_over_each_protocol
+mux-variants padding-protocols-round-trip 3 ferrox-app-singmux::tests::padding_round_trips_over_each_protocol
+mux-variants packet-addr-protocols-round-trip 3 ferrox-app-singmux::tests::packet_addr_frames_each_datagram_with_its_destination
+mux-variants carrier-protocols-round-trip 3 ferrox-app-proxy::tests::a_vless_singmux_carries_a_tcp_stream_on_each_protocol
+mux-variants absent-protocol-keeps-mux-cool 1 ferrox-app-proxy::tests::an_absent_mux_protocol_keeps_mux_cool_and_an_explicit_one_selects_singmux
+
 # --- carriers ---------------------------------------------------------------
 carrier-websocket ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-websocket read-syscalls-per-64-frames 1 ferrox-app-ws::tests::a_read_covers_a_window_not_one_frame_header

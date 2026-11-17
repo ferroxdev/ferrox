@@ -782,7 +782,7 @@ fn encode_target(out: &mut Vec<u8>, target: &crate::proxy::Destination) {
     target.push_addr(out, 3, 2);
 }
 
-fn decode_target(header: &[u8], cursor: &mut usize) -> Option<SocketAddr> {
+fn decode_target(header: &[u8], cursor: &mut usize) -> Option<(SocketAddr, bool)> {
     let port = u16::from_be_bytes(header.get(*cursor..*cursor + 2)?.try_into().ok()?);
     let rest = &header[*cursor + 2..];
     let kind = match rest.first()? {
@@ -794,9 +794,21 @@ fn decode_target(header: &[u8], cursor: &mut usize) -> Option<SocketAddr> {
     let (body, used) = crate::proxy::parse_addr_body(rest, kind)?;
     *cursor += 2 + used;
     Some(match body {
-        crate::proxy::AddrBody::V4(ip) => SocketAddr::new(std::net::IpAddr::V4(ip.into()), port),
-        crate::proxy::AddrBody::V6(ip) => SocketAddr::new(std::net::IpAddr::V6(ip.into()), port),
-        crate::proxy::AddrBody::Domain(host) => crate::proxy::resolve_endpoint(host, port)?,
+        crate::proxy::AddrBody::V4(ip) => (
+            SocketAddr::new(std::net::IpAddr::V4(ip.into()), port),
+            false,
+        ),
+        crate::proxy::AddrBody::V6(ip) => (
+            SocketAddr::new(std::net::IpAddr::V6(ip.into()), port),
+            false,
+        ),
+        crate::proxy::AddrBody::Domain(host) => {
+            if crate::singmux::is_rendezvous(host, port) {
+                (SocketAddr::from(([0, 0, 0, 0], 0)), true)
+            } else {
+                (crate::proxy::resolve_endpoint(host, port)?, false)
+            }
+        }
     })
 }
 
@@ -1712,7 +1724,7 @@ fn read_open_header(
     let head_nonce: [u8; 12] = head_full[..12].try_into().unwrap();
     open_header(&head_key, &head_nonce, &sealed_head, auth_id)
 }
-type HeaderParts = (Option<SocketAddr>, Flow, Flow, Vec<u8>, u8);
+type HeaderParts = (Option<SocketAddr>, Flow, Flow, Vec<u8>, u8, bool);
 
 fn decode_header(header: &[u8]) -> Option<HeaderParts> {
     if header.len() < 38 || header[0] != 1 || header[34] & OPT_STREAM == 0 {
@@ -1734,10 +1746,11 @@ fn decode_header(header: &[u8]) -> Option<HeaderParts> {
     }
     let mut cursor = 38;
     // A mux request names the command alone: the reference reads no address for it (`proxy/vmess/encoding/server.go`).
-    let target = if cmd == 3 {
-        None
+    let (target, rendezvous) = if cmd == 3 {
+        (None, false)
     } else {
-        Some(decode_target(header, &mut cursor)?)
+        let (target, rendezvous) = decode_target(header, &mut cursor)?;
+        (if rendezvous { None } else { Some(target) }, rendezvous)
     };
     let margin = usize::from(header[35] >> 4);
     if cursor + margin + 4 > header.len() {
@@ -1762,7 +1775,7 @@ fn decode_header(header: &[u8]) -> Option<HeaderParts> {
         recv.len_seal = Some(SizeAead::fresh(&data_key, actual, &data_iv)?);
         send.len_seal = Some(SizeAead::fresh(&data_key, actual, &data_iv)?);
     }
-    Some((target, send, recv, prefix, cmd))
+    Some((target, send, recv, prefix, cmd, rendezvous))
 }
 /// The accounts one vmess inbound serves. A mutation lands on the next handshake; a flow already
 /// admitted keeps running, so `AlterInbound` never drops a session.
@@ -1844,7 +1857,7 @@ pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Acc
     read_exact(stream, &mut auth_id).ok()?;
     let (instruction, user) = users.authenticate(&auth_id)?;
     let header = read_open_header(stream, &instruction, &auth_id)?;
-    let (target, mut send, recv, prefix, cmd) = decode_header(&header)?;
+    let (target, mut send, recv, prefix, cmd, rendezvous) = decode_header(&header)?;
     let data_iv: [u8; 16] = header[1..17].try_into().unwrap();
     let data_key: [u8; 16] = header[17..33].try_into().unwrap();
     if session_seen(&user.id, &data_key, &data_iv) {
@@ -1858,6 +1871,7 @@ pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Acc
         recv,
         prefix,
         cmd,
+        rendezvous,
         user: meter,
     })
 }
@@ -2147,6 +2161,7 @@ pub(crate) struct Accepted {
     pub(crate) recv: Flow,
     pub(crate) prefix: Vec<u8>,
     pub(crate) cmd: u8,
+    pub(crate) rendezvous: bool,
     pub(crate) user: crate::stats::Meter,
 }
 pub(crate) type Close = std::sync::Arc<dyn Fn() + Send + Sync>;
@@ -2234,6 +2249,7 @@ fn serve_decoded_impl<R, W>(
         recv,
         prefix,
         cmd,
+        rendezvous,
         user,
     }) = decoded
     else {
@@ -2241,6 +2257,28 @@ fn serve_decoded_impl<R, W>(
         return;
     };
     if !freedom {
+        abandon(close, &mut abort);
+        return;
+    }
+    if rendezvous && cmd == 1 {
+        if !write_prefix(&mut writer, &prefix) {
+            abandon(close, &mut abort);
+            return;
+        }
+        let meter = user.reversed();
+        let Some(sealed) = CarriedWriter::new(writer, send) else {
+            abandon(close, &mut abort);
+            return;
+        };
+        crate::proxy::serve_singmux_tunnel(
+            Box::new(crate::proxy::metered(
+                CarriedReader::new(reader, recv),
+                meter.clone(),
+            )),
+            Box::new(crate::proxy::metered(sealed, meter)),
+            std::sync::Arc::clone(close),
+            &[],
+        );
         abandon(close, &mut abort);
         return;
     }
@@ -2640,6 +2678,7 @@ where
     serve_decoded(reader, writer, close, decoded, freedom);
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn serve(mut stream: Connection, users: &Users, freedom: bool) {
     // Bound the opening request read like the raw VLESS handshake, then restore the relay's blocking reads.
     let budget = crate::budgets::handshake();
@@ -2658,12 +2697,37 @@ pub(crate) fn serve(mut stream: Connection, users: &Users, freedom: bool) {
         recv,
         prefix,
         cmd,
+        rendezvous,
         user,
     }) = request
     else {
         return;
     };
     if !freedom {
+        return;
+    }
+    if rendezvous && cmd == 1 {
+        if stream.write_all(&prefix).is_err() {
+            return;
+        }
+        let Ok(reader) = stream.try_clone() else {
+            return;
+        };
+        let Ok(closer) = stream.try_clone() else {
+            return;
+        };
+        let close: Close = std::sync::Arc::new(move || {
+            let _ = closer.shutdown(Shutdown::Both);
+        });
+        let Some(writer) = CarriedWriter::new(stream, send) else {
+            return;
+        };
+        crate::proxy::serve_singmux_tunnel(
+            Box::new(CarriedReader::new(reader, recv)),
+            Box::new(writer),
+            close,
+            &[],
+        );
         return;
     }
     if cmd == 3 {
@@ -4796,7 +4860,7 @@ mod tests {
         header.push(1);
         header.extend_from_slice(&[127, 0, 0, 1]);
         header.extend_from_slice(&fnv1a(&header).to_be_bytes());
-        let (got, _send, _recv, prefix, cmd) = decode_header(&header).expect("decodes");
+        let (got, _send, _recv, prefix, cmd, _) = decode_header(&header).expect("decodes");
         assert_eq!(got, Some(target));
         assert_eq!(cmd, 1);
         assert_eq!(prefix.len(), 38);
@@ -4808,7 +4872,7 @@ mod tests {
         let cut = udp.len() - 4;
         let sum = fnv1a(&udp[..cut]);
         udp[cut..].copy_from_slice(&sum.to_be_bytes());
-        let (got, _, _, _, cmd) = decode_header(&udp).expect("decodes udp");
+        let (got, _, _, _, cmd, _) = decode_header(&udp).expect("decodes udp");
         assert_eq!(got, Some(target));
         assert_eq!(cmd, 2);
         let mut bad = header.clone();
@@ -4853,7 +4917,7 @@ mod tests {
             OPT_STREAM | OPT_AUTH_LEN | OPT_MASK,
             OPT_STREAM | OPT_AUTH_LEN | OPT_MASK | OPT_PAD,
         ] {
-            let (_, send, recv, _, _) = decode_header(&header(0x04, options)).expect("decodes");
+            let (_, send, recv, _, _, _) = decode_header(&header(0x04, options)).expect("decodes");
             assert_eq!(send.size_field(), SIZE_FIELD);
             assert_eq!(recv.size_field(), SIZE_FIELD);
         }
@@ -4869,7 +4933,7 @@ mod tests {
         // A body without a cipher leaves the sealed size without a key, and the reference refuses the option there too.
         assert!(decode_header(&header(0x05, OPT_STREAM | OPT_AUTH_LEN)).is_none());
         // A 2-octet size field stays the way the bit has always framed it.
-        let (_, send, recv, _, _) =
+        let (_, send, recv, _, _, _) =
             decode_header(&header(0x04, OPT_STREAM | OPT_MASK | OPT_PAD)).expect("decodes");
         assert_eq!(send.size_field(), HEADER_LEN);
         assert_eq!(recv.size_field(), HEADER_LEN);
@@ -4938,7 +5002,7 @@ mod tests {
 
                 // The staged framing is a server's response framing here: the body AEAD rides the response material while the sealed size rides the request's keys (`proxy/vmess/encoding/server.go` `EncodeResponseBody`), so a peer sealing the size with the wrong pair cannot open it.
                 let head = header(cipher.code(), options);
-                let (_, mut srv, _, _, _) = decode_header(&head).expect("decodes");
+                let (_, mut srv, _, _, _, _) = decode_header(&head).expect("decodes");
                 let (response_key, response_iv) = response_material(&[0x01; 16], &[0x02; 16]);
                 let mut peer =
                     Flow::fresh(cipher, &response_key, &response_iv, options, &response_iv)
@@ -5037,7 +5101,7 @@ mod tests {
                 let head_nonce: [u8; 12] = head_full[..12].try_into().expect("nonce");
                 let clear =
                     open_header(&head_key, &head_nonce, &request[42..], &auth_id).expect("opens");
-                let (got, _, _, _, _) = decode_header(&clear).expect("decodes");
+                let (got, _, _, _, _, _) = decode_header(&clear).expect("decodes");
                 assert_eq!(got, Some(target));
             }
         }
