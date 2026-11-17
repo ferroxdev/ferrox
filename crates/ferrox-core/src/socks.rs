@@ -154,6 +154,7 @@ impl Target<'_> {
                     out.put(17, &port.to_be_bytes());
                 }
                 Self::Name(name, port) => {
+                    assert!(name.len() <= NAME4_MAX, "socks5 domain name too long");
                     out.put(0, &[ATYP_DOMAIN]);
                     out.put(1, &[name.len() as u8]);
                     out.put(2, name);
@@ -264,6 +265,7 @@ impl Bound<'_> {
             }
             Self::Name(name, port) => {
                 let len = 4 + name.len();
+                assert!(name.len() <= NAME4_MAX, "socks5 domain name too long");
                 assert!(out.len() >= len, "socks5 address buffer too short");
                 out[0] = ATYP_DOMAIN;
                 out[1] = name.len() as u8;
@@ -295,6 +297,11 @@ pub fn refuse4() -> &'static [u8] {
 /// what tells the server a name follows. One buffer carries the whole request.
 #[must_use]
 pub fn request4(cmd: u8, port: u16, address: [u8; 4], user: &[u8], name: Option<&[u8]>) -> Vec<u8> {
+    assert!(user.len() <= NAME4_MAX, "socks4 user id too long");
+    assert!(
+        name.is_none_or(|name| name.len() <= NAME4_MAX),
+        "socks4a name too long"
+    );
     let total = 9 + user.len() + name.map_or(0, |name| name.len() + 1);
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(&[VERSION4, cmd]);
@@ -320,6 +327,9 @@ pub fn request4_into(
     name: Option<&[u8]>,
     out: &mut [u8],
 ) -> Option<usize> {
+    if user.len() > NAME4_MAX || name.is_some_and(|name| name.len() > NAME4_MAX) {
+        return None;
+    }
     let total = 9 + user.len() + name.map_or(0, |name| name.len() + 1);
     if out.len() < total {
         return None;
@@ -562,6 +572,38 @@ mod tests {
             "the address of a SOCKS4a request is the 0.0.0.1 marker"
         );
         assert_eq!(&with_name[8..], b"user\0example.com\0");
+    }
+
+    #[test]
+    fn a_socks4_name_the_reader_would_refuse_is_not_written() {
+        let too_long = vec![b'a'; NAME4_MAX + 1];
+        assert!(request4_into(
+            CMD4_CONNECT,
+            80,
+            [0, 0, 0, 1],
+            b"user",
+            Some(&too_long),
+            &mut [0u8; 600],
+        )
+        .is_none());
+        assert!(request4_into(
+            CMD4_CONNECT,
+            80,
+            [0, 0, 0, 1],
+            &too_long,
+            None,
+            &mut [0u8; 600],
+        )
+        .is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "socks5 domain name too long")]
+    fn a_socks5_name_that_cannot_carry_its_length_is_refused() {
+        let name = vec![b'a'; NAME4_MAX + 1];
+        let target = Target::Name(&name, 80);
+        let mut out = vec![0u8; target.wire_len()];
+        target.encode_into(&mut out);
     }
 
     #[test]

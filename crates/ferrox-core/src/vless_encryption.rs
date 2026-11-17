@@ -815,7 +815,7 @@ impl Client {
 const MAX_TICKET_RESUMPTIONS: usize = 1024;
 
 struct Session {
-    pfs_key: Vec<u8>,
+    pfs_key: zeroize::Zeroizing<Vec<u8>>,
     seen: HashSet<[u8; 32]>,
 }
 
@@ -992,6 +992,7 @@ impl Server {
                 config.seconds_to as u32,
             ))
         };
+        let seconds = seconds.clamp(0, i64::from(u16::MAX));
         ticket[..2].copy_from_slice(&encode_length(seconds as usize));
         if let (Some(clock), true) = (self.clock.as_ref(), seconds > 0) {
             let now = clock();
@@ -1004,7 +1005,7 @@ impl Server {
             tickets.sessions.insert(
                 ticket,
                 Session {
-                    pfs_key: pfs_key.clone(),
+                    pfs_key: zeroize::Zeroizing::new(pfs_key.clone()),
                     seen: HashSet::new(),
                 },
             );
@@ -1100,7 +1101,7 @@ impl Server {
                         if !session.seen.insert(nfs_id) {
                             return Err(invalid("VLESS encryption: replayed 0-RTT first flight"));
                         }
-                        Some(session.pfs_key.clone())
+                        Some(session.pfs_key.to_vec())
                     }
                 };
                 if spent {
@@ -1518,6 +1519,7 @@ impl WriteSide {
         self.out.clear();
         self.out_pos = 0;
         if self.direct {
+            self.out.append(&mut self.pre_write);
             self.out.extend_from_slice(&buf[..take]);
             self.out_mask.apply(&mut self.out, true);
             let _ = self.flush_out(inner);
@@ -1565,8 +1567,10 @@ impl WriteSide {
             self.out.clear();
             self.out_pos = 0;
             if self.direct {
+                self.out.append(&mut self.pre_write);
+                let pre = self.out.len();
                 copy_from_parts(parts, at, take, &mut self.out);
-                debug_assert_eq!(self.out.len(), take);
+                debug_assert_eq!(self.out.len() - pre, take);
                 self.out_mask.apply(&mut self.out, true);
                 self.flush_out(inner)?;
                 at += take;
@@ -2158,6 +2162,103 @@ mod tests {
     #[test]
     fn random_zero_rtt_exchanges_bytes() {
         exchange("random", true);
+    }
+
+    #[cfg(unix)]
+    fn exchange_clocked(client: &Arc<Client>, server: &Arc<Server>) {
+        use std::os::unix::net::UnixStream;
+        let (a, b) = UnixStream::pair().unwrap();
+        let server = Arc::clone(server);
+        let answer = std::thread::spawn(move || {
+            let mut stream = server.handshake(b).unwrap();
+            let mut buf = [0u8; 5];
+            stream.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"hello");
+            stream.write_all(b"world").unwrap();
+            stream.flush().unwrap();
+        });
+        let mut stream = client.handshake(a).unwrap();
+        stream.write_all(b"hello").unwrap();
+        stream.flush().unwrap();
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"world");
+        answer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_clocked_ticket_resumes_on_the_second_connection() {
+        let (encryption, decryption) = generate_pair(false, "native", "0rtt", "600s");
+        let now = Arc::new(std::sync::atomic::AtomicI64::new(1_000));
+        let clock: Clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || now.load(std::sync::atomic::Ordering::Relaxed))
+        };
+        let server = Server::with_clock(
+            ServerConfig::parse(&decryption).unwrap(),
+            Arc::clone(&clock),
+        );
+        let client = Client::with_clock(
+            ClientConfig::parse(&encryption).unwrap(),
+            Arc::clone(&clock),
+        );
+        exchange_clocked(&client, &server);
+        exchange_clocked(&client, &server);
+        let seen: usize = server
+            .tickets
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .map(|session| session.seen.len())
+            .sum();
+        assert_eq!(seen, 1, "the second connection resumed the ticket");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_ticket_lifetime_is_clamped_to_its_two_byte_field() {
+        let (encryption, decryption) = generate_pair(false, "native", "0rtt", "70000-70000");
+        let now = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let clock: Clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || now.load(std::sync::atomic::Ordering::Relaxed))
+        };
+        let server = Server::with_clock(
+            ServerConfig::parse(&decryption).unwrap(),
+            Arc::clone(&clock),
+        );
+        let client = Client::with_clock(
+            ClientConfig::parse(&encryption).unwrap(),
+            Arc::clone(&clock),
+        );
+        exchange_clocked(&client, &server);
+        let expiry = server
+            .tickets
+            .lock()
+            .unwrap()
+            .expires
+            .iter()
+            .map(|std::cmp::Reverse((expires, _))| *expires)
+            .max();
+        assert_eq!(expiry, Some(i64::from(u16::MAX)));
+    }
+
+    #[test]
+    fn direct_mode_carries_the_first_flight_before_its_first_write() {
+        let key = Vec::from([0x11u8; 64]);
+        let mut stream = EncryptedStream::new(
+            Recorder::default(),
+            key.clone(),
+            Aead::new(b"direct", &key),
+            None,
+            ReadStage::Records,
+        );
+        stream.set_pre_write(b"first flight".to_vec());
+        stream.enter_direct_mode();
+        stream.write_all(b"data").unwrap();
+        assert_eq!(stream.get_ref().wire, b"first flightdata");
     }
 
     #[cfg(unix)]
