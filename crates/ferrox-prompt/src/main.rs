@@ -1157,7 +1157,7 @@ fn join_capped(ids: &[String]) -> String {
     }
 }
 
-fn render_prompt<'a>(args: &Args, library: &'a Library, id: &str) -> Result<&'a Prompt, ExitCode> {
+fn render_prompt<'a>(args: &Args, library: &'a Library, id: u32) -> Result<&'a Prompt, ExitCode> {
     if args.command == Command::Issue {
         return issue_prompt(library).map_err(|reason| {
             eprintln!("{reason}");
