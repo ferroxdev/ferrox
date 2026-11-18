@@ -550,8 +550,12 @@ impl Inner {
     fn open(&self, _target: &Destination, expect_status: bool) -> Option<Stream> {
         if self.role != Role::Client || self.dead() {
             crate::proxy::echo_trace(&format!(
-                "singmux open refused role {:?} dead {}",
-                self.role,
+                "singmux open refused role {} dead {}",
+                if self.role == Role::Client {
+                    "client"
+                } else {
+                    "server"
+                },
                 self.dead()
             ));
             return None;
@@ -988,8 +992,13 @@ impl Inner {
             return;
         }
         crate::proxy::echo_trace(&format!(
-            "singmux finish role {:?} protocol {:?}",
-            self.role, self.protocol
+            "singmux finish role {} protocol {:?}",
+            if self.role == Role::Client {
+                "client"
+            } else {
+                "server"
+            },
+            self.protocol
         ));
         match self.resets.lock() {
             Ok(mut resets) => drop(resets.take()),
