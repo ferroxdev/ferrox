@@ -461,6 +461,12 @@ impl H3Reader {
                 "h3 stream was reset",
             ));
         }
+        if self.buf_at < self.buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "h3 frame ended early",
+            ));
+        }
         if !self.expect_request && !self.head_seen {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
