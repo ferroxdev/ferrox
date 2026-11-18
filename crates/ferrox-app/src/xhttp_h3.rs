@@ -2,8 +2,6 @@
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -76,31 +74,32 @@ impl Wire {
     }
 }
 
-/// What a lane's empty read did: handed the lane back, or slept the transport tick, counted only under `cfg(test)`.
 #[cfg(test)]
-static LANE_GRANTS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(test)]
-static LANE_TICKS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// A lane is a thread, so the count is the lane's own: a process-wide one sees other tests' lanes.
+    static LANE_GRANTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The same lane's empty reads that slept the transport tick instead of handing the lane back.
+    static LANE_TICKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn lane_grants() -> usize {
-    LANE_GRANTS.load(Ordering::Relaxed)
+    LANE_GRANTS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
 pub(crate) fn lane_ticks() -> usize {
-    LANE_TICKS.load(Ordering::Relaxed)
+    LANE_TICKS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
 fn note_lane_grant() {
-    LANE_GRANTS.fetch_add(1, Ordering::Relaxed);
+    LANE_GRANTS.with(|count| count.set(count.get() + 1));
 }
 
 #[cfg(test)]
 fn note_lane_tick() {
-    LANE_TICKS.fetch_add(1, Ordering::Relaxed);
+    LANE_TICKS.with(|count| count.set(count.get() + 1));
 }
 
 #[cfg(not(test))]
