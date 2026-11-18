@@ -4603,19 +4603,16 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
                 continue;
             };
             (sock, local)
+        } else if let Some(bound) = datagram_to_with_source(peer, None, None) {
+            bound
         } else {
-            match datagram_to_with_source(peer, None, None) {
-                Some(bound) => bound,
-                None => {
-                    let Ok(sock) = bind_datagram(wildcard) else {
-                        continue;
-                    };
-                    let Ok(local) = sock.local_addr() else {
-                        continue;
-                    };
-                    (sock, local)
-                }
-            }
+            let Ok(sock) = bind_datagram(wildcard) else {
+                continue;
+            };
+            let Ok(local) = sock.local_addr() else {
+                continue;
+            };
+            (sock, local)
         };
         let sock = match relay.as_ref() {
             Some((control, via)) => Datagram::relayed(sock, *via, Arc::clone(control)),
