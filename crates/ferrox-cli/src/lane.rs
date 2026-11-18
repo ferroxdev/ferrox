@@ -263,6 +263,28 @@ pub fn lock(paths: &Paths) -> Result<File, String> {
     Ok(file)
 }
 
+fn port_lock_path(paths: &Paths) -> PathBuf {
+    paths.conf_dir.join("ports.lock")
+}
+
+/// Serialize the free-port scan and engine start across every lane in this root: a lane that
+/// releases its probe before the next one scans can hand the same port to both.
+pub fn port_lock(paths: &Paths) -> Result<File, String> {
+    secure_dir(&paths.conf_dir)
+        .map_err(|error| format!("cannot create the config dir: {error}"))?;
+    let path = port_lock_path(paths);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    file.lock()
+        .map_err(|error| format!("cannot lock {}: {error}", path.display()))?;
+    Ok(file)
+}
+
 fn register(paths: &Paths) -> Result<(), String> {
     secure_dir(&paths.state_dir)
         .map_err(|error| format!("cannot create the state dir: {error}"))?;
@@ -509,6 +531,23 @@ pub fn other_lanes(paths: &Paths) -> Vec<(String, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lanes_in_one_root_share_the_port_probe_lock() {
+        let root = std::env::temp_dir().join(format!("ferrox-ports-{}", std::process::id()));
+        let one = Paths::with_dirs(root.clone(), root.join("state"), Some("one"));
+        let two = Paths::with_dirs(root.clone(), root.join("state"), Some("two"));
+        let held = port_lock(&one).unwrap();
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(port_lock_path(&two))
+            .unwrap();
+        assert!(probe.try_lock().is_err());
+        drop(held);
+        assert!(probe.try_lock().is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn a_configured_listener_address_is_probed_where_it_listens() {

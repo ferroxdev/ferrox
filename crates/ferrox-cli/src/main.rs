@@ -183,6 +183,13 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             return 1;
         }
     };
+    let port_reservation = match lane::port_lock(paths) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("ferrox-cli: {error}");
+            return 1;
+        }
+    };
     let (ports, user_config) = prepare(options, paths);
     if options.vpn {
         if let Err(error) = proxy::preflight(&options.fronts, ports) {
@@ -251,7 +258,10 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         }
     });
 
-    if !fronts(&options.fronts).is_empty() && !lane::wait_fronts(&options.fronts, ports, paths) {
+    let opened =
+        fronts(&options.fronts).is_empty() || lane::wait_fronts(&options.fronts, ports, paths);
+    drop(port_reservation);
+    if !opened {
         println!(
             "the lane did not open its fronts; last lines of {}:",
             paths.log.display()
