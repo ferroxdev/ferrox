@@ -55,7 +55,7 @@ A flow has a network, a destination (a name stays a name; only a lane that carri
 
 ## Lanes the transport cannot route
 
-A server inbound in this tree dials direct whatever the rules say. Rather than ignore the table per flow, startup walks the rules that can reach the inbound (its tag, its network, the current OS) and requires each to target a freedom outbound — for a balancer, every candidate, its fallback and any active forced target; it stops at a rule that matches every flow on that tag, and otherwise requires the fallback to be freedom. Anything else refuses the config with the tag named.
+A server inbound in this tree dials direct whatever the rules say. Rather than ignore the table per flow, startup walks every rule that can reach the inbound on either network (its tag, the current OS) and requires each to target a freedom outbound — including a rule naming a fact the server flow does not carry, which is checked by its target rather than skipped; for a balancer, every candidate, its fallback and any active forced target; it stops at a rule that matches every flow on that tag, and otherwise requires the fallback to be freedom. Anything else refuses the config with the tag named.
 
 A `tun` flow has no source or local address the rules could read. If any rule that could reach the tun tag names `source`, `sourcePort`, `localIP`, `localPort` or a rule set with a source selector, the config is refused naming that selector instead of letting the rule silently never match. A `process` rule is not refused: a tun flow carries no source address to look an owner up by, so the rule is carried and never holds. A routing script can still answer a tun flow by its destination, so a tun inbound is not refused for naming one.
 

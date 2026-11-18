@@ -1561,17 +1561,12 @@ impl Routing {
             ));
         }
         for rule in rules {
-            if !rule.reachable(inbound, Network::Tcp) || !rule.local_os_matches() {
-                continue;
-            }
-            // A server inbound never evaluates a rule, reads no sent route id and carries no HTTP head.
-            if rule.users.is_some()
-                || rule.vless_routes.is_some()
-                || rule.attrs.is_some()
-                || rule.process.is_some()
+            if (!rule.reachable(inbound, Network::Tcp) && !rule.reachable(inbound, Network::Udp))
+                || !rule.local_os_matches()
             {
                 continue;
             }
+            // A rule naming a fact the server flow does not carry still gates the target.
             let dials_direct = if rule.balancer {
                 candidates.get(&rule.target).is_some_and(|list| {
                     list.iter()
@@ -5693,16 +5688,42 @@ mod tests {
         routing
             .server_routes(&proof(Some("server"), false))
             .expect("the tag's rule pins every flow to direct");
-        let by_user = root(vec![rule(
-            "proxy",
+        for selector in [
+            ("user", array(vec![text("a@x")])),
+            ("vlessRoute", array(vec![number(7)])),
+            ("attrs", object(vec![(":path", text("/x"))])),
+            ("process", array(vec![text("self/")])),
+        ] {
+            let skipped_field = root(vec![rule("proxy", vec![selector])]);
+            let routing = Routing::parse_in(&skipped_field, vec![dir()])
+                .expect("parses")
+                .expect("routing");
+            let error = routing
+                .server_routes(&proof(Some("server"), true))
+                .expect_err("a rule the server flow cannot evaluate still names a proxy");
+            assert!(error.contains("proxy"), "{error}");
+        }
+        let direct_by_user = root(vec![rule(
+            "direct",
             vec![("user", array(vec![text("a@x")]))],
         )]);
-        let routing = Routing::parse_in(&by_user, vec![dir()])
+        let routing = Routing::parse_in(&direct_by_user, vec![dir()])
             .expect("parses")
             .expect("routing");
         routing
             .server_routes(&proof(Some("server"), true))
-            .expect("a server flow carries no account email for the rule to read");
+            .expect("a rule that still targets direct changes nothing");
+        let by_udp = root(vec![rule(
+            "proxy",
+            vec![("network", array(vec![text("udp")]))],
+        )]);
+        let routing = Routing::parse_in(&by_udp, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let error = routing
+            .server_routes(&proof(Some("server"), true))
+            .expect_err("a UDP-only rule can reach the server too");
+        assert!(error.contains("proxy"), "{error}");
         let proxy = root(vec![rule("proxy", vec![("port", number(443))])]);
         let routing = Routing::parse_in(&proxy, vec![dir()])
             .expect("parses")
