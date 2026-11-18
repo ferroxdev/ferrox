@@ -1363,6 +1363,10 @@ impl Session {
                     return;
                 }
                 let length = body.len();
+                if self.half_closed {
+                    self.reject_data(wire, id, length);
+                    return;
+                }
                 let data = strip_padding(flags, body, false);
                 self.window(wire, length);
                 self.capsules(wire, data);
@@ -1374,6 +1378,17 @@ impl Session {
             h2::T_GOAWAY => self.end = true,
             _ => {}
         }
+    }
+
+    /// A stream's request half is already closed: account the bytes at connection scope, then reset the stream without forwarding them.
+    fn reject_data(&mut self, wire: &mut Wire, id: u32, length: usize) {
+        if let Ok(length) = u32::try_from(length) {
+            if length != 0 {
+                wire.send(h2::T_WINDOW, 0, 0, &length.to_be_bytes());
+            }
+        }
+        wire.send(h2::T_RST, 0, id, &5u32.to_be_bytes());
+        self.end = true;
     }
 
     fn request(&mut self, wire: &mut Wire, id: u32, block: &[u8]) {
@@ -1641,11 +1656,13 @@ impl Session {
             }
         }
         let mut origin_closed = false;
-        if self.half_closed && self.udp.is_some() && self.udp_quiet.is_none() {
+        // CONNECT-IP keeps its grant and sender alive, so waiting for `outgoing` to disconnect is a wait it never reaches; both datagram modes drain on a quiet window instead.
+        let drainable = !self.warp;
+        if self.half_closed && drainable && self.udp_quiet.is_none() {
             self.udp_quiet = Some(Instant::now());
         }
         let udp_drained = self.half_closed
-            && self.udp.is_some()
+            && drainable
             && self
                 .udp_quiet
                 .is_some_and(|quiet| quiet.elapsed() >= UDP_DRAIN);
@@ -1693,6 +1710,9 @@ impl Session {
             && !wire.closed
         {
             if let Some(id) = self.request {
+                self.granted = None;
+                self.outgoing = None;
+                self.udp = None;
                 wire.send(h2::T_DATA, h2::F_END, id, &[]);
                 self.end = true;
             }

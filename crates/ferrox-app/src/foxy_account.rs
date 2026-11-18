@@ -189,6 +189,10 @@ impl TokenFile {
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
+        let Some(_lock) = self.lock_file() else {
+            eprintln!("foxy: cannot lock the session at {}", self.path.display());
+            return false;
+        };
         let mut pairs = vec![("email".to_owned(), Json::Str(self.email.clone()))];
         if let Some(auth) = auth {
             pairs.push((
@@ -274,6 +278,9 @@ impl TokenFile {
 
     /// The refused grant only stops a future launch when the file still holds it; a grant another process rotated in since is left alone.
     pub(crate) fn clear_if(&self, refused: &str) {
+        let Some(_lock) = self.lock_file() else {
+            return;
+        };
         let same = self.load().is_some_and(|session| {
             session
                 .auth
@@ -286,6 +293,29 @@ impl TokenFile {
 
     pub(crate) fn clear(&self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+
+    /// Serializes publication and the refused-token check with every other process, so a fresh grant cannot be unlinked between the read and the remove.
+    fn lock_file(&self) -> Option<std::fs::File> {
+        let mut path = self.path.as_os_str().to_owned();
+        path.push(".lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(std::path::PathBuf::from(path))
+            .ok()?;
+        for _ in 0..100 {
+            match file.try_lock() {
+                Ok(()) => return Some(file),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::Error(_)) => return None,
+            }
+        }
+        None
     }
 }
 

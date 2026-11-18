@@ -97,6 +97,8 @@ struct PooledState {
     next_id: u64,
     /// The generation of the pump thread that owns the lane's read side, or zero: a thread clears only its own, so a lane a later lease has already re-armed is left untouched.
     pump: u64,
+    /// Never reused, even after `pump` returns to zero: an older owner cannot match a later lease's generation.
+    next_pump: u64,
     /// When the lane's pump left and no thread owns it: the thread follows only the leases it can serve, so an idle edge and a flow that reads its own socket pin none and the next flow rides the same handshake.
     parked: Option<Instant>,
     /// The route generation this lane last followed: shared by every pump the lane starts, so a park and a restart do not re-probe a route that has not moved.
@@ -4186,7 +4188,8 @@ fn lend(pooled: &PooledConn, up: Option<Connection>, drive: bool) -> Option<u64>
             table.parked = Some(Instant::now());
             return None;
         };
-        table.pump += 1;
+        table.next_pump += 1;
+        table.pump = table.next_pump;
         let owner = PumpOwner {
             table: Arc::clone(&pooled.table),
             generation: table.pump,
@@ -4397,6 +4400,7 @@ fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
                 if !sent {
                     #[cfg(test)]
                     qstage(format!("{} t={} up-unsent {id}", port, qms()));
+                    stop_stream(&pooled.conn, &pooled.sock, id);
                     fail_session(&pooled.table, id);
                     return;
                 }
@@ -4643,6 +4647,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             reply_done: HashSet::new(),
             next_id: 0,
             pump: 0,
+            next_pump: 0,
             // No thread yet: only a lease whose bytes the pump can hand over starts one, so a connection nobody rode and a flow that reads its own socket cost none.
             parked: Some(Instant::now()),
             net: Arc::new(AtomicU64::new(network_generation())),
@@ -5085,12 +5090,10 @@ pub(crate) fn serve_loop(
                     &mut batch,
                     &mut scratch.out,
                 );
-                run_timers(&mut conns, &sock, start.elapsed());
                 reap(serve, &sock, &mut conns, &mut scratch, &live);
                 continue;
             }
             Drain::Empty => {
-                run_timers(&mut conns, &sock, start.elapsed());
                 reap(serve, &sock, &mut conns, &mut scratch, &live);
                 continue;
             }
@@ -5102,16 +5105,12 @@ pub(crate) fn serve_loop(
             Ok((n, from)) => {
                 let Scratch { buf, out, .. } = &mut scratch;
                 route(&sock, local, config, &mut conns, &mut buf[..n], out, from);
-                run_timers(&mut conns, &sock, start.elapsed());
             }
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                run_timers(&mut conns, &sock, start.elapsed());
-            }
+                ) => {}
             Err(_) => return,
         }
         reap(serve, &sock, &mut conns, &mut scratch, &live);
@@ -5130,19 +5129,6 @@ pub(crate) fn serve_loop(
     let left = live.load(Ordering::SeqCst);
     if left != 0 {
         eprintln!("quic: {left} stream handlers still running at shutdown");
-    }
-}
-
-/// Run the timers whose deadline this wait passed, answering what they queued.
-fn run_timers(conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>, sock: &Datagram, elapsed: Duration) {
-    for state in conns.values() {
-        let Ok(mut conn) = state.conn.lock() else {
-            continue;
-        };
-        if conn.timeout().is_none_or(|left| left <= elapsed) {
-            conn.on_timeout();
-            flush_egress(&mut conn, sock);
-        }
     }
 }
 
@@ -5329,13 +5315,22 @@ fn reap(
             continue;
         }
         state.visit.store(epoch, Ordering::Relaxed);
-        let Ok(conn) = state.conn.lock() else {
+        let Ok(mut conn) = state.conn.lock() else {
             continue;
         };
         if conn.is_closed() {
             state.gone.store(true, Ordering::Relaxed);
             scratch.closed.push(key.clone());
             continue;
+        }
+        if conn.timeout().is_some_and(|left| left.is_zero()) {
+            conn.on_timeout();
+            flush_egress(&mut conn, sock);
+            if conn.is_closed() {
+                state.gone.store(true, Ordering::Relaxed);
+                scratch.closed.push(key.clone());
+                continue;
+            }
         }
         if let Some(at) = conn.timeout_instant() {
             deadline = Some(deadline.map_or(at, |soonest: Instant| soonest.min(at)));

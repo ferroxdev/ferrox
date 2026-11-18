@@ -3858,8 +3858,11 @@ fn service(
                 accept(conn, shared, spec, tunnel);
             }
             if let Some(head) = tunnel.pending.take() {
-                send_stream(conn, id, &head, true).ok();
-                tunnel.rejected = true;
+                if send_stream(conn, id, &head, true).is_err() {
+                    cancel(conn, tunnel);
+                } else {
+                    tunnel.rejected = true;
+                }
             }
         } else if !tunnel.rejected {
             let probed = tunnel.stream.map(|stream| probed_mtu(conn, stream));
@@ -4111,7 +4114,7 @@ fn accept(
         frames::quic_varint(&mut head, block.len() as u64);
         head.extend_from_slice(&block);
         if send_stream(conn, stream, &head, false).is_err() {
-            reject(tunnel, 503);
+            cancel(conn, tunnel);
             return;
         }
         return;
@@ -4139,19 +4142,19 @@ fn accept(
     frames::quic_varint(&mut head, block.len() as u64);
     head.extend_from_slice(&block);
     if send_stream(conn, stream, &head, false).is_err() {
-        reject(tunnel, 503);
+        cancel(conn, tunnel);
         return;
     }
     let mut control = Vec::new();
     connectip::address_assign_encode(&assignments, &mut control);
     if send_data(conn, stream, &control).is_err() {
-        reject(tunnel, 503);
+        cancel(conn, tunnel);
         return;
     }
     control.clear();
     connectip::route_advert_encode(&routes(&tunnel.addrs), &mut control);
     if send_data(conn, stream, &control).is_err() {
-        reject(tunnel, 503);
+        cancel(conn, tunnel);
     }
 }
 
@@ -4465,6 +4468,19 @@ fn forward_owned(
             });
         }
     }
+}
+
+/// A success response can no longer be completed: reset the stream and give back the lane or grant instead of queueing a status that cannot replace accepted bytes.
+fn cancel(conn: &mut quiche::Connection, tunnel: &mut Tunnel) {
+    if let Some(stream) = tunnel.stream {
+        let _ = conn.stream_shutdown(stream, quiche::Shutdown::Write, 0);
+        let _ = conn.stream_shutdown(stream, quiche::Shutdown::Read, 0);
+    }
+    tunnel.udp = None;
+    tunnel.granted = None;
+    tunnel.addrs.clear();
+    tunnel.opened = false;
+    tunnel.rejected = true;
 }
 
 fn reject(tunnel: &mut Tunnel, status: u16) {

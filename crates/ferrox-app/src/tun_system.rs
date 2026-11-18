@@ -190,13 +190,20 @@ impl Nat {
         }
         let key = FlowKey::of(view);
         if !self.fallback.contains_key(&key) && self.fallback.len() >= NAT_MAX {
+            // A hand-off must be recorded even when every fallback is young: an unrecorded retransmission can reach `allocate` and switch the flow to kernel NAT mid-stream.
             let expired = self
                 .fallback
                 .iter()
                 .filter(|(_, last)| now.saturating_duration_since(**last) > NAT_IDLE)
                 .min_by_key(|(_, last)| **last)
                 .map(|(key, _)| *key);
-            let Some(oldest) = expired else {
+            let oldest = expired.or_else(|| {
+                self.fallback
+                    .iter()
+                    .min_by_key(|(_, last)| **last)
+                    .map(|(key, _)| *key)
+            });
+            let Some(oldest) = oldest else {
                 return;
             };
             self.fallback.remove(&oldest);

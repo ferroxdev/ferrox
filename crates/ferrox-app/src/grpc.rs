@@ -495,7 +495,7 @@ impl<R: Read> GrpcReader<R> {
         if self.answered {
             if id != self.stream {
                 self.refuse(id);
-                return None;
+                return Some(());
             }
             if flags & F_END != 0 {
                 self.eof = true;
@@ -1670,7 +1670,7 @@ impl GrpcWriter {
         }
         self.shared.upload_ended.store(true, Ordering::SeqCst);
         // END_STREAM is not flow-controlled: an empty DATA frame ends the request even when a nonempty gRPC message would still need credit.
-        if !self.emit(T_DATA, F_END, self.stream, &[]) {
+        if !self.end_stream() {
             self.shared.upload_ended.store(false, Ordering::SeqCst);
             return;
         }
@@ -1708,12 +1708,19 @@ impl GrpcWriter {
         if self.shared.upload_ended.load(Ordering::SeqCst) {
             return;
         }
-        if !self.emit(T_DATA, F_END, self.stream, &[]) {
+        if !self.end_stream() {
             self.shared.ended.store(false, Ordering::SeqCst);
             return;
         }
         self.shared.upload_ended.store(true, Ordering::SeqCst);
         let _ = Gather::settle_blocking(&self.shared);
+    }
+
+    /// `END_STREAM` costs no flow credit, but it still rides the paced tail: a full transport is drained and the same empty frame retried.
+    fn end_stream(&self) -> bool {
+        let mut batch = Gather::new();
+        batch.add(self.stream, F_END, &[], &[]);
+        batch.flush_blocking(&self.shared)
     }
 
     fn emit(&self, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {

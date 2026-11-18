@@ -706,9 +706,24 @@ impl Packer {
         let requested = self.settings.sc_max_each_post.max(1);
         match self.settings.uplink_data_placement {
             Placement::Header | Placement::Cookie => {
-                // Base64url expands by 4/3 and the head carries fixed fields and a padding run.
-                let room = HEAD_LIMIT.saturating_sub(8 * 1024);
-                requested.min(room / 4 * 3).max(1)
+                // Base64url expands by 4/3, and every data field spends its name, index and delimiter before the head can close.
+                let padding =
+                    usize::try_from(self.settings.x_padding_bytes.1).unwrap_or(HEAD_LIMIT);
+                let headers: usize = self
+                    .settings
+                    .headers
+                    .iter()
+                    .map(|(key, value)| key.len() + value.len() + 4)
+                    .sum();
+                let fixed = 4 * 1024usize.saturating_add(padding).saturating_add(headers);
+                let budget = HEAD_LIMIT.saturating_sub(fixed);
+                let chunk = self.settings.uplink_chunk.0.max(1);
+                let field = self.settings.uplink_data_key.len().saturating_add(16);
+                let room = budget
+                    .saturating_mul(chunk.saturating_mul(3))
+                    .checked_div(chunk.saturating_add(field).saturating_mul(4))
+                    .unwrap_or(0);
+                requested.min(room).max(1)
             }
             _ => requested,
         }

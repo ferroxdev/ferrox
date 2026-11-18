@@ -108,23 +108,21 @@ fn through_tunnel<T: Read + Write>(tunnel: &mut T, host: &str, path: &str) -> Op
     let mut chunk = [0u8; 512];
     let mut scanned = 0usize;
     let deadline = Instant::now() + READ;
-    while ferrox_core::foxy::head_end_grown(&head, &mut scanned).is_none()
-        && Instant::now() < deadline
-    {
+    let mut end = ferrox_core::foxy::head_end_grown(&head, &mut scanned);
+    while end.is_none() && Instant::now() < deadline {
         match tunnel.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(read) => head.extend_from_slice(&chunk[..read]),
         }
+        end = ferrox_core::foxy::head_end_grown(&head, &mut scanned);
     }
     // A head that never ended is a failed read, not a short response.
-    ferrox_core::foxy::head_end_grown(&head, &mut scanned)?;
+    end?;
     // Drain the body so the next request on this flow starts after this one ended.
-    if ferrox_core::foxy::head_end_grown(&head, &mut scanned).is_some() {
-        while head.len() < 64 * 1024 && Instant::now() < deadline {
-            match tunnel.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => head.extend_from_slice(&chunk[..read]),
-            }
+    while head.len() < 64 * 1024 && Instant::now() < deadline {
+        match tunnel.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => head.extend_from_slice(&chunk[..read]),
         }
     }
     String::from_utf8(head).ok()
@@ -264,15 +262,15 @@ fn carried(
 }
 
 /// The plane's counter after a charge has landed: mint until two mints agree, so a figure read before the plane wrote it is not read as the charge.
-fn settled(account: &Account, mut was: u64, deadline: Instant) -> u64 {
+fn settled(account: &Account, mut was: u64, deadline: Instant) -> Option<u64> {
     for _ in 0..SETTLE_MINTS {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return was;
+            return None;
         }
         std::thread::sleep(SETTLE.min(left));
         if Instant::now() >= deadline {
-            return was;
+            return None;
         }
         account
             .renew()
@@ -282,11 +280,11 @@ fn settled(account: &Account, mut was: u64, deadline: Instant) -> u64 {
             .quota_remaining
             .expect("the plane names an allowance on every mint");
         if now == was {
-            return now;
+            return Some(now);
         }
         was = now;
     }
-    was
+    None
 }
 
 /// The charge per carried byte, in thousandths: whole and three digits.
@@ -320,7 +318,10 @@ fn canceled(
         until,
     )?;
     std::thread::sleep(SETTLE);
-    let charged = was.saturating_sub(settled(account, was, deadline));
+    let Some(settled) = settled(account, was, deadline) else {
+        return Err("closed flow: the allowance did not settle before the clock".to_owned());
+    };
+    let charged = was.saturating_sub(settled);
     let (whole, fraction) = per_byte(charged, read as u64);
     println!(
         "closed {PAYLOAD_HOST}{} after {read} bytes: {charged} charged ({whole}.{fraction:03}x) for a canceled flow",
@@ -340,9 +341,18 @@ fn brackets(
     let mut was = pass
         .quota_remaining
         .ok_or("the plane names no allowance; without one there is nothing to charge")?;
-    was = settled(account, was, deadline);
+    let Some(next) = settled(account, was, deadline) else {
+        return Err(format!(
+            "{carrier:?}: the allowance did not settle before the clock"
+        ));
+    };
+    was = next;
     std::thread::sleep(IDLE);
-    let idle = settled(account, was, deadline);
+    let Some(idle) = settled(account, was, deadline) else {
+        return Err(format!(
+            "{carrier:?}: the allowance did not settle before the clock"
+        ));
+    };
     let drained = was.saturating_sub(idle);
     println!(
         "idle {:.0}s through {carrier:?}: {drained} bytes charged with no flow",
@@ -367,7 +377,11 @@ fn brackets(
         },
         until,
     )?;
-    let now = settled(account, was, deadline);
+    let Some(now) = settled(account, was, deadline) else {
+        return Err(format!(
+            "{carrier:?}: the allowance did not settle before the clock"
+        ));
+    };
     let fixed = was.saturating_sub(now);
     println!(
         "HEAD {PAYLOAD_HOST}{}: {head} bytes carried, {fixed} charged",
@@ -395,7 +409,11 @@ fn brackets(
             return Err(format!("{path}: {bytes} bytes is not a payload"));
         }
         let bytes = bytes as u64;
-        let now = settled(account, was, deadline);
+        let Some(now) = settled(account, was, deadline) else {
+            return Err(format!(
+                "{carrier:?}: the allowance did not settle before the clock"
+            ));
+        };
         let charged = was.saturating_sub(now);
         let (whole, fraction) = per_byte(charged, bytes);
         println!(

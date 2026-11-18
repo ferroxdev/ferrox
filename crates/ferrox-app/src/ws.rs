@@ -333,6 +333,8 @@ pub(crate) struct WsReader<R: Read = Connection> {
     assembling: bool,
     /// Wall-clock end of the opening handshake: past it an idle socket is death, not a round to retry.
     handshake: Option<std::time::Instant>,
+    /// A read error that arrived after a relay window was already filled: the bytes go first, the error on the next call.
+    deferred: Option<std::io::Error>,
     #[cfg_attr(not(test), allow(dead_code, reason = "read by the syscall gate"))]
     reads: usize,
 }
@@ -668,6 +670,9 @@ impl<R: Read> WsReader<R> {
         &mut self,
         spans: &mut [(usize, usize); crate::proxy::WINDOW_PARTS],
     ) -> std::io::Result<usize> {
+        if let Some(error) = self.deferred.take() {
+            return Err(error);
+        }
         let mut len = 0;
         let mut room = WINDOW_MAX;
         let mut empty = 0usize;
@@ -688,7 +693,15 @@ impl<R: Read> WsReader<R> {
                 self.early.clear();
                 self.eat = 0;
                 let fill = len == 0;
-                if !self.message(fill)? {
+                let message = match self.message(fill) {
+                    Ok(message) => message,
+                    Err(error) if len > 0 => {
+                        self.deferred = Some(error);
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if !message {
                     if fill {
                         self.eof = true;
                         break;
@@ -701,10 +714,20 @@ impl<R: Read> WsReader<R> {
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(error) if crate::proxy::is_timeout(&error) => break,
+                        Err(error) if len > 0 => {
+                            self.deferred = Some(error);
+                            break;
+                        }
                         Err(error) => return Err(error),
                     }
-                    if !self.message(false)? {
-                        break;
+                    match self.message(false) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) if len > 0 => {
+                            self.deferred = Some(error);
+                            break;
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
                 let start = self.at;
@@ -816,6 +839,9 @@ impl WsWriter {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return crate::proxy::Push::Lost;
         };
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return crate::proxy::Push::Lost;
+        }
         if self.masked {
             if self.shared.open.load(Ordering::Relaxed) != 0
                 || self.shared.cut.load(Ordering::Relaxed) != 0
@@ -1064,33 +1090,34 @@ struct Upgrade<'a> {
     early: Vec<u8>,
 }
 
+fn has_token(text: &str, name: &str, token: &str) -> bool {
+    text.split("\r\n").skip(1).any(|line| {
+        line.split_once(':').is_some_and(|(key, value)| {
+            key.trim().eq_ignore_ascii_case(name)
+                && value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
+    })
+}
+
 fn check_request<'a>(head: &'a [u8], path: &str) -> Option<Upgrade<'a>> {
     let text = std::str::from_utf8(head).ok()?;
     if crate::proxy::request_path_in(text)? != path {
         return None;
     }
-    let [key, offered, upgrade, connection, version] = crate::proxy::header_values_in(
+    let [key, offered, version] = crate::proxy::header_values_in(
         text,
         [
             "sec-websocket-key",
             "sec-websocket-protocol",
-            "upgrade",
-            "connection",
             "sec-websocket-version",
         ],
     );
     let key = key?;
     if key.is_empty()
-        || !upgrade.is_some_and(|value| {
-            value
-                .split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("websocket"))
-        })
-        || !connection.is_some_and(|value| {
-            value
-                .split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
-        })
+        || !has_token(text, "upgrade", "websocket")
+        || !has_token(text, "connection", "upgrade")
         || version != Some("13")
     {
         return None;
@@ -1173,37 +1200,29 @@ pub(crate) fn connect(
 }
 
 fn check_response(head: &[u8], key: &[u8]) -> Option<()> {
-    let line_end = head.windows(2).position(|window| window == b"\r\n")?;
-    let mut parts = head[..line_end].split(|byte| *byte == b' ');
-    if parts.next()? != b"HTTP/1.1" || parts.next()? != b"101" {
+    let text = std::str::from_utf8(head).ok()?;
+    let line_end = text.find("\r\n")?;
+    let mut parts = text[..line_end].split(' ');
+    if parts.next()? != "HTTP/1.1" || parts.next()? != "101" {
         return None;
     }
     let accept = accept_key(base64_text(key));
-    let mut rest = &head[line_end + 2..];
-    while !rest.is_empty() {
-        let end = rest
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .unwrap_or(rest.len());
-        let line = &rest[..end];
-        if let Some(colon) = line.iter().position(|byte| *byte == b':') {
-            if line[..colon].eq_ignore_ascii_case(b"sec-websocket-accept") {
-                let value = &line[colon + 1..];
-                let start = value
-                    .iter()
-                    .position(|byte| !byte.is_ascii_whitespace())
-                    .unwrap_or(value.len());
-                let value = &value[start..];
-                let end = value
-                    .iter()
-                    .rposition(|byte| !byte.is_ascii_whitespace())
-                    .map_or(0, |at| at + 1);
-                return (value[..end] == accept).then_some(());
-            }
+    let mut accepted = false;
+    for line in text[line_end + 2..].split("\r\n") {
+        if line.is_empty() {
+            break;
         }
-        rest = rest.get(end + 2..).unwrap_or(&[]);
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("sec-websocket-accept") {
+            accepted = value.trim().as_bytes() == accept;
+        }
     }
-    None
+    (accepted
+        && has_token(text, "upgrade", "websocket")
+        && has_token(text, "connection", "upgrade"))
+    .then_some(())
 }
 
 // The same connect over halves that cannot peek: the kept read takes what rode in behind the `101`.
@@ -1367,6 +1386,7 @@ pub(crate) fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
         coalesce: false,
         assembling: false,
         handshake: None,
+        deferred: None,
         reads: 0,
     };
     (
@@ -1690,6 +1710,7 @@ mod tests {
                     coalesce: false,
                     assembling: false,
                     handshake: None,
+                    deferred: None,
                     reads: 0,
                 };
                 let mut whole = Vec::new();
@@ -1848,6 +1869,7 @@ mod tests {
             coalesce: false,
             assembling: false,
             handshake: None,
+            deferred: None,
             reads: 0,
         };
         let mut buf = [0u8; 600];
@@ -1885,6 +1907,7 @@ mod tests {
             coalesce: false,
             assembling: false,
             handshake: None,
+            deferred: None,
             reads: 0,
         };
         let mut buf = [0u8; 600];
@@ -1955,6 +1978,7 @@ mod tests {
             coalesce: false,
             assembling: false,
             handshake: None,
+            deferred: None,
             reads: 0,
         };
         let mut buf = [0u8; 4096];
@@ -2021,6 +2045,7 @@ mod tests {
             coalesce: false,
             assembling: false,
             handshake: None,
+            deferred: None,
             reads: 0,
         };
         let frame = |fin: bool, opcode: u8, payload: &[u8]| {
@@ -2143,6 +2168,7 @@ mod tests {
             coalesce: false,
             assembling: false,
             handshake: None,
+            deferred: None,
             reads: 0,
         };
         let mut whole = Vec::new();
@@ -2193,6 +2219,7 @@ mod tests {
             coalesce: false,
             assembling: false,
             handshake: None,
+            deferred: None,
             reads: 0,
         };
         let mut whole = Vec::new();
@@ -2250,6 +2277,7 @@ mod tests {
             coalesce: false,
             assembling: false,
             handshake: None,
+            deferred: None,
             reads: 0,
         };
         let mut whole = Vec::new();
@@ -2486,6 +2514,7 @@ mod tests {
             coalesce: false,
             assembling: false,
             handshake: None,
+            deferred: None,
             reads: 0,
         }
     }
