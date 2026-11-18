@@ -7085,7 +7085,7 @@ pub(crate) fn broker_offer(
         let offer_settings = crate::psiphon_broker::OfferSettings {
             secret: offer_secret,
             traffic_shaping: shaping,
-            use_media_streams: webrtc.is_some() && media_secret.is_some(),
+            use_media_streams: crate::psiphon_webrtc::offers_media(&generated),
         };
         match client.client_offer(
             destination,
@@ -8364,11 +8364,11 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
             overrides.truncate(override_take);
             interleave_fronted(&mut group, builtin, overrides);
             group.truncate(candidate_cap);
+            let consumed = group.len();
             // The entry's own front leads, so the first batch dials it before a scan can stall.
             group.insert(0, server);
-            let emitted = group.len();
             groups.push(group);
-            scan_start = scan_start.saturating_add(emitted.min(CDN_SCAN_STRIDE));
+            scan_start = scan_start.saturating_add(consumed.min(CDN_SCAN_STRIDE));
             continue;
         }
         let mut group = Vec::with_capacity(FRONTED_VARIANTS.min(16));
@@ -13751,6 +13751,46 @@ mod tests {
                 "server {index} fell outside the cap"
             );
         }
+    }
+
+    #[test]
+    fn an_even_scan_spec_reaches_both_candidates() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "FrontedMeekCDNScanSpec": {
+                        "IPCandidates": ["198.51.100.7"],
+                        "SNIServerNames": ["scan.example"]
+                    }
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut servers = Vec::new();
+        for index in 0..257 {
+            let mut server = scan_test_server();
+            let meek = server.meek.as_mut().expect("fronted");
+            meek.host = format!("cdn{index}.example");
+            meek.hosts = vec![format!("cdn{index}.example")];
+            servers.push(server);
+        }
+        apply_fronting_overrides(&mut servers, &settings);
+        let candidates: Vec<_> = servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref())
+            .filter(|meek| meek.dial == "198.51.100.7")
+            .collect();
+        assert!(
+            candidates
+                .iter()
+                .any(|meek| meek.sni == "scan.example" && !meek.disable_sni),
+            "the named candidate was never probed"
+        );
+        assert!(
+            candidates.iter().any(|meek| meek.disable_sni),
+            "the empty-SNI candidate was never probed"
+        );
     }
 
     #[test]

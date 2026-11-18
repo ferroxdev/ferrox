@@ -630,6 +630,11 @@ impl MediaRng {
     }
 }
 
+pub(crate) fn offers_media(sdp: &str) -> bool {
+    sdp.lines()
+        .any(|line| line.trim_start().starts_with("m=video"))
+}
+
 fn media_properties(secret: [u8; 32]) -> MediaProperties {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * 1024;
@@ -2031,7 +2036,7 @@ impl Conduit {
         let settings = OfferSettings {
             secret: offer_secret,
             traffic_shaping: shaping,
-            use_media_streams: media_secret.is_some(),
+            use_media_streams: offers_media(&sdp),
         };
         let offer = {
             let mut client = lock(&client);
@@ -2492,7 +2497,27 @@ mod tests {
         )
         .expect("offer");
         assert!(sdp.contains("m=application"));
+        assert!(!offers_media(&sdp));
         assert!(webrtc.socket.local_addr().is_ok());
+    }
+
+    #[test]
+    fn a_media_offer_names_a_video_track() {
+        let (_, sdp) = WebRtc::offer(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &[],
+            false,
+            false,
+            false,
+            false,
+            Duration::from_secs(1),
+            &crate::psiphon_dns::Config::from_servers(&[]),
+            false,
+            Some([7u8; 32]),
+        )
+        .expect("offer");
+        assert!(offers_media(&sdp));
+        assert!(!sdp.contains("m=application"));
     }
 
     #[test]
