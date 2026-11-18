@@ -412,9 +412,8 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
     secure_dir(&paths.state_dir)
         .map_err(|error| format!("cannot create the state dir: {error}"))?;
     let bin = canonical_exe(bin);
-    write_private(&bin_marker(paths), &format!("{}\n", bin.display())).map_err(|error| {
-        format!("cannot record the lane binary {}: {error}", bin.display())
-    })?;
+    write_private(&bin_marker(paths), &format!("{}\n", bin.display()))
+        .map_err(|error| format!("cannot record the lane binary {}: {error}", bin.display()))?;
     register(paths)?;
     let out = OpenOptions::new()
         .create(true)
@@ -601,8 +600,11 @@ pub fn other_lanes(paths: &Paths) -> Vec<(String, u32)> {
             continue;
         };
         if let Some(pid) = read_trim(&entry.path()).and_then(|text| text.parse().ok()) {
-            let lane_paths =
-                Paths::with_dirs(paths.conf_dir.clone(), paths.state_dir.clone(), Some(instance));
+            let lane_paths = Paths::with_dirs(
+                paths.conf_dir.clone(),
+                paths.state_dir.clone(),
+                Some(instance),
+            );
             if alive(pid) && is_ferrox(&lane_paths, pid) {
                 lanes.push((instance.to_owned(), pid));
             }
@@ -670,7 +672,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ferrox-foreign-{}", std::process::id()));
         let paths = Paths::with_dirs(root.join("conf"), root.join("state"), None);
         let current = std::process::id();
-        assert!(!is_ferrox(&paths, current), "the test process looks like the lane");
+        assert!(
+            !is_ferrox(&paths, current),
+            "the test process looks like the lane"
+        );
         write_private(&paths.pid_file, &format!("{current}\n")).unwrap();
         assert!(!running(&paths));
         assert!(stop(&paths).is_ok());
