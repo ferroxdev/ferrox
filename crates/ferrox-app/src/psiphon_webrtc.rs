@@ -945,36 +945,45 @@ fn nat_filtering(socket: &UdpSocket, target: SocketAddr, deadline: Instant) -> R
     }
 }
 
-fn is_bogon(ip: IpAddr) -> bool {
+/// The reference's `IsBogon`: an address no peer or steering IP should name.
+pub(crate) fn is_bogon(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            ip.is_unspecified()
-                || ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_multicast()
-                || ip.is_broadcast()
-                || octets[0] == 0
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
-                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
-                || octets[0] >= 240
-        }
+        IpAddr::V4(ip) => is_bogon_v4(ip),
         IpAddr::V6(ip) => {
             if let Some(ip) = ip.to_ipv4_mapped() {
-                return is_bogon(IpAddr::V4(ip));
+                return is_bogon_v4(ip);
             }
             let octets = ip.octets();
             ip.is_unspecified()
                 || ip.is_loopback()
                 || ip.is_multicast()
-                || (octets[0] & 0xfe) == 0xfc
-                || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || (octets[0] == 0x01 && octets[1] == 0x00 && octets[2..8] == [0; 6])
+                || (octets[0] == 0x20 && octets[1] == 0x01 && octets[2] <= 1)
+                || (octets[0] == 0x20
+                    && octets[1] == 0x01
+                    && octets[2] == 0x0d
+                    && octets[3] == 0xb8)
+                || (octets[0] == 0x20 && octets[1] == 0x02)
         }
     }
+}
+
+fn is_bogon_v4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 0
+        || ip.is_private()
+        || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || ip.is_documentation()
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+        || (octets[0] == 192 && (octets[1] & 0xfe) == 18)
+        || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
+        || ip.is_multicast()
+        || octets[0] >= 240
 }
 
 type InputChannel = Arc<Mutex<Receiver<Result<Vec<u8>, String>>>>;
@@ -2484,5 +2493,50 @@ mod tests {
         .expect("offer");
         assert!(sdp.contains("m=application"));
         assert!(webrtc.socket.local_addr().is_ok());
+    }
+
+    #[test]
+    fn the_reference_bogon_table_is_covered() {
+        for bogon in [
+            [0, 1, 2, 3],
+            [10, 0, 0, 1],
+            [100, 64, 0, 1],
+            [127, 0, 0, 1],
+            [169, 254, 0, 1],
+            [172, 16, 0, 1],
+            [192, 0, 0, 1],
+            [192, 0, 2, 1],
+            [192, 18, 0, 1],
+            [192, 88, 99, 1],
+            [198, 18, 0, 1],
+            [198, 51, 100, 1],
+            [203, 0, 113, 1],
+            [224, 0, 0, 1],
+            [240, 0, 0, 1],
+            [255, 255, 255, 255],
+        ] {
+            assert!(is_bogon(Ipv4Addr::from(bogon).into()), "{bogon:?}");
+        }
+        for bogon in [
+            "::",
+            "::1",
+            "100::1",
+            "2001::1",
+            "2001:2::1",
+            "2001:db8::1",
+            "2002::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            assert!(is_bogon(bogon.parse().expect("address")), "{bogon}");
+        }
+        let mapped = Ipv4Addr::from([192, 0, 2, 1]).to_ipv6_mapped();
+        assert!(is_bogon(mapped.into()));
+        for public in [[1, 1, 1, 1], [8, 8, 8, 8]] {
+            assert!(!is_bogon(Ipv4Addr::from(public).into()), "{public:?}");
+        }
+        let public: IpAddr = "2606:4700:4700::1111".parse().expect("address");
+        assert!(!is_bogon(public), "{public}");
     }
 }
