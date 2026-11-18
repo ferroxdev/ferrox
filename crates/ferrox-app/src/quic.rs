@@ -2072,6 +2072,13 @@ pub(crate) fn rebind_path(
     let Some(source) = probe_source(peer, options) else {
         return Rebind::Retry;
     };
+    // A wildcard lane sends from whatever the kernel picks: record it and leave the socket be.
+    if current.ip().is_unspecified() {
+        if let Ok(mut slot) = sock.source.lock() {
+            *slot = Some(source);
+        }
+        return Rebind::Same;
+    }
     let same = match (source, current) {
         (SocketAddr::V4(found), SocketAddr::V4(now)) => found.ip() == now.ip(),
         (SocketAddr::V6(found), SocketAddr::V6(now)) => {
@@ -4582,15 +4589,30 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
         None => None,
     };
     for peer in peers {
-        let Ok(sock) = (if peer.is_ipv6() {
-            bind_datagram("[::]:0")
+        let wildcard = if peer.is_ipv6() {
+            "[::]:0"
         } else {
-            bind_datagram("0.0.0.0:0")
-        }) else {
-            continue;
+            "0.0.0.0:0"
         };
-        let Ok(local) = sock.local_addr() else {
-            continue;
+        // A plain lane binds the kernel-picked source so the route poll compares an address, not a wildcard.
+        let (sock, local) = if relay.is_some() {
+            let Ok(sock) = bind_datagram(wildcard) else {
+                continue;
+            };
+            let Ok(local) = sock.local_addr() else {
+                continue;
+            };
+            (sock, local)
+        } else if let Some(bound) = datagram_to_with_source(peer, None, None) {
+            bound
+        } else {
+            let Ok(sock) = bind_datagram(wildcard) else {
+                continue;
+            };
+            let Ok(local) = sock.local_addr() else {
+                continue;
+            };
+            (sock, local)
         };
         let sock = match relay.as_ref() {
             Some((control, via)) => Datagram::relayed(sock, *via, Arc::clone(control)),
@@ -4829,10 +4851,17 @@ impl QuicStream {
         let Ok(mut conn) = self.conn.lock() else {
             return Err(std::io::Error::other("quic connection lock poisoned"));
         };
+        // A closed connection cannot progress: fail the write instead of parking it for SEND_WAIT.
+        if conn.is_closed() {
+            return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        }
         match conn.stream_send(self.id, buf, false) {
             Ok(n) => {
                 flush_egress(&mut conn, &self.sock);
                 Ok(n)
+            }
+            Err(quiche::Error::Done) if conn.is_closed() => {
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
             }
             Err(quiche::Error::Done) => Ok(0),
             Err(error) => Err(std::io::Error::other(format!(
@@ -7530,6 +7559,52 @@ mod tests {
         assert_eq!(&after[..got], b"after");
     }
 
+    /// A write on a connection the peer closed returns at once; waiting `SEND_WAIT` for a
+    /// stream that can never make progress is the stall, not the close.
+    #[test]
+    fn a_write_on_a_closed_connection_fails_before_the_send_wait() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let sock = bind_datagram("127.0.0.1:0").expect("binds");
+        let local = sock.local_addr().expect("local");
+        let mut scid = [0u8; SCID_LEN];
+        getrandom::fill(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
+        config.set_application_protos(&[ALPN]).expect("alpn");
+        let mut conn = quiche::connect(
+            Some("closed.test"),
+            &cid,
+            local,
+            peer.local_addr().expect("peer"),
+            &mut config,
+        )
+        .expect("connects");
+        conn.close(false, 0, b"done").expect("closes");
+        assert!(conn.is_closed(), "quiche marks a connection closed at once");
+        let conn = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        let mut stream = QuicStream {
+            conn,
+            sock: std::sync::Arc::new(Datagram::plain(sock)),
+            id: 0,
+            meter: crate::stats::Meter::default(),
+            peer_fin: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fin_sent: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            prefaced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            activity: std::sync::Arc::new(Activity::new()),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            owner: None,
+        };
+        let started = Instant::now();
+        let error = stream
+            .write(b"x")
+            .expect_err("a closed connection refuses the write");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the close is answered at once, not after SEND_WAIT"
+        );
+    }
+
     /// The client side of a move is callable as part of the lane, not only by hand: it issues its
     /// spare IDs, migrates the connection it carries to the new local address, and the server reads
     /// the same stream on the new path.
@@ -7739,6 +7814,33 @@ mod tests {
             Rebind::Same
         ));
         assert_eq!(client.sock.local_addr().expect("addr"), before);
+    }
+
+    /// A wildcard lane already sends from whatever the kernel picks: the poll records that
+    /// source instead of migrating the connection on its first tick.
+    #[test]
+    fn a_wildcard_lane_records_the_kernel_source_without_migrating() {
+        let (mut client, server) = lane_pair();
+        let wildcard = Datagram::plain(bind_datagram("0.0.0.0:0").expect("binds"));
+        let before = wildcard.local_addr().expect("addr");
+        assert!(
+            before.ip().is_unspecified(),
+            "the lane starts on the wildcard"
+        );
+        assert!(matches!(
+            rebind_path(&mut client.conn, &wildcard, server.addr),
+            Rebind::Same
+        ));
+        assert_eq!(
+            wildcard.local_addr().expect("addr"),
+            before,
+            "an unchanged route keeps the descriptor"
+        );
+        let recorded = wildcard.source.lock().expect("lock");
+        assert!(
+            recorded.is_some_and(|source| !source.ip().is_unspecified()),
+            "the source the kernel picks is recorded for the next poll"
+        );
     }
 
     /// A dial binds the source the kernel picks for the edge, not the wildcard, so a later
