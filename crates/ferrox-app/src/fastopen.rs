@@ -124,7 +124,11 @@ mod tests {
         let peer =
             std::net::TcpStream::connect(listener.local_addr().expect("bound")).expect("a pair");
         let (_accepted, _) = listener.accept().expect("the pair");
-        assert_eq!(supported(), supported(), "the kernel probe is answered once");
+        assert_eq!(
+            supported(),
+            supported(),
+            "the kernel probe is answered once"
+        );
         assert!(
             !deferred(&peer),
             "a connected socket has finished its handshake"

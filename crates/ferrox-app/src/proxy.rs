@@ -1507,7 +1507,7 @@ fn dial_from(
     source: Option<IpAddr>,
     sockopts: Option<&crate::sockopt::SocketOptions>,
     fast: bool,
-) -> std::io::Result<Connection> {
+) -> std::io::Result<std::net::TcpStream> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     let domain = if target.is_ipv4() {
         Domain::IPV4
@@ -1525,7 +1525,7 @@ fn dial_from(
         crate::fastopen::arm(&socket)?;
     }
     crate::conn::connect_bounded(&socket, &SockAddr::from(*target), budgets::dial())?;
-    Ok(Connection::Tcp(std::net::TcpStream::from(socket)))
+    Ok(std::net::TcpStream::from(socket))
 }
 
 /// Hand the target to the outbound a `dialerProxy` names over a loopback pipe, then return the
@@ -1759,7 +1759,7 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, bool), Fail
             let stream = dial_through_proxy(*target, tag, options)
                 .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?;
             no_delay(&stream);
-            return Ok((metered(stream), false));
+            return Ok((outbound_metered(stream), false));
         }
     }
     let source = resolve_source(SEND_THROUGH.with(std::cell::Cell::get))
@@ -1777,19 +1777,21 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, bool), Fail
         }
         let (stream, deferred) = kept.expect("the loop returns on its last round");
         no_delay(&stream);
-        return Ok((metered(Connection::Tcp(stream)), deferred));
+        return Ok((outbound_metered(Connection::Tcp(stream)), deferred));
     }
     let stream = match (source, sockopts) {
         (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
             .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
-        (source, sockopts) => dial_from(target, source, sockopts.as_deref(), false)
-            .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
+        (source, sockopts) => Connection::Tcp(
+            dial_from(target, source, sockopts.as_deref(), false)
+                .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
+        ),
     };
     no_delay(&stream);
-    Ok((metered(stream), false))
+    Ok((outbound_metered(stream), false))
 }
 
-fn metered(stream: Connection) -> Connection {
+fn outbound_metered(stream: Connection) -> Connection {
     let meter = OUTBOUND_TAG.with(|cell| {
         cell.borrow()
             .as_deref()
@@ -42845,8 +42847,8 @@ mod tests {
 
     fn tcp_pair() -> Connection {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        let client = std::net::TcpStream::connect(listener.local_addr().expect("bound"))
-            .expect("connects");
+        let client =
+            std::net::TcpStream::connect(listener.local_addr().expect("bound")).expect("connects");
         let (_peer, _) = listener.accept().expect("accepts");
         Connection::Tcp(client)
     }
