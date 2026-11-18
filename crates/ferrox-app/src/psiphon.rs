@@ -61,6 +61,8 @@ const FRONTED_SERVERS: usize = 512;
 /// The reference's aggressive queue: three fronted CDN protocols at an
 /// eight-way fanout per server entry before the next entry.
 const CDN_SCAN_STRIDE: usize = 24;
+/// The first tactics entry to try on the next establishment pass.
+static TACTICS_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
 const CDN_FRONTING_PROTOCOLS: &[&str] = &[
     "FRONTED-MEEK-CDN-OSSH",
@@ -7323,7 +7325,11 @@ fn fetch_tactics_from(
         (Some(wait), None) => Some(wait),
         (None, until) => until,
     };
-    let mut index = 0usize;
+    let mut index = if until.is_some() {
+        TACTICS_CURSOR.load(Ordering::Relaxed) % entries.len()
+    } else {
+        0
+    };
     let mut last = None;
     loop {
         let attempt = if let Some(deadline) = request_deadline {
@@ -7331,7 +7337,14 @@ fn fetch_tactics_from(
             if remaining.is_zero() {
                 return Err(last.unwrap_or_else(|| "psiphon: tactics wait expired".to_owned()));
             }
-            timeout.min(remaining)
+            let share = if until.is_some() {
+                remaining / u32::try_from(entries.len() - index).unwrap_or(u32::MAX)
+            } else {
+                remaining
+            };
+            timeout
+                .min(share.max(Duration::from_millis(1)))
+                .min(remaining)
         } else {
             timeout
         };
@@ -7348,9 +7361,15 @@ fn fetch_tactics_from(
         }
         index += 1;
         if index < entries.len() {
+            if until.is_some() {
+                TACTICS_CURSOR.store(index, Ordering::Relaxed);
+            }
             continue;
         }
         index = 0;
+        if until.is_some() {
+            TACTICS_CURSOR.store(0, Ordering::Relaxed);
+        }
         let Some(wait) = wait_deadline else {
             return Err(last.unwrap_or_else(|| "psiphon: tactics request failed".to_owned()));
         };
