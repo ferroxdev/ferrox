@@ -528,6 +528,7 @@ impl Api {
                             id,
                             block,
                             flags & h2::F_END_HEADERS != 0,
+                            false,
                         ) {
                             goaway(&mut stream, code, last_id);
                             return;
@@ -544,6 +545,7 @@ impl Api {
                             id,
                             block,
                             flags & h2::F_END_HEADERS != 0,
+                            false,
                         ) {
                             goaway(&mut stream, code, last_id);
                             return;
@@ -555,17 +557,32 @@ impl Api {
                     }
                     if calls.get(&id).is_some_and(|call| call.end_headers) {
                         let end = flags & h2::F_END_HEADERS != 0;
+                        let end_stream = flags & h2::F_END != 0;
                         if let Some(call) = calls.get_mut(&id) {
-                            call.end_stream |= flags & h2::F_END != 0;
+                            call.end_stream |= end_stream;
                         }
-                        if let Err(code) =
-                            absorb_headers(&mut decoder, &mut discard, id, block, end)
-                        {
-                            goaway(&mut stream, code, last_id);
-                            return;
-                        }
+                        let pseudo = match absorb_headers(
+                            &mut decoder,
+                            &mut discard,
+                            id,
+                            block,
+                            end,
+                            true,
+                        ) {
+                            Ok(pseudo) => pseudo,
+                            Err(code) => {
+                                goaway(&mut stream, code, last_id);
+                                return;
+                            }
+                        };
                         if end {
-                            if calls.get(&id).is_some_and(|call| call.end_stream) {
+                            if pseudo || !end_stream {
+                                if !reset(&mut stream, id, h2::E_PROTOCOL) {
+                                    return;
+                                }
+                                calls.remove(&id);
+                                flow.close(id);
+                            } else {
                                 last_id = last_id.max(id);
                                 if !self.answer(
                                     id,
@@ -618,28 +635,42 @@ impl Api {
                 }
                 h2::T_CONT => {
                     if discard.is_some() {
-                        if let Err(code) = absorb_headers(
+                        let trailers = calls.get(&id).is_some_and(|call| call.end_headers);
+                        let pseudo = match absorb_headers(
                             &mut decoder,
                             &mut discard,
                             id,
                             &body,
                             flags & h2::F_END_HEADERS != 0,
+                            trailers,
                         ) {
-                            goaway(&mut stream, code, last_id);
-                            return;
-                        }
+                            Ok(pseudo) => pseudo,
+                            Err(code) => {
+                                goaway(&mut stream, code, last_id);
+                                return;
+                            }
+                        };
                         if flags & h2::F_END_HEADERS != 0 {
                             continuation = None;
-                            if calls.get(&id).is_some_and(|call| call.end_stream) {
-                                last_id = last_id.max(id);
-                                if !self.answer(
-                                    id,
-                                    &calls.remove(&id).unwrap_or_default(),
-                                    &mut stream,
-                                    &mut flow,
-                                    &mut responses,
-                                ) {
-                                    return;
+                            if trailers {
+                                if let Some(call) = calls.remove(&id) {
+                                    if pseudo || !call.end_stream {
+                                        if !reset(&mut stream, id, h2::E_PROTOCOL) {
+                                            return;
+                                        }
+                                        flow.close(id);
+                                    } else {
+                                        last_id = last_id.max(id);
+                                        if !self.answer(
+                                            id,
+                                            &call,
+                                            &mut stream,
+                                            &mut flow,
+                                            &mut responses,
+                                        ) {
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1623,14 +1654,19 @@ fn absorb_headers(
     id: u32,
     block: &[u8],
     end: bool,
-) -> Result<(), u32> {
+    trailers: bool,
+) -> Result<bool, u32> {
+    let mut pseudo = false;
     if end && discard.is_none() {
         if block.len() > h2::HEAD_CAP {
             return Err(h2::E_PROTOCOL);
         }
-        return decoder
-            .decode(block, &mut |_, _| {})
-            .ok_or(h2::E_COMPRESSION);
+        decoder
+            .decode(block, &mut |name, _| {
+                pseudo |= trailers && name.first() == Some(&b':')
+            })
+            .ok_or(h2::E_COMPRESSION)?;
+        return Ok(pseudo);
     }
     let (held_id, mut held) = discard.take().unwrap_or_else(|| (id, Vec::new()));
     if held_id != id || held.len() + block.len() > h2::HEAD_CAP {
@@ -1639,12 +1675,14 @@ fn absorb_headers(
     held.extend_from_slice(block);
     if end {
         decoder
-            .decode(&held, &mut |_, _| {})
+            .decode(&held, &mut |name, _| {
+                pseudo |= trailers && name.first() == Some(&b':')
+            })
             .ok_or(h2::E_COMPRESSION)?;
     } else {
         *discard = Some((id, held));
     }
-    Ok(())
+    Ok(pseudo)
 }
 
 fn data_body(body: &[u8], flags: u8) -> Option<&[u8]> {
