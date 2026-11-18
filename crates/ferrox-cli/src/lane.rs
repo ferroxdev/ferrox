@@ -370,6 +370,8 @@ pub fn stop(paths: &Paths) -> Result<(), String> {
     }
 }
 
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(1);
+
 fn loopback_addresses(port: u16) -> Vec<SocketAddr> {
     vec![
         SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
@@ -377,7 +379,7 @@ fn loopback_addresses(port: u16) -> Vec<SocketAddr> {
     ]
 }
 
-fn probe_addresses(listen: &str, port: u16) -> Vec<SocketAddr> {
+fn resolve_addresses(listen: &str, port: u16) -> Vec<SocketAddr> {
     let listen = listen.trim();
     let host = listen
         .strip_prefix('[')
@@ -393,24 +395,25 @@ fn probe_addresses(listen: &str, port: u16) -> Vec<SocketAddr> {
         }
         Ok(IpAddr::V6(ip)) => vec![SocketAddr::from((ip, port))],
         Err(_) if host.is_empty() => loopback_addresses(port),
-        Err(_) => match (host, port).to_socket_addrs() {
-            Ok(addresses) => {
-                let addresses: Vec<SocketAddr> = addresses.collect();
-                if addresses.is_empty() {
-                    loopback_addresses(port)
-                } else {
-                    addresses
-                }
-            }
-            Err(_) => loopback_addresses(port),
-        },
+        Err(_) => {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let host = host.to_owned();
+            let _ = std::thread::spawn(move || {
+                let addresses = (host.as_str(), port)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let _ = sender.send(addresses);
+            });
+            receiver.recv_timeout(RESOLVE_TIMEOUT).unwrap_or_default()
+        }
     }
 }
 
-pub fn port_open(address: &str, port: u16) -> bool {
-    probe_addresses(address, port)
-        .into_iter()
-        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok())
+pub fn port_open(addresses: &[SocketAddr]) -> bool {
+    addresses
+        .iter()
+        .any(|address| TcpStream::connect_timeout(address, Duration::from_millis(300)).is_ok())
 }
 
 pub fn wait_fronts(list: &str, ports: Ports, paths: &Paths) -> bool {
@@ -421,9 +424,10 @@ pub fn wait_fronts(list: &str, ports: Ports, paths: &Paths) -> bool {
             .find(|(name, _)| name == &front)
             .map_or("", |(_, listen)| listen.as_str());
         let port = port_of(&front, ports);
+        let addresses = resolve_addresses(listen, port);
         let mut opened = false;
         for _ in 0..90 {
-            if port_open(listen, port) {
+            if port_open(&addresses) {
                 opened = true;
                 break;
             }
@@ -487,15 +491,15 @@ mod tests {
     #[test]
     fn a_configured_listener_address_is_probed_where_it_listens() {
         assert_eq!(
-            probe_addresses("127.0.0.2", 1080),
+            resolve_addresses("127.0.0.2", 1080),
             [SocketAddr::from(([127, 0, 0, 2], 1080))]
         );
         assert_eq!(
-            probe_addresses("[::1]", 1080),
+            resolve_addresses("[::1]", 1080),
             [SocketAddr::from((Ipv6Addr::LOCALHOST, 1080))]
         );
         assert_eq!(
-            probe_addresses("", 1080),
+            resolve_addresses("", 1080),
             [
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 1080)),
                 SocketAddr::from((Ipv6Addr::LOCALHOST, 1080))
