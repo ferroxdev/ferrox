@@ -1508,8 +1508,13 @@ fn dial_from(
     target: &SocketAddr,
     source: Option<IpAddr>,
     sockopts: Option<&crate::sockopt::SocketOptions>,
-) -> std::io::Result<Connection> {
+    fast: bool,
+    timeout: std::time::Duration,
+) -> std::io::Result<(std::net::TcpStream, bool)> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    if timeout.is_zero() {
+        return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+    }
     let domain = if target.is_ipv4() {
         Domain::IPV4
     } else {
@@ -1522,8 +1527,9 @@ fn dial_from(
     if let Some(source) = source {
         socket.bind(&SockAddr::from(SocketAddr::new(source, 0)))?;
     }
-    crate::conn::connect_bounded(&socket, &SockAddr::from(*target), budgets::dial())?;
-    Ok(Connection::Tcp(std::net::TcpStream::from(socket)))
+    let armed = fast && crate::fastopen::arm(&socket).is_ok();
+    crate::conn::connect_bounded(&socket, &SockAddr::from(*target), timeout)?;
+    Ok((std::net::TcpStream::from(socket), armed))
 }
 
 /// Hand the target to the outbound a `dialerProxy` names over a loopback pipe, then return the
@@ -1743,6 +1749,28 @@ pub(crate) fn dial_udp_through_proxy(
 }
 
 fn dial(target: &SocketAddr) -> Result<Connection, Failure> {
+    dial_kind(target, false).map(|(stream, _)| stream)
+}
+
+/// What the kernel did with the SYN on a direct leg, so the caller knows whether the first write
+/// rides it and whether the reference's rewrite is still needed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fast {
+    /// A `dialerProxy` hop owns the hello, so this leg never asked for it.
+    Off,
+    /// A direct leg that could not ask: the kernel lacks `TCP_FASTOPEN_CONNECT`.
+    Absent,
+    /// The kernel held the SYN back: establishment starts at the first write, whose bytes ride the
+    /// SYN as far as its payload room allows.
+    Deferred,
+    /// The handshake completed outright: this server sent no cookie, so the record is rewritten.
+    Refused,
+}
+
+/// The same dial, with Fast Open wanted on a direct leg. A second round fetches the cookie the
+/// first handshake did not carry; a failed second round keeps the first socket, and a server that
+/// still answers directly leaves the first-record rewrite in place.
+fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Failure> {
     // The seam's one dial entry: a named source or option builds the socket before the same budget, and neither is the TCP dial unchanged.
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow().clone());
     if let Some(options) = sockopts.as_deref() {
@@ -1750,35 +1778,77 @@ fn dial(target: &SocketAddr) -> Result<Connection, Failure> {
             let stream = dial_through_proxy(*target, tag, options)
                 .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?;
             no_delay(&stream);
-            let meter = OUTBOUND_TAG.with(|cell| {
-                cell.borrow()
-                    .as_deref()
-                    .map(|tag| crate::stats::outbound(Some(tag)))
-            });
-            return Ok(match meter {
-                Some(meter) => stream.with_meter(meter),
-                None => stream,
-            });
+            return Ok((outbound_metered(stream), Fast::Off));
         }
     }
     let source = resolve_source(SEND_THROUGH.with(std::cell::Cell::get))
         .map_err(|_| Failure::new(Stage::SocketConnected, Kind::Local))?;
+    if fast && crate::fastopen::supported() {
+        let mut kept = None;
+        let mut outcome = Fast::Refused;
+        let budget = budgets::dial();
+        let started = std::time::Instant::now();
+        for round in 0..2 {
+            let left = budget.saturating_sub(started.elapsed());
+            match dial_from(target, source, sockopts.as_deref(), true, left) {
+                Ok((stream, armed)) => {
+                    let deferred = armed && crate::fastopen::deferred(&stream);
+                    kept = Some(stream);
+                    if deferred {
+                        outcome = Fast::Deferred;
+                        break;
+                    }
+                    if !armed {
+                        outcome = Fast::Absent;
+                        break;
+                    }
+                }
+                Err(_) if round == 0 => {
+                    let plain = sockopts.map(|options| options.without_fast_open());
+                    let left = budget.saturating_sub(started.elapsed());
+                    match dial_from(target, source, plain.as_ref(), false, left) {
+                        Ok((stream, _)) => {
+                            kept = Some(stream);
+                            outcome = Fast::Absent;
+                            break;
+                        }
+                        Err(plain) => {
+                            return Err(Failure::new(Stage::SocketConnected, Kind::of(&plain)));
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let stream =
+            Connection::Tcp(kept.expect("the first round either returns or keeps a socket"));
+        no_delay(&stream);
+        return Ok((outbound_metered(stream), outcome));
+    }
+    let outcome = if fast { Fast::Absent } else { Fast::Off };
     let stream = match (source, sockopts) {
         (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
             .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
-        (source, sockopts) => dial_from(target, source, sockopts.as_deref())
-            .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
+        (source, sockopts) => Connection::Tcp(
+            dial_from(target, source, sockopts.as_deref(), false, budgets::dial())
+                .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?
+                .0,
+        ),
     };
     no_delay(&stream);
+    Ok((outbound_metered(stream), outcome))
+}
+
+fn outbound_metered(stream: Connection) -> Connection {
     let meter = OUTBOUND_TAG.with(|cell| {
         cell.borrow()
             .as_deref()
             .map(|tag| crate::stats::outbound(Some(tag)))
     });
-    Ok(match meter {
+    match meter {
         Some(meter) => stream.with_meter(meter),
         None => stream,
-    })
+    }
 }
 
 pub(crate) fn dial_or_report(target: &SocketAddr) -> Option<Connection> {
@@ -20767,7 +20837,7 @@ fn tls_failure(error: &ferrox_core::tls::TlsError) -> Failure {
 /// Arm the outbound's `sniSpoof` on the leg that is about to write the hello: a raw decoy goes out
 /// ahead of it where the kernel allows one, and the first-record rewrite stands in where it does
 /// not, which is the same fallback the reference makes.
-fn arm_sni(cfg: &ferrox_core::tls::TlsConfig, uplink: Connection) -> Connection {
+fn arm_sni(cfg: &ferrox_core::tls::TlsConfig, uplink: Connection, fast: Fast) -> Connection {
     use ferrox_core::evasion::{SniMethod, SniShape};
     let Some(sni) = cfg.sni.as_ref() else {
         return uplink;
@@ -20789,8 +20859,11 @@ fn arm_sni(cfg: &ferrox_core::tls::TlsConfig, uplink: Connection) -> Connection 
                 SniShape::Record
             }
         },
+        SniMethod::FastOpen if fast == Fast::Deferred => return uplink,
         SniMethod::FastOpen => {
-            warn_sni("fast open is not implemented; this dial rewrites the first record instead");
+            if fast == Fast::Absent || fast == Fast::Refused {
+                warn_fast_open();
+            }
             SniShape::Record
         }
     };
@@ -20800,6 +20873,15 @@ fn arm_sni(cfg: &ferrox_core::tls::TlsConfig, uplink: Connection) -> Connection 
 fn warn_sni(message: &str) {
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| eprintln!("sniSpoof: {message}"));
+}
+
+fn warn_fast_open() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "sniSpoof: fast open needs TCP_FASTOPEN_CONNECT and a cookie this server did not send; this dial rewrites the first record instead"
+        );
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -20832,7 +20914,11 @@ fn dial_tls_session(
     let mut ready = None;
     for attempt in 0..2 {
         let current = retry.as_ref().unwrap_or(cfg);
-        let uplink = match dial(server) {
+        let fast = current
+            .sni
+            .as_ref()
+            .is_some_and(|sni| sni.method == ferrox_core::evasion::SniMethod::FastOpen);
+        let (uplink, fast) = match dial_kind(server, fast) {
             Ok(uplink) => uplink,
             Err(failure) => {
                 note_dial_failure(server, failure);
@@ -20847,7 +20933,7 @@ fn dial_tls_session(
         });
         let mask = cut.as_ref().or(mask);
         let uplink = uplink.with_mask(mask);
-        let uplink = arm_sni(current, uplink);
+        let uplink = arm_sni(current, uplink, fast);
         let Ok(mut session) = ferrox_core::tls::connect(current, uplink) else {
             note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
             return None;
@@ -23973,7 +24059,7 @@ fn tls_session_on(
     uplink: Connection,
     cfg: &ferrox_core::tls::TlsConfig,
 ) -> Option<ferrox_core::tls::ClientSession<Connection>> {
-    let uplink = arm_sni(cfg, uplink);
+    let uplink = arm_sni(cfg, uplink, Fast::Absent);
     let mut session = ferrox_core::tls::connect(cfg, uplink).ok()?;
     session.handshake().ok()?;
     if !settle_ktls(&mut session) {
@@ -42824,6 +42910,47 @@ mod tests {
                 ..Mux::default()
             }
         }
+    }
+
+    fn fast_open_cfg() -> ferrox_core::tls::TlsConfig {
+        ferrox_core::tls::TlsConfig {
+            sni: Some(ferrox_core::evasion::SniSpoof {
+                fake_sni: "www.speedtest.net".to_owned(),
+                sequence: 0,
+                method: ferrox_core::evasion::SniMethod::FastOpen,
+                fooling: ferrox_core::evasion::DecoyFooling::Auto,
+                ttl: 8,
+                mixed_case: false,
+            }),
+            ..ferrox_core::tls::TlsConfig::default()
+        }
+    }
+
+    fn tcp_pair() -> Connection {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let client =
+            std::net::TcpStream::connect(listener.local_addr().expect("bound")).expect("connects");
+        let (_peer, _) = listener.accept().expect("accepts");
+        Connection::Tcp(client)
+    }
+
+    #[test]
+    fn a_deferred_fast_open_dial_keeps_the_hello_as_it_is() {
+        let cfg = fast_open_cfg();
+        assert!(
+            matches!(
+                arm_sni(&cfg, tcp_pair(), Fast::Deferred),
+                Connection::Tcp(_)
+            ),
+            "a SYN the kernel deferred needs no rewrite"
+        );
+        assert!(
+            matches!(
+                arm_sni(&cfg, tcp_pair(), Fast::Refused),
+                Connection::Masked(_)
+            ),
+            "a refused Fast Open rewrites the first record"
+        );
     }
 
     #[test]
