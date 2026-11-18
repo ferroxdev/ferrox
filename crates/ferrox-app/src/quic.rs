@@ -3801,13 +3801,13 @@ fn datagram_to_with_source(
         },
     };
     let sock = if explicit {
-        bind_datagram_at(at).ok()?
+        armed_lane(crate::sockopt::bind_datagram_at(options, at).ok()?, true)
     } else {
-        bind_datagram_at(at).or_else(|_| bind_datagram(bind)).ok()?
+        match crate::sockopt::bind_datagram_at(options, at) {
+            Ok(sock) => armed_lane(sock, true),
+            Err(_) => armed_lane(crate::sockopt::bind_datagram(options, bind).ok()?, true),
+        }
     };
-    if let Some(options) = options {
-        options.apply_to_udp(&sock, peer).ok()?;
-    }
     let local = sock.local_addr().ok()?;
     Some((sock, local))
 }
@@ -3829,14 +3829,6 @@ fn probe_source(
     }
     probe.connect(peer).ok()?;
     probe.local_addr().ok()
-}
-
-fn bind_datagram_at(at: SocketAddr) -> std::io::Result<UdpSocket> {
-    let flow = crate::proxy::flow_sockopts();
-    Ok(armed_lane(
-        crate::sockopt::bind_datagram_at(flow.as_deref(), at)?,
-        true,
-    ))
 }
 
 /// The in-process resumption blobs: one captured session per edge, so a later dial can offer
@@ -4588,6 +4580,8 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
         Some(proxy) => Some(crate::foxy::associate_udp(proxy)?),
         None => None,
     };
+    let flow = crate::proxy::flow_sockopts();
+    let source = crate::proxy::flow_source().ok()?;
     for peer in peers {
         let wildcard = if peer.is_ipv6() {
             "[::]:0"
@@ -4603,8 +4597,10 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
                 continue;
             };
             (sock, local)
-        } else if let Some(bound) = datagram_to_with_source(peer, None, None) {
+        } else if let Some(bound) = datagram_to_with_source(peer, flow.as_deref(), source) {
             bound
+        } else if source.is_some() {
+            continue;
         } else {
             let Ok(sock) = bind_datagram(wildcard) else {
                 continue;
@@ -4851,8 +4847,8 @@ impl QuicStream {
         let Ok(mut conn) = self.conn.lock() else {
             return Err(std::io::Error::other("quic connection lock poisoned"));
         };
-        // A closed connection cannot progress: fail the write instead of parking it for SEND_WAIT.
-        if conn.is_closed() {
+        // A closed or draining connection cannot progress: fail the write instead of parking it for SEND_WAIT.
+        if conn.is_closed() || conn.is_draining() {
             return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         }
         match conn.stream_send(self.id, buf, false) {
@@ -4860,7 +4856,7 @@ impl QuicStream {
                 flush_egress(&mut conn, &self.sock);
                 Ok(n)
             }
-            Err(quiche::Error::Done) if conn.is_closed() => {
+            Err(quiche::Error::Done) if conn.is_closed() || conn.is_draining() => {
                 Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
             }
             Err(quiche::Error::Done) => Ok(0),
@@ -4881,8 +4877,8 @@ impl QuicStream {
                 let Ok(mut conn) = self.conn.lock() else {
                     return false;
                 };
-                if conn.is_closed() {
-                    Some(true)
+                if conn.is_closed() || conn.is_draining() {
+                    Some(false)
                 } else {
                     match conn.stream_send(self.id, &[], true) {
                         Ok(_) => {
@@ -7602,6 +7598,55 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "the close is answered at once, not after SEND_WAIT"
+        );
+    }
+
+    /// A peer's `CONNECTION_CLOSE` parks the connection in draining before the timer retires it;
+    /// a write must not wait out `SEND_WAIT` for a stream the peer can no longer read.
+    #[test]
+    fn a_write_on_a_draining_connection_fails_before_the_send_wait() {
+        let (mut client, mut server) = lane_pair();
+        server.conn.close(false, 0, b"bye").expect("closes");
+        for _ in 0..4 {
+            pass(
+                &mut server.conn,
+                &server.sock,
+                &mut client.conn,
+                &client.sock,
+                client.addr,
+            );
+            if client.conn.is_draining() {
+                break;
+            }
+        }
+        assert!(
+            client.conn.is_draining(),
+            "the peer close starts the draining timer"
+        );
+        assert!(
+            !client.conn.is_closed(),
+            "draining is not yet the closed state"
+        );
+        let mut stream = QuicStream {
+            conn: std::sync::Arc::new(std::sync::Mutex::new(client.conn)),
+            sock: std::sync::Arc::new(client.sock),
+            id: 0,
+            meter: crate::stats::Meter::default(),
+            peer_fin: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fin_sent: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            prefaced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            activity: std::sync::Arc::new(Activity::new()),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            owner: None,
+        };
+        let started = Instant::now();
+        let error = stream
+            .write(b"x")
+            .expect_err("a draining connection refuses the write");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "draining is answered at once, not after SEND_WAIT"
         );
     }
 

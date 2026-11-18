@@ -4853,12 +4853,12 @@ mod tests {
             b"head",
         );
         crate::proxy::echo_trace("wiw: serving");
-        // Resend the trigger within the same budget so a slow inner handshake does not fail the test.
+        // Resend the trigger only after a read timeout, so a slow inner handshake does not fail the test.
         let deadline = Instant::now() + timeout;
         let mut answer = Vec::with_capacity(9);
         let mut found = [0u8; 9];
+        app.write_all(b"hello")?;
         loop {
-            app.write_all(b"hello")?;
             match app.read(&mut found) {
                 Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
                 Ok(n) => answer.extend_from_slice(&found[..n]),
@@ -4866,7 +4866,16 @@ mod tests {
                     if matches!(
                         error.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
+                    ) =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "no echo before the handshake budget",
+                        ));
+                    }
+                    app.write_all(b"hello")?;
+                }
                 Err(error) => return Err(error),
             }
             if answer.len() >= 9 {

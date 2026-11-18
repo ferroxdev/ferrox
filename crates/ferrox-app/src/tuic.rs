@@ -365,7 +365,7 @@ impl TuicOut {
                     &self.address,
                     self.port,
                     options.as_deref(),
-                    proxy::flow_source(),
+                    proxy::flow_source().ok()?,
                 )?;
                 (quic::Datagram::plain(sock).with_gso(false), peer, local)
             };

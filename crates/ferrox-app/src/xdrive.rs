@@ -1367,6 +1367,34 @@ impl Writer {
         true
     }
 
+    fn failed(&self) -> bool {
+        self.sink.failure().is_some()
+            || self
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .err
+                .is_some()
+    }
+
+    /// Stop a failed writer without waiting for segments the store already refused.
+    fn abort(&self) {
+        if self.ended.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            pending.closed = true;
+            pending.buf.clear();
+            pending
+                .err
+                .get_or_insert_with(|| "the carrier write failed".to_owned());
+        }
+        self.ticker.done.store(true, Ordering::Release);
+        Clock::global().wakeup();
+        self.uploads.shut();
+    }
+
     /// Drain what the stream still holds, wait for every segment to land, then name the end: a peer reads the `.end` at the next sequence and closes its own side.
     fn close(&self) -> io::Result<()> {
         if self.ended.swap(true, Ordering::AcqRel) {
@@ -2004,8 +2032,11 @@ impl SlotWriter {
             .stack_size(WORKER_STACK)
             .spawn(move || writer.upload(seq, chunk))
             .map_err(|error| {
+                let message = format!("slot {seq} failed to start: {error}");
+                self.fail(message.clone());
                 self.release_room();
-                io::Error::other(error.to_string())
+                self.signal_error(seq);
+                carrier_error(message)
             })?;
         Ok(())
     }
@@ -2046,19 +2077,27 @@ impl SlotWriter {
 
     #[allow(clippy::needless_pass_by_value)]
     fn upload(self: Arc<Self>, seq: u64, chunk: Vec<u8>) {
+        if self.done.load(Ordering::Acquire) {
+            self.release_room();
+            return;
+        }
         let mode = if chunk.len() <= SLOT_INLINE_LIMIT {
             SLOT_INLINE
         } else {
             SLOT_MEDIA
         };
-        let result = self
-            .await_drained(seq)
-            .and_then(|()| self.set_frame(seq, mode, &chunk));
+        let result = self.await_drained(seq).and_then(|()| {
+            if self.done.load(Ordering::Acquire) {
+                return Err(carrier_error("the writer aborted"));
+            }
+            self.set_frame(seq, mode, &chunk)
+        });
         match result {
             Ok(()) => {}
+            Err(_) if self.done.load(Ordering::Acquire) => {}
             Err(why) => {
                 self.fail(format!("slot {seq} failed: {why}"));
-                let _ = self.set_frame(seq, SLOT_ERR, &[]);
+                self.signal_error(seq);
             }
         }
         self.release_room();
@@ -2116,6 +2155,9 @@ impl SlotWriter {
         let started = Instant::now();
         let mut wait = SLOT_ACK_RETRY;
         loop {
+            if self.done.load(Ordering::Acquire) {
+                return Err(carrier_error("the writer aborted"));
+            }
             match self.drained(seq) {
                 Ok(true) => return Ok(()),
                 Ok(false) => {}
@@ -2152,6 +2194,52 @@ impl SlotWriter {
         self.wake.ring();
     }
 
+    /// Leave the peer a terminal frame once the slot it names is safe to reuse, without holding up the caller that saw the failure.
+    fn signal_error(self: &Arc<Self>, seq: u64) {
+        let writer = Arc::clone(self);
+        let _ = std::thread::Builder::new()
+            .stack_size(WORKER_STACK)
+            .spawn(move || {
+                let started = Instant::now();
+                while !writer.ended.load(Ordering::Acquire) {
+                    if writer.drained(seq).unwrap_or(false) {
+                        let _ = writer.set_frame(seq, SLOT_ERR, &[]);
+                        return;
+                    }
+                    if started.elapsed() >= SLOT_STALL {
+                        return;
+                    }
+                    std::thread::sleep(SLOT_ACK_RETRY);
+                }
+            });
+    }
+
+    fn failed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .err
+            .is_some()
+    }
+
+    fn abort(self: &Arc<Self>) {
+        self.done.store(true, Ordering::Release);
+        if self.ended.swap(true, Ordering::AcqRel) {
+            self.room.notify_all();
+            return;
+        }
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.closed = true;
+            state.buf.clear();
+            state
+                .err
+                .get_or_insert_with(|| "the carrier write failed".to_owned());
+        }
+        self.room.notify_all();
+        self.wake.ring();
+    }
+
     fn close(self: &Arc<Self>) -> io::Result<()> {
         if self.ended.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -2161,10 +2249,20 @@ impl SlotWriter {
             state.closed = true;
         }
         loop {
-            let empty = {
+            let (done, empty, err) = {
                 let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                state.buf.is_empty()
+                (
+                    self.done.load(Ordering::Acquire),
+                    state.buf.is_empty(),
+                    state.err.clone(),
+                )
             };
+            if let Some(message) = err {
+                return Err(carrier_error(message));
+            }
+            if done {
+                return Err(carrier_error("the writer aborted"));
+            }
             if empty {
                 break;
             }
@@ -2261,6 +2359,13 @@ impl SlotReader {
 
     fn end(&self) {
         self.pump.end();
+    }
+}
+
+impl Reader {
+    fn abort(&self) {
+        self.rd.wake.halt();
+        self.inbox.end(None);
     }
 }
 
@@ -2509,6 +2614,25 @@ impl Conn {
     pub(crate) fn with_meter(mut self, meter: crate::stats::Meter) -> Self {
         self.meter = self.meter.merged(meter);
         self
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        match &self.writer {
+            WriterSide::Wal(writer) => writer.failed(),
+            WriterSide::Slot(writer) => writer.failed(),
+        }
+    }
+
+    /// Interrupt both halves after a failed write: no segment drain and no reader left parked.
+    pub(crate) fn abort(&self) {
+        match &self.writer {
+            WriterSide::Wal(writer) => writer.abort(),
+            WriterSide::Slot(writer) => writer.abort(),
+        }
+        match &self.reader {
+            ReaderSide::Wal(reader) => reader.abort(),
+            ReaderSide::Slot(reader) => reader.end(),
+        }
     }
 
     /// End only the write log, so a relay whose source went quiet lets the peer read its `.end` while our own reader keeps serving the reply.

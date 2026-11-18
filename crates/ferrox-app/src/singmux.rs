@@ -2,8 +2,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use crate::h2;
@@ -83,6 +83,7 @@ const H2_MAX_STREAMS: usize = 256;
 const FLAG_UDP: u16 = 1;
 const FLAG_ADDR: u16 = 2;
 const MAX_STREAMS: usize = 1024;
+const RESET_QUEUE: usize = MAX_STREAMS;
 
 /// One stream's opening request: a TCP destination, or the destination a connected UDP flow
 /// speaks to; `packet_addr` marks the full-cone form where every frame names its own address.
@@ -264,23 +265,38 @@ impl Window {
     }
 
     fn take_up_to(&self, size: usize) -> Option<usize> {
+        self.take_up_to_while(size, None)
+    }
+
+    fn take_up_to_while(&self, size: usize, closed: Option<&AtomicBool>) -> Option<usize> {
         let limit = i64::try_from(size).unwrap_or(i64::MAX);
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        while state.value <= 0 {
-            if state.closed {
+        loop {
+            if state.closed || closed.is_some_and(|closed| closed.load(Ordering::Relaxed)) {
                 return None;
+            }
+            if state.value > 0 {
+                let taken = state.value.min(limit);
+                state.value -= taken;
+                return Some(usize::try_from(taken).unwrap_or(usize::MAX));
             }
             state = match self.wake.wait(state) {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
         }
-        let taken = state.value.min(limit);
-        state.value -= taken;
-        Some(usize::try_from(taken).unwrap_or(usize::MAX))
+    }
+
+    fn notify_waiters(&self) {
+        // Hold the lock across the notification so a waiter cannot miss it between its check and wait.
+        match self.state.lock() {
+            Ok(state) => drop(state),
+            Err(poisoned) => drop(poisoned.into_inner()),
+        }
+        self.wake.notify_all();
     }
 
     fn add(&self, size: i64) {
@@ -351,7 +367,7 @@ impl Queue {
             return Push::Closed;
         }
         // The demux thread is shared: a stream that overruns its queue is reset, never waited on.
-        if !state.messages.is_empty() && state.queued.saturating_add(msg.data.len()) > self.limit {
+        if state.queued.saturating_add(msg.data.len()) > self.limit {
             return Push::Full;
         }
         state.queued += msg.data.len();
@@ -405,6 +421,8 @@ impl Queue {
 struct Sink {
     queue: Arc<Queue>,
     window: Arc<Window>,
+    closed: Arc<AtomicBool>,
+    reset: Arc<AtomicBool>,
     awaiting_status: bool,
     remote_end: bool,
     local_end: bool,
@@ -445,12 +463,16 @@ struct Inner {
     role: Role,
     write: Mutex<Box<dyn Write + Send>>,
     sinks: Mutex<HashMap<u32, Sink>>,
+    resets: Mutex<Option<SyncSender<u32>>>,
+    credits: Mutex<Option<SyncSender<()>>>,
+    pending_credit: AtomicUsize,
     accept_tx: Mutex<Option<Sender<Stream>>>,
     accept_rx: Mutex<Receiver<Stream>>,
     next_id: AtomicU32,
     initial_window: Mutex<i64>,
     connection_window: Window,
     dead: AtomicBool,
+    finished: AtomicBool,
     close: Arc<dyn Fn() + Send + Sync>,
     decoder: Mutex<h2::Decoder>,
     self_ref: OnceLock<Weak<Inner>>,
@@ -470,6 +492,9 @@ impl Inner {
             role,
             write: Mutex::new(write),
             sinks: Mutex::new(HashMap::new()),
+            resets: Mutex::new(None),
+            credits: Mutex::new(None),
+            pending_credit: AtomicUsize::new(0),
             accept_tx: Mutex::new(Some(accept_tx)),
             accept_rx: Mutex::new(accept_rx),
             next_id: AtomicU32::new(if role == Role::Client { 1 } else { 2 }),
@@ -484,6 +509,7 @@ impl Inner {
                 i64::MAX
             }),
             dead: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
             close,
             decoder: Mutex::new(h2::Decoder::default()),
             self_ref: OnceLock::new(),
@@ -505,8 +531,18 @@ impl Inner {
             Ok(write) => write,
             Err(poisoned) => poisoned.into_inner(),
         };
-        write.write_all(bytes)?;
-        write.flush()
+        if self.dead() {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let result = write.write_all(bytes).and_then(|()| write.flush());
+        if result.is_err() {
+            self.dead.store(true, Ordering::Relaxed);
+        }
+        drop(write);
+        if result.is_err() {
+            self.finish();
+        }
+        result
     }
 
     fn write_settings(&self) {
@@ -570,11 +606,15 @@ impl Inner {
             Err(poisoned) => poisoned.into_inner(),
         };
         let window = Arc::new(Window::new(*initial));
+        let closed = Arc::new(AtomicBool::new(false));
+        let reset = Arc::new(AtomicBool::new(false));
         sinks.insert(
             id,
             Sink {
                 queue: Arc::clone(&queue),
                 window: Arc::clone(&window),
+                closed: Arc::clone(&closed),
+                reset: Arc::clone(&reset),
                 awaiting_status: false,
                 remote_end: false,
                 local_end: false,
@@ -588,7 +628,8 @@ impl Inner {
             replies: Some(queue),
             request: Vec::new(),
             request_sent: AtomicBool::new(false),
-            closed: Arc::new(AtomicBool::new(false)),
+            closed,
+            reset,
             window,
             buffer: Mutex::new(ReadState::default()),
             read_done: false,
@@ -644,15 +685,31 @@ impl Inner {
     }
 
     fn write_frame(&self, head: &[u8], data: &[u8]) -> bool {
-        if self.dead() {
-            return false;
-        }
+        self.write_frame_while(head, data, None, None)
+    }
+
+    fn write_frame_while(
+        &self,
+        head: &[u8],
+        data: &[u8],
+        closed: Option<&AtomicBool>,
+        reset: Option<&AtomicBool>,
+    ) -> bool {
         let mut write = match self.write.lock() {
             Ok(write) => write,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if self.dead()
+            || closed.is_some_and(|closed| closed.load(Ordering::Relaxed))
+            || reset.is_some_and(|reset| reset.load(Ordering::Relaxed))
+        {
+            return false;
+        }
         let ok =
             write.write_all(head).is_ok() && write.write_all(data).is_ok() && write.flush().is_ok();
+        if !ok {
+            self.dead.store(true, Ordering::Relaxed);
+        }
         drop(write);
         if !ok {
             self.finish();
@@ -677,31 +734,65 @@ impl Inner {
         self.write_raw(&frame).is_ok()
     }
 
-    fn send_data(&self, id: u32, data: &[u8], end: bool) -> bool {
+    fn send_data(
+        &self,
+        id: u32,
+        data: &[u8],
+        end: bool,
+        closed: &AtomicBool,
+        reset: &AtomicBool,
+    ) -> bool {
         if data.is_empty() && !end {
             return true;
         }
         match self.protocol {
             Protocol::Smux => {
                 let flags = if end { SMUX_FIN } else { SMUX_PSH };
-                self.write_frame(&smux_head(flags, id, data.len()), data)
+                self.write_frame_while(
+                    &smux_head(flags, id, data.len()),
+                    data,
+                    Some(closed),
+                    Some(reset),
+                )
             }
             Protocol::Yamux => {
                 let flags = if end { YAMUX_FIN } else { 0 };
-                self.write_frame(&yamux_head(YAMUX_DATA, flags, id, data.len() as u32), data)
+                self.write_frame_while(
+                    &yamux_head(YAMUX_DATA, flags, id, data.len() as u32),
+                    data,
+                    Some(closed),
+                    Some(reset),
+                )
             }
             Protocol::H2Mux => {
                 let flags = if end { h2::F_END } else { 0 };
-                self.write_frame(&h2::frame_head(data.len(), h2::T_DATA, flags, id), data)
+                self.write_frame_while(
+                    &h2::frame_head(data.len(), h2::T_DATA, flags, id),
+                    data,
+                    Some(closed),
+                    Some(reset),
+                )
             }
         }
     }
 
-    fn send_end(&self, id: u32) -> bool {
+    fn send_end(&self, id: u32, reset: &AtomicBool) -> bool {
         match self.protocol {
-            Protocol::Smux => self.write_frame(&smux_head(SMUX_FIN, id, 0), &[]),
-            Protocol::Yamux => self.write_frame(&yamux_head(YAMUX_WINDOW, YAMUX_FIN, id, 0), &[]),
-            Protocol::H2Mux => self.write_frame(&h2::frame_head(0, h2::T_DATA, h2::F_END, id), &[]),
+            Protocol::Smux => {
+                self.write_frame_while(&smux_head(SMUX_FIN, id, 0), &[], None, Some(reset))
+            }
+            Protocol::Yamux => self.write_frame_while(
+                &yamux_head(YAMUX_WINDOW, YAMUX_FIN, id, 0),
+                &[],
+                None,
+                Some(reset),
+            ),
+            Protocol::H2Mux => self.write_frame_while(
+                &h2::frame_head(0, h2::T_DATA, h2::F_END, id),
+                &[],
+                None,
+                Some(reset),
+            ),
         }
     }
 
@@ -715,22 +806,133 @@ impl Inner {
         }
     }
 
+    /// The demux cannot wait on the carrier: resets drain on a thread of their own.
+    fn defer_reset(&self, id: u32, reset: &AtomicBool) {
+        if reset.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let mut resets = match self.resets.lock() {
+            Ok(resets) => resets,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.dead() {
+            return;
+        }
+        if resets.is_some() {
+            let failed = resets
+                .as_ref()
+                .is_some_and(|sender| sender.try_send(id).is_err());
+            if failed {
+                drop(resets);
+                self.finish();
+            }
+            return;
+        }
+        let (sender, pending) = sync_channel(RESET_QUEUE);
+        let inner = Arc::downgrade(&self.clone_handle());
+        let spawned = std::thread::Builder::new()
+            .name("singmux-reset".to_owned())
+            .spawn(move || {
+                while let Ok(id) = pending.recv() {
+                    let Some(inner) = inner.upgrade() else {
+                        break;
+                    };
+                    inner.send_reset(id);
+                }
+            });
+        if spawned.is_err() {
+            drop(resets);
+            self.finish();
+            return;
+        }
+        *resets = Some(sender.clone());
+        drop(resets);
+        let _ = sender.try_send(id);
+    }
+
+    fn defer_credit(&self, credit: usize) {
+        if self.protocol != Protocol::H2Mux || credit == 0 {
+            return;
+        }
+        self.pending_credit.fetch_add(credit, Ordering::Relaxed);
+        let mut credits = match self.credits.lock() {
+            Ok(credits) => credits,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.dead() {
+            return;
+        }
+        if credits.is_none() {
+            let (sender, wake) = sync_channel(1);
+            let inner = Arc::downgrade(&self.clone_handle());
+            let spawned = std::thread::Builder::new()
+                .name("singmux-credit".to_owned())
+                .spawn(move || {
+                    while wake.recv().is_ok() {
+                        let Some(inner) = inner.upgrade() else {
+                            break;
+                        };
+                        let credit = inner.pending_credit.swap(0, Ordering::Relaxed);
+                        inner.send_connection_credit(credit);
+                    }
+                });
+            if spawned.is_err() {
+                drop(credits);
+                self.finish();
+                return;
+            }
+            *credits = Some(sender);
+        }
+        let disconnected = credits.as_ref().is_some_and(|wake| {
+            matches!(
+                wake.try_send(()),
+                Err(std::sync::mpsc::TrySendError::Disconnected(()))
+            )
+        });
+        if disconnected {
+            drop(credits);
+            self.finish();
+        }
+    }
+
+    fn send_connection_credit(&self, credit: usize) {
+        let mut left = credit;
+        while left > 0 && self.protocol == Protocol::H2Mux {
+            let amount = left.min(0x7fff_ffff);
+            let mut frame = [0u8; 13];
+            frame[..9].copy_from_slice(&h2::frame_head(4, h2::T_WINDOW, 0, 0));
+            frame[9..].copy_from_slice(&u32::try_from(amount).unwrap().to_be_bytes());
+            if self.write_raw(&frame).is_err() {
+                self.finish();
+                return;
+            }
+            left -= amount;
+        }
+    }
+
     fn release(&self, id: u32) {
         let sink = match self.sinks.lock() {
             Ok(mut sinks) => sinks.remove(&id),
             Err(poisoned) => poisoned.into_inner().remove(&id),
         };
         if let Some(sink) = sink {
+            sink.closed.store(true, Ordering::Relaxed);
             sink.window.close();
             sink.queue.close();
+            self.connection_window.notify_waiters();
         }
     }
 
     fn reap(&self, id: u32) {
-        let _ = match self.sinks.lock() {
+        let sink = match self.sinks.lock() {
             Ok(mut sinks) => sinks.remove(&id),
             Err(poisoned) => poisoned.into_inner().remove(&id),
         };
+        if let Some(sink) = sink {
+            sink.closed.store(true, Ordering::Relaxed);
+            sink.window.close();
+            self.connection_window.notify_waiters();
+        }
     }
 
     fn end_remote(&self, id: u32) {
@@ -770,19 +972,21 @@ impl Inner {
     }
 
     fn deliver_credit(&self, id: u32, data: &[u8], end: bool, credit: usize) {
-        let (queue, awaiting_status) = {
+        let (queue, reset_stream, awaiting_status) = {
             let mut sinks = match self.sinks.lock() {
                 Ok(sinks) => sinks,
                 Err(poisoned) => poisoned.into_inner(),
             };
             let Some(sink) = sinks.get_mut(&id) else {
+                drop(sinks);
+                self.defer_credit(credit);
                 return;
             };
             let awaiting = sink.awaiting_status;
             if awaiting && (!data.is_empty() || end) {
                 sink.awaiting_status = false;
             }
-            (Arc::clone(&sink.queue), awaiting)
+            (Arc::clone(&sink.queue), Arc::clone(&sink.reset), awaiting)
         };
         let mut data = data;
         let mut credit = if self.protocol == Protocol::Smux {
@@ -798,6 +1002,7 @@ impl Inner {
                     data = rest;
                 }
                 Some(_) => {
+                    self.defer_credit(credit);
                     self.release(id);
                     return;
                 }
@@ -819,20 +1024,22 @@ impl Inner {
                     self.end_remote(id);
                 }
             }
-            Push::Full => {
-                self.send_reset(id);
+            Push::Full | Push::Closed => {
+                self.defer_credit(credit);
+                self.defer_reset(id, &reset_stream);
                 self.release(id);
             }
-            Push::Closed => self.reap(id),
         }
     }
 
-    fn take_window(&self, window: &Window, size: usize) -> Option<usize> {
+    fn take_window(&self, window: &Window, size: usize, closed: &AtomicBool) -> Option<usize> {
         match self.protocol {
             Protocol::Smux => Some(size),
             Protocol::Yamux => window.take_up_to(size),
             Protocol::H2Mux => {
-                let connection = self.connection_window.take_up_to(size)?;
+                let connection = self
+                    .connection_window
+                    .take_up_to_while(size, Some(closed))?;
                 let Some(stream) = window.take_up_to(connection) else {
                     self.connection_window
                         .add(i64::try_from(connection).unwrap_or(i64::MAX));
@@ -883,8 +1090,17 @@ impl Inner {
     }
 
     fn finish(&self) {
-        if self.dead.swap(true, Ordering::Relaxed) {
+        self.dead.store(true, Ordering::Relaxed);
+        if self.finished.swap(true, Ordering::Relaxed) {
             return;
+        }
+        match self.resets.lock() {
+            Ok(mut resets) => drop(resets.take()),
+            Err(poisoned) => drop(poisoned.into_inner().take()),
+        }
+        match self.credits.lock() {
+            Ok(mut credits) => drop(credits.take()),
+            Err(poisoned) => drop(poisoned.into_inner().take()),
         }
         self.connection_window.close();
         match self.accept_tx.lock() {
@@ -896,6 +1112,7 @@ impl Inner {
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         };
         for (_, sink) in sinks {
+            sink.closed.store(true, Ordering::Relaxed);
             sink.window.close();
             sink.queue.close();
         }
@@ -1223,6 +1440,7 @@ pub(crate) struct Stream {
     request: Vec<u8>,
     request_sent: AtomicBool,
     closed: Arc<AtomicBool>,
+    reset: Arc<AtomicBool>,
     window: Arc<Window>,
     buffer: Mutex<ReadState>,
     read_done: bool,
@@ -1250,9 +1468,13 @@ impl Stream {
                 Protocol::Smux => left.min(SMUX_DATA_MAX),
                 Protocol::Yamux | Protocol::H2Mux => left.min(H2_DATA_MAX),
             };
-            let Some(taken) = self.inner.take_window(&self.window, chunk) else {
+            let Some(taken) = self.inner.take_window(&self.window, chunk, &self.closed) else {
                 return false;
             };
+            if self.closed.load(Ordering::Relaxed) {
+                self.inner.refund_window(&self.window, taken);
+                return false;
+            }
             if !self.write_chunk(&data[offset..offset + taken]) {
                 self.inner.refund_window(&self.window, taken);
                 return false;
@@ -1263,7 +1485,8 @@ impl Stream {
     }
 
     fn write_chunk(&self, data: &[u8]) -> bool {
-        self.inner.send_data(self.id, data, false)
+        self.inner
+            .send_data(self.id, data, false, &self.closed, &self.reset)
     }
 
     pub(crate) fn take_replies(&mut self) -> Option<Replies> {
@@ -1279,20 +1502,24 @@ impl Stream {
             inner: Arc::clone(&self.inner),
             id: self.id,
             closed: Arc::clone(&self.closed),
+            reset: Arc::clone(&self.reset),
             window: Arc::clone(&self.window),
         }
     }
 
     pub(crate) fn finish(&self) {
-        if !self.closed.swap(true, Ordering::Relaxed) {
-            self.inner.send_end(self.id);
-        }
+        let first = !self.closed.swap(true, Ordering::Relaxed);
         self.window.close();
+        self.inner.connection_window.notify_waiters();
+        if first {
+            self.inner.send_end(self.id, &self.reset);
+        }
         self.inner.end_local(self.id);
     }
 
     pub(crate) fn reset(&self) {
-        if !self.closed.swap(true, Ordering::Relaxed) {
+        self.closed.store(true, Ordering::Relaxed);
+        if !self.reset.swap(true, Ordering::Relaxed) {
             self.inner.send_reset(self.id);
         }
         self.window.close();
@@ -1370,16 +1597,27 @@ pub(crate) struct StreamWriter {
     inner: Arc<Inner>,
     id: u32,
     closed: Arc<AtomicBool>,
+    reset: Arc<AtomicBool>,
     window: Arc<Window>,
 }
 
 impl StreamWriter {
     fn finish(&self) {
-        if !self.closed.swap(true, Ordering::Relaxed) {
-            self.inner.send_end(self.id);
-        }
+        let first = !self.closed.swap(true, Ordering::Relaxed);
         self.window.close();
+        self.inner.connection_window.notify_waiters();
+        if first {
+            self.inner.send_end(self.id, &self.reset);
+        }
         self.inner.end_local(self.id);
+    }
+}
+
+fn short_write(offset: usize) -> io::Result<usize> {
+    if offset > 0 {
+        Ok(offset)
+    } else {
+        Err(io::ErrorKind::BrokenPipe.into())
     }
 }
 
@@ -1395,15 +1633,22 @@ impl Write for StreamWriter {
                 Protocol::Smux => left.min(SMUX_DATA_MAX),
                 Protocol::Yamux | Protocol::H2Mux => left.min(H2_DATA_MAX),
             };
-            let Some(taken) = self.inner.take_window(&self.window, chunk) else {
-                return Err(io::ErrorKind::BrokenPipe.into());
+            let Some(taken) = self.inner.take_window(&self.window, chunk, &self.closed) else {
+                return short_write(offset);
             };
-            if !self
-                .inner
-                .send_data(self.id, &data[offset..offset + taken], false)
-            {
+            if self.closed.load(Ordering::Relaxed) {
                 self.inner.refund_window(&self.window, taken);
-                return Err(io::ErrorKind::BrokenPipe.into());
+                return short_write(offset);
+            }
+            if !self.inner.send_data(
+                self.id,
+                &data[offset..offset + taken],
+                false,
+                &self.closed,
+                &self.reset,
+            ) {
+                self.inner.refund_window(&self.window, taken);
+                return short_write(offset);
             }
             offset += taken;
         }
@@ -1953,12 +2198,209 @@ mod tests {
         drop(server);
     }
 
+    struct PartialFailWriter {
+        gate: Arc<(Mutex<(bool, bool)>, Condvar)>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Write for PartialFailWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let (lock, wake) = &*self.gate;
+                let mut state = lock.lock().expect("gate");
+                state.0 = true;
+                wake.notify_all();
+                while !state.1 {
+                    state = wake.wait(state).expect("gate");
+                }
+                return Ok(1.min(buf.len()));
+            }
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_carrier_write_stops_the_next_writer() {
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (session, held) = held_h2_session(Box::new(std::io::sink()));
+        let stream = session.attach(1);
+        assert_eq!(
+            session.take_window(&stream.window, 65_535, &stream.closed),
+            Some(65_535),
+            "the test starts with an exhausted connection window"
+        );
+        let (started, waiting) = channel();
+        let (released, done) = channel();
+        let waiter = {
+            let session = Arc::clone(&session);
+            let window = Arc::clone(&stream.window);
+            let closed = Arc::clone(&stream.closed);
+            std::thread::spawn(move || {
+                started.send(()).expect("started");
+                released
+                    .send(session.take_window(&window, 1, &closed).is_none())
+                    .expect("released");
+            })
+        };
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("waiter started");
+        assert!(
+            done.recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "a credit waiter blocks while the connection window is exhausted"
+        );
+        *session.write.lock().expect("write") = Box::new(PartialFailWriter {
+            gate: Arc::clone(&gate),
+            calls: Arc::clone(&calls),
+        });
+        let first = {
+            let session = Arc::clone(&session);
+            std::thread::spawn(move || session.write_frame(&[1, 2, 3], &[4]))
+        };
+        {
+            let (lock, wake) = &*gate;
+            let mut state = lock.lock().expect("gate");
+            while !state.0 {
+                state = wake.wait(state).expect("gate");
+            }
+        }
+        let second = {
+            let session = Arc::clone(&session);
+            std::thread::spawn(move || session.write_frame(&[5], &[]))
+        };
+        {
+            let (lock, wake) = &*gate;
+            let mut state = lock.lock().expect("gate");
+            state.1 = true;
+            wake.notify_all();
+        }
+        assert!(
+            !first.join().expect("first"),
+            "the partially written frame reports failure"
+        );
+        assert_eq!(
+            done.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(true),
+            "finish releases a credit waiter after the carrier fails"
+        );
+        waiter.join().expect("waiter");
+        assert!(
+            !second.join().expect("second"),
+            "a writer waiting on the failed frame must not reach the carrier"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "only the failing head is written, and the next writer sees the closed session"
+        );
+        drop(held);
+    }
+
+    struct StoppingReader {
+        wake: Receiver<()>,
+        done: Sender<()>,
+    }
+
+    impl Read for StoppingReader {
+        fn read(&mut self, _out: &mut [u8]) -> io::Result<usize> {
+            let _ = self.wake.recv();
+            let _ = self.done.send(());
+            Ok(0)
+        }
+    }
+
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _data: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_carrier_write_wakes_the_reader() {
+        let (wake, stopped) = channel();
+        let (done, reader_done) = channel();
+        let session = Inner::start(
+            Protocol::Smux,
+            Role::Client,
+            Box::new(StoppingReader {
+                wake: stopped,
+                done,
+            }),
+            Box::new(BrokenWriter),
+            Arc::new(move || {
+                let _ = wake.send(());
+            }),
+        )
+        .expect("session");
+        assert!(!session.write_frame(&[1], &[]), "the write reports failure");
+        assert_eq!(
+            reader_done.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "the reader exits without a manual release"
+        );
+    }
+
     #[test]
     fn a_window_hands_back_only_the_credit_it_has() {
         let window = Window::new(1_024);
         assert_eq!(window.take_up_to(16_384), Some(1_024));
         window.close();
         assert_eq!(window.take_up_to(1), None);
+    }
+
+    #[test]
+    fn a_closed_window_refuses_remaining_credit() {
+        let window = Window::new(1_024);
+        window.close();
+        assert_eq!(
+            window.take_up_to(1),
+            None,
+            "a closed window must not hand out credit a writer could still spend"
+        );
+    }
+
+    #[test]
+    fn an_open_stream_keeps_connection_credit() {
+        let window = Window::new(2);
+        let closed = AtomicBool::new(false);
+        assert_eq!(
+            window.take_up_to_while(1, Some(&closed)),
+            Some(1),
+            "the connection window must hand out credit while the stream is open"
+        );
+        closed.store(true, Ordering::Relaxed);
+        assert_eq!(
+            window.take_up_to_while(1, Some(&closed)),
+            None,
+            "a closed stream must stop taking connection credit"
+        );
+    }
+
+    #[test]
+    fn an_oversized_first_message_is_refused() {
+        let queue = Queue::new(4);
+        assert_eq!(
+            queue.push(Msg {
+                data: b"12345".to_vec(),
+                end: false,
+                credit: 0,
+            }),
+            Push::Full,
+            "the queue bound holds even when the oversized frame is the only one"
+        );
+        assert!(queue.try_pop().is_none());
     }
 
     #[test]
@@ -1995,6 +2437,114 @@ mod tests {
             }),
             Push::Closed
         );
+    }
+
+    struct HeldReader(Receiver<()>);
+
+    impl Read for HeldReader {
+        fn read(&mut self, _out: &mut [u8]) -> io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+
+    struct GateWriter {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Write for GateWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            let (lock, wake) = &*self.gate;
+            let mut open = lock.lock().expect("gate");
+            while !*open {
+                open = wake.wait(open).expect("gate");
+            }
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn held_session(write: Box<dyn Write + Send>) -> (Arc<Inner>, Sender<()>) {
+        let (held, reader) = channel();
+        let session = Inner::start(
+            Protocol::Smux,
+            Role::Client,
+            Box::new(HeldReader(reader)),
+            write,
+            Arc::new(|| {}),
+        )
+        .expect("session");
+        (session, held)
+    }
+
+    fn held_h2_session(write: Box<dyn Write + Send>) -> (Arc<Inner>, Sender<()>) {
+        let (held, reader) = channel();
+        let session = Inner::start(
+            Protocol::H2Mux,
+            Role::Client,
+            Box::new(HeldReader(reader)),
+            write,
+            Arc::new(|| {}),
+        )
+        .expect("session");
+        (session, held)
+    }
+
+    #[test]
+    fn an_overfull_stream_resets_without_waiting_for_the_carrier() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (session, held) = held_session(Box::new(GateWriter {
+            gate: Arc::clone(&gate),
+        }));
+        let stream = session.attach(1);
+        let mut writer = stream.writer();
+        let deliver = Arc::clone(&session);
+        let (done, waited) = channel();
+        let worker = std::thread::spawn(move || {
+            deliver.deliver_credit(1, &vec![0u8; 64 * 1024], false, 0);
+            deliver.deliver_credit(1, b"x", false, 0);
+            let _ = done.send(());
+        });
+        assert_eq!(
+            waited.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "the demux returned before the carrier accepted the reset"
+        );
+        {
+            let (lock, wake) = &*gate;
+            *lock.lock().expect("gate") = true;
+            wake.notify_all();
+        }
+        worker.join().expect("worker");
+        assert!(
+            writer.write(b"x").is_err(),
+            "the released stream refuses a retained writer"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn data_after_a_remote_end_releases_the_waiting_writer() {
+        let (session, held) = held_session(Box::new(std::io::sink()));
+        let stream = session.attach(1);
+        let mut writer = stream.writer();
+        session.deliver(1, b"", true);
+        session.deliver(1, b"late", false);
+        assert!(
+            writer.write(b"x").is_err(),
+            "a frame after the remote end must not leave a writer free to send"
+        );
+        assert!(
+            session
+                .sinks
+                .lock()
+                .is_ok_and(|sinks| !sinks.contains_key(&1)),
+            "the overflowed stream leaves the carrier's table"
+        );
+        drop(held);
     }
 
     #[test]

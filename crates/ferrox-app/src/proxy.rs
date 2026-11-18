@@ -1352,10 +1352,8 @@ pub(crate) fn flow_sockopts() -> Option<Arc<crate::sockopt::SocketOptions>> {
 }
 
 /// The source the flow on this thread leaves from, for a carrier that binds its own datagram socket.
-pub(crate) fn flow_source() -> Option<IpAddr> {
+pub(crate) fn flow_source() -> std::io::Result<Option<IpAddr>> {
     resolve_source(SEND_THROUGH.with(std::cell::Cell::get))
-        .ok()
-        .flatten()
 }
 
 /// The options one flow's dial carries, cleared on drop so a pooled lane thread's next flow starts on the bare socket.
@@ -12487,7 +12485,9 @@ pub(crate) unsafe fn read_into_tail_room(
 pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
-        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
     ) || ferrox_core::tls::TlsError::is_timeout(error)
 }
 
@@ -14304,7 +14304,7 @@ fn kcp_dial_session(
         let (socket, stop) = dial_udp_through_proxy(server, tag, options)?;
         return ferrox_core::kcp::dial_with(socket, server, config.clone(), conv, stop).ok();
     }
-    let source = flow_source();
+    let source = flow_source().ok()?;
     if source.is_none() && options.is_none() {
         return ferrox_core::kcp::dial(server, config.clone(), conv).ok();
     }
@@ -14753,7 +14753,9 @@ fn xdrive_relay_until(app: &Connection, mut down: crate::xdrive::Conn, response_
 fn xdrive_close(session: &crate::xdrive::Conn) -> Arc<dyn Fn() + Send + Sync> {
     let closer = session.clone();
     Arc::new(move || {
-        let _ = closer.end_write();
+        if closer.failed() || closer.end_write().is_err() {
+            closer.abort();
+        }
     })
 }
 
@@ -42951,6 +42953,18 @@ mod tests {
             ),
             "a refused Fast Open rewrites the first record"
         );
+    }
+
+    #[test]
+    fn a_windows_receive_timeout_counts_as_a_timeout() {
+        let timeout = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert!(
+            is_timeout(&timeout),
+            "Windows reports SO_RCVTIMEO as TimedOut, not WouldBlock"
+        );
+        assert!(!is_timeout(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        )));
     }
 
     #[test]
