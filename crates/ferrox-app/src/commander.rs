@@ -1662,7 +1662,7 @@ fn absorb_headers(
             return Err(h2::E_PROTOCOL);
         }
         decoder
-            .decode(block, &mut |name, _| {
+            .decode(block, &mut |name, value| {
                 invalid |= trailers && !trailer_field(name, value);
             })
             .ok_or(h2::E_COMPRESSION)?;
@@ -1675,7 +1675,7 @@ fn absorb_headers(
     held.extend_from_slice(block);
     if end {
         decoder
-            .decode(&held, &mut |name, _| {
+            .decode(&held, &mut |name, value| {
                 invalid |= trailers && !trailer_field(name, value);
             })
             .ok_or(h2::E_COMPRESSION)?;
