@@ -234,7 +234,7 @@ impl Fragment {
                     self.write_hello(raw, p, record_len)
                 };
             }
-            Ok(self.write_past_decoys(raw, p)?)
+            return self.write_past_decoys(raw, p);
         }
         if self.packets_from != 0
             && (self.count < self.packets_from || self.count > self.packets_to)
