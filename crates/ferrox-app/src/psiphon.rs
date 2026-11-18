@@ -8008,7 +8008,12 @@ fn runtime_protocol_entries(server: Server, protocols: &[String], fronted: bool)
     let named_meek = protocols.iter().any(|protocol| is_meek_protocol(protocol));
     // Try the siblings startup can select, not just the base shape and the CDN carriers.
     let mut candidates = vec![server.clone()];
-    candidates.extend(ssh_variant(&server));
+    if protocols
+        .iter()
+        .any(|protocol| matches!(protocol.as_str(), "SSH" | "UNFRONTED-SSH"))
+    {
+        candidates.extend(ssh_variant(&server));
+    }
     candidates.extend(tls_variant(&server));
     candidates.extend(cdn_variants(&server));
     candidates
@@ -16077,6 +16082,26 @@ mod tests {
             runtime_entry(foreign, &settings, false).is_some(),
             "the startup fallback keeps the foreign entry when the pool has no regional one"
         );
+    }
+
+    #[test]
+    fn an_inproxy_ssh_name_does_not_build_a_direct_ssh_sibling() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"LimitTunnelProtocols":["INPROXY-WEBRTC-SSH","TLS-OSSH"]}"#)
+                .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.port = 22;
+        server.ssh_port = Some(22);
+        server.tls_port = Some(8443);
+        server.tls_obfuscation_key = Some("tls".to_owned());
+        let selected = runtime_entry(server, &settings, true).expect("the TLS sibling");
+        assert!(
+            selected.tls,
+            "the in-proxy SSH name does not authorize a direct SSH sibling"
+        );
+        assert_eq!(selected.port, 8443);
     }
 
     #[test]

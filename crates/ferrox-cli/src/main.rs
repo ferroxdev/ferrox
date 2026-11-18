@@ -823,8 +823,18 @@ fn supervise(options: &Options, paths: &Paths) -> i32 {
         std::thread::sleep(Duration::from_secs(1));
     }
     if !lane::alive(watched) || stop.load(Ordering::SeqCst) {
-        // The lifecycle lock keeps a replacement lane from arming between the pid check and the clear.
-        if let Ok(_lifecycle) = lane::lock(paths) {
+        // Retry the lifecycle lock a status read may hold, then re-check the pid before clearing.
+        let mut lifecycle = None;
+        for _ in 0..20 {
+            match lane::lock(paths) {
+                Ok(lock) => {
+                    lifecycle = Some(lock);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        if let Some(_lifecycle) = lifecycle {
             let current = lane::pid(paths);
             if current.is_none() || current == Some(watched) {
                 if let Err(error) = proxy::clear(paths) {

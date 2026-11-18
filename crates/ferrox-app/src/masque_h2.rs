@@ -2486,6 +2486,74 @@ mod tests {
         assert!(!wire.closed);
     }
 
+    /// A capsule split by partial credit leaves one whole DATA frame per write, and the suffix follows.
+    #[test]
+    fn a_partially_credited_capsule_leaves_one_write_per_frame() {
+        let capsule = [0, 2, 0, 42];
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.request = Some(1);
+        session.send_window = 0;
+        session.connection_window = 0;
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut wire = bare_client().wire;
+        wire.stream = Box::new(Recorder {
+            out: Arc::clone(&out),
+            writes: Arc::clone(&writes),
+        });
+        wire.deadline.arm(Instant::now() + Duration::from_secs(1));
+        session.capsule(&mut wire, &capsule);
+        assert_eq!(
+            session.queued.len(),
+            1,
+            "a closed window queues the capsule"
+        );
+        let one = 1u32.to_be_bytes();
+        session.on(&mut wire, h2::T_WINDOW, 0, 0, &one);
+        session.on(&mut wire, h2::T_WINDOW, 0, 1, &one);
+        session.flush(&mut wire);
+        assert_eq!(
+            writes.load(Ordering::Relaxed),
+            1,
+            "one byte of credit leaves as one whole frame, not a head and a body"
+        );
+        assert_eq!(session.queued_at, 1, "the suffix stays queued");
+        let rest = 3u32.to_be_bytes();
+        session.on(&mut wire, h2::T_WINDOW, 0, 0, &rest);
+        session.on(&mut wire, h2::T_WINDOW, 0, 1, &rest);
+        session.flush(&mut wire);
+        assert_eq!(
+            writes.load(Ordering::Relaxed),
+            2,
+            "the suffix is a second frame"
+        );
+        assert!(session.queued.is_empty());
+        let bytes = out.lock().expect("a recorder");
+        let mut at = 0;
+        let mut frames = 0;
+        let mut body = Vec::new();
+        while at < bytes.len() {
+            let head = &bytes[at..at + FRAME_HEAD];
+            let length =
+                usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
+            assert_eq!(head[3], h2::T_DATA);
+            assert_eq!(
+                u32::from_be_bytes(head[5..9].try_into().expect("an id")) & 0x7fff_ffff,
+                1
+            );
+            body.extend_from_slice(&bytes[at + FRAME_HEAD..at + FRAME_HEAD + length]);
+            at += FRAME_HEAD + length;
+            frames += 1;
+        }
+        assert_eq!(
+            frames,
+            writes.load(Ordering::Relaxed),
+            "one frame per write"
+        );
+        assert_eq!(body, capsule, "the frames reassemble the capsule");
+        assert_eq!(at, bytes.len());
+    }
+
     /// A full queue stops the pull without consuming the next tunnel or reply packet, and the session survives it.
     #[test]
     fn an_overflow_stops_draining_the_packet_channels() {
