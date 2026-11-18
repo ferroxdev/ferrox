@@ -642,6 +642,10 @@ impl<R: Read> GrpcReader<R> {
 
     /// The same resume for the frames that are not a body: the scratch holds what arrived.
     fn fill_frame(&mut self, len: usize, filled: &mut usize) -> std::io::Result<bool> {
+        if self.frame.len() > len {
+            // A smaller control frame than the last one reuses its scratch: shrink before the room is grown, never after.
+            self.frame.truncate(len);
+        }
         // SAFETY: every byte below the watermark is initialised, and each read fills the room past it before `filled` counts it.
         unsafe { ferrox_core::read::init_room(&mut self.frame, &mut self.frame_init, len) };
         while *filled < len {
