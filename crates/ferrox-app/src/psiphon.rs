@@ -7079,6 +7079,7 @@ pub(crate) fn broker_offer(
         let offer_settings = crate::psiphon_broker::OfferSettings {
             secret: offer_secret,
             traffic_shaping: shaping,
+            use_media_streams: webrtc.is_some() && media_secret.is_some(),
         };
         match client.client_offer(
             destination,

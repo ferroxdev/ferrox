@@ -902,7 +902,11 @@ impl<T: Read> Read for LightStream<T> {
             let at = self.wire_at;
             if self.wire.len() - at < 2 {
                 if !fill(&mut self.inner, &mut self.wire)? {
-                    return Ok(0);
+                    return if at == self.wire.len() {
+                        Ok(0)
+                    } else {
+                        Err(truncated_frame())
+                    };
                 }
                 continue;
             }
@@ -914,7 +918,7 @@ impl<T: Read> Read for LightStream<T> {
             }
             if self.wire.len() - at < 4 {
                 if !fill(&mut self.inner, &mut self.wire)? {
-                    return Ok(0);
+                    return Err(truncated_frame());
                 }
                 continue;
             }
@@ -928,7 +932,7 @@ impl<T: Read> Read for LightStream<T> {
             let frame = 4 + usize::from(padding) + usize::from(payload);
             if self.wire.len() - at < frame {
                 if !fill(&mut self.inner, &mut self.wire)? {
-                    return Ok(0);
+                    return Err(truncated_frame());
                 }
                 continue;
             }
@@ -959,6 +963,14 @@ impl<T> LightStream<T> {
         self.wire.truncate(live);
         self.wire_at = 0;
     }
+}
+
+/// A frame that began but never finished is a truncated stream, not EOF.
+fn truncated_frame() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "psiphon light: truncated frame",
+    )
 }
 
 /// Read one frame into `wire`, returning whether more frames remain.

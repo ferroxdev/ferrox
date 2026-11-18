@@ -1281,14 +1281,13 @@ impl ScanSpec {
         skipped: &HashSet<String>,
         shuffle_key: &str,
     ) -> Option<(ScanCandidate, u64)> {
-        if self.count == 0 || candidate_number >= self.count {
+        if self.count == 0 {
             return None;
         }
-        let remaining = self.count - candidate_number;
         let probe_limit = u64::try_from(skipped.len())
             .unwrap_or(u64::MAX)
             .saturating_add(1)
-            .min(remaining)
+            .min(self.count)
             .max(1);
         let mut fallback = None;
         for probe in 0..probe_limit {
@@ -1343,8 +1342,13 @@ fn parse_scan_range(token: &str) -> Result<CdnRange, String> {
         return Ok(CdnRange { first, last });
     }
     let address = token
-        .parse::<Ipv4Addr>()
-        .map_err(|_| format!("psiphon: invalid fronted meek CDN scan IPv4 address: {token:?}"))?;
+        .parse::<IpAddr>()
+        .ok()
+        .and_then(|address| match address {
+            IpAddr::V4(address) => Some(address),
+            IpAddr::V6(address) => address.to_ipv4_mapped(),
+        })
+        .ok_or_else(|| format!("psiphon: invalid fronted meek CDN scan IPv4 address: {token:?}"))?;
     let address = u32::from(address);
     Ok(CdnRange {
         first: address,
@@ -1782,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_selection_does_not_wrap_past_the_last_candidate() {
+    fn scan_selection_wraps_past_the_last_candidate() {
         let spec = super::ScanSpec::from_config(
             &["192.0.2.9".to_owned()],
             &["a.example".to_owned(), "b.example".to_owned()],
@@ -1793,11 +1797,11 @@ mod tests {
             .select(last_number, &std::collections::HashSet::new(), "seed")
             .expect("candidate");
         let skipped = std::collections::HashSet::from([last.key()]);
-        let (fallback, number) = spec
+        let (next, number) = spec
             .select_probe(last_number, &skipped, "seed")
-            .expect("fallback");
-        assert_eq!(fallback, last);
-        assert_eq!(number, spec.candidate_count());
+            .expect("next");
+        assert_ne!(next, last);
+        assert_eq!(number, spec.candidate_count() + 1);
     }
 
     #[test]
