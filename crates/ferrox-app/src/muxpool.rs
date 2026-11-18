@@ -86,23 +86,16 @@ pub(crate) struct UdpFlow {
 impl UdpFlow {
     pub(crate) fn send(&self, target: &mux::Target<'_>, data: &[u8]) -> bool {
         if self.ended.load(std::sync::atomic::Ordering::Relaxed) {
-            crate::proxy::echo_trace("muxpool udp flow ended before keep");
             return false;
         }
-        let sent = self.carrier.frame(
+        self.carrier.frame(
             self.id,
             mux::Status::Keep,
             mux::DATA,
             Some(*target),
             None,
             data,
-        );
-        crate::proxy::echo_trace(&format!(
-            "muxpool udp flow keep id {} len {} sent {sent}",
-            self.id,
-            data.len()
-        ));
-        sent
+        )
     }
 
     pub(crate) fn close(self) {
@@ -309,9 +302,6 @@ impl Carrier {
         let written = writer.frame(id, status, options, target, global_id, data);
         drop(writer);
         if !written {
-            crate::proxy::echo_trace(&format!(
-                "muxpool carrier write failed id {id} status {status:?}"
-            ));
             self.retire();
         }
         written
@@ -430,14 +420,12 @@ impl Carrier {
                 crate::proxy::read_into_tail_room(&mut read, &mut buf, &mut buf_init, READ_ROOM)
             } {
                 Ok(0) => {
-                    crate::proxy::echo_trace("muxpool demux eof");
                     self.retire();
                     return;
                 }
                 Ok(_) => {}
                 Err(error) if crate::proxy::is_timeout(&error) => {}
-                Err(error) => {
-                    crate::proxy::echo_trace(&format!("muxpool demux error {error:?}"));
+                Err(_) => {
                     self.retire();
                     return;
                 }
@@ -452,10 +440,6 @@ impl Carrier {
             .ok()
             .and_then(|table| table.sinks.get(&frame.id).cloned());
         let Some(sink) = sink else {
-            crate::proxy::echo_trace(&format!(
-                "muxpool demux no sink id {} status {:?}",
-                frame.id, frame.status
-            ));
             return;
         };
         let target = frame.target.as_ref().and_then(sockaddr);
