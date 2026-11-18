@@ -1799,7 +1799,7 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
                     }
                 }
                 Err(_) if round == 0 => {
-                    let plain = sockopts.map(crate::sockopt::SocketOptions::without_fast_open);
+                    let plain = sockopts.map(|options| options.without_fast_open());
                     let left = budget.saturating_sub(started.elapsed());
                     match dial_from(target, source, plain.as_ref(), false, left) {
                         Ok((stream, _)) => {
