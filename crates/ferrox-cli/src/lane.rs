@@ -398,7 +398,7 @@ impl Listener {
                 let _ = std::thread::spawn(move || {
                     let addresses = (host.as_str(), port)
                         .to_socket_addrs()
-                        .map(std::iter::Iterator::collect::<Vec<_>>())
+                        .map(std::iter::Iterator::collect::<Vec<_>>)
                         .unwrap_or_default();
                     let _ = sender.send(addresses);
                 });
