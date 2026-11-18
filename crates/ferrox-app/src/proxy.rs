@@ -21631,9 +21631,8 @@ impl<S, R> TlsHalf<S, R> {
         session.read(buf)
     }
 }
-
-// The ciphertext one read of the transport carries: a record is at most sixteen kilobytes, so one read holds a whole record.
-const DRIVEN_CIPHERTEXT: usize = 32 * 1024;
+// The ciphertext one transport read carries: a whole relay window's records with their headers, tags and inner content types.
+const DRIVEN_CIPHERTEXT: usize = RELAY_BUFFER + (RELAY_BUFFER / SESSION_WINDOW) * (5 + 16 + 1);
 /// Record opens that may take ciphertext without yielding plaintext before a read hands the lane
 /// back: a peer that drips cannot hold the worker, and the state resumes on the next read.
 const DRIVEN_DRY_OPENS: usize = 32;
@@ -44500,6 +44499,76 @@ mod tests {
             transport.lock().expect("locks").reads,
             1,
             "the read waited on the transport again with plaintext already in hand"
+        );
+    }
+
+    /// One transport read carries a whole relay window, so a 64 KiB window costs one read and
+    /// one open rather than one of each per record the window is made of.
+    #[test]
+    fn a_whole_relay_window_arrives_in_one_transport_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingOpen(Arc<AtomicUsize>);
+        impl CipherOpen for CountingOpen {
+            fn open(
+                &mut self,
+                ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                let plain = ciphertext.len().min(buf.len());
+                buf[..plain].copy_from_slice(&ciphertext[..plain]);
+                Ok((plain, ciphertext.len()))
+            }
+
+            fn seal_into(
+                &mut self,
+                _plaintext: &[u8],
+                _out: &mut Vec<u8>,
+            ) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        struct Window {
+            left: usize,
+            reads: Arc<AtomicUsize>,
+        }
+        impl Read for Window {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                let take = self.left.min(buf.len());
+                buf[..take].fill(b'x');
+                self.left -= take;
+                Ok(take)
+            }
+        }
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut half = DrivenHalf::new(
+            Arc::new(Mutex::new(CountingOpen(Arc::clone(&opens)))),
+            Arc::new(Mutex::new(Window {
+                left: DRIVEN_CIPHERTEXT,
+                reads: Arc::clone(&reads),
+            })),
+            Arc::new(Mutex::new(Sealed::new(std::io::sink()))),
+        );
+        let mut buf = vec![0u8; RELAY_BUFFER];
+        let mut filled = 0;
+        while filled < buf.len() {
+            let read = half.read(&mut buf[filled..]).expect("reads");
+            assert!(read > 0, "the window ended early at {filled} bytes");
+            filled += read;
+        }
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "a 64 KiB window cost more than one transport read"
+        );
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            1,
+            "a 64 KiB window cost more than one open"
         );
     }
 
