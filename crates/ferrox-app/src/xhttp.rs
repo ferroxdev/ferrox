@@ -3488,6 +3488,7 @@ thread_local! {
 }
 
 // The stream-one dial: one POST, chunked framing both ways, staged in the thread's own room.
+#[cfg(test)]
 fn send_dial_head<W: crate::proxy::FrameWrite>(
     write: &mut W,
     host: &str,
@@ -3558,6 +3559,7 @@ fn send_dial_head_padded<W: crate::proxy::FrameWrite>(
 /// padded referer, and the body's type. H2 encodes the same fields as HEADERS.
 /// The `Referer` an H2 dial encodes: the normalized path and the pad, in one string because HPACK
 /// measures the value it writes before it writes it.
+#[cfg(test)]
 pub(crate) fn referer_value(host: &str, settings: &XhttpSettings) -> String {
     let pad = referer_pad_value(settings);
     referer_value_with(host, settings, &pad)
@@ -3923,6 +3925,7 @@ pub(crate) fn connect_dual_split<
     Some((reader, writer))
 }
 
+#[cfg(test)]
 pub(crate) fn connect(
     stream: Connection,
     host: &str,
@@ -3938,6 +3941,7 @@ pub(crate) fn connect(
 }
 
 // The same connect over halves that cannot peek: pipelined bytes arrive as a prefix.
+#[cfg(test)]
 pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut read: R,
     mut write: W,
