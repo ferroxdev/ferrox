@@ -290,6 +290,16 @@ impl Window {
         }
     }
 
+    fn snapshot(&self) -> (i64, bool) {
+        match self.state.lock() {
+            Ok(state) => (state.value, state.closed),
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                (state.value, state.closed)
+            }
+        }
+    }
+
     fn notify_waiters(&self) {
         // Hold the lock across the notification so a waiter cannot miss it between its check and wait.
         match self.state.lock() {
@@ -947,6 +957,12 @@ impl Inner {
             Protocol::Smux => Some(size),
             Protocol::Yamux => window.take_up_to(size),
             Protocol::H2Mux => {
+                let (connection_value, connection_closed) = self.connection_window.snapshot();
+                let (stream_value, stream_closed) = window.snapshot();
+                crate::proxy::echo_trace(&format!(
+                    "singmux h2 windows size {size} connection {connection_value}/{connection_closed} stream {stream_value}/{stream_closed} alive {}",
+                    !closed.load(Ordering::Relaxed)
+                ));
                 let Some(connection) = self.connection_window.take_up_to_while(size, Some(closed))
                 else {
                     crate::proxy::echo_trace(&format!(
