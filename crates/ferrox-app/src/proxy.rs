@@ -4030,9 +4030,7 @@ fn route_shared_with_api(
         .iter()
         .filter_map(|inbound| {
             let protocol = inbound.get("protocol").and_then(Json::as_str).unwrap_or("");
-            if serve_addresses(inbound, canonical_protocol(protocol)).is_none() {
-                return None;
-            }
+            serve_addresses(inbound, canonical_protocol(protocol))?;
             server_networks(inbound).map(|networks| ServerInbound {
                 tag: inbound_tag(inbound),
                 networks,

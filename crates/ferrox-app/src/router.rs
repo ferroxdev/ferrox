@@ -6036,10 +6036,10 @@ mod tests {
                 ),
                 (
                     "rules",
-                    array(vec![object(vec![
-                        ("balancerTag", text("pool")),
-                        ("port", number(443)),
-                    ])]),
+                    array(vec![
+                        object(vec![("balancerTag", text("pool")), ("port", number(443))]),
+                        object(vec![("outboundTag", text("direct"))]),
+                    ]),
                 ),
             ]),
         )]);

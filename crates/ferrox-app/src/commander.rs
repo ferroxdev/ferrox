@@ -537,7 +537,7 @@ impl Api {
                         goaway(&mut stream, h2::E_PROTOCOL, last_id);
                         return;
                     };
-                    if id % 2 == 0 {
+                    if id.is_multiple_of(2) {
                         if let Err(code) = absorb_headers(
                             &mut decoder,
                             &mut discard,
@@ -1596,7 +1596,7 @@ impl Flow {
     }
 
     fn open(&mut self, id: u32) -> bool {
-        if id == 0 || id % 2 == 0 {
+        if id == 0 || id.is_multiple_of(2) {
             return false;
         }
         self.seen.insert(id);
@@ -2515,7 +2515,7 @@ mod tests {
         if split {
             let (head, tail) = block.split_at(1);
             client
-                .write_all(&h2::frame_head(head.len(), h2::T_HEADERS, 0, id))
+                .write_all(&h2::frame_head(head.len(), h2::T_HEADERS, h2::F_END, id))
                 .expect("writes the trailer head");
             client.write_all(head).expect("writes the trailer prefix");
             client
