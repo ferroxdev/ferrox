@@ -2387,22 +2387,21 @@ fn send_upstream(
         users.retain(|id, _| *id == session);
     }
     let bind = if key.1 { "[::]:0" } else { "0.0.0.0:0" };
-    let socket = match UdpSocket::bind(bind) {
-        Ok(socket) => socket,
-        Err(_) => {
-            let oldest = used.iter().min_by_key(|(_, at)| **at).map(|(key, _)| *key);
-            let Some(oldest) = oldest else {
-                return;
-            };
-            upstreams.remove(&oldest);
-            used.remove(&oldest);
-            clients_of.remove(&oldest.0);
-            users.remove(&oldest.0);
-            let Ok(socket) = UdpSocket::bind(bind) else {
-                return;
-            };
-            socket
-        }
+    let socket = if let Ok(socket) = UdpSocket::bind(bind) {
+        socket
+    } else {
+        let oldest = used.iter().min_by_key(|(_, at)| **at).map(|(key, _)| *key);
+        let Some(oldest) = oldest else {
+            return;
+        };
+        upstreams.remove(&oldest);
+        used.remove(&oldest);
+        clients_of.remove(&oldest.0);
+        users.remove(&oldest.0);
+        let Ok(socket) = UdpSocket::bind(bind) else {
+            return;
+        };
+        socket
     };
     if socket.set_nonblocking(true).is_err() {
         return;

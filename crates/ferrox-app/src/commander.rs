@@ -1344,7 +1344,7 @@ impl Flow {
     }
 
     fn settings(&mut self, body: &[u8]) -> bool {
-        if body.len() % 6 != 0 {
+        if !body.len().is_multiple_of(6) {
             return false;
         }
         let mut at = 0usize;
