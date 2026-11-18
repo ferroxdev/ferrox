@@ -401,7 +401,7 @@ fn resolve_addresses(listen: &str, port: u16) -> Vec<SocketAddr> {
             let _ = std::thread::spawn(move || {
                 let addresses = (host.as_str(), port)
                     .to_socket_addrs()
-                    .map(|addresses| addresses.collect::<Vec<_>>())
+                    .map(std::iter::Iterator::collect::<Vec<_>>())
                     .unwrap_or_default();
                 let _ = sender.send(addresses);
             });
