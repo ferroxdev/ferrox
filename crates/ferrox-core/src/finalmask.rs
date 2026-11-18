@@ -222,15 +222,15 @@ impl Fragment {
                 self.hello_skip = self.hello_skip.saturating_sub(p.len());
                 return raw.write(p);
             }
-            if Self::hello_shape(p).is_none() {
+            let Some(record_len) = Self::hello_shape(p) else {
                 self.forward_unshaped(p);
                 return raw.write(p);
-            }
+            };
             self.hello_done = true;
             return if self.sni {
-                self.write_sni(raw, p)
+                self.write_sni(raw, p, record_len)
             } else {
-                self.write_hello(raw, p)
+                self.write_hello(raw, p, record_len)
             };
         }
         if self.packets_from != 0
@@ -302,10 +302,12 @@ impl Fragment {
     /// records of its own — the original type, version and this piece's width in the header. One draw of
     /// `max_split` bounds the run, and a single zero delay merges the records into one write, which
     /// is what makes the run a single burst on the socket.
-    fn write_hello<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
-        let Some(record_len) = Self::hello_shape(p) else {
-            return raw.write(p);
-        };
+    fn write_hello<W: Write>(
+        &mut self,
+        raw: &mut W,
+        p: &[u8],
+        record_len: usize,
+    ) -> io::Result<usize> {
         let Some(bound) = self.max_split.pick_from(&mut self.ent) else {
             // No entropy for the bound: the hello goes out as the one record it was.
             return raw.write_all(p).map(|()| p.len());
@@ -419,18 +421,20 @@ impl Fragment {
     /// that reads a name out of a single record never finds one whole. Every piece is a complete
     /// handshake record and the server reassembles the handshake exactly as it would any hello.
     /// A write with no name falls back to the width cut, which still splits the record.
-    fn write_sni<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
-        let Some(record_len) = Self::hello_shape(p) else {
-            return raw.write(p);
-        };
+    fn write_sni<W: Write>(
+        &mut self,
+        raw: &mut W,
+        p: &[u8],
+        record_len: usize,
+    ) -> io::Result<usize> {
         let Some(name) = crate::evasion::server_name_range(&p[..record_len]) else {
-            return self.write_hello(raw, p);
+            return self.write_hello(raw, p, record_len);
         };
-        let mut cuts: Vec<usize> = crate::evasion::label_cuts(&p[name.clone()])
-            .into_iter()
-            .map(|at| name.start + at)
-            .filter(|at| *at > HEADER && *at < record_len)
-            .collect();
+        let mut cuts = crate::evasion::label_cuts(&p[name.clone()]);
+        for at in &mut cuts {
+            *at += name.start;
+        }
+        cuts.retain(|at| *at > HEADER && *at < record_len);
         let Some(bound) = self.max_split.pick_from(&mut self.ent) else {
             return write_progress(raw, p);
         };
