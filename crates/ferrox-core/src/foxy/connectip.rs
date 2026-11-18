@@ -784,14 +784,14 @@ fn pseudo_term(source: &[u8], destination: &[u8], protocol: u8, length: usize) -
     (sum & 0xffff) + (sum >> 16)
 }
 
-/// The pseudo-header checksum a GSO frame carries into the kernel: the term above complemented, with the segment left for the kernel to fold its own bytes onto.
+/// The pseudo-header sum a GSO frame hands the kernel: the term above kept uncomplemented, because the kernel folds the segment's own bytes onto it before it complements the total.
 pub fn pseudo_header_checksum(
     source: &[u8],
     destination: &[u8],
     protocol: u8,
     segment_len: usize,
 ) -> u16 {
-    !fold(pseudo_term(source, destination, protocol, segment_len))
+    fold(pseudo_term(source, destination, protocol, segment_len))
 }
 
 /// The TCP checksum of a segment this lane builds (RFC 793), summed without materialising the twelve-byte pseudo-header: the addresses contribute their word runs, the protocol (6) and the segment length their own words, and the segment — header with its checksum field read as zero plus payload — is summed where it already lies. The same one's-complement sum the materialised pseudo-header and a copy of the whole segment reached, so the bytes on the device are unchanged and the throwaway vector and its copy are gone.
