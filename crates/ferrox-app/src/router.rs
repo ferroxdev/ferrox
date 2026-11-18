@@ -143,6 +143,12 @@ impl<'a> Attributes<'a> {
             .find(|(sent, _)| sent.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_ref())
     }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries
+            .iter()
+            .map(|(name, value)| (name.as_ref(), value.as_ref()))
+    }
 }
 
 /// A rule's `attrs` map: each key lowercased and its value compiled as a regexp, which is what the
@@ -1152,7 +1158,7 @@ impl Routing {
                     .as_ref()
                     .is_some_and(|sets| sets.iter().any(|set| set.has_domains()))
         });
-        let wants_attrs = rules.iter().any(|rule| rule.attrs.is_some());
+        let wants_attrs = script.is_some() || rules.iter().any(|rule| rule.attrs.is_some());
         let wants_process = rules.iter().any(|rule| rule.process.is_some());
         Ok(Some(Self {
             strategy,
@@ -1299,7 +1305,8 @@ impl Routing {
                     .as_ref()
                     .is_some_and(|sets| sets.iter().any(|set| set.has_domains()))
         });
-        self.wants_attrs = self.rules.iter().any(|rule| rule.attrs.is_some());
+        self.wants_attrs =
+            self.script.is_some() || self.rules.iter().any(|rule| rule.attrs.is_some());
         self.wants_process = self.rules.iter().any(|rule| rule.process.is_some());
     }
 

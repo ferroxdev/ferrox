@@ -353,7 +353,7 @@ struct Lane {
     session: Mutex<Option<u32>>,
     defrag: Mutex<Defrag>,
     source: Mutex<Option<SocketAddr>>,
-    client: Mutex<Option<std::net::IpAddr>>,
+    client: Mutex<Option<SocketAddr>>,
 }
 
 /// The client's UDP uplink over Hysteria v1: one connection and one datagram session per association, with a companion reader driving replies back into the socks frame.
@@ -393,8 +393,8 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
             break;
         };
         match *client {
-            None => *client = Some(src.ip()),
-            Some(ip) if ip != src.ip() => continue,
+            None => *client = Some(src),
+            Some(peer) if peer != src => continue,
             Some(_) => {}
         }
         drop(client);

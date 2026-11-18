@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrox_core::failure::Kind;
 use ferrox_core::shadowsocks2022::{self, Cipher, Method, BLOCK_LEN, MAX_CHUNK, TAG_LEN};
@@ -15,6 +15,13 @@ use crate::shadowsocks::waited;
 
 const READ_CHUNK: usize = 0x4000;
 const SKEW: u64 = 30;
+const UPSTREAM_IDLE: Duration = Duration::from_secs(60);
+
+/// One turn drains at most this many replies from an upstream, so a busy socket cannot starve the client path or the other address family.
+const DRAIN_PER_TURN: usize = 32;
+
+/// One turn's whole upstream drain budget: a burst cannot keep the loop away from client reads.
+const TURN_DRAIN: usize = 256;
 const LENGTH_LEN: usize = 2;
 /// Room around one chunk's payload inside the caller's buffer: a sealed length before it and its tag after it, so both seals land beside the payload instead of the payload moving to them.
 const SEAL_HEAD: usize = LENGTH_LEN + TAG_LEN;
@@ -1727,17 +1734,6 @@ impl Datagrams {
             }
             let session = u64::from_be_bytes(body[..8].try_into().ok()?);
             let packet_id = u64::from_be_bytes(body[8..16].try_into().ok()?);
-            let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
-                window: shadowsocks2022::SlidingWindow::new(),
-                cipher: None,
-                user: None,
-                server_session: 0,
-                server_packet: 0,
-                server_cipher: None,
-            });
-            if !entry.window.check_and_add(packet_id) {
-                return None;
-            }
             let body = &body[16..];
             if body[0] != 0 {
                 return None;
@@ -1750,10 +1746,26 @@ impl Datagrams {
             if body.len() < 11 + pad {
                 return None;
             }
+            if !self
+                .sessions
+                .get(&session)
+                .is_none_or(|entry| entry.window.check(packet_id))
+            {
+                return None;
+            }
             let (target, used) = parse_addr_header(&body[11 + pad..])?;
             if body.len() < 11 + pad + used {
                 return None;
             }
+            let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
+                window: shadowsocks2022::SlidingWindow::new(),
+                cipher: None,
+                user: None,
+                server_session: 0,
+                server_packet: 0,
+                server_cipher: None,
+            });
+            entry.window.add(packet_id);
             Some((
                 target,
                 &packet[24 + 16 + 11 + pad + used..24 + len],
@@ -1769,6 +1781,10 @@ impl Datagrams {
             let raw = shadowsocks2022::block_decrypt(psk, &enc)?;
             let session = u64::from_be_bytes(raw[..8].try_into().ok()?);
             let packet_id = u64::from_be_bytes(raw[8..].try_into().ok()?);
+            let sub = shadowsocks2022::session_subkey(psk, &raw[..8])?;
+            let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(&raw[4..16]);
             let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
                 window: shadowsocks2022::SlidingWindow::new(),
                 cipher: None,
@@ -1780,15 +1796,12 @@ impl Datagrams {
             if !entry.window.check_and_add(packet_id) {
                 return None;
             }
-            if entry.cipher.is_none() {
-                let sub = shadowsocks2022::session_subkey(psk, &raw[..8])?;
-                entry.cipher = Cipher::from_subkey(method, &sub[..key_len]);
-            }
-            let mut nonce = [0u8; 12];
-            nonce.copy_from_slice(&raw[4..16]);
-            let cipher = self.sessions.get(&session)?.cipher.as_ref()?;
             let (target, total, len) =
-                open_body_in_place(cipher, &nonce, &mut packet[16..], 11, 0)?;
+                open_body_in_place(&cipher, &nonce, &mut packet[16..], 11, 0)?;
+            self.sessions
+                .get_mut(&session)?
+                .cipher
+                .get_or_insert(cipher);
             Some((target, &packet[16 + total..16 + len], session))
         }
     }
@@ -1810,6 +1823,17 @@ impl Datagrams {
         let raw = shadowsocks2022::block_decrypt(&psks[0], &enc)?;
         let session = u64::from_be_bytes(raw[..8].try_into().ok()?);
         let packet_id = u64::from_be_bytes(raw[8..].try_into().ok()?);
+        let mut eih = [0u8; BLOCK_LEN];
+        eih.copy_from_slice(&packet[16..32]);
+        let hash = shadowsocks2022::decrypt_udp_eih(&psks[0], &raw, &eih)?;
+        let idx = psks[1..]
+            .iter()
+            .position(|p| shadowsocks2022::user_hash(p) == hash)?
+            + 1;
+        let sub = shadowsocks2022::session_subkey(&psks[idx], &raw[..8])?;
+        let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&raw[4..16]);
         let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
             window: shadowsocks2022::SlidingWindow::new(),
             cipher: None,
@@ -1818,26 +1842,22 @@ impl Datagrams {
             server_packet: 0,
             server_cipher: None,
         });
+        if let Some(user) = entry.user {
+            if user != idx {
+                return None;
+            }
+        }
         if !entry.window.check_and_add(packet_id) {
             return None;
         }
         if entry.user.is_none() {
-            let mut eih = [0u8; BLOCK_LEN];
-            eih.copy_from_slice(&packet[16..32]);
-            let hash = shadowsocks2022::decrypt_udp_eih(&psks[0], &raw, &eih)?;
-            let idx = psks[1..]
-                .iter()
-                .position(|p| shadowsocks2022::user_hash(p) == hash)?
-                + 1;
-            let sub = shadowsocks2022::session_subkey(&psks[idx], &raw[..8])?;
-            entry.cipher = Cipher::from_subkey(method, &sub[..key_len]);
             entry.user = Some(idx);
         }
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&raw[4..16]);
-        let idx = self.sessions.get(&session)?.user?;
-        let cipher = self.sessions.get(&session)?.cipher.as_ref()?;
-        let (target, total, len) = open_body_in_place(cipher, &nonce, &mut packet[32..], 11, 0)?;
+        let (target, total, len) = open_body_in_place(&cipher, &nonce, &mut packet[32..], 11, 0)?;
+        self.sessions
+            .get_mut(&session)?
+            .cipher
+            .get_or_insert(cipher);
         Some((target, &packet[32 + total..32 + len], idx, session))
     }
     pub(crate) fn seal_server(
@@ -2202,9 +2222,12 @@ pub(crate) fn serve_udp_relay(
     let Ok(upstream) = UdpSocket::bind("0.0.0.0:0") else {
         return;
     };
-    if upstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+    if upstream.set_nonblocking(true).is_err() {
         return;
     }
+    let upstream6 = UdpSocket::bind("[::]:0")
+        .ok()
+        .filter(|socket| socket.set_nonblocking(true).is_ok());
     if clients.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
@@ -2217,6 +2240,7 @@ pub(crate) fn serve_udp_relay(
     let mut forwarded: Vec<u8> = Vec::new();
     let mut body: Vec<u8> = Vec::new();
     let mut buf = crate::proxy::udp_buffer();
+    let mut rotate = 0usize;
     loop {
         match clients.recv_from(&mut buf) {
             Ok((n, src)) => {
@@ -2227,28 +2251,55 @@ pub(crate) fn serve_udp_relay(
                         client_of.clear();
                     }
                     client_of.insert(session, src);
-                    let _ = upstream.send_to(&forwarded, dest);
+                    let socket = if dest.is_ipv6() {
+                        upstream6.as_ref()
+                    } else {
+                        Some(&upstream)
+                    };
+                    if let Some(socket) = socket {
+                        let _ = socket.send_to(&forwarded, dest);
+                    }
                 }
             }
             Err(error) if crate::proxy::is_timeout(&error) => {}
             Err(_) => break,
         }
-        while let Ok((n, from)) = upstream.recv_from(&mut buf) {
-            let Some(idx) = by_addr.get(&from).copied() else {
+        let mut drained = 0usize;
+        let sockets = [Some(&upstream), upstream6.as_ref()];
+        let start = rotate % sockets.len();
+        let mut index = start;
+        while drained < TURN_DRAIN && index < start + sockets.len() {
+            let socket = sockets[index % sockets.len()];
+            index += 1;
+            let Some(socket) = socket else {
                 continue;
             };
-            let Some((dest_psk, _)) = dests.get(idx) else {
-                continue;
-            };
-            if let Some(session) = relay_udp_client_of(dest_psk, &mut body, &buf[..n]) {
-                if let Some(client) = client_of.get(&session) {
-                    let _ = clients.send_to(&buf[..n], client);
+            for _ in 0..DRAIN_PER_TURN {
+                if drained >= TURN_DRAIN {
+                    break;
+                }
+                let Ok((n, from)) = socket.recv_from(&mut buf) else {
+                    break;
+                };
+                drained += 1;
+                let Some(idx) = by_addr.get(&from).copied() else {
+                    continue;
+                };
+                let Some((dest_psk, _)) = dests.get(idx) else {
+                    continue;
+                };
+                if let Some(session) = relay_udp_client_of(dest_psk, &mut body, &buf[..n]) {
+                    if let Some(client) = client_of.get(&session) {
+                        let _ = clients.send_to(&buf[..n], client);
+                    }
                 }
             }
         }
+        rotate = index % sockets.len();
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, freedom: bool) {
     let Some(method) = Method::parse(method) else {
         return;
@@ -2267,21 +2318,21 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
     }
     let multi = !method.is_chacha() && list.len() > 1;
     let psk = list.last().expect("non-empty").clone();
-    let Ok(upstream) = UdpSocket::bind("0.0.0.0:0") else {
+    if clients.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
-    };
-    let upstream6 = UdpSocket::bind("[::]:0").ok();
-    for sock in [clients, &upstream].into_iter().chain(upstream6.as_ref()) {
-        if sock.set_read_timeout(Some(RELAY_POLL)).is_err() {
-            return;
-        }
     }
-    let mut table: HashMap<SocketAddr, SocketAddr> = HashMap::new();
-    let mut users: HashMap<SocketAddr, usize> = HashMap::new();
-    let mut sessions: HashMap<SocketAddr, u64> = HashMap::new();
+    let mut upstreams: HashMap<(u64, bool), UdpSocket> = HashMap::new();
+    let mut used: HashMap<(u64, bool), Instant> = HashMap::new();
+    let mut clients_of: HashMap<u64, SocketAddr> = HashMap::new();
+    let mut users: HashMap<u64, usize> = HashMap::new();
     let mut buf = crate::proxy::udp_buffer();
     let mut reply = crate::proxy::udp_buffer();
     let mut datagrams = Datagrams::new();
+    let mut order: Vec<(u64, bool)> = Vec::new();
+    let mut ordered: HashSet<(u64, bool)> = HashSet::new();
+    let mut seen: HashSet<(u64, bool)> = HashSet::new();
+    let mut cursor = 0usize;
+    let mut resume: Option<(u64, bool)> = None;
     loop {
         match clients.recv_from(&mut buf) {
             Ok((n, src)) => {
@@ -2289,58 +2340,130 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
                     if let Some((dest, payload, idx, session)) =
                         datagrams.open_multi(method, &list, &mut buf[..n])
                     {
-                        if table.len() >= 4096 {
-                            table.clear();
-                            users.clear();
-                            sessions.clear();
-                        }
-                        table.insert(dest, src);
-                        users.insert(src, idx);
-                        sessions.insert(src, session);
-                        if dest.is_ipv6() {
-                            if let Some(sock) = &upstream6 {
-                                let _ = sock.send_to(payload, dest);
-                            }
-                        } else {
-                            let _ = upstream.send_to(payload, dest);
-                        }
+                        clients_of.insert(session, src);
+                        users.insert(session, idx);
+                        send_upstream(&mut upstreams, &mut used, session, dest, payload);
                     }
                 } else if let Some((dest, payload, session)) =
                     datagrams.open(&psk, method, &mut buf[..n])
                 {
-                    if table.len() >= 4096 {
-                        table.clear();
-                        sessions.clear();
-                    }
-                    table.insert(dest, src);
-                    sessions.insert(src, session);
-                    if dest.is_ipv6() {
-                        if let Some(sock) = &upstream6 {
-                            let _ = sock.send_to(payload, dest);
-                        }
-                    } else {
-                        let _ = upstream.send_to(payload, dest);
-                    }
+                    clients_of.insert(session, src);
+                    send_upstream(&mut upstreams, &mut used, session, dest, payload);
                 }
             }
             Err(error) if crate::proxy::is_timeout(&error) => {}
             Err(_) => break,
         }
-        for sock in [&upstream].into_iter().chain(upstream6.as_ref()) {
-            while let Ok((n, src)) = sock.recv_from(&mut reply) {
+        let mut drained = 0usize;
+        order.retain(|key| upstreams.contains_key(key));
+        ordered.clear();
+        ordered.extend(order.iter().copied());
+        for key in upstreams.keys() {
+            if ordered.insert(*key) {
+                order.push(*key);
+            }
+        }
+        let len = order.len();
+        let start = resume
+            .and_then(|key| order.iter().position(|held| *held == key))
+            .unwrap_or(if cursor < len { cursor } else { 0 });
+        seen.clear();
+        let mut index = start;
+        let mut interrupted = false;
+        while drained < TURN_DRAIN && index < start + len {
+            let key = order[index % len];
+            seen.insert(key);
+            let session = key.0;
+            let socket = &upstreams[&key];
+            for _ in 0..DRAIN_PER_TURN {
+                if drained >= TURN_DRAIN {
+                    interrupted = true;
+                    break;
+                }
+                let Ok((n, from)) = socket.recv_from(&mut reply) else {
+                    break;
+                };
+                drained += 1;
+                used.insert(key, Instant::now());
+                let Some(client) = clients_of.get(&session) else {
+                    continue;
+                };
                 let state = UdpAnswer {
                     method,
                     list: &list,
                     psk: &psk,
                     multi,
-                    table: &table,
                     users: &users,
-                    sessions: &sessions,
                 };
-                answer_udp(clients, &mut datagrams, &state, &reply[..n], src);
+                answer_udp(
+                    clients,
+                    &mut datagrams,
+                    &state,
+                    &reply[..n],
+                    from,
+                    *client,
+                    session,
+                );
             }
+            if interrupted {
+                break;
+            }
+            index += 1;
         }
+        cursor = if index < start + len { index % len } else { 0 };
+        resume = order.get(cursor).copied();
+        let now = Instant::now();
+        upstreams.retain(|key, _| {
+            !seen.contains(key)
+                || used
+                    .get(key)
+                    .is_some_and(|at| now.saturating_duration_since(*at) < UPSTREAM_IDLE)
+        });
+        used.retain(|key, _| upstreams.contains_key(key));
+        let live: HashSet<u64> = upstreams.keys().map(|(session, _)| *session).collect();
+        clients_of.retain(|session, _| live.contains(session));
+        users.retain(|session, _| live.contains(session));
     }
+}
+
+fn send_upstream(
+    upstreams: &mut HashMap<(u64, bool), UdpSocket>,
+    used: &mut HashMap<(u64, bool), Instant>,
+    session: u64,
+    dest: SocketAddr,
+    payload: &[u8],
+) {
+    let key = (session, dest.is_ipv6());
+    if let Some(socket) = upstreams.get(&key) {
+        let _ = socket.send_to(payload, dest);
+        used.insert(key, Instant::now());
+        return;
+    }
+    if upstreams.len() >= 4096 && !evict_upstream(upstreams, used) {
+        return;
+    }
+    let bind = if key.1 { "[::]:0" } else { "0.0.0.0:0" };
+    let Ok(socket) = UdpSocket::bind(bind) else {
+        return;
+    };
+    if socket.set_nonblocking(true).is_err() {
+        return;
+    }
+    let _ = socket.send_to(payload, dest);
+    upstreams.insert(key, socket);
+    used.insert(key, Instant::now());
+}
+
+fn evict_upstream(
+    upstreams: &mut HashMap<(u64, bool), UdpSocket>,
+    used: &mut HashMap<(u64, bool), Instant>,
+) -> bool {
+    let Some(oldest) = used.iter().min_by_key(|(_, at)| **at).map(|(key, _)| *key) else {
+        return false;
+    };
+    upstreams.remove(&oldest);
+    used.remove(&oldest);
+    true
 }
 
 struct UdpAnswer<'a> {
@@ -2348,9 +2471,7 @@ struct UdpAnswer<'a> {
     list: &'a [Vec<u8>],
     psk: &'a [u8],
     multi: bool,
-    table: &'a HashMap<SocketAddr, SocketAddr>,
-    users: &'a HashMap<SocketAddr, usize>,
-    sessions: &'a HashMap<SocketAddr, u64>,
+    users: &'a HashMap<u64, usize>,
 }
 
 fn answer_udp(
@@ -2358,18 +2479,14 @@ fn answer_udp(
     datagrams: &mut Datagrams,
     state: &UdpAnswer<'_>,
     reply: &[u8],
-    src: SocketAddr,
+    dest: SocketAddr,
+    client: SocketAddr,
+    session: u64,
 ) {
-    let Some(client) = state.table.get(&src).copied() else {
-        return;
-    };
-    let Some(session) = state.sessions.get(&client).copied() else {
-        return;
-    };
     let user = if state.multi {
         let idx = state
             .users
-            .get(&client)
+            .get(&session)
             .copied()
             .unwrap_or(state.list.len() - 1);
         state.list.get(idx).map(Vec::as_slice)
@@ -2382,7 +2499,7 @@ fn answer_udp(
     if user.len() != state.method.key_len() {
         return;
     }
-    if let Some(packet) = datagrams.seal_server(state.method, user, session, &src, reply) {
+    if let Some(packet) = datagrams.seal_server(state.method, user, session, &dest, reply) {
         let _ = clients.send_to(packet, client);
     }
 }

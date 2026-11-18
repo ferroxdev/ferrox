@@ -2022,6 +2022,11 @@ mod tests {
     /// receiver's window update late.
     #[test]
     fn a_waiting_h3_stream_read_does_not_sleep_the_transport_tick() {
+        if !crate::conn::in_a_quiet_process(
+            "xhttp_h3::tests::a_waiting_h3_stream_read_does_not_sleep_the_transport_tick",
+        ) {
+            return;
+        }
         let (identity, roots) = minted_identity("localhost");
         let settings = dual_settings(XhttpMode::StreamUp);
         let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)

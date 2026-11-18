@@ -21,10 +21,24 @@ pub(crate) struct Owner {
 pub(crate) fn owner(network: Network, source: SocketAddr) -> Option<Owner> {
     let inode = socket_inode(network, source)?;
     let pid = owner_pid(&inode)?;
+    let started = process_start(pid)?;
     let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    if owner_pid(&inode)? != pid || process_start(pid)? != started {
+        return None;
+    }
     let path = path.to_str()?.to_owned();
     let name = path.rsplit('/').next()?.to_owned();
     Some(Owner { pid, name, path })
+}
+
+#[cfg(target_os = "linux")]
+fn process_start(pid: u32) -> Option<u64> {
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let at = stat
+        .windows(2)
+        .rposition(|window| window.first() == Some(&b')') && window.get(1) == Some(&b' '))?;
+    let rest = std::str::from_utf8(&stat[at + 2..]).ok()?;
+    rest.split_ascii_whitespace().nth(19)?.parse().ok()
 }
 
 /// The reference's own lookup answers nothing off Linux, so a `process` rule matches no flow here
@@ -38,7 +52,7 @@ pub(crate) fn owner(_network: Network, _source: SocketAddr) -> Option<Owner> {
 /// address, so a remote peer's address never matches and needs no local-address test of its own.
 #[cfg(target_os = "linux")]
 pub(crate) fn socket_inode(network: Network, source: SocketAddr) -> Option<String> {
-    let (files, address): (&[&str], String) = match (network, source.ip().to_canonical()) {
+    let (files, address): (&[&str], String) = match (network, source.ip()) {
         (Network::Tcp, std::net::IpAddr::V4(ip)) => {
             (&["/proc/net/tcp"], local_hex(&ip.octets(), source.port()))
         }

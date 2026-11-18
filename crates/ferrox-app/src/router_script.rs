@@ -132,6 +132,7 @@ struct ScriptContext {
     network: i64,
     protocol: String,
     user: String,
+    attributes: HashMap<String, String>,
 }
 
 impl ScriptRouter {
@@ -228,6 +229,12 @@ impl ScriptRouter {
             },
             protocol: flow.protocol.unwrap_or("").to_owned(),
             user: flow.user.unwrap_or("").to_owned(),
+            attributes: flow.attrs.map_or_else(HashMap::new, |attrs| {
+                attrs
+                    .iter()
+                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                    .collect()
+            }),
         };
         state.hooks.set(callbacks);
         let guard = ClearOnDrop(&state.hooks);
@@ -286,13 +293,14 @@ fn call(lua: &Lua, context: ScriptContext) -> Result<Option<String>, String> {
         network,
         protocol,
         user,
+        attributes,
     } = context;
     let context = lua
         .create_userdata(ContextUser {
             source,
             target,
             local,
-            attributes: HashMap::new(),
+            attributes,
         })
         .map_err(|error| error.to_string())?;
     let values = handle

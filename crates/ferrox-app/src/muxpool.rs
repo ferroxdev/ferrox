@@ -315,7 +315,12 @@ impl Carrier {
         let Ok(mut writer) = self.write.lock() else {
             return false;
         };
-        writer.keep(id, data)
+        let written = writer.keep(id, data);
+        drop(writer);
+        if !written {
+            self.retire();
+        }
+        written
     }
 
     /// The id is released only after its End frame is written, and `Ids` never reissues one.

@@ -646,10 +646,6 @@ pub(crate) fn start(
                 ) {
                     eprintln!("geodata: scheduled reload failed: {reason}");
                 }
-                let now = SystemTime::now();
-                if now > anchor {
-                    anchor = now;
-                }
             }
         });
 }

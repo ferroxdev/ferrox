@@ -1452,6 +1452,7 @@ struct Inbound {
     settings_sent: bool,
     settings_done: bool,
     auth_buf: Vec<u8>,
+    auth_fin: bool,
     wakes: Arc<Driver>,
     udp: HashMap<u32, UdpFlow>,
     /// The listener's `brutalDown`, answered as this client's `hysteria-cc-rx` hint.
@@ -1513,8 +1514,9 @@ fn serve_stream(
     let mut head = Vec::with_capacity(8);
     let mut room = Unfilled::<64>::new();
     let mut peer_fin = false;
+    let deadline = Instant::now() + ORIGIN_TIMEOUT;
     let prefix = loop {
-        if head.len() >= 8 {
+        if Instant::now() >= deadline || head.len() >= 8 {
             return;
         }
         let before = wake.seen();
@@ -1557,7 +1559,7 @@ fn serve_stream(
                     frames::quic_read(&head, &mut 0usize),
                     Some(kind) if kind == frames::H3_HEADERS || kind == frames::H3_DATA
                 ) {
-                    serve_masquerade_stream(shared, sock, stream, head, peer, masq);
+                    serve_masquerade_stream(shared, sock, stream, head, peer_fin, peer, masq);
                 }
                 return;
             };
@@ -1589,15 +1591,23 @@ const ORIGIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MASQ_BODY_CAP: usize = hysteria::MAX_UDP_PAYLOAD;
 
 /// Answers a browser request that arrived on a flow slot: read the whole request off the stream, build the cover response, and finish the stream with it so the browser sees a complete reply while the connection stays up for its next request.
+#[allow(clippy::too_many_arguments)]
 fn serve_masquerade_stream(
     shared: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<crate::quic::Datagram>,
     stream: u64,
     seed: Vec<u8>,
+    fin: bool,
     peer: SocketAddr,
     masq: &Masquerade,
 ) {
-    let Some(request) = read_h3_request(shared, stream, seed) else {
+    let Some(request) = read_h3_request(shared, stream, seed, fin) else {
+        let Ok(mut conn) = shared.lock() else {
+            return;
+        };
+        let _ = conn.stream_shutdown(stream, quiche::Shutdown::Read, 0);
+        let _ = conn.stream_shutdown(stream, quiche::Shutdown::Write, 0);
+        crate::quic::flush_egress(&mut conn, sock);
         return;
     };
     let peer = peer.to_string();
@@ -1618,42 +1628,62 @@ fn read_h3_request(
     shared: &Arc<Mutex<quiche::Connection>>,
     stream: u64,
     mut buf: Vec<u8>,
+    mut fin: bool,
 ) -> Option<hysteria::H3Request> {
     let mut room = Unfilled::<4096>::new();
+    let deadline = Instant::now() + ORIGIN_TIMEOUT;
     loop {
+        if Instant::now() >= deadline {
+            return assemble_request(&buf).filter(|request| request_complete(request, fin));
+        }
         if let Some(request) = assemble_request(&buf) {
-            let declares_body = request.headers.iter().any(|(name, _)| {
-                name.eq_ignore_ascii_case("content-length")
-                    || name.eq_ignore_ascii_case("transfer-encoding")
-            });
-            if !declares_body || !request.body.is_empty() {
+            if request_complete(&request, fin) {
                 return Some(request);
             }
         }
         if buf.len() >= HEAD_CAP {
-            return assemble_request(&buf);
+            return assemble_request(&buf).filter(|request| request_complete(request, fin));
         }
-        let fin = {
+        let read_fin = {
             let Ok(mut conn) = shared.lock() else {
-                return assemble_request(&buf);
+                return None;
             };
             if conn.is_closed() {
-                return assemble_request(&buf);
+                return assemble_request(&buf).filter(|request| request_complete(request, fin));
             }
             match conn.stream_recv(stream, room.as_mut()) {
-                Ok((0, _)) | Err(quiche::Error::Done) => false,
+                Ok((0, fin)) => fin,
                 Ok((n, fin)) => {
                     buf.extend_from_slice(&room.as_mut()[..n]);
                     fin
                 }
-                Err(_) => return assemble_request(&buf),
+                Err(quiche::Error::Done) => false,
+                Err(_) => return None,
             }
         };
+        fin |= read_fin;
         if fin {
-            return assemble_request(&buf);
+            return assemble_request(&buf).filter(|request| request_complete(request, true));
         }
         std::thread::sleep(STREAM_POLL);
     }
+}
+
+fn request_complete(request: &hysteria::H3Request, fin: bool) -> bool {
+    let mut declared = None;
+    for (name, value) in &request.headers {
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let Ok(length) = value.trim().parse::<usize>() else {
+            return false;
+        };
+        if declared.is_some_and(|declared| declared != length) {
+            return false;
+        }
+        declared = Some(length);
+    }
+    declared.map_or(fin, |length| request.body.len() == length)
 }
 
 /// Walks a request stream's HTTP/3 frames once: the first `HEADERS` block becomes the request line and fields, and every `DATA` payload that follows becomes the body. `None` while any frame is still incomplete, so the reader keeps waiting rather than answering a half request.
@@ -1993,11 +2023,16 @@ fn origin_request(
     let mut head = Vec::with_capacity(256 + request.body.len());
     let _ = write!(&mut head, "{method} {target} HTTP/1.1\r\n");
     let _ = write!(&mut head, "Host: {host}\r\n");
+    let mut has_content_length = false;
     for (name, value) in &request.headers {
         if is_hop_by_hop(name) {
             continue;
         }
+        has_content_length |= name.eq_ignore_ascii_case("content-length");
         let _ = write!(&mut head, "{name}: {value}\r\n");
+    }
+    if !has_content_length && !request.body.is_empty() {
+        let _ = write!(&mut head, "Content-Length: {}\r\n", request.body.len());
     }
     if x_forwarded {
         if let Some(for_ip) = peer {
@@ -2436,8 +2471,15 @@ fn auth_exchange(
     let mut room = Unfilled::<4096>::new();
     loop {
         match conn.stream_recv(AUTH_STREAM, room.as_mut()) {
-            Ok((0, _)) | Err(_) => break,
-            Ok((n, _)) => inbound.auth_buf.extend_from_slice(&room.as_mut()[..n]),
+            Ok((0, fin)) => {
+                inbound.auth_fin |= fin;
+                break;
+            }
+            Ok((n, fin)) => {
+                inbound.auth_fin |= fin;
+                inbound.auth_buf.extend_from_slice(&room.as_mut()[..n]);
+            }
+            Err(_) => break,
         }
     }
     if inbound.auth_buf.len() >= HEAD_CAP {
@@ -2449,7 +2491,10 @@ fn auth_exchange(
         .and_then(|frame| inbound.auth_buf.get(at..at + frame.length as usize))?;
     // A request that is not the hysteria handshake shape is a browser: it is answered as the cover site on this very stream — the plain not-found when no richer cover is configured — and the connection is kept for its later requests. A right-shape, wrong-password handshake still falls through below and refuses exactly as a plain hysteria server would.
     if !hysteria::is_hysteria_auth_shape(body) {
-        let request = hysteria::parse_h3_request(body).unwrap_or_default();
+        let request = assemble_request(&inbound.auth_buf)?;
+        if !request_complete(&request, inbound.auth_fin) {
+            return None;
+        }
         inbound.auth_buf.clear();
         let peer = peer.to_string();
         if let Some(shared) = background {
@@ -2537,6 +2582,7 @@ impl Router<'_> {
             settings_sent: false,
             settings_done: false,
             auth_buf: Vec::new(),
+            auth_fin: false,
             wakes: Driver::new(),
             udp: HashMap::new(),
             cc_rx: self.cc_rx,
@@ -3476,6 +3522,7 @@ mod tests {
             settings_sent: true,
             settings_done: true,
             auth_buf: Vec::new(),
+            auth_fin: false,
             wakes: Driver::new(),
             udp: HashMap::new(),
             cc_rx: 0,
@@ -3614,6 +3661,7 @@ mod tests {
                     settings_sent: true,
                     settings_done: true,
                     auth_buf: Vec::new(),
+                    auth_fin: false,
                     wakes: Driver::new(),
                     udp,
                     cc_rx: 0,
@@ -3796,6 +3844,7 @@ mod tests {
                     settings_sent: false,
                     settings_done: false,
                     auth_buf: Vec::new(),
+                    auth_fin: false,
                     wakes: Driver::new(),
                     udp: HashMap::new(),
                     cc_rx: 0,
