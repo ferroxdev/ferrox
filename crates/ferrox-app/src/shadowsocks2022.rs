@@ -983,7 +983,7 @@ fn pump_relay_carried_inner<R, W>(
                 &mut outbound,
                 &mut writer,
                 &up_flow,
-                &up_close,
+                up_close.as_ref(),
             );
             if next == crate::proxy::lane_pool::Next::Idle {
                 crate::proxy::note_wait_finish(&up_flow);

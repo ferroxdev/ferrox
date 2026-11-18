@@ -1081,7 +1081,7 @@ pub(crate) fn pump_relay_carried<R, W>(
                 &mut send,
                 &mut writer,
                 &up_flow,
-                &up_close,
+                up_close.as_ref(),
             )
         }),
         Box::new(crate::proxy::stream_lane_done(&flow)),
