@@ -180,7 +180,10 @@ fn target_path(target: &str) -> &str {
         return target;
     }
     let rest = &target[at + 3..];
-    rest.find('/').map_or("/", |slash| &rest[slash..])
+    match rest.find(['/', '?', '#']) {
+        Some(at) if rest.as_bytes()[at] == b'/' => &rest[at..],
+        _ => "/",
+    }
 }
 
 pub(crate) struct Client {

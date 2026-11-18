@@ -2623,8 +2623,7 @@ impl Handler {
     fn shrink_flow(&mut self, key: FlowKey, mtu: u32) {
         if let Some(flow) = self.flows.table().get(&key).cloned() {
             let mss = path_mss(mtu, flow.remote.0.is_ipv6());
-            let current = flow.mss.load(Relaxed);
-            flow.mss.store(current.min(mss), Relaxed);
+            flow.mss.fetch_min(mss, Relaxed);
         }
     }
 

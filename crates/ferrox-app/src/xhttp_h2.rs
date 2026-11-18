@@ -1666,15 +1666,20 @@ impl H2Conn {
                     .peer_initial
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                let delta = value.saturating_sub(*previous);
+                let delta = value.cast_signed() - (*previous).cast_signed();
                 *previous = value;
                 drop(previous);
+                let max = i64::from(u32::MAX >> 1);
                 for state in streams.values() {
                     let mut window = state
                         .send_window
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
-                    *window = window.saturating_add(delta).min((1 << 31) - 1);
+                    *window = (*window)
+                        .cast_signed()
+                        .saturating_add(delta)
+                        .clamp(0, max)
+                        .cast_unsigned();
                 }
                 drop(streams);
                 self.wake.notify_all();

@@ -85,6 +85,7 @@ impl QuicServer {
 
 /// How many flows one lane lends before it is handed back for a fresh dial: reuse without a bound is the leak the lane was first closed for, and a stream id only comes back if the edge grants it.
 pub(crate) const MAX_FLOWS_ON_LANE: u64 = 64;
+const MAX_SERVER_CONNECTIONS: usize = 1024;
 
 struct PooledState {
     /// One handle per flow, shared by every burst it arrives in: a hand-off takes a refcount, not a `dup`.
@@ -1864,7 +1865,8 @@ fn stream_recv_exact_parked(
                 return None;
             }
             match conn.stream_recv(stream, &mut chunk[..end]) {
-                Ok((0, _)) | Err(quiche::Error::Done) => None,
+                Ok((0, true)) => return None,
+                Ok((0, false)) | Err(quiche::Error::Done) => None,
                 Ok(found) => Some(found),
                 Err(_) => return None,
             }
@@ -1897,7 +1899,8 @@ pub(crate) fn stream_recv_exact(
     while out.len() < want {
         let end = (want - out.len()).min(chunk.len());
         match conn.stream_recv(stream, &mut chunk[..end]) {
-            Ok((0, _)) | Err(quiche::Error::Done) => {
+            Ok((0, true)) => return None,
+            Ok((0, false)) | Err(quiche::Error::Done) => {
                 if conn.is_closed() || Instant::now() >= deadline {
                     return None;
                 }
@@ -4106,6 +4109,9 @@ fn pump(
                 None if timed_out => conn.on_timeout(),
                 None => {}
             }
+            if conn.timeout() == Some(Duration::ZERO) {
+                conn.on_timeout();
+            }
             flush_egress(&mut conn, sock);
             hand_off(&mut conn, table, &mut chunk, &mut ready);
             if conn.is_closed() {
@@ -4209,7 +4215,6 @@ fn park_if_idle(table: &Arc<Mutex<PooledState>>) -> bool {
         if !state.sessions.is_empty() || !state.opening.is_empty() {
             return false;
         }
-        state.pump = 0;
         state.parked = Some(Instant::now());
         true
     })
@@ -4392,7 +4397,8 @@ fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
                 if !sent {
                     #[cfg(test)]
                     qstage(format!("{} t={} up-unsent {id}", port, qms()));
-                    break;
+                    fail_session(&pooled.table, id);
+                    return;
                 }
                 #[cfg(test)]
                 qstage(format!("{} t={} up {id} {n}", port, qms()));
@@ -4452,6 +4458,7 @@ pub(crate) fn dial_pooled_with(
         qstage(format!("{} t={} build-none", dial.port, qms()));
         return;
     };
+    let _ = client.set_write_timeout(Some(SEND_WAIT));
     let Some(id) = lend(&pooled, client.try_clone().ok(), true) else {
         #[cfg(test)]
         qstage(format!("{} t={} open-none", dial.port, qms()));
@@ -4747,6 +4754,10 @@ impl Write for QuicStream {
             match self.send_once(rest) {
                 Ok(0) => {
                     if Instant::now() >= deadline {
+                        let sent = buf.len() - rest.len();
+                        if sent > 0 {
+                            return Ok(sent);
+                        }
                         return Err(std::io::Error::other("quic stream send timed out"));
                     }
                     std::thread::sleep(STREAM_POLL);
@@ -4756,7 +4767,13 @@ impl Write for QuicStream {
                     self.activity.touch();
                     rest = &rest[n..];
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    let sent = buf.len() - rest.len();
+                    if sent > 0 {
+                        return Ok(sent);
+                    }
+                    return Err(error);
+                }
             }
         }
         Ok(buf.len())
@@ -5068,6 +5085,7 @@ pub(crate) fn serve_loop(
                     &mut batch,
                     &mut scratch.out,
                 );
+                run_timers(&mut conns, &sock, start.elapsed());
                 reap(serve, &sock, &mut conns, &mut scratch, &live);
                 continue;
             }
@@ -5084,6 +5102,7 @@ pub(crate) fn serve_loop(
             Ok((n, from)) => {
                 let Scratch { buf, out, .. } = &mut scratch;
                 route(&sock, local, config, &mut conns, &mut buf[..n], out, from);
+                run_timers(&mut conns, &sock, start.elapsed());
             }
             Err(e)
                 if matches!(
@@ -5190,6 +5209,16 @@ fn route(
         if let Ok(len) = quiche::negotiate_version(&header.scid, &header.dcid, out) {
             let _ = sock.send_to(&out[..len], from);
         }
+        return;
+    }
+    // Every routing key names the same connection, so count distinct lanes before opening another.
+    if conns
+        .values()
+        .map(Arc::as_ptr)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        >= MAX_SERVER_CONNECTIONS
+    {
         return;
     }
     // Server SCIDs are the parse length, so short-header DCIDs read exactly, not into payload.

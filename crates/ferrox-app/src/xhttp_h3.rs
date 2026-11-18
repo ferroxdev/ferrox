@@ -231,6 +231,9 @@ impl H3Reader {
     /// Take one transport read into the framing buffer.
     fn fill_room(&mut self) -> std::io::Result<()> {
         self.compact();
+        if self.expired() {
+            return Err(std::io::Error::other("h3 request stalled"));
+        }
         let base = self.buf.len();
         // SAFETY: every byte below the watermark is initialised, and the read fills the room past it before the length counts it.
         unsafe {
@@ -276,6 +279,9 @@ impl H3Reader {
     /// Parse the frames already buffered, then take one datagram's worth when nothing completes.
     fn step(&mut self) -> std::io::Result<()> {
         loop {
+            if self.expired() {
+                return Err(std::io::Error::other("h3 request stalled"));
+            }
             if self.frame_left > 0 {
                 self.fill_data()?;
                 if self.data_available() {
@@ -432,6 +438,12 @@ impl H3Reader {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionReset,
                     "h3 stream was reset",
+                ));
+            }
+            if !self.expect_request && !self.head_seen {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "h3 response head is missing",
                 ));
             }
             return Ok(false);
@@ -1206,11 +1218,12 @@ impl H3Client {
         session: &str,
         seq: u64,
         piece: &[u8],
+        activity: Arc<Activity>,
     ) -> bool {
         let (head, body) = crate::xhttp::packet_head(host, settings, session, seq, piece);
         let block = block_from_text(&head, host, "https");
         let deadline = Instant::now() + crate::budgets::relay_stall();
-        let Some((mut reader, out)) = self.open(&block, false) else {
+        let Some((mut reader, out)) = self.open_with(&block, false, activity) else {
             return false;
         };
         reader.set_deadline(deadline);
@@ -1382,12 +1395,19 @@ struct H3Post {
     host: String,
     settings: XhttpSettings,
     session: String,
+    activity: Arc<Activity>,
 }
 
 impl crate::xhttp::PacketPost for H3Post {
     fn post(&mut self, seq: u64, piece: &[u8]) -> bool {
-        self.client
-            .packet(&self.host, &self.settings, &self.session, seq, piece)
+        self.client.packet(
+            &self.host,
+            &self.settings,
+            &self.session,
+            seq,
+            piece,
+            Arc::clone(&self.activity),
+        )
     }
 }
 
@@ -1451,7 +1471,13 @@ pub(crate) fn connect_dual_split(
     let activity = Arc::new(Activity::new());
     let (reader, _) = client.open_with(&block, true, Arc::clone(&activity))?;
     let writer = if settings.mode == XhttpMode::PacketUp {
-        crate::xhttp::XhttpWriter::packets_h3(Arc::clone(&client), host, settings, session)
+        crate::xhttp::XhttpWriter::packets_h3(
+            Arc::clone(&client),
+            host,
+            settings,
+            session,
+            Arc::clone(&activity),
+        )
     } else {
         let up = crate::xhttp::dial_head(host, settings, &session, None);
         let block = block_from_text(&up, host, "https");
@@ -1468,12 +1494,14 @@ pub(crate) fn packets(
     host: &str,
     settings: &XhttpSettings,
     session: String,
+    activity: Arc<Activity>,
 ) -> crate::xhttp::XhttpWriter {
     let post = H3Post {
         client,
         host: host.to_owned(),
         settings: settings.clone(),
         session,
+        activity,
     };
     crate::xhttp::XhttpWriter::packets_with(Box::new(post), settings)
 }

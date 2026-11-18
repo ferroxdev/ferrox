@@ -1775,6 +1775,12 @@ struct UdpLane {
     last_used: Arc<AtomicU64>,
 }
 
+impl Drop for UdpLane {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static LAST_SERVER_DATAGRAM: std::cell::Cell<Option<(usize, usize)>> =
@@ -2647,10 +2653,9 @@ fn lane_reply(
     key: &(String, u16),
     remote: SocketAddr,
 ) -> bool {
-    match winners.get(key) {
-        Some((won, _)) if *won != remote => false,
-        Some(_) => true,
-        None => {
+    match winners.get(key).map(|(won, _)| *won) {
+        Some(won) if won != remote => false,
+        _ => {
             winners.insert(key.clone(), (remote, StdInstant::now()));
             true
         }
@@ -2738,7 +2743,12 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     let port = local.port();
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     if let Ok(mut table) = routes.lock() {
-        table.insert(port, reply_tx.clone());
+        match table.entry(port) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(reply_tx.clone());
+            }
+            std::collections::hash_map::Entry::Occupied(_) => return,
+        }
     }
     let _ = relay.set_read_timeout(Some(LANE_TICK));
     if let Some(associate) = associate {
@@ -2851,7 +2861,12 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
     let port = local.port();
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     if let Ok(mut table) = routes.lock() {
-        table.insert(port, reply_tx);
+        match table.entry(port) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(reply_tx);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => return,
+        }
     }
     let _ = relay.set_read_timeout(Some(LANE_TICK));
     let mut buf = crate::proxy::udp_buffer();

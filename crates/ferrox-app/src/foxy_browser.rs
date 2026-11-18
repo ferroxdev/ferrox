@@ -132,6 +132,9 @@ pub(crate) fn login(email: &str, token_file: &str, code: Option<&str>, no_open: 
     let Some(verifier) = verifier() else {
         exit("no randomness for the sign-in verifier");
     };
+    let Some(tokens) = TokenFile::new(token_file, email) else {
+        exit("the browser sign-in needs an account email and a token file path");
+    };
     let location = start_url(&endpoint, &verifier);
     if no_open {
         println!("open this in a browser: {location}");
@@ -180,10 +183,9 @@ pub(crate) fn login(email: &str, token_file: &str, code: Option<&str>, no_open: 
         refresh_token: String::new(),
         expires_at,
     };
-    let Some(tokens) = TokenFile::new(token_file, email) else {
-        exit("the browser sign-in needs an account email and a token file path");
-    };
-    tokens.save(Some(&auth), None);
+    if !tokens.save(Some(&auth), None) {
+        exit("the grant could not be written to the token file");
+    }
     println!("signed in; the grant is stored in {token_file}, expires_at={expires_at}");
     std::process::exit(0);
 }

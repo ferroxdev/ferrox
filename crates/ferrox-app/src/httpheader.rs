@@ -141,9 +141,9 @@ pub(crate) fn connect(
 }
 
 fn check_response(head: &[u8]) -> Option<()> {
-    let text = std::str::from_utf8(head).ok()?;
-    let mut parts = text.split("\r\n").next()?.split_ascii_whitespace();
-    if parts.next()? != "HTTP/1.1" || parts.next()? != "200" {
+    let line_end = head.windows(2).position(|window| window == b"\r\n")?;
+    let mut parts = head[..line_end].split(|byte| *byte == b' ');
+    if parts.next()? != b"HTTP/1.1" || parts.next()? != b"200" {
         return None;
     }
     Some(())

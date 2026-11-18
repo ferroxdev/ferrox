@@ -190,14 +190,16 @@ impl Nat {
         }
         let key = FlowKey::of(view);
         if !self.fallback.contains_key(&key) && self.fallback.len() >= NAT_MAX {
-            if let Some(oldest) = self
+            let expired = self
                 .fallback
                 .iter()
+                .filter(|(_, last)| now.saturating_duration_since(**last) > NAT_IDLE)
                 .min_by_key(|(_, last)| **last)
-                .map(|(key, _)| *key)
-            {
-                self.fallback.remove(&oldest);
-            }
+                .map(|(key, _)| *key);
+            let Some(oldest) = expired else {
+                return;
+            };
+            self.fallback.remove(&oldest);
         }
         self.fallback.insert(key, now);
     }

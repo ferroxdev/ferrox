@@ -1016,7 +1016,11 @@ pub(crate) fn verify_endpoint(
     timeout: Duration,
     noise: crate::noize::WireGuardNoize,
 ) -> Option<Duration> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    let bind = match endpoint {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    };
+    let socket = UdpSocket::bind(bind).ok()?;
     let started = Instant::now();
     noise.send_before(|packet| {
         let _ = socket.send_to(packet, endpoint);

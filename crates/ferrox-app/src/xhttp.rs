@@ -683,7 +683,10 @@ impl Packets {
 
     fn finish(&self) -> bool {
         self.up.closed.store(true, Ordering::SeqCst);
-        self.up.cv.notify_all();
+        if let Ok(_queue) = self.up.queue.lock() {
+            self.up.cv.notify_all();
+        }
+
         let poster = self.poster.lock().ok().and_then(|mut poster| poster.take());
         if let Some(poster) = poster {
             let _ = poster.join();
@@ -700,7 +703,15 @@ impl Drop for Packets {
 
 impl Packer {
     fn max(&self) -> usize {
-        self.settings.sc_max_each_post.max(1)
+        let requested = self.settings.sc_max_each_post.max(1);
+        match self.settings.uplink_data_placement {
+            Placement::Header | Placement::Cookie => {
+                // Base64url expands by 4/3 and the head carries fixed fields and a padding run.
+                let room = HEAD_LIMIT.saturating_sub(8 * 1024);
+                requested.min(room / 4 * 3).max(1)
+            }
+            _ => requested,
+        }
     }
 
     /// The reference's pipe batches every write that lands while a POST is in flight (`dialer.go:489`), so a full pipe becomes one POST instead of one POST per relay window.
@@ -729,11 +740,18 @@ impl Packer {
         crate::proxy::Push::Took(take)
     }
 
+    fn fail(&self) {
+        self.failed.store(true, Ordering::SeqCst);
+        if let Ok(_queue) = self.queue.lock() {
+            self.cv.notify_all();
+        }
+    }
+
     fn pump(&self) {
         let mut spare = Vec::new();
         loop {
             let Ok(mut queue) = self.queue.lock() else {
-                self.failed.store(true, Ordering::SeqCst);
+                self.fail();
                 return;
             };
             while queue.is_empty() && !self.closed.load(Ordering::SeqCst) {
@@ -755,12 +773,11 @@ impl Packer {
             self.cv.notify_all();
             drop(queue);
             let Ok(mut transport) = self.transport.lock() else {
-                self.failed.store(true, Ordering::SeqCst);
+                self.fail();
                 return;
             };
             if !self.post(&mut **transport, &piece) {
-                self.failed.store(true, Ordering::SeqCst);
-                self.cv.notify_all();
+                self.fail();
                 return;
             }
             spare = piece;
@@ -1012,8 +1029,9 @@ impl XhttpWriter {
         host: &str,
         settings: &XhttpSettings,
         session: String,
+        activity: Arc<crate::quic::Activity>,
     ) -> Self {
-        crate::xhttp_h3::packets(client, host, settings, session)
+        crate::xhttp_h3::packets(client, host, settings, session, activity)
     }
     pub(crate) fn packets_with(post: Box<dyn PacketPost + Send>, settings: &XhttpSettings) -> Self {
         let up = Arc::new(Packer {

@@ -116,6 +116,8 @@ fn through_tunnel<T: Read + Write>(tunnel: &mut T, host: &str, path: &str) -> Op
             Ok(read) => head.extend_from_slice(&chunk[..read]),
         }
     }
+    // A head that never ended is a failed read, not a short response.
+    ferrox_core::foxy::head_end_grown(&head, &mut scanned)?;
     // Drain the body so the next request on this flow starts after this one ended.
     if ferrox_core::foxy::head_end_grown(&head, &mut scanned).is_some() {
         while head.len() < 64 * 1024 && Instant::now() < deadline {
@@ -131,7 +133,9 @@ fn through_tunnel<T: Read + Write>(tunnel: &mut T, host: &str, path: &str) -> Op
 fn opened<T: Read + Write>(tunnel: &mut T, country: &str) -> Option<String> {
     let trace = through_tunnel(tunnel, TRACE_HOST, TRACE_PATH)?;
     let seen = crate::foxy::exit_country(trace.as_bytes())?;
-    (seen.eq_ignore_ascii_case(country) || seen == "T1" || country == "REC").then_some(seen)
+    (seen.eq_ignore_ascii_case(country)
+        || ((seen == "T1" || seen == "REC") && (country.is_empty() || country == "REC")))
+        .then_some(seen)
 }
 
 /// One carrier on one edge, as the lane would dial it.
@@ -260,9 +264,16 @@ fn carried(
 }
 
 /// The plane's counter after a charge has landed: mint until two mints agree, so a figure read before the plane wrote it is not read as the charge.
-fn settled(account: &Account, mut was: u64) -> u64 {
+fn settled(account: &Account, mut was: u64, deadline: Instant) -> u64 {
     for _ in 0..SETTLE_MINTS {
-        std::thread::sleep(SETTLE);
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return was;
+        }
+        std::thread::sleep(SETTLE.min(left));
+        if Instant::now() >= deadline {
+            return was;
+        }
         account
             .renew()
             .expect("mints a pass while the counter settles");
@@ -309,7 +320,7 @@ fn canceled(
         until,
     )?;
     std::thread::sleep(SETTLE);
-    let charged = was.saturating_sub(settled(account, was));
+    let charged = was.saturating_sub(settled(account, was, deadline));
     let (whole, fraction) = per_byte(charged, read as u64);
     println!(
         "closed {PAYLOAD_HOST}{} after {read} bytes: {charged} charged ({whole}.{fraction:03}x) for a canceled flow",
@@ -329,9 +340,9 @@ fn brackets(
     let mut was = pass
         .quota_remaining
         .ok_or("the plane names no allowance; without one there is nothing to charge")?;
-    was = settled(account, was);
+    was = settled(account, was, deadline);
     std::thread::sleep(IDLE);
-    let idle = settled(account, was);
+    let idle = settled(account, was, deadline);
     let drained = was.saturating_sub(idle);
     println!(
         "idle {:.0}s through {carrier:?}: {drained} bytes charged with no flow",
@@ -356,7 +367,7 @@ fn brackets(
         },
         until,
     )?;
-    let now = settled(account, was);
+    let now = settled(account, was, deadline);
     let fixed = was.saturating_sub(now);
     println!(
         "HEAD {PAYLOAD_HOST}{}: {head} bytes carried, {fixed} charged",
@@ -384,7 +395,7 @@ fn brackets(
             return Err(format!("{path}: {bytes} bytes is not a payload"));
         }
         let bytes = bytes as u64;
-        let now = settled(account, was);
+        let now = settled(account, was, deadline);
         let charged = was.saturating_sub(now);
         let (whole, fraction) = per_byte(charged, bytes);
         println!(

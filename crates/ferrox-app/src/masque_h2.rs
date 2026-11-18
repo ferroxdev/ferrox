@@ -1181,6 +1181,7 @@ struct Session {
     addrs: Vec<IpAddr>,
     udp: Option<masque::UdpLane>,
     warp: bool,
+    half_closed: bool,
     end: bool,
 }
 
@@ -1205,6 +1206,7 @@ impl Session {
             addrs: Vec::new(),
             udp: None,
             warp: false,
+            half_closed: false,
             end: false,
         }
     }
@@ -1222,6 +1224,8 @@ impl Session {
     /// Serve buffered frames until the wire closes or the deadline passes before a request.
     fn run_until(&mut self, wire: &mut Wire, deadline: Instant) {
         let mut settings = Vec::new();
+        settings.extend_from_slice(&h2::S_MAX_CONCURRENT.to_be_bytes());
+        settings.extend_from_slice(&1u32.to_be_bytes());
         settings.extend_from_slice(&SETTINGS_ENABLE_CONNECT.to_be_bytes());
         settings.extend_from_slice(&1u32.to_be_bytes());
         wire.send(h2::T_SETTINGS, 0, 0, &settings);
@@ -1309,12 +1313,17 @@ impl Session {
                 if let Some(active) = self.request {
                     if id != active {
                         wire.send(h2::T_RST, 0, id, &7u32.to_be_bytes());
+                    } else if flags & h2::F_END != 0 {
+                        self.half_closed = true;
                     }
                     return;
                 }
                 let block = strip_padding(flags, body, true);
                 if flags & h2::F_END_HEADERS != 0 {
                     self.request(wire, id, block);
+                    if flags & h2::F_END != 0 {
+                        self.half_closed = true;
+                    }
                 } else {
                     self.continuation = Some((id, block.to_vec(), flags));
                 }
@@ -1333,6 +1342,9 @@ impl Session {
                     block.extend_from_slice(data);
                     if flags & h2::F_END_HEADERS != 0 {
                         self.request(wire, id, &block);
+                        if head_flags & h2::F_END != 0 {
+                            self.half_closed = true;
+                        }
                     } else {
                         self.continuation = Some((id, block, head_flags));
                     }
@@ -1340,6 +1352,11 @@ impl Session {
             }
             h2::T_DATA => {
                 if Some(id) != self.request {
+                    if let Ok(length) = u32::try_from(body.len()) {
+                        if length != 0 {
+                            wire.send(h2::T_WINDOW, 0, 0, &length.to_be_bytes());
+                        }
+                    }
                     return;
                 }
                 let length = body.len();
@@ -1347,7 +1364,7 @@ impl Session {
                 self.window(wire, length);
                 self.capsules(wire, data);
                 if flags & h2::F_END != 0 {
-                    self.end = true;
+                    self.half_closed = true;
                 }
             }
             h2::T_RST if Some(id) == self.request => self.end = true,
@@ -1358,9 +1375,16 @@ impl Session {
 
     fn request(&mut self, wire: &mut Wire, id: u32, block: &[u8]) {
         let mut fields = Vec::new();
+        let mut expanded = 0usize;
+        let mut overflow = false;
         let decoded = self
             .decoder
             .decode(block, &mut |name, value| {
+                expanded = expanded.saturating_add(name.len() + value.len());
+                if overflow || fields.len() >= 128 || expanded > h2::HEAD_CAP {
+                    overflow = true;
+                    return;
+                }
                 fields.push((name.to_vec(), value.to_vec()));
             })
             .is_some();
@@ -1392,8 +1416,8 @@ impl Session {
             || field(b"capsule-protocol")
                 .and_then(|value| value.strip_prefix(b"?"))
                 .is_some_and(|value| value.split(|byte| *byte == b';').next() == Some(b"1"));
-        if !decoded {
-            self.reply(wire, id, 400, udp);
+        if !decoded || overflow {
+            self.reply(wire, id, 400, false);
             return;
         }
         if !path_ok {
@@ -1613,18 +1637,29 @@ impl Session {
                 self.queued_at = 0;
             }
         }
+        let mut origin_closed = self.half_closed && self.udp.is_some();
         for _ in 0..QUEUED_CAP {
             // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
             if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
                 break;
             }
-            let Some(packet) = (if let Some(udp) = &self.udp {
+            let packet = if let Some(udp) = &self.udp {
                 udp.try_recv()
             } else {
-                self.outgoing
+                match self
+                    .outgoing
                     .as_ref()
-                    .and_then(|outgoing| outgoing.try_recv().ok())
-            }) else {
+                    .map(std::sync::mpsc::Receiver::try_recv)
+                {
+                    Some(Ok(packet)) => Some(packet),
+                    Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                        origin_closed = true;
+                        None
+                    }
+                    _ => None,
+                }
+            };
+            let Some(packet) = packet else {
                 break;
             };
             let Some(id) = self.request else {
@@ -1640,6 +1675,12 @@ impl Session {
             self.send(wire, &frame);
         }
         self.frame = frame;
+        if self.half_closed && origin_closed && self.queued.is_empty() && !wire.closed {
+            if let Some(id) = self.request {
+                wire.send(h2::T_DATA, h2::F_END, id, &[]);
+                self.end = true;
+            }
+        }
         if self.request.is_some() && !wire.closed && self.queued.is_empty() {
             wire.deadline.clear();
         }
@@ -2334,7 +2375,7 @@ mod tests {
         assert!(session.end, "the handshake clock ended the session");
         assert_eq!(
             out.lock().expect("a recorder").len(),
-            15,
+            21,
             "the due clock stopped before the ping was answered"
         );
     }
@@ -2363,7 +2404,7 @@ mod tests {
         assert!(session.end, "the handshake clock ended the session");
         assert_eq!(
             out.lock().expect("a gate").len(),
-            32,
+            38,
             "the due clock stopped before the second ping was answered"
         );
     }
@@ -2423,6 +2464,10 @@ mod tests {
         assert!(
             out.lock().expect("a recorder").is_empty(),
             "an empty DATA frame credits nothing"
+        );
+        assert!(
+            session.half_closed && !session.end,
+            "a client half-close leaves the reply direction live"
         );
     }
 

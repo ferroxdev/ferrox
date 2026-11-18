@@ -61,7 +61,8 @@ const WIDE_PASS: usize = 32;
 
 fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {
     let len = buf.len();
-    let (src, dst) = (buf.as_ptr(), buf.as_mut_ptr());
+    let dst = buf.as_mut_ptr();
+    let src = dst.cast_const();
     // SAFETY: both pointers name the buffer itself, and the ladder reads each chunk before that same chunk's store at the identical offset — the old in-place read-modify-write.
     #[cfg(target_arch = "x86_64")]
     if len >= WIDE_PASS && std::is_x86_feature_detected!("avx2") {
@@ -434,10 +435,9 @@ impl<R: Read> WsReader<R> {
                     // A split's poll with no lane above it: sleep a grain and keep the wait blocking.
                     None => std::thread::sleep(crate::budgets::RELAY_POLL),
                 },
-                Err(_) => {
+                Err(error) => {
                     self.have.truncate(base);
-                    self.eof = true;
-                    break 0;
+                    return Err(error);
                 }
             }
         };
@@ -461,6 +461,17 @@ impl<R: Read> WsReader<R> {
             let fin = head[0] & 0x80 != 0;
             let opcode = head[0] & 0x0F;
             let masked = head[1] & 0x80 != 0;
+            if head[0] & 0x70 != 0
+                || !matches!(
+                    opcode,
+                    OP_CONT | OP_TEXT | OP_DATA | OP_CLOSE | OP_PING | OP_PONG
+                )
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "websocket frame is malformed",
+                ));
+            }
             let marker = usize::from(head[1] & 0x7F);
             let ext_len = if marker == 126 {
                 2
@@ -482,13 +493,25 @@ impl<R: Read> WsReader<R> {
             } else if marker == 127 {
                 let mut raw = [0u8; 8];
                 raw.copy_from_slice(&self.have[at + 2..at + 10]);
+                if raw[0] & 0x80 != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "websocket frame length is malformed",
+                    ));
+                }
                 let Ok(wide) = usize::try_from(u64::from_be_bytes(raw)) else {
-                    return Ok(None);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "websocket frame is too large",
+                    ));
                 };
                 len = wide;
             }
             if len > FRAME_LIMIT || (opcode & 0x08 != 0 && (len > 125 || !fin)) {
-                return Ok(None);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "websocket frame is too large",
+                ));
             }
             if avail < head_len + len {
                 if !fill || self.eof || !self.pull(head_len + len)? {
@@ -763,6 +786,7 @@ impl WsWriter {
         };
         if self.shared.open.load(Ordering::Relaxed) != 0
             || self.shared.cut.load(Ordering::Relaxed) != 0
+            || self.shared.closed.load(Ordering::SeqCst)
         {
             return false;
         }
@@ -778,6 +802,7 @@ impl WsWriter {
         };
         if self.shared.open.load(Ordering::Relaxed) != 0
             || self.shared.cut.load(Ordering::Relaxed) != 0
+            || self.shared.closed.load(Ordering::SeqCst)
         {
             return false;
         }
@@ -794,6 +819,7 @@ impl WsWriter {
         if self.masked {
             if self.shared.open.load(Ordering::Relaxed) != 0
                 || self.shared.cut.load(Ordering::Relaxed) != 0
+                || self.shared.closed.load(Ordering::SeqCst)
             {
                 return crate::proxy::Push::Parked;
             }
@@ -1043,10 +1069,30 @@ fn check_request<'a>(head: &'a [u8], path: &str) -> Option<Upgrade<'a>> {
     if crate::proxy::request_path_in(text)? != path {
         return None;
     }
-    let [key, offered] =
-        crate::proxy::header_values_in(text, ["sec-websocket-key", "sec-websocket-protocol"]);
+    let [key, offered, upgrade, connection, version] = crate::proxy::header_values_in(
+        text,
+        [
+            "sec-websocket-key",
+            "sec-websocket-protocol",
+            "upgrade",
+            "connection",
+            "sec-websocket-version",
+        ],
+    );
     let key = key?;
-    if key.is_empty() {
+    if key.is_empty()
+        || !upgrade.is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("websocket"))
+        })
+        || !connection.is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        })
+        || version != Some("13")
+    {
         return None;
     }
     let offered = offered.unwrap_or_default();
@@ -1127,15 +1173,37 @@ pub(crate) fn connect(
 }
 
 fn check_response(head: &[u8], key: &[u8]) -> Option<()> {
-    let text = std::str::from_utf8(head).ok()?;
-    if text.split("\r\n").next()?.split(' ').nth(1)? != "101" {
+    let line_end = head.windows(2).position(|window| window == b"\r\n")?;
+    let mut parts = head[..line_end].split(|byte| *byte == b' ');
+    if parts.next()? != b"HTTP/1.1" || parts.next()? != b"101" {
         return None;
     }
     let accept = accept_key(base64_text(key));
-    if crate::proxy::header_value_in(text, "sec-websocket-accept")?.as_bytes() != accept {
-        return None;
+    let mut rest = &head[line_end + 2..];
+    while !rest.is_empty() {
+        let end = rest
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .unwrap_or(rest.len());
+        let line = &rest[..end];
+        if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+            if line[..colon].eq_ignore_ascii_case(b"sec-websocket-accept") {
+                let value = &line[colon + 1..];
+                let start = value
+                    .iter()
+                    .position(|byte| !byte.is_ascii_whitespace())
+                    .unwrap_or(value.len());
+                let value = &value[start..];
+                let end = value
+                    .iter()
+                    .rposition(|byte| !byte.is_ascii_whitespace())
+                    .map_or(0, |at| at + 1);
+                return (value[..end] == accept).then_some(());
+            }
+        }
+        rest = rest.get(end + 2..).unwrap_or(&[]);
     }
-    Some(())
+    None
 }
 
 // The same connect over halves that cannot peek: the kept read takes what rode in behind the `101`.
@@ -2844,7 +2912,7 @@ mod tests {
     /// The record arm takes the buffer its own head read filled, head octets and all: what rode behind the delimiter is handed over inside it, not copied into a second owner.
     #[test]
     fn the_record_head_hands_over_the_buffer_it_filled() {
-        const HEAD: &[u8] = b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+        const HEAD: &[u8] = b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
         const TAIL: &[u8] = b"\x82\x02hi";
         let mut wire = Vec::from(HEAD);
         wire.extend_from_slice(TAIL);
@@ -2866,7 +2934,7 @@ mod tests {
     /// The kept head hands the reader its own buffer with the head already walked past: a frame that rode in with the handshake is delivered without asking the socket, and its bytes never move.
     #[test]
     fn a_frame_that_rode_in_with_the_head_costs_no_syscall() {
-        const HEAD: &[u8] = b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+        const HEAD: &[u8] = b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
         let mut have = Vec::from(HEAD);
         have.extend_from_slice(b"\x82\x02hi\x82\x02yo");
         let base = have.as_ptr();
@@ -2901,7 +2969,7 @@ mod tests {
         };
         assert!(write_frame(&mut frame, true, OP_DATA, b"pong"));
         let mut wire = Vec::from(
-            &b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: cGluZw\r\n\r\n"[..],
+            &b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: cGluZw\r\n\r\n"[..],
         );
         wire.extend_from_slice(&frame.kept);
         let (mut reader, _writer) =
@@ -2960,7 +3028,7 @@ mod tests {
         let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .write_all(b"GET /interop-ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
-                         Connection: Upgrade\r\nSec-WebSocket-Key: aGVsbG8gd29ybGQxMjM0NQ==\r\n\r\n")
+                         Connection: Upgrade\r\nSec-WebSocket-Key: aGVsbG8gd29ybGQxMjM0NQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
             .expect("writes");
         server.join().expect("joins");
         drop(stream);

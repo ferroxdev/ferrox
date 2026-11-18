@@ -2231,7 +2231,10 @@ fn send_stream(
                     return Ok(());
                 }
             }
-            Err(quiche::Error::Done) => return Ok(()),
+            Err(quiche::Error::Done) if rest.is_empty() => return Ok(()),
+            Err(quiche::Error::Done) => {
+                return Err("masque: the stream stopped accepting a frame".to_owned());
+            }
             Err(error) => return Err(format!("masque: cannot write the stream: {error}")),
         }
     }
@@ -4107,7 +4110,10 @@ fn accept(
         frames::quic_varint(&mut head, frames::H3_HEADERS);
         frames::quic_varint(&mut head, block.len() as u64);
         head.extend_from_slice(&block);
-        send_stream(conn, stream, &head, false).ok();
+        if send_stream(conn, stream, &head, false).is_err() {
+            reject(tunnel, 503);
+            return;
+        }
         return;
     }
     let Some(addrs) = assign(shared) else {
@@ -4132,13 +4138,21 @@ fn accept(
     frames::quic_varint(&mut head, frames::H3_HEADERS);
     frames::quic_varint(&mut head, block.len() as u64);
     head.extend_from_slice(&block);
-    send_stream(conn, stream, &head, false).ok();
+    if send_stream(conn, stream, &head, false).is_err() {
+        reject(tunnel, 503);
+        return;
+    }
     let mut control = Vec::new();
     connectip::address_assign_encode(&assignments, &mut control);
-    send_data(conn, stream, &control).ok();
+    if send_data(conn, stream, &control).is_err() {
+        reject(tunnel, 503);
+        return;
+    }
     control.clear();
     connectip::route_advert_encode(&routes(&tunnel.addrs), &mut control);
-    send_data(conn, stream, &control).ok();
+    if send_data(conn, stream, &control).is_err() {
+        reject(tunnel, 503);
+    }
 }
 
 /// One address per family from the pool, or `None` when it has none left.

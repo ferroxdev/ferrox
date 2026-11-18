@@ -200,14 +200,12 @@ pub(crate) fn masque_candidates(mode: ScanMode) -> Vec<SocketAddr> {
     };
     for seed in &seeds {
         push(*seed, MASQUE_PORTS[0]);
-    }
-    for ip in sample_prefixes(&MASQUE_PREFIXES_V4, strategy.full_subnet, strategy.sample) {
-        push(ip, MASQUE_PORTS[0]);
-    }
-    for seed in &seeds {
         for &port in &MASQUE_PORTS[1..] {
             push(*seed, port);
         }
+    }
+    for ip in sample_prefixes(&MASQUE_PREFIXES_V4, strategy.full_subnet, strategy.sample) {
+        push(ip, MASQUE_PORTS[0]);
     }
     out
 }

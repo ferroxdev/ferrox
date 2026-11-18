@@ -175,8 +175,8 @@ impl TokenFile {
     }
 
     /// Best-effort and owner-only: a session that cannot be written costs the next launch a sign-in, which is a line, not a failed lane.
-    pub(crate) fn save(&self, auth: Option<&Auth>, pending: Option<&str>) {
-        self.save_pending(auth, pending, None);
+    pub(crate) fn save(&self, auth: Option<&Auth>, pending: Option<&str>) -> bool {
+        self.save_pending(auth, pending, None)
     }
 
     fn save_pending(
@@ -184,7 +184,7 @@ impl TokenFile {
         auth: Option<&Auth>,
         pending: Option<&str>,
         pending_method: Option<&str>,
-    ) {
+    ) -> bool {
         use crate::json::{self, Json};
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -214,7 +214,10 @@ impl TokenFile {
         let mut opened = None;
         for _ in 0..8 {
             let mut raw = [0u8; 8];
-            let _ = getrandom::fill(&mut raw);
+            if getrandom::fill(&mut raw).is_err() {
+                eprintln!("foxy: no randomness for the session file name");
+                return false;
+            }
             let mut temp = self.path.clone().into_os_string();
             temp.push(format!(
                 ".{}.{}.tmp",
@@ -240,13 +243,13 @@ impl TokenFile {
         }
         let Some((mut file, temp)) = opened else {
             eprintln!("foxy: cannot write the session to {}", self.path.display());
-            return;
+            return false;
         };
         if file.write_all(text.as_bytes()).is_err() {
             eprintln!("foxy: cannot write the session to {}", self.path.display());
             drop(file);
             let _ = std::fs::remove_file(&temp);
-            return;
+            return false;
         }
         #[cfg(unix)]
         {
@@ -257,7 +260,9 @@ impl TokenFile {
         if std::fs::rename(&temp, &self.path).is_err() {
             eprintln!("foxy: cannot write the session to {}", self.path.display());
             let _ = std::fs::remove_file(&temp);
+            return false;
         }
+        true
     }
 
     /// Another process refreshes a rotating grant in this file, so a token this launch loaded may already be spent; the pair the file names instead is the one to spend.
@@ -269,9 +274,11 @@ impl TokenFile {
 
     /// The refused grant only stops a future launch when the file still holds it; a grant another process rotated in since is left alone.
     pub(crate) fn clear_if(&self, refused: &str) {
-        let same = self
-            .load()
-            .is_none_or(|session| session.auth.is_none_or(|auth| auth.access_token == refused));
+        let same = self.load().is_some_and(|session| {
+            session
+                .auth
+                .is_some_and(|auth| auth.access_token == refused)
+        });
         if same {
             self.clear();
         }
@@ -2164,18 +2171,17 @@ impl Account {
 
     /// Forgets a grant the plane refused, so the next launch asks for the password instead of replaying a dead token.
     pub(crate) fn forget(&self) {
-        let refused = self
-            .auth
-            .lock()
-            .map(|auth| auth.access_token.clone())
-            .unwrap_or_default();
-        if let Ok(mut auth) = self.auth.lock() {
+        let refused = if let Ok(mut auth) = self.auth.lock() {
+            let refused = auth.access_token.clone();
             *auth = Auth {
                 access_token: String::new(),
                 refresh_token: String::new(),
                 expires_at: 0,
             };
-        }
+            refused
+        } else {
+            return;
+        };
         if let Some(tokens) = &self.tokens {
             tokens.clear_if(&refused);
         }
