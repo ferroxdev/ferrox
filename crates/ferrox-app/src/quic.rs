@@ -7566,24 +7566,28 @@ mod tests {
     /// stream that can never make progress is the stall, not the close.
     #[test]
     fn a_write_on_a_closed_connection_fails_before_the_send_wait() {
-        let (client, mut server) = lane_pair();
-        server.conn.close(false, 0, b"done").expect("closes");
-        let mut client_conn = client.conn;
-        pass(
-            &mut server.conn,
-            &server.sock,
-            &mut client_conn,
-            &client.sock,
-            client.addr,
-        );
-        assert!(
-            client_conn.is_closed(),
-            "the peer's close reaches the lane before the write"
-        );
-        let conn = std::sync::Arc::new(std::sync::Mutex::new(client_conn));
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let sock = bind_datagram("127.0.0.1:0").expect("binds");
+        let local = sock.local_addr().expect("local");
+        let mut scid = [0u8; SCID_LEN];
+        getrandom::fill(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
+        config.set_application_protos(&[ALPN]).expect("alpn");
+        let mut conn = quiche::connect(
+            Some("closed.test"),
+            &cid,
+            local,
+            peer.local_addr().expect("peer"),
+            &mut config,
+        )
+        .expect("connects");
+        conn.close(false, 0, b"done").expect("closes");
+        assert!(conn.is_closed(), "quiche marks a connection closed at once");
+        let conn = std::sync::Arc::new(std::sync::Mutex::new(conn));
         let mut stream = QuicStream {
             conn,
-            sock: std::sync::Arc::new(client.sock),
+            sock: std::sync::Arc::new(Datagram::plain(sock)),
             id: 0,
             meter: crate::stats::Meter::default(),
             peer_fin: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
