@@ -1072,8 +1072,18 @@ pub(crate) fn pump_relay_carried<R, W>(
     let mut writer = writer;
     let mut buf = vec![0u8; uplink_buffer_len(&send)];
     let up_flow = std::sync::Arc::clone(&flow);
+    let up_close = std::sync::Arc::clone(close);
     crate::proxy::lane_pool::submit(
-        Box::new(move || uplink_step(&mut plain_read, &mut buf, &mut send, &mut writer, &up_flow)),
+        Box::new(move || {
+            uplink_step(
+                &mut plain_read,
+                &mut buf,
+                &mut send,
+                &mut writer,
+                &up_flow,
+                &up_close,
+            )
+        }),
         Box::new(crate::proxy::stream_lane_done(&flow)),
     );
     let mut reader = reader;
@@ -1094,6 +1104,7 @@ fn uplink_step(
     send: &mut Uplink,
     writer: &mut dyn Write,
     flow: &crate::proxy::RelayFinish,
+    close: &(dyn Fn() + Send + Sync),
 ) -> crate::proxy::lane_pool::Next {
     let read = match send {
         Uplink::Aead(_) => read_slots(plain_read, buf),
@@ -1111,7 +1122,10 @@ fn uplink_step(
         {
             crate::proxy::lane_pool::Next::Idle
         }
-        Ok(_) | Err(_) => crate::proxy::lane_pool::Next::Done,
+        Ok(_) | Err(_) => {
+            close();
+            crate::proxy::lane_pool::Next::Done
+        }
     }
 }
 
@@ -4133,6 +4147,48 @@ mod tests {
         );
     }
 
+    /// A carrier write that fails is not a healthy upload EOF: the stream closes at once instead of waiting for the downlink's reply grace.
+    #[test]
+    fn a_failed_carrier_write_closes_the_stream() {
+        struct Refuse;
+        impl Write for Refuse {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let mut client =
+            std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connects");
+        let (server, _) = listener.accept().expect("accepts");
+        client.write_all(b"payload").expect("writes");
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&closed);
+        let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let salt = [7u8; SALT_LEN];
+        let mut send = Uplink::Aead(
+            Cipher::new(Method::Aes256Gcm, "an-example-shared-password", &salt).expect("derives"),
+        );
+        let mut buf = vec![0u8; uplink_buffer_len(&send)];
+        let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::clone(&close), None);
+        assert_eq!(
+            crate::proxy::lane_pool::Next::Done,
+            uplink_step(
+                &mut Connection::Tcp(server),
+                &mut buf,
+                &mut send,
+                &mut Refuse,
+                &flow,
+                &*close,
+            )
+        );
+        assert!(closed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
     /// A chunk sealed into the carrier is progress too: a download that pauses after the upload ended keeps its lane while it still seals.
     #[test]
     fn a_sealed_chunk_restarts_the_reply_grace() {
@@ -4165,6 +4221,7 @@ mod tests {
             &mut send,
             &mut wire,
             &flow,
+            &|| {},
         );
         assert_eq!(crate::proxy::lane_pool::Next::More, next);
         assert!(!wire.is_empty(), "the chunk reached the carrier");

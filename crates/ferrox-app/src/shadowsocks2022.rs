@@ -974,6 +974,7 @@ fn pump_relay_carried_inner<R, W>(
     let mut writer = writer;
     let mut buf = crate::proxy::RelayBuf::with_len(SEAL_HEAD + READ_CHUNK + TAG_LEN);
     let up_flow = std::sync::Arc::clone(&flow);
+    let up_close = std::sync::Arc::clone(close);
     crate::proxy::lane_pool::submit(
         Box::new(move || {
             let next = uplink_step(
@@ -982,6 +983,7 @@ fn pump_relay_carried_inner<R, W>(
                 &mut outbound,
                 &mut writer,
                 &up_flow,
+                &up_close,
             );
             if next == crate::proxy::lane_pool::Next::Idle {
                 crate::proxy::note_wait_finish(&up_flow);
@@ -1014,6 +1016,7 @@ fn uplink_step(
     outbound: &mut Outbound,
     writer: &mut dyn Write,
     flow: &crate::proxy::RelayFinish,
+    close: &(dyn Fn() + Send + Sync),
 ) -> crate::proxy::lane_pool::Next {
     let read = plain_read.read(&mut buf[SEAL_HEAD..SEAL_HEAD + READ_CHUNK]);
     let sealed = match read {
@@ -1047,6 +1050,7 @@ fn uplink_step(
         flow.mark_progress();
         crate::proxy::lane_pool::Next::More
     } else {
+        close();
         crate::proxy::lane_pool::Next::Done
     }
 }

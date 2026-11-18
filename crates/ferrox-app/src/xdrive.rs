@@ -2032,12 +2032,10 @@ impl SlotWriter {
             .stack_size(WORKER_STACK)
             .spawn(move || writer.upload(seq, chunk))
             .map_err(|error| {
-                self.release_room();
                 let message = format!("slot {seq} failed to start: {error}");
                 self.fail(message.clone());
-                if self.drained(seq).unwrap_or(false) {
-                    let _ = self.set_frame(seq, SLOT_ERR, &[]);
-                }
+                self.release_room();
+                self.signal_error(seq);
                 carrier_error(message)
             })?;
         Ok(())
@@ -2099,7 +2097,7 @@ impl SlotWriter {
             Err(_) if self.done.load(Ordering::Acquire) => {}
             Err(why) => {
                 self.fail(format!("slot {seq} failed: {why}"));
-                let _ = self.set_frame(seq, SLOT_ERR, &[]);
+                self.signal_error(seq);
             }
         }
         self.release_room();
@@ -2194,6 +2192,27 @@ impl SlotWriter {
         drop(state);
         self.room.notify_all();
         self.wake.ring();
+    }
+
+    /// Leave the peer a terminal frame once the slot it names is safe to reuse, without holding up the caller that saw the failure.
+    fn signal_error(self: &Arc<Self>, seq: u64) {
+        if self.drained(seq).unwrap_or(false) {
+            let _ = self.set_frame(seq, SLOT_ERR, &[]);
+            return;
+        }
+        let writer = Arc::clone(self);
+        let _ = std::thread::Builder::new()
+            .stack_size(WORKER_STACK)
+            .spawn(move || {
+                let started = Instant::now();
+                while started.elapsed() < SLOT_STALL && !writer.ended.load(Ordering::Acquire) {
+                    if writer.drained(seq).unwrap_or(false) {
+                        let _ = writer.set_frame(seq, SLOT_ERR, &[]);
+                        return;
+                    }
+                    std::thread::sleep(SLOT_ACK_RETRY);
+                }
+            });
     }
 
     fn failed(&self) -> bool {
