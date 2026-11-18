@@ -3,13 +3,13 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
-use std::net::{Ipv6Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::args::die;
-use crate::config::{fronts, port_of, Ports};
+use crate::config::{front_listeners, fronts, port_of, Ports};
 use crate::paths::{read_trim, read_trim_checked, secure_dir, write_private, Paths};
 
 fn bin_name() -> &'static str {
@@ -370,21 +370,40 @@ pub fn stop(paths: &Paths) -> Result<(), String> {
     }
 }
 
-pub fn port_open(port: u16) -> bool {
-    let v4 = SocketAddr::from(([127, 0, 0, 1], port));
-    if TcpStream::connect_timeout(&v4, Duration::from_millis(300)).is_ok() {
-        return true;
+fn probe_addresses(listen: &str, port: u16) -> Vec<SocketAddr> {
+    match listen.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) if ip.is_unspecified() => {
+            vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]
+        }
+        Ok(IpAddr::V4(ip)) => vec![SocketAddr::from((ip, port))],
+        Ok(IpAddr::V6(ip)) if ip.is_unspecified() => {
+            vec![SocketAddr::from((Ipv6Addr::LOCALHOST, port))]
+        }
+        Ok(IpAddr::V6(ip)) => vec![SocketAddr::from((ip, port))],
+        Err(_) => vec![
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+        ],
     }
-    let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
-    TcpStream::connect_timeout(&v6, Duration::from_millis(300)).is_ok()
+}
+
+pub fn port_open(address: &str, port: u16) -> bool {
+    probe_addresses(address, port)
+        .into_iter()
+        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok())
 }
 
 pub fn wait_fronts(list: &str, ports: Ports, paths: &Paths) -> bool {
+    let listeners = front_listeners(&paths.cfg, list);
     for front in fronts(list) {
+        let listen = listeners
+            .iter()
+            .find(|(name, _)| name == &front)
+            .map_or("", |(_, listen)| listen.as_str());
         let port = port_of(&front, ports);
         let mut opened = false;
         for _ in 0..90 {
-            if port_open(port) {
+            if port_open(listen, port) {
                 opened = true;
                 break;
             }

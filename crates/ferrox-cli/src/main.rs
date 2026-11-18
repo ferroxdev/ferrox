@@ -592,10 +592,30 @@ fn stop_all_lanes(paths: &Paths) -> i32 {
         dirs.push(paths.conf_dir.clone());
     }
     for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                eprintln!(
+                    "ferrox-cli: cannot read {}: {error}; its lanes were not stopped.",
+                    dir.display()
+                );
+                rc = 1;
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    eprintln!(
+                        "ferrox-cli: cannot read a lane entry in {}: {error}",
+                        dir.display()
+                    );
+                    rc = 1;
+                    continue;
+                }
+            };
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(rest) = name.strip_prefix("lane") else {
                 continue;

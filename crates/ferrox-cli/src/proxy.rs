@@ -130,14 +130,21 @@ fn same_owner(text: &str, paths: &Paths) -> bool {
 
 /// A legacy owner names only the shared snapshot, so it cannot say which root armed it; clearing is safe only when no other registered lane is alive.
 fn another_lane_runs(paths: &Paths) -> bool {
-    let Ok(text) = read_trim_checked(&paths.lanes_file) else {
-        return false;
+    let text = match read_trim_checked(&paths.lanes_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
     };
     for dir in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return true,
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true;
+            };
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
@@ -654,6 +661,24 @@ mod tests {
         assert_eq!(owned(&second), Ok(false));
         let _ = std::fs::remove_file(&first.pid_file);
         assert_eq!(owned(&second), Ok(true));
+        let _ = std::fs::remove_dir_all(&shared);
+    }
+
+    #[test]
+    fn a_legacy_snapshot_owner_does_not_clear_an_unreadable_registry() {
+        let shared = workspace("legacy-unreadable-registry");
+        let paths = Paths::with_dirs(shared.join("conf"), shared.clone(), None);
+        std::fs::create_dir_all(&shared).expect("state");
+        crate::paths::write_private(
+            &paths.proxy_owner,
+            &serde_json::to_string(&paths.proxy_state).expect("owner"),
+        )
+        .expect("owner file");
+        let blocker = shared.join("not-a-directory");
+        std::fs::write(&blocker, "not a lane directory").expect("blocker");
+        crate::paths::write_private(&paths.lanes_file, &format!("{}\n", blocker.display()))
+            .expect("lane registry");
+        assert_eq!(owned(&paths), Ok(false));
         let _ = std::fs::remove_dir_all(&shared);
     }
 

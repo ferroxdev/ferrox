@@ -3275,12 +3275,18 @@ pub fn harness_ceiling(connections: usize, payload_size: usize, bytes: u64) -> R
         let pattern = Arc::clone(&pattern);
         move || {
             let deadline = Instant::now() + RUN_TIMEOUT;
+            let mut emitters = Vec::with_capacity(connections);
             for (index, listener) in listeners.into_iter().enumerate() {
                 let Some(stream) = accept_until(&listener, deadline) else {
-                    return;
+                    break;
                 };
                 let flow = Arc::new(rotate(&pattern, index, connections));
-                std::thread::spawn(move || emit(stream, &flow, index, bytes));
+                emitters.push(std::thread::spawn(move || {
+                    emit(stream, &flow, index, bytes)
+                }));
+            }
+            for emitter in emitters {
+                let _ = emitter.join();
             }
         }
     });

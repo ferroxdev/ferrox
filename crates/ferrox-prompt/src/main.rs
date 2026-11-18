@@ -862,6 +862,9 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
         return ExitCode::from(1);
     };
     let ledger = load_ledger(root);
+    if let Some(code) = ledger_refusal(&ledger) {
+        return code;
+    }
     let state = ProjectState::load(root);
 
     // A named row is the work; the template that draws it is then the advisor's choice.
@@ -1122,6 +1125,9 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         return ExitCode::from(1);
     };
     let ledger = load_ledger(root);
+    if let Some(code) = ledger_refusal(&ledger) {
+        return code;
+    }
     let state = ProjectState::load(root);
     let named = match &args.row {
         Some(selector) => match named_row(prompt, &state, library, selector) {
@@ -1370,7 +1376,7 @@ fn report_metadata(
 fn load_ledger(root: &Path) -> Ledger {
     let ledger = Ledger::load(Ledger::path_for(root));
     if let Some(error) = &ledger.read_error {
-        eprintln!("warning: {error}; continuing with an empty history");
+        eprintln!("warning: {error}; the history is incomplete");
     }
     if ledger.skipped > 0 {
         eprintln!(
@@ -1380,6 +1386,13 @@ fn load_ledger(root: &Path) -> Ledger {
         );
     }
     ledger
+}
+
+/// Refuse a choice that would repeat served work because the history could not be read.
+fn ledger_refusal(ledger: &Ledger) -> Option<ExitCode> {
+    let error = ledger.read_error.as_ref()?;
+    eprintln!("{error}; refusing to choose a slice from an unreadable history");
+    Some(ExitCode::from(1))
 }
 
 /// Record progress by rewriting exactly the prompt's `**Status:**` line: reflowing Markdown would fight the contributor's edits.

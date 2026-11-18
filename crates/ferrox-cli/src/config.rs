@@ -505,11 +505,20 @@ fn vmess_outbound(options: &Options) -> Result<Value, String> {
                 .to_owned(),
         );
     }
+    let network = match options.vmess_network.as_str() {
+        "" | "tcp" | "raw" => "tcp",
+        "ws" | "websocket" => "ws",
+        other => {
+            return Err(format!(
+                "`{other}` is not a VMess network here: use tcp or ws, or --config"
+            ));
+        }
+    };
     Ok(json!({
         "protocol": "vmess",
         "settings": {"vnext": [{"address": host, "port": port,
             "users": [{"id": options.vmess_id, "security": "auto"}]}]},
-        "streamSettings": {"network": if options.vmess_network.is_empty() { "tcp" } else { options.vmess_network.as_str() }},
+        "streamSettings": {"network": network},
     }))
 }
 
@@ -654,6 +663,32 @@ pub fn plan_ports(options: &Options, paths: &Paths, scan: bool) -> Ports {
         }
     }
     ports
+}
+
+pub fn front_listeners(path: &Path, list: &str) -> Vec<(String, String)> {
+    let document = read_trim_checked(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let inbounds = document
+        .as_ref()
+        .and_then(|document| document.get("inbounds"))
+        .and_then(Value::as_array);
+    fronts(list)
+        .into_iter()
+        .map(|front| {
+            let listen = inbounds
+                .and_then(|inbounds| {
+                    inbounds.iter().find(|inbound| {
+                        inbound.get("protocol").and_then(Value::as_str) == Some(front.as_str())
+                    })
+                })
+                .and_then(|inbound| inbound.get("listen"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            (front, listen)
+        })
+        .collect()
 }
 
 pub fn config_fronts(
@@ -831,6 +866,19 @@ mod tests {
     }
 
     #[test]
+    fn vmess_network_names_a_transport_this_cli_can_build() {
+        let mut options = options();
+        options.vmess = "host:443".to_owned();
+        options.vmess_id = "uuid".to_owned();
+        options.vmess_network = "websocket".to_owned();
+        let outbound = vmess_outbound(&options).unwrap();
+        assert_eq!(outbound["streamSettings"]["network"], "ws");
+        options.vmess_network = "quic".to_owned();
+        let error = vmess_outbound(&options).unwrap_err();
+        assert!(error.contains("use tcp or ws"));
+    }
+
+    #[test]
     fn vless_reality_without_a_key_is_refused() {
         let error = vless_outbound("vless://uuid@host:443?security=reality").unwrap_err();
         assert!(error.contains("pbk"));
@@ -918,6 +966,24 @@ mod tests {
         .unwrap();
         let error = config_fronts(file.to_str().unwrap(), true, false, "").unwrap_err();
         assert!(error.contains("not loopback"));
+    }
+
+    #[test]
+    fn front_listeners_keep_a_configured_loopback_alias() {
+        let dir = scratch("listeners-alias");
+        let file = dir.join("mine.json");
+        std::fs::write(
+            &file,
+            r#"{"inbounds":[{"protocol":"socks","listen":"127.0.0.2","port":1080}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            front_listeners(&file, "socks,http"),
+            [
+                ("socks".to_owned(), "127.0.0.2".to_owned()),
+                ("http".to_owned(), String::new())
+            ]
+        );
     }
 
     #[test]
