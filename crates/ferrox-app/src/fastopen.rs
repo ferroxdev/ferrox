@@ -1,4 +1,4 @@
-//! TCP Fast Open, where the ClientHello rides the SYN instead of following the handshake. A
+//! TCP Fast Open, where the `ClientHello` rides the SYN instead of following the handshake. A
 //! filter that reads names out of an established stream never sees the one in the SYN.
 //!
 //! `TCP_FASTOPEN_CONNECT` defers the handshake to the first write, and only when the kernel holds
@@ -88,7 +88,7 @@ mod imp {
                 libc::IPPROTO_TCP,
                 libc::TCP_INFO,
                 info.as_mut_ptr().cast(),
-                &mut len,
+                &raw mut len,
             )
         };
         rc == 0 && len > 0 && info[0] == SYN_SENT
