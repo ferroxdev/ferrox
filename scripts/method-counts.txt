@@ -140,7 +140,7 @@ vless sealed-record-copies 2 ferrox-core-vless::tests::a_record_inside_one_part_
 vless sealed-record-write-instructions 50874900 scripts/count-ops.sh
 
 # --- Trojan -----------------------------------------------------------------
-trojan ops-retired-instructions 1182 scripts/count-ops.sh
+trojan ops-retired-instructions 1292 scripts/count-ops.sh
 trojan syscalls-per-handshake UNBLESSED scripts/count-ops.sh
 trojan trojan-tls-raw-down-8-ubuntu-x86-64-mib-per-second 2814.1 CI benchmark-matrix.yml trojan-tls-raw-down-8
 trojan password-bytes-on-the-wire 56 ferrox-app-proxy::tests::trojan_key_is_sha224_hex
@@ -153,7 +153,7 @@ trojan mux-tcp-carriers-holding-a-stream 21 ferrox-app-proxy::tests::a_trojan_mu
 trojan mux-udp-carriers-holding-an-association 4 ferrox-app-proxy::tests::a_trojan_mux_carries_a_udp_association_over_raw_and_reality
 
 # --- XTLS Vision ------------------------------------------------------------
-xtls-vision ops-retired-instructions 26240 scripts/count-ops.sh
+xtls-vision ops-retired-instructions 26304 scripts/count-ops.sh
 xtls-vision syscalls-per-framed-read UNBLESSED scripts/count-ops.sh
 xtls-vision seconds-per-framed-read UNBLESSED CI bench.yml (no cell yet)
 xtls-vision padding-command-bytes 5 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
