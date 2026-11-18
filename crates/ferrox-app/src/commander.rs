@@ -1438,7 +1438,11 @@ fn flush_response(
             return true;
         }
         let remaining = i64::try_from(response.framed.len() - response.at).unwrap_or(i64::MAX);
-        let take = usize::try_from(room.min(remaining).min(i64::from(H2_MAX_FRAME))).unwrap_or(0);
+        let take = usize::try_from(
+            room.min(remaining)
+                .min(i64::try_from(H2_MAX_FRAME).unwrap_or(i64::MAX)),
+        )
+        .unwrap_or(0);
         if take == 0 {
             return true;
         }
