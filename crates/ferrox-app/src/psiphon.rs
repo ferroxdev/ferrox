@@ -7318,35 +7318,44 @@ fn fetch_tactics_from(
     let timeout = timing.timeout.unwrap_or(settings.ready);
     let deadline = (!timing.wait.is_zero()).then(|| Instant::now() + timing.wait);
     let mut index = 0usize;
+    let mut last = None;
     loop {
+        let attempt = if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(last.unwrap_or_else(|| "psiphon: tactics wait expired".to_owned()));
+            }
+            timeout.min(remaining)
+        } else {
+            timeout
+        };
         match crate::psiphon_tactics::Tactics::fetch(
             entries[index],
             &identity,
-            timeout,
+            attempt,
             settings.proxy.as_ref(),
             &settings.dns,
             settings.compress_tactics,
         ) {
             Ok(tactics) => return Ok(tactics),
-            Err(why) => {
-                index += 1;
-                if index < entries.len() {
-                    continue;
-                }
-                index = 0;
-                let Some(deadline) = deadline else {
-                    return Err(why);
-                };
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(why);
-                }
-                let base = timing.retry.min(remaining);
-                let span = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
-                let delay = base.mul_f64(1.0 + timing.jitter * span).min(remaining);
-                thread::sleep(delay);
-            }
+            Err(why) => last = Some(why),
         }
+        index += 1;
+        if index < entries.len() {
+            continue;
+        }
+        index = 0;
+        let Some(deadline) = deadline else {
+            return Err(last.unwrap_or_else(|| "psiphon: tactics request failed".to_owned()));
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(last.unwrap_or_else(|| "psiphon: tactics wait expired".to_owned()));
+        }
+        let base = timing.retry.min(remaining);
+        let span = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
+        let delay = base.mul_f64(1.0 + timing.jitter * span).min(remaining);
+        thread::sleep(delay);
     }
 }
 
@@ -8443,13 +8452,26 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
     let mut expanded = Vec::new();
     let mut fronted = 0;
     let server_cap = if scan.is_some() {
-        FRONTED_SERVERS.saturating_add(scan_groups)
+        FRONTED_SERVERS.saturating_add(groups.len())
     } else {
         FRONTED_SERVERS
     };
     let depth = groups.iter().map(Vec::len).max().unwrap_or(0);
     let stride = if scan.is_some() { CDN_SCAN_STRIDE } else { 1 };
-    for base in (0..depth).step_by(stride) {
+    let start = if scan.is_some() {
+        for group in &groups {
+            if let Some(server) = group.first() {
+                if front.present(server) {
+                    fronted += 1;
+                }
+                expanded.push(server.clone());
+            }
+        }
+        1
+    } else {
+        0
+    };
+    for base in (start..depth).step_by(stride) {
         for group in &groups {
             let end = base.saturating_add(stride).min(group.len());
             if base >= end {
@@ -13711,6 +13733,14 @@ mod tests {
             .iter()
             .filter_map(|server| server.meek.as_ref())
             .any(|meek| meek.dial == "198.51.100.7"));
+        assert_eq!(
+            servers
+                .iter()
+                .filter_map(|server| server.meek.as_ref())
+                .filter(|meek| meek.dial == "front.example")
+                .count(),
+            513
+        );
         let hosts: HashSet<String> = servers
             .iter()
             .filter_map(|server| server.meek.as_ref().map(|meek| meek.host.clone()))
