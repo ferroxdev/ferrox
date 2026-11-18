@@ -955,7 +955,7 @@ mod tests {
         }
     }
 
-    /// The gate for `demux-frames-per-read`: the demux offers the kernel a whole batch, so a 64 KiB
+    /// The gate for `demux-read-room-bytes`: the demux offers the kernel a whole batch, so a 64 KiB
     /// burst is one read rather than eight.
     #[test]
     fn a_demux_read_asks_for_a_whole_batch_of_frames() {
@@ -980,8 +980,8 @@ mod tests {
             .expect("the demux read");
         assert_eq!(
             offered,
-            BATCH * mux::CHUNK_MAX,
-            "one read asks for a batch, not a frame"
+            64 * 1024,
+            "one read asks for a batch of 8 KiB payloads, not a frame"
         );
     }
 
