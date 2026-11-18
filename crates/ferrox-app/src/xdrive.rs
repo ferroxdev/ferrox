@@ -1392,7 +1392,7 @@ impl Writer {
         }
         self.ticker.done.store(true, Ordering::Release);
         Clock::global().wakeup();
-        self.uploads.abort();
+        self.uploads.shut();
     }
 
     /// Drain what the stream still holds, wait for every segment to land, then name the end: a peer reads the `.end` at the next sequence and closes its own side.
@@ -2033,7 +2033,9 @@ impl SlotWriter {
             .spawn(move || writer.upload(seq, chunk))
             .map_err(|error| {
                 self.release_room();
-                io::Error::other(error.to_string())
+                let message = format!("slot {seq} failed to start: {error}");
+                self.fail(message.clone());
+                carrier_error(message)
             })?;
         Ok(())
     }
@@ -2074,16 +2076,24 @@ impl SlotWriter {
 
     #[allow(clippy::needless_pass_by_value)]
     fn upload(self: Arc<Self>, seq: u64, chunk: Vec<u8>) {
+        if self.done.load(Ordering::Acquire) {
+            self.release_room();
+            return;
+        }
         let mode = if chunk.len() <= SLOT_INLINE_LIMIT {
             SLOT_INLINE
         } else {
             SLOT_MEDIA
         };
-        let result = self
-            .await_drained(seq)
-            .and_then(|()| self.set_frame(seq, mode, &chunk));
+        let result = self.await_drained(seq).and_then(|()| {
+            if self.done.load(Ordering::Acquire) {
+                return Err(carrier_error("the writer aborted"));
+            }
+            self.set_frame(seq, mode, &chunk)
+        });
         match result {
             Ok(()) => {}
+            Err(_) if self.done.load(Ordering::Acquire) => {}
             Err(why) => {
                 self.fail(format!("slot {seq} failed: {why}"));
                 let _ = self.set_frame(seq, SLOT_ERR, &[]);
@@ -2144,6 +2154,9 @@ impl SlotWriter {
         let started = Instant::now();
         let mut wait = SLOT_ACK_RETRY;
         loop {
+            if self.done.load(Ordering::Acquire) {
+                return Err(carrier_error("the writer aborted"));
+            }
             match self.drained(seq) {
                 Ok(true) => return Ok(()),
                 Ok(false) => {}
@@ -2314,6 +2327,13 @@ impl SlotReader {
 
     fn end(&self) {
         self.pump.end();
+    }
+}
+
+impl Reader {
+    fn abort(&self) {
+        self.rd.wake.halt();
+        self.inbox.end(None);
     }
 }
 
@@ -2577,7 +2597,10 @@ impl Conn {
             WriterSide::Wal(writer) => writer.abort(),
             WriterSide::Slot(writer) => writer.abort(),
         }
-        self.end_read();
+        match &self.reader {
+            ReaderSide::Wal(reader) => reader.abort(),
+            ReaderSide::Slot(reader) => reader.end(),
+        }
     }
 
     /// End only the write log, so a relay whose source went quiet lets the peer read its `.end` while our own reader keeps serving the reply.

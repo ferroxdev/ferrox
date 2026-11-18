@@ -14755,8 +14755,8 @@ fn xdrive_close(session: &crate::xdrive::Conn) -> Arc<dyn Fn() + Send + Sync> {
     Arc::new(move || {
         if closer.failed() {
             closer.abort();
-        } else {
-            let _ = closer.end_write();
+        } else if closer.end_write().is_err() {
+            closer.abort();
         }
     })
 }
