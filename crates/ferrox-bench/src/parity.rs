@@ -2309,6 +2309,7 @@ fn run_latency_flow(plan: &LatencyPlan) -> FlowResult {
     result
 }
 
+#[allow(clippy::too_many_lines)]
 fn socks_udp_associate(engine: SocketAddr) -> Result<(TcpStream, SocketAddr, Setup), String> {
     let t0 = Instant::now();
     let mut control = TcpStream::connect_timeout(&engine, Duration::from_secs(10))
@@ -2779,6 +2780,7 @@ impl FlowPlan {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn spawn_sink(
     listeners: Vec<TcpListener>,
     udp_sockets: Vec<UdpSocket>,
@@ -4172,9 +4174,12 @@ mod tests {
             request_with(&[("traffic", &quote("held-open")), ("duration_ms", "120000")]).as_bytes(),
         )
         .expect("a hold at the run cap");
+        let barely_left = CELL_WINDOW
+            .checked_sub(Duration::from_secs(220))
+            .expect("a 220s hold fits in a cell");
         let barely = Cell {
             started: Instant::now()
-                .checked_sub(CELL_WINDOW - Duration::from_secs(220))
+                .checked_sub(barely_left)
                 .expect("a cell with 220s left"),
             window: CELL_WINDOW,
         };
