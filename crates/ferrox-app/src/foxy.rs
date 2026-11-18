@@ -1625,7 +1625,7 @@ impl Tls2 {
         body: impl FnOnce(&mut SessionInner, frames::H2Frame, &[u8], bool) -> R,
     ) -> std::io::Result<R> {
         let mut inner = self.inner().map_err(io)?;
-        Self::with_frame_locked(&mut *inner, self.stream, dst, body)
+        Self::with_frame_locked(&mut inner, self.stream, dst, body)
     }
 
     /// The frame read under a session lock the caller already holds: `await_status` checks the staged status and decides whether to read in the same lock, so a status staged by another lane between the two is not a frame this lane waits for.
@@ -1829,7 +1829,7 @@ impl Tls2 {
                 return Ok(status);
             }
             let status =
-                Self::with_frame_locked(&mut *inner, own, &mut [], |inner, frame, payload, _| {
+                Self::with_frame_locked(&mut inner, own, &mut [], |inner, frame, payload, _| {
                     match frames::h2_routed(frame, payload) {
                         frames::H2Routed::Data {
                             stream,
@@ -8703,7 +8703,7 @@ pub(crate) mod loopback {
         drop(Datagram::H2(Box::new(lane)));
         let inner = session.inner.lock().expect("the session lock");
         assert!(
-            inner.streams.get(&stream).is_none(),
+            !inner.streams.contains_key(&stream),
             "the dropped lane left its stream on the session"
         );
         drop(inner);
