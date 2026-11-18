@@ -64,6 +64,9 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: identity, then deterministic properties, then timings
         run: cargo run --locked --release -p ferrox-bench
+      - name: the record layer's aead against ring
+        if: always()
+        run: cargo run --locked --release -p ferrox-bench --bin record-aead
       - name: publish the table
         if: always()
         run: |

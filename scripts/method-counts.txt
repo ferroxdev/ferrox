@@ -140,7 +140,7 @@ vless sealed-record-copies 2 ferrox-core-vless::tests::a_record_inside_one_part_
 vless sealed-record-write-instructions 50874900 scripts/count-ops.sh
 
 # --- Trojan -----------------------------------------------------------------
-trojan ops-retired-instructions 1182 scripts/count-ops.sh
+trojan ops-retired-instructions 1292 scripts/count-ops.sh
 trojan syscalls-per-handshake UNBLESSED scripts/count-ops.sh
 trojan trojan-tls-raw-down-8-ubuntu-x86-64-mib-per-second 2814.1 CI benchmark-matrix.yml trojan-tls-raw-down-8
 trojan password-bytes-on-the-wire 56 ferrox-app-proxy::tests::trojan_key_is_sha224_hex
@@ -153,7 +153,7 @@ trojan mux-tcp-carriers-holding-a-stream 21 ferrox-app-proxy::tests::a_trojan_mu
 trojan mux-udp-carriers-holding-an-association 4 ferrox-app-proxy::tests::a_trojan_mux_carries_a_udp_association_over_raw_and_reality
 
 # --- XTLS Vision ------------------------------------------------------------
-xtls-vision ops-retired-instructions 26240 scripts/count-ops.sh
+xtls-vision ops-retired-instructions 26304 scripts/count-ops.sh
 xtls-vision syscalls-per-framed-read UNBLESSED scripts/count-ops.sh
 xtls-vision seconds-per-framed-read UNBLESSED CI bench.yml (no cell yet)
 xtls-vision padding-command-bytes 5 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
@@ -506,7 +506,7 @@ carrier-quic bbr-profiles 3 ferrox-app-quic::tests::the_three_profiles_move_the_
 carrier-quic bbr-knobs-set-by-a-profile 8 ferrox-app-quic::tests::the_three_profiles_move_the_gains_and_nothing_else
 carrier-quic standard-profile-overrides 0 ferrox-app-quic::tests::the_three_profiles_move_the_gains_and_nothing_else
 
-reality-tls ops-retired-instructions UNBLESSED scripts/count-ops.sh
+reality-tls ops-retired-instructions 202 scripts/count-ops.sh
 reality-tls tls-providers 1 ferrox-core::active_backends
 reality-tls client-outbound-rows-dialled 6 ferrox-app-proxy::tests::vless_outbound_with_reality_dials_raw_and_every_carrier
 reality-tls client-carriers-roundtrip-verified 1 ferrox-app-proxy::tests::reality_ws_dial_reaches_echo_through_the_relay
@@ -544,7 +544,9 @@ reality-tls transport-reads-per-answer-write 0 ferrox-core-tls::rustls_backend::
 reality-tls relay-write-waits-for-a-parked-read 0 ferrox-app-proxy::tests::a_relay_write_goes_out_while_the_reader_is_parked
 reality-tls session-write-waits-for-a-parked-read 0 ferrox-app-proxy::tests::a_session_write_goes_out_while_its_read_is_parked
 reality-tls session-read-waits-for-a-parked-write 0 ferrox-app-proxy::tests::a_session_read_runs_while_its_write_is_parked
+reality-tls tls-split-wire-descriptors 1 ferrox-app-proxy::tests::a_split_buys_no_descriptor_for_its_wire
 reality-tls transport-reads-behind-ready-plaintext 0 ferrox-app-proxy::tests::a_driven_read_hands_over_ready_plaintext_without_another_transport_read
+reality-tls driven-transport-reads-per-relay-window 1 ferrox-app-proxy::tests::a_whole_relay_window_arrives_in_one_transport_read
 reality-tls driven-session-opens-per-steady-read 1 ferrox-app-proxy::tests::a_steady_read_opens_the_session_once
 reality-tls relay-reads-on-an-unarmed-handle 0 ferrox-app-proxy::tests::the_socket_half_reads_on_the_armed_handle
 reality-tls relay-writes-on-an-unarmed-handle 0 ferrox-app-proxy::tests::eight_downloads_finish_over_each_grpc_carrier
