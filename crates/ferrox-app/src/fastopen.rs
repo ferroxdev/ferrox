@@ -81,8 +81,7 @@ mod imp {
     pub(super) fn deferred(stream: &TcpStream) -> bool {
         let mut info = [0u8; 256];
         let mut len = info.len() as libc::socklen_t;
-        // SAFETY: `info` and `len` are valid out-parameters for the option, and the kernel fills
-        // as much of the buffer as it has fields for.
+        // SAFETY: `info`/`len` are valid out-parameters; the kernel fills the fields it has.
         let rc = unsafe {
             libc::getsockopt(
                 stream.as_raw_fd(),
