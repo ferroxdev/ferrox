@@ -3,7 +3,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -370,8 +370,20 @@ pub fn stop(paths: &Paths) -> Result<(), String> {
     }
 }
 
+fn loopback_addresses(port: u16) -> Vec<SocketAddr> {
+    vec![
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+    ]
+}
+
 fn probe_addresses(listen: &str, port: u16) -> Vec<SocketAddr> {
-    match listen.parse::<IpAddr>() {
+    let listen = listen.trim();
+    let host = listen
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(listen);
+    match host.parse::<IpAddr>() {
         Ok(IpAddr::V4(ip)) if ip.is_unspecified() => {
             vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]
         }
@@ -380,10 +392,18 @@ fn probe_addresses(listen: &str, port: u16) -> Vec<SocketAddr> {
             vec![SocketAddr::from((Ipv6Addr::LOCALHOST, port))]
         }
         Ok(IpAddr::V6(ip)) => vec![SocketAddr::from((ip, port))],
-        Err(_) => vec![
-            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-            SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
-        ],
+        Err(_) if host.is_empty() => loopback_addresses(port),
+        Err(_) => match (host, port).to_socket_addrs() {
+            Ok(addresses) => {
+                let addresses: Vec<SocketAddr> = addresses.collect();
+                if addresses.is_empty() {
+                    loopback_addresses(port)
+                } else {
+                    addresses
+                }
+            }
+            Err(_) => loopback_addresses(port),
+        },
     }
 }
 
@@ -458,4 +478,28 @@ pub fn other_lanes(paths: &Paths) -> Vec<(String, u32)> {
         }
     }
     lanes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_configured_listener_address_is_probed_where_it_listens() {
+        assert_eq!(
+            probe_addresses("127.0.0.2", 1080),
+            [SocketAddr::from(([127, 0, 0, 2], 1080))]
+        );
+        assert_eq!(
+            probe_addresses("[::1]", 1080),
+            [SocketAddr::from((Ipv6Addr::LOCALHOST, 1080))]
+        );
+        assert_eq!(
+            probe_addresses("", 1080),
+            [
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 1080)),
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 1080))
+            ]
+        );
+    }
 }

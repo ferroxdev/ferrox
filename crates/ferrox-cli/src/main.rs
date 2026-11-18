@@ -504,9 +504,11 @@ fn diagnose(options: &Options, paths: &Paths) {
 fn down(options: &Options, paths: &Paths) -> i32 {
     if options.all {
         let mut rc = stop_all_lanes(paths);
-        if let Err(error) = proxy::clear(paths) {
-            eprintln!("ferrox-cli: {error}");
-            rc = 1;
+        if rc == 0 {
+            if let Err(error) = proxy::clear(paths) {
+                eprintln!("ferrox-cli: {error}");
+                rc = 1;
+            }
         }
         if rc == 0 {
             let _ = std::fs::remove_file(&paths.lanes_file);
@@ -572,11 +574,11 @@ fn forget_config(paths: &Paths) {
 
 fn stop_all_lanes(paths: &Paths) -> i32 {
     let mut rc = 0;
-    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
     match read_trim_checked(&paths.lanes_file) {
         Ok(text) => {
             for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-                dirs.push(PathBuf::from(line));
+                dirs.push((PathBuf::from(line), true));
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -588,13 +590,13 @@ fn stop_all_lanes(paths: &Paths) -> i32 {
             return 1;
         }
     }
-    if !dirs.iter().any(|dir| dir == &paths.conf_dir) {
-        dirs.push(paths.conf_dir.clone());
+    if !dirs.iter().any(|(dir, _)| dir == &paths.conf_dir) {
+        dirs.push((paths.conf_dir.clone(), false));
     }
-    for dir in dirs {
+    for (dir, registered) in dirs {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !registered => continue,
             Err(error) => {
                 eprintln!(
                     "ferrox-cli: cannot read {}: {error}; its lanes were not stopped.",

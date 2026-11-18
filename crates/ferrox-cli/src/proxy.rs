@@ -87,7 +87,7 @@ fn owned(paths: &Paths) -> Result<bool, String> {
             ));
         }
     };
-    Ok(same_owner(&text, paths))
+    same_owner(&text, paths)
 }
 
 fn same_path(owner: &str, path: &std::path::Path) -> bool {
@@ -108,43 +108,48 @@ fn owner_text(paths: &Paths) -> String {
     .to_string()
 }
 
-fn same_owner(text: &str, paths: &Paths) -> bool {
+fn same_owner(text: &str, paths: &Paths) -> Result<bool, String> {
     if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(text) {
         let conf = fields.get("conf_dir").and_then(serde_json::Value::as_str);
         let state = fields
             .get("proxy_state")
             .and_then(serde_json::Value::as_str);
-        return conf.is_some_and(|conf| same_path(conf, &paths.conf_dir))
-            && state.is_some_and(|state| same_path(state, &paths.proxy_state));
+        return Ok(conf.is_some_and(|conf| same_path(conf, &paths.conf_dir))
+            && state.is_some_and(|state| same_path(state, &paths.proxy_state)));
     }
     let owner = serde_json::from_str::<String>(text).unwrap_or_else(|_| text.to_owned());
     if same_path(&owner, &paths.proxy_state) {
-        return !another_lane_runs(paths);
+        return another_lane_runs(paths).map(|runs| !runs);
     }
-    same_path(&owner, &paths.conf_dir)
+    Ok(same_path(&owner, &paths.conf_dir)
         && paths
             .proxy_state
             .file_name()
-            .is_some_and(|name| name == std::ffi::OsStr::new("system-proxy.state"))
+            .is_some_and(|name| name == std::ffi::OsStr::new("system-proxy.state")))
 }
 
-/// A legacy owner names only the shared snapshot, so it cannot say which root armed it; clearing is safe only when no other registered lane is alive.
-fn another_lane_runs(paths: &Paths) -> bool {
+/// A legacy owner names only the shared snapshot, so it cannot say which root armed it; clearing is safe only when every registered lane can be read and none is alive.
+fn another_lane_runs(paths: &Paths) -> Result<bool, String> {
     let text = match read_trim_checked(&paths.lanes_file) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "system proxy: cannot read {}: {error}; the snapshot was kept.",
+                paths.lanes_file.display()
+            ));
+        }
     };
     for dir in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return true,
-        };
+        let entries = std::fs::read_dir(dir).map_err(|error| {
+            format!("system proxy: cannot read {dir}: {error}; the snapshot was kept.")
+        })?;
         for entry in entries {
-            let Ok(entry) = entry else {
-                return true;
-            };
+            let entry = entry.map_err(|error| {
+                format!(
+                    "system proxy: cannot read a lane entry in {dir}: {error}; the snapshot was kept."
+                )
+            })?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
@@ -162,11 +167,11 @@ fn another_lane_runs(paths: &Paths) -> bool {
                 .and_then(|text| text.parse().ok())
                 .is_some_and(crate::lane::alive)
             {
-                return true;
+                return Ok(true);
             }
         }
     }
-    false
+    Ok(false)
 }
 
 #[cfg(windows)]
@@ -665,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_snapshot_owner_does_not_clear_an_unreadable_registry() {
+    fn a_legacy_snapshot_owner_refuses_an_unreadable_registry() {
         let shared = workspace("legacy-unreadable-registry");
         let paths = Paths::with_dirs(shared.join("conf"), shared.clone(), None);
         std::fs::create_dir_all(&shared).expect("state");
@@ -678,7 +683,27 @@ mod tests {
         std::fs::write(&blocker, "not a lane directory").expect("blocker");
         crate::paths::write_private(&paths.lanes_file, &format!("{}\n", blocker.display()))
             .expect("lane registry");
-        assert_eq!(owned(&paths), Ok(false));
+        let error = owned(&paths).expect_err("an unreadable registry cannot prove a lane is gone");
+        assert!(error.contains("snapshot was kept"));
+        let _ = std::fs::remove_dir_all(&shared);
+    }
+
+    #[test]
+    fn a_legacy_snapshot_owner_keeps_the_snapshot_for_a_missing_registered_dir() {
+        let shared = workspace("legacy-missing-lane-dir");
+        let paths = Paths::with_dirs(shared.join("conf"), shared.clone(), None);
+        std::fs::create_dir_all(&shared).expect("state");
+        crate::paths::write_private(
+            &paths.proxy_owner,
+            &serde_json::to_string(&paths.proxy_state).expect("owner"),
+        )
+        .expect("owner file");
+        let missing = shared.join("gone");
+        crate::paths::write_private(&paths.lanes_file, &format!("{}\n", missing.display()))
+            .expect("lane registry");
+        let error =
+            owned(&paths).expect_err("a missing lane directory cannot prove a lane is gone");
+        assert!(error.contains("snapshot was kept"));
         let _ = std::fs::remove_dir_all(&shared);
     }
 

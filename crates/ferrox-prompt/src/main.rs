@@ -980,11 +980,8 @@ fn choose_slice<'p>(
     supplied: &Values,
     named: Option<&'p MethodRow>,
 ) -> Result<(Offer<'p>, Vec<advisor::Skipped>), Refusal> {
-    if let Some(error) = &ledger.read_error {
-        return Err((
-            format!("{error}; refusing to choose a slice from an unreadable history"),
-            1,
-        ));
+    if let Some(message) = ledger_refusal(ledger) {
+        return Err((message, 1));
     }
     if let Some(id) = args.forced {
         let Some(prompt) = library.prompt(id) else {
@@ -1128,8 +1125,9 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         return ExitCode::from(1);
     };
     let ledger = load_ledger(root);
-    if let Some(code) = ledger_refusal(&ledger) {
-        return code;
+    if let Some(message) = ledger_refusal(&ledger) {
+        eprintln!("{message}");
+        return ExitCode::from(1);
     }
     let state = ProjectState::load(root);
     let named = match &args.row {
@@ -1391,11 +1389,19 @@ fn load_ledger(root: &Path) -> Ledger {
     ledger
 }
 
-/// Refuse a choice that would repeat served work because the history could not be read.
-fn ledger_refusal(ledger: &Ledger) -> Option<ExitCode> {
-    let error = ledger.read_error.as_ref()?;
-    eprintln!("{error}; refusing to choose a slice from an unreadable history");
-    Some(ExitCode::from(1))
+/// Refuse a choice that would repeat served work because the history could not be read in full.
+fn ledger_refusal(ledger: &Ledger) -> Option<String> {
+    if let Some(error) = &ledger.read_error {
+        return Some(format!(
+            "{error}; refusing to choose a slice from an unreadable history"
+        ));
+    }
+    (ledger.skipped > 0).then(|| {
+        format!(
+            "{} ledger record(s) were skipped; refusing to choose a slice from an incomplete history",
+            ledger.skipped
+        )
+    })
 }
 
 /// Record progress by rewriting exactly the prompt's `**Status:**` line: reflowing Markdown would fight the contributor's edits.
