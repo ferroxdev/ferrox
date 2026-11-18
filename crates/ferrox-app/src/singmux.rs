@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
@@ -84,6 +84,11 @@ const FLAG_UDP: u16 = 1;
 const FLAG_ADDR: u16 = 2;
 const MAX_STREAMS: usize = 1024;
 const RESET_QUEUE: usize = MAX_STREAMS;
+
+enum Deferred {
+    Reset(u32),
+    Credit,
+}
 
 /// One stream's opening request: a TCP destination, or the destination a connected UDP flow
 /// speaks to; `packet_addr` marks the full-cone form where every frame names its own address.
@@ -462,7 +467,8 @@ struct Inner {
     role: Role,
     write: Mutex<Box<dyn Write + Send>>,
     sinks: Mutex<HashMap<u32, Sink>>,
-    resets: Mutex<Option<SyncSender<u32>>>,
+    resets: Mutex<Option<SyncSender<Deferred>>>,
+    pending_credit: AtomicUsize,
     accept_tx: Mutex<Option<Sender<Stream>>>,
     accept_rx: Mutex<Receiver<Stream>>,
     next_id: AtomicU32,
@@ -489,6 +495,7 @@ impl Inner {
             write: Mutex::new(write),
             sinks: Mutex::new(HashMap::new()),
             resets: Mutex::new(None),
+            pending_credit: AtomicUsize::new(0),
             accept_tx: Mutex::new(Some(accept_tx)),
             accept_rx: Mutex::new(accept_rx),
             next_id: AtomicU32::new(if role == Role::Client { 1 } else { 2 }),
@@ -753,6 +760,18 @@ impl Inner {
 
     /// The demux cannot wait on the carrier: resets drain on a thread of their own.
     fn defer_reset(&self, id: u32) {
+        self.defer(Deferred::Reset(id), true);
+    }
+
+    fn defer_credit(&self, credit: usize) {
+        if self.protocol != Protocol::H2Mux || credit == 0 {
+            return;
+        }
+        self.pending_credit.fetch_add(credit, Ordering::Relaxed);
+        self.defer(Deferred::Credit, false);
+    }
+
+    fn defer(&self, job: Deferred, fatal: bool) {
         let mut resets = match self.resets.lock() {
             Ok(resets) => resets,
             Err(poisoned) => poisoned.into_inner(),
@@ -761,10 +780,10 @@ impl Inner {
             return;
         }
         if resets.is_some() {
-            let failed = resets
+            let sent = resets
                 .as_ref()
-                .is_some_and(|sender| sender.try_send(id).is_err());
-            if failed {
+                .is_some_and(|sender| sender.try_send(job).is_ok());
+            if !sent && fatal {
                 drop(resets);
                 self.finish();
             }
@@ -775,11 +794,15 @@ impl Inner {
         let spawned = std::thread::Builder::new()
             .name("singmux-reset".to_owned())
             .spawn(move || {
-                while let Ok(id) = pending.recv() {
+                while let Ok(job) = pending.recv() {
                     let Some(inner) = inner.upgrade() else {
                         break;
                     };
-                    inner.send_reset(id);
+                    if let Deferred::Reset(id) = job {
+                        inner.send_reset(id);
+                    }
+                    let credit = inner.pending_credit.swap(0, Ordering::Relaxed);
+                    inner.send_connection_credit(credit);
                 }
             });
         if spawned.is_err() {
@@ -789,8 +812,22 @@ impl Inner {
         }
         *resets = Some(sender.clone());
         drop(resets);
-        if sender.try_send(id).is_err() {
+        if sender.try_send(job).is_err() && fatal {
             self.finish();
+        }
+    }
+
+    fn send_connection_credit(&self, credit: usize) {
+        let mut left = credit;
+        while left > 0 && self.protocol == Protocol::H2Mux {
+            let amount = left.min(0x7fff_ffff);
+            let mut frame = [0u8; 13];
+            frame[..9].copy_from_slice(&h2::frame_head(4, h2::T_WINDOW, 0, 0));
+            frame[9..].copy_from_slice(&u32::try_from(amount).unwrap().to_be_bytes());
+            if self.write_raw(&frame).is_err() {
+                return;
+            }
+            left -= amount;
         }
     }
 
@@ -825,6 +862,8 @@ impl Inner {
                 return;
             };
             let Some(sink) = sinks.get_mut(&id) else {
+                drop(sinks);
+                self.defer_credit(credit);
                 return;
             };
             sink.remote_end = true;
@@ -884,6 +923,7 @@ impl Inner {
                     data = rest;
                 }
                 Some(_) => {
+                    self.defer_credit(credit);
                     self.release(id);
                     return;
                 }
@@ -906,6 +946,7 @@ impl Inner {
                 }
             }
             Push::Full | Push::Closed => {
+                self.defer_credit(credit);
                 self.release(id);
                 self.defer_reset(id);
             }
@@ -1380,11 +1421,11 @@ impl Stream {
     }
 
     pub(crate) fn finish(&self) {
+        self.window.close();
+        self.inner.connection_window.notify_waiters();
         if !self.closed.swap(true, Ordering::Relaxed) {
             self.inner.send_end(self.id);
         }
-        self.window.close();
-        self.inner.connection_window.notify_waiters();
         self.inner.end_local(self.id);
     }
 
@@ -1472,11 +1513,11 @@ pub(crate) struct StreamWriter {
 
 impl StreamWriter {
     fn finish(&self) {
+        self.window.close();
+        self.inner.connection_window.notify_waiters();
         if !self.closed.swap(true, Ordering::Relaxed) {
             self.inner.send_end(self.id);
         }
-        self.window.close();
-        self.inner.connection_window.notify_waiters();
         self.inner.end_local(self.id);
     }
 }
@@ -2079,6 +2120,23 @@ mod tests {
             window.take_up_to(1),
             None,
             "a closed window must not hand out credit a writer could still spend"
+        );
+    }
+
+    #[test]
+    fn an_open_stream_keeps_connection_credit() {
+        let window = Window::new(2);
+        let closed = AtomicBool::new(false);
+        assert_eq!(
+            window.take_up_to_while(1, Some(&closed)),
+            Some(1),
+            "the connection window must hand out credit while the stream is open"
+        );
+        closed.store(true, Ordering::Relaxed);
+        assert_eq!(
+            window.take_up_to_while(1, Some(&closed)),
+            None,
+            "a closed stream must stop taking connection credit"
         );
     }
 
