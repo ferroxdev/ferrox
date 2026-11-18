@@ -8421,7 +8421,7 @@ pub(crate) mod loopback {
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let edge = masque_h2_two_stream_edge(listener, server, seen_tx);
         let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
-        let mut first = open_udp(&dial, "one.test", 443).expect("opens");
+        let first = open_udp(&dial, "one.test", 443).expect("opens");
         let mut second = open_udp(&dial, "two.test", 443).expect("opens on the session");
         assert!(
             std::sync::Arc::ptr_eq(&first.session, &second.session),
