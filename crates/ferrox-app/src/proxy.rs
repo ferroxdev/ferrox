@@ -829,9 +829,9 @@ fn serve_inbounds_counted(
                 }
             }
             if !prove && inbounds > before {
-                if let Some(networks) = server_networks(protocol) {
+                if let Some(networks) = server_networks(inbound) {
                     if let Some(shared) = route {
-                        shared.record_server_inbound(handler_tag.clone(), networks);
+                        shared.record_server_inbound(handler_tag.clone(), &networks);
                     }
                 }
             }
@@ -2671,7 +2671,7 @@ struct Dynamic {
 #[derive(Debug, Clone)]
 struct ServerInbound {
     tag: Option<String>,
-    networks: &'static [crate::router::Network],
+    networks: Vec<crate::router::Network>,
 }
 
 /// Routing once its assets are read: the rules, every outbound a rule names, and the first
@@ -2807,17 +2807,19 @@ impl RouteShared {
 
     /// Remember a direct-dial server inbound the management API added, so a later rule that can
     /// reach it is proved against the lane it really serves.
-    fn record_server_inbound(
-        &self,
-        tag: Option<String>,
-        networks: &'static [crate::router::Network],
-    ) {
+    fn record_server_inbound(&self, tag: Option<String>, networks: &[crate::router::Network]) {
         let mut inbounds = self
             .server_inbounds
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !inbounds.iter().any(|inbound| inbound.tag == tag) {
-            inbounds.push(ServerInbound { tag, networks });
+        if !inbounds
+            .iter()
+            .any(|inbound| inbound.tag == tag && inbound.networks.as_slice() == networks)
+        {
+            inbounds.push(ServerInbound {
+                tag,
+                networks: networks.to_vec(),
+            });
         }
     }
 
@@ -3038,7 +3040,7 @@ impl Runtime {
             .clone();
         let proofs: Vec<crate::router::ServerProof<'_>> = server_inbounds
             .iter()
-            .map(|inbound| server_proof(route, inbound.tag.as_deref(), inbound.networks, &direct))
+            .map(|inbound| server_proof(route, inbound.tag.as_deref(), &inbound.networks, &direct))
             .collect();
         route
             .routing
@@ -3135,7 +3137,7 @@ impl Runtime {
             if let Err(reason) = routing.server_routes(&server_proof(
                 route,
                 inbound.tag.as_deref(),
-                inbound.networks,
+                &inbound.networks,
                 &direct,
             )) {
                 balancer.force(&previous);
@@ -4028,7 +4030,8 @@ fn route_shared_with_api(
         .iter()
         .filter_map(|inbound| {
             let protocol = inbound.get("protocol").and_then(Json::as_str).unwrap_or("");
-            server_networks(protocol).map(|networks| ServerInbound {
+            serve_addresses(inbound, canonical_protocol(protocol))?;
+            server_networks(inbound).map(|networks| ServerInbound {
                 tag: inbound_tag(inbound),
                 networks,
             })
@@ -4362,12 +4365,26 @@ fn pick_script_outbound(
 
 /// The target networks a direct-dial server inbound serves; `None` when this tree routes it
 /// through an outbound instead. `AnyTLS` carries streams only, so a datagram rule never reaches it.
-fn server_networks(protocol: &str) -> Option<&'static [crate::router::Network]> {
+fn server_networks(inbound: &Json) -> Option<Vec<crate::router::Network>> {
+    let protocol = inbound.get("protocol").and_then(Json::as_str).unwrap_or("");
     match canonical_protocol(protocol) {
-        "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria" | "tuic" => {
-            Some(&[crate::router::Network::Tcp, crate::router::Network::Udp])
+        "shadowsocks" => {
+            let (tcp, udp) = inbound_ss_networks(inbound);
+            let udp = matches!(inbound_carrier(inbound), Carrier::Raw(_)) && (tcp || udp);
+            let mut networks = Vec::with_capacity(2);
+            if tcp {
+                networks.push(crate::router::Network::Tcp);
+            }
+            if udp {
+                networks.push(crate::router::Network::Udp);
+            }
+            (!networks.is_empty()).then_some(networks)
         }
-        "anytls" => Some(&[crate::router::Network::Tcp]),
+        "vless" | "trojan" | "vmess" | "hysteria" | "tuic" => Some(vec![
+            crate::router::Network::Tcp,
+            crate::router::Network::Udp,
+        ]),
+        "anytls" => Some(vec![crate::router::Network::Tcp]),
         _ => None,
     }
 }
@@ -4375,8 +4392,7 @@ fn server_networks(protocol: &str) -> Option<&'static [crate::router::Network]> 
 /// A server inbound dials direct, so every rule that can reach it must name a freedom outbound and
 /// the fallback must be one too; anything else refuses the start rather than serving the wrong lane.
 fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
-    let protocol = inbound.get("protocol").and_then(Json::as_str).unwrap_or("");
-    let Some(networks) = server_networks(protocol) else {
+    let Some(networks) = server_networks(inbound) else {
         return;
     };
     let tag = inbound_tag(inbound);
@@ -4386,7 +4402,7 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Err(error) =
-        routing.server_routes(&server_proof(shared, tag.as_deref(), networks, &direct))
+        routing.server_routes(&server_proof(shared, tag.as_deref(), &networks, &direct))
     {
         exit(&format!("bad config {label}: {error}"));
     }
@@ -19974,7 +19990,14 @@ fn relay_pool_flow(client: &Connection, mut flow: PooledFlow) {
         return;
     };
     // A stalled app costs its own flow: the downlink gives up at the relay stall, and dropping the replies unparks the demux for every other flow.
-    let _ = down.set_write_timeout(Some(budgets::relay_stall()));
+    if down
+        .set_write_timeout(Some(budgets::relay_stall()))
+        .is_err()
+    {
+        drop(replies);
+        flow.close();
+        return;
+    }
     let done = RelayPool::global().run(move || {
         let mut down = down;
         if mux_pool_downlink(&replies, &mut down) {
@@ -20011,12 +20034,15 @@ const MUX_DOWN_BATCH: usize = 8;
 /// batched into one vectored call, and `true` reports an `End` so the caller can close its half.
 fn mux_pool_downlink(replies: &PooledReplies, down: &mut dyn Write) -> bool {
     let mut batch: Vec<PooledReply> = Vec::with_capacity(MUX_DOWN_BATCH);
+    let mut empty: Vec<usize> = Vec::with_capacity(MUX_DOWN_BATCH);
     loop {
         let Ok(first) = replies.recv() else {
             return false;
         };
         let mut ended = first.end;
-        if !first.data.is_empty() {
+        if first.data.is_empty() {
+            empty.push(first.credit);
+        } else {
             batch.push(first);
         }
         while !ended && batch.len() < MUX_DOWN_BATCH {
@@ -20024,20 +20050,27 @@ fn mux_pool_downlink(replies: &PooledReplies, down: &mut dyn Write) -> bool {
                 break;
             };
             ended = reply.end;
-            if !reply.data.is_empty() {
+            if reply.data.is_empty() {
+                empty.push(reply.credit);
+            } else {
                 batch.push(reply);
             }
         }
+        let mut written = true;
         if !batch.is_empty() {
             let parts: [&[u8]; MUX_DOWN_BATCH] =
                 std::array::from_fn(|at| batch.get(at).map_or(&[][..], |reply| &reply.data[..]));
-            if write_all_parts::<MUX_DOWN_BATCH>(&mut *down, &parts[..batch.len()]).is_err() {
-                return false;
-            }
+            written = write_all_parts::<MUX_DOWN_BATCH>(&mut *down, &parts[..batch.len()]).is_ok();
             for reply in &batch {
                 replies.settle(reply.credit);
             }
             batch.clear();
+        }
+        for credit in empty.drain(..) {
+            replies.settle(credit);
+        }
+        if !written {
+            return false;
         }
         if ended {
             return true;

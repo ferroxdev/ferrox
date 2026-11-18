@@ -3593,6 +3593,8 @@ mod tests {
         use std::os::fd::AsRawFd as _;
 
         let (side, mut peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("arms the peer's clock");
         let stream = Connection::Unix(side.into());
         let mut clone = stream.try_clone().expect("clones");
         assert_eq!(
