@@ -1198,7 +1198,7 @@ impl Sink {
             *err = Some(message);
         }
         drop(err);
-        self.wake.ring();
+        self.wake.halt();
     }
 
     fn failure(&self) -> Option<String> {

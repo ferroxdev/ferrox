@@ -1029,8 +1029,8 @@ fn uplink_step(
     let sealed = match read {
         Ok(0) => {
             if let Outbound::Server(response) = outbound {
-                if response.first_owed {
-                    let _ = response.seal_first(buf, 0, writer);
+                if response.first_owed && response.seal_first(buf, 0, writer).is_err() {
+                    close();
                 }
             }
             return crate::proxy::lane_pool::Next::Done;
@@ -1746,17 +1746,6 @@ impl Datagrams {
             if body.len() < 11 + pad {
                 return None;
             }
-            if !self
-                .sessions
-                .get(&session)
-                .is_none_or(|entry| entry.window.check(packet_id))
-            {
-                return None;
-            }
-            let (target, used) = parse_addr_header(&body[11 + pad..])?;
-            if body.len() < 11 + pad + used {
-                return None;
-            }
             let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
                 window: shadowsocks2022::SlidingWindow::new(),
                 cipher: None,
@@ -1765,7 +1754,13 @@ impl Datagrams {
                 server_packet: 0,
                 server_cipher: None,
             });
-            entry.window.add(packet_id);
+            if !entry.window.check_and_add(packet_id) {
+                return None;
+            }
+            let (target, used) = parse_addr_header(&body[11 + pad..])?;
+            if body.len() < 11 + pad + used {
+                return None;
+            }
             Some((
                 target,
                 &packet[24 + 16 + 11 + pad + used..24 + len],
@@ -1785,6 +1780,7 @@ impl Datagrams {
             let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
+            let len = authenticate_body(&cipher, &nonce, &mut packet[16..])?;
             let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
                 window: shadowsocks2022::SlidingWindow::new(),
                 cipher: None,
@@ -1796,8 +1792,7 @@ impl Datagrams {
             if !entry.window.check_and_add(packet_id) {
                 return None;
             }
-            let (target, total, len) =
-                open_body_in_place(&cipher, &nonce, &mut packet[16..], 11, 0)?;
+            let (target, total) = parse_body(&packet[16..16 + len], 11, 0)?;
             self.sessions
                 .get_mut(&session)?
                 .cipher
@@ -1834,6 +1829,7 @@ impl Datagrams {
         let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&raw[4..16]);
+        let len = authenticate_body(&cipher, &nonce, &mut packet[32..])?;
         let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
             window: shadowsocks2022::SlidingWindow::new(),
             cipher: None,
@@ -1853,7 +1849,7 @@ impl Datagrams {
         if entry.user.is_none() {
             entry.user = Some(idx);
         }
-        let (target, total, len) = open_body_in_place(&cipher, &nonce, &mut packet[32..], 11, 0)?;
+        let (target, total) = parse_body(&packet[32..32 + len], 11, 0)?;
         self.sessions
             .get_mut(&session)?
             .cipher
@@ -2082,18 +2078,12 @@ fn peer_check(
     true
 }
 
-fn open_body_in_place(
-    cipher: &Cipher,
-    nonce: &[u8; 12],
-    body: &mut [u8],
-    header: usize,
-    kind: u8,
-) -> Option<(SocketAddr, usize, usize)> {
+fn authenticate_body(cipher: &Cipher, nonce: &[u8; 12], body: &mut [u8]) -> Option<usize> {
     let len = cipher.open_with_nonce(nonce, body)?;
-    if len > body.len() {
-        return None;
-    }
-    let body = &body[..len];
+    (len <= body.len()).then_some(len)
+}
+
+fn parse_body(body: &[u8], header: usize, kind: u8) -> Option<(SocketAddr, usize)> {
     if body.len() < header || body[0] != kind {
         return None;
     }
@@ -2110,7 +2100,7 @@ fn open_body_in_place(
     if body.len() < total {
         return None;
     }
-    Some((target, total, len))
+    Some((target, total))
 }
 
 fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
@@ -2423,6 +2413,9 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
         let live: HashSet<u64> = upstreams.keys().map(|(session, _)| *session).collect();
         clients_of.retain(|session, _| live.contains(session));
         users.retain(|session, _| live.contains(session));
+        datagrams
+            .sessions
+            .retain(|session, _| live.contains(session));
     }
 }
 
@@ -2458,7 +2451,13 @@ fn evict_upstream(
     upstreams: &mut HashMap<(u64, bool), UdpSocket>,
     used: &mut HashMap<(u64, bool), Instant>,
 ) -> bool {
-    let Some(oldest) = used.iter().min_by_key(|(_, at)| **at).map(|(key, _)| *key) else {
+    let now = Instant::now();
+    let Some(oldest) = used
+        .iter()
+        .filter(|(_, at)| now.saturating_duration_since(**at) >= UPSTREAM_IDLE)
+        .min_by_key(|(_, at)| **at)
+        .map(|(key, _)| *key)
+    else {
         return false;
     };
     upstreams.remove(&oldest);

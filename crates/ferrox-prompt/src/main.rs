@@ -1171,9 +1171,20 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         }
     };
     let library = &reloaded;
-    let Some(prompt) = library.prompt(id) else {
-        eprintln!("{}", unknown_prompt(library, id));
-        return ExitCode::from(2);
+    let prompt = if args.command == Command::Issue {
+        match issue_prompt(library) {
+            Ok(prompt) => prompt,
+            Err(reason) => {
+                eprintln!("{reason}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        let Some(prompt) = library.prompt(id) else {
+            eprintln!("{}", unknown_prompt(library, id));
+            return ExitCode::from(2);
+        };
+        prompt
     };
     let ledger = load_ledger(root);
     if let Some(message) = ledger_refusal(&ledger) {

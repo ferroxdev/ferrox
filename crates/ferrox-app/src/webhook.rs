@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrox_core::tls::TlsProvider as _;
@@ -241,7 +241,7 @@ impl Webhook {
         let mut redirected = false;
         for _ in 0..=10 {
             url.userinfo.clone_from(&credentials);
-            if redirected && !url.tls {
+            if !url.tls {
                 headers.retain(|(name, _)| !credential_header(name));
             }
             if url.userinfo.is_some() && !url.tls {
@@ -329,7 +329,7 @@ impl Webhook {
     }
 
     /// The address the URL names: the socket path it carries, or the first address its host resolves
-    /// to. Each attempt spends only what the one deadline has left, and resolution is untimed.
+    /// to. Each attempt spends only what the one deadline has left, including resolution.
     fn dial(&self, url: &HttpUrl, deadline: Instant) -> Result<Connection, String> {
         if Instant::now() >= deadline {
             return Err("the webhook budget ended before a dial".to_owned());
@@ -338,10 +338,20 @@ impl Webhook {
             return dial_socket(path, left(deadline));
         }
         let mut last = format!("{} resolved to no address", url.host);
-        for address in (url.host.as_str(), url.port)
-            .to_socket_addrs()
-            .map_err(|error| format!("{}: {error}", url.host))?
-        {
+        let host = url.host.clone();
+        let port = url.port;
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(
+                (host.as_str(), port)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.collect::<Vec<_>>()),
+            );
+        });
+        let resolved = receiver
+            .recv_timeout(left(deadline))
+            .map_err(|_| format!("{} resolution ran past the webhook budget", url.host))?;
+        for address in resolved.map_err(|error| format!("{}: {error}", url.host))? {
             if Instant::now() >= deadline {
                 break;
             }
@@ -572,16 +582,7 @@ fn redirect_url(base: &HttpUrl, location: &str) -> Result<String, String> {
     if location.is_empty() {
         return Err("a redirect Location is empty".to_owned());
     }
-    if location.contains("://") {
-        return Ok(location.to_owned());
-    }
     let scheme = if base.tls { "https" } else { "http" };
-    if location.starts_with("//") {
-        return Ok(format!("{scheme}:{location}"));
-    }
-    if location.starts_with('/') {
-        return Ok(format!("{scheme}://{}{location}", base.authority));
-    }
     if let Some(query) = location.strip_prefix('?') {
         let path = base.path.split('?').next().unwrap_or("/");
         return Ok(format!("{scheme}://{}{path}?{query}", base.authority));
@@ -591,6 +592,15 @@ fn redirect_url(base: &HttpUrl, location: &str) -> Result<String, String> {
             "{scheme}://{}{}{}",
             base.authority, base.path, location
         ));
+    }
+    if location.contains("://") {
+        return Ok(location.to_owned());
+    }
+    if location.starts_with("//") {
+        return Ok(format!("{scheme}:{location}"));
+    }
+    if location.starts_with('/') {
+        return Ok(format!("{scheme}://{}{location}", base.authority));
     }
     let directory = base
         .path
