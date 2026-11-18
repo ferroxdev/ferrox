@@ -183,6 +183,8 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             return 1;
         }
     };
+    options.carrier = choose_carrier(options);
+    let bin = lane::require_bin();
     let port_reservation = match lane::port_lock(paths) {
         Ok(lock) => lock,
         Err(error) => {
@@ -197,13 +199,11 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             return 1;
         }
     }
-    options.carrier = choose_carrier(options);
     let account = if options.outbound == Some(Outbound::Foxy) {
         Some(foxy_account(options, paths))
     } else {
         None
     };
-    let bin = lane::require_bin();
     write_lane_config(options, paths, ports, account.as_ref());
     if lane::running(paths) {
         println!(
@@ -260,15 +260,17 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
 
     let opened =
         fronts(&options.fronts).is_empty() || lane::wait_fronts(&options.fronts, ports, paths);
-    drop(port_reservation);
     if !opened {
         println!(
             "the lane did not open its fronts; last lines of {}:",
             paths.log.display()
         );
         tail(&paths.log, 20);
-        return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
+        let code = stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
+        drop(port_reservation);
+        return code;
     }
+    drop(port_reservation);
     if interrupted.load(Ordering::SeqCst) {
         return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
     }
