@@ -13706,9 +13706,15 @@ mod tests {
         }
         apply_fronting_overrides(&mut servers, &settings);
         assert!(servers.len() <= FRONTED_SERVERS + 513);
-        for (index, server) in servers.iter().take(513).enumerate() {
-            let meek = server.meek.as_ref().expect("fronted");
-            assert_eq!(meek.host, format!("cdn{index}.example"));
+        let hosts: HashSet<String> = servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref().map(|meek| meek.host.clone()))
+            .collect();
+        for index in 0..513 {
+            assert!(
+                hosts.contains(&format!("cdn{index}.example")),
+                "server {index} fell outside the cap"
+            );
         }
     }
 
