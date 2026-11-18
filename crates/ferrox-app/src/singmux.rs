@@ -85,11 +85,6 @@ const FLAG_ADDR: u16 = 2;
 const MAX_STREAMS: usize = 1024;
 const RESET_QUEUE: usize = MAX_STREAMS;
 
-enum Deferred {
-    Reset(u32),
-    Credit,
-}
-
 /// One stream's opening request: a TCP destination, or the destination a connected UDP flow
 /// speaks to; `packet_addr` marks the full-cone form where every frame names its own address.
 #[derive(Debug, PartialEq, Eq)]
@@ -467,7 +462,8 @@ struct Inner {
     role: Role,
     write: Mutex<Box<dyn Write + Send>>,
     sinks: Mutex<HashMap<u32, Sink>>,
-    resets: Mutex<Option<SyncSender<Deferred>>>,
+    resets: Mutex<Option<SyncSender<u32>>>,
+    credits: Mutex<Option<SyncSender<()>>>,
     pending_credit: AtomicUsize,
     accept_tx: Mutex<Option<Sender<Stream>>>,
     accept_rx: Mutex<Receiver<Stream>>,
@@ -495,6 +491,7 @@ impl Inner {
             write: Mutex::new(write),
             sinks: Mutex::new(HashMap::new()),
             resets: Mutex::new(None),
+            credits: Mutex::new(None),
             pending_credit: AtomicUsize::new(0),
             accept_tx: Mutex::new(Some(accept_tx)),
             accept_rx: Mutex::new(accept_rx),
@@ -760,18 +757,6 @@ impl Inner {
 
     /// The demux cannot wait on the carrier: resets drain on a thread of their own.
     fn defer_reset(&self, id: u32) {
-        self.defer(Deferred::Reset(id), true);
-    }
-
-    fn defer_credit(&self, credit: usize) {
-        if self.protocol != Protocol::H2Mux || credit == 0 {
-            return;
-        }
-        self.pending_credit.fetch_add(credit, Ordering::Relaxed);
-        self.defer(Deferred::Credit, false);
-    }
-
-    fn defer(&self, job: Deferred, fatal: bool) {
         let mut resets = match self.resets.lock() {
             Ok(resets) => resets,
             Err(poisoned) => poisoned.into_inner(),
@@ -780,10 +765,10 @@ impl Inner {
             return;
         }
         if resets.is_some() {
-            let sent = resets
+            let failed = resets
                 .as_ref()
-                .is_some_and(|sender| sender.try_send(job).is_ok());
-            if !sent && fatal {
+                .is_some_and(|sender| sender.try_send(id).is_err());
+            if failed {
                 drop(resets);
                 self.finish();
             }
@@ -794,15 +779,11 @@ impl Inner {
         let spawned = std::thread::Builder::new()
             .name("singmux-reset".to_owned())
             .spawn(move || {
-                while let Ok(job) = pending.recv() {
+                while let Ok(id) = pending.recv() {
                     let Some(inner) = inner.upgrade() else {
                         break;
                     };
-                    if let Deferred::Reset(id) = job {
-                        inner.send_reset(id);
-                    }
-                    let credit = inner.pending_credit.swap(0, Ordering::Relaxed);
-                    inner.send_connection_credit(credit);
+                    inner.send_reset(id);
                 }
             });
         if spawned.is_err() {
@@ -812,7 +793,50 @@ impl Inner {
         }
         *resets = Some(sender.clone());
         drop(resets);
-        if sender.try_send(job).is_err() && fatal {
+        let _ = sender.try_send(id);
+    }
+
+    fn defer_credit(&self, credit: usize) {
+        if self.protocol != Protocol::H2Mux || credit == 0 {
+            return;
+        }
+        self.pending_credit.fetch_add(credit, Ordering::Relaxed);
+        let mut credits = match self.credits.lock() {
+            Ok(credits) => credits,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.dead() {
+            return;
+        }
+        if credits.is_none() {
+            let (sender, wake) = sync_channel(1);
+            let inner = Arc::downgrade(&self.clone_handle());
+            let spawned = std::thread::Builder::new()
+                .name("singmux-credit".to_owned())
+                .spawn(move || {
+                    while wake.recv().is_ok() {
+                        let Some(inner) = inner.upgrade() else {
+                            break;
+                        };
+                        let credit = inner.pending_credit.swap(0, Ordering::Relaxed);
+                        inner.send_connection_credit(credit);
+                    }
+                });
+            if spawned.is_err() {
+                drop(credits);
+                self.finish();
+                return;
+            }
+            *credits = Some(sender);
+        }
+        let disconnected = credits.as_ref().is_some_and(|wake| {
+            matches!(
+                wake.try_send(()),
+                Err(std::sync::mpsc::TrySendError::Disconnected(()))
+            )
+        });
+        if disconnected {
+            drop(credits);
             self.finish();
         }
     }
@@ -825,6 +849,7 @@ impl Inner {
             frame[..9].copy_from_slice(&h2::frame_head(4, h2::T_WINDOW, 0, 0));
             frame[9..].copy_from_slice(&u32::try_from(amount).unwrap().to_be_bytes());
             if self.write_raw(&frame).is_err() {
+                self.finish();
                 return;
             }
             left -= amount;
@@ -1016,6 +1041,10 @@ impl Inner {
         }
         match self.resets.lock() {
             Ok(mut resets) => drop(resets.take()),
+            Err(poisoned) => drop(poisoned.into_inner().take()),
+        }
+        match self.credits.lock() {
+            Ok(mut credits) => drop(credits.take()),
             Err(poisoned) => drop(poisoned.into_inner().take()),
         }
         self.connection_window.close();
@@ -1421,9 +1450,10 @@ impl Stream {
     }
 
     pub(crate) fn finish(&self) {
+        let first = !self.closed.swap(true, Ordering::Relaxed);
         self.window.close();
         self.inner.connection_window.notify_waiters();
-        if !self.closed.swap(true, Ordering::Relaxed) {
+        if first {
             self.inner.send_end(self.id);
         }
         self.inner.end_local(self.id);
@@ -1513,9 +1543,10 @@ pub(crate) struct StreamWriter {
 
 impl StreamWriter {
     fn finish(&self) {
+        let first = !self.closed.swap(true, Ordering::Relaxed);
         self.window.close();
         self.inner.connection_window.notify_waiters();
-        if !self.closed.swap(true, Ordering::Relaxed) {
+        if first {
             self.inner.send_end(self.id);
         }
         self.inner.end_local(self.id);
