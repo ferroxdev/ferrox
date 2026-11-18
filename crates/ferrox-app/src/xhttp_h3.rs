@@ -1985,7 +1985,7 @@ mod tests {
     #[test]
     fn a_waiting_h3_stream_read_returns_on_the_relay_poll_budget() {
         let (identity, roots) = minted_identity("localhost");
-        let settings = settings();
+        let settings = dual_settings(XhttpMode::StreamUp);
         let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
             .expect("the h3 listener binds");
         // The upload stays open, so the echoing server has nothing to answer yet.
