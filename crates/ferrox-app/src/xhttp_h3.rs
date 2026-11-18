@@ -2,6 +2,8 @@
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -73,6 +75,41 @@ impl Wire {
         }
     }
 }
+
+/// What a lane's empty read did: handed the lane back, or slept the transport tick, counted only under `cfg(test)`.
+#[cfg(test)]
+static LANE_GRANTS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+static LANE_TICKS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn lane_grants() -> usize {
+    LANE_GRANTS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn lane_ticks() -> usize {
+    LANE_TICKS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn note_lane_grant() {
+    LANE_GRANTS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn note_lane_tick() {
+    LANE_TICKS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+#[inline]
+fn note_lane_grant() {}
+
+#[cfg(not(test))]
+#[inline]
+fn note_lane_tick() {}
 
 /// The request stream as the shared dispatch reads it: HEADERS becomes the H1 head `accept_core`
 /// parses, and every DATA frame after it is body.
@@ -222,11 +259,11 @@ impl H3Reader {
                 if self.idle_expired(since) {
                     return Err(std::io::Error::other("h3 request stalled"));
                 }
-                if crate::proxy::relay_step_owns_poll()
-                    && since.elapsed() >= crate::budgets::RELAY_POLL
-                {
+                if crate::proxy::relay_step_owns_poll() {
+                    note_lane_grant();
                     return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
+                note_lane_tick();
                 std::thread::sleep(POLL);
             }
             Err(error) => {
@@ -890,10 +927,11 @@ impl Read for ClientStream {
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
             }
             drop(conn);
-            if Instant::now() >= deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
-            std::thread::sleep(POLL);
+            std::thread::sleep(left.min(POLL));
         }
     }
 }
@@ -1978,6 +2016,47 @@ mod tests {
             );
         }
         assert_eq!(&got, b"hello");
+    }
+
+    /// A lane's empty h3 read hands the lane back without sleeping the transport tick: the cell's
+    /// eight download streams share one connection, and a lane asleep for the tick makes the
+    /// receiver's window update late.
+    #[test]
+    fn a_waiting_h3_stream_read_does_not_sleep_the_transport_tick() {
+        let (identity, roots) = minted_identity("localhost");
+        let settings = dual_settings(XhttpMode::StreamUp);
+        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
+            .expect("the h3 listener binds");
+        // The upload stays open, so the echoing server has nothing to answer yet.
+        let (mut reader, _writer) = dial(port, &settings, roots);
+        let mut room = [0u8; 4096];
+        let lane = crate::proxy::RelayStep::enter();
+        let began = Instant::now();
+        let ticks = lane_ticks();
+        let grants = lane_grants();
+        loop {
+            match reader.read(&mut room) {
+                Ok(0) => panic!("the h3 stream ended before it had to wait"),
+                Ok(_) => assert!(
+                    began.elapsed() < Duration::from_secs(2),
+                    "the h3 stream answered for two seconds without ever making a read wait"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("the h3 read fails: {error}"),
+            }
+        }
+        let slept = lane_ticks() - ticks;
+        let handed = lane_grants() - grants;
+        drop(lane);
+        assert_eq!(
+            slept, 0,
+            "a lane's empty h3 read slept the {POLL:?} transport tick {slept} time(s) instead of \
+             handing the lane back"
+        );
+        assert!(
+            handed > 0,
+            "a lane's empty h3 read never handed the lane back, so the reader slept a tick"
+        );
     }
 
     #[test]
