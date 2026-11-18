@@ -790,8 +790,8 @@ impl Comparison {
         let _ = writeln!(
             s,
             "| one-hop ceiling | {} |",
-            match self.ceiling_summary() {
-                Some((median, low, high)) => format!(
+            if let Some((median, low, high)) = self.ceiling_summary() {
+                format!(
                     "{median:.1} MiB/s with no engine in the path and **one** socket \
                      hop, {} per repeat, min {low:.1} max {high:.1}, spread {}. Every \
                      row below is a relay, which is **two** hops, so 100% here is \
@@ -802,24 +802,23 @@ impl Comparison {
                     self.ceilings_mib_s.len(),
                     spread_text((high - low) / median),
                     stats::HARNESS_BOUND * 100.0
-                ),
-                None => {
-                    let because = if self.workload.measures_ceiling() {
-                        self.ceiling_failures.first().map_or_else(
-                            || "the harness ran no probe for this cell".to_owned(),
-                            |reason| format!("the harness probe failed: {reason}"),
-                        )
-                    } else {
-                        format!(
-                            "a {} cell has no TCP stream for the one-hop generator to bound",
-                            self.workload.traffic
-                        )
-                    };
-                    format!(
-                        "not measured, because {because}; no row below can be called \
-                         generator-saturated"
+                )
+            } else {
+                let because = if self.workload.measures_ceiling() {
+                    self.ceiling_failures.first().map_or_else(
+                        || "the harness ran no probe for this cell".to_owned(),
+                        |reason| format!("the harness probe failed: {reason}"),
                     )
-                }
+                } else {
+                    format!(
+                        "a {} cell has no TCP stream for the one-hop generator to bound",
+                        self.workload.traffic
+                    )
+                };
+                format!(
+                    "not measured, because {because}; no row below can be called \
+                     generator-saturated"
+                )
             }
         );
         let _ = writeln!(
@@ -2815,6 +2814,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn comparison_json_reports_rows_verdicts_and_cells() {
         let comparison = Comparison {
             workload: workload(),
