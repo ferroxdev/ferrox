@@ -276,7 +276,7 @@ impl Webhook {
                 })?;
                 let next = redirect_url(&url, &location)?;
                 url = HttpUrl::parse(&next)?;
-                if matches!(status, 301 | 302 | 303) {
+                if matches!(status, 301..=303) {
                     method = "GET";
                     body = "";
                 }

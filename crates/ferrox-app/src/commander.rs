@@ -416,6 +416,7 @@ impl Api {
     /// One HTTP/2 connection's worth of calls. The client opens the preface and its SETTINGS, then
     /// a HEADERS/DATA pair per call; this answers each completed body in arrival order. Every frame
     /// head waits only for the configured idle bound, not the relay's retry grain.
+    #[allow(clippy::too_many_lines)]
     fn serve_stream_with_idle(&self, mut stream: Connection, idle: Duration) {
         if stream.set_read_timeout(Some(idle)).is_err()
             || stream.set_write_timeout(Some(idle)).is_err()

@@ -606,7 +606,7 @@ pub(crate) fn udid(named: &str) -> String {
     let mut raw = [0u8; 16];
     if getrandom::fill(&mut raw).is_err() {
         let mut state = foxy_account::epoch().wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ u64::from(FALLBACK_ID.fetch_add(1, Ordering::Relaxed))
+            ^ FALLBACK_ID.fetch_add(1, Ordering::Relaxed)
             ^ u64::from(std::process::id());
         for byte in &mut raw {
             state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);

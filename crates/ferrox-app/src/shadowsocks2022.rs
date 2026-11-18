@@ -2350,7 +2350,7 @@ fn send_upstream(
 ) {
     let ipv6 = dest.is_ipv6();
     let key = (client, ipv6);
-    if !upstreams.contains_key(&key) {
+    if let std::collections::hash_map::Entry::Vacant(entry) = upstreams.entry(key) {
         let bind = if ipv6 { "[::]:0" } else { "0.0.0.0:0" };
         let Ok(socket) = UdpSocket::bind(bind) else {
             return;
@@ -2358,7 +2358,7 @@ fn send_upstream(
         if socket.set_read_timeout(Some(RELAY_POLL)).is_err() {
             return;
         }
-        upstreams.insert(key, socket);
+        entry.insert(socket);
     }
     if let Some(socket) = upstreams.get(&key) {
         let _ = socket.send_to(payload, dest);
