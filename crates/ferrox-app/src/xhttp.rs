@@ -3513,15 +3513,12 @@ fn send_dial_head_padded<W: crate::proxy::FrameWrite>(
     const BEFORE_REFERER: &str = "\r\nReferer: http://";
     // The reference dialer disables keep-alives (dialer.go:272), and a chunked request whose first chunk waits on the 200 hangs a peer that drains the body before it flushes.
     const TAIL: &str = "Transfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
-    // The default padding's longest shape stays in the room, so a configured pad only grows it when it exceeds the default's ceiling.
-    const PADDING_ROOM: usize = 1000;
     let referer = target.split_once('?').map_or(target, |(path, _)| path);
-    let room = padding.len().max(referer_pad.len()).max(PADDING_ROOM);
     let headers_len = crate::headers::masked_len(headers, crate::headers::FETCH);
     DIAL_HEAD.with(|cell| {
         let mut head = cell.borrow_mut();
         head.clear();
-        // The room is the head's longest shape, so the allocator is entered once and a default padding never grows it.
+        // The room is the head's exact shape, so the allocator is entered once.
         head.reserve(
             BEFORE_PATH.len()
                 + target.len()
@@ -3530,7 +3527,6 @@ fn send_dial_head_padded<W: crate::proxy::FrameWrite>(
                 + BEFORE_REFERER.len()
                 + host.len()
                 + referer.len()
-                + room
                 + referer_prefix.len()
                 + referer_pad.len()
                 + padding.len()
