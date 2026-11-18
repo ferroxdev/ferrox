@@ -443,6 +443,7 @@ p
 **Status:** todo
 **Leverage:** 3
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`; CI: `ci.yml`
 **Touches:** Cargo.toml
 
@@ -506,7 +507,7 @@ body
         );
         let text = format!(
             "{one}\n## P2 · Two\n\n**When to use:** now\n**Status:** todo\n**Leverage:** 1\n\
-             **Effort:** small\n**Gates:** `cargo test`\n\n```text\n{shared} twice\n```\n"
+             **Effort:** small\n**Targets:** none\n**Gates:** `cargo test`\n\n```text\n{shared} twice\n```\n"
         );
         let findings = run(&load(&text), &crate::manifest_root(), true);
         assert!(
@@ -596,7 +597,7 @@ body
     fn two_open_prompts_claiming_one_file_are_reported() {
         let text = format!(
             "{GOOD}\n## P2 · Two\n\n**When to use:** now\n**Status:** todo\n**Leverage:** 1\n\
-             **Effort:** small\n**Gates:** `cargo test`\n**Touches:** Cargo.toml\n\n```text\nb\n```\n"
+             **Effort:** small\n**Targets:** none\n**Gates:** `cargo test`\n**Touches:** Cargo.toml\n\n```text\nb\n```\n"
         );
         let findings = run(&load(&text), &crate::manifest_root(), true);
         assert!(
@@ -615,7 +616,7 @@ body
         );
         let text = format!(
             "{touched}\n## P2 · Two\n\n**When to use:** now\n**Status:** todo\n**Leverage:** 1\n\
-             **Effort:** small\n**Gates:** `cargo test`\n**Touches:** +crates/ferrox-prompt/src/contended.rs\n\n```text\nb\n```\n"
+             **Effort:** small\n**Targets:** none\n**Gates:** `cargo test`\n**Touches:** +crates/ferrox-prompt/src/contended.rs\n\n```text\nb\n```\n"
         );
         let findings = run(&load(&text), &crate::manifest_root(), true);
         assert!(

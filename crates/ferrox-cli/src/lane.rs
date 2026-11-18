@@ -41,9 +41,13 @@ fn beside_bin() -> Option<PathBuf> {
         .and_then(|path| path.parent().map(|parent| parent.join(bin_name())))
 }
 
+fn env_bin() -> Option<PathBuf> {
+    std::env::var_os("FERROX_BIN").map(PathBuf::from)
+}
+
 fn resolve_bin() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("FERROX_BIN") {
-        return Some(PathBuf::from(path));
+    if let Some(path) = env_bin() {
+        return Some(path);
     }
     if let Some(path) = beside_bin().filter(|path| path.exists()) {
         return Some(path);
@@ -154,7 +158,7 @@ fn process_exe(pid: u32) -> Option<PathBuf> {
     }
 }
 
-fn expected_bin(paths: &Paths) -> PathBuf {
+fn recorded_bin(paths: &Paths) -> PathBuf {
     read_trim(&bin_marker(paths))
         .filter(|text| !text.is_empty())
         .map_or_else(
@@ -190,6 +194,10 @@ fn same_exe(actual: &Path, expected: &Path) -> bool {
     }
 }
 
+fn recognises(actual: &Path, recorded: &Path, overridden: Option<&Path>) -> bool {
+    same_exe(actual, recorded) || overridden.is_some_and(|path| same_exe(actual, path))
+}
+
 fn is_ferrox(paths: &Paths, pid: u32) -> bool {
     let Some(actual) = process_exe(pid) else {
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -197,7 +205,8 @@ fn is_ferrox(paths: &Paths, pid: u32) -> bool {
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         return false;
     };
-    same_exe(&actual, &expected_bin(paths))
+    let overridden = env_bin();
+    recognises(&actual, &recorded_bin(paths), overridden.as_deref())
 }
 
 #[cfg(any(unix, windows))]
@@ -214,7 +223,8 @@ fn wait_exit(pid: u32, attempts: u32) -> bool {
 pub fn kill(paths: &Paths, pid: u32) -> Result<(), String> {
     if !is_ferrox(paths, pid) {
         return Err(format!(
-            "process {pid} is not ferrox-app; it was not stopped. If the binary was renamed, set FERROX_BIN."
+            "process {pid} is not ferrox-app; it was not stopped. If the binary was renamed, set FERROX_BIN. Otherwise remove the stale pid file {}.",
+            paths.pid_file.display()
         ));
     }
     #[cfg(unix)]
@@ -469,7 +479,7 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
 
 pub fn stop(paths: &Paths) -> Result<(), String> {
     if let Some(pid) = pid(paths) {
-        if alive(pid) && is_ferrox(paths, pid) {
+        if alive(pid) {
             kill(paths, pid)?;
         }
     }
@@ -679,7 +689,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
-    fn a_live_foreign_pid_is_stale_not_a_running_lane() {
+    fn a_live_foreign_pid_is_kept_for_retry() {
         let root = std::env::temp_dir().join(format!("ferrox-foreign-{}", std::process::id()));
         let paths = Paths::with_dirs(root.join("conf"), root.join("state"), None);
         let current = std::process::id();
@@ -689,8 +699,32 @@ mod tests {
         );
         write_private(&paths.pid_file, &format!("{current}\n")).unwrap();
         assert!(!running(&paths));
-        assert!(stop(&paths).is_ok());
-        assert_eq!(pid(&paths), None);
+        let error = stop(&paths).expect_err("a foreign pid is not stopped");
+        assert!(
+            error.contains(&paths.pid_file.display().to_string()),
+            "the refusal names the pid file: {error}"
+        );
+        assert_eq!(pid(&paths), Some(current));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_lane_is_recognised_by_its_recorded_or_overridden_binary() {
+        let root = std::env::temp_dir().join(format!("ferrox-rename-{}", std::process::id()));
+        let paths = Paths::with_dirs(root.join("conf"), root.join("state"), None);
+        let recorded = root.join("ferrox-app");
+        let overridden = root.join("renamed-ferrox-app");
+        write_private(&bin_marker(&paths), &format!("{}\n", recorded.display())).unwrap();
+        assert_eq!(recorded_bin(&paths), recorded);
+        assert!(recognises(&recorded, &recorded, None));
+        assert!(!recognises(&overridden, &recorded, None));
+        assert!(recognises(&recorded, &recorded, Some(&overridden)));
+        assert!(recognises(&overridden, &recorded, Some(&overridden)));
+        assert!(!recognises(
+            &root.join("other"),
+            &recorded,
+            Some(&overridden)
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 

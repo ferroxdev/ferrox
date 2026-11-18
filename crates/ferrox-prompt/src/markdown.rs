@@ -981,6 +981,10 @@ const REQUIRED_FIELDS: &[(&str, &str)] = &[
         "the advisor ranks on it, so an unstated prompt is ranked last by accident",
     ),
     ("Effort", "the advisor breaks ties with it"),
+    (
+        "Targets",
+        "a matrix prompt without a target class is never expanded for a row",
+    ),
 ];
 
 /// Whether a field appears at all, as opposed to appearing empty.
@@ -1083,6 +1087,7 @@ stand up
 **Status:** done
 **Leverage:** 5
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 **Touches:** crates/ferrox-core/src/lib.rs
 **Random weight:** 0
@@ -1099,6 +1104,7 @@ do the first thing with {len=40}
 **Status:** todo
 **Leverage:** 3
 **Effort:** large
+**Targets:** none
 **Gates:** `cargo clippy`; CI: `ci.yml`
 **Depends on:** P1
 **Touches:** +crates/ferrox-prompt/src/new.rs
@@ -1112,6 +1118,19 @@ do the second thing with {scope}
 
     fn load(text: &str) -> Library {
         Library::parse(Path::new("prompts.md"), text)
+    }
+
+    #[test]
+    fn a_prompt_without_targets_is_an_error() {
+        let library = load(&LIBRARY.replace("**Targets:** none\n", ""));
+        let named = library
+            .errors()
+            .any(|error| error.message.contains("**Targets:**"));
+        assert!(
+            named,
+            "the missing target class is named: {:?}",
+            library.diagnostics
+        );
     }
 
     #[test]
@@ -1208,6 +1227,7 @@ p
 **Status:** todo
 **Leverage:** 1
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 **Depends on:** P2
 
@@ -1221,6 +1241,7 @@ b
 **Status:** todo
 **Leverage:** 1
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 **Depends on:** P1
 

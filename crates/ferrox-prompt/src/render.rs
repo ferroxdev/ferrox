@@ -442,6 +442,7 @@ prove it or do not say it
 **Status:** todo
 **Leverage:** 4
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test --workspace`
 
 ```text
@@ -456,6 +457,7 @@ run with {len=40} and {scope}
 **Status:** todo
 **Leverage:** 4
 **Effort:** large
+**Targets:** none
 **Gates:** `cargo test`
 **Depends on:** P1
 **Touches:** README.md
@@ -761,6 +763,7 @@ p
 **Status:** todo
 **Leverage:** 1
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 
 ```text
@@ -799,6 +802,7 @@ p
 **Status:** todo
 **Leverage:** 1
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 
 ```text
@@ -903,6 +907,7 @@ p
 **Status:** todo
 **Leverage:** 1
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 
 ```text

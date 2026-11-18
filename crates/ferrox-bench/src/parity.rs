@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,7 +22,9 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 
 const FLOW_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const HOLD_PROBE: Duration = Duration::from_millis(250);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+const WARMUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A completed transfer whose slowest flow finished this far behind the median is a runner straggler - a descheduled flow or one TCP retransmit (Linux's 200 ms `RTO_MIN`) - not the engine: the bytes are whole and the rest of the cell is at the fast mode, so the run is re-measured.
 const STRAGGLER_TAIL: Duration = Duration::from_millis(150);
@@ -1127,8 +1129,8 @@ impl Cell {
     }
 
     /// Whether starting a measure still fits: its first attempt can take the whole run cap, and the cell still owes the margin to print.
-    pub fn fits(&self) -> bool {
-        self.left() > RUN_TIMEOUT + CELL_MARGIN
+    pub fn fits(&self, first_attempt_cap: Duration) -> bool {
+        self.left() > first_attempt_cap + CELL_MARGIN
     }
 }
 
@@ -1285,7 +1287,7 @@ fn measure_once(
     while Instant::now() < settle_until && sink_thread.received() < sink_expected {
         std::thread::sleep(Duration::from_millis(5));
     }
-    let (sink_received, sink_reasons) = sink_thread.join()?;
+    let (sink_received, sink_accepted, sink_reasons) = sink_thread.join()?;
     let server = match server {
         Some(server) => Some(server.finish()?),
         None => None,
@@ -1309,6 +1311,12 @@ fn measure_once(
         request.total_bytes(),
         sink_received,
         sink_expected,
+        sink_accepted,
+        if request.traffic == Traffic::HeldOpen {
+            u64::try_from(request.connections).unwrap_or(u64::MAX)
+        } else {
+            0
+        },
         &sink_reasons,
         &desync,
     )?;
@@ -1346,6 +1354,8 @@ fn validate_transfer(
     expected: u64,
     sink_received: u64,
     sink_expected: u64,
+    sink_accepted: u64,
+    held_connections: u64,
     sink_reasons: &[String],
     desync: &Desync,
 ) -> Result<(), Error> {
@@ -1356,6 +1366,11 @@ fn validate_transfer(
     // A flow that reported why it stopped is a fault even when its byte totals look whole.
     if !moved.all_stopped.is_empty() {
         return short_transfer(moved, expected, sink_received, sink_expected, sink_reasons);
+    }
+    if held_connections != 0 && sink_accepted != held_connections {
+        return Err(Error::Workload(format!(
+            "held-open sink accepted {sink_accepted} of {held_connections} flows; the engine did not dial every held target"
+        )));
     }
     if moved.sent + moved.received == expected && sink_received == sink_expected {
         if let Some(tail) = straggler_tail(&moved.flow_windows) {
@@ -1622,15 +1637,16 @@ struct Moved {
 }
 
 /// A hold's own duration is the workload, so its fan-in cap leaves room for a hold thread scheduled after the clock starts.
-fn fan_in_cap(request: &Request) -> Duration {
-    if request.traffic == Traffic::HeldOpen {
-        request
-            .duration
-            .saturating_add(FLOW_IO_TIMEOUT)
-            .max(RUN_TIMEOUT)
+pub fn first_attempt_cap(traffic: &str, duration: Duration) -> Duration {
+    if traffic == "held-open" {
+        duration.saturating_add(FLOW_IO_TIMEOUT).max(RUN_TIMEOUT)
     } else {
         RUN_TIMEOUT
     }
+}
+
+fn fan_in_cap(request: &Request) -> Duration {
+    first_attempt_cap(request.traffic.as_str(), request.duration)
 }
 
 fn collect_flows(
@@ -1810,19 +1826,24 @@ struct SinkThread {
     reasons: Arc<std::sync::Mutex<Vec<String>>>,
     done: Arc<AtomicBool>,
     received: Arc<AtomicU64>,
+    accepted: Arc<AtomicU64>,
 }
 
 impl SinkThread {
     /// Stop the workers, join them, and read what they counted, so a drain that finished after the
     /// settle still contributes every byte and every reason before validation.
-    fn join(mut self) -> Result<(u64, Vec<String>), Error> {
+    fn join(mut self) -> Result<(u64, u64, Vec<String>), Error> {
         self.done.store(true, Ordering::Relaxed);
         if let Some(accept) = self.accept.take() {
             accept
                 .join()
                 .map_err(|_| Error::Workload("the sink thread panicked".into()))?;
         }
-        Ok((self.received(), self.reasons()))
+        Ok((
+            self.received.load(Ordering::Relaxed),
+            self.accepted.load(Ordering::Relaxed),
+            self.reasons(),
+        ))
     }
 
     /// Every byte the client counts has reached the sink, so the engine's window can close there.
@@ -2190,6 +2211,33 @@ fn run_hold_flow(plan: &HoldPlan, index: usize) -> FlowResult {
             std::thread::sleep(plan.duration.saturating_sub(Duration::from_micros(
                 u64::try_from(setup.total_us).unwrap_or(u64::MAX),
             )));
+            let mut probe = [0u8; 1];
+            match stream.set_read_timeout(Some(HOLD_PROBE)) {
+                Err(e) => {
+                    result.stopped = Some(format!("flow {index}: cannot probe the hold: {e}"));
+                }
+                Ok(()) => match stream.peek(&mut probe) {
+                    Ok(0) => {
+                        result.stopped = Some(format!(
+                            "flow {index}: the engine closed the held connection"
+                        ));
+                    }
+                    Ok(_) => {
+                        result.stopped = Some(format!(
+                            "flow {index}: the engine sent data on a held connection"
+                        ));
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(e) => {
+                        result.stopped =
+                            Some(format!("flow {index}: the held connection failed: {e}"));
+                    }
+                },
+            }
             let _ = stream.shutdown(Shutdown::Both);
         }
         Err(reason) => result.stopped = Some(format!("flow {index}: {reason}")),
@@ -2263,6 +2311,7 @@ fn run_latency_flow(plan: &LatencyPlan) -> FlowResult {
     result
 }
 
+#[allow(clippy::too_many_lines)]
 fn socks_udp_associate(engine: SocketAddr) -> Result<(TcpStream, SocketAddr, Setup), String> {
     let t0 = Instant::now();
     let mut control = TcpStream::connect_timeout(&engine, Duration::from_secs(10))
@@ -2333,8 +2382,38 @@ fn socks_udp_associate(engine: SocketAddr) -> Result<(TcpStream, SocketAddr, Set
             };
             Ok((control, relay, setup))
         }
+        3 => {
+            let mut len = [0u8; 1];
+            control
+                .read_exact(&mut len)
+                .map_err(|e| format!("udp associate domain length read failed: {e}"))?;
+            let mut name = vec![0u8; usize::from(len[0])];
+            control
+                .read_exact(&mut name)
+                .map_err(|e| format!("udp associate domain read failed: {e}"))?;
+            let mut tail = [0u8; 2];
+            control
+                .read_exact(&mut tail)
+                .map_err(|e| format!("udp associate port read failed: {e}"))?;
+            let port = u16::from_be_bytes(tail);
+            let name = String::from_utf8(name)
+                .map_err(|_| "the udp associate reply has a non-UTF-8 domain".to_owned())?;
+            let relay = (name.as_str(), port)
+                .to_socket_addrs()
+                .map_err(|e| format!("cannot resolve the udp associate relay {name}:{port}: {e}"))?
+                .find(|addr| addr.is_ipv4() == engine.is_ipv4())
+                .ok_or_else(|| {
+                    format!(
+                        "the udp associate relay {name}:{port} has no address in the engine's family"
+                    )
+                })?;
+            setup.socks_connect_us = t2.elapsed().as_micros();
+            setup.socks_setup_us = t1.elapsed().as_micros();
+            setup.total_us = t0.elapsed().as_micros();
+            Ok((control, relay, setup))
+        }
         other => Err(format!(
-            "the udp associate reply has address type {other}, not ipv4 or ipv6"
+            "the udp associate reply has address type {other}, not IPv4, domain or IPv6"
         )),
     }
 }
@@ -2703,6 +2782,7 @@ impl FlowPlan {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn spawn_sink(
     listeners: Vec<TcpListener>,
     udp_sockets: Vec<UdpSocket>,
@@ -2734,7 +2814,12 @@ fn spawn_sink(
     let accept_desync = Arc::clone(desync);
     let done = Arc::new(AtomicBool::new(false));
     let received = Arc::new(AtomicU64::new(0));
-    let (sink_done, sink_received) = (Arc::clone(&done), Arc::clone(&received));
+    let accepted = Arc::new(AtomicU64::new(0));
+    let (sink_done, sink_received, sink_accepted) = (
+        Arc::clone(&done),
+        Arc::clone(&received),
+        Arc::clone(&accepted),
+    );
     let accept = std::thread::spawn(move || {
         let done = sink_done;
         let mut handles = Vec::with_capacity(listeners.len() + udp_sockets.len());
@@ -2742,7 +2827,11 @@ fn spawn_sink(
             let flow = Arc::new(rotate(&pattern, index, flows));
             let sink_reasons = Arc::clone(&accept_reasons);
             let sink_desync = Arc::clone(&accept_desync);
-            let (thread_done, thread_received) = (Arc::clone(&done), Arc::clone(&sink_received));
+            let (thread_done, thread_received, thread_accepted) = (
+                Arc::clone(&done),
+                Arc::clone(&sink_received),
+                Arc::clone(&sink_accepted),
+            );
             handles.push(std::thread::spawn(move || {
                 let listener_done = thread_done;
                 loop {
@@ -2751,7 +2840,10 @@ fn spawn_sink(
                             return;
                         }
                         match listener.accept() {
-                            Ok(pair) => break pair,
+                            Ok(pair) => {
+                                thread_accepted.fetch_add(1, Ordering::Relaxed);
+                                break pair;
+                            }
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                 std::thread::sleep(Duration::from_millis(20));
                             }
@@ -2808,6 +2900,7 @@ fn spawn_sink(
         reasons,
         done,
         received,
+        accepted,
     })
 }
 
@@ -2976,29 +3069,51 @@ fn emit(
 }
 
 fn warmup(socks: SocketAddr, pattern: &[u8]) -> Result<(), Error> {
+    let deadline = Instant::now() + WARMUP_TIMEOUT;
+    let within = || {
+        if Instant::now() >= deadline {
+            Err(Error::Engine {
+                message: "warmup exceeded its 30s budget".into(),
+            })
+        } else {
+            Ok(())
+        }
+    };
     let mut stream = TcpStream::connect_timeout(&socks, Duration::from_secs(10))
         .map_err(io("warmup connect"))?;
     let _ = stream.set_nodelay(true);
     stream
+        .set_read_timeout(Some(WARMUP_TIMEOUT))
+        .map_err(io("warmup timeout"))?;
+    stream
+        .set_write_timeout(Some(WARMUP_TIMEOUT))
+        .map_err(io("warmup timeout"))?;
+    stream
         .write_all(&[5, 1, 0])
         .map_err(io("warmup greeting"))?;
+    within()?;
     let mut greeting = [0u8; 2];
     stream
         .read_exact(&mut greeting)
         .map_err(io("warmup greeting reply"))?;
+    within()?;
     let mut connect = vec![5, 1, 0, 1, 127, 0, 0, 1];
     connect.extend_from_slice(&1u16.to_be_bytes());
     stream
         .write_all(&connect)
         .map_err(io("warmup connect request"))?;
+    within()?;
     let mut reply = [0u8; 10];
     stream
         .read_exact(&mut reply)
         .map_err(io("warmup connect reply"))?;
+    within()?;
     let chunk = &pattern[..pattern.len().min(1024)];
     stream.write_all(chunk).map_err(io("warmup write"))?;
+    within()?;
     let mut echo = vec![0u8; chunk.len()];
     stream.read_exact(&mut echo).map_err(io("warmup echo"))?;
+    within()?;
     let _ = stream.shutdown(Shutdown::Both);
     Ok(())
 }
@@ -3958,7 +4073,8 @@ mod tests {
         };
         let mut one_late = vec![Duration::from_millis(80); 7];
         one_late.push(Duration::from_millis(280));
-        let straggled = validate_transfer(&moved(one_late.clone()), expected, 0, 0, &[], &desync);
+        let straggled =
+            validate_transfer(&moved(one_late.clone()), expected, 0, 0, 0, 0, &[], &desync);
         assert!(
             matches!(&straggled, Err(Error::Transient(m)) if m.contains("runner straggler")),
             "one flow an RTO behind the rest is re-measured: {straggled:?}"
@@ -3966,7 +4082,7 @@ mod tests {
         let mut calls = 0usize;
         let storm = remeasure_disturbed(REMEASURE_ATTEMPTS, REMEASURE_BUDGET, || {
             calls += 1;
-            validate_transfer(&moved(one_late.clone()), expected, 0, 0, &[], &desync)
+            validate_transfer(&moved(one_late.clone()), expected, 0, 0, 0, 0, &[], &desync)
         });
         assert!(
             matches!(&storm, Err(Error::Workload(m))
@@ -3977,6 +4093,8 @@ mod tests {
         let uniform = validate_transfer(
             &moved(vec![Duration::from_millis(280); 8]),
             expected,
+            0,
+            0,
             0,
             0,
             &[],
@@ -3996,17 +4114,38 @@ mod tests {
             Duration::from_millis(280),
             Duration::from_millis(280),
         ];
-        let split = validate_transfer(&moved(half_slow), expected, 0, 0, &[], &desync);
+        let split = validate_transfer(&moved(half_slow), expected, 0, 0, 0, 0, &[], &desync);
         assert!(
             split.is_ok(),
             "half the flows slow is not an isolated straggler: {split:?}"
         );
         let mut stalled = vec![Duration::from_millis(80); 7];
         stalled.push(Duration::from_millis(1_500));
-        let beyond = validate_transfer(&moved(stalled), expected, 0, 0, &[], &desync);
+        let beyond = validate_transfer(&moved(stalled), expected, 0, 0, 0, 0, &[], &desync);
         assert!(
             beyond.is_ok(),
             "a tail past the retransmit band is banked, not re-measured: {beyond:?}"
+        );
+    }
+
+    #[test]
+    fn a_held_open_run_without_sink_connections_is_unmeasured() {
+        let desync: Desync = Arc::new(std::sync::Mutex::new(None));
+        let moved = Moved {
+            sent: 0,
+            received: 0,
+            latency_us: Vec::new(),
+            window: None,
+            flow_windows: Vec::new(),
+            setup: Vec::new(),
+            stopped: None,
+            all_stopped: Vec::new(),
+        };
+        let error = validate_transfer(&moved, 0, 0, 0, 0, 1, &[], &desync)
+            .expect_err("a hold whose target was never dialed is not a hold");
+        assert!(
+            error.to_string().contains("accepted 0 of 1"),
+            "the engine's missing dial is named: {error}"
         );
     }
 
@@ -4035,8 +4174,9 @@ mod tests {
     #[test]
     fn a_cell_stops_taking_a_measure_it_cannot_finish() {
         // A measure's first attempt can take the whole run cap, so a cell with less than that and the print margin left starts none.
+        let request = Request::parse(request_with(&[]).as_bytes()).expect("a valid request");
         assert!(
-            Cell::new(CELL_WINDOW).fits(),
+            Cell::new(CELL_WINDOW).fits(fan_in_cap(&request)),
             "a fresh cell can always measure"
         );
         let spent = Cell {
@@ -4045,11 +4185,35 @@ mod tests {
                 .expect("a cell one window in the past"),
             window: CELL_WINDOW,
         };
-        assert!(!spent.fits(), "a cell past its window takes no measure");
+        assert!(
+            !spent.fits(fan_in_cap(&request)),
+            "a cell past its window takes no measure"
+        );
         assert_eq!(
             spent.left(),
             Duration::ZERO,
             "and its clock saturates at zero rather than going negative"
+        );
+        let hold = Request::parse(
+            request_with(&[("traffic", &quote("held-open")), ("duration_ms", "120000")]).as_bytes(),
+        )
+        .expect("a hold at the run cap");
+        let barely_left = CELL_WINDOW
+            .checked_sub(Duration::from_secs(220))
+            .expect("a 220s hold fits in a cell");
+        let barely = Cell {
+            started: Instant::now()
+                .checked_sub(barely_left)
+                .expect("a cell with 220s left"),
+            window: CELL_WINDOW,
+        };
+        assert!(
+            barely.fits(fan_in_cap(&request)),
+            "a 120s measure still fits in 220s"
+        );
+        assert!(
+            !barely.fits(fan_in_cap(&hold)),
+            "a hold's first attempt can take 150s, so 220s is not enough"
         );
     }
 
@@ -4270,6 +4434,89 @@ mod tests {
         assert!(peer.is_ok(), "{peer:?}");
         assert_eq!(stopped, None, "both directions completed");
         assert_eq!((sent, received), (bytes, bytes), "every byte moved");
+    }
+
+    #[test]
+    fn stream_up_keeps_the_pattern_phase_across_chunks() {
+        let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
+            return;
+        };
+        let addr = listener.local_addr().expect("has an address");
+        let pattern = bulk_pattern_template(1200);
+        let bytes = 2 * UPLOAD_CHUNK as u64 + 736;
+        let sink_pattern = pattern.clone();
+        let sink = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the sink accepts");
+            read_validated(&mut stream, &sink_pattern, bytes)
+        });
+        let plan = FlowPlan {
+            bytes,
+            pattern,
+            traffic: Traffic::Upload,
+            engine: addr,
+            target: addr,
+            index: 0,
+            desync: Arc::new(std::sync::Mutex::new(None)),
+            abort: Arc::new(AtomicBool::new(false)),
+        };
+        let mut stream = TcpStream::connect(addr).expect("connects to the sink");
+        apply_flow_timeouts(&stream);
+        let mut sent = 0u64;
+        plan.stream_up(&mut stream, &mut sent)
+            .expect("the upload completes");
+        assert_eq!(sent, bytes);
+        drop(stream);
+        let read = sink.join().expect("the sink thread survived");
+        assert_eq!(read.expect("the whole pattern crossed"), bytes);
+    }
+
+    #[test]
+    fn a_hold_rejects_a_connection_closed_after_connect() {
+        let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
+            return;
+        };
+        let addr = listener.local_addr().expect("has an address");
+        let engine = std::thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|e| e.to_string())?;
+            let mut greeting = [0u8; 3];
+            stream
+                .read_exact(&mut greeting)
+                .map_err(|e| e.to_string())?;
+            stream.write_all(&[5, 0]).map_err(|e| e.to_string())?;
+            let mut head = [0u8; 4];
+            stream.read_exact(&mut head).map_err(|e| e.to_string())?;
+            let rest = match head[3] {
+                1 => 6,
+                4 => 18,
+                3 => {
+                    let mut len = [0u8; 1];
+                    stream.read_exact(&mut len).map_err(|e| e.to_string())?;
+                    1 + usize::from(len[0]) + 2
+                }
+                other => return Err(format!("unexpected address type {other}")),
+            };
+            let mut skip = vec![0u8; rest];
+            stream.read_exact(&mut skip).map_err(|e| e.to_string())?;
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .map_err(|e| e.to_string())?;
+            stream.shutdown(Shutdown::Both).map_err(|e| e.to_string())
+        });
+        let plan = HoldPlan {
+            engine: addr,
+            target: SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            duration: Duration::from_millis(80),
+        };
+        let result = run_hold_flow(&plan, 0);
+        assert!(
+            result
+                .stopped
+                .as_deref()
+                .is_some_and(|reason| reason.contains("closed the held connection")),
+            "a closed hold is a stopped flow: {:?}",
+            result.stopped
+        );
+        assert!(engine.join().expect("the fake engine survived").is_ok());
     }
 
     /// A pattern shorter than the write chunk must keep its phase past 64 KiB.
