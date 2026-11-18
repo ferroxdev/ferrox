@@ -1903,7 +1903,7 @@ mod tests {
         .expect("client");
         let target = Destination::Name("example.com".to_owned(), 443);
         let flow = open_on(&session.session, &target).expect("flow");
-        let id = flow.id;
+        let id = flow.stream.id;
         session.session.deliver(id, b"", true);
         assert!(
             session
