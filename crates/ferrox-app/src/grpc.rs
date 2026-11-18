@@ -61,7 +61,7 @@ const PREFACE: [u8; 34] = {
 #[derive(Debug, Default)]
 struct SendWindow {
     conn: u64,
-    stream: u64,
+    stream: i64,
     /// The transport gates the bytes itself (the multiplexed server), so this layer must not take a
     /// window it never receives a `WINDOW_UPDATE` for.
     unlimited: bool,
@@ -115,7 +115,8 @@ fn take_window_until(shared: &Shared, need: u64, deadline: Option<Instant>) -> b
     if send.unlimited {
         return true;
     }
-    while send.conn < need || send.stream < need {
+    let need_stream = i64::try_from(need).unwrap_or(i64::MAX);
+    while send.conn < need || send.stream < need_stream {
         if shared.dead.load(Ordering::SeqCst) {
             return false;
         }
@@ -136,7 +137,7 @@ fn take_window_until(shared: &Shared, need: u64, deadline: Option<Instant>) -> b
         }
     }
     send.conn -= need;
-    send.stream -= need;
+    send.stream -= need_stream;
     true
 }
 
@@ -151,7 +152,7 @@ fn refund(shared: &Shared, need: u64) {
         return;
     }
     send.conn += need;
-    send.stream += need;
+    send.stream += i64::try_from(need).unwrap_or(i64::MAX);
     drop(send);
     shared.wake.notify_all();
 }
@@ -385,11 +386,11 @@ impl<R: Read> GrpcReader<R> {
                     .send
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
+                let delta = i64::from(value) - i64::try_from(*init).unwrap_or(i64::MAX);
                 send.stream = send
                     .stream
-                    .saturating_add(u64::from(value))
-                    .saturating_sub(*init);
-                send.stream = send.stream.min(WINDOW_MAX);
+                    .saturating_add(delta)
+                    .min(i64::try_from(WINDOW_MAX).unwrap_or(i64::MAX));
                 *init = u64::from(value);
                 self.shared.wake.notify_all();
             } else if id == S_MAX_FRAME {
@@ -400,7 +401,7 @@ impl<R: Read> GrpcReader<R> {
                     .unwrap_or_else(PoisonError::into_inner);
                 *max = usize::try_from(value)
                     .unwrap_or(FRAME_CAP)
-                    .clamp(16_384, FRAME_CAP);
+                    .clamp(16_384, (1 << 24) - 1);
             }
             at += 6;
         }
@@ -456,8 +457,8 @@ impl<R: Read> GrpcReader<R> {
         }
     }
 
-    fn refuse(&self, id: u32) {
-        self.emit(T_RST, 0, id, &E_REFUSED.to_be_bytes());
+    fn refuse(&self, id: u32) -> bool {
+        self.emit(T_RST, 0, id, &E_REFUSED.to_be_bytes())
     }
 
     fn headers(&mut self, id: u32, flags: u8, block: &[u8]) -> Option<()> {
@@ -492,6 +493,9 @@ impl<R: Read> GrpcReader<R> {
 
     fn serve_headers(&mut self, id: u32, flags: u8, gate: &Gate) -> Option<()> {
         if self.answered {
+            if id != self.stream {
+                return self.refuse(id).then_some(());
+            }
             if flags & F_END != 0 {
                 self.eof = true;
                 self.remote_end = true;
@@ -546,11 +550,14 @@ impl<R: Read> GrpcReader<R> {
     fn finish_data(&mut self, id: u32, flags: u8, from: usize, len: usize) -> Option<()> {
         if id != self.stream || !self.answered {
             self.msg.truncate(from);
+            // The discarded body still spent connection-level credit.
+            self.replenish(0, len);
             return Some(());
         }
         // DATA after END_STREAM is a protocol violation: discard it rather than buffer a body the read half can no longer consume.
         if self.remote_end {
             self.msg.truncate(from);
+            self.replenish(id, len);
             return None;
         }
         let (first, pad) = if flags & F_PADDED != 0 {
@@ -603,6 +610,13 @@ impl<R: Read> GrpcReader<R> {
         // SAFETY: every byte below the watermark is initialised, and each read fills the room past it before `filled` counts it.
         unsafe { ferrox_core::read::init_room(&mut self.msg, &mut self.msg_init, end) };
         while *filled < len {
+            if self
+                .handshake
+                .is_some_and(|until| std::time::Instant::now() >= until)
+            {
+                self.msg.truncate(from + *filled);
+                return Ok(false);
+            }
             match self.read.read(&mut self.msg[from + *filled..end]) {
                 Ok(0) => {
                     self.msg.truncate(from + *filled);
@@ -657,6 +671,13 @@ impl<R: Read> GrpcReader<R> {
         // SAFETY: every byte below the watermark is initialised, and each read fills the room past it before `filled` counts it.
         unsafe { ferrox_core::read::init_room(&mut self.frame, &mut self.frame_init, len) };
         while *filled < len {
+            if self
+                .handshake
+                .is_some_and(|until| std::time::Instant::now() >= until)
+            {
+                self.frame.truncate(*filled);
+                return Ok(false);
+            }
             match self.read.read(&mut self.frame[*filled..len]) {
                 Ok(0) => {
                     self.frame.truncate(*filled);
@@ -687,6 +708,12 @@ impl<R: Read> GrpcReader<R> {
     /// The nine bytes that open a frame, resumed on a poll timeout: nothing of a partial head is lost.
     fn read_frame_head(&mut self) -> std::io::Result<bool> {
         while self.frame_have < 9 {
+            if self
+                .handshake
+                .is_some_and(|until| std::time::Instant::now() >= until)
+            {
+                return Ok(false);
+            }
             match self.read.read(&mut self.frame_head[self.frame_have..]) {
                 Ok(0) => return Ok(false),
                 Ok(n) => self.frame_have += n,
@@ -994,7 +1021,10 @@ impl<R: Read> GrpcReader<R> {
         if id == 0 {
             send.conn = send.conn.saturating_add(inc).min(WINDOW_MAX);
         } else if id == self.stream {
-            send.stream = send.stream.saturating_add(inc).min(WINDOW_MAX);
+            send.stream = send
+                .stream
+                .saturating_add(i64::try_from(inc).unwrap_or(i64::MAX))
+                .min(i64::try_from(WINDOW_MAX).unwrap_or(i64::MAX));
         } else {
             return;
         }
@@ -1200,7 +1230,7 @@ impl<'a> Gather<'a> {
                     if Instant::now() >= deadline || !Self::settle_blocking(shared) {
                         return false;
                     }
-                    if !take_window(shared, self.credit, true) {
+                    if self.credit > 0 && !take_window(shared, self.credit, true) {
                         return false;
                     }
                     if let Ok(stream) = shared.stream.lock() {
@@ -1426,7 +1456,8 @@ impl GrpcWriter {
             .send
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let available = (*init).min(send.conn).min(send.stream);
+        let stream = u64::try_from(send.stream.max(0)).unwrap_or(0);
+        let available = (*init).min(send.conn).min(stream);
         let margin = if available > 16_375 { 64 } else { 16 };
         let limit = usize::try_from(available).unwrap_or(usize::MAX);
         Some(
@@ -1502,7 +1533,8 @@ impl GrpcWriter {
             .send
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        init.min(65_535).min(send.conn).min(send.stream).min(room)
+        let stream = u64::try_from(send.stream.max(0)).unwrap_or(0);
+        init.min(65_535).min(send.conn).min(stream).min(room)
     }
 
     /// Adds one `MultiHunk` message to the batch, flushing first when the batch cannot hold all its
@@ -1636,10 +1668,8 @@ impl GrpcWriter {
             return;
         }
         self.shared.upload_ended.store(true, Ordering::SeqCst);
-        let mut batch = Gather::new();
-        if !self.message(&[], self.max_frame(), true, &mut batch)
-            || !batch.flush_blocking(&self.shared)
-        {
+        // END_STREAM is not flow-controlled: an empty DATA frame ends the request even when a nonempty gRPC message would still need credit.
+        if !self.end_stream() {
             self.shared.upload_ended.store(false, Ordering::SeqCst);
             return;
         }
@@ -1677,15 +1707,19 @@ impl GrpcWriter {
         if self.shared.upload_ended.load(Ordering::SeqCst) {
             return;
         }
-        let mut batch = Gather::new();
-        if !self.message(&[], self.max_frame(), true, &mut batch)
-            || !batch.flush_blocking(&self.shared)
-        {
+        if !self.end_stream() {
             self.shared.ended.store(false, Ordering::SeqCst);
             return;
         }
         self.shared.upload_ended.store(true, Ordering::SeqCst);
         let _ = Gather::settle_blocking(&self.shared);
+    }
+
+    /// `END_STREAM` costs no flow credit, but it still rides the paced tail: a full transport is drained and the same empty frame retried.
+    fn end_stream(&self) -> bool {
+        let mut batch = Gather::new();
+        batch.add(self.stream, F_END, &[], &[]);
+        batch.flush_blocking(&self.shared)
     }
 
     fn emit(&self, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
@@ -2343,7 +2377,7 @@ fn mux_shared(write: Box<dyn FrameWrite + Send>, max: usize, window: u64) -> Arc
         stream: Mutex::new(write),
         send: Mutex::new(SendWindow {
             conn: window,
-            stream: window,
+            stream: i64::try_from(window).unwrap_or(i64::MAX),
             unlimited: true,
         }),
         wake: Condvar::new(),
@@ -3159,6 +3193,9 @@ pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
     // The clock the preface was read under covers the request headers too, and ends where the head ends: past it the pump is a give-up rather than a wait, and a reader handed to a caller is unarmed again.
     reader.set_handshake_budget(Some(until));
     while !reader.answered && !reader.eof {
+        if std::time::Instant::now() >= until {
+            return None;
+        }
         if !matches!(reader.pump(), Ok(Some(()))) {
             reader.eof = true;
         }
@@ -3814,7 +3851,7 @@ mod tests {
         *shared.init.lock().unwrap() = window;
         let mut send = shared.send.lock().unwrap();
         send.conn = window;
-        send.stream = window;
+        send.stream = i64::try_from(window).unwrap_or(i64::MAX);
         drop(send);
         GrpcWriter {
             shared,
@@ -4241,7 +4278,7 @@ mod tests {
                 {
                     let mut send = shared.send.lock().unwrap_or_else(PoisonError::into_inner);
                     send.conn = u64::MAX;
-                    send.stream = u64::MAX;
+                    send.stream = i64::MAX;
                 }
                 shared.wake.notify_all();
                 std::thread::sleep(Duration::from_millis(1));
@@ -4270,7 +4307,7 @@ mod tests {
                 {
                     let mut send = shared.send.lock().unwrap_or_else(PoisonError::into_inner);
                     send.conn = u64::MAX;
-                    send.stream = u64::MAX;
+                    send.stream = i64::MAX;
                 }
                 shared.wake.notify_all();
                 std::thread::sleep(Duration::from_millis(1));
@@ -5056,7 +5093,7 @@ mod tests {
         writer.upload_done();
         writer.close();
         let peer = peer.lock().unwrap();
-        assert_eq!(peer.writes.concat(), frame(T_DATA, F_END, 1, &message(b"")));
+        assert_eq!(peer.writes.concat(), frame(T_DATA, F_END, 1, &[]));
     }
 
     /// A batch that carries both a body and a trailer cannot send both without dropping one, so it is refused rather than half-written.
@@ -5248,10 +5285,9 @@ mod tests {
         );
     }
 
-    /// A half-close that cannot take the end marker leaves the completion retryable: the full close
-    /// sends `F_END` once the peer grants the seven bytes the empty message needs.
+    /// `END_STREAM` rides a zero-length DATA frame, so a peer that granted no credit still takes the end marker.
     #[test]
-    fn a_half_close_that_cannot_send_the_end_marker_is_retried() {
+    fn a_half_close_sends_the_end_marker_without_credit() {
         crate::budgets::apply(&crate::config::Budgets {
             relay_stall: Some(Duration::from_millis(100)),
             ..Default::default()
@@ -5263,7 +5299,7 @@ mod tests {
         {
             let mut send = shared.send.lock().unwrap();
             send.conn = u64::MAX;
-            send.stream = u64::MAX;
+            send.stream = i64::MAX;
         }
         shared.wake.notify_all();
         writer.close();
@@ -5271,8 +5307,8 @@ mod tests {
         let peer = peer.lock().unwrap();
         assert_eq!(
             peer.writes.concat(),
-            frame(T_DATA, F_END, 1, &message(b"")),
-            "the end marker was lost after a stalled half-close"
+            frame(T_DATA, F_END, 1, &[]),
+            "the end marker waited for credit it does not need"
         );
     }
 
@@ -5341,21 +5377,15 @@ mod tests {
         {
             let mut send = shared.send.lock().unwrap();
             send.conn = u64::MAX;
-            send.stream = u64::MAX;
+            send.stream = i64::MAX;
         }
         shared.wake.notify_all();
         writer.close();
         crate::budgets::clear();
-        let prefix = message(b"");
-        let mut want = Vec::new();
-        for (i, byte) in prefix.iter().enumerate() {
-            let flags = if i + 1 == prefix.len() { F_END } else { 0 };
-            want.extend_from_slice(&frame(T_DATA, flags, 1, &[*byte]));
-        }
         assert_eq!(
             peer.lock().unwrap().writes.concat(),
-            want,
-            "a stalled end marker was replayed from the start"
+            frame(T_DATA, F_END, 1, &[]),
+            "a stalled end marker was written more than once"
         );
     }
 
@@ -5443,10 +5473,9 @@ mod tests {
         assert!(request_ended(&reader));
     }
 
-    /// An empty end marker reserves its whole window once: the per-frame loop must not charge it again,
-    /// or a marker that fits the window exactly is refused and leaks the reservation.
+    /// A zero-length `END_STREAM` frame is not flow-controlled, so it spends none of either window.
     #[test]
-    fn an_empty_end_marker_charges_its_window_once() {
+    fn an_empty_end_marker_does_not_charge_the_window() {
         crate::budgets::apply(&crate::config::Budgets {
             relay_stall: Some(Duration::from_millis(100)),
             ..Default::default()
@@ -5457,21 +5486,10 @@ mod tests {
         writer.upload_done();
         {
             let send = shared.send.lock().unwrap();
-            assert_eq!(
-                send.conn, 0,
-                "the end marker charged the connection window twice"
-            );
-            assert_eq!(
-                send.stream, 0,
-                "the end marker charged the stream window twice"
-            );
+            assert_eq!(send.conn, 7, "the end marker charged the connection window");
+            assert_eq!(send.stream, 7, "the end marker charged the stream window");
         }
-        let prefix = message(b"");
-        let mut want = Vec::new();
-        for (i, byte) in prefix.iter().enumerate() {
-            let flags = if i + 1 == prefix.len() { F_END } else { 0 };
-            want.extend_from_slice(&frame(T_DATA, flags, 1, &[*byte]));
-        }
+        let want = frame(T_DATA, F_END, 1, &[]);
         crate::budgets::clear();
         assert_eq!(
             peer.lock().unwrap().writes.concat(),
@@ -5509,7 +5527,7 @@ mod tests {
         {
             let mut send = shared.send.lock().unwrap();
             send.conn = u64::MAX;
-            send.stream = u64::MAX;
+            send.stream = i64::MAX;
         }
         shared.wake.notify_all();
         assert!(handle.join().expect("joins"));
@@ -5811,7 +5829,7 @@ mod tests {
                         ),
                         send: Mutex::new(SendWindow {
                             conn: u64::MAX,
-                            stream: u64::MAX,
+                            stream: i64::MAX,
                             unlimited: false,
                         }),
                         wake: Condvar::new(),

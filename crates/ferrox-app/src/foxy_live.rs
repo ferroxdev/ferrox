@@ -108,21 +108,21 @@ fn through_tunnel<T: Read + Write>(tunnel: &mut T, host: &str, path: &str) -> Op
     let mut chunk = [0u8; 512];
     let mut scanned = 0usize;
     let deadline = Instant::now() + READ;
-    while ferrox_core::foxy::head_end_grown(&head, &mut scanned).is_none()
-        && Instant::now() < deadline
-    {
+    let mut end = ferrox_core::foxy::head_end_grown(&head, &mut scanned);
+    while end.is_none() && Instant::now() < deadline {
         match tunnel.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(read) => head.extend_from_slice(&chunk[..read]),
         }
+        end = ferrox_core::foxy::head_end_grown(&head, &mut scanned);
     }
+    // A head that never ended is a failed read, not a short response.
+    end?;
     // Drain the body so the next request on this flow starts after this one ended.
-    if ferrox_core::foxy::head_end_grown(&head, &mut scanned).is_some() {
-        while head.len() < 64 * 1024 && Instant::now() < deadline {
-            match tunnel.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => head.extend_from_slice(&chunk[..read]),
-            }
+    while head.len() < 64 * 1024 && Instant::now() < deadline {
+        match tunnel.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => head.extend_from_slice(&chunk[..read]),
         }
     }
     String::from_utf8(head).ok()
@@ -131,7 +131,10 @@ fn through_tunnel<T: Read + Write>(tunnel: &mut T, host: &str, path: &str) -> Op
 fn opened<T: Read + Write>(tunnel: &mut T, country: &str) -> Option<String> {
     let trace = through_tunnel(tunnel, TRACE_HOST, TRACE_PATH)?;
     let seen = crate::foxy::exit_country(trace.as_bytes())?;
-    (seen.eq_ignore_ascii_case(country) || seen == "T1" || country == "REC").then_some(seen)
+    (seen.eq_ignore_ascii_case(country)
+        || country == "REC"
+        || ((seen == "T1" || seen == "REC") && country.is_empty()))
+    .then_some(seen)
 }
 
 /// One carrier on one edge, as the lane would dial it.
@@ -181,8 +184,17 @@ fn try_carrier(
     // The lease goes into the open and rides the lane, so the probe gives the pool entry back when it ends.
     let mut tunnel = Tunnel::open(&dial, &format!("{PROBE_HOST}:80"), quic)
         .map_err(|failure| failure.to_string())?;
-    let ip = through_tunnel(&mut tunnel, PROBE_HOST, PROBE_PATH)
+    let answer = through_tunnel(&mut tunnel, PROBE_HOST, PROBE_PATH)
         .ok_or_else(|| "no answer through the tunnel".to_owned())?;
+    let response = ferrox_core::hysteria::parse_origin_response(answer.as_bytes())
+        .ok_or_else(|| "the probe did not answer a full response".to_owned())?;
+    if response.status != 200 {
+        return Err("the probe did not answer 200".to_owned());
+    }
+    let ip = std::str::from_utf8(&response.body)
+        .ok()
+        .and_then(|body| body.trim().parse::<std::net::IpAddr>().ok())
+        .ok_or_else(|| "the probe did not name an IP".to_owned())?;
     let _ = tunnel.finish();
     tunnel.settle();
     // The trace names another origin, so it needs its own CONNECT rather than a Host header on the probe's flow.
@@ -200,7 +212,7 @@ fn try_carrier(
     trace.settle();
     Ok(format!(
         "{} {} in {:?}, exit {seen}",
-        ip.split_whitespace().last().unwrap_or("?"),
+        ip,
         edge.authority(),
         started.elapsed(),
     ))
@@ -260,22 +272,34 @@ fn carried(
 }
 
 /// The plane's counter after a charge has landed: mint until two mints agree, so a figure read before the plane wrote it is not read as the charge.
-fn settled(account: &Account, mut was: u64) -> u64 {
+fn settled(account: &Account, _was: u64, deadline: Instant) -> Option<u64> {
+    let mut last = None;
     for _ in 0..SETTLE_MINTS {
-        std::thread::sleep(SETTLE);
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        std::thread::sleep(SETTLE.min(left));
+        if Instant::now() >= deadline {
+            return None;
+        }
         account
             .renew()
             .expect("mints a pass while the counter settles");
+        if Instant::now() >= deadline {
+            return None;
+        }
         let now = account
             .current()
             .quota_remaining
             .expect("the plane names an allowance on every mint");
-        if now == was {
-            return now;
+        // Two post-transfer mints must agree: the balance read before the request is not one of them.
+        if last == Some(now) {
+            return Some(now);
         }
-        was = now;
+        last = Some(now);
     }
-    was
+    None
 }
 
 /// The charge per carried byte, in thousandths: whole and three digits.
@@ -309,7 +333,10 @@ fn canceled(
         until,
     )?;
     std::thread::sleep(SETTLE);
-    let charged = was.saturating_sub(settled(account, was));
+    let Some(settled) = settled(account, was, deadline) else {
+        return Err("closed flow: the allowance did not settle before the clock".to_owned());
+    };
+    let charged = was.saturating_sub(settled);
     let (whole, fraction) = per_byte(charged, read as u64);
     println!(
         "closed {PAYLOAD_HOST}{} after {read} bytes: {charged} charged ({whole}.{fraction:03}x) for a canceled flow",
@@ -329,9 +356,18 @@ fn brackets(
     let mut was = pass
         .quota_remaining
         .ok_or("the plane names no allowance; without one there is nothing to charge")?;
-    was = settled(account, was);
+    let Some(next) = settled(account, was, deadline) else {
+        return Err(format!(
+            "{carrier:?}: the allowance did not settle before the clock"
+        ));
+    };
+    was = next;
     std::thread::sleep(IDLE);
-    let idle = settled(account, was);
+    let Some(idle) = settled(account, was, deadline) else {
+        return Err(format!(
+            "{carrier:?}: the allowance did not settle before the clock"
+        ));
+    };
     let drained = was.saturating_sub(idle);
     println!(
         "idle {:.0}s through {carrier:?}: {drained} bytes charged with no flow",
@@ -356,7 +392,11 @@ fn brackets(
         },
         until,
     )?;
-    let now = settled(account, was);
+    let Some(now) = settled(account, was, deadline) else {
+        return Err(format!(
+            "{carrier:?}: the allowance did not settle before the clock"
+        ));
+    };
     let fixed = was.saturating_sub(now);
     println!(
         "HEAD {PAYLOAD_HOST}{}: {head} bytes carried, {fixed} charged",
@@ -384,7 +424,11 @@ fn brackets(
             return Err(format!("{path}: {bytes} bytes is not a payload"));
         }
         let bytes = bytes as u64;
-        let now = settled(account, was);
+        let Some(now) = settled(account, was, deadline) else {
+            return Err(format!(
+                "{carrier:?}: the allowance did not settle before the clock"
+            ));
+        };
         let charged = was.saturating_sub(now);
         let (whole, fraction) = per_byte(charged, bytes);
         println!(
@@ -401,13 +445,13 @@ fn brackets(
     println!(
         "{carrier:?}: {whole}.{fraction:03} bytes charged per byte carried between {small_bytes} and {large_bytes} bytes; {fixed} bytes fixed per flow"
     );
-    // Last, so a closing flow's fetch cannot be read as the large payload's: what a cancel costs is the window the edge was allowed to fill ahead of the caller.
-    canceled(account, carrier, edge, pass, was, deadline)?;
     // A tunnel that costs its payload spends one allowance byte per carried byte; a per-flow cost is the head's, and is not the slope.
     assert!(
         delta_charge.saturating_mul(4) <= delta_bytes.saturating_mul(5),
         "{carrier:?} charged {whole}.{fraction:03} bytes per carried byte between {small_bytes} and {large_bytes}: {large_charge} for {large_bytes} after {small_charge} for {small_bytes}, {fixed} fixed per flow"
     );
+    // Last, so a closing flow's fetch cannot be read as the large payload's: what a cancel costs is the window the edge was allowed to fill ahead of the caller.
+    canceled(account, carrier, edge, pass, was, deadline)?;
     Ok(())
 }
 

@@ -4234,7 +4234,18 @@ fn pct(out: &mut String, byte: u8) {
     out.push(UPPER_HEX[(byte & 0x0f) as usize] as char);
 }
 
-/// `url.Values.Encode` of a list of pairs: keys sorted, every value percent-quoted with a space as `+`.
+/// One form key or value: unreserved bytes verbatim, a space as `+`, everything else percent-quoted.
+fn form_component(out: &mut String, value: &str) {
+    for byte in value.as_bytes() {
+        match byte {
+            b' ' => out.push('+'),
+            other if reserved(*other) => pct(out, *other),
+            other => out.push(*other as char),
+        }
+    }
+}
+
+/// `url.Values.Encode` of a list of pairs: keys sorted, every key and value percent-quoted with a space as `+`.
 fn query(pairs: &[(&str, &str)]) -> String {
     let mut sorted = pairs.to_vec();
     sorted.sort_unstable();
@@ -4243,15 +4254,9 @@ fn query(pairs: &[(&str, &str)]) -> String {
         if index > 0 {
             out.push('&');
         }
-        out.push_str(key);
+        form_component(&mut out, key);
         out.push('=');
-        for byte in value.as_bytes() {
-            match byte {
-                b' ' => out.push('+'),
-                other if reserved(*other) => pct(&mut out, *other),
-                other => out.push(*other as char),
-            }
-        }
+        form_component(&mut out, value);
     }
     out
 }
@@ -4517,7 +4522,9 @@ impl Template {
             if index > 0 {
                 form.push('&');
             }
-            let _ = write!(form, "{key}={}", vars.sub(value));
+            form_component(&mut form, key);
+            form.push('=');
+            form_component(&mut form, &vars.sub(value));
         }
         let (status, payload) = self.http.ask(
             "POST",

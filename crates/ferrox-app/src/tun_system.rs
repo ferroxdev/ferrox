@@ -76,6 +76,7 @@ enum Outcome {
     Handled,
     UnhandledTcp,
     Other,
+    Drop,
 }
 
 struct TcpView {
@@ -162,12 +163,18 @@ impl Nat {
         }
 
         if view.flags & FLAG_SYN == 0 || view.flags & FLAG_ACK != 0 {
-            self.remember_fallback(&view, now);
-            return Outcome::UnhandledTcp;
+            return if self.remember_fallback(&view, now) {
+                Outcome::UnhandledTcp
+            } else {
+                Outcome::Drop
+            };
         }
         let Some(port) = self.allocate(now) else {
-            self.remember_fallback(&view, now);
-            return Outcome::UnhandledTcp;
+            return if self.remember_fallback(&view, now) {
+                Outcome::UnhandledTcp
+            } else {
+                Outcome::Drop
+            };
         };
         let generation = self.created;
         self.forward.insert(key, port);
@@ -184,22 +191,26 @@ impl Nat {
         mapped(packet, &view, peer, local, port, listener_port)
     }
 
-    fn remember_fallback(&mut self, view: &TcpView, now: Instant) {
+    fn remember_fallback(&mut self, view: &TcpView, now: Instant) -> bool {
         if !self.hybrid || view.source != self.local {
-            return;
+            return true;
         }
         let key = FlowKey::of(view);
         if !self.fallback.contains_key(&key) && self.fallback.len() >= NAT_MAX {
-            if let Some(oldest) = self
+            // A live owner stays until it goes idle: evicting it could switch its retransmission to kernel NAT mid-stream.
+            let Some(oldest) = self
                 .fallback
                 .iter()
+                .filter(|(_, last)| now.saturating_duration_since(**last) > NAT_IDLE)
                 .min_by_key(|(_, last)| **last)
                 .map(|(key, _)| *key)
-            {
-                self.fallback.remove(&oldest);
-            }
+            else {
+                return false;
+            };
+            self.fallback.remove(&oldest);
         }
         self.fallback.insert(key, now);
+        true
     }
 
     fn allocate(&mut self, now: Instant) -> Option<u16> {
@@ -632,7 +643,7 @@ fn packet_loop(
                 }
                 crate::tun_stack::wake_signal(&wake);
             }
-            Outcome::UnhandledTcp => {
+            Outcome::UnhandledTcp | Outcome::Drop => {
                 let _ = recycle.try_send(packet.bytes);
             }
         }

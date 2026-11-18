@@ -187,7 +187,12 @@ impl Drop for Lease {
 
 impl Manager {
     pub(crate) fn new(bounds: Xmux, config: Option<Arc<ferrox_core::tls::TlsConfig>>) -> Arc<Self> {
-        let max_connections = roll(bounds.max_connections).max(1);
+        let bounded = bounds.max_connections.1 > 0 || bounds.max_concurrency.1 > 0;
+        let max_connections = if bounded {
+            roll(bounds.max_connections)
+        } else {
+            1
+        };
         let max_concurrency = roll(bounds.max_concurrency);
         Arc::new(Self {
             bounds,

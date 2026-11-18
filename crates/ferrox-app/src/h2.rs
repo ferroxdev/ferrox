@@ -275,19 +275,32 @@ fn indexed(table: &VecDeque<(Vec<u8>, Vec<u8>)>, index: usize) -> Option<(&[u8],
     Some((&name[..], &value[..]))
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Decoder {
     table: VecDeque<(Vec<u8>, Vec<u8>)>,
     size: usize,
+    max: usize,
     name: Vec<u8>,
     value: Vec<u8>,
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self {
+            table: VecDeque::new(),
+            size: 0,
+            max: 4096,
+            name: Vec::new(),
+            value: Vec::new(),
+        }
+    }
 }
 
 impl Decoder {
     fn insert(&mut self, name: Vec<u8>, value: Vec<u8>) {
         self.size += 32 + name.len() + value.len();
         self.table.push_front((name, value));
-        while self.size > 4096 {
+        while self.size > self.max {
             let Some((name, value)) = self.table.pop_back() else {
                 break;
             };
@@ -331,6 +344,7 @@ impl Decoder {
                 if max > 4096 {
                     return None;
                 }
+                self.max = max;
                 while self.size > max {
                     let Some((name, value)) = self.table.pop_back() else {
                         break;

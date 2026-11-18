@@ -1775,6 +1775,12 @@ struct UdpLane {
     last_used: Arc<AtomicU64>,
 }
 
+impl Drop for UdpLane {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static LAST_SERVER_DATAGRAM: std::cell::Cell<Option<(usize, usize)>> =
@@ -2647,10 +2653,9 @@ fn lane_reply(
     key: &(String, u16),
     remote: SocketAddr,
 ) -> bool {
-    match winners.get(key) {
-        Some((won, _)) if *won != remote => false,
-        Some(_) => true,
-        None => {
+    match winners.get(key).map(|(won, _)| *won) {
+        Some(won) if won != remote => false,
+        _ => {
             winners.insert(key.clone(), (remote, StdInstant::now()));
             true
         }
@@ -2717,6 +2722,28 @@ fn lane_over(associate: Option<&Connection>, quiet: StdInstant) -> bool {
     associate.is_some_and(crate::proxy::peer_left) || quiet.elapsed() >= crate::budgets::udp_idle()
 }
 
+pub(crate) type UdpRouteClaim = (Sender<Vec<u8>>, Receiver<Vec<u8>>);
+
+/// The lifecycle controls of a fixed-target datagram lane.
+pub(crate) struct ForwardControl {
+    pub(crate) stop: Arc<AtomicBool>,
+    pub(crate) ready: Option<Sender<Result<(), String>>>,
+    pub(crate) preclaimed: Option<Receiver<Vec<u8>>>,
+}
+
+/// Claims one relay port for a datagram lane, so a second owner reports the collision before it reads.
+pub(crate) fn claim_udp_route(routes: &UdpRoutes, port: u16) -> Result<UdpRouteClaim, String> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let mut table = routes
+        .lock()
+        .map_err(|_| "the UDP route table is poisoned".to_owned())?;
+    if table.contains_key(&port) {
+        return Err(format!("UDP relay port {port} is already registered"));
+    }
+    table.insert(port, reply_tx.clone());
+    Ok((reply_tx, reply_rx))
+}
+
 /// A client datagram lane: every frame the local SOCKS5 front writes becomes an
 /// inner UDP packet, and the reply the tunnel returns is framed back to the last
 /// app that spoke. Each name gets its own inner source port, so a reply pins
@@ -2730,16 +2757,15 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     associate: Option<&Connection>,
     resolve: &dyn Fn(&str, u16) -> Vec<SocketAddr>,
     headroom: usize,
-) {
+) -> bool {
     let to_tunnel: ToTunnel = to_tunnel.clone().into();
     let Ok(local) = relay.local_addr() else {
-        return;
+        return false;
     };
     let port = local.port();
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    if let Ok(mut table) = routes.lock() {
-        table.insert(port, reply_tx.clone());
-    }
+    let Ok((reply_tx, reply_rx)) = claim_udp_route(routes, port) else {
+        return false;
+    };
     let _ = relay.set_read_timeout(Some(LANE_TICK));
     if let Some(associate) = associate {
         let _ = associate.set_read_timeout(Some(crate::budgets::SESSION_POLL));
@@ -2832,6 +2858,7 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
             table.remove(&port);
         }
     }
+    true
 }
 
 /// A fixed-target client lane that carries another tunnel's datagrams verbatim.
@@ -2842,16 +2869,35 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
     routes: &UdpRoutes,
     target: SocketAddr,
     headroom: usize,
-    stop: &Arc<AtomicBool>,
-) {
+    control: ForwardControl,
+) -> bool {
+    let ForwardControl {
+        stop,
+        ready,
+        preclaimed,
+    } = control;
     let to_tunnel: ToTunnel = to_tunnel.clone().into();
     let Ok(local) = relay.local_addr() else {
-        return;
+        if let Some(ready) = ready {
+            let _ = ready.send(Err("the UDP relay has no local address".to_owned()));
+        }
+        return false;
     };
     let port = local.port();
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    if let Ok(mut table) = routes.lock() {
-        table.insert(port, reply_tx);
+    let reply_rx = match preclaimed {
+        Some(reply_rx) => reply_rx,
+        None => match claim_udp_route(routes, port) {
+            Ok((_reply_tx, reply_rx)) => reply_rx,
+            Err(reason) => {
+                if let Some(ready) = ready {
+                    let _ = ready.send(Err(reason));
+                }
+                return false;
+            }
+        },
+    };
+    if let Some(ready) = ready {
+        let _ = ready.send(Ok(()));
     }
     let _ = relay.set_read_timeout(Some(LANE_TICK));
     let mut buf = crate::proxy::udp_buffer();
@@ -2892,6 +2938,7 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
     if let Ok(mut table) = routes.lock() {
         table.remove(&port);
     }
+    true
 }
 
 /// A server datagram lane: the inner flow is one client source and one target,
@@ -5184,7 +5231,11 @@ mod client_tests {
                 &thread_routes,
                 target,
                 0,
-                &thread_stop,
+                ForwardControl {
+                    stop: thread_stop,
+                    ready: None,
+                    preclaimed: None,
+                },
             );
         });
         let port = relay_address.port();

@@ -99,7 +99,7 @@ fn open(spec: &Spec) -> io::Result<(SyncDevice, bool, usize)> {
                     return Ok((device, offload, if multi { spec.queues() } else { 1 }));
                 }
                 if multi {
-                    if let Ok((device, offload, _)) = build(spec, false, true) {
+                    if let Ok((device, offload, _)) = build(spec, false, spec.gso()) {
                         return Ok((device, offload, 1));
                     }
                 }

@@ -85,6 +85,7 @@ impl QuicServer {
 
 /// How many flows one lane lends before it is handed back for a fresh dial: reuse without a bound is the leak the lane was first closed for, and a stream id only comes back if the edge grants it.
 pub(crate) const MAX_FLOWS_ON_LANE: u64 = 64;
+const MAX_SERVER_CONNECTIONS: usize = 1024;
 
 struct PooledState {
     /// One handle per flow, shared by every burst it arrives in: a hand-off takes a refcount, not a `dup`.
@@ -96,6 +97,8 @@ struct PooledState {
     next_id: u64,
     /// The generation of the pump thread that owns the lane's read side, or zero: a thread clears only its own, so a lane a later lease has already re-armed is left untouched.
     pump: u64,
+    /// Never reused, even after `pump` returns to zero: an older owner cannot match a later lease's generation.
+    next_pump: u64,
     /// When the lane's pump left and no thread owns it: the thread follows only the leases it can serve, so an idle edge and a flow that reads its own socket pin none and the next flow rides the same handshake.
     parked: Option<Instant>,
     /// The route generation this lane last followed: shared by every pump the lane starts, so a park and a restart do not re-probe a route that has not moved.
@@ -1864,7 +1867,8 @@ fn stream_recv_exact_parked(
                 return None;
             }
             match conn.stream_recv(stream, &mut chunk[..end]) {
-                Ok((0, _)) | Err(quiche::Error::Done) => None,
+                Ok((0, true)) => return None,
+                Ok((0, false)) | Err(quiche::Error::Done) => None,
                 Ok(found) => Some(found),
                 Err(_) => return None,
             }
@@ -1897,7 +1901,8 @@ pub(crate) fn stream_recv_exact(
     while out.len() < want {
         let end = (want - out.len()).min(chunk.len());
         match conn.stream_recv(stream, &mut chunk[..end]) {
-            Ok((0, _)) | Err(quiche::Error::Done) => {
+            Ok((0, true)) => return None,
+            Ok((0, false)) | Err(quiche::Error::Done) => {
                 if conn.is_closed() || Instant::now() >= deadline {
                     return None;
                 }
@@ -4106,6 +4111,9 @@ fn pump(
                 None if timed_out => conn.on_timeout(),
                 None => {}
             }
+            if conn.timeout() == Some(Duration::ZERO) {
+                conn.on_timeout();
+            }
             flush_egress(&mut conn, sock);
             hand_off(&mut conn, table, &mut chunk, &mut ready);
             if conn.is_closed() {
@@ -4180,7 +4188,8 @@ fn lend(pooled: &PooledConn, up: Option<Connection>, drive: bool) -> Option<u64>
             table.parked = Some(Instant::now());
             return None;
         };
-        table.pump += 1;
+        table.next_pump += 1;
+        table.pump = table.next_pump;
         let owner = PumpOwner {
             table: Arc::clone(&pooled.table),
             generation: table.pump,
@@ -4209,7 +4218,6 @@ fn park_if_idle(table: &Arc<Mutex<PooledState>>) -> bool {
         if !state.sessions.is_empty() || !state.opening.is_empty() {
             return false;
         }
-        state.pump = 0;
         state.parked = Some(Instant::now());
         true
     })
@@ -4392,7 +4400,9 @@ fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
                 if !sent {
                     #[cfg(test)]
                     qstage(format!("{} t={} up-unsent {id}", port, qms()));
-                    break;
+                    stop_stream(&pooled.conn, &pooled.sock, id);
+                    fail_session(&pooled.table, id);
+                    return;
                 }
                 #[cfg(test)]
                 qstage(format!("{} t={} up {id} {n}", port, qms()));
@@ -4452,6 +4462,7 @@ pub(crate) fn dial_pooled_with(
         qstage(format!("{} t={} build-none", dial.port, qms()));
         return;
     };
+    let _ = client.set_write_timeout(Some(SEND_WAIT));
     let Some(id) = lend(&pooled, client.try_clone().ok(), true) else {
         #[cfg(test)]
         qstage(format!("{} t={} open-none", dial.port, qms()));
@@ -4636,6 +4647,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             reply_done: HashSet::new(),
             next_id: 0,
             pump: 0,
+            next_pump: 0,
             // No thread yet: only a lease whose bytes the pump can hand over starts one, so a connection nobody rode and a flow that reads its own socket cost none.
             parked: Some(Instant::now()),
             net: Arc::new(AtomicU64::new(network_generation())),
@@ -4747,6 +4759,10 @@ impl Write for QuicStream {
             match self.send_once(rest) {
                 Ok(0) => {
                     if Instant::now() >= deadline {
+                        let sent = buf.len() - rest.len();
+                        if sent > 0 {
+                            return Ok(sent);
+                        }
                         return Err(std::io::Error::other("quic stream send timed out"));
                     }
                     std::thread::sleep(STREAM_POLL);
@@ -4756,7 +4772,13 @@ impl Write for QuicStream {
                     self.activity.touch();
                     rest = &rest[n..];
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    let sent = buf.len() - rest.len();
+                    if sent > 0 {
+                        return Ok(sent);
+                    }
+                    return Err(error);
+                }
             }
         }
         Ok(buf.len())
@@ -5072,7 +5094,6 @@ pub(crate) fn serve_loop(
                 continue;
             }
             Drain::Empty => {
-                run_timers(&mut conns, &sock, start.elapsed());
                 reap(serve, &sock, &mut conns, &mut scratch, &live);
                 continue;
             }
@@ -5089,10 +5110,7 @@ pub(crate) fn serve_loop(
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                run_timers(&mut conns, &sock, start.elapsed());
-            }
+                ) => {}
             Err(_) => return,
         }
         reap(serve, &sock, &mut conns, &mut scratch, &live);
@@ -5111,19 +5129,6 @@ pub(crate) fn serve_loop(
     let left = live.load(Ordering::SeqCst);
     if left != 0 {
         eprintln!("quic: {left} stream handlers still running at shutdown");
-    }
-}
-
-/// Run the timers whose deadline this wait passed, answering what they queued.
-fn run_timers(conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>, sock: &Datagram, elapsed: Duration) {
-    for state in conns.values() {
-        let Ok(mut conn) = state.conn.lock() else {
-            continue;
-        };
-        if conn.timeout().is_none_or(|left| left <= elapsed) {
-            conn.on_timeout();
-            flush_egress(&mut conn, sock);
-        }
     }
 }
 
@@ -5190,6 +5195,16 @@ fn route(
         if let Ok(len) = quiche::negotiate_version(&header.scid, &header.dcid, out) {
             let _ = sock.send_to(&out[..len], from);
         }
+        return;
+    }
+    // Every routing key names the same connection, so count distinct lanes before opening another.
+    if conns
+        .values()
+        .map(Arc::as_ptr)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        >= MAX_SERVER_CONNECTIONS
+    {
         return;
     }
     // Server SCIDs are the parse length, so short-header DCIDs read exactly, not into payload.
@@ -5300,13 +5315,22 @@ fn reap(
             continue;
         }
         state.visit.store(epoch, Ordering::Relaxed);
-        let Ok(conn) = state.conn.lock() else {
+        let Ok(mut conn) = state.conn.lock() else {
             continue;
         };
         if conn.is_closed() {
             state.gone.store(true, Ordering::Relaxed);
             scratch.closed.push(key.clone());
             continue;
+        }
+        if conn.timeout().is_some_and(|left| left.is_zero()) {
+            conn.on_timeout();
+            flush_egress(&mut conn, sock);
+            if conn.is_closed() {
+                state.gone.store(true, Ordering::Relaxed);
+                scratch.closed.push(key.clone());
+                continue;
+            }
         }
         if let Some(at) = conn.timeout_instant() {
             deadline = Some(deadline.map_or(at, |soonest: Instant| soonest.min(at)));

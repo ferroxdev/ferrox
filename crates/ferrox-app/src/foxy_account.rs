@@ -175,8 +175,8 @@ impl TokenFile {
     }
 
     /// Best-effort and owner-only: a session that cannot be written costs the next launch a sign-in, which is a line, not a failed lane.
-    pub(crate) fn save(&self, auth: Option<&Auth>, pending: Option<&str>) {
-        self.save_pending(auth, pending, None);
+    pub(crate) fn save(&self, auth: Option<&Auth>, pending: Option<&str>) -> bool {
+        self.save_pending(auth, pending, None)
     }
 
     fn save_pending(
@@ -184,10 +184,33 @@ impl TokenFile {
         auth: Option<&Auth>,
         pending: Option<&str>,
         pending_method: Option<&str>,
-    ) {
+    ) -> bool {
+        self.save_pending_checked(auth, pending, pending_method, None)
+    }
+
+    fn save_pending_checked(
+        &self,
+        auth: Option<&Auth>,
+        pending: Option<&str>,
+        pending_method: Option<&str>,
+        expected_refresh: Option<&str>,
+    ) -> bool {
         use crate::json::{self, Json};
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
+        }
+        let Some(_lock) = self.lock_file() else {
+            eprintln!("foxy: cannot lock the session at {}", self.path.display());
+            return false;
+        };
+        if expected_refresh.is_some_and(|expected| {
+            self.load()
+                .and_then(|session| session.auth)
+                .is_some_and(|auth| {
+                    !auth.refresh_token.is_empty() && auth.refresh_token != expected
+                })
+        }) {
+            return true;
         }
         let mut pairs = vec![("email".to_owned(), Json::Str(self.email.clone()))];
         if let Some(auth) = auth {
@@ -214,7 +237,10 @@ impl TokenFile {
         let mut opened = None;
         for _ in 0..8 {
             let mut raw = [0u8; 8];
-            let _ = getrandom::fill(&mut raw);
+            if getrandom::fill(&mut raw).is_err() {
+                eprintln!("foxy: no randomness for the session file name");
+                return false;
+            }
             let mut temp = self.path.clone().into_os_string();
             temp.push(format!(
                 ".{}.{}.tmp",
@@ -240,13 +266,13 @@ impl TokenFile {
         }
         let Some((mut file, temp)) = opened else {
             eprintln!("foxy: cannot write the session to {}", self.path.display());
-            return;
+            return false;
         };
         if file.write_all(text.as_bytes()).is_err() {
             eprintln!("foxy: cannot write the session to {}", self.path.display());
             drop(file);
             let _ = std::fs::remove_file(&temp);
-            return;
+            return false;
         }
         #[cfg(unix)]
         {
@@ -257,7 +283,9 @@ impl TokenFile {
         if std::fs::rename(&temp, &self.path).is_err() {
             eprintln!("foxy: cannot write the session to {}", self.path.display());
             let _ = std::fs::remove_file(&temp);
+            return false;
         }
+        true
     }
 
     /// Another process refreshes a rotating grant in this file, so a token this launch loaded may already be spent; the pair the file names instead is the one to spend.
@@ -268,17 +296,46 @@ impl TokenFile {
     }
 
     /// The refused grant only stops a future launch when the file still holds it; a grant another process rotated in since is left alone.
-    pub(crate) fn clear_if(&self, refused: &str) {
-        let same = self
-            .load()
-            .is_none_or(|session| session.auth.is_none_or(|auth| auth.access_token == refused));
+    pub(crate) fn clear_if(&self, refused: &str) -> bool {
+        let Some(_lock) = self.lock_file() else {
+            return false;
+        };
+        let same = self.load().is_some_and(|session| {
+            session
+                .auth
+                .is_some_and(|auth| auth.access_token == refused)
+        });
         if same {
             self.clear();
         }
+        true
     }
 
     pub(crate) fn clear(&self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+
+    /// Serializes publication and the refused-token check with every other process, so a fresh grant cannot be unlinked between the read and the remove.
+    fn lock_file(&self) -> Option<std::fs::File> {
+        let mut path = self.path.as_os_str().to_owned();
+        path.push(".lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(std::path::PathBuf::from(path))
+            .ok()?;
+        for _ in 0..100 {
+            match file.try_lock() {
+                Ok(()) => return Some(file),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::Error(_)) => return None,
+            }
+        }
+        None
     }
 }
 
@@ -2163,22 +2220,21 @@ impl Account {
     }
 
     /// Forgets a grant the plane refused, so the next launch asks for the password instead of replaying a dead token.
-    pub(crate) fn forget(&self) {
-        let refused = self
-            .auth
-            .lock()
-            .map(|auth| auth.access_token.clone())
-            .unwrap_or_default();
-        if let Ok(mut auth) = self.auth.lock() {
+    pub(crate) fn forget(&self) -> bool {
+        let refused = if let Ok(mut auth) = self.auth.lock() {
+            let refused = auth.access_token.clone();
             *auth = Auth {
                 access_token: String::new(),
                 refresh_token: String::new(),
                 expires_at: 0,
             };
-        }
-        if let Some(tokens) = &self.tokens {
-            tokens.clear_if(&refused);
-        }
+            refused
+        } else {
+            return false;
+        };
+        self.tokens
+            .as_ref()
+            .is_none_or(|tokens| tokens.clear_if(&refused))
     }
 
     /// Sets the new grant before minting so a refresh that is written but not yet used still renews the next launch; `forced` stops trusting a clock the plane has already refused.
@@ -2216,7 +2272,13 @@ impl Account {
             Err(other) => return Err(other),
         };
         *self.auth.lock().map_err(|_| Denied::Token)? = fresh.clone();
-        self.persist();
+        if !self.persist_after(Some(&base.refresh_token))
+            && !self.persist_after(Some(&base.refresh_token))
+        {
+            return Err(Denied::Unreachable(
+                "the session store stayed locked".to_owned(),
+            ));
+        }
         Ok(fresh)
     }
 
@@ -2228,9 +2290,13 @@ impl Account {
         fresh
     }
 
-    fn persist(&self) {
+    fn persist(&self) -> bool {
+        self.persist_after(None)
+    }
+
+    fn persist_after(&self, expected_refresh: Option<&str>) -> bool {
         let Some(tokens) = &self.tokens else {
-            return;
+            return true;
         };
         let auth = self.auth.lock().ok().map(|auth| auth.clone());
         let pending = self.pending.lock().ok().and_then(|pending| pending.clone());
@@ -2239,7 +2305,12 @@ impl Account {
             .lock()
             .ok()
             .and_then(|method| method.clone());
-        tokens.save_pending(auth.as_ref(), pending.as_deref(), method.as_deref());
+        tokens.save_pending_checked(
+            auth.as_ref(),
+            pending.as_deref(),
+            method.as_deref(),
+            expected_refresh,
+        )
     }
 
     /// Turns a session token into an access token and mints the first pass.

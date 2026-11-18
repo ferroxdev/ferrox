@@ -212,7 +212,7 @@ impl H2StreamOut {
 pub(crate) struct H2Stream {
     state: Mutex<StreamState>,
     cv: Condvar,
-    send_window: Mutex<u64>,
+    send_window: Mutex<i64>,
     responded: AtomicBool,
 }
 
@@ -1066,11 +1066,12 @@ impl H2Conn {
             else {
                 return None;
             };
-            if *conn < total || *window < total {
+            let total_signed = i64::try_from(total).unwrap_or(i64::MAX);
+            if *conn < total || *window < total_signed {
                 return None;
             }
             *conn -= total;
-            *window -= total;
+            *window -= total_signed;
         }
         let max = *self
             .max_frame
@@ -1141,7 +1142,7 @@ impl H2Conn {
             .send_window
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        conn.min(window)
+        conn.min(window.max(0).cast_unsigned())
     }
 
     /// The caller already knows its batch does not fit, so any wait here is the poll it would pay
@@ -1202,10 +1203,10 @@ impl H2Conn {
                     .send_window
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                let take = need.min(*conn).min(*window);
+                let take = need.min(*conn).min(window.max(0).cast_unsigned());
                 if take > 0 {
                     *conn -= take;
-                    *window -= take;
+                    *window -= i64::try_from(take).unwrap_or(i64::MAX);
                 }
                 take
             };
@@ -1660,23 +1661,30 @@ impl H2Conn {
                     .clamp(16_384, 16_777_215);
             } else if id == S_WINDOW {
                 let value = u64::from(value.min((1 << 31) - 1));
+                // A sender holds the connection window while it decides to wait; taking it here closes that gap.
+                let conn = self
+                    .send_conn
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
                 // The stream table gates the snapshot and the delta so neither misses nor doubles the other.
                 let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
                 let mut previous = self
                     .peer_initial
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                let delta = value.saturating_sub(*previous);
+                let delta = value.cast_signed() - (*previous).cast_signed();
                 *previous = value;
                 drop(previous);
+                let max = i64::from(u32::MAX >> 1);
                 for state in streams.values() {
                     let mut window = state
                         .send_window
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
-                    *window = window.saturating_add(delta).min((1 << 31) - 1);
+                    *window = window.saturating_add(delta).min(max);
                 }
                 drop(streams);
+                drop(conn);
                 self.wake.notify_all();
             }
         }
@@ -1710,7 +1718,7 @@ impl H2Conn {
                 pending_credit: 0,
             }),
             cv: Condvar::new(),
-            send_window: Mutex::new(initial),
+            send_window: Mutex::new(i64::try_from(initial).unwrap_or(i64::MAX)),
             responded: AtomicBool::new(false),
         });
         streams.insert(sid, Arc::clone(&state));
@@ -3194,7 +3202,9 @@ fn control_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: &[u8]) -> O
                     .send_window
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                *window = window.saturating_add(inc).min((1 << 31) - 1);
+                *window = window
+                    .saturating_add(i64::try_from(inc).unwrap_or(i64::MAX))
+                    .min((1 << 31) - 1);
             }
             conn.wake.notify_all();
             Some(true)
@@ -6554,7 +6564,7 @@ mod tests {
                 pending_credit: 0,
             }),
             cv: Condvar::new(),
-            send_window: Mutex::new(total as u64),
+            send_window: Mutex::new(i64::try_from(total).unwrap_or(i64::MAX)),
             responded: AtomicBool::new(false),
         });
         conn.streams

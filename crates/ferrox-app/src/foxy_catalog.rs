@@ -167,7 +167,15 @@ fn read_at(path: &std::path::Path) -> (u64, Vec<Candidate>) {
 
 /// Written beside the file it replaces and moved onto it, so a reader sees this whole list or the last one; best-effort, because a catalogue that cannot be cached is still a catalogue that was fetched.
 fn write_at(path: &std::path::Path, listed: &[Candidate]) {
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut nonce = [0u8; 8];
+    if getrandom::fill(&mut nonce).is_err() {
+        return;
+    }
+    let temp = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        ferrox_core::foxy::account::hex_encode(&nonce)
+    ));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

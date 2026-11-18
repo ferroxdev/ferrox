@@ -742,11 +742,17 @@ fn ask_human(image: &[u8], extension: &str) -> Option<String> {
         options.mode(0o600);
     }
     let mut file = options.open(&path).ok()?;
-    file.write_all(image).ok()?;
+    if file.write_all(image).is_err() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
     drop(file);
     println!("the edge asks for a captcha: open {}", path.display());
     print!("captcha characters: ");
-    std::io::stdout().flush().ok()?;
+    if std::io::stdout().flush().is_err() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
     let mut line = String::new();
     let read = std::io::stdin().read_line(&mut line);
     let _ = std::fs::remove_file(&path);

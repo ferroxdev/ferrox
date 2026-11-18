@@ -41185,7 +41185,9 @@ fn foxy_account(
                 Ok(()) => resumed = true,
                 Err(denied) if denied.is_final() => {
                     eprintln!("foxy: the stored session was refused ({denied}), signing in again");
-                    account.forget();
+                    if !account.forget() {
+                        eprintln!("foxy: the refused session could not be cleared from disk");
+                    }
                 }
                 Err(denied) => {
                     eprintln!("foxy: the stored session did not resume: {denied}");

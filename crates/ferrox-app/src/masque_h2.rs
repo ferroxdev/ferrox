@@ -21,6 +21,7 @@ use crate::wg_stack::{Packet, UdpRoutes};
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const EDGE_RETRY: Duration = Duration::from_secs(1);
 const READ_WAIT: Duration = Duration::from_millis(10);
+const UDP_DRAIN: Duration = Duration::from_secs(1);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
 const PING_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_ROOM: usize = 16 * 1024;
@@ -1181,6 +1182,8 @@ struct Session {
     addrs: Vec<IpAddr>,
     udp: Option<masque::UdpLane>,
     warp: bool,
+    half_closed: bool,
+    udp_quiet: Option<Instant>,
     end: bool,
 }
 
@@ -1205,7 +1208,17 @@ impl Session {
             addrs: Vec::new(),
             udp: None,
             warp: false,
+            half_closed: false,
+            udp_quiet: None,
             end: false,
+        }
+    }
+
+    /// The request half is done: no new packets, so a datagram lane starts (or restarts) its quiet interval now.
+    fn half_close(&mut self) {
+        self.half_closed = true;
+        if self.warp || self.udp.is_some() {
+            self.udp_quiet = Some(Instant::now());
         }
     }
 
@@ -1222,6 +1235,8 @@ impl Session {
     /// Serve buffered frames until the wire closes or the deadline passes before a request.
     fn run_until(&mut self, wire: &mut Wire, deadline: Instant) {
         let mut settings = Vec::new();
+        settings.extend_from_slice(&h2::S_MAX_CONCURRENT.to_be_bytes());
+        settings.extend_from_slice(&1u32.to_be_bytes());
         settings.extend_from_slice(&SETTINGS_ENABLE_CONNECT.to_be_bytes());
         settings.extend_from_slice(&1u32.to_be_bytes());
         wire.send(h2::T_SETTINGS, 0, 0, &settings);
@@ -1309,12 +1324,17 @@ impl Session {
                 if let Some(active) = self.request {
                     if id != active {
                         wire.send(h2::T_RST, 0, id, &7u32.to_be_bytes());
+                    } else if flags & h2::F_END != 0 {
+                        self.half_close();
                     }
                     return;
                 }
                 let block = strip_padding(flags, body, true);
                 if flags & h2::F_END_HEADERS != 0 {
                     self.request(wire, id, block);
+                    if flags & h2::F_END != 0 {
+                        self.half_close();
+                    }
                 } else {
                     self.continuation = Some((id, block.to_vec(), flags));
                 }
@@ -1333,6 +1353,9 @@ impl Session {
                     block.extend_from_slice(data);
                     if flags & h2::F_END_HEADERS != 0 {
                         self.request(wire, id, &block);
+                        if head_flags & h2::F_END != 0 {
+                            self.half_close();
+                        }
                     } else {
                         self.continuation = Some((id, block, head_flags));
                     }
@@ -1340,14 +1363,23 @@ impl Session {
             }
             h2::T_DATA => {
                 if Some(id) != self.request {
+                    if let Ok(length) = u32::try_from(body.len()) {
+                        if length != 0 {
+                            wire.send(h2::T_WINDOW, 0, 0, &length.to_be_bytes());
+                        }
+                    }
                     return;
                 }
                 let length = body.len();
+                if self.half_closed {
+                    self.reject_data(wire, id, length);
+                    return;
+                }
                 let data = strip_padding(flags, body, false);
                 self.window(wire, length);
                 self.capsules(wire, data);
                 if flags & h2::F_END != 0 {
-                    self.end = true;
+                    self.half_close();
                 }
             }
             h2::T_RST if Some(id) == self.request => self.end = true,
@@ -1356,11 +1388,29 @@ impl Session {
         }
     }
 
+    /// A stream's request half is already closed: account the bytes at connection scope, then reset the stream without forwarding them.
+    fn reject_data(&mut self, wire: &mut Wire, id: u32, length: usize) {
+        if let Ok(length) = u32::try_from(length) {
+            if length != 0 {
+                wire.send(h2::T_WINDOW, 0, 0, &length.to_be_bytes());
+            }
+        }
+        wire.send(h2::T_RST, 0, id, &5u32.to_be_bytes());
+        self.end = true;
+    }
+
     fn request(&mut self, wire: &mut Wire, id: u32, block: &[u8]) {
         let mut fields = Vec::new();
+        let mut expanded = 0usize;
+        let mut overflow = false;
         let decoded = self
             .decoder
             .decode(block, &mut |name, value| {
+                expanded = expanded.saturating_add(name.len() + value.len());
+                if overflow || fields.len() >= 128 || expanded > h2::HEAD_CAP {
+                    overflow = true;
+                    return;
+                }
                 fields.push((name.to_vec(), value.to_vec()));
             })
             .is_some();
@@ -1392,8 +1442,8 @@ impl Session {
             || field(b"capsule-protocol")
                 .and_then(|value| value.strip_prefix(b"?"))
                 .is_some_and(|value| value.split(|byte| *byte == b';').next() == Some(b"1"));
-        if !decoded {
-            self.reply(wire, id, 400, udp);
+        if !decoded || overflow {
+            self.reply(wire, id, 400, false);
             return;
         }
         if !path_ok {
@@ -1613,20 +1663,37 @@ impl Session {
                 self.queued_at = 0;
             }
         }
+        let mut origin_closed = false;
+        // CONNECT-IP keeps its grant and sender alive, so waiting for `outgoing` to disconnect is a wait it never reaches; both datagram modes drain on a quiet window instead.
+        let drainable = self.warp || self.udp.is_some();
+        if self.half_closed && drainable && self.udp_quiet.is_none() {
+            self.udp_quiet = Some(Instant::now());
+        }
         for _ in 0..QUEUED_CAP {
             // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
             if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
                 break;
             }
-            let Some(packet) = (if let Some(udp) = &self.udp {
+            let packet = if let Some(udp) = &self.udp {
                 udp.try_recv()
             } else {
-                self.outgoing
+                match self
+                    .outgoing
                     .as_ref()
-                    .and_then(|outgoing| outgoing.try_recv().ok())
-            }) else {
+                    .map(std::sync::mpsc::Receiver::try_recv)
+                {
+                    Some(Ok(packet)) => Some(packet),
+                    Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                        origin_closed = true;
+                        None
+                    }
+                    _ => None,
+                }
+            };
+            let Some(packet) = packet else {
                 break;
             };
+            self.udp_quiet = Some(Instant::now());
             let Some(id) = self.request else {
                 break;
             };
@@ -1640,6 +1707,24 @@ impl Session {
             self.send(wire, &frame);
         }
         self.frame = frame;
+        let udp_drained = self.half_closed
+            && drainable
+            && self
+                .udp_quiet
+                .is_some_and(|quiet| quiet.elapsed() >= UDP_DRAIN);
+        if self.half_closed
+            && (origin_closed || udp_drained)
+            && self.queued.is_empty()
+            && !wire.closed
+        {
+            if let Some(id) = self.request {
+                self.granted = None;
+                self.outgoing = None;
+                self.udp = None;
+                wire.send(h2::T_DATA, h2::F_END, id, &[]);
+                self.end = true;
+            }
+        }
         if self.request.is_some() && !wire.closed && self.queued.is_empty() {
             wire.deadline.clear();
         }
@@ -2334,7 +2419,7 @@ mod tests {
         assert!(session.end, "the handshake clock ended the session");
         assert_eq!(
             out.lock().expect("a recorder").len(),
-            15,
+            21,
             "the due clock stopped before the ping was answered"
         );
     }
@@ -2363,7 +2448,7 @@ mod tests {
         assert!(session.end, "the handshake clock ended the session");
         assert_eq!(
             out.lock().expect("a gate").len(),
-            32,
+            38,
             "the due clock stopped before the second ping was answered"
         );
     }
@@ -2423,6 +2508,10 @@ mod tests {
         assert!(
             out.lock().expect("a recorder").is_empty(),
             "an empty DATA frame credits nothing"
+        );
+        assert!(
+            session.half_closed && !session.end,
+            "a client half-close leaves the reply direction live"
         );
     }
 
