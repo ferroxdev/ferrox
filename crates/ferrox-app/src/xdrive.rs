@@ -1367,6 +1367,34 @@ impl Writer {
         true
     }
 
+    fn failed(&self) -> bool {
+        self.sink.failure().is_some()
+            || self
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .err
+                .is_some()
+    }
+
+    /// Stop a failed writer without waiting for segments the store already refused.
+    fn abort(&self) {
+        if self.ended.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            pending.closed = true;
+            pending.buf.clear();
+            pending
+                .err
+                .get_or_insert_with(|| "the carrier write failed".to_owned());
+        }
+        self.ticker.done.store(true, Ordering::Release);
+        Clock::global().wakeup();
+        self.uploads.abort();
+    }
+
     /// Drain what the stream still holds, wait for every segment to land, then name the end: a peer reads the `.end` at the next sequence and closes its own side.
     fn close(&self) -> io::Result<()> {
         if self.ended.swap(true, Ordering::AcqRel) {
@@ -2152,6 +2180,31 @@ impl SlotWriter {
         self.wake.ring();
     }
 
+    fn failed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .err
+            .is_some()
+    }
+
+    fn abort(self: &Arc<Self>) {
+        if self.ended.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.done.store(true, Ordering::Release);
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.closed = true;
+            state.buf.clear();
+            state
+                .err
+                .get_or_insert_with(|| "the carrier write failed".to_owned());
+        }
+        self.room.notify_all();
+        self.wake.ring();
+    }
+
     fn close(self: &Arc<Self>) -> io::Result<()> {
         if self.ended.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -2509,6 +2562,22 @@ impl Conn {
     pub(crate) fn with_meter(mut self, meter: crate::stats::Meter) -> Self {
         self.meter = self.meter.merged(meter);
         self
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        match &self.writer {
+            WriterSide::Wal(writer) => writer.failed(),
+            WriterSide::Slot(writer) => writer.failed(),
+        }
+    }
+
+    /// Interrupt both halves after a failed write: no segment drain and no reader left parked.
+    pub(crate) fn abort(&self) {
+        match &self.writer {
+            WriterSide::Wal(writer) => writer.abort(),
+            WriterSide::Slot(writer) => writer.abort(),
+        }
+        self.end_read();
     }
 
     /// End only the write log, so a relay whose source went quiet lets the peer read its `.end` while our own reader keeps serving the reply.

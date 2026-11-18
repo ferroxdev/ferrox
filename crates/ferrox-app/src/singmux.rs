@@ -540,7 +540,7 @@ impl Inner {
         }
         drop(write);
         if result.is_err() {
-            self.abort();
+            self.finish();
         }
         result
     }
@@ -712,7 +712,7 @@ impl Inner {
         }
         drop(write);
         if !ok {
-            self.abort();
+            self.finish();
         }
         ok
     }
@@ -1090,15 +1090,6 @@ impl Inner {
     }
 
     fn finish(&self) {
-        self.teardown(true);
-    }
-
-    /// A failed carrier write ends the session without the graceful write drain its closer runs.
-    fn abort(&self) {
-        self.teardown(false);
-    }
-
-    fn teardown(&self, carrier: bool) {
         self.dead.store(true, Ordering::Relaxed);
         if self.finished.swap(true, Ordering::Relaxed) {
             return;
@@ -1125,9 +1116,7 @@ impl Inner {
             sink.window.close();
             sink.queue.close();
         }
-        if carrier {
-            (self.close)();
-        }
+        (self.close)();
     }
 
     fn smux_loop(&self, mut read: Box<dyn Read + Send>) {
@@ -2311,6 +2300,56 @@ mod tests {
             "only the failing head is written, and the next writer sees the closed session"
         );
         drop(held);
+    }
+
+    struct StoppingReader {
+        wake: Receiver<()>,
+        done: Sender<()>,
+    }
+
+    impl Read for StoppingReader {
+        fn read(&mut self, _out: &mut [u8]) -> io::Result<usize> {
+            let _ = self.wake.recv();
+            let _ = self.done.send(());
+            Ok(0)
+        }
+    }
+
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _data: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_carrier_write_wakes_the_reader() {
+        let (wake, stopped) = channel();
+        let (done, reader_done) = channel();
+        let session = Inner::start(
+            Protocol::Smux,
+            Role::Client,
+            Box::new(StoppingReader {
+                wake: stopped,
+                done,
+            }),
+            Box::new(BrokenWriter),
+            Arc::new(move || {
+                let _ = wake.send(());
+            }),
+        )
+        .expect("session");
+        assert!(!session.write_frame(&[1], &[]), "the write reports failure");
+        assert_eq!(
+            reader_done.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "the reader exits without a manual release"
+        );
     }
 
     #[test]

@@ -14753,7 +14753,11 @@ fn xdrive_relay_until(app: &Connection, mut down: crate::xdrive::Conn, response_
 fn xdrive_close(session: &crate::xdrive::Conn) -> Arc<dyn Fn() + Send + Sync> {
     let closer = session.clone();
     Arc::new(move || {
-        let _ = closer.end_write();
+        if closer.failed() {
+            closer.abort();
+        } else {
+            let _ = closer.end_write();
+        }
     })
 }
 
