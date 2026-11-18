@@ -13926,12 +13926,13 @@ mod tests {
                 .is_some_and(|meek| !dialled.contains(meek.host.as_str()))),
             "the retry repeated the first pass"
         );
+        let expected = servers[next].meek.as_ref().expect("fronted").host.as_str();
         assert!(
             second.iter().any(|server| server
                 .meek
                 .as_ref()
-                .is_some_and(|meek| meek.host == "cdn3.example")),
-            "the retry did not reach the fourth server group"
+                .is_some_and(|meek| meek.host == expected)),
+            "the retry did not start where the first stopped"
         );
     }
 
