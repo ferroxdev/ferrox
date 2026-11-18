@@ -970,7 +970,7 @@ impl Inner {
     }
 
     fn deliver_credit(&self, id: u32, data: &[u8], end: bool, credit: usize) {
-        let (queue, reset, awaiting_status) = {
+        let (queue, reset_stream, awaiting_status) = {
             let mut sinks = match self.sinks.lock() {
                 Ok(sinks) => sinks,
                 Err(poisoned) => poisoned.into_inner(),
@@ -1024,7 +1024,7 @@ impl Inner {
             }
             Push::Full | Push::Closed => {
                 self.defer_credit(credit);
-                self.defer_reset(id, &reset);
+                self.defer_reset(id, &reset_stream);
                 self.release(id);
             }
         }
