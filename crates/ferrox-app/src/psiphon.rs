@@ -1465,7 +1465,7 @@ impl Inner {
                     .iter()
                     .any(|server| server.inproxy.is_some() || server.tls_inproxy.is_some())
             {
-                match self.conduit() {
+                match self.conduit(deadline) {
                     Ok(conduit) => Some(conduit),
                     Err(error) => {
                         eprintln!("psiphon: conduit unavailable: {error}");
@@ -1990,7 +1990,7 @@ impl Inner {
 
     /// Build the broker conduit once from the tactics payload and selected compartments.
     #[allow(clippy::too_many_lines)]
-    fn conduit(&self) -> Result<Arc<crate::psiphon_webrtc::Conduit>, String> {
+    fn conduit(&self, until: Instant) -> Result<Arc<crate::psiphon_webrtc::Conduit>, String> {
         let mode = self.conduit_mode();
         if let Some((cached, conduit)) = lock(&self.conduit).clone() {
             if cached == mode {
@@ -2012,7 +2012,7 @@ impl Inner {
         };
         let servers = load_tactics_entries(&self.settings)?;
         let session_id = hex(&random::<16>());
-        let tactics = fetch_tactics_from(&self.settings, &servers, &session_id)?;
+        let tactics = fetch_tactics_from(&self.settings, &servers, &session_id, Some(until))?;
         let personal = decode_compartment(&self.settings.compartment)?;
         let configured_compartments = configured_inproxy_compartments(&self.settings);
         let common = if configured_compartments.is_empty() {
@@ -6934,7 +6934,7 @@ pub(crate) fn broker_offer(
     }
     let servers = load_tactics_entries(&settings)?;
     let session_id = hex(&random::<16>());
-    let tactics = fetch_tactics_from(&settings, &servers, &session_id)?;
+    let tactics = fetch_tactics_from(&settings, &servers, &session_id, None)?;
     let personal: [u8; 32] = compartment32(&settings.compartment, "personal compartment")?;
     let server = servers
         .iter()
@@ -7275,13 +7275,14 @@ fn fetch_tactics(settings: &Settings) -> Result<crate::psiphon_tactics::Tactics,
     }
     let servers = load_tactics_entries(settings)?;
     let session_id = hex(&random::<16>());
-    fetch_tactics_from(settings, &servers, &session_id)
+    fetch_tactics_from(settings, &servers, &session_id, None)
 }
 
 fn fetch_tactics_from(
     settings: &Settings,
     servers: &[Server],
     session_id: &str,
+    until: Option<Instant>,
 ) -> Result<crate::psiphon_tactics::Tactics, String> {
     if settings.disable_tactics {
         return Err(
@@ -7316,11 +7317,16 @@ fn fetch_tactics_from(
     };
     let timing = tactics_timing(settings.raw.as_ref());
     let timeout = timing.timeout.unwrap_or(settings.ready);
-    let deadline = (!timing.wait.is_zero()).then(|| Instant::now() + timing.wait);
+    let wait_deadline = (!timing.wait.is_zero()).then(|| Instant::now() + timing.wait);
+    let request_deadline = match (wait_deadline, until) {
+        (Some(wait), Some(until)) => Some(wait.min(until)),
+        (Some(wait), None) => Some(wait),
+        (None, until) => until,
+    };
     let mut index = 0usize;
     let mut last = None;
     loop {
-        let attempt = if let Some(deadline) = deadline {
+        let attempt = if let Some(deadline) = request_deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(last.unwrap_or_else(|| "psiphon: tactics wait expired".to_owned()));
@@ -7345,10 +7351,13 @@ fn fetch_tactics_from(
             continue;
         }
         index = 0;
-        let Some(deadline) = deadline else {
+        let Some(wait) = wait_deadline else {
             return Err(last.unwrap_or_else(|| "psiphon: tactics request failed".to_owned()));
         };
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let mut remaining = wait.saturating_duration_since(Instant::now());
+        if let Some(until) = until {
+            remaining = remaining.min(until.saturating_duration_since(Instant::now()));
+        }
         if remaining.is_zero() {
             return Err(last.unwrap_or_else(|| "psiphon: tactics wait expired".to_owned()));
         }
@@ -8456,28 +8465,25 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
     } else {
         FRONTED_SERVERS
     };
-    let depth = groups.iter().map(Vec::len).max().unwrap_or(0);
-    let stride = if scan.is_some() { CDN_SCAN_STRIDE } else { 1 };
-    let start = if scan.is_some() {
+    if scan.is_some() {
         for group in &groups {
-            if let Some(server) = group.first() {
+            for server in group {
                 if front.present(server) {
+                    if fronted >= server_cap {
+                        continue;
+                    }
                     fronted += 1;
                 }
                 expanded.push(server.clone());
             }
         }
-        1
     } else {
-        0
-    };
-    for base in (start..depth).step_by(stride) {
-        for group in &groups {
-            let end = base.saturating_add(stride).min(group.len());
-            if base >= end {
-                continue;
-            }
-            for server in &group[base..end] {
+        let depth = groups.iter().map(Vec::len).max().unwrap_or(0);
+        for base in 0..depth {
+            for group in &groups {
+                let Some(server) = group.get(base) else {
+                    continue;
+                };
                 if front.present(server) {
                     if fronted >= server_cap {
                         continue;
@@ -13733,6 +13739,14 @@ mod tests {
             .iter()
             .filter_map(|server| server.meek.as_ref())
             .any(|meek| meek.dial == "198.51.100.7"));
+        assert!(
+            servers
+                .iter()
+                .take(64)
+                .filter_map(|server| server.meek.as_ref())
+                .any(|meek| meek.dial == "198.51.100.7"),
+            "the opening dial pass reached no scan candidate"
+        );
         assert_eq!(
             servers
                 .iter()
