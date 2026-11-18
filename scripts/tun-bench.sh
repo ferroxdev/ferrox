@@ -482,13 +482,19 @@ while [ "$rep" -le "$REPEAT" ]; do
         printf 'round %s engine %s\n' "$rep" "$engine"
         if ! start_engine "$engine"; then
             printf '  failed to start %s\n' "$engine"
-            STATUS=1
+            case "$engine" in
+                ferrox*) STATUS=1 ;;
+                *) printf -- '- `%s` did not start\n' "$engine" >> "$GAPS" ;;
+            esac
             stop_engine
             continue
         fi
         if ! probe_engine "$engine"; then
             printf '  %s did not pass the TCP probe\n' "$engine"
-            STATUS=1
+            case "$engine" in
+                ferrox*) STATUS=1 ;;
+                *) printf -- '- `%s` did not pass the TCP probe\n' "$engine" >> "$GAPS" ;;
+            esac
             stop_engine
             continue
         fi
