@@ -558,7 +558,13 @@ impl Masked {
                 _ => *part,
             };
             match chain.write(&mut &self.stream, part) {
-                Ok(written) => total += written,
+                Ok(written) => {
+                    total += written;
+                    // A short run leaves the rest of this part first in line, never the next one.
+                    if written < part.len() {
+                        return Ok(total);
+                    }
+                }
                 Err(error) => return self.keep_shape(armed.as_ref(), Err(error)),
             }
         }
@@ -1140,6 +1146,7 @@ impl Connection {
                 .copied()
                 .find(|part| !part.is_empty())
                 .map_or(Ok(0), |first| masked.send(first)),
+            Connection::Masked(masked) if masked.is_plain() => sendmsg_ready(&masked.stream, parts),
             Connection::Masked(masked) => masked.send_ready(parts),
             Connection::Metered(metered) => match metered.inner.write_ready(parts) {
                 Ok(n) => {

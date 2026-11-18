@@ -250,7 +250,18 @@ impl Fragment {
         let mut done = 0usize;
         let mut rest = p;
         loop {
-            raw.write_all(&rest[..HEADER])?;
+            let mut sent = 0usize;
+            while sent < HEADER {
+                match raw.write(&rest[sent..HEADER]) {
+                    Ok(0) if sent > 0 => return Ok(done + sent),
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(written) => sent += written,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    // The octets that did land stay counted, so a retry resumes after them.
+                    Err(error) if sent > 0 => return Ok(done + sent),
+                    Err(error) => return Err(error),
+                }
+            }
             done += HEADER;
             rest = &rest[HEADER..];
             if rest.is_empty() {
@@ -305,8 +316,16 @@ impl Fragment {
         else {
             return Ok(());
         };
-        raw.flush()?;
-        std::thread::sleep(Duration::from_millis(ms as u64));
+        match raw.flush() {
+            Ok(()) => std::thread::sleep(Duration::from_millis(ms as u64)),
+            // The record before this delay is out; a full socket only costs the spacing.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error),
+        }
         Ok(())
     }
 
