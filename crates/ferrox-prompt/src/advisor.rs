@@ -132,17 +132,20 @@ pub fn handable<'a>(
             continue;
         }
         if !allow_unfilled {
-            let inputs: Vec<&str> = match crate::render::resolve_addons(prompt, requested_addons) {
-                Ok(addons) => prompt.required_inputs_for(&addons).collect(),
-                Err(_) => {
-                    unresolved.push(prompt);
-                    continue;
-                }
-            };
+            let inputs: Vec<String> =
+                match crate::render::resolve_addons(prompt, requested_addons) {
+                    Ok(addons) => prompt
+                        .required_inputs_for(&addons)
+                        .map(str::to_owned)
+                        .collect(),
+                    Err(_) => {
+                        unresolved.push(prompt);
+                        continue;
+                    }
+                };
             let missing: Vec<String> = inputs
                 .into_iter()
-                .filter(|name| !supplied.contains_key(*name))
-                .map(str::to_owned)
+                .filter(|name| !supplied.contains_key(name))
                 .collect();
             if !missing.is_empty() {
                 skipped.push(Skipped {
@@ -693,12 +696,17 @@ run {core}
 **Add-on — Extra:** needs {extra}
 ",
         );
-        let (ready, skipped) =
-            handable(&library, None, &[], &["nope".to_owned()], &BTreeMap::new(), false);
+        let (ready, skipped) = handable(
+            &library,
+            None,
+            &[],
+            &["nope".to_owned()],
+            &BTreeMap::new(),
+            false,
+        );
         assert_eq!(ready.len(), 1);
         assert_eq!(skipped, Vec::<Skipped>::new());
-        let error =
-            crate::render::resolve_addons(ready[0], &["nope".to_owned()]).unwrap_err();
+        let error = crate::render::resolve_addons(ready[0], &["nope".to_owned()]).unwrap_err();
         assert!(error.contains("no add-on matching `nope`"), "{error}");
     }
 

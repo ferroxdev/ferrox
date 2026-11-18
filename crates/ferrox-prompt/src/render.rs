@@ -716,8 +716,8 @@ fix issue #{issue}
 
     #[test]
     fn a_lone_brace_does_not_swallow_a_later_placeholder() {
-        let values = values(&[("name", "value")]);
-        assert_eq!(substitute("a { b {name}", &values), "a { b value");
+        let filled = values(&[("name", "value")]);
+        assert_eq!(substitute("a { b {name}", &filled), "a { b value");
         assert_eq!(substitute("a { b {name}", &values(&[])), "a { b {name}");
     }
 

@@ -281,9 +281,7 @@ pub fn methods_from_text(text: &str) -> Vec<MethodRow> {
             section = match first {
                 Some(letter)
                     if letter.is_ascii_uppercase()
-                        && next.is_none_or(|next| {
-                            !next.is_ascii_alphanumeric() && next != '_'
-                        }) =>
+                        && next.is_none_or(|next| !next.is_ascii_alphanumeric() && next != '_') =>
                 {
                     Some(letter)
                 }
@@ -301,7 +299,10 @@ pub fn methods_from_text(text: &str) -> Vec<MethodRow> {
         }
         let row = cells(trimmed);
         if row.iter().all(|cell| {
-            !cell.is_empty() && cell.chars().all(|character| character == '-' || character == ':')
+            !cell.is_empty()
+                && cell
+                    .chars()
+                    .all(|character| character == '-' || character == ':')
         }) {
             continue;
         }
@@ -646,7 +647,12 @@ mod tests {
             .iter()
             .filter(|row| row.state.to_ascii_lowercase().starts_with("partial"))
         {
-            assert!(!row.implemented, "{} reads as shipped: {}", row.key(), row.state);
+            assert!(
+                !row.implemented,
+                "{} reads as shipped: {}",
+                row.key(),
+                row.state
+            );
             assert_eq!(row.gap, Gap::Partial, "{}: {}", row.key(), row.state);
         }
     }

@@ -936,10 +936,9 @@ mod tests {
 
     #[test]
     fn vless_tls_reads_allow_insecure_from_either_spelling() {
-        let permissive = vless_outbound(
-            "vless://uuid@host.test:443?type=tcp&security=tls&allowInsecure=1",
-        )
-        .unwrap();
+        let permissive =
+            vless_outbound("vless://uuid@host.test:443?type=tcp&security=tls&allowInsecure=1")
+                .unwrap();
         assert_eq!(
             permissive["streamSettings"]["tlsSettings"]["allowInsecure"],
             true
@@ -956,10 +955,10 @@ mod tests {
             strict["streamSettings"]["tlsSettings"]["allowInsecure"],
             false
         );
-        assert!(
-            vless_outbound("vless://uuid@host.test:443?type=tcp&security=tls&allowInsecure=maybe")
-                .is_err()
-        );
+        assert!(vless_outbound(
+            "vless://uuid@host.test:443?type=tcp&security=tls&allowInsecure=maybe"
+        )
+        .is_err());
     }
 
     #[test]

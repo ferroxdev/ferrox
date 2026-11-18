@@ -370,18 +370,18 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
     }
     if options.vpn && arm {
         // Hold the cancellation lock across the arm and handoff so a Ctrl-C either owns cleanup or looks at a finished start.
-        let mut cancelled = cancelled
+        let mut state = cancelled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *cancelled || interrupted.load(Ordering::SeqCst) {
-            *cancelled = true;
+        if *state || interrupted.load(Ordering::SeqCst) {
+            *state = true;
             stop_and_forget(paths, user_config);
-            drop(cancelled);
+            drop(state);
             return 130;
         }
         if let Err(error) = proxy::arm(paths, &options.fronts, ports) {
-            *cancelled = true;
-            drop(cancelled);
+            *state = true;
+            drop(state);
             eprintln!("{error}");
             stop_and_forget(paths, user_config);
             return 1;
@@ -390,12 +390,12 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             spawn_supervisor(paths, pid, options.instance.as_deref());
         }
         if interrupted.load(Ordering::SeqCst) {
-            *cancelled = true;
+            *state = true;
             stop_and_forget(paths, user_config);
-            drop(cancelled);
+            drop(state);
             return 130;
         }
-        drop(cancelled);
+        drop(state);
         if interrupted.load(Ordering::SeqCst) {
             return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 130);
         }
@@ -976,7 +976,9 @@ fn logout(paths: &Paths) -> i32 {
         }
     }
     if rc != 0 {
-        eprintln!("ferrox-cli: the stored session or saved account could not be removed; it was kept.");
+        eprintln!(
+            "ferrox-cli: the stored session or saved account could not be removed; it was kept."
+        );
         return rc;
     }
     forget_config(paths);

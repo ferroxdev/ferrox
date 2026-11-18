@@ -2936,9 +2936,7 @@ mod tests {
                 ),
             ],
             ceilings_mib_s: Vec::new(),
-            ceiling_failures: vec![
-                "harness ceiling: the generator did not answer".to_owned(),
-            ],
+            ceiling_failures: vec!["harness ceiling: the generator did not answer".to_owned()],
             gated: Some("ferrox"),
             failures: Vec::new(),
             skipped: vec![(

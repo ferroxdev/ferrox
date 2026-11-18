@@ -4819,7 +4819,10 @@ mod tests {
                 }
             }
         });
-        let _echo = EchoWorker { stop, handle: worker };
+        let _echo = EchoWorker {
+            stop,
+            handle: worker,
+        };
 
         let outer_client_private = [0x11; 32];
         let outer_server_private = [0x22; 32];
@@ -4934,7 +4937,9 @@ mod tests {
             ));
         }
         app.set_write_timeout(Some(
-            remaining.min(Duration::from_secs(5)).max(Duration::from_millis(1)),
+            remaining
+                .min(Duration::from_secs(5))
+                .max(Duration::from_millis(1)),
         ))?;
         app.set_read_timeout(Some(
             remaining
@@ -4960,7 +4965,9 @@ mod tests {
                         ));
                     }
                     app.set_write_timeout(Some(
-                        remaining.min(Duration::from_secs(5)).max(Duration::from_millis(1)),
+                        remaining
+                            .min(Duration::from_secs(5))
+                            .max(Duration::from_millis(1)),
                     ))?;
                     app.set_read_timeout(Some(
                         remaining

@@ -359,10 +359,10 @@ fn register(paths: &Paths) -> Result<(), String> {
 }
 
 fn config_marker(paths: &Paths) -> PathBuf {
-    let name = paths
-        .pid_file
-        .file_stem()
-        .map_or_else(|| String::from("lane"), |stem| stem.to_string_lossy().into_owned());
+    let name = paths.pid_file.file_stem().map_or_else(
+        || String::from("lane"),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
     paths.conf_dir.join(format!(".{name}.provenance"))
 }
 
@@ -371,7 +371,12 @@ pub fn remember_user_config(paths: &Paths) -> Result<(), String> {
         &config_marker(paths),
         &format!("{}\n", paths.cfg.to_string_lossy()),
     )
-    .map_err(|error| format!("cannot record the lane config {}: {error}", paths.cfg.display()))
+    .map_err(|error| {
+        format!(
+            "cannot record the lane config {}: {error}",
+            paths.cfg.display()
+        )
+    })
 }
 
 pub fn forget_user_config(paths: &Paths) {
