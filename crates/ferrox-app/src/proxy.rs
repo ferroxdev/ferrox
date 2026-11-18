@@ -76154,6 +76154,7 @@ mod tests {
         let front = crate::conn::test_bind("127.0.0.1:0").expect("bind front");
         let front_addr = front.local_addr().expect("front addr");
         let pipes = splice_pipes_allocated();
+        let spliced = poll_relay::spliced_bytes();
         let relay = thread::spawn(move || {
             let (client, _) = front.accept().expect("front accepts");
             dial_http_outbound(
@@ -76173,6 +76174,12 @@ mod tests {
             allocated >= 2,
             "the plain hop allocated {allocated} splice pipes: its relay is still copying every \
              byte through a user-space buffer"
+        );
+        let moved = poll_relay::spliced_bytes() - spliced;
+        assert!(
+            moved >= 4,
+            "the plain hop spliced {moved} bytes: a hand-off that armed no pipes falls back to \
+             relay_owned, and this count is what tells the two apart"
         );
         let _ = sock.shutdown(Shutdown::Write);
         relay.join().expect("relay returns");
@@ -80698,6 +80705,25 @@ mod poll_relay {
     #[inline]
     fn note_idle_ingest(_pending: usize, _capacity: usize) {}
 
+    /// Bytes the pump has moved with `splice` rather than through a buffer: the one count a
+    /// relay that fell back to `relay_owned` cannot produce.
+    #[cfg(test)]
+    static SPLICED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(test)]
+    pub(crate) fn spliced_bytes() -> usize {
+        SPLICED_BYTES.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn note_spliced(moved: usize) {
+        SPLICED_BYTES.fetch_add(moved, Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn note_spliced(_moved: usize) {}
+
     /// A blocking socket parks the worker inside a splice when a wake arrives for a
     /// queue that has gone — `SPLICE_F_NONBLOCK` guards the pipe half only. `held` stops
     /// the descriptor being recycled under a restore that writes back the flags it found.
@@ -80918,6 +80944,7 @@ mod poll_relay {
                     };
                     if moved > 0 {
                         self.pending += moved as usize;
+                        note_spliced(moved as usize);
                         self.ingest_stalled = false;
                         progressed = true;
                     } else if moved == 0 {
