@@ -980,7 +980,7 @@ fn is_bogon_v4(ip: Ipv4Addr) -> bool {
         || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
         || ip.is_documentation()
         || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
-        || (octets[0] == 192 && (octets[1] & 0xfe) == 18)
+        // RFC 2544, not the reference's 192.18 typo.
         || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
         || ip.is_multicast()
         || octets[0] >= 240
@@ -2506,7 +2506,6 @@ mod tests {
             [172, 16, 0, 1],
             [192, 0, 0, 1],
             [192, 0, 2, 1],
-            [192, 18, 0, 1],
             [192, 88, 99, 1],
             [198, 18, 0, 1],
             [198, 51, 100, 1],
@@ -2533,7 +2532,7 @@ mod tests {
         }
         let mapped = Ipv4Addr::from([192, 0, 2, 1]).to_ipv6_mapped();
         assert!(is_bogon(mapped.into()));
-        for public in [[1, 1, 1, 1], [8, 8, 8, 8]] {
+        for public in [[1, 1, 1, 1], [8, 8, 8, 8], [192, 18, 0, 1]] {
             assert!(!is_bogon(Ipv4Addr::from(public).into()), "{public:?}");
         }
         let public: IpAddr = "2606:4700:4700::1111".parse().expect("address");
