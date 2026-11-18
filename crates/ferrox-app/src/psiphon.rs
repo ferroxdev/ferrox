@@ -63,6 +63,8 @@ const FRONTED_SERVERS: usize = 512;
 const CDN_SCAN_STRIDE: usize = 24;
 /// The first tactics entry to try on the next establishment pass.
 static TACTICS_CURSOR: AtomicUsize = AtomicUsize::new(0);
+/// The least time one tactics entry gets before the pass moves on.
+const TACTICS_ATTEMPT_MIN: Duration = Duration::from_secs(10);
 
 const CDN_FRONTING_PROTOCOLS: &[&str] = &[
     "FRONTED-MEEK-CDN-OSSH",
@@ -7325,26 +7327,49 @@ fn fetch_tactics_from(
         (Some(wait), None) => Some(wait),
         (None, until) => until,
     };
+    let total = entries.len();
     let mut index = if until.is_some() {
-        TACTICS_CURSOR.load(Ordering::Relaxed) % entries.len()
+        TACTICS_CURSOR.load(Ordering::Relaxed) % total
     } else {
         0
     };
+    let mut attempted = 0usize;
     let mut last = None;
     loop {
+        if attempted == total {
+            attempted = 0;
+            index = 0;
+            if until.is_some() {
+                TACTICS_CURSOR.store(0, Ordering::Relaxed);
+            }
+            let Some(wait) = wait_deadline else {
+                return Err(last.unwrap_or_else(|| "psiphon: tactics request failed".to_owned()));
+            };
+            let mut remaining = wait.saturating_duration_since(Instant::now());
+            if let Some(until) = until {
+                remaining = remaining.min(until.saturating_duration_since(Instant::now()));
+            }
+            if remaining.is_zero() {
+                return Err(last.unwrap_or_else(|| "psiphon: tactics wait expired".to_owned()));
+            }
+            let base = timing.retry.min(remaining);
+            let span = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
+            let delay = base.mul_f64(1.0 + timing.jitter * span).min(remaining);
+            thread::sleep(delay);
+        }
         let attempt = if let Some(deadline) = request_deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(last.unwrap_or_else(|| "psiphon: tactics wait expired".to_owned()));
             }
             let share = if until.is_some() {
-                remaining / u32::try_from(entries.len() - index).unwrap_or(u32::MAX)
+                let left = u32::try_from(total - attempted).unwrap_or(u32::MAX);
+                remaining / left
             } else {
                 remaining
             };
-            timeout
-                .min(share.max(Duration::from_millis(1)))
-                .min(remaining)
+            let floor = TACTICS_ATTEMPT_MIN.min(remaining / 2);
+            timeout.min(share.max(floor)).min(remaining)
         } else {
             timeout
         };
@@ -7359,31 +7384,11 @@ fn fetch_tactics_from(
             Ok(tactics) => return Ok(tactics),
             Err(why) => last = Some(why),
         }
-        index += 1;
-        if index < entries.len() {
-            if until.is_some() {
-                TACTICS_CURSOR.store(index, Ordering::Relaxed);
-            }
-            continue;
+        attempted += 1;
+        index = (index + 1) % total;
+        if until.is_some() && attempted < total {
+            TACTICS_CURSOR.store(index, Ordering::Relaxed);
         }
-        index = 0;
-        if until.is_some() {
-            TACTICS_CURSOR.store(0, Ordering::Relaxed);
-        }
-        let Some(wait) = wait_deadline else {
-            return Err(last.unwrap_or_else(|| "psiphon: tactics request failed".to_owned()));
-        };
-        let mut remaining = wait.saturating_duration_since(Instant::now());
-        if let Some(until) = until {
-            remaining = remaining.min(until.saturating_duration_since(Instant::now()));
-        }
-        if remaining.is_zero() {
-            return Err(last.unwrap_or_else(|| "psiphon: tactics wait expired".to_owned()));
-        }
-        let base = timing.retry.min(remaining);
-        let span = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
-        let delay = base.mul_f64(1.0 + timing.jitter * span).min(remaining);
-        thread::sleep(delay);
     }
 }
 
