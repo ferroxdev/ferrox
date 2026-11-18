@@ -183,10 +183,11 @@ const API_CALLS: usize = 100;
 /// The receive limit the service advertises is a message size; the five-byte gRPC envelope rides on top of it.
 const CALL_MAX: usize = 4 * 1024 * 1024;
 const CALL_ENVELOPE: usize = 5;
+const WIRE_MAX: usize = CALL_MAX + CALL_ENVELOPE;
 const H2_MAX_FRAME: usize = 16_384;
 /// What a connection's open calls may hold together: two maximum messages in flight, so the product
 /// of the call cap and the message cap is not what one peer can pin.
-const API_HELD: usize = 2 * (CALL_MAX + CALL_ENVELOPE);
+const API_HELD: usize = 2 * WIRE_MAX;
 static API_SLOTS: crate::limit::Slots = crate::limit::Slots::new(API_WORKERS);
 static API_REFUSED: AtomicBool = AtomicBool::new(false);
 
@@ -437,19 +438,42 @@ impl Api {
         let mut flow = Flow::new();
         let mut last_id = 0u32;
         while let Some((len, kind, flags, id)) = h2::read_head_bounded(&mut stream) {
-            let cap = if kind == h2::T_DATA {
-                CALL_MAX + CALL_ENVELOPE
-            } else {
-                h2::HEAD_CAP
+            let cap = match kind {
+                h2::T_HEADERS | h2::T_CONT => h2::HEAD_CAP,
+                _ => WIRE_MAX,
             };
             if len > cap {
                 goaway(&mut stream, h2::E_FRAME_SIZE, last_id);
                 return;
             }
-            let mut body = vec![0u8; len];
-            if stream.read_exact(&mut body).is_err() {
-                return;
-            }
+            let body = if matches!(
+                kind,
+                h2::T_HEADERS
+                    | h2::T_CONT
+                    | h2::T_DATA
+                    | h2::T_SETTINGS
+                    | h2::T_WINDOW
+                    | h2::T_PING
+                    | h2::T_RST
+                    | h2::T_GOAWAY
+            ) {
+                let mut body = vec![0u8; len];
+                if stream.read_exact(&mut body).is_err() {
+                    return;
+                }
+                body
+            } else {
+                let mut left = len;
+                let mut waste = [0u8; 4096];
+                while left > 0 {
+                    let take = left.min(waste.len());
+                    if stream.read_exact(&mut waste[..take]).is_err() {
+                        return;
+                    }
+                    left -= take;
+                }
+                Vec::new()
+            };
             if id == 0 && matches!(kind, h2::T_HEADERS | h2::T_DATA | h2::T_CONT | h2::T_RST) {
                 goaway(&mut stream, h2::E_PROTOCOL, last_id);
                 return;
@@ -485,6 +509,19 @@ impl Api {
                 }
                 h2::T_HEADERS => {
                     let block = header_body(&body, flags);
+                    if responses.contains_key(&id) {
+                        if !absorb_headers(
+                            &mut decoder,
+                            &mut scratch,
+                            id,
+                            block,
+                            flags & h2::F_END_HEADERS != 0,
+                        ) {
+                            goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                            return;
+                        }
+                        continue;
+                    }
                     if flow.cancelled(id) {
                         if !absorb_headers(
                             &mut decoder,
@@ -560,7 +597,9 @@ impl Api {
                 }
                 h2::T_DATA => {
                     if flow.cancelled(id) {
-                        let _ = window_update(&mut stream, 0, body.len());
+                        if !window_update(&mut stream, 0, body.len()) {
+                            return;
+                        }
                         continue;
                     }
                     let Some(payload) = data_body(&body, flags) else {
@@ -572,8 +611,7 @@ impl Api {
                         goaway(&mut stream, h2::E_PROTOCOL, last_id);
                         return;
                     };
-                    if call.body.len() + payload.len() > CALL_MAX + CALL_ENVELOPE
-                        || held + payload.len() > API_HELD
+                    if call.body.len() + payload.len() > WIRE_MAX || held + payload.len() > API_HELD
                     {
                         goaway(&mut stream, h2::E_REFUSED, last_id);
                         return;
@@ -631,6 +669,15 @@ impl Api {
                 framed.push(0);
                 framed.extend_from_slice(&(answer.len() as u32).to_be_bytes());
                 framed.extend_from_slice(&answer);
+                let held: usize = responses
+                    .values()
+                    .map(|response| response.framed.len() - response.at)
+                    .sum();
+                if held.saturating_add(framed.len()) > API_HELD {
+                    reset(stream, id, h2::E_REFUSED);
+                    flow.close(id);
+                    return true;
+                }
                 let trailers = h2::block_encode(&[("grpc-status", "0")]);
                 responses.insert(
                     id,
@@ -1280,7 +1327,7 @@ fn settings() -> [u8; 12] {
     out[..2].copy_from_slice(&h2::S_MAX_CONCURRENT.to_be_bytes());
     out[2..6].copy_from_slice(&(API_CALLS as u32).to_be_bytes());
     out[6..8].copy_from_slice(&h2::S_MAX_FRAME.to_be_bytes());
-    out[8..].copy_from_slice(&((CALL_MAX + CALL_ENVELOPE) as u32).to_be_bytes());
+    out[8..].copy_from_slice(&(WIRE_MAX as u32).to_be_bytes());
     out
 }
 
@@ -2162,7 +2209,7 @@ mod tests {
         let mut expected = h2::S_MAX_CONCURRENT.to_be_bytes().to_vec();
         expected.extend_from_slice(&(API_CALLS as u32).to_be_bytes());
         expected.extend_from_slice(&h2::S_MAX_FRAME.to_be_bytes());
-        expected.extend_from_slice(&((CALL_MAX + CALL_ENVELOPE) as u32).to_be_bytes());
+        expected.extend_from_slice(&(WIRE_MAX as u32).to_be_bytes());
         assert_eq!(served_settings(&mut client), expected);
         drop(client);
         assert!(waited.recv_timeout(Duration::from_secs(2)).is_ok());

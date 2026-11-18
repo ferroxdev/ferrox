@@ -1600,6 +1600,11 @@ fn serve_masquerade_stream(
     masq: &Masquerade,
 ) {
     let Some(request) = read_h3_request(shared, stream, seed, fin) else {
+        let Ok(mut conn) = shared.lock() else {
+            return;
+        };
+        let _ = conn.stream_shutdown(stream, quiche::Shutdown::Write, 0);
+        crate::quic::flush_egress(&mut conn, sock);
         return;
     };
     let peer = peer.to_string();
