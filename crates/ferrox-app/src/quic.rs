@@ -7601,8 +7601,8 @@ mod tests {
         );
     }
 
-    /// A peer's CONNECTION_CLOSE parks the connection in draining before the timer retires it;
-    /// a write must not wait out SEND_WAIT for a stream the peer can no longer read.
+    /// A peer's `CONNECTION_CLOSE` parks the connection in draining before the timer retires it;
+    /// a write must not wait out `SEND_WAIT` for a stream the peer can no longer read.
     #[test]
     fn a_write_on_a_draining_connection_fails_before_the_send_wait() {
         let (mut client, mut server) = lane_pair();
