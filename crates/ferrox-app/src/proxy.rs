@@ -19973,6 +19973,8 @@ fn relay_pool_flow(client: &Connection, mut flow: PooledFlow) {
         flow.close();
         return;
     };
+    // A stalled app costs its own flow: the downlink gives up at the relay stall, and dropping the replies unparks the demux for every other flow.
+    let _ = down.set_write_timeout(Some(budgets::relay_stall()));
     let done = RelayPool::global().run(move || {
         let mut down = down;
         if mux_pool_downlink(&replies, &mut down) {
