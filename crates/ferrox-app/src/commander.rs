@@ -183,6 +183,7 @@ const API_CALLS: usize = 100;
 /// The receive limit the service advertises is a message size; the five-byte gRPC envelope rides on top of it.
 const CALL_MAX: usize = 4 * 1024 * 1024;
 const CALL_ENVELOPE: usize = 5;
+const H2_MAX_FRAME: usize = 16_384;
 /// What a connection's open calls may hold together: two maximum messages in flight, so the product
 /// of the call cap and the message cap is not what one peer can pin.
 const API_HELD: usize = 2 * (CALL_MAX + CALL_ENVELOPE);
@@ -494,18 +495,27 @@ impl Api {
                     }
                 }
                 h2::T_DATA => {
+                    let Some(payload) = data_body(&body, flags) else {
+                        goaway(&mut stream, h2::E_PROTOCOL);
+                        return;
+                    };
                     let held: usize = calls.values().map(|call| call.body.len()).sum();
+                    let known = calls.contains_key(&id);
                     if let Some(call) = calls.get_mut(&id) {
-                        if call.body.len() + body.len() > CALL_MAX + CALL_ENVELOPE
-                            || held + body.len() > API_HELD
+                        if call.body.len() + payload.len() > CALL_MAX + CALL_ENVELOPE
+                            || held + payload.len() > API_HELD
                         {
                             goaway(&mut stream, h2::E_REFUSED);
                             return;
                         }
-                        call.body.extend_from_slice(&body);
-                        if flags & h2::F_END != 0 {
-                            self.answer(id, &calls.remove(&id).unwrap_or_default(), &mut stream);
-                        }
+                        call.body.extend_from_slice(payload);
+                    }
+                    window_update(&mut stream, 0, body.len());
+                    if known {
+                        window_update(&mut stream, id, body.len());
+                    }
+                    if flags & h2::F_END != 0 && known {
+                        self.answer(id, &calls.remove(&id).unwrap_or_default(), &mut stream);
                     }
                 }
                 h2::T_RST => {
@@ -528,7 +538,9 @@ impl Api {
                 framed.push(0);
                 framed.extend_from_slice(&(answer.len() as u32).to_be_bytes());
                 framed.extend_from_slice(&answer);
-                h2::write_frame(stream, h2::T_DATA, 0, id, &framed);
+                for chunk in framed.chunks(H2_MAX_FRAME) {
+                    h2::write_frame(stream, h2::T_DATA, 0, id, chunk);
+                }
                 let trailers = h2::block_encode(&[("grpc-status", "0")]);
                 h2::write_frame(
                     stream,
@@ -1179,6 +1191,27 @@ fn goaway(stream: &mut Connection, code: u32) {
     let _ = h2::write_frame(stream, h2::T_GOAWAY, 0, 0, &frame);
 }
 
+fn window_update(stream: &mut Connection, id: u32, increment: usize) {
+    if increment != 0 {
+        let _ = h2::write_frame(
+            stream,
+            h2::T_WINDOW,
+            0,
+            id,
+            &(increment as u32).to_be_bytes(),
+        );
+    }
+}
+
+fn data_body(body: &[u8], flags: u8) -> Option<&[u8]> {
+    if flags & h2::F_PADDED == 0 {
+        return Some(body);
+    }
+    let (&pad, rest) = body.split_first()?;
+    let pad = usize::from(pad);
+    (pad <= rest.len()).then(|| &rest[..rest.len() - pad])
+}
+
 fn header_body(body: &[u8], flags: u8) -> &[u8] {
     let mut rest = body;
     if flags & h2::F_PADDED != 0 {
@@ -1686,7 +1719,7 @@ mod tests {
 
     fn reply(mut stream: Connection) -> (Vec<u8>, Vec<(String, String)>) {
         let mut decoder = h2::Decoder::default();
-        let mut message = Vec::new();
+        let mut raw = Vec::new();
         let mut trailers = Vec::new();
         while let Some((len, kind, flags, id)) = h2::read_head(&mut stream) {
             let mut body = vec![0u8; len];
@@ -1694,12 +1727,7 @@ mod tests {
                 break;
             }
             match kind {
-                h2::T_DATA => {
-                    if body.len() >= 5 {
-                        let n = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
-                        message.extend_from_slice(&body[5..5 + n]);
-                    }
-                }
+                h2::T_DATA => raw.extend_from_slice(&body),
                 h2::T_HEADERS if id == 1 && flags & h2::F_END != 0 => {
                     decoder.decode(&body, &mut |name, value| {
                         trailers.push((
@@ -1712,6 +1740,14 @@ mod tests {
                 _ => {}
             }
         }
+        let message = raw
+            .get(5..)
+            .and_then(|body| {
+                let n = u32::from_be_bytes(raw.get(1..5)?.try_into().ok()?) as usize;
+                body.get(..n)
+            })
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
         (message, trailers)
     }
 
@@ -1795,11 +1831,16 @@ mod tests {
     }
 
     fn goaway_code(client: &mut Connection) -> u32 {
-        let (len, kind, _, _) = h2::read_head(client).expect("goaway");
-        assert_eq!(kind, h2::T_GOAWAY);
-        let mut body = vec![0u8; len];
-        client.read_exact(&mut body).expect("goaway body");
-        u32::from_be_bytes(body[4..8].try_into().expect("code"))
+        loop {
+            let (len, kind, _, _) = h2::read_head(client).expect("goaway");
+            let mut body = vec![0u8; len];
+            client.read_exact(&mut body).expect("frame body");
+            if kind == h2::T_WINDOW {
+                continue;
+            }
+            assert_eq!(kind, h2::T_GOAWAY);
+            return u32::from_be_bytes(body[4..8].try_into().expect("code"));
+        }
     }
 
     fn call_head(client: &mut Connection, id: u32) {
@@ -1882,6 +1923,30 @@ mod tests {
             .write_all(&[0u8])
             .expect("writes the byte that crosses the cap");
         assert_eq!(goaway_code(&mut client), h2::E_PROTOCOL);
+        assert!(waited.recv_timeout(Duration::from_secs(2)).is_ok());
+    }
+
+    #[test]
+    fn a_consumed_data_frame_restores_both_receive_windows() {
+        let (mut client, waited) = api_connection(Duration::from_millis(500));
+        served_settings(&mut client);
+        call_head(&mut client, 1);
+        let body = vec![0u8; 1024];
+        client
+            .write_all(&h2::frame_head(body.len(), h2::T_DATA, 0, 1))
+            .expect("writes a body frame");
+        client.write_all(&body).expect("writes its bytes");
+        for want in [0, 1] {
+            let (len, kind, _, id) = h2::read_head(&mut client).expect("window update");
+            let mut payload = vec![0u8; len];
+            client.read_exact(&mut payload).expect("window body");
+            assert_eq!((kind, id), (h2::T_WINDOW, want));
+            assert_eq!(
+                u32::from_be_bytes(payload.try_into().expect("increment")),
+                body.len() as u32
+            );
+        }
+        drop(client);
         assert!(waited.recv_timeout(Duration::from_secs(2)).is_ok());
     }
 

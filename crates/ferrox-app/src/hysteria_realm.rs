@@ -935,6 +935,7 @@ pub(crate) fn serve_registration(
         let heartbeat_stop = std::sync::Arc::clone(&stop);
         let heartbeat_servers = config.stun_servers.clone();
         let heartbeat_family = config.family;
+        let heartbeat_mapping = config.port_mapping;
         let ttl_for_heartbeat = ttl;
         let session_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let heartbeat_session_stop = std::sync::Arc::clone(&session_stop);
@@ -948,6 +949,7 @@ pub(crate) fn serve_registration(
                 heartbeat_locals,
                 heartbeat_servers,
                 heartbeat_family,
+                heartbeat_mapping,
                 ttl_for_heartbeat,
                 heartbeat_stop,
                 heartbeat_session_stop,
@@ -1007,6 +1009,7 @@ fn heartbeat_loop(
     locals: std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>,
     servers: Vec<String>,
     family: Family,
+    mapping: Option<realm::PortMapping>,
     ttl: u64,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     session_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1026,15 +1029,27 @@ fn heartbeat_loop(
         let Some(base) = stun_discover_via_state(&state, &sock, &servers, family) else {
             continue;
         };
-        let moved = locals.lock().is_ok_and(|guard| *guard != base);
+        let mut next = base;
+        if let Some(mapping) = mapping.filter(|mapping| mapping.enabled) {
+            if let Some(external) =
+                port_mapping_external(sock.local_addr().ok(), mapping.timeout, mapping.lifetime)
+            {
+                if !next.contains(&external) {
+                    next.push(external);
+                    next.sort_unstable();
+                    next.dedup();
+                }
+            }
+        }
+        let moved = locals.lock().is_ok_and(|guard| *guard != next);
         let sent = if moved {
-            client.heartbeat(id, session, Some(&base))
+            client.heartbeat(id, session, Some(&next))
         } else {
             client.heartbeat(id, session, None)
         };
         if sent.is_some() && moved {
             if let Ok(mut guard) = locals.lock() {
-                guard.clone_from(&base);
+                guard.clone_from(&next);
             }
         }
     }

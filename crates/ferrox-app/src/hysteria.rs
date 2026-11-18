@@ -1622,11 +1622,7 @@ fn read_h3_request(
     let mut room = Unfilled::<4096>::new();
     loop {
         if let Some(request) = assemble_request(&buf) {
-            let declares_body = request.headers.iter().any(|(name, _)| {
-                name.eq_ignore_ascii_case("content-length")
-                    || name.eq_ignore_ascii_case("transfer-encoding")
-            });
-            if !declares_body || !request.body.is_empty() {
+            if request_complete(&request) {
                 return Some(request);
             }
         }
@@ -1654,6 +1650,19 @@ fn read_h3_request(
         }
         std::thread::sleep(STREAM_POLL);
     }
+}
+
+fn request_complete(request: &hysteria::H3Request) -> bool {
+    let mut declared = None;
+    let mut chunked = false;
+    for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case("content-length") {
+            declared = value.trim().parse::<usize>().ok();
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = true;
+        }
+    }
+    declared.map_or(!chunked, |length| request.body.len() >= length)
 }
 
 /// Walks a request stream's HTTP/3 frames once: the first `HEADERS` block becomes the request line and fields, and every `DATA` payload that follows becomes the body. `None` while any frame is still incomplete, so the reader keeps waiting rather than answering a half request.

@@ -596,6 +596,7 @@ fn zone_name() -> String {
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
+static FALLBACK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The id the launch publishes as `udid`: the one configured, or a version-4 drawn for this process so the plane's free pool sees one device rather than one per flow. Written a byte at a time — no formatter runs.
 pub(crate) fn udid(named: &str) -> String {
@@ -603,7 +604,18 @@ pub(crate) fn udid(named: &str) -> String {
         return named.to_owned();
     }
     let mut raw = [0u8; 16];
-    getrandom::fill(&mut raw).unwrap_or_default();
+    if getrandom::fill(&mut raw).is_err() {
+        let mut state = foxy_account::epoch().wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ u64::from(FALLBACK_ID.fetch_add(1, Ordering::Relaxed))
+            ^ u64::from(std::process::id());
+        for byte in &mut raw {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut mixed = state;
+            mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            *byte = (mixed ^ (mixed >> 31)) as u8;
+        }
+    }
     raw[6] = (raw[6] & 0x0f) | 0x40;
     raw[8] = (raw[8] & 0x3f) | 0x80;
     let mut text = String::with_capacity(36);

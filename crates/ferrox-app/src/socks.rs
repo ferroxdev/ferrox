@@ -24,7 +24,7 @@
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use crate::conn::Connection;
@@ -176,7 +176,12 @@ fn read_exact_within(stream: &mut impl Read, buf: &mut [u8], until: Instant) -> 
                 if matches!(
                     error.kind(),
                     ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
-                ) => {}
+                ) =>
+            {
+                if error.kind() != ErrorKind::Interrupted {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
             Err(_) => return None,
         }
     }

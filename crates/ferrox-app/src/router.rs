@@ -143,6 +143,12 @@ impl<'a> Attributes<'a> {
             .find(|(sent, _)| sent.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_ref())
     }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries
+            .iter()
+            .map(|(name, value)| (name.as_ref(), value.as_ref()))
+    }
 }
 
 /// A rule's `attrs` map: each key lowercased and its value compiled as a regexp, which is what the

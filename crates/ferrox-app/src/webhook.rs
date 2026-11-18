@@ -231,42 +231,63 @@ impl Webhook {
     /// The POST over TCP, from the URL it parses to the status line it reads, inside the one
     /// budget. Host name resolution is the stage `std` cannot bound, so it sits outside the deadline.
     fn send(&self, body: &str) -> Result<(), String> {
-        let url = HttpUrl::parse(&self.url)?;
-        if url.userinfo.is_some() && !url.tls {
-            return Err("refuses URL credentials over plaintext http".to_owned());
-        }
         let deadline = Instant::now() + BUDGET;
-        let connection = self.dial(&url, deadline)?;
-        let mut connection = DeadlineConnection::new(connection, deadline);
-        let request = request_bytes(&url, &self.headers, body);
-        if url.tls {
-            let config = ferrox_core::tls::TlsConfig {
-                server_name: url.host.clone(),
-                alpn: Vec::new().into(),
-                roots: crate::quic::system_roots(),
-                cert_pins: std::sync::Arc::default(),
-                verify_names: std::sync::Arc::default(),
-                pins: ferrox_core::foxy::pin::Pins::default(),
-                cipher_suites: std::sync::Arc::default(),
-                curves: std::sync::Arc::default(),
-                insecure: false,
-                resumption: true,
-                fingerprint: None,
-                ech_config_list: None,
-                websocket: false,
-                master_key_log: None,
-                client_cert: None,
-                client_random: None,
-                padding: None,
-                ..Default::default()
+        let mut url = HttpUrl::parse(&self.url)?;
+        let mut method = "POST";
+        let mut body = body;
+        for _ in 0..=10 {
+            if url.userinfo.is_some() && !url.tls {
+                return Err("refuses URL credentials over plaintext http".to_owned());
+            }
+            let connection = self.dial(&url, deadline)?;
+            let mut connection = DeadlineConnection::new(connection, deadline);
+            let request = request_bytes_method(&url, &self.headers, body, method);
+            let (status, location) = if url.tls {
+                let config = ferrox_core::tls::TlsConfig {
+                    server_name: url.host.clone(),
+                    alpn: Vec::new().into(),
+                    roots: crate::quic::system_roots(),
+                    cert_pins: std::sync::Arc::default(),
+                    verify_names: std::sync::Arc::default(),
+                    pins: ferrox_core::foxy::pin::Pins::default(),
+                    cipher_suites: std::sync::Arc::default(),
+                    curves: std::sync::Arc::default(),
+                    insecure: false,
+                    resumption: true,
+                    fingerprint: None,
+                    ech_config_list: None,
+                    websocket: false,
+                    master_key_log: None,
+                    client_cert: None,
+                    client_random: None,
+                    padding: None,
+                    ..Default::default()
+                };
+                let mut session = ferrox_core::tls::RustlsProvider::connect(&config, connection)
+                    .map_err(|error| error.to_string())?;
+                session.handshake().map_err(|error| error.to_string())?;
+                exchange_status(&mut session, &request)?
+            } else {
+                exchange_status(&mut connection, &request)?
             };
-            let mut session = ferrox_core::tls::RustlsProvider::connect(&config, connection)
-                .map_err(|error| error.to_string())?;
-            session.handshake().map_err(|error| error.to_string())?;
-            exchange(&mut session, &request)
-        } else {
-            exchange(&mut connection, &request)
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                let location = location.ok_or_else(|| {
+                    format!("POST returned redirect status {status} without a Location")
+                })?;
+                let next = redirect_url(&url, &location)?;
+                url = HttpUrl::parse(&next)?;
+                if matches!(status, 301 | 302 | 303) {
+                    method = "GET";
+                    body = "";
+                }
+                continue;
+            }
+            if status >= 400 {
+                return Err(format!("POST returned status {status}"));
+            }
+            return Ok(());
         }
+        Err("the redirect chain runs past 10 hops".to_owned())
     }
 
     /// The request and status line over an already-open stream, so a test can drive the production
@@ -404,7 +425,17 @@ fn abstract_name(name: &str) -> Result<Vec<u8>, String> {
 
 /// The exact request bytes: the JSON content type first, then each configured header, a repeated name
 /// replacing the one already written as `http.Header.Set` does.
+#[cfg(test)]
 fn request_bytes(url: &HttpUrl, headers: &[(String, String)], body: &str) -> Vec<u8> {
+    request_bytes_method(url, headers, body, "POST")
+}
+
+fn request_bytes_method(
+    url: &HttpUrl,
+    headers: &[(String, String)],
+    body: &str,
+    method: &str,
+) -> Vec<u8> {
     let authorization = url.userinfo.as_ref().filter(|_| {
         !headers
             .iter()
@@ -426,12 +457,59 @@ fn request_bytes(url: &HttpUrl, headers: &[(String, String)], body: &str) -> Vec
     if let Some(authorization) = authorization.as_deref() {
         wire.push(("Authorization", authorization));
     }
-    crate::foxy_account::request("POST", &url.authority, &url.path, &wire, body.as_bytes())
+    crate::foxy_account::request(method, &url.authority, &url.path, &wire, body.as_bytes())
+}
+
+fn redirect_url(base: &HttpUrl, location: &str) -> Result<String, String> {
+    let location = location.trim();
+    if location.is_empty() {
+        return Err("a redirect Location is empty".to_owned());
+    }
+    if location.contains("://") {
+        return Ok(location.to_owned());
+    }
+    let scheme = if base.tls { "https" } else { "http" };
+    if location.starts_with("//") {
+        return Ok(format!("{scheme}:{location}"));
+    }
+    if location.starts_with('/') {
+        return Ok(format!("{scheme}://{}{location}", base.authority));
+    }
+    if let Some(query) = location.strip_prefix('?') {
+        let path = base.path.split('?').next().unwrap_or("/");
+        return Ok(format!("{scheme}://{}{path}?{query}", base.authority));
+    }
+    let directory = base
+        .path
+        .split('?')
+        .next()
+        .unwrap_or("/")
+        .rsplit_once('/')
+        .map_or("", |(directory, _)| directory);
+    let directory = directory.trim_end_matches('/');
+    let path = if directory.is_empty() {
+        format!("/{location}")
+    } else {
+        format!("{directory}/{location}")
+    };
+    Ok(format!("{scheme}://{}{path}", base.authority))
 }
 
 /// Write the request and read only the status line back: the body is discarded, and dropping the
 /// connection is what ends it, so nothing pays to drain what the peer sends.
+#[cfg(all(test, unix))]
 fn exchange(io: &mut (impl Read + Write), request: &[u8]) -> Result<(), String> {
+    let (status, _) = exchange_status(io, request)?;
+    if status >= 400 {
+        return Err(format!("POST returned status {status}"));
+    }
+    Ok(())
+}
+
+fn exchange_status(
+    io: &mut (impl Read + Write),
+    request: &[u8],
+) -> Result<(u16, Option<String>), String> {
     io.write_all(request).map_err(|error| error.to_string())?;
     io.flush().map_err(|error| error.to_string())?;
     let mut head = Vec::new();
@@ -447,7 +525,8 @@ fn exchange(io: &mut (impl Read + Write), request: &[u8]) -> Result<(), String> 
                     .map(|at| at + 2)
             });
         if let Some(end) = end {
-            let status = head[..end]
+            let block = &head[..end];
+            let status = block
                 .split(|byte| *byte == b' ' || *byte == b'\n' || *byte == b'\r')
                 .find(|part| part.len() == 3 && part.iter().all(u8::is_ascii_digit))
                 .and_then(|code| std::str::from_utf8(code).ok())
@@ -458,10 +537,14 @@ fn exchange(io: &mut (impl Read + Write), request: &[u8]) -> Result<(), String> 
                 head.drain(..end);
                 continue;
             }
-            if status >= 400 {
-                return Err(format!("POST returned status {status}"));
-            }
-            return Ok(());
+            let location = block.split(|byte| *byte == b'\n').find_map(|line| {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                let colon = line.iter().position(|byte| *byte == b':')?;
+                let (name, value) = line.split_at(colon);
+                name.eq_ignore_ascii_case(b"location")
+                    .then(|| String::from_utf8_lossy(&value[1..]).trim().to_owned())
+            });
+            return Ok((status, location));
         }
         if head.len() >= 8192 {
             return Err("the reply head runs past 8192 bytes".to_owned());
@@ -855,6 +938,47 @@ mod tests {
             waited < Duration::from_secs(15),
             "the budget ends the wait: {waited:?}"
         );
+    }
+
+    fn request_head(stream: &mut std::net::TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut buf = [0u8; 256];
+        let mut scanned = 0usize;
+        while ferrox_core::foxy::head_end_grown(&head, &mut scanned).is_none() {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => head.extend_from_slice(&buf[..read]),
+            }
+        }
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    #[test]
+    fn a_relative_redirect_is_resolved_and_rewritten_as_a_get() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("receiver");
+        let port = listener.local_addr().expect("address").port();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for answer in [
+                "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n",
+                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
+            ] {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                send.send(request_head(&mut stream))
+                    .expect("reports the request");
+                stream.write_all(answer.as_bytes()).expect("answers");
+            }
+        });
+        let webhook = notifier(&format!("http://127.0.0.1:{port}/hook"));
+        webhook.send("{}").expect("the redirect is followed");
+        let first = receive
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the first request arrives");
+        let second = receive
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the second request arrives");
+        assert!(first.starts_with("POST /hook HTTP/1.1\r\n"), "{first}");
+        assert!(second.starts_with("GET /next HTTP/1.1\r\n"), "{second}");
     }
 
     /// A receiver that answers one byte per second cannot buy a fresh budget for every read.
