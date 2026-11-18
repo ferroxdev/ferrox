@@ -1567,8 +1567,7 @@ impl Routing {
                 inbound.unwrap_or("<untagged>")
             ));
         }
-        // Per network, stop at the first direct rule that matches every flow: later rules cannot
-        // decide it. A rule that only covers one network leaves the other for later rules.
+        // Stop at the first direct rule covering a network; later rules cannot decide it.
         let mut open = [false; 2];
         for network in networks {
             match network {
@@ -1591,15 +1590,14 @@ impl Routing {
             // A rule naming a fact the server flow does not carry still gates the target.
             let dials_direct = if rule.balancer {
                 let forced_tag = forced(&rule.target);
-                match forced_tag.as_deref() {
-                    Some(tag) => direct(tag),
-                    None => {
-                        let list = candidates.get(&rule.target).map_or(&[][..], Vec::as_slice);
-                        let fallback = fallbacks.get(&rule.target);
-                        list.iter().all(|tag| direct(tag))
-                            && fallback.is_none_or(|tag| direct(tag))
-                            && (fallback.is_some() || default_direct)
-                    }
+                if let Some(tag) = forced_tag.as_deref() {
+                    direct(tag)
+                } else {
+                    let list = candidates.get(&rule.target).map_or(&[][..], Vec::as_slice);
+                    let fallback = fallbacks.get(&rule.target);
+                    list.iter().all(|tag| direct(tag))
+                        && fallback.is_none_or(|tag| direct(tag))
+                        && (fallback.is_some() || default_direct)
                 }
             } else {
                 direct(&rule.target)

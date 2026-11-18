@@ -4293,7 +4293,7 @@ fn pick_script_outbound(
 }
 
 /// The target networks a direct-dial server inbound serves; `None` when this tree routes it
-/// through an outbound instead. AnyTLS carries streams only, so a datagram rule never reaches it.
+/// through an outbound instead. `AnyTLS` carries streams only, so a datagram rule never reaches it.
 fn server_networks(protocol: &str) -> Option<&'static [crate::router::Network]> {
     match canonical_protocol(protocol) {
         "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria" | "tuic" => {
@@ -43332,7 +43332,10 @@ mod tests {
             .expect("routing");
         let portals = Arc::new(crate::reverse::Portals::default());
         let shared = route_shared(&root, routing, &portals, None).expect("shared");
-        shared.record_server_inbound(Some("dyn".to_owned()));
+        shared.record_server_inbound(
+            Some("dyn".to_owned()),
+            &[crate::router::Network::Tcp, crate::router::Network::Udp],
+        );
         let runtime = Runtime::new(None, Some(Arc::clone(&shared)), true, Arc::clone(&portals));
         let rules = crate::json::parse(
             r#"[{"type":"field","inboundTag":["dyn"],"outboundTag":"blocked"}]"#,
