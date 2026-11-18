@@ -610,9 +610,7 @@ impl Client {
                 personal_compartments,
                 sdp,
                 &metrics,
-                settings.secret,
-                settings.traffic_shaping.as_ref(),
-                settings.use_media_streams,
+                settings,
             );
             self.offer_budget = if personal_compartments.is_empty() {
                 self.offer_timeout
@@ -926,9 +924,7 @@ fn client_offer_request(
     personal_compartments: &[[u8; 32]],
     sdp: &str,
     metrics: &Metrics,
-    offer_secret: [u8; 32],
-    traffic_shaping: Option<&TrafficShapingParameters>,
-    use_media_streams: bool,
+    settings: &OfferSettings,
 ) -> Value {
     let mut metrics_fields = vec![
         (Value::UInt(1), metrics.base_parameters.clone()),
@@ -976,10 +972,10 @@ fn client_offer_request(
     }
     // The reference always asks legacy proxies to randomize their DTLS handshake.
     fields.push((Value::UInt(7), Value::Bool(true)));
-    if use_media_streams {
+    if settings.use_media_streams {
         fields.push((Value::UInt(12), Value::Bool(true)));
     }
-    if let Some(params) = traffic_shaping {
+    if let Some(params) = settings.traffic_shaping.as_ref() {
         let mut shaped = Vec::new();
         for (key, value) in [
             (1, params.min_padded_messages),
@@ -1015,7 +1011,7 @@ fn client_offer_request(
             Value::UInt(5),
             Value::Array(vec![Value::UInt(1), Value::UInt(3), Value::UInt(4)]),
         ),
-        (Value::UInt(6), Value::Bytes(offer_secret.to_vec())),
+        (Value::UInt(6), Value::Bytes(settings.secret.to_vec())),
         (
             Value::UInt(9),
             Value::Bytes(destination.packed_server_entry.clone()),
@@ -1856,9 +1852,11 @@ mod tests {
             &[[8u8; 32]],
             "v=0\r\n",
             &metrics,
-            [4u8; 32],
-            None,
-            false,
+            &OfferSettings {
+                secret: [4u8; 32],
+                traffic_shaping: None,
+                use_media_streams: false,
+            },
         );
         assert_eq!(request.get(1).unwrap().get(2).unwrap().uint(), Some(2));
         assert_eq!(
@@ -1897,9 +1895,11 @@ mod tests {
             &[],
             "v=0\r\n",
             &metrics,
-            [4u8; 32],
-            Some(&parameters),
-            true,
+            &OfferSettings {
+                secret: [4u8; 32],
+                traffic_shaping: Some(parameters),
+                use_media_streams: true,
+            },
         );
         assert_eq!(request.get(7).and_then(Value::bool), Some(true));
         assert_eq!(request.get(12).and_then(Value::bool), Some(true));
