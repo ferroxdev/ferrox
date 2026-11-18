@@ -129,6 +129,12 @@ fn ensure_config(options: &Options) {
     }
 }
 
+fn reject_duplicate_ports(options: &Options, paths: &Paths) {
+    if options.outbound != Some(Outbound::Config) {
+        duplicate_fronts(&options.fronts, config::plan_ports(options, paths, false));
+    }
+}
+
 fn prepare(options: &mut Options, paths: &mut Paths) -> (Ports, bool) {
     let user_config = options.outbound == Some(Outbound::Config);
     if user_config {
@@ -188,6 +194,7 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         }
     };
     ensure_config(options);
+    reject_duplicate_ports(options, paths);
     options.carrier = choose_carrier(options);
     let bin = lane::require_bin();
     let account = if options.outbound == Some(Outbound::Foxy) {
