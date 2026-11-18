@@ -222,27 +222,45 @@ impl Fragment {
                 self.hello_skip = self.hello_skip.saturating_sub(p.len());
                 return raw.write(p);
             }
-            let mut rest = p;
-            let mut done = 0usize;
-            loop {
-                if self.hello_done {
-                    return Ok(done + raw.write(rest)?);
-                }
-                if self.hello_skip > 0 {
-                    self.hello_skip = self.hello_skip.saturating_sub(rest.len());
-                    return Ok(done + raw.write(rest)?);
-                }
-                let Some(record_len) = Self::hello_shape(rest) else {
-                    self.forward_unshaped(rest);
-                    return Ok(done + raw.write(rest)?);
+            let Some(record_len) = Self::hello_shape(p) else {
+                self.forward_unshaped(p);
+                return raw.write(p);
+            };
+            if record_len != HEADER || p.len() == HEADER {
+                self.hello_done = true;
+                return if self.sni {
+                    self.write_sni(raw, p, record_len)
+                } else {
+                    self.write_hello(raw, p, record_len)
                 };
-                if record_len == HEADER && rest.len() > HEADER {
-                    // An empty decoy ahead of the hello in the same write: send it, keep the slot.
-                    raw.write_all(&rest[..HEADER])?;
-                    done += HEADER;
-                    rest = &rest[HEADER..];
-                    continue;
-                }
+            }
+            Ok(self.write_past_decoys(raw, p)?)
+        }
+        if self.packets_from != 0
+            && (self.count < self.packets_from || self.count > self.packets_to)
+        {
+            return raw.write(p);
+        }
+        self.write_pieces(raw, p)
+    }
+
+    /// An empty handshake record ahead of the hello in the same write is a decoy: it goes out
+    /// untouched and the slot the hello needs stays open for what follows it.
+    fn write_past_decoys<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
+        let mut done = 0usize;
+        let mut rest = p;
+        loop {
+            raw.write_all(&rest[..HEADER])?;
+            done += HEADER;
+            rest = &rest[HEADER..];
+            if rest.is_empty() {
+                return Ok(done);
+            }
+            let Some(record_len) = Self::hello_shape(rest) else {
+                self.forward_unshaped(rest);
+                return Ok(done + raw.write(rest)?);
+            };
+            if record_len != HEADER || rest.len() == HEADER {
                 self.hello_done = true;
                 let taken = if self.sni {
                     self.write_sni(raw, rest, record_len)?
@@ -252,12 +270,6 @@ impl Fragment {
                 return Ok(done + taken);
             }
         }
-        if self.packets_from != 0
-            && (self.count < self.packets_from || self.count > self.packets_to)
-        {
-            return raw.write(p);
-        }
-        self.write_pieces(raw, p)
     }
 
     /// Put the retained burst on the wire without a new plaintext write.
