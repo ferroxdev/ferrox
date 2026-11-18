@@ -42,8 +42,8 @@ fn content_tokens(text: &str) -> Vec<String> {
                 index = close + width;
             }
             b'{' => {
-                // A `{` with no `}` behind it is literal text, not a blank that swallows the rest.
-                if bytes[index..].contains(&b'}') {
+                // A `{` with no close the tokenizer can see outside a span is literal text, not a blank that swallows the rest.
+                if blank_closes(bytes, index + 1) {
                     in_blank = true;
                 } else {
                     stripped.push('{');
@@ -70,6 +70,25 @@ fn content_tokens(text: &str) -> Vec<String> {
             word.len() > 2 && !word.chars().all(char::is_numeric) && !STOP.contains(&word.as_str())
         })
         .collect()
+}
+
+/// Whether a `}` the tokenizer will read follows, skipping the spans `closing_fence` also skips.
+fn blank_closes(bytes: &[u8], mut index: usize) -> bool {
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' => {
+                let width = bytes[index..]
+                    .iter()
+                    .take_while(|byte| **byte == b'`')
+                    .count();
+                index = closing_fence(bytes, index + width, width)
+                    .map_or(index + width, |close| close + width);
+            }
+            b'}' => return true,
+            _ => index += 1,
+        }
+    }
+    false
 }
 
 /// The byte offset of the next backtick run of exactly `width`, or `None` when the span never closes.
@@ -427,6 +446,18 @@ p
 body
 ```
 ";
+
+    #[test]
+    fn a_fenced_close_does_not_open_a_blank() {
+        let tokens = content_tokens("{ alpha `}` beta gamma delta epsilon zeta");
+        assert!(tokens.iter().any(|word| word == "zeta"), "{tokens:?}");
+    }
+
+    #[test]
+    fn an_unmatched_brace_stays_literal() {
+        let tokens = content_tokens("{ alpha beta gamma");
+        assert!(tokens.iter().any(|word| word == "beta"), "{tokens:?}");
+    }
 
     #[test]
     fn a_body_that_restates_the_shared_protocol_is_an_error() {

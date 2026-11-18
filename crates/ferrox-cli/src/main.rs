@@ -810,40 +810,28 @@ fn supervise(options: &Options, paths: &Paths) -> i32 {
     };
     let _ = paths::write_private(&paths.supervisor_file, &format!("{watched}\n"));
     let stop = Arc::new(AtomicBool::new(false));
-    let killed = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
-    let killed_flag = Arc::clone(&killed);
     let pid = watched;
-    let watched_paths = paths.clone();
     let _ = ctrlc::set_handler(move || {
-        let stopped = match lane::kill(pid) {
-            Ok(()) => {
-                killed_flag.store(true, Ordering::SeqCst);
-                true
-            }
-            Err(error) => {
-                eprintln!("ferrox-cli: {error}");
-                false
-            }
-        };
-        // A kill that failed leaves the lane live: keep the proxy so it still points somewhere.
-        if stopped {
-            if let Err(error) = proxy::clear(&watched_paths) {
-                eprintln!("ferrox-cli: {error}");
-            }
+        match lane::kill(pid) {
+            Ok(()) => flag.store(true, Ordering::SeqCst),
+            // A failed kill leaves the lane live: keep polling so its exit still clears the proxy, and a second Ctrl-C retries.
+            Err(error) => eprintln!("ferrox-cli: {error}"),
         }
-        flag.store(true, Ordering::SeqCst);
     });
     while lane::alive(watched) && !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_secs(1));
     }
-    if !lane::alive(watched) || killed.load(Ordering::SeqCst) {
-        let current = lane::pid(paths);
-        if current.is_none() || current == Some(watched) {
-            if let Err(error) = proxy::clear(paths) {
-                eprintln!("ferrox-cli: {error}");
+    if !lane::alive(watched) || stop.load(Ordering::SeqCst) {
+        // The lifecycle lock keeps a replacement lane from arming between the pid check and the clear.
+        if let Ok(_lifecycle) = lane::lock(paths) {
+            let current = lane::pid(paths);
+            if current.is_none() || current == Some(watched) {
+                if let Err(error) = proxy::clear(paths) {
+                    eprintln!("ferrox-cli: {error}");
+                }
+                let _ = std::fs::remove_file(&paths.pid_file);
             }
-            let _ = std::fs::remove_file(&paths.pid_file);
         }
     }
     if read_trim(&paths.supervisor_file).as_deref() == Some(watched.to_string().as_str()) {

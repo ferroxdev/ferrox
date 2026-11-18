@@ -4469,8 +4469,9 @@ pub(crate) fn dial_pooled_with(
         && (!expect_reply
             || match stream_recv_exact_parked(&pooled.conn, id, 2, deadline) {
                 Some((reply, fin)) => {
-                    // The opening read drains the stream, so a FIN it saw is the only chance to record it.
+                    // The opening read drains the stream, so a FIN it saw is the only chance to record and forward it.
                     if fin {
+                        let _ = client.shutdown(Shutdown::Write);
                         finish_session(&pooled.table, id, false);
                     }
                     reply.as_slice() == &[0u8, 0u8][..]

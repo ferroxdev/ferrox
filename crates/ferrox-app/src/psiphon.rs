@@ -1851,10 +1851,9 @@ impl Inner {
                             let Some(server) = server else {
                                 continue;
                             };
-                            let region_available = {
-                                let known = lock(&self.entries);
-                                entries_match_region(known.as_slice(), &self.settings)
-                            };
+                            let mut entries = lock(&self.entries);
+                            let region_available =
+                                entries_match_region(entries.as_slice(), &self.settings);
                             let Some(server) =
                                 runtime_entry(server, &self.settings, region_available)
                             else {
@@ -1864,7 +1863,6 @@ impl Inner {
                             if name.is_empty() {
                                 continue;
                             }
-                            let mut entries = lock(&self.entries);
                             let list = Arc::make_mut(&mut *entries);
                             if let Some(existing) = list
                                 .iter()
@@ -7962,41 +7960,50 @@ fn entries_match_region(entries: &[Server], settings: &Settings) -> bool {
 fn runtime_entry(server: Server, settings: &Settings, region_available: bool) -> Option<Server> {
     let mut servers = limit_quic_versions(vec![server], settings);
     let server = servers.pop()?;
-    let server = runtime_protocol_entry(server, &settings.protocols, settings.fronted)?;
-    if region_available
-        && settings
-            .region
-            .as_deref()
-            .is_some_and(|region| server.region.as_deref() != Some(region))
-    {
-        return None;
-    }
-    let mut servers = vec![server];
-    if coin(settings.dial_ports_probability) {
-        let normal = shape_filter(&settings.protocols, "LimitTunnelProtocols");
-        let named_meek = settings
-            .protocols
-            .iter()
-            .any(|protocol| is_meek_protocol(protocol));
-        servers = apply_dial_port_limits(
-            servers,
-            &settings.dial_ports,
-            normal,
-            named_meek,
-            &settings.protocols,
-        );
-        if servers.is_empty() {
-            return None;
+    let normal = shape_filter(&settings.protocols, "LimitTunnelProtocols");
+    let named_meek = settings
+        .protocols
+        .iter()
+        .any(|protocol| is_meek_protocol(protocol));
+    let limit_ports = coin(settings.dial_ports_probability);
+    // A sibling that fails the port limit is passed over for the next one that also shapes to the protocol limit.
+    for server in runtime_protocol_entries(server, &settings.protocols, settings.fronted) {
+        if region_available
+            && settings
+                .region
+                .as_deref()
+                .is_some_and(|region| server.region.as_deref() != Some(region))
+        {
+            continue;
+        }
+        let mut servers = vec![server];
+        if limit_ports {
+            servers = apply_dial_port_limits(
+                servers,
+                &settings.dial_ports,
+                normal,
+                named_meek,
+                &settings.protocols,
+            );
+            if servers.is_empty() {
+                continue;
+            }
+        }
+        apply_session_settings(&mut servers, settings);
+        if let Some(server) = servers.pop() {
+            return Some(server);
         }
     }
-    apply_session_settings(&mut servers, settings);
-    servers.pop()
+    None
 }
 
-/// The runtime entry to insert, converted to the CDN carrier the limit names.
-fn runtime_protocol_entry(server: Server, protocols: &[String], fronted: bool) -> Option<Server> {
+/// The runtime entries to try, converted to the siblings a protocol limit can select.
+fn runtime_protocol_entries(server: Server, protocols: &[String], fronted: bool) -> Vec<Server> {
     let Some(filter) = shape_filter(protocols, "LimitTunnelProtocols") else {
-        return entry_allowed(&server, protocols, fronted).then_some(server);
+        return entry_allowed(&server, protocols, fronted)
+            .then_some(server)
+            .into_iter()
+            .collect();
     };
     let named_meek = protocols.iter().any(|protocol| is_meek_protocol(protocol));
     // Try the siblings startup can select, not just the base shape and the CDN carriers.
@@ -8004,10 +8011,13 @@ fn runtime_protocol_entry(server: Server, protocols: &[String], fronted: bool) -
     candidates.extend(ssh_variant(&server));
     candidates.extend(tls_variant(&server));
     candidates.extend(cdn_variants(&server));
-    candidates.into_iter().find(|candidate| {
-        entry_allowed(candidate, protocols, fronted)
-            && matches_limit(candidate, filter, named_meek, protocols)
-    })
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            entry_allowed(candidate, protocols, fronted)
+                && matches_limit(candidate, filter, named_meek, protocols)
+        })
+        .collect()
 }
 
 fn matches_limit(server: &Server, filter: Shape, meek_named: bool, protocols: &[String]) -> bool {
@@ -13565,7 +13575,8 @@ mod tests {
         server.cdn_protocols = CDN_PROTOCOL_HTTP | CDN_PROTOCOL_QUIC;
         server.meek.as_mut().expect("fronted").protocol = "FRONTED-MEEK-QUIC-OSSH";
         let limit = vec!["FRONTED-MEEK-CDN-HTTP-OSSH".to_owned()];
-        let selected = runtime_protocol_entry(server, &limit, true).expect("allowed");
+        let selected = runtime_protocol_entries(server, &limit, true);
+        let selected = selected.first().expect("allowed");
         assert_eq!(
             selected.meek.as_ref().expect("fronted").protocol,
             "FRONTED-MEEK-CDN-HTTP-OSSH"
@@ -16066,6 +16077,28 @@ mod tests {
             runtime_entry(foreign, &settings, false).is_some(),
             "the startup fallback keeps the foreign entry when the pool has no regional one"
         );
+    }
+
+    #[test]
+    fn a_runtime_entry_tries_the_sibling_that_meets_the_dial_port_limit() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"LimitTunnelProtocols":["SSH","TLS-OSSH"],"LimitTunnelDialPortNumbers":{"All":[8443]}}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.port = 443;
+        server.ssh_port = Some(22);
+        server.tls_port = Some(8443);
+        server.tls_obfuscation_key = Some("tls".to_owned());
+        let selected = runtime_entry(server, &settings, true).expect("the TLS sibling");
+        assert!(
+            selected.tls,
+            "the SSH sibling is the one the port limit refuses"
+        );
+        assert_eq!(selected.port, 8443);
     }
 
     #[test]

@@ -1588,7 +1588,7 @@ fn nothing_to_hand_over(
             join_or(spent.iter().map(|id| format!("P{id}")))
         );
     }
-    if withheld.is_empty() && skipped.is_empty() && spent.is_empty() {
+    if named.is_none() && withheld.is_empty() && skipped.is_empty() && spent.is_empty() {
         return match advisor::next_index(library, effort, &[]) {
             Err(reason) => reason,
             Ok(_) => "no ready template draws an available row: every ready template's class \

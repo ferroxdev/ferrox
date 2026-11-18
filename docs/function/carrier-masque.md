@@ -109,6 +109,7 @@ graph TD
 | h2-datagram-packet-queue-copies | 0 | ferrox-app-masque-h2::tests::a_datagram_capsule_goes_straight_to_its_lane |
 | h2-queued-capsule-cap | 64 | ferrox-app-masque-h2::tests::a_stalled_send_window_bounds_the_queued_capsules |
 | h2-writes-per-immediate-data-frame | 1 | ferrox-app-masque-h2::tests::a_data_frame_leaves_the_wire_in_one_write |
+| h2-writes-per-queued-capsule | 1 | ferrox-app-masque-h2::tests::queued_capsules_flush_when_the_peer_grants_window |
 | early-datagram-cap | 64 | ferrox-app-masque::tests::poll_refuses_a_pre_stack_datagram_flood |
 | early-datagram-byte-cap | 1048576 | ferrox-app-masque::tests::early_h3_datagrams_are_bounded_by_count_and_bytes |
 | quic-v2-generic-default | off | ferrox-app-masque::tests::the_quic_v2_setting_is_opt_in_for_generic_masque |
