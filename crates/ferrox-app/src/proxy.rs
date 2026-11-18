@@ -1510,6 +1510,9 @@ fn dial_from(
     timeout: std::time::Duration,
 ) -> std::io::Result<(std::net::TcpStream, bool)> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    if timeout.is_zero() {
+        return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+    }
     let domain = if target.is_ipv4() {
         Domain::IPV4
     } else {
