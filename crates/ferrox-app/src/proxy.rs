@@ -44502,23 +44502,33 @@ mod tests {
         );
     }
 
-    /// One transport read carries a whole relay window, so a 64 KiB window costs one read and
-    /// one open rather than one of each per record the window is made of.
+    /// One transport read carries a whole relay window: a 64 KiB window costs one read, and the
+    /// opens it costs are the ones its records cost, one each.
     #[test]
     fn a_whole_relay_window_arrives_in_one_transport_read() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct CountingOpen(Arc<AtomicUsize>);
-        impl CipherOpen for CountingOpen {
+        struct RecordOpen {
+            opens: Arc<AtomicUsize>,
+            records: Arc<AtomicUsize>,
+        }
+        impl CipherOpen for RecordOpen {
             fn open(
                 &mut self,
                 ciphertext: &[u8],
                 buf: &mut [u8],
             ) -> std::io::Result<(usize, usize)> {
-                self.0.fetch_add(1, Ordering::Relaxed);
-                let plain = ciphertext.len().min(buf.len());
+                self.opens.fetch_add(1, Ordering::Relaxed);
+                if ciphertext.is_empty() {
+                    return Ok((0, 0));
+                }
+                let record = ciphertext.len().min(SESSION_WINDOW);
+                let plain = record.min(buf.len());
                 buf[..plain].copy_from_slice(&ciphertext[..plain]);
-                Ok((plain, ciphertext.len()))
+                if plain > 0 {
+                    self.records.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok((plain, record))
             }
 
             fn seal_into(
@@ -44544,9 +44554,13 @@ mod tests {
         }
 
         let opens = Arc::new(AtomicUsize::new(0));
+        let records = Arc::new(AtomicUsize::new(0));
         let reads = Arc::new(AtomicUsize::new(0));
         let mut half = DrivenHalf::new(
-            Arc::new(Mutex::new(CountingOpen(Arc::clone(&opens)))),
+            Arc::new(Mutex::new(RecordOpen {
+                opens: Arc::clone(&opens),
+                records: Arc::clone(&records),
+            })),
             Arc::new(Mutex::new(Window {
                 left: DRIVEN_CIPHERTEXT,
                 reads: Arc::clone(&reads),
@@ -44566,9 +44580,13 @@ mod tests {
             "a 64 KiB window cost more than one transport read"
         );
         assert_eq!(
-            opens.load(Ordering::Relaxed),
-            1,
-            "a 64 KiB window cost more than one open"
+            records.load(Ordering::Relaxed),
+            RELAY_BUFFER / SESSION_WINDOW,
+            "the window's records were not opened one each"
+        );
+        assert!(
+            opens.load(Ordering::Relaxed) <= RELAY_BUFFER / SESSION_WINDOW + 1,
+            "a 64 KiB window cost more opens than its records and the queued probe"
         );
     }
 
