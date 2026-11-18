@@ -2375,7 +2375,16 @@ fn apply_socket_mode(
         if rc == 0 {
             Ok(())
         } else {
-            Err(io::Error::last_os_error())
+            let error = io::Error::last_os_error();
+            #[cfg(target_os = "linux")]
+            if matches!(
+                error.raw_os_error(),
+                Some(code)
+                    if code == libc::ENOTSUP || code == libc::EINVAL || code == libc::ENOSYS
+            ) {
+                return chmod_pinned(path, mode);
+            }
+            Err(error)
         }
     };
     #[cfg(target_vendor = "apple")]
@@ -2414,6 +2423,37 @@ fn apply_socket_mode(
         ));
     }
     Ok(())
+}
+
+/// Older glibc spells `fchmodat`'s no-follow flag as `ENOTSUP`, so pin the inode with `O_PATH`
+/// and chmod through `/proc/self/fd` instead of ever re-resolving the path.
+#[cfg(target_os = "linux")]
+fn chmod_pinned(path: &std::path::Path, mode: u32) -> io::Result<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    let text = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the unix path has a NUL"))?;
+    // SAFETY: `text` is a live NUL-terminated path and `O_NOFOLLOW` pins the socket itself.
+    let raw = unsafe {
+        libc::open(
+            text.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a fresh descriptor this function owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let pinned = std::ffi::CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the fd has a NUL"))?;
+    // SAFETY: `pinned` names the inode the descriptor holds and `mode` is a file-mode bit set.
+    let rc = unsafe { libc::chmod(pinned.as_ptr(), mode as libc::mode_t) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Remove the socket the initial check saw, only while the same inode is still at the path, so two

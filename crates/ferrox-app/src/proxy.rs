@@ -9163,6 +9163,7 @@ fn teardown_mux(
     };
     // The session's own socket goes first: a flow parked in a Keep to a client that stopped reading wakes here instead of at its deadline.
     wire.shutdown();
+    let flow_count = u32::try_from(flows.len()).unwrap_or(u32::MAX);
     for flow in flows {
         flow.control.cancel();
     }
@@ -9171,6 +9172,12 @@ fn teardown_mux(
         session.done.store(true, Ordering::Relaxed);
     }
     if let Some(worker) = worker {
+        for _ in 0..flow_count {
+            worker.release_connection();
+        }
+        for _ in udp.values() {
+            worker.release_connection();
+        }
         worker.closed();
     }
     for done in handles {
