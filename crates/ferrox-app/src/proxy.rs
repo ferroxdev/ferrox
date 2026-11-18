@@ -12487,7 +12487,9 @@ pub(crate) unsafe fn read_into_tail_room(
 pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
-        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
     ) || ferrox_core::tls::TlsError::is_timeout(error)
 }
 
@@ -42951,6 +42953,18 @@ mod tests {
             ),
             "a refused Fast Open rewrites the first record"
         );
+    }
+
+    #[test]
+    fn a_windows_receive_timeout_counts_as_a_timeout() {
+        let timeout = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert!(
+            is_timeout(&timeout),
+            "Windows reports SO_RCVTIMEO as TimedOut, not WouldBlock"
+        );
+        assert!(!is_timeout(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        )));
     }
 
     #[test]

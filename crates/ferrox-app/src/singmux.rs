@@ -278,6 +278,9 @@ impl Window {
                 Err(poisoned) => poisoned.into_inner(),
             };
         }
+        if state.closed {
+            return None;
+        }
         let taken = state.value.min(limit);
         state.value -= taken;
         Some(usize::try_from(taken).unwrap_or(usize::MAX))
@@ -351,7 +354,7 @@ impl Queue {
             return Push::Closed;
         }
         // The demux thread is shared: a stream that overruns its queue is reset, never waited on.
-        if !state.messages.is_empty() && state.queued.saturating_add(msg.data.len()) > self.limit {
+        if state.queued.saturating_add(msg.data.len()) > self.limit {
             return Push::Full;
         }
         state.queued += msg.data.len();
@@ -405,6 +408,7 @@ impl Queue {
 struct Sink {
     queue: Arc<Queue>,
     window: Arc<Window>,
+    closed: Arc<AtomicBool>,
     awaiting_status: bool,
     remote_end: bool,
     local_end: bool,
@@ -445,6 +449,7 @@ struct Inner {
     role: Role,
     write: Mutex<Box<dyn Write + Send>>,
     sinks: Mutex<HashMap<u32, Sink>>,
+    resets: Mutex<Option<Sender<u32>>>,
     accept_tx: Mutex<Option<Sender<Stream>>>,
     accept_rx: Mutex<Receiver<Stream>>,
     next_id: AtomicU32,
@@ -470,6 +475,7 @@ impl Inner {
             role,
             write: Mutex::new(write),
             sinks: Mutex::new(HashMap::new()),
+            resets: Mutex::new(None),
             accept_tx: Mutex::new(Some(accept_tx)),
             accept_rx: Mutex::new(accept_rx),
             next_id: AtomicU32::new(if role == Role::Client { 1 } else { 2 }),
@@ -570,11 +576,13 @@ impl Inner {
             Err(poisoned) => poisoned.into_inner(),
         };
         let window = Arc::new(Window::new(*initial));
+        let closed = Arc::new(AtomicBool::new(false));
         sinks.insert(
             id,
             Sink {
                 queue: Arc::clone(&queue),
                 window: Arc::clone(&window),
+                closed: Arc::clone(&closed),
                 awaiting_status: false,
                 remote_end: false,
                 local_end: false,
@@ -588,7 +596,7 @@ impl Inner {
             replies: Some(queue),
             request: Vec::new(),
             request_sent: AtomicBool::new(false),
-            closed: Arc::new(AtomicBool::new(false)),
+            closed,
             window,
             buffer: Mutex::new(ReadState::default()),
             read_done: false,
@@ -715,22 +723,52 @@ impl Inner {
         }
     }
 
+    /// The demux cannot wait on the carrier: resets drain on a thread of their own.
+    fn defer_reset(&self, id: u32) {
+        let mut resets = match self.resets.lock() {
+            Ok(resets) => resets,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(sender) = resets.as_ref() {
+            let _ = sender.send(id);
+            return;
+        }
+        let (sender, pending) = channel();
+        *resets = Some(sender.clone());
+        drop(resets);
+        let inner = Arc::downgrade(&self.clone_handle());
+        std::thread::spawn(move || {
+            while let Ok(id) = pending.recv() {
+                let Some(inner) = inner.upgrade() else {
+                    break;
+                };
+                inner.send_reset(id);
+            }
+        });
+        let _ = sender.send(id);
+    }
+
     fn release(&self, id: u32) {
         let sink = match self.sinks.lock() {
             Ok(mut sinks) => sinks.remove(&id),
             Err(poisoned) => poisoned.into_inner().remove(&id),
         };
         if let Some(sink) = sink {
+            sink.closed.store(true, Ordering::Relaxed);
             sink.window.close();
             sink.queue.close();
         }
     }
 
     fn reap(&self, id: u32) {
-        let _ = match self.sinks.lock() {
+        let sink = match self.sinks.lock() {
             Ok(mut sinks) => sinks.remove(&id),
             Err(poisoned) => poisoned.into_inner().remove(&id),
         };
+        if let Some(sink) = sink {
+            sink.closed.store(true, Ordering::Relaxed);
+            sink.window.close();
+        }
     }
 
     fn end_remote(&self, id: u32) {
@@ -819,11 +857,10 @@ impl Inner {
                     self.end_remote(id);
                 }
             }
-            Push::Full => {
-                self.send_reset(id);
+            Push::Full | Push::Closed => {
+                self.defer_reset(id);
                 self.release(id);
             }
-            Push::Closed => self.reap(id),
         }
     }
 
@@ -896,6 +933,7 @@ impl Inner {
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         };
         for (_, sink) in sinks {
+            sink.closed.store(true, Ordering::Relaxed);
             sink.window.close();
             sink.queue.close();
         }
@@ -1253,6 +1291,10 @@ impl Stream {
             let Some(taken) = self.inner.take_window(&self.window, chunk) else {
                 return false;
             };
+            if self.closed.load(Ordering::Relaxed) {
+                self.inner.refund_window(&self.window, taken);
+                return false;
+            }
             if !self.write_chunk(&data[offset..offset + taken]) {
                 self.inner.refund_window(&self.window, taken);
                 return false;
@@ -1398,6 +1440,10 @@ impl Write for StreamWriter {
             let Some(taken) = self.inner.take_window(&self.window, chunk) else {
                 return Err(io::ErrorKind::BrokenPipe.into());
             };
+            if self.closed.load(Ordering::Relaxed) {
+                self.inner.refund_window(&self.window, taken);
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
             if !self
                 .inner
                 .send_data(self.id, &data[offset..offset + taken], false)
@@ -1962,6 +2008,32 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_window_refuses_remaining_credit() {
+        let window = Window::new(1_024);
+        window.close();
+        assert_eq!(
+            window.take_up_to(1),
+            None,
+            "a closed window must not hand out credit a writer could still spend"
+        );
+    }
+
+    #[test]
+    fn an_oversized_first_message_is_refused() {
+        let queue = Queue::new(4);
+        assert_eq!(
+            queue.push(Msg {
+                data: b"12345".to_vec(),
+                end: false,
+                credit: 0,
+            }),
+            Push::Full,
+            "the queue bound holds even when the oversized frame is the only one"
+        );
+        assert!(queue.try_pop().is_none());
+    }
+
+    #[test]
     fn a_full_queue_refuses_a_message_instead_of_blocking_the_session() {
         let queue = Queue::new(4);
         assert_eq!(
@@ -1995,6 +2067,101 @@ mod tests {
             }),
             Push::Closed
         );
+    }
+
+    struct HeldReader(Receiver<()>);
+
+    impl Read for HeldReader {
+        fn read(&mut self, _out: &mut [u8]) -> io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+
+    struct GateWriter {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Write for GateWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            let (lock, wake) = &*self.gate;
+            let mut open = lock.lock().expect("gate");
+            while !*open {
+                open = wake.wait(open).expect("gate");
+            }
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn held_session(write: Box<dyn Write + Send>) -> (Arc<Inner>, Sender<()>) {
+        let (held, reader) = channel();
+        let session = Inner::start(
+            Protocol::Smux,
+            Role::Client,
+            Box::new(HeldReader(reader)),
+            write,
+            Arc::new(|| {}),
+        )
+        .expect("session");
+        (session, held)
+    }
+
+    #[test]
+    fn an_overfull_stream_resets_without_waiting_for_the_carrier() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (session, held) = held_session(Box::new(GateWriter {
+            gate: Arc::clone(&gate),
+        }));
+        let stream = session.attach(1);
+        let mut writer = stream.writer();
+        let deliver = Arc::clone(&session);
+        let (done, waited) = channel();
+        let worker = std::thread::spawn(move || {
+            deliver.deliver_credit(1, &vec![0u8; 64 * 1024], false, 0);
+            deliver.deliver_credit(1, b"x", false, 0);
+            let _ = done.send(());
+        });
+        assert_eq!(
+            waited.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "the demux returned before the carrier accepted the reset"
+        );
+        {
+            let (lock, wake) = &*gate;
+            *lock.lock().expect("gate") = true;
+            wake.notify_all();
+        }
+        worker.join().expect("worker");
+        assert!(
+            writer.write(b"x").is_err(),
+            "the released stream refuses a retained writer"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn data_after_a_remote_end_releases_the_waiting_writer() {
+        let (session, held) = held_session(Box::new(std::io::sink()));
+        let stream = session.attach(1);
+        let mut writer = stream.writer();
+        session.deliver(1, b"", true);
+        session.deliver(1, b"late", false);
+        assert!(
+            writer.write(b"x").is_err(),
+            "a frame after the remote end must not leave a writer free to send"
+        );
+        assert!(
+            session
+                .sinks
+                .lock()
+                .is_ok_and(|sinks| !sinks.contains_key(&1)),
+            "the overflowed stream leaves the carrier's table"
+        );
+        drop(held);
     }
 
     #[test]
