@@ -1342,6 +1342,7 @@ fn participant_names(
     (names, skipped)
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn run(
     engines: &[Engine],
     workload: &Workload,
@@ -1402,6 +1403,10 @@ pub fn run(
                 break 'measures;
             }
             let (output, request) = write_request(workload, engine, out_dir, name, repeat)?;
+            if !cell.fits(workload.first_attempt_cap()) {
+                failures.push(window_ended(&by_engine, &names, repeats));
+                break 'measures;
+            }
             match parity::measure(
                 &request,
                 engine.config_arg,

@@ -24,6 +24,7 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 const FLOW_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const HOLD_PROBE: Duration = Duration::from_millis(250);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+const WARMUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A completed transfer whose slowest flow finished this far behind the median is a runner straggler - a descheduled flow or one TCP retransmit (Linux's 200 ms `RTO_MIN`) - not the engine: the bytes are whole and the rest of the cell is at the fast mode, so the run is re-measured.
 const STRAGGLER_TAIL: Duration = Duration::from_millis(150);
@@ -3068,29 +3069,51 @@ fn emit(
 }
 
 fn warmup(socks: SocketAddr, pattern: &[u8]) -> Result<(), Error> {
+    let deadline = Instant::now() + WARMUP_TIMEOUT;
+    let within = || {
+        if Instant::now() >= deadline {
+            Err(Error::Engine {
+                message: "warmup exceeded its 30s budget".into(),
+            })
+        } else {
+            Ok(())
+        }
+    };
     let mut stream = TcpStream::connect_timeout(&socks, Duration::from_secs(10))
         .map_err(io("warmup connect"))?;
     let _ = stream.set_nodelay(true);
     stream
+        .set_read_timeout(Some(WARMUP_TIMEOUT))
+        .map_err(io("warmup timeout"))?;
+    stream
+        .set_write_timeout(Some(WARMUP_TIMEOUT))
+        .map_err(io("warmup timeout"))?;
+    stream
         .write_all(&[5, 1, 0])
         .map_err(io("warmup greeting"))?;
+    within()?;
     let mut greeting = [0u8; 2];
     stream
         .read_exact(&mut greeting)
         .map_err(io("warmup greeting reply"))?;
+    within()?;
     let mut connect = vec![5, 1, 0, 1, 127, 0, 0, 1];
     connect.extend_from_slice(&1u16.to_be_bytes());
     stream
         .write_all(&connect)
         .map_err(io("warmup connect request"))?;
+    within()?;
     let mut reply = [0u8; 10];
     stream
         .read_exact(&mut reply)
         .map_err(io("warmup connect reply"))?;
+    within()?;
     let chunk = &pattern[..pattern.len().min(1024)];
     stream.write_all(chunk).map_err(io("warmup write"))?;
+    within()?;
     let mut echo = vec![0u8; chunk.len()];
     stream.read_exact(&mut echo).map_err(io("warmup echo"))?;
+    within()?;
     let _ = stream.shutdown(Shutdown::Both);
     Ok(())
 }
