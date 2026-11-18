@@ -44512,8 +44512,7 @@ mod tests {
             opens: Arc<AtomicUsize>,
             records: Arc<AtomicUsize>,
         }
-        // A TLS 1.3 record: five header bytes, the content, its inner type byte and a 16-byte tag,
-        // so the scratch has to hold the overhead of every record, not just their plaintext.
+        // A TLS 1.3 record: five header bytes, the content, an inner type byte and a 16-byte tag.
         const OVERHEAD: usize = 5 + 1 + 16;
         impl CipherOpen for RecordOpen {
             fn open(
