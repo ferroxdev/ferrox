@@ -255,6 +255,18 @@ struct WindowState {
     waiting: usize,
 }
 
+#[cfg(test)]
+fn note_wait(state: &mut WindowState, waiting: bool) {
+    if waiting {
+        state.waiting += 1;
+    } else {
+        state.waiting -= 1;
+    }
+}
+
+#[cfg(not(test))]
+fn note_wait(_state: &mut WindowState, _waiting: bool) {}
+
 impl Window {
     fn new(value: i64) -> Self {
         Self {
@@ -287,14 +299,12 @@ impl Window {
                 state.value -= taken;
                 return Some(usize::try_from(taken).unwrap_or(usize::MAX));
             }
-            #[cfg(test)]
-            state.waiting += 1;
+            note_wait(&mut state, true);
             state = match self.wake.wait(state) {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            #[cfg(test)]
-            state.waiting -= 1;
+            note_wait(&mut state, false);
         }
     }
 

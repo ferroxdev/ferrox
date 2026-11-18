@@ -1157,6 +1157,19 @@ fn join_capped(ids: &[String]) -> String {
     }
 }
 
+fn render_prompt<'a>(args: &Args, library: &'a Library, id: &str) -> Result<&'a Prompt, ExitCode> {
+    if args.command == Command::Issue {
+        return issue_prompt(library).map_err(|reason| {
+            eprintln!("{reason}");
+            ExitCode::from(2)
+        });
+    }
+    library.prompt(id).ok_or_else(|| {
+        eprintln!("{}", unknown_prompt(library, id));
+        ExitCode::from(2)
+    })
+}
+
 /// `render <id>`: a matrix template filled from its first unserved row, like `next`, not a page of holes.
 fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
     let id = args.id.expect("parse requires an id for render");
@@ -1171,20 +1184,9 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         }
     };
     let library = &reloaded;
-    let prompt = if args.command == Command::Issue {
-        match issue_prompt(library) {
-            Ok(prompt) => prompt,
-            Err(reason) => {
-                eprintln!("{reason}");
-                return ExitCode::from(2);
-            }
-        }
-    } else {
-        let Some(prompt) = library.prompt(id) else {
-            eprintln!("{}", unknown_prompt(library, id));
-            return ExitCode::from(2);
-        };
-        prompt
+    let prompt = match render_prompt(args, library, id) {
+        Ok(prompt) => prompt,
+        Err(code) => return code,
     };
     let ledger = load_ledger(root);
     if let Some(message) = ledger_refusal(&ledger) {

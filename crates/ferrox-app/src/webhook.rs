@@ -238,7 +238,6 @@ impl Webhook {
         let mut headers = self.headers.clone();
         let mut method = "POST";
         let mut body = body;
-        let mut redirected = false;
         for _ in 0..=10 {
             url.userinfo.clone_from(&credentials);
             if !url.tls {
@@ -301,7 +300,6 @@ impl Webhook {
                     headers.retain(|(name, _)| !credential_header(name));
                 }
                 url = next;
-                redirected = true;
                 if matches!(status, 301..=303) {
                     method = "GET";
                     body = "";
