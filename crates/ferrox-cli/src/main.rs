@@ -609,13 +609,21 @@ fn diagnose(options: &Options, paths: &Paths) {
 fn down(options: &Options, paths: &mut Paths) -> i32 {
     let explicit_config =
         options.outbound == Some(Outbound::Config) && !options.config_file.is_empty();
-    adopt_lane_config(options, paths);
-    if explicit_config {
-        if let Err(error) = lane::remember_user_config(paths) {
-            eprintln!("ferrox-cli: {error}");
-        }
-    }
     if options.all {
+        if explicit_config {
+            let _lifecycle = match lane::lock(paths) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    eprintln!("ferrox-cli: {error}");
+                    return 1;
+                }
+            };
+            adopt_lane_config(options, paths);
+            if let Err(error) = lane::remember_user_config(paths) {
+                eprintln!("ferrox-cli: {error}");
+                return 1;
+            }
+        }
         let mut rc = stop_all_lanes(paths);
         if rc == 0 {
             if let Err(error) = proxy::clear(paths) {
@@ -629,8 +637,21 @@ fn down(options: &Options, paths: &mut Paths) -> i32 {
         }
         return rc;
     }
+    let _lifecycle = match lane::lock(paths) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("ferrox-cli: {error}");
+            return 1;
+        }
+    };
+    adopt_lane_config(options, paths);
+    if explicit_config {
+        if let Err(error) = lane::remember_user_config(paths) {
+            eprintln!("ferrox-cli: {error}");
+        }
+    }
     let user_config = lane::user_config(paths).is_some();
-    let rc = stop_lane(paths);
+    let rc = stop_lane_locked(paths);
     if rc == 0 && !explicit_config {
         forget_config(paths);
     }
@@ -662,6 +683,10 @@ fn stop_lane(paths: &Paths) -> i32 {
             return 1;
         }
     };
+    stop_lane_locked(paths)
+}
+
+fn stop_lane_locked(paths: &Paths) -> i32 {
     let saved_pid = lane::pid(paths);
     if let Err(error) = lane::stop(paths) {
         eprintln!("ferrox-cli: {error}");
@@ -710,7 +735,14 @@ fn prune_lanes(paths: &Paths, missing: &[PathBuf]) {
         .lines()
         .map(str::trim)
         .filter(|line| {
-            !line.is_empty() && !missing.iter().any(|dir| Path::new(*line) == dir.as_path())
+            !line.is_empty()
+                && !missing.iter().any(|dir| {
+                    Path::new(*line) == dir.as_path()
+                        && matches!(
+                            std::fs::metadata(dir),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                        )
+                })
         })
         .collect();
     let result = if kept.is_empty() {

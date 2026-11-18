@@ -414,7 +414,16 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
     secure_dir(&paths.state_dir)
         .map_err(|error| format!("cannot create the state dir: {error}"))?;
     let bin = canonical_exe(bin);
-    write_private(&bin_marker(paths), &format!("{}\n", bin.display()))
+    let recorded = bin
+        .to_str()
+        .filter(|path| !path.contains('\n') && !path.contains('\r'));
+    let Some(recorded) = recorded else {
+        return Err(format!(
+            "cannot record the lane binary {}: its path is not a single valid UTF-8 line",
+            bin.display()
+        ));
+    };
+    write_private(&bin_marker(paths), &format!("{recorded}\n"))
         .map_err(|error| format!("cannot record the lane binary {}: {error}", bin.display()))?;
     register(paths)?;
     let out = OpenOptions::new()
