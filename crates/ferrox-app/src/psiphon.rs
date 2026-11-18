@@ -7,6 +7,7 @@ use crate::psiphon_ssh::{
     ApiEncoding, Channel, ChannelChunk, Identity, KeepAlive, Proxy, Server, Session, TlsShape,
     MAX_PADDING, MIN_PADDING,
 };
+use crate::psiphon_webrtc::is_bogon;
 use crate::socks::{Credential, Destination, Version};
 use crypto_secretbox::aead::{Aead as _, KeyInit as _};
 use ferrox_core::tls::shaped::{Body, Ext, Profile};
@@ -9527,37 +9528,6 @@ fn absorb(
     }
 }
 
-/// The reference's `IsBogon`: an address no handshake steering IP should name.
-fn is_bogon(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(ip) => is_bogon_v4(ip),
-        IpAddr::V6(ip) => {
-            if let Some(ip) = ip.to_ipv4_mapped() {
-                return is_bogon_v4(ip);
-            }
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-        }
-    }
-}
-
-fn is_bogon_v4(ip: Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
-        || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
-        || octets[0] >= 240
-}
-
 /// Decode one base64 server-list entry for the tunnel race.
 #[cfg(test)]
 fn decode_entry(line: &str) -> Option<Server> {
@@ -18702,19 +18672,6 @@ mod tests {
         assert_eq!(server.web_server_certificate, "AAAA");
     }
 
-    #[test]
-    fn a_steering_ip_is_not_a_bogon() {
-        for bogon in ["10.0.0.1", "172.16.0.1", "192.168.0.1", "127.0.0.1", "::1"] {
-            assert!(is_bogon(bogon.parse().expect("address")), "{bogon}");
-        }
-        for bogon in [
-            Ipv4Addr::from([100, 64, 0, 1]),
-            Ipv4Addr::from([240, 0, 0, 1]),
-        ] {
-            assert!(is_bogon(bogon.into()), "{bogon}");
-        }
-        assert!(!is_bogon(Ipv4Addr::from([8, 8, 8, 8]).into()));
-    }
     #[test]
     fn a_dsl_tag_is_the_reference_hmac() {
         let entry = json::parse(
