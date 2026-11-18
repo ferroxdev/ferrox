@@ -80720,6 +80720,12 @@ mod poll_relay {
         SPLICED_BYTES.fetch_add(moved, Ordering::Relaxed);
     }
 
+    /// The pool's width: the number of flows whose wakes do not queue behind one another.
+    #[cfg(test)]
+    pub(crate) fn pool_width() -> usize {
+        workers().len()
+    }
+
     #[cfg(not(test))]
     #[inline]
     fn note_spliced(_moved: usize) {}
@@ -81282,10 +81288,12 @@ mod poll_relay {
         }
     }
 
+    /// A lane is parked in `poll`, not busy, so the pool sizes to the widest cell's flows: eight,
+    /// one per flow, doubled from the cores and capped at sixteen.
     fn worker_count() -> usize {
         match std::thread::available_parallelism() {
-            Ok(count) => count.get().min(8),
-            Err(_) => 1,
+            Ok(count) => (count.get() * 2).clamp(8, 16),
+            Err(_) => 8,
         }
     }
 
@@ -82153,6 +82161,20 @@ mod relay_tests {
         assert_eq!(&up, b"ping");
         let _ = client.shutdown(Shutdown::Both);
         let _ = peer.shutdown(Shutdown::Both);
+    }
+
+    /// The splice pool holds one lane per flow of the widest standard cell, the width the
+    /// carriered pool holds at eight: a wake that finds every lane busy waits for another flow's
+    /// service, which is the 141-against-158 MiB/s seven lanes measured on `lane_pool`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_splice_pool_holds_a_lane_per_flow_of_the_widest_cell() {
+        let width = poll_relay::pool_width();
+        assert!(
+            width >= 8,
+            "the splice pump pools {width} lanes for an eight-flow cell, so the eighth flow's \
+             wake queues behind another flow's service"
+        );
     }
 
     /// A server that withholds its answer until it sees payload must not hold the upload: the
