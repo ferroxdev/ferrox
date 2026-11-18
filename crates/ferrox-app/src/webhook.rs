@@ -280,6 +280,9 @@ impl Webhook {
                 })?;
                 let mut next = HttpUrl::parse(&redirect_url(&url, &location)?)?;
                 next.path = normalize_path(&next.path);
+                if url.tls && !next.tls {
+                    return Err("refuses an HTTPS-to-HTTP redirect".to_owned());
+                }
                 let same = same_origin(&url, &next);
                 if self.socket.is_some() && !same {
                     return Err("refuses a Unix-socket redirect to another origin".to_owned());
@@ -288,7 +291,7 @@ impl Webhook {
                     credentials.clone_from(&url.userinfo);
                 } else {
                     credentials = None;
-                    headers.retain(|(name, _)| !sensitive_header(name));
+                    headers.clear();
                 }
                 url = next;
                 if matches!(status, 301..=303) {
@@ -476,7 +479,10 @@ fn request_bytes_method(
 }
 
 fn normalize_path(path: &str) -> String {
-    let (path, query) = path.split_once('?').map_or((path, ""), |(a, b)| (a, b));
+    let (path, query) = match path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path, None),
+    };
     let mut out = String::with_capacity(path.len());
     let mut input = path;
     while !input.is_empty() {
@@ -508,13 +514,11 @@ fn normalize_path(path: &str) -> String {
     if out.is_empty() {
         out.push('/');
     }
-    if query.is_empty() {
-        out
-    } else {
+    if let Some(query) = query {
         out.push('?');
         out.push_str(query);
-        out
     }
+    out
 }
 
 fn pop_segment(out: &mut String) {
@@ -524,14 +528,16 @@ fn pop_segment(out: &mut String) {
 }
 
 fn same_origin(left: &HttpUrl, right: &HttpUrl) -> bool {
-    left.tls == right.tls && left.host.eq_ignore_ascii_case(&right.host) && left.port == right.port
-}
-
-fn sensitive_header(name: &str) -> bool {
-    name.eq_ignore_ascii_case("authorization")
-        || name.eq_ignore_ascii_case("proxy-authorization")
-        || name.eq_ignore_ascii_case("cookie")
-        || name.eq_ignore_ascii_case("cookie2")
+    if left.tls != right.tls || left.port != right.port {
+        return false;
+    }
+    match (
+        left.host.parse::<std::net::Ipv6Addr>(),
+        right.host.parse::<std::net::Ipv6Addr>(),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left.host.eq_ignore_ascii_case(&right.host),
+    }
 }
 
 fn redirect_url(base: &HttpUrl, location: &str) -> Result<String, String> {
@@ -601,10 +607,15 @@ fn exchange_status(
         if let Some(end) = end {
             let block = &head[..end];
             let line = block.split(|byte| *byte == b'\n').next().unwrap_or(block);
-            let status = line
+            let mut parts = line
                 .split(|byte| *byte == b' ' || *byte == b'\r')
-                .filter(|part| !part.is_empty())
-                .nth(1)
+                .filter(|part| !part.is_empty());
+            let version = parts.next().ok_or("the reply carries no status line")?;
+            if !version.starts_with(b"HTTP/") {
+                return Err("the reply carries no status line".to_owned());
+            }
+            let status = parts
+                .next()
                 .filter(|code| code.len() == 3 && code.iter().all(u8::is_ascii_digit))
                 .and_then(|code| std::str::from_utf8(code).ok())
                 .and_then(|code| code.parse::<u16>().ok())
@@ -1034,6 +1045,7 @@ mod tests {
     fn a_redirect_path_loses_its_dot_segments() {
         assert_eq!(normalize_path("/api/../next"), "/next");
         assert_eq!(normalize_path("/api/./v1/../next?q=1"), "/api/next?q=1");
+        assert_eq!(normalize_path("/hook?"), "/hook?");
     }
 
     #[test]
@@ -1041,6 +1053,9 @@ mod tests {
         let mut malformed =
             std::io::Cursor::new(b"HTTP/1.1\r\nX-Code: 302\r\nLocation: /next\r\n\r\n".to_vec());
         assert!(exchange_status(&mut malformed, b"").is_err());
+        let mut notice =
+            std::io::Cursor::new(b"NOTICE 302 Found\r\nLocation: /next\r\n\r\n".to_vec());
+        assert!(exchange_status(&mut notice, b"").is_err());
         let mut valid =
             std::io::Cursor::new(b"HTTP/1.1 302 Found\r\nLocation: /next\r\n\r\n".to_vec());
         assert_eq!(

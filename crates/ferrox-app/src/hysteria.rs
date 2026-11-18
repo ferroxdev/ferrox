@@ -1557,7 +1557,7 @@ fn serve_stream(
                     frames::quic_read(&head, &mut 0usize),
                     Some(kind) if kind == frames::H3_HEADERS || kind == frames::H3_DATA
                 ) {
-                    serve_masquerade_stream(shared, sock, stream, head, peer, masq);
+                    serve_masquerade_stream(shared, sock, stream, head, peer_fin, peer, masq);
                 }
                 return;
             };
@@ -1594,10 +1594,11 @@ fn serve_masquerade_stream(
     sock: &Arc<crate::quic::Datagram>,
     stream: u64,
     seed: Vec<u8>,
+    fin: bool,
     peer: SocketAddr,
     masq: &Masquerade,
 ) {
-    let Some(request) = read_h3_request(shared, stream, seed) else {
+    let Some(request) = read_h3_request(shared, stream, seed, fin) else {
         return;
     };
     let peer = peer.to_string();
