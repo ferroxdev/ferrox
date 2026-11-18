@@ -119,13 +119,47 @@ fn same_owner(text: &str, paths: &Paths) -> bool {
     }
     let owner = serde_json::from_str::<String>(text).unwrap_or_else(|_| text.to_owned());
     if same_path(&owner, &paths.proxy_state) {
-        return true;
+        return !another_lane_runs(paths);
     }
     same_path(&owner, &paths.conf_dir)
         && paths
             .proxy_state
             .file_name()
             .is_some_and(|name| name == std::ffi::OsStr::new("system-proxy.state"))
+}
+
+/// A legacy owner names only the shared snapshot, so it cannot say which root armed it; clearing is safe only when no other registered lane is alive.
+fn another_lane_runs(paths: &Paths) -> bool {
+    let Ok(text) = read_trim_checked(&paths.lanes_file) else {
+        return false;
+    };
+    for dir in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.starts_with("lane") {
+                continue;
+            }
+            let pid = std::path::Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pid"));
+            if !pid || entry.path() == paths.pid_file {
+                continue;
+            }
+            if read_trim(&entry.path())
+                .and_then(|text| text.parse().ok())
+                .is_some_and(crate::lane::alive)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(windows)]
@@ -594,6 +628,33 @@ mod tests {
         .expect("owner file");
         assert_eq!(owned(&paths), Ok(true));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_snapshot_owner_does_not_clear_another_roots_live_lane() {
+        let shared = workspace("legacy-snapshot-other-root");
+        let first = Paths::with_dirs(shared.join("first"), shared.clone(), None);
+        let second = Paths::with_dirs(shared.join("second"), shared.clone(), None);
+        std::fs::create_dir_all(&first.conf_dir).expect("first conf");
+        std::fs::create_dir_all(&second.conf_dir).expect("second conf");
+        std::fs::create_dir_all(&shared).expect("state");
+        crate::paths::write_private(
+            &second.proxy_owner,
+            &serde_json::to_string(&second.proxy_state).expect("owner"),
+        )
+        .expect("owner file");
+        crate::paths::write_private(&first.pid_file, &format!("{}\n", std::process::id()))
+            .expect("pid file");
+        crate::paths::write_private(
+            &shared.join("lanes"),
+            &format!("{}\n", first.conf_dir.display()),
+        )
+        .expect("lane registry");
+        assert_eq!(owned(&first), Ok(true));
+        assert_eq!(owned(&second), Ok(false));
+        let _ = std::fs::remove_file(&first.pid_file);
+        assert_eq!(owned(&second), Ok(true));
+        let _ = std::fs::remove_dir_all(&shared);
     }
 
     #[test]

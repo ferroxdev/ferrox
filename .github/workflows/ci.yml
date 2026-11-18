@@ -9,6 +9,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/ferrox-core/**"
+      - "crates/ferrox-cli/**"
       - "crates/ferrox-app/**"
       - "crates/ferrox-prompt/**"
       - "crates/ferrox-bench/**"
