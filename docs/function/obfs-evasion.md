@@ -65,10 +65,11 @@ Where the kernel lets the process send a raw segment (Linux with `CAP_NET_RAW`),
 `decoy` send the fake hello outside the connection's sequence window before the handshake and
 write the real hello untouched. Where it does not, and on every other platform, both fall back to
 the `record` rewrite and print one warning per process. `fastopen` arms `TCP_FASTOPEN_CONNECT` on
-a direct Linux/Android leg, dials once to fetch the kernel's cookie for the destination and again
-with it, and keeps the deferred socket, so the handshake's first write — the ClientHello — rides
-the SYN; a kernel that lacks the option or a server that sends no cookie keeps the record rewrite
-and prints one warning per process. The record rewrite
+a direct Linux/Android leg, makes a first connect that asks the server for a cookie and a second
+one that carries it, and keeps the deferred socket, so the handshake's first write — the
+ClientHello, or the decoy a `finalmask` puts in front of it — rides the SYN. A kernel that lacks the option or a server that sends no cookie
+keeps the record rewrite and prints one warning per process; a `dialerProxy` hop never arms the
+option on this leg — the inner dial owns the hello — and rewrites the record without a warning. The record rewrite
 is armed on the same `Connection` the handshake writes through, ahead of the `finalmask` chain and
 of an `xmc` session's payload write, and pads the version in the first TLS record header from
 `03 01`/`03 03` to `03 04` once per stream; a write that does not open a TLS handshake record is
@@ -268,10 +269,11 @@ reassembled, and the parser tests hold every accepted form and its refusal.
   stage cannot spend the rewrite on a short cut, and a cloned relay leg shares the same one-shot
   state.
 - **The urgent byte and the hello in the SYN.** Both ship on Linux and Android. Fast Open costs
-  the deferred connect nothing beyond one throwaway handshake per destination, and the record
-  rewrite stands in where the kernel refuses the option or the server sends no cookie, with one
-  warning per process. Neither is silently skipped: a config that asks for fast open still sends
-  a hello, and the console says which method stood in.
+  the deferred connect nothing beyond one throwaway handshake per dial until the kernel caches a
+  cookie; a server that never sends one pays it on every dial. The record rewrite stands in where
+  the kernel refuses the option or the server sends no cookie, with one warning per process, and
+  silently behind a `dialerProxy` because the inner leg owns the hello. Neither is silently
+  skipped: a config that asks for fast open still sends a hello.
 - **A second handshake parser for the cut.** The fragment stage and the mixed-case rewrite read
   the same `server_name_range` the record decoy already needed, so the bound checks (record
   length, handshake length, version, extensions) exist once and a truncated record can never

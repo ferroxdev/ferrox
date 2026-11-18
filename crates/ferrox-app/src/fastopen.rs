@@ -69,13 +69,28 @@ mod imp {
         }
         // SAFETY: plain socket(2); the descriptor is checked and closed below.
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        let ok = fd >= 0 && set_connect(fd).is_ok();
-        if fd >= 0 {
-            // SAFETY: `fd` was opened here and is not used again.
-            unsafe { libc::close(fd) };
+        if fd < 0 {
+            return false;
         }
-        STATE.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
-        ok
+        let asked = set_connect(fd);
+        // SAFETY: `fd` was opened here and is not used again.
+        unsafe { libc::close(fd) };
+        match asked {
+            Ok(()) => {
+                STATE.store(1, Ordering::Relaxed);
+                true
+            }
+            Err(error) => {
+                // Cache only a refusal: a probe that lost a descriptor or hit a limit asks again.
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL | libc::ENOPROTOOPT | libc::ENOSYS)
+                ) {
+                    STATE.store(2, Ordering::Relaxed);
+                }
+                false
+            }
+        }
     }
 
     pub(super) fn deferred(stream: &TcpStream) -> bool {
