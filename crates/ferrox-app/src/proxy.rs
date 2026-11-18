@@ -1794,7 +1794,7 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
                         break;
                     }
                 }
-                Err(error) if round == 0 => {
+                Err(_) if round == 0 => {
                     match dial_from(target, source, sockopts.as_deref(), false) {
                         Ok((stream, _)) => {
                             kept = Some(stream);
