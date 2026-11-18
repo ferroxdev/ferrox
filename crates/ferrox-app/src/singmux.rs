@@ -307,7 +307,7 @@ impl Window {
 pub(crate) struct Msg {
     pub(crate) data: Vec<u8>,
     pub(crate) end: bool,
-    credit: usize,
+    pub(crate) credit: usize,
 }
 
 struct Queue {
@@ -377,6 +377,18 @@ impl Queue {
         Some(msg)
     }
 
+    fn try_pop(&self) -> Option<Msg> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let msg = state.messages.pop_front()?;
+        state.queued -= msg.data.len();
+        drop(state);
+        self.space.notify_all();
+        Some(msg)
+    }
+
     fn close(&self) {
         let mut state = match self.state.lock() {
             Ok(state) => state,
@@ -401,12 +413,20 @@ pub(crate) struct Replies {
 }
 
 impl Replies {
+    /// A reply, blocking until one is queued. The caller settles its window credit once the bytes
+    /// are out: a credit write blocks on the carrier's writer and must not hold a collected batch.
     pub(crate) fn recv(&self) -> Result<Msg, std::sync::mpsc::RecvError> {
-        let msg = self.queue.pop().ok_or(std::sync::mpsc::RecvError)?;
-        if msg.credit > 0 {
-            self.inner.credit(self.id, msg.credit);
-        }
-        Ok(msg)
+        self.queue.pop().ok_or(std::sync::mpsc::RecvError)
+    }
+
+    /// A reply already queued, for the downlink's drain behind `recv`.
+    pub(crate) fn try_recv(&self) -> Option<Msg> {
+        self.queue.try_pop()
+    }
+
+    /// Hands a served reply's window back to the peer.
+    pub(crate) fn settle(&self, credit: usize) {
+        self.inner.credit(self.id, credit);
     }
 }
 
