@@ -1663,7 +1663,7 @@ fn absorb_headers(
         }
         decoder
             .decode(block, &mut |name, _| {
-                invalid |= trailers && !trailer_field(name);
+                invalid |= trailers && !trailer_field(name, value);
             })
             .ok_or(h2::E_COMPRESSION)?;
         return Ok(invalid);
@@ -1676,7 +1676,7 @@ fn absorb_headers(
     if end {
         decoder
             .decode(&held, &mut |name, _| {
-                invalid |= trailers && !trailer_field(name);
+                invalid |= trailers && !trailer_field(name, value);
             })
             .ok_or(h2::E_COMPRESSION)?;
     } else {
@@ -1685,14 +1685,44 @@ fn absorb_headers(
     Ok(invalid)
 }
 
-fn trailer_field(name: &[u8]) -> bool {
+fn trailer_field(name: &[u8], value: &[u8]) -> bool {
+    let token = |byte: &u8| {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    };
     !name.is_empty()
-        && !name.iter().any(u8::is_ascii_uppercase)
-        && name.first() != Some(&b':')
+        && name.iter().all(token)
         && !matches!(
             name,
             b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding" | b"upgrade"
         )
+        && (name != b"te" || value.eq_ignore_ascii_case(b"trailers"))
+        && !value
+            .first()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        && !value
+            .last()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        && !value
+            .iter()
+            .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
 }
 
 fn data_body(body: &[u8], flags: u8) -> Option<&[u8]> {
