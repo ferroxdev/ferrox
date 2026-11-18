@@ -1828,14 +1828,15 @@ impl Datagrams {
             server_packet: 0,
             server_cipher: None,
         });
-        if !entry.window.check_and_add(packet_id) {
-            return None;
-        }
         if let Some(user) = entry.user {
             if user != idx {
                 return None;
             }
-        } else {
+        }
+        if !entry.window.check_and_add(packet_id) {
+            return None;
+        }
+        if entry.user.is_none() {
             entry.cipher.get_or_insert(cipher);
             entry.user = Some(idx);
         }
@@ -2203,12 +2204,12 @@ pub(crate) fn serve_udp_relay(
     let Ok(upstream) = UdpSocket::bind("0.0.0.0:0") else {
         return;
     };
-    if upstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+    if upstream.set_nonblocking(true).is_err() {
         return;
     }
     let upstream6 = UdpSocket::bind("[::]:0")
         .ok()
-        .filter(|socket| socket.set_read_timeout(Some(RELAY_POLL)).is_ok());
+        .filter(|socket| socket.set_nonblocking(true).is_ok());
     if clients.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
@@ -2355,7 +2356,7 @@ fn send_upstream(
         let Ok(socket) = UdpSocket::bind(bind) else {
             return;
         };
-        if socket.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        if socket.set_nonblocking(true).is_err() {
             return;
         }
         entry.insert(socket);

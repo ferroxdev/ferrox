@@ -233,6 +233,7 @@ impl Webhook {
     fn send(&self, body: &str) -> Result<(), String> {
         let deadline = Instant::now() + BUDGET;
         let mut url = HttpUrl::parse(&self.url)?;
+        url.path = normalize_path(&url.path);
         let mut credentials = url.userinfo.clone();
         let mut headers = self.headers.clone();
         let mut method = "POST";
@@ -277,7 +278,8 @@ impl Webhook {
                 let location = location.ok_or_else(|| {
                     format!("POST returned redirect status {status} without a Location")
                 })?;
-                let next = HttpUrl::parse(&redirect_url(&url, &location)?)?;
+                let mut next = HttpUrl::parse(&redirect_url(&url, &location)?)?;
+                next.path = normalize_path(&next.path);
                 let same = same_origin(&url, &next);
                 if self.socket.is_some() && !same {
                     return Err("refuses a Unix-socket redirect to another origin".to_owned());
@@ -471,6 +473,54 @@ fn request_bytes_method(
         wire.push(("Authorization", authorization));
     }
     crate::foxy_account::request(method, &url.authority, &url.path, &wire, body.as_bytes())
+}
+
+fn normalize_path(path: &str) -> String {
+    let (path, query) = path.split_once('?').map_or((path, ""), |(a, b)| (a, b));
+    let mut out = String::with_capacity(path.len());
+    let mut input = path;
+    while !input.is_empty() {
+        if let Some(rest) = input.strip_prefix("../") {
+            input = rest;
+        } else if let Some(rest) = input.strip_prefix("./") {
+            input = rest;
+        } else if let Some(rest) = input.strip_prefix("/./") {
+            input = &input[2..];
+        } else if input == "/." {
+            input = "/";
+        } else if let Some(rest) = input.strip_prefix("/../") {
+            input = &input[3..];
+            pop_segment(&mut out);
+        } else if input == "/.." {
+            input = "/";
+            pop_segment(&mut out);
+        } else if input == "." || input == ".." {
+            input = "";
+        } else {
+            let start = usize::from(input.starts_with('/'));
+            let end = input[start..]
+                .find('/')
+                .map_or(input.len(), |at| at + start);
+            out.push_str(&input[..end]);
+            input = &input[end..];
+        }
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    if query.is_empty() {
+        out
+    } else {
+        out.push('?');
+        out.push_str(query);
+        out
+    }
+}
+
+fn pop_segment(out: &mut String) {
+    if let Some(at) = out.rfind('/') {
+        out.truncate(at);
+    }
 }
 
 fn same_origin(left: &HttpUrl, right: &HttpUrl) -> bool {
@@ -978,6 +1028,12 @@ mod tests {
             }
         }
         String::from_utf8_lossy(&head).into_owned()
+    }
+
+    #[test]
+    fn a_redirect_path_loses_its_dot_segments() {
+        assert_eq!(normalize_path("/api/../next"), "/next");
+        assert_eq!(normalize_path("/api/./v1/../next?q=1"), "/api/next?q=1");
     }
 
     #[test]

@@ -1014,11 +1014,18 @@ fn heartbeat_loop(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     session_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let interval = if ttl > 0 {
+    let mut interval = if ttl > 0 {
         Duration::from_secs(ttl / 2).max(Duration::from_secs(1))
     } else {
         Duration::from_secs(15)
     };
+    if let Some(mapping) = mapping
+        .as_ref()
+        .filter(|mapping| mapping.enabled && mapping.lifetime > 0)
+    {
+        interval =
+            interval.min(Duration::from_secs(mapping.lifetime / 2).max(Duration::from_secs(1)));
+    }
     loop {
         if stop.load(std::sync::atomic::Ordering::Relaxed)
             || session_stop.load(std::sync::atomic::Ordering::Relaxed)

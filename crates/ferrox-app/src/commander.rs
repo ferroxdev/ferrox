@@ -5,7 +5,7 @@
 //! five-byte message prefix itself. Nothing is dialed to answer a call in `listen` mode, and in
 //! outbound mode the routed link is the transport.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -432,25 +432,43 @@ impl Api {
         }
         let mut decoder = h2::Decoder::default();
         let mut calls: HashMap<u32, Call> = HashMap::new();
+        let mut flow = Flow::new();
         let mut last_id = 0u32;
-        while let Some((len, kind, flags, id)) = h2::read_head_bounded(&mut stream) {
-            let cap = if kind == h2::T_DATA {
-                CALL_MAX + CALL_ENVELOPE
+        loop {
+            let (kind, flags, id, body) = if let Some(frame) = flow.pending.pop_front() {
+                frame
             } else {
-                h2::HEAD_CAP
+                let Some((len, kind, flags, id)) = h2::read_head_bounded(&mut stream) else {
+                    break;
+                };
+                let cap = if kind == h2::T_DATA {
+                    CALL_MAX + CALL_ENVELOPE
+                } else {
+                    h2::HEAD_CAP
+                };
+                if len > cap {
+                    goaway(&mut stream, h2::E_FRAME_SIZE, last_id);
+                    return;
+                }
+                let mut body = vec![0u8; len];
+                if stream.read_exact(&mut body).is_err() {
+                    return;
+                }
+                (kind, flags, id, body)
             };
-            if len > cap {
-                goaway(&mut stream, h2::E_FRAME_SIZE, last_id);
-                return;
-            }
-            let mut body = vec![0u8; len];
-            if stream.read_exact(&mut body).is_err() {
-                return;
-            }
             match kind {
                 h2::T_SETTINGS => {
                     if flags & h2::F_ACK == 0 {
+                        flow.settings(&body);
                         h2::write_frame(&mut stream, h2::T_SETTINGS, h2::F_ACK, 0, &[]);
+                    }
+                }
+                h2::T_WINDOW => {
+                    if body.len() == 4 {
+                        flow.window(
+                            id,
+                            i64::from(u32::from_be_bytes(body[..4].try_into().unwrap())),
+                        );
                     }
                 }
                 h2::T_PING => {
@@ -459,6 +477,7 @@ impl Api {
                     }
                 }
                 h2::T_HEADERS => {
+                    flow.open(id);
                     let block = header_body(&body, flags);
                     if calls.len() >= API_CALLS && !calls.contains_key(&id) {
                         goaway(&mut stream, h2::E_REFUSED, last_id);
@@ -479,7 +498,12 @@ impl Api {
                     }
                     if flags & h2::F_END != 0 {
                         last_id = last_id.max(id);
-                        if !self.answer(id, &calls.remove(&id).unwrap_or_default(), &mut stream) {
+                        if !self.answer(
+                            id,
+                            &calls.remove(&id).unwrap_or_default(),
+                            &mut stream,
+                            &mut flow,
+                        ) {
                             return;
                         }
                     }
@@ -523,13 +547,19 @@ impl Api {
                     }
                     if flags & h2::F_END != 0 {
                         last_id = last_id.max(id);
-                        if !self.answer(id, &calls.remove(&id).unwrap_or_default(), &mut stream) {
+                        if !self.answer(
+                            id,
+                            &calls.remove(&id).unwrap_or_default(),
+                            &mut stream,
+                            &mut flow,
+                        ) {
                             return;
                         }
                     }
                 }
                 h2::T_RST => {
                     calls.remove(&id);
+                    flow.close(id);
                 }
                 h2::T_GOAWAY => return,
                 _ => {}
@@ -537,7 +567,7 @@ impl Api {
         }
     }
 
-    fn answer(&self, id: u32, call: &Call, stream: &mut Connection) -> bool {
+    fn answer(&self, id: u32, call: &Call, stream: &mut Connection, flow: &mut Flow) -> bool {
         let request = grpc_message(&call.body).unwrap_or_default();
         match self.dispatch(&call.path, request) {
             Ok(answer) => {
@@ -550,19 +580,21 @@ impl Api {
                 framed.push(0);
                 framed.extend_from_slice(&(answer.len() as u32).to_be_bytes());
                 framed.extend_from_slice(&answer);
-                for chunk in framed.chunks(H2_MAX_FRAME) {
-                    if !h2::write_frame(stream, h2::T_DATA, 0, id, chunk) {
-                        return false;
-                    }
+                if !write_data(stream, id, &framed, flow) {
+                    return false;
                 }
                 let trailers = h2::block_encode(&[("grpc-status", "0")]);
-                h2::write_frame(
+                let ok = h2::write_frame(
                     stream,
                     h2::T_HEADERS,
                     h2::F_END_HEADERS | h2::F_END,
                     id,
                     &trailers,
-                )
+                );
+                if ok {
+                    flow.close(id);
+                }
+                ok
             }
             Err((status, message)) => {
                 let code = status.to_string();
@@ -576,13 +608,17 @@ impl Api {
                     ("grpc-status", code.as_str()),
                     ("grpc-message", message.as_str()),
                 ]);
-                h2::write_frame(
+                let ok = h2::write_frame(
                     stream,
                     h2::T_HEADERS,
                     h2::F_END_HEADERS | h2::F_END,
                     id,
                     &trailers,
-                )
+                );
+                if ok {
+                    flow.close(id);
+                }
+                ok
             }
         }
     }
@@ -1198,6 +1234,142 @@ fn settings() -> [u8; 6] {
     out[..2].copy_from_slice(&h2::S_MAX_CONCURRENT.to_be_bytes());
     out[2..].copy_from_slice(&(API_CALLS as u32).to_be_bytes());
     out
+}
+
+/// The peer's send windows, from its SETTINGS and WINDOW_UPDATE frames: a response waits for room rather than overrunning the default 65,535.
+struct Flow {
+    connection: i64,
+    initial: i64,
+    streams: HashMap<u32, i64>,
+    pending: VecDeque<(u8, u8, u32, Vec<u8>)>,
+}
+
+impl Flow {
+    fn new() -> Self {
+        Self {
+            connection: 65_535,
+            initial: 65_535,
+            streams: HashMap::new(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn open(&mut self, id: u32) {
+        if id != 0 {
+            self.streams.entry(id).or_insert(self.initial);
+        }
+    }
+
+    fn close(&mut self, id: u32) {
+        self.streams.remove(&id);
+    }
+
+    fn window(&mut self, id: u32, increment: i64) {
+        if id == 0 {
+            self.connection = self.connection.saturating_add(increment);
+        } else if let Some(window) = self.streams.get_mut(&id) {
+            *window = window.saturating_add(increment);
+        }
+    }
+
+    fn settings(&mut self, body: &[u8]) {
+        for entry in body.chunks_exact(6) {
+            if u16::from_be_bytes([entry[0], entry[1]]) == h2::S_WINDOW {
+                let value = i64::from(u32::from_be_bytes(entry[2..6].try_into().unwrap()));
+                let change = value - self.initial;
+                self.initial = value;
+                for window in self.streams.values_mut() {
+                    *window = window.saturating_add(change);
+                }
+            }
+        }
+    }
+
+    fn available(&self, id: u32) -> i64 {
+        self.connection
+            .min(self.streams.get(&id).copied().unwrap_or(0))
+    }
+}
+
+fn await_window(stream: &mut Connection, id: u32, flow: &mut Flow) -> bool {
+    loop {
+        if flow.available(id) > 0 {
+            return true;
+        }
+        let Some((len, kind, flags, id_in)) = h2::read_head_bounded(stream) else {
+            return false;
+        };
+        let cap = if kind == h2::T_DATA {
+            CALL_MAX + CALL_ENVELOPE
+        } else {
+            h2::HEAD_CAP
+        };
+        if len > cap {
+            return false;
+        }
+        let mut body = vec![0u8; len];
+        if stream.read_exact(&mut body).is_err() {
+            return false;
+        }
+        match kind {
+            h2::T_WINDOW if len == 4 => {
+                flow.window(
+                    id_in,
+                    i64::from(u32::from_be_bytes(body[..4].try_into().unwrap())),
+                );
+            }
+            h2::T_SETTINGS if flags & h2::F_ACK == 0 => {
+                flow.settings(&body);
+                if !h2::write_frame(stream, h2::T_SETTINGS, h2::F_ACK, 0, &[]) {
+                    return false;
+                }
+            }
+            h2::T_PING if flags & h2::F_ACK == 0 => {
+                if !h2::write_frame(stream, h2::T_PING, h2::F_ACK, 0, &body) {
+                    return false;
+                }
+            }
+            h2::T_RST => {
+                flow.close(id_in);
+                if id_in == id {
+                    return false;
+                }
+            }
+            h2::T_GOAWAY => return false,
+            h2::T_HEADERS => {
+                flow.open(id_in);
+                flow.pending.push_back((kind, flags, id_in, body));
+            }
+            h2::T_DATA | h2::T_CONT => flow.pending.push_back((kind, flags, id_in, body)),
+            _ => {}
+        }
+    }
+}
+
+fn write_data(stream: &mut Connection, id: u32, data: &[u8], flow: &mut Flow) -> bool {
+    let mut at = 0usize;
+    while at < data.len() {
+        if !await_window(stream, id, flow) {
+            return false;
+        }
+        let remaining = i64::try_from(data.len() - at).unwrap_or(i64::MAX);
+        let room = flow.available(id).min(remaining);
+        let take =
+            usize::try_from(room.min(i64::try_from(H2_MAX_FRAME).unwrap_or(i64::MAX))).unwrap_or(0);
+        if take == 0 {
+            continue;
+        }
+        if !h2::write_frame(stream, h2::T_DATA, 0, id, &data[at..at + take]) {
+            return false;
+        }
+        at += take;
+        let taken = i64::try_from(take).unwrap_or(i64::MAX);
+        flow.connection -= taken;
+        if let Some(window) = flow.streams.get_mut(&id) {
+            *window -= taken;
+        }
+    }
+    true
 }
 
 /// Refuse a peer that exceeded a bound: the GOAWAY names the reason before the connection closes.

@@ -1622,19 +1622,19 @@ fn read_h3_request(
     let mut room = Unfilled::<4096>::new();
     loop {
         if let Some(request) = assemble_request(&buf) {
-            if request_complete(&request) {
+            if request_complete(&request, false) {
                 return Some(request);
             }
         }
         if buf.len() >= HEAD_CAP {
-            return assemble_request(&buf).filter(request_complete);
+            return assemble_request(&buf).filter(|request| request_complete(request, false));
         }
         let fin = {
             let Ok(mut conn) = shared.lock() else {
                 return assemble_request(&buf);
             };
             if conn.is_closed() {
-                return assemble_request(&buf).filter(request_complete);
+                return assemble_request(&buf).filter(|request| request_complete(request, false));
             }
             match conn.stream_recv(stream, room.as_mut()) {
                 Ok((0, fin)) => fin,
@@ -1643,27 +1643,27 @@ fn read_h3_request(
                     fin
                 }
                 Err(quiche::Error::Done) => false,
-                Err(_) => return assemble_request(&buf).filter(request_complete),
+                Err(_) => {
+                    return assemble_request(&buf)
+                        .filter(|request| request_complete(request, false));
+                }
             }
         };
         if fin {
-            return assemble_request(&buf).filter(request_complete);
+            return assemble_request(&buf).filter(|request| request_complete(request, true));
         }
         std::thread::sleep(STREAM_POLL);
     }
 }
 
-fn request_complete(request: &hysteria::H3Request) -> bool {
+fn request_complete(request: &hysteria::H3Request, fin: bool) -> bool {
     let mut declared = None;
-    let mut chunked = false;
     for (name, value) in &request.headers {
         if name.eq_ignore_ascii_case("content-length") {
             declared = value.trim().parse::<usize>().ok();
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            chunked = true;
         }
     }
-    declared.map_or(!chunked, |length| request.body.len() >= length)
+    declared.map_or(fin, |length| request.body.len() >= length)
 }
 
 /// Walks a request stream's HTTP/3 frames once: the first `HEADERS` block becomes the request line and fields, and every `DATA` payload that follows becomes the body. `None` while any frame is still incomplete, so the reader keeps waiting rather than answering a half request.
