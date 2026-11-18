@@ -1619,23 +1619,24 @@ fn read_h3_request(
     shared: &Arc<Mutex<quiche::Connection>>,
     stream: u64,
     mut buf: Vec<u8>,
+    mut fin: bool,
 ) -> Option<hysteria::H3Request> {
     let mut room = Unfilled::<4096>::new();
     loop {
         if let Some(request) = assemble_request(&buf) {
-            if request_complete(&request, false) {
+            if request_complete(&request, fin) {
                 return Some(request);
             }
         }
         if buf.len() >= HEAD_CAP {
-            return assemble_request(&buf).filter(|request| request_complete(request, false));
+            return assemble_request(&buf);
         }
-        let fin = {
+        let read_fin = {
             let Ok(mut conn) = shared.lock() else {
-                return assemble_request(&buf);
+                return None;
             };
             if conn.is_closed() {
-                return assemble_request(&buf).filter(|request| request_complete(request, false));
+                return assemble_request(&buf).filter(|request| request_complete(request, fin));
             }
             match conn.stream_recv(stream, room.as_mut()) {
                 Ok((0, fin)) => fin,
@@ -1644,12 +1645,10 @@ fn read_h3_request(
                     fin
                 }
                 Err(quiche::Error::Done) => false,
-                Err(_) => {
-                    return assemble_request(&buf)
-                        .filter(|request| request_complete(request, false));
-                }
+                Err(_) => return None,
             }
         };
+        fin |= read_fin;
         if fin {
             return assemble_request(&buf).filter(|request| request_complete(request, true));
         }
