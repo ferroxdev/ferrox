@@ -76,7 +76,7 @@ impl Wire {
     }
 }
 
-/// What a lane's empty read did: handed the lane back, or slept the transport tick, counted only under `cfg(test)`.
+// What a lane's empty read did: handed the lane back, or slept the transport tick, counted only under `cfg(test)`.
 #[cfg(test)]
 thread_local! {
     static LANE_GRANTS: Cell<usize> = const { Cell::new(0) };
