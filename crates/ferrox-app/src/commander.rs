@@ -518,10 +518,10 @@ impl Api {
                     }
                 }
                 h2::T_PING => {
-                    if flags & h2::F_ACK == 0 {
-                        if !h2::write_frame(&mut stream, h2::T_PING, h2::F_ACK, 0, &body) {
-                            return;
-                        }
+                    if flags & h2::F_ACK == 0
+                        && !h2::write_frame(&mut stream, h2::T_PING, h2::F_ACK, 0, &body)
+                    {
+                        return;
                     }
                 }
                 h2::T_HEADERS => {
@@ -1545,7 +1545,7 @@ impl Flow {
     fn take_recv(&mut self, id: u32, bytes: usize) -> bool {
         let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
         self.recv_connection = self.recv_connection.saturating_sub(bytes);
-        let stream = self.recv_streams.get_mut(&id).map_or(true, |window| {
+        let stream = self.recv_streams.get_mut(&id).is_none_or(|window| {
             *window = window.saturating_sub(bytes);
             *window >= 0
         });
