@@ -4481,7 +4481,8 @@ mod tests {
                 .stopped
                 .as_deref()
                 .is_some_and(|reason| reason.contains("closed the held connection")),
-            "a closed hold is a stopped flow: {result:?}"
+            "a closed hold is a stopped flow: {:?}",
+            result.stopped
         );
         assert!(engine.join().expect("the fake engine survived").is_ok());
     }

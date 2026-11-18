@@ -155,6 +155,9 @@ fn process_exe(pid: u32) -> Option<PathBuf> {
 }
 
 fn expected_bin(paths: &Paths) -> PathBuf {
+    if let Some(path) = std::env::var_os("FERROX_BIN") {
+        return PathBuf::from(path);
+    }
     read_trim(&bin_marker(paths))
         .filter(|text| !text.is_empty())
         .map_or_else(
@@ -214,7 +217,8 @@ fn wait_exit(pid: u32, attempts: u32) -> bool {
 pub fn kill(paths: &Paths, pid: u32) -> Result<(), String> {
     if !is_ferrox(paths, pid) {
         return Err(format!(
-            "process {pid} is not ferrox-app; it was not stopped. If the binary was renamed, set FERROX_BIN."
+            "process {pid} is not ferrox-app; it was not stopped. If the binary was renamed, set FERROX_BIN. Otherwise remove the stale pid file {}.",
+            paths.pid_file.display()
         ));
     }
     #[cfg(unix)]
@@ -689,7 +693,11 @@ mod tests {
         );
         write_private(&paths.pid_file, &format!("{current}\n")).unwrap();
         assert!(!running(&paths));
-        assert!(stop(&paths).is_err());
+        let error = stop(&paths).expect_err("a foreign pid is not stopped");
+        assert!(
+            error.contains(&paths.pid_file.display().to_string()),
+            "the refusal names the pid file: {error}"
+        );
         assert_eq!(pid(&paths), Some(current));
         let _ = std::fs::remove_dir_all(root);
     }
