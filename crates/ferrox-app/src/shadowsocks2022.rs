@@ -2291,6 +2291,7 @@ pub(crate) fn serve_udp_relay(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, freedom: bool) {
     let Some(method) = Method::parse(method) else {
         return;

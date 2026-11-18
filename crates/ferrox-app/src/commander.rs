@@ -669,11 +669,11 @@ impl Api {
                 framed.push(0);
                 framed.extend_from_slice(&(answer.len() as u32).to_be_bytes());
                 framed.extend_from_slice(&answer);
-                let held: usize = responses
+                let buffered: usize = responses
                     .values()
                     .map(|response| response.framed.len() - response.at)
                     .sum();
-                if held.saturating_add(framed.len()) > API_HELD {
+                if buffered.saturating_add(framed.len()) > API_HELD {
                     reset(stream, id, h2::E_REFUSED);
                     flow.close(id);
                     return true;
