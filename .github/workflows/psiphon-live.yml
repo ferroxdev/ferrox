@@ -294,7 +294,7 @@ jobs:
           with open("psiphon-live.json", "w") as handle:
               json.dump(document, handle)
           PY
-          PSIPHON_REGION="$PSIPHON_REGION" STATE="$RUNNER_TEMP/psiphon-reference-state" python3 - <<'PY'
+          PSIPHON_REGION="$PSIPHON_REGION" PSIPHON_PROTOCOL="$PSIPHON_PROTOCOL" STATE="$RUNNER_TEMP/psiphon-reference-state" python3 - <<'PY'
           import base64, json, os, re
           source = open("crates/ferrox-core/src/psiphon.rs").read()
           url = re.search(r'SERVER_LIST_URL: &str =\s*"([^"]+)"', source).group(1)
@@ -318,6 +318,14 @@ jobs:
               config["EgressRegion"] = os.environ["PSIPHON_REGION"].upper()
           if os.environ.get("PSIPHON_POOL"):
               config["TunnelPoolSize"] = int(os.environ["PSIPHON_POOL"])
+          if os.environ.get("PSIPHON_PROTOCOL") == "cdn":
+              config["LimitTunnelProtocols"] = [
+                  "FRONTED-MEEK-CDN-OSSH",
+                  "FRONTED-MEEK-CDN-HTTP-OSSH",
+                  "FRONTED-MEEK-CDN-QUIC-OSSH",
+              ]
+              config["DisableTactics"] = True
+              config["FrontedMeekCDNScanUseBuiltInSpec"] = True
           with open("psiphon-reference.json", "w") as handle:
               json.dump(config, handle)
           PY
@@ -383,7 +391,7 @@ jobs:
           sample_process "native ready" "$LANE_PID"
           if [ "${PSIPHON_PROTOCOL:-direct}" = cdn ]; then
             if ! grep -Eq \
-              'tunnel up via \S+ (FRONTED-MEEK-OSSH|FRONTED-MEEK-HTTP-OSSH)' psiphon-live.log; then
+              'tunnel up via \S+ FRONTED-MEEK(-CDN)?(-HTTP|-QUIC)?-OSSH' psiphon-live.log; then
               echo "::error::the CDN leg established no fronted tunnel" >&2
               FAILED="$FAILED native(cdn)"
             fi
