@@ -300,7 +300,11 @@ fn parse(arguments: &[String]) -> Result<Args, String> {
             "--row" | "-r" => parsed.row = Some(text(&mut index)?),
             "--set" => assign(&mut parsed.values, &text(&mut index)?)?,
             "--addon" => parsed.addons.push(text(&mut index)?),
-            "--print" => parsed.output = Output::Print,
+            "--print" => {
+                if parsed.output != Output::Json {
+                    parsed.output = Output::Print;
+                }
+            }
             // JSON wins over `--print` rather than fighting it: both mean stdout.
             "--json" => parsed.output = Output::Json,
             "--rotate" => parsed.draw = Draw::Rotate,
@@ -2452,6 +2456,12 @@ fix issue #{issue} at {priority=P0 or P1} priority
     #[test]
     fn a_bare_invocation_asks_for_help() {
         assert_eq!(parse_args(&[]).command, Command::Help);
+    }
+
+    #[test]
+    fn json_wins_over_print_in_either_order() {
+        assert_eq!(parse_args(&["list", "--print", "--json"]).output, Output::Json);
+        assert_eq!(parse_args(&["list", "--json", "--print"]).output, Output::Json);
     }
 
     #[test]

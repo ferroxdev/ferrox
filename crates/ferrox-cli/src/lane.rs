@@ -469,7 +469,7 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
 
 pub fn stop(paths: &Paths) -> Result<(), String> {
     if let Some(pid) = pid(paths) {
-        if alive(pid) && is_ferrox(paths, pid) {
+        if alive(pid) {
             kill(paths, pid)?;
         }
     }
@@ -679,7 +679,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
-    fn a_live_foreign_pid_is_stale_not_a_running_lane() {
+    fn a_live_foreign_pid_is_kept_for_retry() {
         let root = std::env::temp_dir().join(format!("ferrox-foreign-{}", std::process::id()));
         let paths = Paths::with_dirs(root.join("conf"), root.join("state"), None);
         let current = std::process::id();
@@ -689,8 +689,8 @@ mod tests {
         );
         write_private(&paths.pid_file, &format!("{current}\n")).unwrap();
         assert!(!running(&paths));
-        assert!(stop(&paths).is_ok());
-        assert_eq!(pid(&paths), None);
+        assert!(stop(&paths).is_err());
+        assert_eq!(pid(&paths), Some(current));
         let _ = std::fs::remove_dir_all(root);
     }
 

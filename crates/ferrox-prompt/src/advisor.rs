@@ -2,7 +2,7 @@
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
-use std::io::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -338,11 +338,21 @@ impl Ledger {
             Some(key) => format!("{} P{} {} t={key}\n", entry.at, entry.id, entry.how),
             None => format!("{} P{} {}\n", entry.at, entry.id, entry.how),
         };
-        std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)?
-            .write_all(line.as_bytes())?;
+            .read(true)
+            .open(&self.path)?;
+        let len = file.metadata()?.len();
+        if len != 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0u8; 1];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+            }
+        }
+        file.write_all(line.as_bytes())?;
         self.entries.push(entry);
         Ok(())
     }
@@ -453,6 +463,7 @@ p
 **Status:** done
 **Leverage:** 1
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 
 ```text
@@ -465,6 +476,7 @@ b
 **Status:** todo
 **Leverage:** 5
 **Effort:** large
+**Targets:** none
 **Gates:** `cargo test`
 **Random weight:** 0
 
@@ -478,6 +490,7 @@ b
 **Status:** todo
 **Leverage:** 3
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 **Random weight:** 3
 
@@ -491,6 +504,7 @@ b
 **Status:** todo
 **Leverage:** 4
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 **Depends on:** P3
 **Random weight:** 1
@@ -505,6 +519,7 @@ b
 **Status:** doing
 **Leverage:** 5
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 **Random weight:** 9
 
@@ -590,6 +605,7 @@ p
 **Status:** todo
 **Leverage:** 5
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 
 ```text
@@ -602,6 +618,7 @@ run it with {scope}
 **Status:** todo
 **Leverage:** 3
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 
 ```text
@@ -651,6 +668,7 @@ p
 **Status:** todo
 **Leverage:** 5
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 
 ```text
@@ -686,6 +704,7 @@ p
 **Status:** todo
 **Leverage:** 5
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 
 ```text
@@ -725,6 +744,7 @@ p
 **Status:** todo
 **Leverage:** 5
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 **Random weight:** 0
 
@@ -738,6 +758,7 @@ b
 **Status:** todo
 **Leverage:** 1
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 **Random weight:** 3
 
@@ -770,6 +791,7 @@ p
 **Status:** todo
 **Leverage:** 5
 **Effort:** small
+**Targets:** none
 **Gates:** `cargo test`
 **Random weight:** 0
 
@@ -806,6 +828,21 @@ b
         assert_eq!(reread.targets_for(3), vec!["A13"]);
         drop(ledger);
         drop(reread);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn an_unterminated_ledger_is_not_joined_by_the_next_record() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ferrox-ledger-open-{}.log", std::process::id()));
+        std::fs::write(&path, "2026-10-02T00:00:00Z P2 next").unwrap();
+        let mut ledger = Ledger::load(path.clone());
+        ledger.record(3, "next", Some("A13")).unwrap();
+        let reread = Ledger::load(path.clone());
+        assert_eq!(reread.entries.len(), 2);
+        assert_eq!(reread.skipped, 0);
+        assert_eq!(reread.targets_for(2), Vec::<String>::new());
+        assert_eq!(reread.targets_for(3), vec!["A13"]);
         std::fs::remove_file(&path).unwrap();
     }
 
