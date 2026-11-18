@@ -1776,8 +1776,9 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, bool), Fail
             }
         }
         let (stream, deferred) = kept.expect("the loop returns on its last round");
+        let stream = Connection::Tcp(stream);
         no_delay(&stream);
-        return Ok((outbound_metered(Connection::Tcp(stream)), deferred));
+        return Ok((outbound_metered(stream), deferred));
     }
     let stream = match (source, sockopts) {
         (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
