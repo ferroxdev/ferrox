@@ -696,7 +696,11 @@ impl MasqueOut {
                 std::thread::sleep(TICK);
             }
         });
-        match ready_rx.recv_timeout(ESTABLISH_TIMEOUT) {
+        let setup = ESTABLISH_TIMEOUT
+            .saturating_add(HEAD_TIMEOUT)
+            .saturating_add(WARP_ASSIGN_WAIT)
+            .saturating_add(Duration::from_secs(1));
+        match ready_rx.recv_timeout(setup) {
             Ok(Ok(())) => Ok(UdpForwarder::new(local, stop)),
             Ok(Err(reason)) => {
                 stop.store(true, Ordering::Relaxed);
