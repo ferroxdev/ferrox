@@ -4,7 +4,7 @@ Mux is the only method here whose bytes are not the caller's bytes: the frame he
 
 A data frame is `metadataLen(2) | metadata | dataLen(2) | data`, where the metadata is `sessionID(2) | status(1) | option(1)` and the `New` status carries a source and a local address. The payload is handed to the relay exactly as it arrived — `mux::CHUNK_MAX` is 8192 and nothing else in the pipeline touches it.
 
-Every write that hands a payload to a socket from where it was read is **zero** user-space copies per byte: the header is appended in front of the payload and the pair goes down as one `writev`. The one exception is the session's client-to-origin path, which stages each payload once into the flow's writer queue so the session thread never waits on an origin's window; `## A stalled origin` is that design and why the copy is the price. The codec's own write side is one copy into the frame buffer (`codec-copies-per-byte-written 1`), and `ferrox-bench` gate 6 requires zero staging, zero temp and zero per-frame allocation on the codec path.
+Every write that hands a payload to a socket from where it was read is **zero** user-space copies per byte: the header is appended in front of the payload and the pair goes down as one `writev`. The one exception is the session's client-to-origin path, which stages each payload once into the flow's writer queue, so the session waits only on that flow's queue and never on the origin's socket; `## A stalled origin` is that design and why the copy is the price. The codec's own write side is one copy into the frame buffer (`codec-copies-per-byte-written 1`), and `ferrox-bench` gate 6 requires zero staging, zero temp and zero per-frame allocation on the codec path.
 
 ## Data path
 
@@ -21,8 +21,8 @@ graph TD
         W --> R["read into the session's buffer"]
         R --> S["parse the metadata in place"]
         S --> T{"status"}
-        T -- keep --> U["copy the payload once<br/>into the flow's queue"]
-        U --> Q["the flow's writer owns the origin:<br/>16 pending, then that flow ends"]
+        T -- keep --> U["copy the payload once<br/>into the flow's queue,<br/>parking when it is full"]
+        U --> Q["the flow's writer owns the origin:<br/>16 pending, then the session<br/>parks until it drains"]
         Q --> O(("origin"))
         T -- new --> V["queue its first data,<br/>dial in the flow's task"]
         V --> O
@@ -74,9 +74,9 @@ The probe is 4096 decodes of one fixed frame with a fold as the witness — no s
 
 ## A stalled origin
 
-The session thread used to write every client `Keep` straight to its origin under that flow's mutex: once an origin stopped reading, its window filled, the write parked, and the session read nothing for any flow until it returned. The session side of issue #389 follows from that one blocking call; its other half is the uplink read that never timed out.
+The session thread used to write every client `Keep` straight to its origin under that flow's mutex: once an origin stopped reading, its window filled, the write parked with no slack ahead of it, and the session read nothing for any flow until it returned. The session side of issue #389 follows from that one blocking call; its other half is the uplink read that never timed out.
 
-Each TCP flow is now two directions with their own handles. The session never writes to an origin: it copies the payload into the flow's `sync_channel(MUX_PENDING = 16)` and goes back to reading. The writer owns the origin socket, arms `relay_stall` once before its loop, and half-closes after the queue drains, so a client `End` still sends FIN behind every byte that was queued. A full queue is a stalled origin: that flow is removed and its socket shut down, and the session keeps reading — the flow's next `Keep` finds no entry and is dropped. The origin-bound copy is what buys that, and it is prose rather than a row because a pointer gate witnesses a copy removed, not one paid deliberately.
+Each TCP flow is now two directions with their own handles. The session never writes to an origin: it hands the payload to the flow's `sync_channel(MUX_PENDING = 16)` and goes back to reading, parking only once that flow's own writer is sixteen frames behind. The writer owns the origin socket, arms `relay_stall` once before its loop, and half-closes after the queue drains, so a client `End` still sends FIN behind every byte that was queued. A full queue is back-pressure, not a fault: the session parks on that flow's `send` until the writer drains, so the tunnel's own window slows the client, and the writer's `relay_stall` ends an origin that never drains — where removing the flow on a full queue ended every duplex download at zero bytes against a slow origin. The origin-bound copy is what buys that, and it is prose rather than a row because a pointer gate witnesses a copy removed, not one paid deliberately.
 
 The uplink reader polls its origin on `RELAY_POLL` rather than blocking, and a timeout asks the session's table whether it is done; teardown sets that flag, drains the flows, shuts each socket and then joins, so a silent origin costs one poll instead of the whole join budget. The session's client-bound writes carry the same `relay_stall` deadline as a relay leg: a client that stops reading makes its write error and the session unwind, and a flow parked writing to it is woken by the session's own shutdown rather than waiting out the deadline.
 

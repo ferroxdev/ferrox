@@ -8818,7 +8818,9 @@ fn send_mux_end(wire: &MuxWire, staging: &mut Vec<u8>, id: u16) {
     let _ = wire.write_frame(staging, end, None);
 }
 
-/// Frames one flow may have waiting before its origin is treated as stalled: a slow reader costs its own flow, and the session keeps reading for every other.
+/// Frames one flow may have waiting before the session parks on its writer: a slow origin costs the
+/// upload side of the tunnel, never the flow, and the writer's own stall budget ends an origin that
+/// never drains.
 const MUX_PENDING: usize = 16;
 
 /// One TCP flow's origin: `control` wakes both directions without waiting on a parked write, and `pending` is the only way the session reaches the socket.
@@ -9356,8 +9358,8 @@ fn handle_mux_frame(
             let Some(flow) = flow else {
                 return;
             };
-            if flow.pending.try_send(data.to_vec()).is_err() {
-                // A full queue is a stalled origin: end that flow and keep the session reading, so its next Keep is dropped here rather than parking every other flow.
+            // A full queue is back-pressure, not a fault: the session parks on this flow until its writer drains, so the tunnel's window slows the client instead of a dropped flow ending a duplex download at zero bytes.
+            if flow.pending.send(data.to_vec()).is_err() {
                 let removed = match table.lock() {
                     Ok(mut table) => table.flows.remove(&frame.id).is_some(),
                     Err(_) => false,
@@ -47831,21 +47833,6 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         use std::time::{Duration, Instant};
 
-        fn small_buffer(fd: std::os::unix::io::RawFd, name: libc::c_int) {
-            let want: libc::c_int = 4096;
-            // SAFETY: `want` outlives the call, and the size is its own.
-            let set = unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    name,
-                    std::ptr::addr_of!(want).cast(),
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                )
-            };
-            assert_eq!(set, 0, "a small socket buffer is refused");
-        }
-
         let (server_stream, client_stream) = std::os::unix::net::UnixStream::pair().expect("pairs");
         small_buffer(server_stream.as_raw_fd(), libc::SO_SNDBUF);
         small_buffer(client_stream.as_raw_fd(), libc::SO_RCVBUF);
@@ -64335,6 +64322,23 @@ mod tests {
         }
     }
 
+    /// A 4 KiB socket buffer, so a test fills a window with a few frames instead of megabytes.
+    #[cfg(unix)]
+    fn small_buffer(fd: std::os::unix::io::RawFd, name: libc::c_int) {
+        let want: libc::c_int = 4096;
+        // SAFETY: `want` outlives the call, and the size is its own.
+        let set = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                name,
+                std::ptr::addr_of!(want).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0, "a small socket buffer is refused");
+    }
+
     fn mux_test_echo() -> u16 {
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = echo.local_addr().expect("addr").port();
@@ -65362,26 +65366,42 @@ mod tests {
     /// One flow's origin stops reading and the session must not stop with it: the flood is larger
     /// than a loopback receive window, so the old shape parks the session thread inside the first
     /// flow's Keep and the second flow's ping is never read. A slow origin costs its own flow, not
-    /// every flow on the session.
+    /// A stalled origin parks the session's upload side, as the reference's inline copy does, and
+    /// nothing is lost: another origin's download still crosses, the flow keeps its end, and the
+    /// queue drains into the origin once it reads.
+    #[cfg(unix)]
     #[test]
-    fn a_stalled_origin_does_not_park_the_mux_session() {
+    fn a_stalled_origin_parks_the_upload_side_and_keeps_the_flow() {
+        use std::os::unix::io::AsRawFd;
+
+        const CHUNKS: usize = 50;
+        const PAYLOAD: usize = CHUNKS * 8192;
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let stalled = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let stalled = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
         let stalled_port = stalled.local_addr().expect("addr").port();
-        // Accepted and never read, so the receive window closes and stays closed.
-        let held: Arc<Mutex<Vec<Connection>>> = Arc::new(Mutex::new(Vec::new()));
-        let keep_open = Arc::clone(&held);
-        thread::spawn(move || {
-            for stream in stalled.incoming() {
-                let Ok(stream) = stream else {
-                    continue;
-                };
-                if let Ok(mut held) = keep_open.lock() {
-                    held.push(stream);
+        let (go, drain) = std::sync::mpsc::channel::<()>();
+        let accepted = thread::spawn(move || {
+            let (mut stream, _) = stalled.accept().expect("accepts");
+            small_buffer(stream.as_raw_fd(), libc::SO_RCVBUF);
+            drain.recv().expect("the drain gate");
+            let mut buf = [0u8; 8192];
+            let mut total = 0usize;
+            while total < PAYLOAD {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => total += read,
                 }
             }
+            stream.write_all(b"drained").expect("writes the marker");
+            total
         });
-        let echo_port = mux_test_echo();
+        let banner = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let banner_port = banner.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = banner.accept().expect("accepts");
+            let _ = stream.write_all(b"banner");
+            thread::sleep(Duration::from_secs(10));
+        });
         let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
@@ -65389,9 +65409,6 @@ mod tests {
             serve_vless_raw(stream, &one_vless_user(&id), true, None);
         });
         let mut client = mux_test_connect(&id, tunnel_port);
-        client
-            .set_write_timeout(Some(Duration::from_secs(10)))
-            .expect("timeout");
         let new = |id: u16, port: u16| ferrox_core::mux::Outgoing {
             id,
             status: ferrox_core::mux::Status::New,
@@ -65400,7 +65417,7 @@ mod tests {
             global_id: None,
         };
         mux_test_send(&mut client, new(1, stalled_port), None);
-        mux_test_send(&mut client, new(2, echo_port), None);
+        mux_test_send(&mut client, new(3, banner_port), None);
         let keep = |id: u16| ferrox_core::mux::Outgoing {
             id,
             status: ferrox_core::mux::Status::Keep,
@@ -65408,44 +65425,60 @@ mod tests {
             target: None,
             global_id: None,
         };
-        let payload = [0x5au8; ferrox_core::mux::CHUNK_MAX];
-        let mut frame = vec![0u8; keep(1).frame_len(payload.len())];
-        let n = keep(1).encode_into(Some(&payload), &mut frame);
-        let mut kept_reading = true;
-        for _ in 0..4096 {
-            if client.write_all(&frame[..n]).is_err() {
-                kept_reading = false;
+        let mut writer = client.try_clone().expect("a handle");
+        let filling = thread::spawn(move || {
+            let payload = [0x5au8; 8192];
+            for _ in 0..CHUNKS {
+                mux_test_send(&mut writer, keep(1), Some(&payload));
+            }
+        });
+        // Whatever the kernel absorbs, the policy below holds: no End for the flow, and every queued byte reaches the origin.
+        for _ in 0..50 {
+            if filling.is_finished() {
                 break;
             }
+            thread::sleep(Duration::from_millis(10));
         }
-        assert!(
-            kept_reading,
-            "the session kept reading while one origin was stalled"
-        );
-        mux_test_send(&mut client, keep(2), Some(b"ping"));
-        let mut answered = false;
-        for _ in 0..64 {
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let (got, status, data) = mux_test_recv(&mut client);
+        assert_eq!(got, 3, "the answering origin is the one read");
+        assert_eq!(status, ferrox_core::mux::Status::Keep);
+        assert_eq!(data, b"banner", "a parked upload does not hold a download");
+        go.send(()).expect("the drain gate opens");
+        loop {
             let (got, status, data) = mux_test_recv(&mut client);
-            if got == 2 && status == ferrox_core::mux::Status::Keep {
-                assert_eq!(data, b"ping");
-                answered = true;
-                break;
+            if got != 1 {
+                continue;
             }
+            assert_ne!(
+                status,
+                ferrox_core::mux::Status::End,
+                "a full origin queue parked the session instead of ending the flow"
+            );
+            assert_eq!(
+                data, b"drained",
+                "the stalled flow answers once its origin reads"
+            );
+            break;
         }
-        assert!(
-            answered,
-            "the second flow was answered, not queued behind the first"
+        filling.join().expect("the fill");
+        assert_eq!(
+            accepted.join().expect("the origin"),
+            PAYLOAD,
+            "every queued byte reached the origin"
         );
     }
 
-    /// A full queue drops one flow, and the client has to learn that: an End on the wire is what
-    /// stops it keeping a flow the server has already forgotten.
+    /// An origin whose writer is gone drops its flow, and the client has to learn that: an End on
+    /// the wire is what stops it keeping a flow the server has already forgotten.
     #[test]
-    fn a_full_mux_queue_ends_the_flow_it_drops() {
+    fn a_dead_origin_ends_the_flow_it_drops() {
         let (server, mut client) = crate::reverse::loopback_pair().expect("pair");
         let wire = MuxWire::Conn(Arc::new(Mutex::new(server)));
-        let (pending, _queued) = std::sync::mpsc::sync_channel(1);
-        pending.send(vec![0u8; 1]).expect("fills");
+        let (pending, queued) = std::sync::mpsc::sync_channel(1);
+        drop(queued);
         let flow = Arc::new(MuxFlow {
             control: Arc::new(MuxControl {
                 stop: Mutex::new(None),
