@@ -2375,16 +2375,23 @@ fn apply_socket_mode(
         if rc == 0 {
             Ok(())
         } else {
-            let error = io::Error::last_os_error();
             #[cfg(target_os = "linux")]
-            if matches!(
-                error.raw_os_error(),
-                Some(code)
-                    if code == libc::ENOTSUP || code == libc::EINVAL || code == libc::ENOSYS
-            ) {
-                return chmod_pinned(path, mode);
+            {
+                let error = io::Error::last_os_error();
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code)
+                        if code == libc::ENOTSUP || code == libc::EINVAL || code == libc::ENOSYS
+                ) {
+                    chmod_pinned(path, mode)
+                } else {
+                    Err(error)
+                }
             }
-            Err(error)
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(io::Error::last_os_error())
+            }
         }
     };
     #[cfg(target_vendor = "apple")]
