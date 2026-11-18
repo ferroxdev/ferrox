@@ -101,15 +101,19 @@ enum Sink {
     Udp(Deliver, Arc<std::sync::atomic::AtomicBool>),
 }
 
-/// Frames one bulk `Keep` leaves in a single vectored write: a 32 KiB upload read is four frames
-/// and one syscall where it used to be four writes, and no payload byte moves.
-const BATCH: usize = 4;
+/// Frames one bulk `Keep` leaves in a single vectored write: a 64 KiB upload read is eight frames
+/// and one syscall where it used to be four writes of four, and no payload byte moves.
+const BATCH: usize = 8;
 
 /// The segments one batch hands the kernel: a head and a payload part for each frame.
 const BATCH_PARTS: usize = 2 * BATCH;
 
 /// The empty segment a parts list starts from, overwritten by every frame it holds.
 const NO_PART: &[u8] = &[];
+
+/// The room the demux gives the kernel per read: one batch of frames, so a 64 KiB burst is one
+/// read rather than eight.
+const READ_ROOM: usize = BATCH * mux::CHUNK_MAX;
 
 struct Writer {
     out: Box<dyn Write + Send>,
@@ -348,7 +352,7 @@ impl Carrier {
     }
 
     fn demux(self: Arc<Self>, mut read: Box<dyn Read + Send>) {
-        let mut buf: Vec<u8> = Vec::with_capacity(crate::proxy::READ_SLICE);
+        let mut buf: Vec<u8> = Vec::with_capacity(READ_ROOM);
         let mut buf_init = 0usize;
         let mut at = 0;
         loop {
@@ -376,7 +380,9 @@ impl Carrier {
                 at = 0;
             }
             // SAFETY: `buf_init` describes `buf`, whose tail this loop owns.
-            match unsafe { crate::proxy::read_into_tail(&mut read, &mut buf, &mut buf_init) } {
+            match unsafe {
+                crate::proxy::read_into_tail_room(&mut read, &mut buf, &mut buf_init, READ_ROOM)
+            } {
                 Ok(0) => {
                     self.retire();
                     return;
@@ -886,10 +892,10 @@ mod tests {
         }
     }
 
-    /// The gate for `uplink-frames-per-write`: a 32 KiB send leaves as four frames under one call,
+    /// The gate for `uplink-frames-per-write`: a 64 KiB send leaves as eight frames under one call,
     /// and every payload byte reaches the wire.
     #[test]
-    fn a_bulk_uplink_frames_four_keeps_in_one_write() {
+    fn a_bulk_uplink_frames_eight_keeps_in_one_write() {
         let seen: Arc<Mutex<(Vec<u8>, usize)>> = Arc::new(Mutex::new((Vec::new(), 0)));
         let sink = Arc::clone(&seen);
         let peers: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
@@ -905,7 +911,7 @@ mod tests {
             })
         });
         let flow = manager.dial(&target()).expect("a flow");
-        let payload: Vec<u8> = (0..4 * mux::CHUNK_MAX).map(|at| at as u8).collect();
+        let payload: Vec<u8> = (0..8 * mux::CHUNK_MAX).map(|at| at as u8).collect();
         assert!(flow.send(&payload));
         let (bytes, calls) = {
             let seen = seen.lock().expect("the recorded stream");
@@ -913,15 +919,15 @@ mod tests {
         };
         assert_eq!(
             calls, 2,
-            "the New frame and the four-frame batch are one call each"
+            "the New frame and the eight-frame batch are one call each"
         );
         assert_eq!(
             frames(&bytes)
                 .iter()
                 .filter(|(_, status)| *status == mux::Status::Keep)
                 .count(),
-            4,
-            "32 KiB leaves as four 8 KiB keeps",
+            8,
+            "64 KiB leaves as eight 8 KiB keeps",
         );
         let mut at = 0;
         let mut kept = Vec::new();
@@ -936,6 +942,40 @@ mod tests {
             1,
             "the carrier's peer stays open so its demux does not retire"
         );
+    }
+
+    struct Room(Arc<Mutex<Sender<usize>>>);
+
+    impl Read for Room {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Ok(tx) = self.0.lock() {
+                let _ = tx.send(buf.len());
+            }
+            Ok(0)
+        }
+    }
+
+    /// The gate for `demux-frames-per-read`: the demux offers the kernel a whole batch, so a 64 KiB
+    /// burst is one read rather than eight.
+    #[test]
+    fn a_demux_read_asks_for_a_whole_batch_of_frames() {
+        let (tx, rx) = channel();
+        let room = Arc::new(Mutex::new(tx));
+        let opened = Arc::clone(&room);
+        let manager = Manager::with_lifetime(1, LIFETIME, move || {
+            let (mine, _peer) = UnixStream::pair().ok()?;
+            Some(Uplink {
+                read: Box::new(Room(Arc::clone(&opened))),
+                write: Box::new(mine),
+                close: Arc::new(|| {}),
+            })
+        });
+        let _flow = manager.dial(&target()).expect("a flow");
+        let offered = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the demux read");
+        assert_eq!(offered, READ_ROOM, "one read asks for a batch, not a frame");
+        assert_eq!(READ_ROOM, BATCH * mux::CHUNK_MAX);
     }
 
     #[test]

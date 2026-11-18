@@ -5187,6 +5187,19 @@ impl PooledReplies {
             }),
         }
     }
+
+    fn try_recv(&self) -> Option<PooledReply> {
+        match self {
+            Self::Cool(replies) => replies.try_recv().ok().map(|msg| PooledReply {
+                data: msg.data,
+                end: msg.end,
+            }),
+            Self::Sing(replies) => replies.try_recv().map(|msg| PooledReply {
+                data: msg.data,
+                end: msg.end,
+            }),
+        }
+    }
 }
 
 enum PooledUdpFlow {
@@ -12318,9 +12331,24 @@ pub(crate) unsafe fn read_into_tail(
     buf: &mut Vec<u8>,
     init: &mut usize,
 ) -> std::io::Result<usize> {
+    // SAFETY: the caller's watermark describes this buffer.
+    unsafe { read_into_tail_room(read, buf, init, READ_SLICE) }
+}
+
+/// The same room, sized by the caller: a framing buffer that decodes a whole batch per read asks the
+/// kernel for that batch in one call instead of one `READ_SLICE` at a time.
+/// # Safety
+///
+/// `init` must describe `buf`: every byte below it is initialised.
+pub(crate) unsafe fn read_into_tail_room(
+    read: &mut (impl Read + ?Sized),
+    buf: &mut Vec<u8>,
+    init: &mut usize,
+    room: usize,
+) -> std::io::Result<usize> {
     let base = buf.len();
     // SAFETY: the caller's watermark describes this buffer.
-    unsafe { ferrox_core::read::init_room(buf, init, base + READ_SLICE) };
+    unsafe { ferrox_core::read::init_room(buf, init, base + room) };
     match read.read(&mut buf[base..]) {
         Ok(n) => {
             buf.truncate(base + n);
@@ -19803,9 +19831,9 @@ fn dial_pooled_mux(client: &Connection, pool: &Arc<MuxPool>, target: &Destinatio
     true
 }
 
-/// A bulk mux upload read: four frame-sized chunks, so 32 KiB costs one read and one vectored write
-/// where an 8 KiB slice cost four of each.
-const MUX_UPLOAD_SLICE: usize = 4 * ferrox_core::mux::CHUNK_MAX;
+/// A bulk mux upload read: eight frame-sized chunks, so 64 KiB costs one read and one vectored write
+/// where an 8 KiB slice cost eight of each.
+const MUX_UPLOAD_SLICE: usize = 8 * ferrox_core::mux::CHUNK_MAX;
 
 fn relay_pool_flow(client: &Connection, mut flow: PooledFlow) {
     let Ok(up) = client.try_clone() else {
@@ -19845,18 +19873,43 @@ fn relay_pool_flow(client: &Connection, mut flow: PooledFlow) {
     join(&done);
 }
 
+/// Replies one downlink hands the app socket at a time: a batch of `Keep` payloads leaves as one
+/// vectored write, so 64 KiB costs one call where a frame at a time cost eight.
+const MUX_DOWN_BATCH: usize = 8;
+
 /// One session's replies as the client's downlink: every `Keep` payload is written in arrival order,
-/// and `true` reports an `End` so the caller can close its half.
-fn mux_pool_downlink(replies: &PooledReplies, down: &mut Connection) -> bool {
-    while let Ok(msg) = replies.recv() {
-        if !msg.data.is_empty() && down.write_all(&msg.data).is_err() {
+/// batched into one vectored call, and `true` reports an `End` so the caller can close its half.
+fn mux_pool_downlink(replies: &PooledReplies, down: &mut dyn Write) -> bool {
+    let mut batch: Vec<PooledReply> = Vec::with_capacity(MUX_DOWN_BATCH);
+    loop {
+        let Ok(first) = replies.recv() else {
             return false;
+        };
+        let mut ended = first.end;
+        if !first.data.is_empty() {
+            batch.push(first);
         }
-        if msg.end {
+        while !ended && batch.len() < MUX_DOWN_BATCH {
+            let Some(reply) = replies.try_recv() else {
+                break;
+            };
+            ended = reply.end;
+            if !reply.data.is_empty() {
+                batch.push(reply);
+            }
+        }
+        if !batch.is_empty() {
+            let parts: [&[u8]; MUX_DOWN_BATCH] =
+                std::array::from_fn(|at| batch.get(at).map_or(&[][..], |reply| &reply.data[..]));
+            if write_all_parts::<MUX_DOWN_BATCH>(&mut *down, &parts[..batch.len()]).is_err() {
+                return false;
+            }
+            batch.clear();
+        }
+        if ended {
             return true;
         }
     }
-    false
 }
 
 fn mux_target(target: &Destination) -> ferrox_core::mux::Target<'_> {
@@ -65196,6 +65249,78 @@ mod tests {
             "the payload must be the writev part itself, not a copy of it"
         );
         assert_eq!(parts[1].iov_len, 1400);
+    }
+
+    #[derive(Default)]
+    struct Parts {
+        calls: usize,
+        bases: Vec<usize>,
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for Parts {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.write_vectored(&[IoSlice::new(buf)])
+        }
+
+        fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+            self.calls += 1;
+            for buf in bufs {
+                self.bases.push(buf.as_ptr() as usize);
+                self.bytes.extend_from_slice(buf);
+            }
+            Ok(bufs.iter().map(|buf| buf.len()).sum())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The gate for `downlink-frames-per-write`: eight `Keep` payloads leave the downlink as one
+    /// vectored call whose parts are the replies' own buffers.
+    #[test]
+    fn a_mux_downlink_hands_a_batch_of_frames_over_in_one_call() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut bases = Vec::new();
+        let mut want = Vec::new();
+        for at in 0..8u8 {
+            let data = vec![at; 8 * 1024];
+            bases.push(data.as_ptr() as usize);
+            want.extend_from_slice(&data);
+            tx.send(crate::muxpool::Msg { data, end: false })
+                .expect("the reply is queued");
+        }
+        drop(tx);
+        let mut sink = Parts::default();
+        let ended = mux_pool_downlink(&PooledReplies::Cool(rx), &mut sink);
+        assert!(!ended, "a closed channel is not an End frame");
+        assert_eq!(sink.calls, 1, "eight replies leave in one call");
+        assert_eq!(sink.bases, bases, "each part is the reply's own buffer");
+        assert_eq!(sink.bytes, want, "every payload byte reaches the app");
+    }
+
+    /// The room a tail read offers is the caller's: the mux demux asks the kernel for a whole batch.
+    #[test]
+    fn a_read_into_the_tail_offers_the_callers_whole_room() {
+        struct Fixed(usize);
+        impl Read for Fixed {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0 = buf.len();
+                buf[..3].copy_from_slice(b"abc");
+                Ok(3)
+            }
+        }
+        let mut read = Fixed(0);
+        let mut buf = Vec::new();
+        let mut init = 0;
+        // SAFETY: `init` starts at zero, so nothing below it is uninitialised.
+        let got = unsafe { read_into_tail_room(&mut read, &mut buf, &mut init, 64 * 1024) }
+            .expect("the read lands");
+        assert_eq!(got, 3);
+        assert_eq!(read.0, 64 * 1024, "the kernel is offered the whole room");
+        assert_eq!(&buf[..], b"abc", "the tail holds only what was read");
+        assert!(init >= 3, "the watermark covers the bytes read");
     }
 
     /// The stream frame is written whole before it is read, so its buffer is claimed, not zeroed: the

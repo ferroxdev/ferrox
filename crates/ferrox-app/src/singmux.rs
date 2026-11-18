@@ -377,6 +377,18 @@ impl Queue {
         Some(msg)
     }
 
+    fn try_pop(&self) -> Option<Msg> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let msg = state.messages.pop_front()?;
+        state.queued -= msg.data.len();
+        drop(state);
+        self.space.notify_all();
+        Some(msg)
+    }
+
     fn close(&self) {
         let mut state = match self.state.lock() {
             Ok(state) => state,
@@ -402,11 +414,21 @@ pub(crate) struct Replies {
 
 impl Replies {
     pub(crate) fn recv(&self) -> Result<Msg, std::sync::mpsc::RecvError> {
-        let msg = self.queue.pop().ok_or(std::sync::mpsc::RecvError)?;
+        self.settle(self.queue.pop())
+            .ok_or(std::sync::mpsc::RecvError)
+    }
+
+    /// A reply already queued: what the downlink drains behind its first blocking read.
+    pub(crate) fn try_recv(&self) -> Option<Msg> {
+        self.settle(self.queue.try_pop())
+    }
+
+    fn settle(&self, msg: Option<Msg>) -> Option<Msg> {
+        let msg = msg?;
         if msg.credit > 0 {
             self.inner.credit(self.id, msg.credit);
         }
-        Ok(msg)
+        Some(msg)
     }
 }
 
