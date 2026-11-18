@@ -538,24 +538,8 @@ impl Api {
                         return;
                     };
                     if id.is_multiple_of(2) {
-                        if let Err(code) = absorb_headers(
-                            &mut decoder,
-                            &mut discard,
-                            id,
-                            block,
-                            flags & h2::F_END_HEADERS != 0,
-                            false,
-                        ) {
-                            goaway(&mut stream, code, last_id);
-                            return;
-                        }
-                        if flags & h2::F_END_HEADERS == 0 {
-                            continuation = Some(id);
-                        }
-                        if !reset(&mut stream, id, h2::E_PROTOCOL) {
-                            return;
-                        }
-                        continue;
+                        goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                        return;
                     }
                     if responses.contains_key(&id) {
                         if let Err(code) = absorb_headers(
@@ -654,6 +638,7 @@ impl Api {
                         if !reset(&mut stream, id, h2::E_REFUSED) {
                             return;
                         }
+                        flow.refuse(id);
                         continue;
                     }
                     if !flow.open(id) {
@@ -1577,7 +1562,6 @@ struct Flow {
     recv_connection: i64,
     recv_streams: HashMap<u32, i64>,
     ended: HashSet<u32>,
-    seen: HashSet<u32>,
     opened: u32,
 }
 
@@ -1590,7 +1574,6 @@ impl Flow {
             recv_connection: 65_535,
             recv_streams: HashMap::new(),
             ended: HashSet::new(),
-            seen: HashSet::new(),
             opened: 0,
         }
     }
@@ -1599,7 +1582,6 @@ impl Flow {
         if id == 0 || id.is_multiple_of(2) {
             return false;
         }
-        self.seen.insert(id);
         if id > self.opened {
             self.streams.entry(id).or_insert(self.initial);
             self.recv_streams.entry(id).or_insert(65_535);
@@ -1609,7 +1591,11 @@ impl Flow {
     }
 
     fn idle(&self, id: u32) -> bool {
-        id != 0 && !self.seen.contains(&id)
+        id != 0 && (id.is_multiple_of(2) || id > self.opened)
+    }
+
+    fn refuse(&mut self, id: u32) {
+        self.opened = self.opened.max(id);
     }
 
     fn close(&mut self, id: u32) {

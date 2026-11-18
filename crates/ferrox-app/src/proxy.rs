@@ -4370,6 +4370,7 @@ fn server_networks(inbound: &Json) -> Option<Vec<crate::router::Network>> {
     match canonical_protocol(protocol) {
         "shadowsocks" => {
             let (tcp, udp) = inbound_ss_networks(inbound);
+            let udp = matches!(inbound_carrier(inbound), Carrier::Raw(_)) && (tcp || udp);
             let mut networks = Vec::with_capacity(2);
             if tcp {
                 networks.push(crate::router::Network::Tcp);
