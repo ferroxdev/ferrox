@@ -2378,16 +2378,26 @@ fn apply_socket_mode(
             Err(io::Error::last_os_error())
         }
     };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(target_vendor = "apple")]
     let applied = {
-        use std::os::unix::io::AsRawFd as _;
-        // SAFETY: the listener owns a live descriptor and `mode` is a file-mode bit set.
-        let rc = unsafe { libc::fchmod(_listener.as_raw_fd(), mode as libc::mode_t) };
+        use std::os::unix::ffi::OsStrExt as _;
+        let text = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the unix path has a NUL"))?;
+        // SAFETY: `text` is a live NUL-terminated path and `lchmod` never follows the last link.
+        let rc = unsafe { libc::lchmod(text.as_ptr(), mode as libc::mode_t) };
         if rc == 0 {
             Ok(())
         } else {
             Err(io::Error::last_os_error())
         }
+    };
+    #[cfg(all(
+        unix,
+        not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))
+    ))]
+    let applied = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
     };
     applied?;
     let after = std::fs::symlink_metadata(path)?;
