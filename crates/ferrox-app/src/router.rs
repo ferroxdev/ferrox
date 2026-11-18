@@ -1266,6 +1266,7 @@ impl Routing {
             rules.push(rule);
         }
         let forced = |tag: &str| self.forced_tag(tag);
+        let always_picks = self.always_picks();
         for proof in proofs {
             if append {
                 Self::server_routes_over(
@@ -1273,9 +1274,16 @@ impl Routing {
                     self.rules.iter().chain(rules.iter()),
                     proof,
                     &forced,
+                    &always_picks,
                 )?;
             } else {
-                Self::server_routes_over(self.script.is_some(), rules.iter(), proof, &forced)?;
+                Self::server_routes_over(
+                    self.script.is_some(),
+                    rules.iter(),
+                    proof,
+                    &forced,
+                    &always_picks,
+                )?;
             }
         }
         if append {
@@ -1545,7 +1553,21 @@ impl Routing {
     /// could match and points elsewhere refuses the start, because this tree serves that inbound direct.
     pub(crate) fn server_routes(&self, proof: &ServerProof<'_>) -> Result<(), String> {
         let forced = |tag: &str| self.forced_tag(tag);
-        Self::server_routes_over(self.script.is_some(), self.rules.iter(), proof, &forced)
+        Self::server_routes_over(
+            self.script.is_some(),
+            self.rules.iter(),
+            proof,
+            &forced,
+            &self.always_picks(),
+        )
+    }
+
+    fn always_picks(&self) -> HashSet<&str> {
+        self.balancers
+            .iter()
+            .filter(|balancer| matches!(balancer.strategy, Strategy::Random | Strategy::RoundRobin))
+            .map(|balancer| balancer.tag.as_str())
+            .collect()
     }
 
     /// The tag `OverrideBalancerTarget` forced on a balancer, when one is active.
@@ -1559,6 +1581,7 @@ impl Routing {
         rules: impl Iterator<Item = &'r Rule>,
         proof: &ServerProof<'_>,
         forced: &dyn Fn(&str) -> Option<String>,
+        always_picks: &HashSet<&str>,
     ) -> Result<(), String> {
         let ServerProof {
             inbound,
@@ -1604,7 +1627,9 @@ impl Routing {
                     let fallback = fallbacks.get(&rule.target);
                     list.iter().all(|tag| direct(tag))
                         && fallback.is_none_or(|tag| direct(tag))
-                        && (fallback.is_some() || default_direct)
+                        && (fallback.is_some()
+                            || default_direct
+                            || (always_picks.contains(rule.target.as_str()) && !list.is_empty()))
                 }
             } else {
                 direct(&rule.target)
@@ -2607,6 +2632,17 @@ impl SetRule {
     /// into a hit, so only a non-inverted branch proves the network is impossible.
     fn can_reach_on(&self, network: Network) -> bool {
         if self.invert {
+            let network_only = self.logical.is_none()
+                && self.domains.is_none()
+                && self.ports.is_none()
+                && self.source_ports.is_none()
+                && self.ips.is_none()
+                && self.source_ips.is_none();
+            if network_only {
+                if let Some(networks) = &self.networks {
+                    return !networks.contains(&network);
+                }
+            }
             return true;
         }
         let Some(logical) = &self.logical else {
@@ -6018,13 +6054,21 @@ mod tests {
             default_direct: false,
             ..proof
         };
-        let error = routing
+        routing
             .server_routes(&proxy_default)
-            .expect_err("a strategy with no pick falls to the proxy default");
+            .expect("a nonempty random pool never falls to the proxy default");
+        let no_candidates = HashMap::new();
+        let no_pick = ServerProof {
+            candidates: &no_candidates,
+            ..proxy_default
+        };
+        let error = routing
+            .server_routes(&no_pick)
+            .expect_err("an empty random pool falls to the proxy default");
         assert!(error.contains("pool"), "{error}");
         let direct_default = ServerProof {
             default_direct: true,
-            ..proxy_default
+            ..no_pick
         };
         routing
             .server_routes(&direct_default)

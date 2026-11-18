@@ -2478,24 +2478,32 @@ fn auth_exchange(
             Ok((n, fin)) => {
                 inbound.auth_fin |= fin;
                 inbound.auth_buf.extend_from_slice(&room.as_mut()[..n]);
+                if inbound.auth_buf.len() >= HEAD_CAP {
+                    inbound.auth_buf.clear();
+                    inbound.auth_fin = false;
+                    return Some(Auth::Refused);
+                }
             }
             Err(_) => break,
         }
     }
-    if inbound.auth_buf.len() >= HEAD_CAP {
-        return Some(Auth::Refused);
-    }
     let mut at = 0usize;
-    let body = frames::h3_frame(&inbound.auth_buf, &mut at)
+    let Some(body) = frames::h3_frame(&inbound.auth_buf, &mut at)
         .filter(|frame| frame.kind == frames::H3_HEADERS)
-        .and_then(|frame| inbound.auth_buf.get(at..at + frame.length as usize))?;
+        .and_then(|frame| inbound.auth_buf.get(at..at + frame.length as usize))
+    else {
+        return inbound.auth_fin.then_some(Auth::Refused);
+    };
     // A request that is not the hysteria handshake shape is a browser: it is answered as the cover site on this very stream — the plain not-found when no richer cover is configured — and the connection is kept for its later requests. A right-shape, wrong-password handshake still falls through below and refuses exactly as a plain hysteria server would.
     if !hysteria::is_hysteria_auth_shape(body) {
-        let request = assemble_request(&inbound.auth_buf)?;
+        let Some(request) = assemble_request(&inbound.auth_buf) else {
+            return inbound.auth_fin.then_some(Auth::Refused);
+        };
         if !request_complete(&request, inbound.auth_fin) {
-            return None;
+            return inbound.auth_fin.then_some(Auth::Refused);
         }
         inbound.auth_buf.clear();
+        inbound.auth_fin = false;
         let peer = peer.to_string();
         if let Some(shared) = background {
             let Some(slot) = CoverSlot::acquire() else {
@@ -2524,7 +2532,7 @@ fn auth_exchange(
             masq_bytes(masq, &request, Some(&peer), &mut reply);
             if !crate::quic::stream_send_all(conn, sock, AUTH_STREAM, &reply, true, Instant::now())
             {
-                return None;
+                return Some(Auth::Refused);
             }
         }
         return Some(Auth::Cover);
@@ -2533,9 +2541,12 @@ fn auth_exchange(
         .iter()
         .any(|auth| hysteria::verify_auth_request(body, auth));
     if !answer_auth(conn, sock, ok, inbound.cc_rx) {
-        return None;
+        inbound.auth_buf.clear();
+        inbound.auth_fin = false;
+        return Some(Auth::Refused);
     }
     inbound.auth_buf.clear();
+    inbound.auth_fin = false;
     if ok {
         inbound.standing = Standing::Authed;
         Some(Auth::Ok)
