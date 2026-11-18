@@ -185,6 +185,16 @@ impl TokenFile {
         pending: Option<&str>,
         pending_method: Option<&str>,
     ) -> bool {
+        self.save_pending_checked(auth, pending, pending_method, None)
+    }
+
+    fn save_pending_checked(
+        &self,
+        auth: Option<&Auth>,
+        pending: Option<&str>,
+        pending_method: Option<&str>,
+        expected_refresh: Option<&str>,
+    ) -> bool {
         use crate::json::{self, Json};
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -193,6 +203,15 @@ impl TokenFile {
             eprintln!("foxy: cannot lock the session at {}", self.path.display());
             return false;
         };
+        if expected_refresh.is_some_and(|expected| {
+            self.load()
+                .and_then(|session| session.auth)
+                .is_some_and(|auth| {
+                    !auth.refresh_token.is_empty() && auth.refresh_token != expected
+                })
+        }) {
+            return true;
+        }
         let mut pairs = vec![("email".to_owned(), Json::Str(self.email.clone()))];
         if let Some(auth) = auth {
             pairs.push((
@@ -277,9 +296,9 @@ impl TokenFile {
     }
 
     /// The refused grant only stops a future launch when the file still holds it; a grant another process rotated in since is left alone.
-    pub(crate) fn clear_if(&self, refused: &str) {
+    pub(crate) fn clear_if(&self, refused: &str) -> bool {
         let Some(_lock) = self.lock_file() else {
-            return;
+            return false;
         };
         let same = self.load().is_some_and(|session| {
             session
@@ -289,6 +308,7 @@ impl TokenFile {
         if same {
             self.clear();
         }
+        true
     }
 
     pub(crate) fn clear(&self) {
@@ -2200,7 +2220,7 @@ impl Account {
     }
 
     /// Forgets a grant the plane refused, so the next launch asks for the password instead of replaying a dead token.
-    pub(crate) fn forget(&self) {
+    pub(crate) fn forget(&self) -> bool {
         let refused = if let Ok(mut auth) = self.auth.lock() {
             let refused = auth.access_token.clone();
             *auth = Auth {
@@ -2210,11 +2230,11 @@ impl Account {
             };
             refused
         } else {
-            return;
+            return false;
         };
-        if let Some(tokens) = &self.tokens {
-            tokens.clear_if(&refused);
-        }
+        self.tokens
+            .as_ref()
+            .is_none_or(|tokens| tokens.clear_if(&refused))
     }
 
     /// Sets the new grant before minting so a refresh that is written but not yet used still renews the next launch; `forced` stops trusting a clock the plane has already refused.
@@ -2252,7 +2272,13 @@ impl Account {
             Err(other) => return Err(other),
         };
         *self.auth.lock().map_err(|_| Denied::Token)? = fresh.clone();
-        self.persist();
+        if !self.persist_after(Some(&base.refresh_token))
+            && !self.persist_after(Some(&base.refresh_token))
+        {
+            return Err(Denied::Unreachable(
+                "the session store stayed locked".to_owned(),
+            ));
+        }
         Ok(fresh)
     }
 
@@ -2264,9 +2290,13 @@ impl Account {
         fresh
     }
 
-    fn persist(&self) {
+    fn persist(&self) -> bool {
+        self.persist_after(None)
+    }
+
+    fn persist_after(&self, expected_refresh: Option<&str>) -> bool {
         let Some(tokens) = &self.tokens else {
-            return;
+            return true;
         };
         let auth = self.auth.lock().ok().map(|auth| auth.clone());
         let pending = self.pending.lock().ok().and_then(|pending| pending.clone());
@@ -2275,7 +2305,12 @@ impl Account {
             .lock()
             .ok()
             .and_then(|method| method.clone());
-        tokens.save_pending(auth.as_ref(), pending.as_deref(), method.as_deref());
+        tokens.save_pending_checked(
+            auth.as_ref(),
+            pending.as_deref(),
+            method.as_deref(),
+            expected_refresh,
+        )
     }
 
     /// Turns a session token into an access token and mints the first pass.

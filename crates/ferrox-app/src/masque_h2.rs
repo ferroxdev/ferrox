@@ -1214,6 +1214,14 @@ impl Session {
         }
     }
 
+    /// The request half is done: no new packets, so a datagram lane starts (or restarts) its quiet interval now.
+    fn half_close(&mut self) {
+        self.half_closed = true;
+        if self.warp || self.udp.is_some() {
+            self.udp_quiet = Some(Instant::now());
+        }
+    }
+
     /// Serve one connection from the handshake clock onward.
     fn run(&mut self, wire: &mut Wire) {
         self.run_until(
@@ -1317,7 +1325,7 @@ impl Session {
                     if id != active {
                         wire.send(h2::T_RST, 0, id, &7u32.to_be_bytes());
                     } else if flags & h2::F_END != 0 {
-                        self.half_closed = true;
+                        self.half_close();
                     }
                     return;
                 }
@@ -1325,7 +1333,7 @@ impl Session {
                 if flags & h2::F_END_HEADERS != 0 {
                     self.request(wire, id, block);
                     if flags & h2::F_END != 0 {
-                        self.half_closed = true;
+                        self.half_close();
                     }
                 } else {
                     self.continuation = Some((id, block.to_vec(), flags));
@@ -1346,7 +1354,7 @@ impl Session {
                     if flags & h2::F_END_HEADERS != 0 {
                         self.request(wire, id, &block);
                         if head_flags & h2::F_END != 0 {
-                            self.half_closed = true;
+                            self.half_close();
                         }
                     } else {
                         self.continuation = Some((id, block, head_flags));
@@ -1371,7 +1379,7 @@ impl Session {
                 self.window(wire, length);
                 self.capsules(wire, data);
                 if flags & h2::F_END != 0 {
-                    self.half_closed = true;
+                    self.half_close();
                 }
             }
             h2::T_RST if Some(id) == self.request => self.end = true,
@@ -1657,15 +1665,10 @@ impl Session {
         }
         let mut origin_closed = false;
         // CONNECT-IP keeps its grant and sender alive, so waiting for `outgoing` to disconnect is a wait it never reaches; both datagram modes drain on a quiet window instead.
-        let drainable = !self.warp;
+        let drainable = self.warp || self.udp.is_some();
         if self.half_closed && drainable && self.udp_quiet.is_none() {
             self.udp_quiet = Some(Instant::now());
         }
-        let udp_drained = self.half_closed
-            && drainable
-            && self
-                .udp_quiet
-                .is_some_and(|quiet| quiet.elapsed() >= UDP_DRAIN);
         for _ in 0..QUEUED_CAP {
             // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
             if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
@@ -1704,6 +1707,11 @@ impl Session {
             self.send(wire, &frame);
         }
         self.frame = frame;
+        let udp_drained = self.half_closed
+            && drainable
+            && self
+                .udp_quiet
+                .is_some_and(|quiet| quiet.elapsed() >= UDP_DRAIN);
         if self.half_closed
             && (origin_closed || udp_drained)
             && self.queued.is_empty()

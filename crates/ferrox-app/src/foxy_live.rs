@@ -183,8 +183,19 @@ fn try_carrier(
     // The lease goes into the open and rides the lane, so the probe gives the pool entry back when it ends.
     let mut tunnel = Tunnel::open(&dial, &format!("{PROBE_HOST}:80"), quic)
         .map_err(|failure| failure.to_string())?;
-    let ip = through_tunnel(&mut tunnel, PROBE_HOST, PROBE_PATH)
+    let answer = through_tunnel(&mut tunnel, PROBE_HOST, PROBE_PATH)
         .ok_or_else(|| "no answer through the tunnel".to_owned())?;
+    let (head, body) = answer
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "the probe sent a head without a body".to_owned())?;
+    let mut status = head.lines().next().unwrap_or_default().split_whitespace();
+    if status.next() != Some("HTTP/1.1") || status.next() != Some("200") {
+        return Err("the probe did not answer 200".to_owned());
+    }
+    let ip = body
+        .trim()
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| "the probe did not name an IP".to_owned())?;
     let _ = tunnel.finish();
     tunnel.settle();
     // The trace names another origin, so it needs its own CONNECT rather than a Host header on the probe's flow.
@@ -202,7 +213,7 @@ fn try_carrier(
     trace.settle();
     Ok(format!(
         "{} {} in {:?}, exit {seen}",
-        ip.split_whitespace().last().unwrap_or("?"),
+        ip,
         edge.authority(),
         started.elapsed(),
     ))
@@ -262,7 +273,8 @@ fn carried(
 }
 
 /// The plane's counter after a charge has landed: mint until two mints agree, so a figure read before the plane wrote it is not read as the charge.
-fn settled(account: &Account, mut was: u64, deadline: Instant) -> Option<u64> {
+fn settled(account: &Account, _was: u64, deadline: Instant) -> Option<u64> {
+    let mut last = None;
     for _ in 0..SETTLE_MINTS {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -275,14 +287,18 @@ fn settled(account: &Account, mut was: u64, deadline: Instant) -> Option<u64> {
         account
             .renew()
             .expect("mints a pass while the counter settles");
+        if Instant::now() >= deadline {
+            return None;
+        }
         let now = account
             .current()
             .quota_remaining
             .expect("the plane names an allowance on every mint");
-        if now == was {
+        // Two post-transfer mints must agree: the balance read before the request is not one of them.
+        if last == Some(now) {
             return Some(now);
         }
-        was = now;
+        last = Some(now);
     }
     None
 }
@@ -430,13 +446,13 @@ fn brackets(
     println!(
         "{carrier:?}: {whole}.{fraction:03} bytes charged per byte carried between {small_bytes} and {large_bytes} bytes; {fixed} bytes fixed per flow"
     );
-    // Last, so a closing flow's fetch cannot be read as the large payload's: what a cancel costs is the window the edge was allowed to fill ahead of the caller.
-    canceled(account, carrier, edge, pass, was, deadline)?;
     // A tunnel that costs its payload spends one allowance byte per carried byte; a per-flow cost is the head's, and is not the slope.
     assert!(
         delta_charge.saturating_mul(4) <= delta_bytes.saturating_mul(5),
         "{carrier:?} charged {whole}.{fraction:03} bytes per carried byte between {small_bytes} and {large_bytes}: {large_charge} for {large_bytes} after {small_charge} for {small_bytes}, {fixed} fixed per flow"
     );
+    // Last, so a closing flow's fetch cannot be read as the large payload's: what a cancel costs is the window the edge was allowed to fill ahead of the caller.
+    canceled(account, carrier, edge, pass, was, deadline)?;
     Ok(())
 }
 

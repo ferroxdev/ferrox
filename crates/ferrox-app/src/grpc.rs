@@ -457,8 +457,8 @@ impl<R: Read> GrpcReader<R> {
         }
     }
 
-    fn refuse(&self, id: u32) {
-        self.emit(T_RST, 0, id, &E_REFUSED.to_be_bytes());
+    fn refuse(&self, id: u32) -> bool {
+        self.emit(T_RST, 0, id, &E_REFUSED.to_be_bytes())
     }
 
     fn headers(&mut self, id: u32, flags: u8, block: &[u8]) -> Option<()> {
@@ -494,8 +494,7 @@ impl<R: Read> GrpcReader<R> {
     fn serve_headers(&mut self, id: u32, flags: u8, gate: &Gate) -> Option<()> {
         if self.answered {
             if id != self.stream {
-                self.refuse(id);
-                return Some(());
+                return self.refuse(id).then_some(());
             }
             if flags & F_END != 0 {
                 self.eof = true;
@@ -1231,7 +1230,7 @@ impl<'a> Gather<'a> {
                     if Instant::now() >= deadline || !Self::settle_blocking(shared) {
                         return false;
                     }
-                    if !take_window(shared, self.credit, true) {
+                    if self.credit > 0 && !take_window(shared, self.credit, true) {
                         return false;
                     }
                     if let Ok(stream) = shared.stream.lock() {

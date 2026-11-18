@@ -839,14 +839,17 @@ impl WsWriter {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return crate::proxy::Push::Lost;
         };
-        if self.shared.closed.load(Ordering::SeqCst) {
+        let open = self.shared.open.load(Ordering::Relaxed);
+        let cut = self.shared.cut.load(Ordering::Relaxed);
+        if self.shared.closed.load(Ordering::SeqCst) && open == 0 && cut == 0 {
+            let _ = self.shared.flush(&mut **stream);
             return crate::proxy::Push::Lost;
         }
         if self.masked {
-            if self.shared.open.load(Ordering::Relaxed) != 0
-                || self.shared.cut.load(Ordering::Relaxed) != 0
-                || self.shared.closed.load(Ordering::SeqCst)
-            {
+            if self.shared.closed.load(Ordering::SeqCst) {
+                return crate::proxy::Push::Lost;
+            }
+            if open != 0 || cut != 0 {
                 return crate::proxy::Push::Parked;
             }
             match self.shared.flush(&mut **stream) {
@@ -860,8 +863,8 @@ impl WsWriter {
                 crate::proxy::Push::Lost
             };
         }
-        let mut owed = self.shared.open.load(Ordering::Relaxed);
-        let mut cut = self.shared.cut.load(Ordering::Relaxed);
+        let mut owed = open;
+        let mut cut = cut;
         if owed == 0 && cut == 0 {
             match self.shared.flush(&mut **stream) {
                 Flushed::Clear => {}
@@ -1199,29 +1202,78 @@ pub(crate) fn connect(
     Some((reader, writer))
 }
 
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = bytes {
+        if *first != b' ' && *first != b'\t' {
+            break;
+        }
+        bytes = rest;
+    }
+    while let [rest @ .., last] = bytes {
+        if *last != b' ' && *last != b'\t' {
+            break;
+        }
+        bytes = rest;
+    }
+    bytes
+}
+
+fn has_token_bytes(head: &[u8], name: &[u8], token: &[u8]) -> bool {
+    head.split(|byte| *byte == b'\n').skip(1).any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line
+            .first()
+            .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+        {
+            return false;
+        }
+        let Some(at) = line.iter().position(|byte| *byte == b':') else {
+            return false;
+        };
+        trim_ascii(&line[..at]).eq_ignore_ascii_case(name)
+            && line[at + 1..]
+                .split(|byte| *byte == b',')
+                .any(|part| trim_ascii(part).eq_ignore_ascii_case(token))
+    })
+}
+
 fn check_response(head: &[u8], key: &[u8]) -> Option<()> {
-    let text = std::str::from_utf8(head).ok()?;
-    let line_end = text.find("\r\n")?;
-    let mut parts = text[..line_end].split(' ');
-    if parts.next()? != "HTTP/1.1" || parts.next()? != "101" {
+    let line_end = head.windows(2).position(|pair| pair == b"\r\n")?;
+    let mut parts = head[..line_end]
+        .split(|byte| *byte == b' ')
+        .filter(|part| !part.is_empty());
+    if parts.next()? != b"HTTP/1.1" || parts.next()? != b"101" {
         return None;
     }
     let accept = accept_key(base64_text(key));
+    let mut seen = false;
     let mut accepted = false;
-    for line in text[line_end + 2..].split("\r\n") {
+    for line in head[line_end + 2..].split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             break;
         }
-        let Some((name, value)) = line.split_once(':') else {
+        if line
+            .first()
+            .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+        {
+            return None;
+        }
+        let Some(at) = line.iter().position(|byte| *byte == b':') else {
             continue;
         };
-        if name.eq_ignore_ascii_case("sec-websocket-accept") {
-            accepted = value.trim().as_bytes() == accept;
+        if trim_ascii(&line[..at]).eq_ignore_ascii_case(b"sec-websocket-accept") {
+            if seen {
+                return None;
+            }
+            seen = true;
+            accepted = trim_ascii(&line[at + 1..]) == accept;
         }
     }
-    (accepted
-        && has_token(text, "upgrade", "websocket")
-        && has_token(text, "connection", "upgrade"))
+    (seen
+        && accepted
+        && has_token_bytes(head, b"upgrade", b"websocket")
+        && has_token_bytes(head, b"connection", b"upgrade"))
     .then_some(())
 }
 

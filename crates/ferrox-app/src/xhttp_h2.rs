@@ -1661,6 +1661,11 @@ impl H2Conn {
                     .clamp(16_384, 16_777_215);
             } else if id == S_WINDOW {
                 let value = u64::from(value.min((1 << 31) - 1));
+                // A sender holds the connection window while it decides to wait; taking it here closes that gap.
+                let conn = self
+                    .send_conn
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
                 // The stream table gates the snapshot and the delta so neither misses nor doubles the other.
                 let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
                 let mut previous = self
@@ -1679,6 +1684,7 @@ impl H2Conn {
                     *window = window.saturating_add(delta).min(max);
                 }
                 drop(streams);
+                drop(conn);
                 self.wake.notify_all();
             }
         }
