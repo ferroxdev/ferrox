@@ -1768,8 +1768,11 @@ impl Rule {
                 "inboundTag" => inbound_tags = string_list(field, "inboundTag")?,
                 "localOS" => local_os = string_list(field, "localOS")?,
                 "protocol" => {
-                    protocols = string_list(field, "protocol")?
-                        .map(|list| list.into_iter().filter(|listed| !listed.is_empty()).collect());
+                    protocols = string_list(field, "protocol")?.map(|list| {
+                        list.into_iter()
+                            .filter(|listed| !listed.is_empty())
+                            .collect()
+                    });
                 }
                 "user" => {
                     users = string_list(field, "user")?.map(|names| UserSelector::parse(&names));
