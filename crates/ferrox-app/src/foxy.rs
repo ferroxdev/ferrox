@@ -559,6 +559,7 @@ pub(crate) fn open_h1(
     opened(status)?;
     Ok(Tls1 {
         tls,
+        wait: std::sync::OnceLock::new(),
         carried,
         at: 0,
         park: None,
@@ -804,6 +805,7 @@ pub(crate) fn open_udp_h1(
     Ok(H1Datagram {
         tls: Tls1 {
             tls,
+            wait: std::sync::OnceLock::new(),
             carried,
             at: 0,
             park: None,
@@ -838,6 +840,7 @@ fn open_session(dial: &FoxyDial) -> Result<Arc<Session>, Failure> {
     Ok(Arc::new(Session {
         inner: std::sync::Mutex::new(SessionInner {
             tls,
+            wait: std::sync::OnceLock::new(),
             // What a flow may put on the wire is only what the edge grants: the stream window arrives in its settings and the connection window only moves by a `WINDOW_UPDATE` on stream 0, so both start at the protocol default rather than at the window this lane asks the edge to keep open for it.
             conn: foxy::flow::Window::new(i64::from(frames::DEFAULT_WINDOW)),
             peer_initial: frames::DEFAULT_WINDOW,
@@ -1173,6 +1176,8 @@ impl Session {
 /// The session's state, under its one lock: one socket is one reader and one writer, so every frame is taken by one of them.
 struct SessionInner {
     tls: ferrox_core::tls::RustlsProvider<Connection>,
+    /// The session's edge socket, duplicated once the first lane parks and kept for every park after it.
+    wait: std::sync::OnceLock<Arc<Connection>>,
     /// The credit the whole connection may spend: every stream's bytes are spent against it at once, so it is a connection's window and not a stream's.
     conn: foxy::flow::Window,
     /// The `INITIAL_WINDOW_SIZE` the edge last announced: a change moves every stream by the difference, and the streams already running move too.
@@ -1502,7 +1507,7 @@ impl Tls2 {
         if !inner.tls.wants_read() {
             return None;
         }
-        Some((EdgeWait::Tcp(inner.tls.get_ref().try_clone().ok()?), park))
+        Some((EdgeWait::Tcp(parked_socket(&inner.tls, &inner.wait)?), park))
     }
 
     /// Ends this lane's half of its stream: an empty DATA with `END_STREAM`, so the edge closes the tunnel while the session stays open for the next stream.
@@ -2151,6 +2156,8 @@ impl Read for Tls2 {
 /// The HTTP/1.1 relay: bytes in, bytes out, once the status has been read. The head walk reads a whole window at a time, so the octets that arrived past `\r\n\r\n` in the answer's own record are the tunnel's first bytes and are handed over from here before the socket is touched again.
 pub(crate) struct Tls1 {
     tls: ferrox_core::tls::RustlsProvider<Connection>,
+    /// The lane's edge socket, duplicated once the first park needs it and kept for every park after it.
+    wait: std::sync::OnceLock<Arc<Connection>>,
     /// What the head walk took past the delimiter, with a cursor: draining would move what is left on every call.
     carried: Vec<u8>,
     at: usize,
@@ -2163,6 +2170,18 @@ fn debug_block(block: &[u8]) {
     if debug_on() {
         eprintln!("foxy-debug: undecodable header block {block:02x?}");
     }
+}
+
+/// The edge socket a lane parks on: one duplicate made on the first park and kept, because a parked leg wakes once per quantum and a dup and a close per wake is an idle flow's own syscall load.
+fn parked_socket(
+    tls: &ferrox_core::tls::RustlsProvider<Connection>,
+    wait: &std::sync::OnceLock<Arc<Connection>>,
+) -> Option<Arc<Connection>> {
+    if let Some(socket) = wait.get() {
+        return Some(Arc::clone(socket));
+    }
+    let socket = Arc::new(tls.get_ref().try_clone().ok()?);
+    Some(Arc::clone(wait.get_or_init(|| socket)))
 }
 
 impl Tls1 {
@@ -2182,7 +2201,7 @@ impl Tls1 {
         let park = self
             .park
             .filter(|_| self.at >= self.carried.len() && self.tls.wants_read())?;
-        Some((EdgeWait::Tcp(self.tls.get_ref().try_clone().ok()?), park))
+        Some((EdgeWait::Tcp(parked_socket(&self.tls, &self.wait)?), park))
     }
 }
 
@@ -3819,7 +3838,7 @@ pub(crate) enum Tunnel {
 
 /// The socket a relay leg parks on after it has handed the lane back: a TCP carrier's edge connection, or an h3 lane's datagram socket. Both answers are readiness only — neither takes a byte, so what wakes the wait is still there for the lane's own reader.
 pub(crate) enum EdgeWait {
-    Tcp(Connection),
+    Tcp(Arc<Connection>),
     Udp(std::sync::Arc<crate::quic::Datagram>),
 }
 
@@ -5164,6 +5183,48 @@ pub(crate) mod loopback {
         edge.join().expect("joins");
     }
 
+    /// An h1 lane parks on the one socket it dialled: a second park takes the same descriptor, not a dup this flow would close a quantum later.
+    #[test]
+    fn a_parked_http11_lane_hands_out_one_socket() {
+        let (roots, server) = minted(b"http/1.1");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                read_exact(&mut tls, &mut byte).expect("reads the request");
+                head.push(byte[0]);
+            }
+            tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answers");
+            let mut sink = [0u8; 1];
+            let _ = tls.read(&mut sink);
+        });
+        let dial = dial_for(roots, port, Carrier::H1, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        tunnel
+            .set_relay_quantum(Duration::from_millis(100))
+            .expect("arms");
+        let (one, _) = tunnel.read_wait().expect("the lane can park");
+        let (two, _) = tunnel.read_wait().expect("the lane can park again");
+        assert_eq!(
+            crate::census::handle(&one),
+            crate::census::handle(&two),
+            "a second park on one h1 lane duplicated its socket again"
+        );
+        drop((one, two));
+        drop(tunnel);
+        edge.join().expect("joins");
+    }
+
     /// The no-loss gate for the bulk head walk: an edge that puts the answer and the target's first bytes in one record has to have both reach the relay, in order. A walk that read one byte at a time could not overshoot the delimiter, so nothing in the suite saw this shape before.
     #[test]
     fn the_head_walk_hands_on_the_bytes_the_edge_pipelined_behind_it() {
@@ -5539,6 +5600,35 @@ pub(crate) mod loopback {
         second.read_exact(&mut back_two).expect("reads the second");
         assert_eq!(back_one, one, "the first flow got its own bytes");
         assert_eq!(back_two, two, "the second flow got its own bytes");
+    }
+
+    /// Every park on one h2 session waits on the one socket the session was dialled with: the lane that parks second and the lane that parks again take the same descriptor, not a new dup and a close each quantum.
+    #[test]
+    fn a_parked_http2_session_hands_out_one_socket() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _edge = h2_session_edge(listener, server, accepts);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut first = Tunnel::open(&dial, "one.test:80", None).expect("opens");
+        let second = Tunnel::open(&dial, "two.test:80", None).expect("opens");
+        first
+            .set_relay_quantum(Duration::from_millis(100))
+            .expect("arms the first lane");
+        let (one, _) = first.read_wait().expect("the first lane can park");
+        let (two, _) = second.read_wait().expect("the second lane can park");
+        let (again, _) = first.read_wait().expect("the first lane can park again");
+        assert_eq!(
+            crate::census::handle(&one),
+            crate::census::handle(&two),
+            "two streams of one session park on two sockets"
+        );
+        assert_eq!(
+            crate::census::handle(&one),
+            crate::census::handle(&again),
+            "a second park on one lane duplicated its socket again"
+        );
     }
 
     /// An h2 edge that answers the open, writes the frames handed to it, and then drains until the socket goes quiet.
