@@ -2034,6 +2034,9 @@ impl SlotWriter {
             .map_err(|error| {
                 self.release_room();
                 let message = format!("slot {seq} failed to start: {error}");
+                if self.drained(seq).unwrap_or(false) {
+                    let _ = self.set_frame(seq, SLOT_ERR, &[]);
+                }
                 self.fail(message.clone());
                 carrier_error(message)
             })?;
@@ -2202,10 +2205,11 @@ impl SlotWriter {
     }
 
     fn abort(self: &Arc<Self>) {
+        self.done.store(true, Ordering::Release);
         if self.ended.swap(true, Ordering::AcqRel) {
+            self.room.notify_all();
             return;
         }
-        self.done.store(true, Ordering::Release);
         {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.closed = true;
