@@ -980,6 +980,9 @@ fn choose_slice<'p>(
     supplied: &Values,
     named: Option<&'p MethodRow>,
 ) -> Result<(Offer<'p>, Vec<advisor::Skipped>), Refusal> {
+    if let Some(message) = ledger_refusal(ledger) {
+        return Err((message, 1));
+    }
     if let Some(id) = args.forced {
         let Some(prompt) = library.prompt(id) else {
             return Err((unknown_prompt(library, id), 2));
@@ -1122,6 +1125,10 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         return ExitCode::from(1);
     };
     let ledger = load_ledger(root);
+    if let Some(message) = ledger_refusal(&ledger) {
+        eprintln!("{message}");
+        return ExitCode::from(1);
+    }
     let state = ProjectState::load(root);
     let named = match &args.row {
         Some(selector) => match named_row(prompt, &state, library, selector) {
@@ -1370,7 +1377,7 @@ fn report_metadata(
 fn load_ledger(root: &Path) -> Ledger {
     let ledger = Ledger::load(Ledger::path_for(root));
     if let Some(error) = &ledger.read_error {
-        eprintln!("warning: {error}; continuing with an empty history");
+        eprintln!("warning: {error}; the history is incomplete");
     }
     if ledger.skipped > 0 {
         eprintln!(
@@ -1380,6 +1387,21 @@ fn load_ledger(root: &Path) -> Ledger {
         );
     }
     ledger
+}
+
+/// Refuse a choice that would repeat served work because the history could not be read in full.
+fn ledger_refusal(ledger: &Ledger) -> Option<String> {
+    if let Some(error) = &ledger.read_error {
+        return Some(format!(
+            "{error}; refusing to choose a slice from an unreadable history"
+        ));
+    }
+    (ledger.skipped > 0).then(|| {
+        format!(
+            "{} ledger record(s) were skipped; refusing to choose a slice from an incomplete history",
+            ledger.skipped
+        )
+    })
 }
 
 /// Record progress by rewriting exactly the prompt's `**Status:**` line: reflowing Markdown would fight the contributor's edits.

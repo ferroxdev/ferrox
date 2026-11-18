@@ -3,13 +3,13 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
-use std::net::{Ipv6Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::args::die;
-use crate::config::{fronts, port_of, Ports};
+use crate::config::{front_listeners, fronts, port_of, Ports};
 use crate::paths::{read_trim, read_trim_checked, secure_dir, write_private, Paths};
 
 fn bin_name() -> &'static str {
@@ -370,21 +370,86 @@ pub fn stop(paths: &Paths) -> Result<(), String> {
     }
 }
 
-pub fn port_open(port: u16) -> bool {
-    let v4 = SocketAddr::from(([127, 0, 0, 1], port));
-    if TcpStream::connect_timeout(&v4, Duration::from_millis(300)).is_ok() {
-        return true;
+enum Listener {
+    Ready(Vec<SocketAddr>),
+    Pending(std::sync::mpsc::Receiver<Vec<SocketAddr>>),
+}
+
+impl Listener {
+    fn new(listen: &str, port: u16) -> Self {
+        let listen = listen.trim();
+        let host = listen
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(listen);
+        match host.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) if ip.is_unspecified() => {
+                Self::Ready(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))])
+            }
+            Ok(IpAddr::V4(ip)) => Self::Ready(vec![SocketAddr::from((ip, port))]),
+            Ok(IpAddr::V6(ip)) if ip.is_unspecified() => {
+                Self::Ready(vec![SocketAddr::from((Ipv6Addr::LOCALHOST, port))])
+            }
+            Ok(IpAddr::V6(ip)) => Self::Ready(vec![SocketAddr::from((ip, port))]),
+            Err(_) if host.is_empty() => Self::Ready(loopback_addresses(port)),
+            Err(_) => {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let host = host.to_owned();
+                let _ = std::thread::spawn(move || {
+                    let addresses = (host.as_str(), port)
+                        .to_socket_addrs()
+                        .map(std::iter::Iterator::collect::<Vec<_>>)
+                        .unwrap_or_default();
+                    let _ = sender.send(addresses);
+                });
+                Self::Pending(receiver)
+            }
+        }
     }
-    let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
-    TcpStream::connect_timeout(&v6, Duration::from_millis(300)).is_ok()
+
+    fn addresses(&mut self) -> Vec<SocketAddr> {
+        match self {
+            Self::Ready(addresses) => addresses.clone(),
+            Self::Pending(receiver) => match receiver.try_recv() {
+                Ok(addresses) => {
+                    *self = Self::Ready(addresses.clone());
+                    addresses
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => Vec::new(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    *self = Self::Ready(Vec::new());
+                    Vec::new()
+                }
+            },
+        }
+    }
+}
+
+fn loopback_addresses(port: u16) -> Vec<SocketAddr> {
+    vec![
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+    ]
+}
+
+pub fn port_open(addresses: &[SocketAddr]) -> bool {
+    addresses
+        .iter()
+        .any(|address| TcpStream::connect_timeout(address, Duration::from_millis(300)).is_ok())
 }
 
 pub fn wait_fronts(list: &str, ports: Ports, paths: &Paths) -> bool {
+    let listeners = front_listeners(&paths.cfg, list);
     for front in fronts(list) {
+        let listen = listeners
+            .iter()
+            .find(|(name, _)| name == &front)
+            .map_or("", |(_, listen)| listen.as_str());
         let port = port_of(&front, ports);
+        let mut listener = Listener::new(listen, port);
         let mut opened = false;
         for _ in 0..90 {
-            if port_open(port) {
+            if port_open(&listener.addresses()) {
                 opened = true;
                 break;
             }
@@ -439,4 +504,36 @@ pub fn other_lanes(paths: &Paths) -> Vec<(String, u32)> {
         }
     }
     lanes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_configured_listener_address_is_probed_where_it_listens() {
+        assert_eq!(
+            Listener::new("127.0.0.2", 1080).addresses(),
+            [SocketAddr::from(([127, 0, 0, 2], 1080))]
+        );
+        assert_eq!(
+            Listener::new("[::1]", 1080).addresses(),
+            [SocketAddr::from((Ipv6Addr::LOCALHOST, 1080))]
+        );
+        assert_eq!(
+            Listener::new("", 1080).addresses(),
+            [
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 1080)),
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 1080))
+            ]
+        );
+        assert_eq!(
+            Listener::new("0.0.0.0", 1080).addresses(),
+            [SocketAddr::from((Ipv4Addr::LOCALHOST, 1080))]
+        );
+        assert_eq!(
+            Listener::new("[::]", 1080).addresses(),
+            [SocketAddr::from((Ipv6Addr::LOCALHOST, 1080))]
+        );
+    }
 }
