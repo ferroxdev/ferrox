@@ -64,8 +64,11 @@ carry the mark and be lost.
 Where the kernel lets the process send a raw segment (Linux with `CAP_NET_RAW`), `auto` and
 `decoy` send the fake hello outside the connection's sequence window before the handshake and
 write the real hello untouched. Where it does not, and on every other platform, both fall back to
-the `record` rewrite and print one warning per process; `fastopen` prints one warning and takes
-the same fallback, because this tree does not implement the hello in the SYN. The record rewrite
+the `record` rewrite and print one warning per process. `fastopen` arms `TCP_FASTOPEN_CONNECT` on
+a direct Linux/Android leg, dials once to fetch the kernel's cookie for the destination and again
+with it, and keeps the deferred socket, so the handshake's first write — the ClientHello — rides
+the SYN; a kernel that lacks the option or a server that sends no cookie keeps the record rewrite
+and prints one warning per process. The record rewrite
 is armed on the same `Connection` the handshake writes through, ahead of the `finalmask` chain and
 of an `xmc` session's payload write, and pads the version in the first TLS record header from
 `03 01`/`03 03` to `03 04` once per stream; a write that does not open a TLS handshake record is
@@ -128,6 +131,9 @@ graph TD
     S -- absent --> H["TLS connect writes the hello as-is"]
     S -- "mixedCase" --> MC["backend serializes the case-altered name"]
     S -- "record / empty / urgent" --> A["Connection::with_sni"]
+    S -- "fastopen" --> T{"TCP_FASTOPEN_CONNECT + cookie?"}
+    T -- yes --> TD["deferred connect: first write rides the SYN"]
+    T -- no --> A
     S -- "decoy / auto" --> I{"CAP_NET_RAW available?"}
     I -- yes --> J["build_fake_client_hello (517 bytes)"]
     J --> K["build_ipv4_packet: IP + TCP checksums"]
@@ -136,6 +142,7 @@ graph TD
     I -- no --> A
     MC --> H
     H --> W2["first write → Masked.send"]
+    TD --> H
     A --> W2
     W2 --> SH{"SniState pending and 16 03…?"}
     SH -- record --> RV["copy, patch bytes 1..3 to 03 04"]
@@ -260,10 +267,11 @@ reassembled, and the parser tests hold every accepted form and its refusal.
   unconfigured connection pays no wrapper, a configured one pays one atomic swap, a fragmenting
   stage cannot spend the rewrite on a short cut, and a cloned relay leg shares the same one-shot
   state.
-- **The urgent byte and the hello in the SYN.** The urgent byte now ships on Linux and Android;
-  the hello in the SYN is still named as not implemented and takes the record fallback with one
-  warning. Neither is silently skipped: a config that asks for fast open still sends a hello, and
-  the console says which method stood in.
+- **The urgent byte and the hello in the SYN.** Both ship on Linux and Android. Fast Open costs
+  the deferred connect nothing beyond one throwaway handshake per destination, and the record
+  rewrite stands in where the kernel refuses the option or the server sends no cookie, with one
+  warning per process. Neither is silently skipped: a config that asks for fast open still sends
+  a hello, and the console says which method stood in.
 - **A second handshake parser for the cut.** The fragment stage and the mixed-case rewrite read
   the same `server_name_range` the record decoy already needed, so the bound checks (record
   length, handshake length, version, extensions) exist once and a truncated record can never
@@ -274,6 +282,6 @@ reassembled, and the parser tests hold every accepted form and its refusal.
 
 <!-- scope:begin -->
 - paths: crates/ferrox-core/src/evasion.rs
-- symbols: evasion, arm_sni, warn_sni, inject_sni_decoy, FreedomNoise, parse_freedom_noises, parse_noise_list, parse_finalmask_noises, parse_freedom_noise, freedom_base64, freedom_byte_range, freedom_array, outbound_sni_spoof
+- symbols: evasion, arm_sni, warn_sni, inject_sni_decoy, fastopen, FreedomNoise, parse_freedom_noises, parse_noise_list, parse_finalmask_noises, parse_freedom_noise, freedom_base64, freedom_byte_range, freedom_array, outbound_sni_spoof
 - scenarios: vless-tls-raw
 <!-- scope:end -->

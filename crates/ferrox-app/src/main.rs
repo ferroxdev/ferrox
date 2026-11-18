@@ -24,6 +24,7 @@ mod conn;
 mod dnsapp;
 mod dnsnet;
 mod ech_dns;
+mod fastopen;
 mod foxy;
 mod foxy_account;
 mod foxy_browser;
