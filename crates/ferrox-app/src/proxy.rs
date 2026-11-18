@@ -5172,6 +5172,7 @@ enum PooledReplies {
 struct PooledReply {
     data: Vec<u8>,
     end: bool,
+    credit: usize,
 }
 
 impl PooledReplies {
@@ -5180,10 +5181,12 @@ impl PooledReplies {
             Self::Cool(replies) => replies.recv().map(|msg| PooledReply {
                 data: msg.data,
                 end: msg.end,
+                credit: 0,
             }),
             Self::Sing(replies) => replies.recv().map(|msg| PooledReply {
                 data: msg.data,
                 end: msg.end,
+                credit: msg.credit,
             }),
         }
     }
@@ -5193,11 +5196,20 @@ impl PooledReplies {
             Self::Cool(replies) => replies.try_recv().ok().map(|msg| PooledReply {
                 data: msg.data,
                 end: msg.end,
+                credit: 0,
             }),
             Self::Sing(replies) => replies.try_recv().map(|msg| PooledReply {
                 data: msg.data,
                 end: msg.end,
+                credit: msg.credit,
             }),
+        }
+    }
+
+    /// Hands a written reply's window back to the peer; the Cool carrier has no window to return.
+    fn settle(&self, credit: usize) {
+        if let Self::Sing(replies) = self {
+            replies.settle(credit);
         }
     }
 }
@@ -19903,6 +19915,9 @@ fn mux_pool_downlink(replies: &PooledReplies, down: &mut dyn Write) -> bool {
                 std::array::from_fn(|at| batch.get(at).map_or(&[][..], |reply| &reply.data[..]));
             if write_all_parts::<MUX_DOWN_BATCH>(&mut *down, &parts[..batch.len()]).is_err() {
                 return false;
+            }
+            for reply in &batch {
+                replies.settle(reply.credit);
             }
             batch.clear();
         }
@@ -37419,7 +37434,11 @@ pub(crate) fn write_all_parts<const N: usize>(
         }
         let mut slices = &mut made[..pieces];
         while !slices.is_empty() {
-            let wrote = out.write_vectored(slices)?;
+            let wrote = match out.write_vectored(slices) {
+                Ok(wrote) => wrote,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
             if wrote == 0 {
                 return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
             }
@@ -65298,6 +65317,56 @@ mod tests {
         assert_eq!(sink.calls, 1, "eight replies leave in one call");
         assert_eq!(sink.bases, bases, "each part is the reply's own buffer");
         assert_eq!(sink.bytes, want, "every payload byte reaches the app");
+    }
+
+    struct Once {
+        calls: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for Once {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.write_vectored(&[IoSlice::new(buf)])
+        }
+
+        fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+            self.calls += 1;
+            match self.calls {
+                1 => return Err(std::io::ErrorKind::Interrupted.into()),
+                2 => {
+                    self.bytes.extend_from_slice(&bufs[0][..2]);
+                    return Ok(2);
+                }
+                _ => {}
+            }
+            for buf in bufs {
+                self.bytes.extend_from_slice(buf);
+            }
+            Ok(bufs.iter().map(|buf| buf.len()).sum())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An interrupted write retries the same slices, so the accepted prefix is never written twice
+    /// and the batch is not restarted.
+    #[test]
+    fn a_write_that_was_interrupted_resumes_the_same_slices() {
+        let mut sink = Once {
+            calls: 0,
+            bytes: Vec::new(),
+        };
+        write_all_parts::<2>(&mut sink, &[b"head", b"payload"]).expect("the retry lands");
+        assert_eq!(
+            sink.calls, 3,
+            "the interruption and the short write each retry"
+        );
+        assert_eq!(
+            sink.bytes, b"headpayload",
+            "the prefix is not written twice"
+        );
     }
 
     /// The room a tail read offers is the caller's: the mux demux asks the kernel for a whole batch.
