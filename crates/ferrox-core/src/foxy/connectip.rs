@@ -780,8 +780,11 @@ pub fn checksum_update(checksum: u16, old: &[u8], new: &[u8]) -> u16 {
 
 /// The pseudo-header a checksum covers, summed without writing it down and folded once: a one's-complement sum is position-independent, so the addresses contribute their word runs, the length its value (sixteen bits by construction, and IPv6's wider field is congruent because 2^16 folds to 1) and the protocol a lone word whose high half is zero — the same words the materialised header held, so both versions agree with no branch.
 fn pseudo_term(source: &[u8], destination: &[u8], protocol: u8, length: usize) -> u32 {
-    let sum = word_sum(source) + word_sum(destination) + (length as u32) + u32::from(protocol);
-    (sum & 0xffff) + (sum >> 16)
+    let sum = u64::from(word_sum(source))
+        + u64::from(word_sum(destination))
+        + length as u64
+        + u64::from(protocol);
+    ((sum & 0xffff) + (sum >> 16)) as u32
 }
 
 /// The pseudo-header sum a GSO frame hands the kernel: the term above kept uncomplemented, because the kernel folds the segment's own bytes onto it before it complements the total.

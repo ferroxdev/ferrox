@@ -211,6 +211,11 @@ run_variant() {
     start_variant "$variant" || rc=$?
     if [ "$rc" -eq 2 ]; then
         stop_variant
+        # A comparator with no command is unmeasured, not green: past a missing TUN_RS_DIR the cell is named, while a ferrox variant that lost its command still fails the gate.
+        case "$variant" in
+            ferrox-raw*) return 1 ;;
+        esac
+        printf -- '- `%s` had no command to run\n' "$variant" >> "$GAPS"
         return 0
     fi
     if [ "$rc" -ne 0 ]; then
