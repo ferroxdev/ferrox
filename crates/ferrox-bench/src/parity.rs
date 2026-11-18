@@ -1128,8 +1128,8 @@ impl Cell {
     }
 
     /// Whether starting a measure still fits: its first attempt can take the whole run cap, and the cell still owes the margin to print.
-    pub fn fits(&self, request: &Request) -> bool {
-        self.left() > fan_in_cap(request) + CELL_MARGIN
+    pub fn fits(&self, first_attempt_cap: Duration) -> bool {
+        self.left() > first_attempt_cap + CELL_MARGIN
     }
 }
 
@@ -1636,15 +1636,16 @@ struct Moved {
 }
 
 /// A hold's own duration is the workload, so its fan-in cap leaves room for a hold thread scheduled after the clock starts.
-fn fan_in_cap(request: &Request) -> Duration {
-    if request.traffic == Traffic::HeldOpen {
-        request
-            .duration
-            .saturating_add(FLOW_IO_TIMEOUT)
-            .max(RUN_TIMEOUT)
+pub fn first_attempt_cap(traffic: &str, duration: Duration) -> Duration {
+    if traffic == "held-open" {
+        duration.saturating_add(FLOW_IO_TIMEOUT).max(RUN_TIMEOUT)
     } else {
         RUN_TIMEOUT
     }
+}
+
+fn fan_in_cap(request: &Request) -> Duration {
+    first_attempt_cap(request.traffic.as_str(), request.duration)
 }
 
 fn collect_flows(
@@ -4152,7 +4153,7 @@ mod tests {
         // A measure's first attempt can take the whole run cap, so a cell with less than that and the print margin left starts none.
         let request = Request::parse(request_with(&[]).as_bytes()).expect("a valid request");
         assert!(
-            Cell::new(CELL_WINDOW).fits(&request),
+            Cell::new(CELL_WINDOW).fits(fan_in_cap(&request)),
             "a fresh cell can always measure"
         );
         let spent = Cell {
@@ -4162,7 +4163,7 @@ mod tests {
             window: CELL_WINDOW,
         };
         assert!(
-            !spent.fits(&request),
+            !spent.fits(fan_in_cap(&request)),
             "a cell past its window takes no measure"
         );
         assert_eq!(
@@ -4183,9 +4184,12 @@ mod tests {
                 .expect("a cell with 220s left"),
             window: CELL_WINDOW,
         };
-        assert!(barely.fits(&request), "a 120s measure still fits in 220s");
         assert!(
-            !barely.fits(&hold),
+            barely.fits(fan_in_cap(&request)),
+            "a 120s measure still fits in 220s"
+        );
+        assert!(
+            !barely.fits(fan_in_cap(&hold)),
             "a hold's first attempt can take 150s, so 220s is not enough"
         );
     }

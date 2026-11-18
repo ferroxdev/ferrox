@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::json::{self, Json};
 use crate::parity::{self, ConfigArg, Error, Request, Run};
@@ -56,6 +57,10 @@ pub struct Workload {
 impl Workload {
     fn flow_bytes(&self) -> u64 {
         (self.iterations * self.payload_size) as u64
+    }
+
+    fn first_attempt_cap(&self) -> Duration {
+        parity::first_attempt_cap(&self.traffic, Duration::from_millis(self.duration_ms))
     }
 
     /// The one-hop ceiling is a TCP generator, so it bounds only the traffic that
@@ -1392,9 +1397,7 @@ pub fn run(
             let Some(engine) = engines.iter().find(|e| e.name == name) else {
                 continue;
             };
-            let planned = out_dir.join(format!("{name}-run{repeat}"));
-            let planned_request = Request::parse(workload.request(engine, &planned).as_bytes())?;
-            if !cell.fits(&planned_request) {
+            if !cell.fits(workload.first_attempt_cap()) {
                 failures.push(window_ended(&by_engine, &names, repeats));
                 break 'measures;
             }
