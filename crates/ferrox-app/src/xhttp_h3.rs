@@ -92,6 +92,8 @@ pub(crate) struct H3Reader {
     idle_since: Option<Instant>,
     activity: Arc<Activity>,
     deadline: Option<Instant>,
+    /// Bytes of `buf` already initialised for a transport read, so a read lands without the room being zeroed first.
+    buf_init: usize,
     #[cfg(test)]
     read_target: usize,
 }
@@ -115,6 +117,7 @@ impl H3Reader {
             idle_since: None,
             activity,
             deadline: None,
+            buf_init: 0,
             #[cfg(test)]
             read_target: 0,
         }
@@ -193,7 +196,10 @@ impl H3Reader {
     fn fill_room(&mut self) -> std::io::Result<()> {
         self.compact();
         let base = self.buf.len();
-        crate::proxy::grow_scratch(&mut self.buf, base + READ_ROOM);
+        // SAFETY: every byte below the watermark is initialised, and the read fills the room past it before the length counts it.
+        unsafe {
+            ferrox_core::read::init_room(&mut self.buf, &mut self.buf_init, base + READ_ROOM)
+        };
         #[cfg(test)]
         {
             self.read_target = self.buf[base..].as_ptr() as usize;

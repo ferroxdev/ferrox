@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::conn::Connection;
 use crate::proxy::lane_pool::Next;
-use crate::proxy::{read_exact, under_handshake};
+use crate::proxy::{read_exact, under_handshake, FrameWrite};
 
 const AUTH_LEN: usize = 16;
 const TAG_LEN: usize = 16;
@@ -1160,6 +1160,9 @@ pub(crate) struct Wire<R> {
     front: usize,
     /// How many plaintext bytes this batch holds from `front`.
     plain: usize,
+    /// Where each frame of this batch opened and how many plaintext bytes it holds, so a caller that can take several slices never moves them.
+    spans: [(usize, usize); FRAMES_PER_WRITE],
+    span_count: usize,
     /// A frame whose length is drawn but whose bytes have not all arrived.
     waiting: Option<(usize, usize)>,
     last: bool,
@@ -1178,6 +1181,8 @@ impl<R: Read> Wire<R> {
             end: 0,
             front: 0,
             plain: 0,
+            spans: [(0, 0); FRAMES_PER_WRITE],
+            span_count: 0,
             waiting: None,
             last: false,
             marker: false,
@@ -1197,8 +1202,9 @@ impl<R: Read> Wire<R> {
     }
 
     /// One step of the relay: open up to `FRAMES_PER_WRITE` frames, waiting only for the first,
-    /// and hand back their plaintext as one slice starting where the first of them opened. A wait
-    /// with nothing yet gathered is `Idle` so the lane can come back to it.
+    /// and hand back their plaintext where each of them opened, so a caller that writes several
+    /// slices pays for none of them moving. A wait with nothing yet gathered is `Idle` so the lane
+    /// can come back to it.
     fn step(&mut self, recv: &mut Flow) -> Opened {
         if self.last {
             return Opened::End;
@@ -1211,9 +1217,8 @@ impl<R: Read> Wire<R> {
                 Frame::Decoded { at, len } => {
                     if decoded == 0 {
                         self.front = at;
-                    } else {
-                        self.held.copy_within(at..at + len, self.front + self.plain);
                     }
+                    self.spans[decoded] = (at, len);
                     self.plain += len;
                     decoded += 1;
                 }
@@ -1224,6 +1229,7 @@ impl<R: Read> Wire<R> {
                 }
             }
         }
+        self.span_count = decoded;
         if decoded > 0 {
             return Opened::Batch {
                 at: self.front,
@@ -1237,13 +1243,35 @@ impl<R: Read> Wire<R> {
         }
     }
 
+    /// The plaintext spans the last batch opened, into `held`: the shape a vectored write takes.
+    fn spans(&self) -> &[(usize, usize)] {
+        &self.spans[..self.span_count]
+    }
+
+    /// Fold the batch's spans onto `at` for a caller that takes one slice: every frame after the first moves behind the one before it, over the sealed bytes it was opened from.
+    fn pack(&mut self, at: usize, len: usize) {
+        let spans = self.spans;
+        let mut plain = 0;
+        for &(span_at, span_len) in &spans[..self.span_count] {
+            if span_at != at + plain {
+                self.held
+                    .copy_within(span_at..span_at + span_len, at + plain);
+            }
+            plain += span_len;
+        }
+        debug_assert_eq!(plain, len);
+    }
+
     /// The blocking shape: wait out an idle step, so a caller outside a lane never sees one.
     fn batch(&mut self, recv: &mut Flow) -> Option<&[u8]> {
         loop {
             match self.step(recv) {
                 Opened::Idle => {}
                 Opened::End => return None,
-                Opened::Batch { at, len } => return Some(&self.held[at..at + len]),
+                Opened::Batch { at, len } => {
+                    self.pack(at, len);
+                    return Some(&self.held[at..at + len]);
+                }
             }
         }
     }
@@ -2136,12 +2164,17 @@ fn backward_step<R: Read + crate::proxy::RelayPoll>(
                 None => Next::Done,
             }
         }
-        Opened::Batch { at, len } => {
+        Opened::Batch { len, .. } => {
             if crate::proxy::echo_trace_on() && *first {
                 crate::proxy::echo_trace("relay bwd first read");
                 *first = false;
             }
-            if out.write_all(&reader.held[at..at + len]).is_ok() {
+            let spans = reader.spans();
+            let mut parts = [&[][..]; FRAMES_PER_WRITE];
+            for (part, &(at, len)) in parts.iter_mut().zip(spans) {
+                *part = &reader.held[at..at + len];
+            }
+            if out.write_slices(&parts[..spans.len()]) {
                 if len > 0 {
                     flow.mark_progress();
                 }
@@ -5290,6 +5323,54 @@ mod tests {
             got.extend_from_slice(batch);
         }
         (writes, got)
+    }
+
+    /// A batch's frames stay where they opened: the sink writes the spans it is handed, so no frame is moved behind the one before it.
+    #[test]
+    fn a_batch_hands_each_frame_back_where_it_landed() {
+        let (sealed, plain, mut recv) = frames(&[1000, 1000, 1000]);
+        let carrier = Sealed {
+            held: sealed,
+            at: 0,
+            grain: usize::MAX,
+            reads: 0,
+        };
+        let mut wire = Wire::new(carrier);
+        let base = wire.held.as_ptr();
+        let capacity = wire.held.capacity();
+        let Opened::Batch { at, len } = wire.step(&mut recv) else {
+            panic!("the three frames open in one batch");
+        };
+        let spans = wire.spans().to_vec();
+        assert_eq!(spans.len(), 3, "each frame is handed back on its own");
+        assert_eq!(
+            at, spans[0].0,
+            "the batch starts where the first frame opened"
+        );
+        assert_eq!(
+            spans.iter().map(|&(_, len)| len).sum::<usize>(),
+            len,
+            "the batch is every span's plaintext"
+        );
+        assert!(
+            spans.iter().all(|&(at, len)| at + len <= wire.held.len()),
+            "every span lies in the buffer"
+        );
+        assert_ne!(
+            spans[1].0,
+            spans[0].0 + spans[0].1,
+            "the second frame was not folded behind the first"
+        );
+        assert_eq!(wire.held.as_ptr(), base, "the buffer does not move");
+        assert_eq!(wire.held.capacity(), capacity, "and does not grow");
+        let mut got = Vec::new();
+        for &(at, len) in &spans {
+            got.extend_from_slice(&wire.held[at..at + len]);
+        }
+        while let Some(batch) = wire.batch(&mut recv) {
+            got.extend_from_slice(batch);
+        }
+        assert_eq!(got, plain, "the frames still read back whole");
     }
 
     /// The flow's windows are zeroed once: the wire's receive window and the relay leg's

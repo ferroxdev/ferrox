@@ -276,8 +276,12 @@ pub(crate) struct GrpcReader<R: Read = Connection> {
     /// The reclaim moves that copied live bytes: a drained buffer cleared rather than moved is a call fewer here, which the byte counter cannot see.
     #[cfg_attr(not(test), allow(dead_code, reason = "read by the reclaim gate"))]
     reclaims: usize,
+    /// Bytes of `msg` already initialised for a read, so a body lands without the tail being zeroed first.
+    msg_init: usize,
     /// Scratch for the frames that are not a body: headers, settings, ping.
     frame: Vec<u8>,
+    /// The same watermark for `frame`.
+    frame_init: usize,
     /// The nine bytes that open the next frame, and how many are in hand: a poll timeout hands the
     /// lane back with the partial head kept, so the next read resumes on the same bytes.
     frame_head: [u8; 9],
@@ -596,7 +600,8 @@ impl<R: Read> GrpcReader<R> {
     /// buffer and hands the lane back, and the next call fills the rest.
     fn fill_msg(&mut self, from: usize, len: usize, filled: &mut usize) -> std::io::Result<bool> {
         let end = from + len;
-        crate::proxy::grow_scratch(&mut self.msg, end);
+        // SAFETY: every byte below the watermark is initialised, and each read fills the room past it before `filled` counts it.
+        unsafe { ferrox_core::read::init_room(&mut self.msg, &mut self.msg_init, end) };
         while *filled < len {
             match self.read.read(&mut self.msg[from + *filled..end]) {
                 Ok(0) => {
@@ -608,7 +613,10 @@ impl<R: Read> GrpcReader<R> {
                     self.msg.truncate(from + *filled);
                     match self.handshake {
                         Some(until) if std::time::Instant::now() < until => {
-                            crate::proxy::grow_scratch(&mut self.msg, end);
+                            // SAFETY: as above; the tail below the watermark is unchanged by the truncate.
+                            unsafe {
+                                ferrox_core::read::init_room(&mut self.msg, &mut self.msg_init, end)
+                            };
                         }
                         // The head's clock is spent: a hard end, so `read_exact` stops retrying.
                         Some(_) => return Ok(false),
@@ -616,7 +624,10 @@ impl<R: Read> GrpcReader<R> {
                         None if crate::proxy::relay_step_owns_poll() => return Err(error),
                         None => {
                             std::thread::sleep(crate::budgets::RELAY_POLL);
-                            crate::proxy::grow_scratch(&mut self.msg, end);
+                            // SAFETY: as above.
+                            unsafe {
+                                ferrox_core::read::init_room(&mut self.msg, &mut self.msg_init, end)
+                            };
                         }
                     }
                 }
@@ -631,7 +642,8 @@ impl<R: Read> GrpcReader<R> {
 
     /// The same resume for the frames that are not a body: the scratch holds what arrived.
     fn fill_frame(&mut self, len: usize, filled: &mut usize) -> std::io::Result<bool> {
-        crate::proxy::grow_scratch(&mut self.frame, len);
+        // SAFETY: every byte below the watermark is initialised, and each read fills the room past it before `filled` counts it.
+        unsafe { ferrox_core::read::init_room(&mut self.frame, &mut self.frame_init, len) };
         while *filled < len {
             match self.read.read(&mut self.frame[*filled..len]) {
                 Ok(0) => {
@@ -3066,7 +3078,9 @@ fn new_reader<R: Read>(
         pay_end: 0,
         staged: 0,
         reclaims: 0,
+        msg_init: 0,
         frame: Vec::new(),
+        frame_init: 0,
         frame_head: [0; 9],
         frame_have: 0,
         pending: None,
