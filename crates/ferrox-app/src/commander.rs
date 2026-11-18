@@ -1663,7 +1663,7 @@ fn absorb_headers(
         }
         decoder
             .decode(block, &mut |name, _| {
-                pseudo |= trailers && name.first() == Some(&b':')
+                pseudo |= trailers && name.first() == Some(&b':');
             })
             .ok_or(h2::E_COMPRESSION)?;
         return Ok(pseudo);
@@ -1676,7 +1676,7 @@ fn absorb_headers(
     if end {
         decoder
             .decode(&held, &mut |name, _| {
-                pseudo |= trailers && name.first() == Some(&b':')
+                pseudo |= trailers && name.first() == Some(&b':');
             })
             .ok_or(h2::E_COMPRESSION)?;
     } else {
