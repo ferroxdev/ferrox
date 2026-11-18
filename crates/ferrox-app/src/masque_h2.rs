@@ -21,6 +21,7 @@ use crate::wg_stack::{Packet, UdpRoutes};
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const EDGE_RETRY: Duration = Duration::from_secs(1);
 const READ_WAIT: Duration = Duration::from_millis(10);
+const UDP_DRAIN: Duration = Duration::from_secs(1);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
 const PING_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_ROOM: usize = 16 * 1024;
@@ -1182,6 +1183,7 @@ struct Session {
     udp: Option<masque::UdpLane>,
     warp: bool,
     half_closed: bool,
+    udp_quiet: Option<Instant>,
     end: bool,
 }
 
@@ -1207,6 +1209,7 @@ impl Session {
             udp: None,
             warp: false,
             half_closed: false,
+            udp_quiet: None,
             end: false,
         }
     }
@@ -1637,7 +1640,15 @@ impl Session {
                 self.queued_at = 0;
             }
         }
-        let mut origin_closed = self.half_closed && self.udp.is_some();
+        let mut origin_closed = false;
+        if self.half_closed && self.udp.is_some() && self.udp_quiet.is_none() {
+            self.udp_quiet = Some(Instant::now());
+        }
+        let udp_drained = self.half_closed
+            && self.udp.is_some()
+            && self
+                .udp_quiet
+                .is_some_and(|quiet| quiet.elapsed() >= UDP_DRAIN);
         for _ in 0..QUEUED_CAP {
             // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
             if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
@@ -1662,6 +1673,7 @@ impl Session {
             let Some(packet) = packet else {
                 break;
             };
+            self.udp_quiet = Some(Instant::now());
             let Some(id) = self.request else {
                 break;
             };
@@ -1675,7 +1687,11 @@ impl Session {
             self.send(wire, &frame);
         }
         self.frame = frame;
-        if self.half_closed && origin_closed && self.queued.is_empty() && !wire.closed {
+        if self.half_closed
+            && (origin_closed || udp_drained)
+            && self.queued.is_empty()
+            && !wire.closed
+        {
             if let Some(id) = self.request {
                 wire.send(h2::T_DATA, h2::F_END, id, &[]);
                 self.end = true;
