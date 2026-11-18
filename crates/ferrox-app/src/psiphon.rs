@@ -13915,23 +13915,36 @@ mod tests {
         let next = next_dial_start(0, taken, servers.len());
         let (second, _) =
             take_dial_batch(&servers, next, 0, DIAL_ATTEMPTS, DIAL_ATTEMPTS, 0, false);
-        let dialled: HashSet<&str> = first
+        let dialled: HashSet<(&str, &str, &str)> = first
             .iter()
-            .filter_map(|server| server.meek.as_ref().map(|meek| meek.host.as_str()))
+            .filter_map(|server| {
+                server
+                    .meek
+                    .as_ref()
+                    .map(|meek| (meek.host.as_str(), meek.dial.as_str(), meek.sni.as_str()))
+            })
             .collect();
         assert!(
-            second.iter().any(|server| server
-                .meek
-                .as_ref()
-                .is_some_and(|meek| !dialled.contains(meek.host.as_str()))),
+            second
+                .iter()
+                .any(|server| server.meek.as_ref().is_some_and(|meek| {
+                    !dialled.contains(&(meek.host.as_str(), meek.dial.as_str(), meek.sni.as_str()))
+                })),
             "the retry repeated the first pass"
         );
-        let expected = servers[next].meek.as_ref().expect("fronted").host.as_str();
-        assert!(
-            second.iter().any(|server| server
-                .meek
-                .as_ref()
-                .is_some_and(|meek| meek.host == expected)),
+        let expected = servers[next].meek.as_ref().expect("fronted");
+        let actual = second[0].meek.as_ref().expect("fronted");
+        assert_eq!(
+            (
+                actual.host.as_str(),
+                actual.dial.as_str(),
+                actual.sni.as_str()
+            ),
+            (
+                expected.host.as_str(),
+                expected.dial.as_str(),
+                expected.sni.as_str()
+            ),
             "the retry did not start where the first stopped"
         );
     }
