@@ -944,14 +944,14 @@ mod tests {
         );
     }
 
-    struct Room(Arc<Mutex<Sender<usize>>>);
+    struct Room(Arc<Mutex<Sender<usize>>>, UnixStream);
 
     impl Read for Room {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             if let Ok(tx) = self.0.lock() {
                 let _ = tx.send(buf.len());
             }
-            Ok(0)
+            self.1.read(buf)
         }
     }
 
@@ -962,10 +962,14 @@ mod tests {
         let (tx, rx) = channel();
         let room = Arc::new(Mutex::new(tx));
         let opened = Arc::clone(&room);
+        let peers: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let held = Arc::clone(&peers);
         let manager = Manager::with_lifetime(1, LIFETIME, move || {
-            let (mine, _peer) = UnixStream::pair().ok()?;
+            let (mine, peer) = UnixStream::pair().ok()?;
+            let read = mine.try_clone().ok()?;
+            held.lock().ok()?.push(peer);
             Some(Uplink {
-                read: Box::new(Room(Arc::clone(&opened))),
+                read: Box::new(Room(Arc::clone(&opened), read)),
                 write: Box::new(mine),
                 close: Arc::new(|| {}),
             })
@@ -974,8 +978,11 @@ mod tests {
         let offered = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the demux read");
-        assert_eq!(offered, READ_ROOM, "one read asks for a batch, not a frame");
-        assert_eq!(READ_ROOM, BATCH * mux::CHUNK_MAX);
+        assert_eq!(
+            offered,
+            BATCH * mux::CHUNK_MAX,
+            "one read asks for a batch, not a frame"
+        );
     }
 
     #[test]
