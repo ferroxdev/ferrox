@@ -13070,7 +13070,7 @@ mod tests {
             &json::parse(
                 r#"{
                     "FrontedMeekCDNScanSpec": {
-                        "IPCandidates": ["198.51.100.7:443"],
+                        "IPCandidates": ["198.51.100.7"],
                         "SNIServerNames": ["scan.example"]
                     }
                 }"#,
