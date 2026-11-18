@@ -370,44 +370,66 @@ pub fn stop(paths: &Paths) -> Result<(), String> {
     }
 }
 
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(1);
+enum Listener {
+    Ready(Vec<SocketAddr>),
+    Pending(std::sync::mpsc::Receiver<Vec<SocketAddr>>),
+}
+
+impl Listener {
+    fn new(listen: &str, port: u16) -> Self {
+        let listen = listen.trim();
+        let host = listen
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(listen);
+        match host.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) if ip.is_unspecified() => {
+                Self::Ready(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))])
+            }
+            Ok(IpAddr::V4(ip)) => Self::Ready(vec![SocketAddr::from((ip, port))]),
+            Ok(IpAddr::V6(ip)) if ip.is_unspecified() => {
+                Self::Ready(vec![SocketAddr::from((Ipv6Addr::LOCALHOST, port))])
+            }
+            Ok(IpAddr::V6(ip)) => Self::Ready(vec![SocketAddr::from((ip, port))]),
+            Err(_) if host.is_empty() => Self::Ready(loopback_addresses(port)),
+            Err(_) => {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let host = host.to_owned();
+                let _ = std::thread::spawn(move || {
+                    let addresses = (host.as_str(), port)
+                        .to_socket_addrs()
+                        .map(std::iter::Iterator::collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let _ = sender.send(addresses);
+                });
+                Self::Pending(receiver)
+            }
+        }
+    }
+
+    fn addresses(&mut self) -> Vec<SocketAddr> {
+        match self {
+            Self::Ready(addresses) => addresses.clone(),
+            Self::Pending(receiver) => match receiver.try_recv() {
+                Ok(addresses) => {
+                    *self = Self::Ready(addresses.clone());
+                    addresses
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => Vec::new(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    *self = Self::Ready(Vec::new());
+                    Vec::new()
+                }
+            },
+        }
+    }
+}
 
 fn loopback_addresses(port: u16) -> Vec<SocketAddr> {
     vec![
         SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
         SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
     ]
-}
-
-fn resolve_addresses(listen: &str, port: u16) -> Vec<SocketAddr> {
-    let listen = listen.trim();
-    let host = listen
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(listen);
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) if ip.is_unspecified() => {
-            vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]
-        }
-        Ok(IpAddr::V4(ip)) => vec![SocketAddr::from((ip, port))],
-        Ok(IpAddr::V6(ip)) if ip.is_unspecified() => {
-            vec![SocketAddr::from((Ipv6Addr::LOCALHOST, port))]
-        }
-        Ok(IpAddr::V6(ip)) => vec![SocketAddr::from((ip, port))],
-        Err(_) if host.is_empty() => loopback_addresses(port),
-        Err(_) => {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let host = host.to_owned();
-            let _ = std::thread::spawn(move || {
-                let addresses = (host.as_str(), port)
-                    .to_socket_addrs()
-                    .map(std::iter::Iterator::collect::<Vec<_>>())
-                    .unwrap_or_default();
-                let _ = sender.send(addresses);
-            });
-            receiver.recv_timeout(RESOLVE_TIMEOUT).unwrap_or_default()
-        }
-    }
 }
 
 pub fn port_open(addresses: &[SocketAddr]) -> bool {
@@ -424,10 +446,10 @@ pub fn wait_fronts(list: &str, ports: Ports, paths: &Paths) -> bool {
             .find(|(name, _)| name == &front)
             .map_or("", |(_, listen)| listen.as_str());
         let port = port_of(&front, ports);
-        let addresses = resolve_addresses(listen, port);
+        let mut listener = Listener::new(listen, port);
         let mut opened = false;
         for _ in 0..90 {
-            if port_open(&addresses) {
+            if port_open(&listener.addresses()) {
                 opened = true;
                 break;
             }
@@ -491,19 +513,27 @@ mod tests {
     #[test]
     fn a_configured_listener_address_is_probed_where_it_listens() {
         assert_eq!(
-            resolve_addresses("127.0.0.2", 1080),
+            Listener::new("127.0.0.2", 1080).addresses(),
             [SocketAddr::from(([127, 0, 0, 2], 1080))]
         );
         assert_eq!(
-            resolve_addresses("[::1]", 1080),
+            Listener::new("[::1]", 1080).addresses(),
             [SocketAddr::from((Ipv6Addr::LOCALHOST, 1080))]
         );
         assert_eq!(
-            resolve_addresses("", 1080),
+            Listener::new("", 1080).addresses(),
             [
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 1080)),
                 SocketAddr::from((Ipv6Addr::LOCALHOST, 1080))
             ]
+        );
+        assert_eq!(
+            Listener::new("0.0.0.0", 1080).addresses(),
+            [SocketAddr::from((Ipv4Addr::LOCALHOST, 1080))]
+        );
+        assert_eq!(
+            Listener::new("[::]", 1080).addresses(),
+            [SocketAddr::from((Ipv6Addr::LOCALHOST, 1080))]
         );
     }
 }
