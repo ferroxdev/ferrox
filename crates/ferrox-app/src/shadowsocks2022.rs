@@ -2329,8 +2329,9 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
     let mut reply = crate::proxy::udp_buffer();
     let mut datagrams = Datagrams::new();
     let mut order: Vec<(u64, bool)> = Vec::new();
+    let mut ordered: HashSet<(u64, bool)> = HashSet::new();
     let mut seen: HashSet<(u64, bool)> = HashSet::new();
-    let mut resume: Option<(u64, bool)> = None;
+    let mut cursor = 0usize;
     loop {
         match clients.recv_from(&mut buf) {
             Ok((n, src)) => {
@@ -2353,12 +2354,16 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
             Err(_) => break,
         }
         let mut drained = 0usize;
-        order.clear();
-        order.extend(upstreams.keys().copied());
+        order.retain(|key| upstreams.contains_key(key));
+        ordered.clear();
+        ordered.extend(order.iter().copied());
+        for key in upstreams.keys() {
+            if ordered.insert(*key) {
+                order.push(*key);
+            }
+        }
         let len = order.len();
-        let start = resume
-            .and_then(|key| order.iter().position(|held| *held == key))
-            .unwrap_or(0);
+        let start = if cursor < len { cursor } else { 0 };
         seen.clear();
         let mut index = start;
         while drained < TURN_DRAIN && index < start + len {
@@ -2397,11 +2402,7 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
                 );
             }
         }
-        resume = if index < start + len {
-            order.get(index % len).copied()
-        } else {
-            None
-        };
+        cursor = if index < start + len { index % len } else { 0 };
         let now = Instant::now();
         upstreams.retain(|key, _| {
             !seen.contains(key)

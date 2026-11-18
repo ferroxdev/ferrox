@@ -434,6 +434,7 @@ impl Api {
         let mut decoder = h2::Decoder::default();
         let mut calls: HashMap<u32, Call> = HashMap::new();
         let mut discard: Option<(u32, Vec<u8>)> = None;
+        let mut continuation: Option<u32> = None;
         let mut responses: HashMap<u32, Response> = HashMap::new();
         let mut flow = Flow::new();
         let mut last_id = 0u32;
@@ -478,11 +479,14 @@ impl Api {
                 goaway(&mut stream, h2::E_PROTOCOL, last_id);
                 return;
             }
-            if let Some((owner, _)) = &discard {
-                if kind != h2::T_CONT || id != *owner {
+            if let Some(owner) = continuation {
+                if kind != h2::T_CONT || id != owner {
                     goaway(&mut stream, h2::E_PROTOCOL, last_id);
                     return;
                 }
+            } else if kind == h2::T_CONT {
+                goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                return;
             }
             match kind {
                 h2::T_SETTINGS => {
@@ -528,6 +532,9 @@ impl Api {
                             goaway(&mut stream, code, last_id);
                             return;
                         }
+                        if flags & h2::F_END_HEADERS == 0 {
+                            continuation = Some(id);
+                        }
                         continue;
                     }
                     if flow.cancelled(id) {
@@ -540,6 +547,38 @@ impl Api {
                         ) {
                             goaway(&mut stream, code, last_id);
                             return;
+                        }
+                        if flags & h2::F_END_HEADERS == 0 {
+                            continuation = Some(id);
+                        }
+                        continue;
+                    }
+                    if calls.get(&id).is_some_and(|call| call.end_headers) {
+                        let end = flags & h2::F_END_HEADERS != 0;
+                        if let Some(call) = calls.get_mut(&id) {
+                            call.end_stream |= flags & h2::F_END != 0;
+                        }
+                        if let Err(code) =
+                            absorb_headers(&mut decoder, &mut discard, id, block, end)
+                        {
+                            goaway(&mut stream, code, last_id);
+                            return;
+                        }
+                        if end {
+                            if calls.get(&id).is_some_and(|call| call.end_stream) {
+                                last_id = last_id.max(id);
+                                if !self.answer(
+                                    id,
+                                    &calls.remove(&id).unwrap_or_default(),
+                                    &mut stream,
+                                    &mut flow,
+                                    &mut responses,
+                                ) {
+                                    return;
+                                }
+                            }
+                        } else {
+                            continuation = Some(id);
                         }
                         continue;
                     }
@@ -558,10 +597,11 @@ impl Api {
                     #[cfg(test)]
                     self.header_cap_reached(call.headers.len());
                     call.end_headers = flags & h2::F_END_HEADERS != 0;
+                    call.end_stream = flags & h2::F_END != 0;
                     if call.end_headers {
                         call.read_path(&mut decoder);
                     }
-                    if flags & h2::F_END != 0 {
+                    if call.end_headers && call.end_stream {
                         last_id = last_id.max(id);
                         if !self.answer(
                             id,
@@ -572,6 +612,8 @@ impl Api {
                         ) {
                             return;
                         }
+                    } else if !call.end_headers {
+                        continuation = Some(id);
                     }
                 }
                 h2::T_CONT => {
@@ -586,11 +628,22 @@ impl Api {
                             goaway(&mut stream, code, last_id);
                             return;
                         }
+                        if flags & h2::F_END_HEADERS != 0 {
+                            continuation = None;
+                            if calls.get(&id).is_some_and(|call| call.end_stream) {
+                                last_id = last_id.max(id);
+                                if !self.answer(
+                                    id,
+                                    &calls.remove(&id).unwrap_or_default(),
+                                    &mut stream,
+                                    &mut flow,
+                                    &mut responses,
+                                ) {
+                                    return;
+                                }
+                            }
+                        }
                         continue;
-                    }
-                    if calls.get(&id).is_none_or(|call| call.end_headers) {
-                        goaway(&mut stream, h2::E_PROTOCOL, last_id);
-                        return;
                     }
                     if let Some(call) = calls.get_mut(&id) {
                         if call.headers.len() + body.len() > h2::HEAD_CAP {
@@ -603,10 +656,27 @@ impl Api {
                         if flags & h2::F_END_HEADERS != 0 {
                             call.end_headers = true;
                             call.read_path(&mut decoder);
+                            continuation = None;
+                            if call.end_stream {
+                                last_id = last_id.max(id);
+                                if !self.answer(
+                                    id,
+                                    &calls.remove(&id).unwrap_or_default(),
+                                    &mut stream,
+                                    &mut flow,
+                                    &mut responses,
+                                ) {
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
                 h2::T_DATA => {
+                    let Some(payload) = data_body(&body, flags) else {
+                        goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                        return;
+                    };
                     if flow.cancelled(id) {
                         if !reset(&mut stream, id, h2::E_CLOSED) {
                             return;
@@ -616,10 +686,6 @@ impl Api {
                         }
                         continue;
                     }
-                    let Some(payload) = data_body(&body, flags) else {
-                        goaway(&mut stream, h2::E_PROTOCOL, last_id);
-                        return;
-                    };
                     let held: usize = calls.values().map(|call| call.body.len()).sum();
                     let Some(call) = calls.get_mut(&id) else {
                         goaway(&mut stream, h2::E_PROTOCOL, last_id);
@@ -1326,6 +1392,7 @@ struct Call {
     path: String,
     headers: Vec<u8>,
     end_headers: bool,
+    end_stream: bool,
     body: Vec<u8>,
 }
 
