@@ -258,7 +258,7 @@ impl Fragment {
                     Ok(written) => sent += written,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                     // The octets that did land stay counted, so a retry resumes after them.
-                    Err(error) if sent > 0 => return Ok(done + sent),
+                    Err(_) if sent > 0 => return Ok(done + sent),
                     Err(error) => return Err(error),
                 }
             }
