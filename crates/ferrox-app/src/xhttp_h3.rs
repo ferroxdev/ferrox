@@ -222,9 +222,7 @@ impl H3Reader {
                 if self.idle_expired(since) {
                     return Err(std::io::Error::other("h3 request stalled"));
                 }
-                if crate::proxy::relay_step_owns_poll()
-                    && since.elapsed() >= crate::budgets::RELAY_POLL
-                {
+                if crate::proxy::relay_step_owns_poll() {
                     return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
                 std::thread::sleep(POLL);
@@ -1990,16 +1988,24 @@ mod tests {
         let settings = settings();
         let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
             .expect("the h3 listener binds");
-        let client = client(port, roots);
-        let mut wire = raw_stream(&client);
+        // The upload stays open, so the echoing server has nothing to answer yet.
+        let (mut reader, _writer) = dial(port, &settings, roots);
         let mut room = [0u8; 4096];
+        let lane = crate::proxy::RelayStep::enter();
         let began = Instant::now();
-        let outcome = wire.read(&mut room);
+        loop {
+            match reader.read(&mut room) {
+                Ok(0) => panic!("the h3 stream ended before it had to wait"),
+                Ok(_) => assert!(
+                    began.elapsed() < Duration::from_secs(2),
+                    "the h3 stream answered for two seconds without ever making a read wait"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("the h3 read fails: {error}"),
+            }
+        }
         let took = began.elapsed();
-        assert!(
-            matches!(&outcome, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
-            "an empty h3 stream read handed back {outcome:?}"
-        );
+        drop(lane);
         assert!(
             took < POLL,
             "an empty h3 stream read held its lane {took:?}, past the {POLL:?} transport tick \
