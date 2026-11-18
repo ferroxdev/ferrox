@@ -2312,7 +2312,7 @@ mod tests {
             }
             match kind {
                 h2::T_DATA => raw.extend_from_slice(&body),
-                h2::T_HEADERS if id == 1 && flags & h2::F_END != 0 => {
+                h2::T_HEADERS if flags & h2::F_END != 0 => {
                     decoder.decode(&body, &mut |name, value| {
                         trailers.push((
                             String::from_utf8_lossy(name).into_owned(),
@@ -2446,6 +2446,21 @@ mod tests {
                 ))
                 .expect("writes the trailer head");
             client.write_all(block).expect("writes the trailer");
+        }
+    }
+
+    fn send_body(client: &mut Connection, id: u32, body: &[u8]) {
+        for chunk in body.chunks(65_535) {
+            client
+                .write_all(&h2::frame_head(chunk.len(), h2::T_DATA, 0, id))
+                .expect("writes the body head");
+            client.write_all(chunk).expect("writes the body");
+            for want in [0, id] {
+                let (len, kind, _, frame) = h2::read_head(client).expect("window update");
+                let mut payload = vec![0u8; len];
+                client.read_exact(&mut payload).expect("window body");
+                assert_eq!((kind, frame), (h2::T_WINDOW, want));
+            }
         }
     }
 
@@ -2736,10 +2751,7 @@ mod tests {
         call_head(&mut client, 3);
         let chunk = vec![0u8; CALL_MAX + CALL_ENVELOPE];
         for id in [1, 3] {
-            client
-                .write_all(&h2::frame_head(chunk.len(), h2::T_DATA, 0, id))
-                .expect("writes the head");
-            client.write_all(&chunk).expect("writes the body");
+            send_body(&mut client, id, &chunk);
         }
         client
             .write_all(&h2::frame_head(1, h2::T_DATA, 0, 1))
