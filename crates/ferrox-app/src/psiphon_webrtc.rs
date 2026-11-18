@@ -498,16 +498,7 @@ impl WebRtc {
     /// Move the engine onto a driver thread and expose it as an `io` stream.
     pub(crate) fn into_stream(mut self, timeout: Duration) -> Result<WebRtcStream, String> {
         self.send_timeout = Some(timeout);
-        WebRtcStream::spawn(self, timeout, false)
-    }
-
-    /// Move the engine onto a driver thread and preserve each write as one datagram.
-    pub(crate) fn into_datagram_stream(
-        mut self,
-        timeout: Duration,
-    ) -> Result<WebRtcStream, String> {
-        self.send_timeout = Some(timeout);
-        WebRtcStream::spawn(self, timeout, true)
+        WebRtcStream::spawn(self, timeout)
     }
 
     /// Drain engine output, sending every transmitted datagram.
@@ -970,8 +961,12 @@ fn is_bogon(ip: IpAddr) -> bool {
                 || (octets[0] == 198 && (18..=19).contains(&octets[1]))
                 || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
                 || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                || octets[0] >= 240
         }
         IpAddr::V6(ip) => {
+            if let Some(ip) = ip.to_ipv4_mapped() {
+                return is_bogon(IpAddr::V4(ip));
+            }
             let octets = ip.octets();
             ip.is_unspecified()
                 || ip.is_loopback()
@@ -1199,7 +1194,7 @@ impl Clone for WebRtcStream {
 
 impl WebRtcStream {
     /// Start the driver thread and the bounded queues.
-    fn spawn(mut webrtc: WebRtc, timeout: Duration, raw: bool) -> Result<Self, String> {
+    fn spawn(mut webrtc: WebRtc, timeout: Duration) -> Result<Self, String> {
         let (out, out_rx) = mpsc::sync_channel(64);
         let (input_tx, input) = mpsc::sync_channel(16);
         let stop = Arc::new(AtomicBool::new(false));
@@ -1211,7 +1206,7 @@ impl WebRtcStream {
             .shaping
             .take()
             .map(|(parameters, secret)| Arc::new(Mutex::new(Shaping::new(parameters, secret))));
-        let unframed = raw && shaping.is_none();
+        let unframed = media;
         let padding_sent = Arc::new(AtomicBool::new(unframed));
         let write_timeout = Arc::new(Mutex::new(Some(timeout)));
         let thread_write_timeout = Arc::clone(&write_timeout);
@@ -1448,7 +1443,7 @@ fn drive(
     input: SyncSender<Result<Vec<u8>, String>>,
     stop: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
-    raw: bool,
+    unframed: bool,
     shaping: Option<Arc<Mutex<Shaping>>>,
     write_timeout: Arc<Mutex<Option<Duration>>>,
     terminal: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -1469,7 +1464,7 @@ fn drive(
                         if stop.load(Ordering::Acquire) {
                             return;
                         }
-                        webrtc.take_received(raw, &mut peer_padding_done, &mut backlog);
+                        webrtc.take_received(unframed, &mut peer_padding_done, &mut backlog);
                         let mut buffered = lock(&terminal);
                         for data in backlog.drain(..).flatten() {
                             buffered.push_back(data);
@@ -1510,7 +1505,7 @@ fn drive(
         };
         match webrtc.receive(timeout) {
             Ok(Some(data)) => {
-                if raw {
+                if unframed {
                     if !data.is_empty() {
                         backlog.push_back(Ok(data));
                     }
@@ -2027,6 +2022,7 @@ impl Conduit {
         let settings = OfferSettings {
             secret: offer_secret,
             traffic_shaping: shaping,
+            use_media_streams: media_secret.is_some(),
         };
         let offer = {
             let mut client = lock(&client);
@@ -2089,15 +2085,9 @@ impl Conduit {
             }
         }
         let media = webrtc.media.is_some();
-        let stream = if unreliable || media {
-            webrtc
-                .into_datagram_stream(self.timeout)
-                .map_err(|error| (error, false))?
-        } else {
-            webrtc
-                .into_stream(self.timeout)
-                .map_err(|error| (error, false))?
-        };
+        let stream = webrtc
+            .into_stream(self.timeout)
+            .map_err(|error| (error, false))?;
         let stream = if media && !unreliable {
             InproxyStream::Reliable(
                 crate::psiphon_quic::QuicStream::connect_inproxy_reliability(

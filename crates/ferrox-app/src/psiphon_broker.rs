@@ -474,6 +474,7 @@ struct Session {
 pub(crate) struct OfferSettings {
     pub(crate) secret: [u8; 32],
     pub(crate) traffic_shaping: Option<TrafficShapingParameters>,
+    pub(crate) use_media_streams: bool,
 }
 
 /// A broker client with at most one live session.
@@ -609,8 +610,7 @@ impl Client {
                 personal_compartments,
                 sdp,
                 &metrics,
-                settings.secret,
-                settings.traffic_shaping.as_ref(),
+                settings,
             );
             self.offer_budget = if personal_compartments.is_empty() {
                 self.offer_timeout
@@ -627,7 +627,9 @@ impl Client {
                     response.kind
                 ));
             }
-            Ok(parse_offer(&response.value))
+            let offer = parse_offer(&response.value);
+            validate_offer_version(&offer, settings.use_media_streams)?;
+            Ok(offer)
         })();
         self.offer_deadline = None;
         self.transport.set_deadline(None);
@@ -870,18 +872,6 @@ fn api_parameters(identity: &Identity<'_>) -> Value {
         (Value::UInt(9), Value::Text(identity.platform.to_owned())),
         (Value::UInt(54), Value::Text("unknown".to_owned())),
     ];
-    if !identity.authorizations.is_empty() {
-        fields.push((
-            Value::UInt(1),
-            Value::Array(
-                identity
-                    .authorizations
-                    .iter()
-                    .map(|authorization| Value::Text(authorization.clone()))
-                    .collect(),
-            ),
-        ));
-    }
     if !identity.client_features.is_empty() {
         fields.push((
             Value::UInt(10),
@@ -934,8 +924,7 @@ fn client_offer_request(
     personal_compartments: &[[u8; 32]],
     sdp: &str,
     metrics: &Metrics,
-    offer_secret: [u8; 32],
-    traffic_shaping: Option<&TrafficShapingParameters>,
+    settings: &OfferSettings,
 ) -> Value {
     let mut metrics_fields = vec![
         (Value::UInt(1), metrics.base_parameters.clone()),
@@ -983,7 +972,10 @@ fn client_offer_request(
     }
     // The reference always asks legacy proxies to randomize their DTLS handshake.
     fields.push((Value::UInt(7), Value::Bool(true)));
-    if let Some(params) = traffic_shaping {
+    if settings.use_media_streams {
+        fields.push((Value::UInt(12), Value::Bool(true)));
+    }
+    if let Some(params) = settings.traffic_shaping.as_ref() {
         let mut shaped = Vec::new();
         for (key, value) in [
             (1, params.min_padded_messages),
@@ -1019,7 +1011,7 @@ fn client_offer_request(
             Value::UInt(5),
             Value::Array(vec![Value::UInt(1), Value::UInt(3), Value::UInt(4)]),
         ),
-        (Value::UInt(6), Value::Bytes(offer_secret.to_vec())),
+        (Value::UInt(6), Value::Bytes(settings.secret.to_vec())),
         (
             Value::UInt(9),
             Value::Bytes(destination.packed_server_entry.clone()),
@@ -1027,6 +1019,22 @@ fn client_offer_request(
         (Value::UInt(11), Value::Text(destination.address.clone())),
     ]);
     Value::Map(fields)
+}
+
+fn validate_offer_version(offer: &Offer, use_media_streams: bool) -> Result<(), String> {
+    if offer.must_upgrade || offer.limited || offer.no_match {
+        return Ok(());
+    }
+    if offer.protocol_version < 1
+        || (use_media_streams && offer.protocol_version < 2)
+        || offer.protocol_version > LATEST_PROTOCOL_VERSION
+    {
+        return Err(format!(
+            "psiphon broker: unsupported protocol version {}",
+            offer.protocol_version
+        ));
+    }
+    Ok(())
 }
 
 fn parse_offer(value: &Value) -> Offer {
@@ -1844,8 +1852,11 @@ mod tests {
             &[[8u8; 32]],
             "v=0\r\n",
             &metrics,
-            [4u8; 32],
-            None,
+            &OfferSettings {
+                secret: [4u8; 32],
+                traffic_shaping: None,
+                use_media_streams: false,
+            },
         );
         assert_eq!(request.get(1).unwrap().get(2).unwrap().uint(), Some(2));
         assert_eq!(
@@ -1884,10 +1895,14 @@ mod tests {
             &[],
             "v=0\r\n",
             &metrics,
-            [4u8; 32],
-            Some(&parameters),
+            &OfferSettings {
+                secret: [4u8; 32],
+                traffic_shaping: Some(parameters),
+                use_media_streams: true,
+            },
         );
         assert_eq!(request.get(7).and_then(Value::bool), Some(true));
+        assert_eq!(request.get(12).and_then(Value::bool), Some(true));
         let shaped = request.get(8).expect("shaping parameters");
         assert_eq!(shaped.get(1).and_then(Value::uint), Some(1));
         assert_eq!(shaped.get(2).and_then(Value::uint), Some(2));
@@ -2024,12 +2039,31 @@ mod tests {
                 &OfferSettings {
                     secret: [3; 32],
                     traffic_shaping: None,
+                    use_media_streams: false,
                 },
             )
             .unwrap();
         assert_eq!(offer.answer_sdp, "answer");
         assert_eq!(offer.connection_id, vec![4; 32]);
         assert_eq!(offer.protocol_version, 2);
+    }
+
+    #[test]
+    fn a_media_offer_needs_protocol_version_two() {
+        let mut offer = Offer {
+            limited: false,
+            no_match: false,
+            must_upgrade: false,
+            connection_id: Vec::new(),
+            protocol_version: 1,
+            answer_sdp: String::new(),
+            relay_packet_to_server: Vec::new(),
+        };
+        assert!(validate_offer_version(&offer, false).is_ok());
+        assert!(validate_offer_version(&offer, true).is_err());
+        offer.limited = true;
+        offer.protocol_version = 0;
+        assert!(validate_offer_version(&offer, true).is_ok());
     }
 
     #[test]
