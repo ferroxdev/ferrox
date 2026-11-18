@@ -3496,7 +3496,7 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
     headers: &[(String, String)],
     pad: &str,
 ) -> Option<()> {
-    send_dial_head_padded(write, host, target, headers, pad, "", "?x_padding=", pad)
+    send_dial_head_padded(write, host, target, headers, "", "?x_padding=", pad)
 }
 
 fn send_dial_head_padded<W: crate::proxy::FrameWrite>(
@@ -3504,7 +3504,6 @@ fn send_dial_head_padded<W: crate::proxy::FrameWrite>(
     host: &str,
     target: &str,
     headers: &[(String, String)],
-    pad: &str,
     padding: &str,
     referer_prefix: &str,
     referer_pad: &str,
@@ -3517,7 +3516,7 @@ fn send_dial_head_padded<W: crate::proxy::FrameWrite>(
     // The default padding's longest shape stays in the room, so a configured pad only grows it when it exceeds the default's ceiling.
     const PADDING_ROOM: usize = 1000;
     let referer = target.split_once('?').map_or(target, |(path, _)| path);
-    let room = pad.len().max(PADDING_ROOM);
+    let room = padding.len().max(referer_pad.len()).max(PADDING_ROOM);
     let headers_len = crate::headers::masked_len(headers, crate::headers::FETCH);
     DIAL_HEAD.with(|cell| {
         let mut head = cell.borrow_mut();
@@ -3957,13 +3956,13 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     Some(split_halves(read, write, head, at))
 }
 
-fn dial_head_parts(settings: &XhttpSettings) -> (String, String, String, String) {
+fn dial_head_parts(settings: &XhttpSettings) -> (String, String, String) {
     let mut target = dial_path(settings);
     let pad = referer_pad_value(settings);
     pad_target(settings, &pad, &mut target);
     let padding = pad_head(settings, &pad);
     let referer = pad_referer(settings, &pad);
-    (target, pad, padding, referer)
+    (target, padding, referer)
 }
 
 pub(crate) fn connect_settings(
@@ -3972,13 +3971,12 @@ pub(crate) fn connect_settings(
     settings: &XhttpSettings,
 ) -> Option<(XhttpReader, XhttpWriter)> {
     let mut read = stream;
-    let (target, pad, padding, referer) = dial_head_parts(settings);
+    let (target, padding, referer) = dial_head_parts(settings);
     send_dial_head_padded(
         &mut read,
         host,
         &target,
         &settings.headers,
-        &pad,
         &padding,
         "",
         &referer,
@@ -3994,13 +3992,12 @@ pub(crate) fn connect_split_settings<R: Read, W: crate::proxy::FrameWrite + 'sta
     host: &str,
     settings: &XhttpSettings,
 ) -> Option<(Reader<R>, XhttpWriter)> {
-    let (target, pad, padding, referer) = dial_head_parts(settings);
+    let (target, padding, referer) = dial_head_parts(settings);
     send_dial_head_padded(
         &mut write,
         host,
         &target,
         &settings.headers,
-        &pad,
         &padding,
         "",
         &referer,
