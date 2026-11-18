@@ -9,10 +9,11 @@
 //! request a documented no-op on a Unix stream rather than a silent failure.
 //!
 //! The Unix arm is built on both host families that name a socket path in a config. On a Unix
-//! host it is `std`'s `UnixStream`; on Windows `std` has the type but keeps it behind the
-//! unstable `windows_unix_domain_sockets` feature, which a stable build cannot name, so there the
-//! same arm is a `SOCK_STREAM` socket in the `AF_UNIX` family, opened and driven through
-//! `WinSock` (`winunix` below) the way `std` drives its own sockets. What neither host gives for
+//! host it is a shared handle over `std`'s `UnixStream`; on Windows `std` has the type but keeps
+//! it behind the unstable `windows_unix_domain_sockets` feature, which a stable build cannot
+//! name, so there the same arm is a `SOCK_STREAM` socket in the `AF_UNIX` family, opened and
+//! driven through `WinSock` (`winunix` below) the way `std` drives its own sockets. Both hosts
+//! share one socket across relay legs, so a clone costs no `dup`. What neither host gives for
 //! free is carried by the seam: `std` has no timeout setter for a Unix stream at all, and
 //! `WinSock` spells the wait bound in milliseconds rather than a `timeval`. The `SOCK_STREAM`
 //! shape and the Windows 10 build 17063 floor are the ones `std`'s own Windows unix module names.
@@ -25,7 +26,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use libc::{SO_RCVTIMEO, SO_SNDTIMEO};
 #[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 #[cfg(any(unix, windows))]
 use std::path::PathBuf;
 #[cfg(windows)]
@@ -1040,6 +1041,13 @@ impl From<TcpStream> for Connection {
 impl From<UnixStream> for Connection {
     fn from(stream: UnixStream) -> Self {
         Connection::Unix(stream)
+    }
+}
+
+#[cfg(unix)]
+impl From<std::os::unix::net::UnixStream> for Connection {
+    fn from(stream: std::os::unix::net::UnixStream) -> Self {
+        Connection::Unix(stream.into())
     }
 }
 
@@ -2331,7 +2339,7 @@ impl Iterator for Incoming<'_> {
             #[cfg(any(unix, windows))]
             Listener::Unix(listener) => listener
                 .incoming()
-                .map(|stream| stream.map(Connection::Unix))
+                .map(|stream| stream.map(Connection::from))
                 .next(),
         }
     }
@@ -2436,7 +2444,7 @@ impl Listener {
             #[cfg(any(unix, windows))]
             Listener::Unix(listener) => listener.accept().map(|(stream, _addr)| {
                 (
-                    Connection::Unix(stream),
+                    Connection::from(stream),
                     SocketAddr::from(([0, 0, 0, 0], 0)),
                 )
             }),
@@ -2801,6 +2809,113 @@ fn is_unix_socket(path: &std::path::Path) -> io::Result<bool> {
     Ok(info.tag == IO_REPARSE_TAG_AF_UNIX)
 }
 
+/// A unix stream both relay legs share, so a clone reaches the same descriptor instead of a `dup`.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct UnixStream(std::sync::Arc<std::os::unix::net::UnixStream>);
+
+#[cfg(unix)]
+impl UnixStream {
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the seam matches one fallible clone signature"
+    )]
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self(std::sync::Arc::clone(&self.0)))
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.0.shutdown(how)
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.0.set_nonblocking(nonblocking)
+    }
+}
+
+#[cfg(unix)]
+impl From<std::os::unix::net::UnixStream> for UnixStream {
+    fn from(stream: std::os::unix::net::UnixStream) -> Self {
+        Self(std::sync::Arc::new(stream))
+    }
+}
+
+#[cfg(unix)]
+impl From<std::os::fd::OwnedFd> for UnixStream {
+    fn from(fd: std::os::fd::OwnedFd) -> Self {
+        std::os::unix::net::UnixStream::from(fd).into()
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for UnixStream {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&*self.0)
+    }
+}
+
+#[cfg(unix)]
+impl Read for &UnixStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut stream = &*self.0;
+        stream.read(buf)
+    }
+
+    fn read_vectored(&mut self, bufs: &mut [std::io::IoSliceMut<'_>]) -> io::Result<usize> {
+        let mut stream = &*self.0;
+        stream.read_vectored(bufs)
+    }
+}
+
+#[cfg(unix)]
+impl Write for &UnixStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut stream = &*self.0;
+        stream.write(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> io::Result<usize> {
+        let mut stream = &*self.0;
+        stream.write_vectored(bufs)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut stream = &*self.0;
+        stream.flush()
+    }
+}
+
+#[cfg(unix)]
+impl Read for UnixStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut stream = &*self;
+        stream.read(buf)
+    }
+
+    fn read_vectored(&mut self, bufs: &mut [std::io::IoSliceMut<'_>]) -> io::Result<usize> {
+        let mut stream = &*self;
+        stream.read_vectored(bufs)
+    }
+}
+
+#[cfg(unix)]
+impl Write for UnixStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut stream = &*self;
+        stream.write(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> io::Result<usize> {
+        let mut stream = &*self;
+        stream.write_vectored(bufs)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut stream = &*self;
+        stream.flush()
+    }
+}
+
 /// One nonblocking `connect` waited out with `poll`, so a full backlog costs the budget and not the
 /// flow's thread, and a listener that answers at once still does.
 #[cfg(unix)]
@@ -2850,7 +2965,7 @@ pub(crate) fn connect_bounded(
 
 #[cfg(unix)]
 fn unix_connection(socket: socket2::Socket) -> Connection {
-    Connection::Unix(UnixStream::from(std::os::fd::OwnedFd::from(socket)))
+    Connection::Unix(std::os::fd::OwnedFd::from(socket).into())
 }
 
 /// The `sockaddr_un` an abstract name fills: the leading zero is the namespace's marker, as
@@ -3470,13 +3585,55 @@ mod tests {
         }
     }
 
+    /// A clone shares the descriptor instead of duplicating it: the relay's second leg reaches the
+    /// same socket without a `dup`, and the last leg closes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_clone_shares_the_descriptor_instead_of_duplicating_it() {
+        use std::os::fd::AsRawFd as _;
+
+        let (side, mut peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let stream = Connection::Unix(side.into());
+        let mut clone = stream.try_clone().expect("clones");
+        assert_eq!(
+            stream.as_raw_fd(),
+            clone.as_raw_fd(),
+            "a unix clone reaches the same descriptor"
+        );
+        clone.write_all(b"x").expect("writes on the clone");
+        let mut byte = [0u8; 1];
+        peer.read_exact(&mut byte).expect("reads the clone's byte");
+        assert_eq!(&byte, b"x");
+        stream.shutdown(Shutdown::Write).expect("half-closes");
+        let mut eof = [0u8; 1];
+        assert_eq!(peer.read(&mut eof).expect("reads eof"), 0);
+
+        let (side, mut peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("arms the peer's clock");
+        let stream = Connection::Unix(side.into());
+        let mut clone = stream.try_clone().expect("clones");
+        drop(stream);
+        clone
+            .write_all(b"y")
+            .expect("writes with the original gone");
+        peer.read_exact(&mut byte).expect("reads the clone's byte");
+        assert_eq!(&byte, b"y");
+        drop(clone);
+        assert_eq!(
+            peer.read(&mut eof).expect("reads eof after the last owner"),
+            0,
+            "the last owner's drop must close the socket"
+        );
+    }
+
     /// A relay read on an empty socket answers instead of waiting out the read clock, which is what
     /// lets the lane park on the descriptor with the worker free.
     #[cfg(unix)]
     #[test]
     fn a_relay_read_never_waits_out_the_clock() {
         let (side, _peer) = std::os::unix::net::UnixStream::pair().expect("pair");
-        let mut stream = Connection::Unix(side);
+        let mut stream = Connection::Unix(side.into());
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("arms the read clock");
@@ -4087,7 +4244,7 @@ mod tests {
         let filler_path = path.clone();
         let (progress, filled) = mpsc::channel();
         std::thread::spawn(move || loop {
-            match UnixStream::connect(&filler_path) {
+            match std::os::unix::net::UnixStream::connect(&filler_path) {
                 // A queued connection keeps its slot; dropping it would free the room the dial needs to find full.
                 Ok(stream) => std::mem::forget(stream),
                 Err(_) => std::thread::sleep(Duration::from_millis(50)),
