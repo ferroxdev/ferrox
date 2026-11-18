@@ -4581,7 +4581,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
         None => None,
     };
     let flow = crate::proxy::flow_sockopts();
-    let source = crate::proxy::flow_source();
+    let source = crate::proxy::flow_source().ok()?;
     for peer in peers {
         let wildcard = if peer.is_ipv6() {
             "[::]:0"
@@ -4878,7 +4878,7 @@ impl QuicStream {
                     return false;
                 };
                 if conn.is_closed() || conn.is_draining() {
-                    Some(true)
+                    Some(false)
                 } else {
                     match conn.stream_send(self.id, &[], true) {
                         Ok(_) => {

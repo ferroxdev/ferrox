@@ -4868,6 +4868,12 @@ mod tests {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "no echo before the handshake budget",
+                        ));
+                    }
                     app.write_all(b"hello")?;
                 }
                 Err(error) => return Err(error),

@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use crate::h2;
@@ -83,6 +83,7 @@ const H2_MAX_STREAMS: usize = 256;
 const FLAG_UDP: u16 = 1;
 const FLAG_ADDR: u16 = 2;
 const MAX_STREAMS: usize = 1024;
+const RESET_QUEUE: usize = MAX_STREAMS;
 
 /// One stream's opening request: a TCP destination, or the destination a connected UDP flow
 /// speaks to; `packet_addr` marks the full-cone form where every frame names its own address.
@@ -264,26 +265,38 @@ impl Window {
     }
 
     fn take_up_to(&self, size: usize) -> Option<usize> {
+        self.take_up_to_while(size, None)
+    }
+
+    fn take_up_to_while(&self, size: usize, alive: Option<&AtomicBool>) -> Option<usize> {
         let limit = i64::try_from(size).unwrap_or(i64::MAX);
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        while state.value <= 0 {
-            if state.closed {
+        loop {
+            if state.closed || alive.is_some_and(|alive| !alive.load(Ordering::Relaxed)) {
                 return None;
+            }
+            if state.value > 0 {
+                let taken = state.value.min(limit);
+                state.value -= taken;
+                return Some(usize::try_from(taken).unwrap_or(usize::MAX));
             }
             state = match self.wake.wait(state) {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
         }
-        if state.closed {
-            return None;
+    }
+
+    fn notify_waiters(&self) {
+        // Hold the lock across the notification so a waiter cannot miss it between its check and wait.
+        match self.state.lock() {
+            Ok(state) => drop(state),
+            Err(poisoned) => drop(poisoned.into_inner()),
         }
-        let taken = state.value.min(limit);
-        state.value -= taken;
-        Some(usize::try_from(taken).unwrap_or(usize::MAX))
+        self.wake.notify_all();
     }
 
     fn add(&self, size: i64) {
@@ -449,7 +462,7 @@ struct Inner {
     role: Role,
     write: Mutex<Box<dyn Write + Send>>,
     sinks: Mutex<HashMap<u32, Sink>>,
-    resets: Mutex<Option<Sender<u32>>>,
+    resets: Mutex<Option<SyncSender<u32>>>,
     accept_tx: Mutex<Option<Sender<Stream>>>,
     accept_rx: Mutex<Receiver<Stream>>,
     next_id: AtomicU32,
@@ -652,6 +665,10 @@ impl Inner {
     }
 
     fn write_frame(&self, head: &[u8], data: &[u8]) -> bool {
+        self.write_frame_while(head, data, None)
+    }
+
+    fn write_frame_while(&self, head: &[u8], data: &[u8], closed: Option<&AtomicBool>) -> bool {
         if self.dead() {
             return false;
         }
@@ -659,6 +676,9 @@ impl Inner {
             Ok(write) => write,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if closed.is_some_and(|closed| closed.load(Ordering::Relaxed)) {
+            return false;
+        }
         let ok =
             write.write_all(head).is_ok() && write.write_all(data).is_ok() && write.flush().is_ok();
         drop(write);
@@ -685,22 +705,30 @@ impl Inner {
         self.write_raw(&frame).is_ok()
     }
 
-    fn send_data(&self, id: u32, data: &[u8], end: bool) -> bool {
+    fn send_data(&self, id: u32, data: &[u8], end: bool, closed: &AtomicBool) -> bool {
         if data.is_empty() && !end {
             return true;
         }
         match self.protocol {
             Protocol::Smux => {
                 let flags = if end { SMUX_FIN } else { SMUX_PSH };
-                self.write_frame(&smux_head(flags, id, data.len()), data)
+                self.write_frame_while(&smux_head(flags, id, data.len()), data, Some(closed))
             }
             Protocol::Yamux => {
                 let flags = if end { YAMUX_FIN } else { 0 };
-                self.write_frame(&yamux_head(YAMUX_DATA, flags, id, data.len() as u32), data)
+                self.write_frame_while(
+                    &yamux_head(YAMUX_DATA, flags, id, data.len() as u32),
+                    data,
+                    Some(closed),
+                )
             }
             Protocol::H2Mux => {
                 let flags = if end { h2::F_END } else { 0 };
-                self.write_frame(&h2::frame_head(data.len(), h2::T_DATA, flags, id), data)
+                self.write_frame_while(
+                    &h2::frame_head(data.len(), h2::T_DATA, flags, id),
+                    data,
+                    Some(closed),
+                )
             }
         }
     }
@@ -729,23 +757,41 @@ impl Inner {
             Ok(resets) => resets,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(sender) = resets.as_ref() {
-            let _ = sender.send(id);
+        if self.dead() {
             return;
         }
-        let (sender, pending) = channel();
+        if resets.is_some() {
+            let failed = resets
+                .as_ref()
+                .is_some_and(|sender| sender.try_send(id).is_err());
+            if failed {
+                drop(resets);
+                self.finish();
+            }
+            return;
+        }
+        let (sender, pending) = sync_channel(RESET_QUEUE);
+        let inner = Arc::downgrade(&self.clone_handle());
+        let spawned = std::thread::Builder::new()
+            .name("singmux-reset".to_owned())
+            .spawn(move || {
+                while let Ok(id) = pending.recv() {
+                    let Some(inner) = inner.upgrade() else {
+                        break;
+                    };
+                    inner.send_reset(id);
+                }
+            });
+        if spawned.is_err() {
+            drop(resets);
+            self.finish();
+            return;
+        }
         *resets = Some(sender.clone());
         drop(resets);
-        let inner = Arc::downgrade(&self.clone_handle());
-        std::thread::spawn(move || {
-            while let Ok(id) = pending.recv() {
-                let Some(inner) = inner.upgrade() else {
-                    break;
-                };
-                inner.send_reset(id);
-            }
-        });
-        let _ = sender.send(id);
+        if sender.try_send(id).is_err() {
+            self.finish();
+        }
     }
 
     fn release(&self, id: u32) {
@@ -757,6 +803,7 @@ impl Inner {
             sink.closed.store(true, Ordering::Relaxed);
             sink.window.close();
             sink.queue.close();
+            self.connection_window.notify_waiters();
         }
     }
 
@@ -768,6 +815,7 @@ impl Inner {
         if let Some(sink) = sink {
             sink.closed.store(true, Ordering::Relaxed);
             sink.window.close();
+            self.connection_window.notify_waiters();
         }
     }
 
@@ -858,18 +906,20 @@ impl Inner {
                 }
             }
             Push::Full | Push::Closed => {
-                self.defer_reset(id);
                 self.release(id);
+                self.defer_reset(id);
             }
         }
     }
 
-    fn take_window(&self, window: &Window, size: usize) -> Option<usize> {
+    fn take_window(&self, window: &Window, size: usize, closed: &AtomicBool) -> Option<usize> {
         match self.protocol {
             Protocol::Smux => Some(size),
             Protocol::Yamux => window.take_up_to(size),
             Protocol::H2Mux => {
-                let connection = self.connection_window.take_up_to(size)?;
+                let connection = self
+                    .connection_window
+                    .take_up_to_while(size, Some(closed))?;
                 let Some(stream) = window.take_up_to(connection) else {
                     self.connection_window
                         .add(i64::try_from(connection).unwrap_or(i64::MAX));
@@ -922,6 +972,10 @@ impl Inner {
     fn finish(&self) {
         if self.dead.swap(true, Ordering::Relaxed) {
             return;
+        }
+        match self.resets.lock() {
+            Ok(mut resets) => drop(resets.take()),
+            Err(poisoned) => drop(poisoned.into_inner().take()),
         }
         self.connection_window.close();
         match self.accept_tx.lock() {
@@ -1288,7 +1342,7 @@ impl Stream {
                 Protocol::Smux => left.min(SMUX_DATA_MAX),
                 Protocol::Yamux | Protocol::H2Mux => left.min(H2_DATA_MAX),
             };
-            let Some(taken) = self.inner.take_window(&self.window, chunk) else {
+            let Some(taken) = self.inner.take_window(&self.window, chunk, &self.closed) else {
                 return false;
             };
             if self.closed.load(Ordering::Relaxed) {
@@ -1305,7 +1359,7 @@ impl Stream {
     }
 
     fn write_chunk(&self, data: &[u8]) -> bool {
-        self.inner.send_data(self.id, data, false)
+        self.inner.send_data(self.id, data, false, &self.closed)
     }
 
     pub(crate) fn take_replies(&mut self) -> Option<Replies> {
@@ -1330,6 +1384,7 @@ impl Stream {
             self.inner.send_end(self.id);
         }
         self.window.close();
+        self.inner.connection_window.notify_waiters();
         self.inner.end_local(self.id);
     }
 
@@ -1421,7 +1476,16 @@ impl StreamWriter {
             self.inner.send_end(self.id);
         }
         self.window.close();
+        self.inner.connection_window.notify_waiters();
         self.inner.end_local(self.id);
+    }
+}
+
+fn short_write(offset: usize) -> io::Result<usize> {
+    if offset > 0 {
+        Ok(offset)
+    } else {
+        Err(io::ErrorKind::BrokenPipe.into())
     }
 }
 
@@ -1437,19 +1501,19 @@ impl Write for StreamWriter {
                 Protocol::Smux => left.min(SMUX_DATA_MAX),
                 Protocol::Yamux | Protocol::H2Mux => left.min(H2_DATA_MAX),
             };
-            let Some(taken) = self.inner.take_window(&self.window, chunk) else {
-                return Err(io::ErrorKind::BrokenPipe.into());
+            let Some(taken) = self.inner.take_window(&self.window, chunk, &self.closed) else {
+                return short_write(offset);
             };
             if self.closed.load(Ordering::Relaxed) {
                 self.inner.refund_window(&self.window, taken);
-                return Err(io::ErrorKind::BrokenPipe.into());
+                return short_write(offset);
             }
             if !self
                 .inner
-                .send_data(self.id, &data[offset..offset + taken], false)
+                .send_data(self.id, &data[offset..offset + taken], false, &self.closed)
             {
                 self.inner.refund_window(&self.window, taken);
-                return Err(io::ErrorKind::BrokenPipe.into());
+                return short_write(offset);
             }
             offset += taken;
         }

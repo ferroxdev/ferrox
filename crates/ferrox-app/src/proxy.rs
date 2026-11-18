@@ -1352,10 +1352,8 @@ pub(crate) fn flow_sockopts() -> Option<Arc<crate::sockopt::SocketOptions>> {
 }
 
 /// The source the flow on this thread leaves from, for a carrier that binds its own datagram socket.
-pub(crate) fn flow_source() -> Option<IpAddr> {
+pub(crate) fn flow_source() -> std::io::Result<Option<IpAddr>> {
     resolve_source(SEND_THROUGH.with(std::cell::Cell::get))
-        .ok()
-        .flatten()
 }
 
 /// The options one flow's dial carries, cleared on drop so a pooled lane thread's next flow starts on the bare socket.
@@ -9345,9 +9343,15 @@ fn handle_mux_frame(
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                     });
+                echo_trace(&format!(
+                    "mux udp keep id {} len {} dest {dest}",
+                    frame.id,
+                    data.len()
+                ));
                 let _ = session.socket.send_to(data, dest);
                 return;
             }
+            echo_trace(&format!("mux udp keep without session id {}", frame.id));
             if frame.target.is_some() {
                 return;
             }
@@ -9699,7 +9703,9 @@ fn spawn_mux_udp_reader(
             loop {
                 match read.recv_from(&mut buf) {
                     Ok((n, source)) => {
+                        echo_trace(&format!("mux udp recv {n} from {source}"));
                         if done.load(Ordering::Relaxed) || stopped.try_recv().is_ok() {
+                            echo_trace("mux udp stopped before write");
                             return;
                         }
                         let keep = ferrox_core::mux::Outgoing {
@@ -9710,21 +9716,28 @@ fn spawn_mux_udp_reader(
                             global_id: None,
                         };
                         if !wire.write_frame(&mut staging, keep, Some(&buf[..n])) {
+                            echo_trace("mux udp reply write failed");
                             return;
                         }
+                        echo_trace("mux udp reply written");
                     }
                     Err(error) if is_timeout(&error) => {
                         if done.load(Ordering::Relaxed) {
+                            echo_trace("mux udp reader timeout after done");
                             return;
                         }
                     }
                     Err(error) if is_udp_gone(&error) => {
+                        echo_trace(&format!("mux udp gone {error:?}"));
                         thread::sleep(RELAY_POLL);
                         if done.load(Ordering::Relaxed) {
                             return;
                         }
                     }
-                    Err(_) => return,
+                    Err(error) => {
+                        echo_trace(&format!("mux udp reader error {error:?}"));
+                        return;
+                    }
                 }
             }
         }))
@@ -14306,7 +14319,7 @@ fn kcp_dial_session(
         let (socket, stop) = dial_udp_through_proxy(server, tag, options)?;
         return ferrox_core::kcp::dial_with(socket, server, config.clone(), conv, stop).ok();
     }
-    let source = flow_source();
+    let source = flow_source().ok()?;
     if source.is_none() && options.is_none() {
         return ferrox_core::kcp::dial(server, config.clone(), conv).ok();
     }
@@ -31158,7 +31171,9 @@ fn serve_socks_udp_pool<F, G>(
         };
         let target = mux_target_of(dest);
         if let Some(flow) = flows.get(&dest) {
-            if flow.send(&target, &buf[at..at + len]) {
+            let sent = flow.send(&target, &buf[at..at + len]);
+            echo_trace(&format!("muxpool udp reuse {dest} len {len} sent {sent}"));
+            if sent {
                 continue;
             }
             if let Some(old) = flows.remove(&dest) {
@@ -31178,7 +31193,12 @@ fn serve_socks_udp_pool<F, G>(
             let out = socks_udp_frame(&mut head, &target.unwrap_or(dest), data);
             let _ = sink_reply.send_to(out, peer);
         });
-        if let Some(flow) = pool.udp(dest, id.as_ref(), &buf[at..at + len], &deliver) {
+        let opened = pool.udp(dest, id.as_ref(), &buf[at..at + len], &deliver);
+        echo_trace(&format!(
+            "muxpool udp new {dest} len {len} opened {}",
+            opened.is_some()
+        ));
+        if let Some(flow) = opened {
             flows.insert(dest, flow);
         }
     }
