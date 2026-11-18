@@ -813,6 +813,12 @@ impl Inner {
             Ok(mut sinks) => sinks.remove(&id),
             Err(poisoned) => poisoned.into_inner().remove(&id),
         };
+        if sink.is_some() {
+            crate::proxy::echo_trace(&format!(
+                "singmux release id {id} protocol {:?}",
+                self.protocol
+            ));
+        }
         if let Some(sink) = sink {
             sink.closed.store(true, Ordering::Relaxed);
             sink.window.close();
@@ -826,6 +832,12 @@ impl Inner {
             Ok(mut sinks) => sinks.remove(&id),
             Err(poisoned) => poisoned.into_inner().remove(&id),
         };
+        if sink.is_some() {
+            crate::proxy::echo_trace(&format!(
+                "singmux reap id {id} protocol {:?}",
+                self.protocol
+            ));
+        }
         if let Some(sink) = sink {
             sink.closed.store(true, Ordering::Relaxed);
             sink.window.close();
@@ -935,10 +947,17 @@ impl Inner {
             Protocol::Smux => Some(size),
             Protocol::Yamux => window.take_up_to(size),
             Protocol::H2Mux => {
-                let connection = self
-                    .connection_window
-                    .take_up_to_while(size, Some(closed))?;
+                let Some(connection) = self.connection_window.take_up_to_while(size, Some(closed))
+                else {
+                    crate::proxy::echo_trace(&format!(
+                        "singmux no connection window size {size} protocol H2Mux"
+                    ));
+                    return None;
+                };
                 let Some(stream) = window.take_up_to(connection) else {
+                    crate::proxy::echo_trace(&format!(
+                        "singmux no stream window size {size} connection {connection} protocol H2Mux"
+                    ));
                     self.connection_window
                         .add(i64::try_from(connection).unwrap_or(i64::MAX));
                     return None;
@@ -1438,6 +1457,10 @@ impl Stream {
     }
 
     pub(crate) fn finish(&self) {
+        crate::proxy::echo_trace(&format!(
+            "singmux stream finish id {} protocol {:?}",
+            self.id, self.inner.protocol
+        ));
         if !self.closed.swap(true, Ordering::Relaxed) {
             self.inner.send_end(self.id);
         }
