@@ -1656,10 +1656,7 @@ impl Tls2 {
                 end_headers,
                 ..
             } => {
-                let over = {
-                    let Some(entry) = inner.streams.get_mut(&stream) else {
-                        false
-                    };
+                let over = if let Some(entry) = inner.streams.get_mut(&stream) {
                     if entry.head_end {
                         false
                     } else {
@@ -1670,16 +1667,15 @@ impl Tls2 {
                         }
                         over
                     }
+                } else {
+                    false
                 };
                 if over {
                     reset_stream(inner, stream);
                 }
             }
             frames::H2Routed::Continuation { stream, block, end } => {
-                let over = {
-                    let Some(entry) = inner.streams.get_mut(&stream) else {
-                        false
-                    };
+                let over = if let Some(entry) = inner.streams.get_mut(&stream) {
                     if entry.head_end {
                         false
                     } else {
@@ -1690,6 +1686,8 @@ impl Tls2 {
                         }
                         over
                     }
+                } else {
+                    false
                 };
                 if over {
                     reset_stream(inner, stream);
