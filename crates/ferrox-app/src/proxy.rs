@@ -79488,7 +79488,7 @@ end
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             probe.send(&frame).expect("sends");
-            let Ok((n, _)) = probe.recv(&mut back) else {
+            let Ok(n) = probe.recv(&mut back) else {
                 assert!(Instant::now() < deadline, "no echo to {frame:?}");
                 continue;
             };
