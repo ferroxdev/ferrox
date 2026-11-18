@@ -20856,41 +20856,42 @@ fn dial_tls_session(
     Some(session)
 }
 
-// The handle a sealed writer puts its records on: the write clock must live on this duplicate, not on the session's own descriptor, because Windows gives each duplicate its own clock.
-trait WriteClock {
-    fn write_clock(&self) -> Option<Connection>;
+// The handle a split's writer puts its records on: a socket becomes the sealed wire itself, so the clock lives on the handle that sends and the split buys no second descriptor for it.
+trait SealedWire: Write + Send + Sized + 'static {
+    fn sealed(self) -> Sealed;
 }
 
-impl WriteClock for Connection {
-    fn write_clock(&self) -> Option<Connection> {
-        self.try_clone().ok()
+impl SealedWire for Connection {
+    fn sealed(self) -> Sealed {
+        Sealed::wired(self)
     }
 }
 
-impl WriteClock for KcpIo {
-    fn write_clock(&self) -> Option<Connection> {
-        None
+impl SealedWire for KcpIo {
+    fn sealed(self) -> Sealed {
+        Sealed::new(self)
     }
 }
 
-impl WriteClock for std::io::Sink {
-    fn write_clock(&self) -> Option<Connection> {
-        None
+// A session written to nowhere, which the frame tests drive.
+impl SealedWire for std::io::Sink {
+    fn sealed(self) -> Sealed {
+        Sealed::new(self)
     }
 }
 
 // One session, two owners: the reader drives the transport when the session exposes one, so its parked read holds no session lock.
 fn session_halves<S, W>(session: S, transport: W) -> (TlsHalf<S>, TlsHalf<S>)
 where
-    W: Write + Send + 'static + WriteClock,
+    W: SealedWire,
     S: ferrox_core::tls::TlsProvider
         + ferrox_core::tls::RecordAlignment
         + Drivable
         + Send
         + 'static,
 {
-    let clock = transport.write_clock();
-    let out = Arc::new(Mutex::new(Sealed::new(transport)));
+    // A socket's writer sends on the handle it was handed, so the split spends no second duplicate on a clock.
+    let out = Arc::new(Mutex::new(transport.sealed()));
     let cipher = session.transport().and_then(|cipher| {
         cipher
             .set_read_timeout(Some(RELAY_POLL))
@@ -20911,15 +20912,12 @@ where
         None => Arc::new(Mutex::new(session)),
     };
     if cipher.is_none() {
-        if let Some(wire) = clock.as_ref() {
-            let _ = wire.set_write_timeout(Some(RELAY_POLL));
-        }
         if let Ok(mut sealed) = out.lock() {
+            if let Some(wire) = sealed.wire.as_ref() {
+                let _ = wire.set_write_timeout(Some(RELAY_POLL));
+            }
             sealed.paced = true;
         }
-    }
-    if let (Some(wire), Ok(mut sealed)) = (clock, out.lock()) {
-        sealed.wire = Some(wire);
     }
     let reader = TlsHalf {
         session: Arc::clone(&shared),
@@ -21428,6 +21426,16 @@ impl Sealed {
         }
     }
 
+    /// A socket writer sends through the one handle it owns; the boxed fallback is never read.
+    fn wired(wire: Connection) -> Self {
+        Self {
+            transport: Box::new(std::io::sink()),
+            wire: Some(wire),
+            bytes: Vec::new(),
+            paced: false,
+        }
+    }
+
     /// The record goes out with no session lock held, so a peer that is not draining this
     /// direction parks this write alone.
     fn send(&mut self) -> std::io::Result<()> {
@@ -21623,9 +21631,8 @@ impl<S, R> TlsHalf<S, R> {
         session.read(buf)
     }
 }
-
-// The ciphertext one read of the transport carries: a record is at most sixteen kilobytes, so one read holds a whole record.
-const DRIVEN_CIPHERTEXT: usize = 32 * 1024;
+// The ciphertext one transport read carries: a whole relay window's records with their headers, tags and inner content types.
+const DRIVEN_CIPHERTEXT: usize = RELAY_BUFFER + (RELAY_BUFFER / SESSION_WINDOW) * (5 + 16 + 1);
 /// Record opens that may take ciphertext without yielding plaintext before a read hands the lane
 /// back: a peer that drips cannot hold the worker, and the state resumes on the next read.
 const DRIVEN_DRY_OPENS: usize = 32;
@@ -44495,6 +44502,96 @@ mod tests {
         );
     }
 
+    /// One transport read carries a whole relay window: a 64 KiB window costs one read, and the
+    /// opens it costs are the ones its records cost, one each.
+    #[test]
+    fn a_whole_relay_window_arrives_in_one_transport_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RecordOpen {
+            opens: Arc<AtomicUsize>,
+            records: Arc<AtomicUsize>,
+        }
+        // A TLS 1.3 record: five header bytes, the content, an inner type byte and a 16-byte tag.
+        const OVERHEAD: usize = 5 + 1 + 16;
+        impl CipherOpen for RecordOpen {
+            fn open(
+                &mut self,
+                ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                self.opens.fetch_add(1, Ordering::Relaxed);
+                if ciphertext.is_empty() {
+                    return Ok((0, 0));
+                }
+                let record = ciphertext.len().min(SESSION_WINDOW + OVERHEAD);
+                let plain = (record - OVERHEAD).min(buf.len());
+                buf[..plain].copy_from_slice(&ciphertext[OVERHEAD..OVERHEAD + plain]);
+                if plain > 0 {
+                    self.records.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok((plain, record))
+            }
+
+            fn seal_into(
+                &mut self,
+                _plaintext: &[u8],
+                _out: &mut Vec<u8>,
+            ) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        struct Window {
+            left: usize,
+            reads: Arc<AtomicUsize>,
+        }
+        impl Read for Window {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                let take = self.left.min(buf.len());
+                buf[..take].fill(b'x');
+                self.left -= take;
+                Ok(take)
+            }
+        }
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let records = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut half = DrivenHalf::new(
+            Arc::new(Mutex::new(RecordOpen {
+                opens: Arc::clone(&opens),
+                records: Arc::clone(&records),
+            })),
+            Arc::new(Mutex::new(Window {
+                left: DRIVEN_CIPHERTEXT,
+                reads: Arc::clone(&reads),
+            })),
+            Arc::new(Mutex::new(Sealed::new(std::io::sink()))),
+        );
+        let mut buf = vec![0u8; RELAY_BUFFER];
+        let mut filled = 0;
+        while filled < buf.len() {
+            let read = half.read(&mut buf[filled..]).expect("reads");
+            assert!(read > 0, "the window ended early at {filled} bytes");
+            filled += read;
+        }
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "a 64 KiB window cost more than one transport read"
+        );
+        assert_eq!(
+            records.load(Ordering::Relaxed),
+            RELAY_BUFFER / SESSION_WINDOW,
+            "the window's records were not opened one each"
+        );
+        assert!(
+            opens.load(Ordering::Relaxed) <= RELAY_BUFFER / SESSION_WINDOW + 1,
+            "a 64 KiB window cost more opens than its records and the queued probe"
+        );
+    }
+
     /// The app's own client and server speak the sealed raw session end to end: the hello,
     /// the VLESS header and the echoed payload all cross the encryption engine.
     #[cfg(unix)]
@@ -65669,6 +65766,40 @@ mod tests {
         );
     }
 
+    /// A split buys no descriptor for its wire: the writer sends on the handle the caller
+    /// duplicated, so a relay flow holds one where it held two.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_split_buys_no_descriptor_for_its_wire() {
+        fn open_descriptors() -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("reads the descriptor table")
+                .count()
+        }
+        if !crate::conn::in_a_quiet_process("proxy::tests::a_split_buys_no_descriptor_for_its_wire")
+        {
+            return;
+        }
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let socket = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let (_accepted, _) = listener.accept().expect("accepts");
+        let before = open_descriptors();
+        let wire = socket.try_clone().expect("dups the wire");
+        let after_dup = open_descriptors();
+        let (_reader, _writer) = session_halves(CountedSession::default(), wire);
+        let after_split = open_descriptors();
+        assert_eq!(
+            after_dup,
+            before + 1,
+            "the caller's duplicate is the only one"
+        );
+        assert_eq!(
+            after_split, after_dup,
+            "the split adds no descriptor of its own"
+        );
+    }
+
     /// What the write side of the halves put on the wire: one entry per send, holding the bytes it
     /// carried, which a session-side call count cannot see.
     #[derive(Clone, Default)]
@@ -65689,9 +65820,9 @@ mod tests {
         }
     }
 
-    impl WriteClock for CountedTransport {
-        fn write_clock(&self) -> Option<Connection> {
-            None
+    impl SealedWire for CountedTransport {
+        fn sealed(self) -> Sealed {
+            Sealed::new(self)
         }
     }
 

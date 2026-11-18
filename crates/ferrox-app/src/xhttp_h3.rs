@@ -1,7 +1,5 @@
 // xHTTP over HTTP/3: one QUIC connection carries the same request streams the H2 lane does, so stream-one, stream-up and packet-up keep their shapes and only the framing under them changes.
 
-#[cfg(test)]
-use std::cell::Cell;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -76,21 +74,22 @@ impl Wire {
     }
 }
 
-// What a lane's empty read did: handed the lane back, or slept the transport tick, counted only under `cfg(test)`.
 #[cfg(test)]
 thread_local! {
-    static LANE_GRANTS: Cell<usize> = const { Cell::new(0) };
-    static LANE_TICKS: Cell<usize> = const { Cell::new(0) };
+    /// A lane is a thread, so the count is the lane's own: a process-wide one sees other tests' lanes.
+    static LANE_GRANTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The same lane's empty reads that slept the transport tick instead of handing the lane back.
+    static LANE_TICKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn lane_grants() -> usize {
-    LANE_GRANTS.with(Cell::get)
+    LANE_GRANTS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
 pub(crate) fn lane_ticks() -> usize {
-    LANE_TICKS.with(Cell::get)
+    LANE_TICKS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]

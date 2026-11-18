@@ -123,12 +123,22 @@ fn duplicate_fronts(list: &str, ports: Ports) {
     }
 }
 
+fn ensure_config(options: &Options) {
+    if options.outbound == Some(Outbound::Config) && !Path::new(&options.config_file).is_file() {
+        args::die(&format!("no such config: {}", options.config_file));
+    }
+}
+
+fn reject_duplicate_ports(options: &Options, paths: &Paths) {
+    if options.outbound != Some(Outbound::Config) {
+        duplicate_fronts(&options.fronts, config::plan_ports(options, paths, false));
+    }
+}
+
 fn prepare(options: &mut Options, paths: &mut Paths) -> (Ports, bool) {
     let user_config = options.outbound == Some(Outbound::Config);
     if user_config {
-        if !Path::new(&options.config_file).is_file() {
-            args::die(&format!("no such config: {}", options.config_file));
-        }
+        ensure_config(options);
         let list = config::config_fronts(
             &options.config_file,
             options.vpn,
@@ -183,6 +193,22 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             return 1;
         }
     };
+    ensure_config(options);
+    reject_duplicate_ports(options, paths);
+    options.carrier = choose_carrier(options);
+    let bin = lane::require_bin();
+    let account = if options.outbound == Some(Outbound::Foxy) {
+        Some(foxy_account(options, paths))
+    } else {
+        None
+    };
+    let port_reservation = match lane::port_lock(paths) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("ferrox-cli: {error}");
+            return 1;
+        }
+    };
     let (ports, user_config) = prepare(options, paths);
     if options.vpn {
         if let Err(error) = proxy::preflight(&options.fronts, ports) {
@@ -190,13 +216,6 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             return 1;
         }
     }
-    options.carrier = choose_carrier(options);
-    let account = if options.outbound == Some(Outbound::Foxy) {
-        Some(foxy_account(options, paths))
-    } else {
-        None
-    };
-    let bin = lane::require_bin();
     write_lane_config(options, paths, ports, account.as_ref());
     if lane::running(paths) {
         println!(
@@ -251,14 +270,19 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         }
     });
 
-    if !fronts(&options.fronts).is_empty() && !lane::wait_fronts(&options.fronts, ports, paths) {
+    let opened =
+        fronts(&options.fronts).is_empty() || lane::wait_fronts(&options.fronts, ports, paths);
+    if !opened {
         println!(
             "the lane did not open its fronts; last lines of {}:",
             paths.log.display()
         );
         tail(&paths.log, 20);
-        return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
+        let code = stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
+        drop(port_reservation);
+        return code;
     }
+    drop(port_reservation);
     if interrupted.load(Ordering::SeqCst) {
         return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
     }

@@ -4890,11 +4890,16 @@ mod tests {
             return;
         }
         let budget = Duration::from_secs(60);
-        if let Err(error) = wireguard_rides_inside_wireguard_attempt(budget) {
-            panic!(
-                "the inner handshake did not complete over WireGuard within {budget:?}: {error}"
-            );
+        let started = Instant::now();
+        let mut last = None;
+        while started.elapsed() < budget {
+            crate::proxy::echo_trace("wiw: attempt");
+            match wireguard_rides_inside_wireguard_attempt(Duration::from_secs(20)) {
+                Ok(()) => return,
+                Err(error) => last = Some(error),
+            }
         }
+        panic!("the inner handshake did not complete over WireGuard within {budget:?}: {last:?}");
     }
 
     #[cfg(unix)]

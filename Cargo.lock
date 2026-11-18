@@ -991,6 +991,7 @@ dependencies = [
  "ferrox-core",
  "libc",
  "rcgen",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "windows-sys 0.61.2",
