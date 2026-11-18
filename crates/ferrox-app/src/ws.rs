@@ -635,6 +635,9 @@ impl<R: Read> Read for WsReader<R> {
             self.eat += n;
             return Ok(n);
         }
+        if let Some(error) = self.deferred.take() {
+            return Err(error);
+        }
         let mut filled = 0;
         loop {
             if self.at < self.msg_end {
@@ -653,11 +656,19 @@ impl<R: Read> Read for WsReader<R> {
             self.eat = 0;
             // The first message may wait in the transport; a message already buffered behind it may not.
             let fill = filled == 0;
-            if !self.message(fill)? {
-                if fill {
-                    self.eof = true;
+            match self.message(fill) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if fill {
+                        self.eof = true;
+                    }
+                    return Ok(filled);
                 }
-                return Ok(filled);
+                Err(error) if filled > 0 => {
+                    self.deferred = Some(error);
+                    return Ok(filled);
+                }
+                Err(error) => return Err(error),
             }
         }
     }

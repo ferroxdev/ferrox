@@ -373,7 +373,7 @@ impl WireGuardOut {
             self.serve_udp_kernel(kernel, relay, associate);
             return;
         }
-        wg_stack::client_udp(
+        if !wg_stack::client_udp(
             relay,
             &self.config,
             &self.to_tunnel,
@@ -381,7 +381,9 @@ impl WireGuardOut {
             associate,
             &|host, port| self.destinations(&Destination::Name(host.to_owned(), port)),
             WG_HEADER_SIZE,
-        );
+        ) {
+            eprintln!("wireguard: the UDP relay port is already in use");
+        }
     }
 
     /// A fixed-target datagram lane that carries another tunnel's packets
@@ -400,6 +402,8 @@ impl WireGuardOut {
         let config = Arc::clone(&self.config);
         let to_tunnel = self.to_tunnel.clone();
         let routes = Arc::clone(&self.routes);
+        let (_reply_tx, reply_rx) = wg_stack::claim_udp_route(&routes, local.port())
+            .map_err(|reason| format!("wireguard forwarder: {reason}"))?;
         std::thread::spawn(move || {
             wg_stack::client_udp_forward(
                 &socket,
@@ -409,6 +413,8 @@ impl WireGuardOut {
                 target,
                 WG_HEADER_SIZE,
                 &thread_stop,
+                None,
+                Some(reply_rx),
             );
         });
         Ok(wg_stack::UdpForwarder::new(local, stop))

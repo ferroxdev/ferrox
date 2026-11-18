@@ -2722,6 +2722,22 @@ fn lane_over(associate: Option<&Connection>, quiet: StdInstant) -> bool {
     associate.is_some_and(crate::proxy::peer_left) || quiet.elapsed() >= crate::budgets::udp_idle()
 }
 
+/// Claims one relay port for a datagram lane, so a second owner reports the collision before it reads.
+pub(crate) fn claim_udp_route(
+    routes: &UdpRoutes,
+    port: u16,
+) -> Result<(Sender<Vec<u8>>, Receiver<Vec<u8>>), String> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let mut table = routes
+        .lock()
+        .map_err(|_| "the UDP route table is poisoned".to_owned())?;
+    if table.contains_key(&port) {
+        return Err(format!("UDP relay port {port} is already registered"));
+    }
+    table.insert(port, reply_tx.clone());
+    Ok((reply_tx, reply_rx))
+}
+
 /// A client datagram lane: every frame the local SOCKS5 front writes becomes an
 /// inner UDP packet, and the reply the tunnel returns is framed back to the last
 /// app that spoke. Each name gets its own inner source port, so a reply pins
@@ -2735,21 +2751,16 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     associate: Option<&Connection>,
     resolve: &dyn Fn(&str, u16) -> Vec<SocketAddr>,
     headroom: usize,
-) {
+) -> bool {
     let to_tunnel: ToTunnel = to_tunnel.clone().into();
     let Ok(local) = relay.local_addr() else {
-        return;
+        return false;
     };
     let port = local.port();
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    if let Ok(mut table) = routes.lock() {
-        match table.entry(port) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(reply_tx.clone());
-            }
-            std::collections::hash_map::Entry::Occupied(_) => return,
-        }
-    }
+    let (reply_tx, reply_rx) = match claim_udp_route(routes, port) {
+        Ok(claim) => claim,
+        Err(_) => return false,
+    };
     let _ = relay.set_read_timeout(Some(LANE_TICK));
     if let Some(associate) = associate {
         let _ = associate.set_read_timeout(Some(crate::budgets::SESSION_POLL));
@@ -2842,6 +2853,7 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
             table.remove(&port);
         }
     }
+    true
 }
 
 /// A fixed-target client lane that carries another tunnel's datagrams verbatim.
@@ -2853,20 +2865,31 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
     target: SocketAddr,
     headroom: usize,
     stop: &Arc<AtomicBool>,
-) {
+    ready: Option<Sender<Result<(), String>>>,
+    preclaimed: Option<Receiver<Vec<u8>>>,
+) -> bool {
     let to_tunnel: ToTunnel = to_tunnel.clone().into();
     let Ok(local) = relay.local_addr() else {
-        return;
+        if let Some(ready) = ready {
+            let _ = ready.send(Err("the UDP relay has no local address".to_owned()));
+        }
+        return false;
     };
     let port = local.port();
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    if let Ok(mut table) = routes.lock() {
-        match table.entry(port) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(reply_tx);
+    let reply_rx = match preclaimed {
+        Some(reply_rx) => reply_rx,
+        None => match claim_udp_route(routes, port) {
+            Ok((_reply_tx, reply_rx)) => reply_rx,
+            Err(reason) => {
+                if let Some(ready) = ready {
+                    let _ = ready.send(Err(reason));
+                }
+                return false;
             }
-            std::collections::hash_map::Entry::Occupied(_) => return,
-        }
+        },
+    };
+    if let Some(ready) = ready {
+        let _ = ready.send(Ok(()));
     }
     let _ = relay.set_read_timeout(Some(LANE_TICK));
     let mut buf = crate::proxy::udp_buffer();
@@ -2907,6 +2930,7 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
     if let Ok(mut table) = routes.lock() {
         table.remove(&port);
     }
+    true
 }
 
 /// A server datagram lane: the inner flow is one client source and one target,
@@ -5200,6 +5224,8 @@ mod client_tests {
                 target,
                 0,
                 &thread_stop,
+                None,
+                None,
             );
         });
         let port = relay_address.port();

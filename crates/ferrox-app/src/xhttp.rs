@@ -707,8 +707,16 @@ impl Packer {
         match self.settings.uplink_data_placement {
             Placement::Header | Placement::Cookie => {
                 // Base64url expands by 4/3, and every data field spends its name, index and delimiter before the head can close.
-                let padding =
-                    usize::try_from(self.settings.x_padding_bytes.1).unwrap_or(HEAD_LIMIT);
+                let padding = match self.settings.x_padding_method {
+                    PadMethod::RepeatX => {
+                        usize::try_from(self.settings.x_padding_bytes.1).unwrap_or(HEAD_LIMIT)
+                    }
+                    PadMethod::Tokenish => usize::try_from(self.settings.x_padding_bytes.1)
+                        .unwrap_or(HEAD_LIMIT)
+                        .saturating_mul(10)
+                        .div_ceil(8)
+                        .saturating_add(150),
+                };
                 let headers: usize = self
                     .settings
                     .headers

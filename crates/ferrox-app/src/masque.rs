@@ -600,7 +600,7 @@ impl MasqueOut {
         match self.ensure_leased() {
             Ok((inner, _lease)) => {
                 let remote = self.spec.remote_dns.as_slice();
-                wg_stack::client_udp(
+                if !wg_stack::client_udp(
                     relay,
                     &inner.config,
                     &inner.to_tunnel,
@@ -622,13 +622,15 @@ impl MasqueOut {
                             .collect()
                     },
                     0,
-                );
+                ) {
+                    eprintln!("masque: the UDP relay port is already in use");
+                }
             }
             Err(reason) => eprintln!("masque: {reason}"),
         }
     }
 
-    /// A fixed-target datagram lane through this tunnel, dialled on its first datagram.
+    /// A fixed-target datagram lane through this tunnel, dialled before the forwarder is returned so a port collision is reported.
     pub(crate) fn udp_forwarder(
         self: &Arc<Self>,
         target: SocketAddr,
@@ -641,24 +643,12 @@ impl MasqueOut {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let tunnel = Arc::clone(self);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let port = local.port();
         std::thread::spawn(move || {
-            let mut probe = vec![0u8; 65_535];
-            let _ = socket.set_read_timeout(Some(TICK));
             let mut reported = false;
+            let mut ready = Some(ready_tx);
             while !thread_stop.load(Ordering::Relaxed) {
-                match socket.peek_from(&mut probe) {
-                    Ok(_) => {}
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        continue;
-                    }
-                    Err(error) if crate::proxy::is_udp_gone(&error) => continue,
-                    Err(_) => break,
-                }
                 let (inner, _lease) = match tunnel.ensure_leased() {
                     Ok(inner) => {
                         reported = false;
@@ -673,7 +663,20 @@ impl MasqueOut {
                         continue;
                     }
                 };
-                wg_stack::client_udp_forward(
+                let preclaimed = match ready.take() {
+                    Some(ready) => match wg_stack::claim_udp_route(&inner.routes, port) {
+                        Ok((_reply_tx, reply_rx)) => {
+                            let _ = ready.send(Ok(()));
+                            Some(reply_rx)
+                        }
+                        Err(reason) => {
+                            let _ = ready.send(Err(reason));
+                            break;
+                        }
+                    },
+                    None => None,
+                };
+                let routed = wg_stack::client_udp_forward(
                     &socket,
                     &inner.config,
                     &inner.to_tunnel,
@@ -681,11 +684,27 @@ impl MasqueOut {
                     target,
                     0,
                     &thread_stop,
+                    None,
+                    preclaimed,
                 );
+                if !routed {
+                    eprintln!("masque: the UDP relay could not be served");
+                    break;
+                }
                 std::thread::sleep(TICK);
             }
         });
-        Ok(UdpForwarder::new(local, stop))
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => Ok(UdpForwarder::new(local, stop)),
+            Ok(Err(reason)) => {
+                stop.store(true, Ordering::Relaxed);
+                Err(format!("masque forwarder: {reason}"))
+            }
+            Err(_) => {
+                stop.store(true, Ordering::Relaxed);
+                Err("masque forwarder: the UDP relay did not start".to_owned())
+            }
+        }
     }
 
     /// A name resolves inside the tunnel the reference names, then falls back to
