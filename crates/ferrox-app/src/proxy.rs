@@ -47678,11 +47678,14 @@ mod tests {
         small_buffer(server_stream.as_raw_fd(), libc::SO_SNDBUF);
         small_buffer(client_stream.as_raw_fd(), libc::SO_RCVBUF);
         let server = std::thread::spawn(move || {
-            crate::ws::accept(crate::conn::Connection::Unix(server_stream), "/frame")
-                .expect("upgrades")
+            crate::ws::accept(
+                crate::conn::Connection::Unix(server_stream.into()),
+                "/frame",
+            )
+            .expect("upgrades")
         });
         let (client, _client_writer) = crate::ws::connect(
-            crate::conn::Connection::Unix(client_stream),
+            crate::conn::Connection::Unix(client_stream.into()),
             "127.0.0.1",
             "/frame",
             0,
