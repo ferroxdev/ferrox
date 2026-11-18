@@ -132,8 +132,9 @@ fn opened<T: Read + Write>(tunnel: &mut T, country: &str) -> Option<String> {
     let trace = through_tunnel(tunnel, TRACE_HOST, TRACE_PATH)?;
     let seen = crate::foxy::exit_country(trace.as_bytes())?;
     (seen.eq_ignore_ascii_case(country)
-        || ((seen == "T1" || seen == "REC") && (country.is_empty() || country == "REC")))
-        .then_some(seen)
+        || country == "REC"
+        || ((seen == "T1" || seen == "REC") && country.is_empty()))
+    .then_some(seen)
 }
 
 /// One carrier on one edge, as the lane would dial it.
@@ -185,17 +186,15 @@ fn try_carrier(
         .map_err(|failure| failure.to_string())?;
     let answer = through_tunnel(&mut tunnel, PROBE_HOST, PROBE_PATH)
         .ok_or_else(|| "no answer through the tunnel".to_owned())?;
-    let (head, body) = answer
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "the probe sent a head without a body".to_owned())?;
-    let mut status = head.lines().next().unwrap_or_default().split_whitespace();
-    if status.next() != Some("HTTP/1.1") || status.next() != Some("200") {
+    let response = ferrox_core::hysteria::parse_origin_response(answer.as_bytes())
+        .ok_or_else(|| "the probe did not answer a full response".to_owned())?;
+    if response.status != 200 {
         return Err("the probe did not answer 200".to_owned());
     }
-    let ip = body
-        .trim()
-        .parse::<std::net::IpAddr>()
-        .map_err(|_| "the probe did not name an IP".to_owned())?;
+    let ip = std::str::from_utf8(&response.body)
+        .ok()
+        .and_then(|body| body.trim().parse::<std::net::IpAddr>().ok())
+        .ok_or_else(|| "the probe did not name an IP".to_owned())?;
     let _ = tunnel.finish();
     tunnel.settle();
     // The trace names another origin, so it needs its own CONNECT rather than a Host header on the probe's flow.
