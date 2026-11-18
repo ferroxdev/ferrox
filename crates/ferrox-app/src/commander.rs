@@ -5,7 +5,7 @@
 //! five-byte message prefix itself. Nothing is dialed to answer a call in `listen` mode, and in
 //! outbound mode the routed link is the transport.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::Read;
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -437,28 +437,22 @@ impl Api {
         let mut flow = Flow::new();
         let mut last_id = 0u32;
         loop {
-            let (kind, flags, id, body, credited) = if let Some(frame) = flow.pending.pop_front() {
-                flow.pending_bytes = flow.pending_bytes.saturating_sub(frame.3.len());
-                frame
-            } else {
-                let Some((len, kind, flags, id)) = h2::read_head_bounded(&mut stream) else {
-                    break;
-                };
-                let cap = if kind == h2::T_DATA {
-                    CALL_MAX + CALL_ENVELOPE
-                } else {
-                    h2::HEAD_CAP
-                };
-                if len > cap {
-                    goaway(&mut stream, h2::E_FRAME_SIZE, last_id);
-                    return;
-                }
-                let mut body = vec![0u8; len];
-                if stream.read_exact(&mut body).is_err() {
-                    return;
-                }
-                (kind, flags, id, body, false)
+            let Some((len, kind, flags, id)) = h2::read_head_bounded(&mut stream) else {
+                break;
             };
+            let cap = if kind == h2::T_DATA {
+                CALL_MAX + CALL_ENVELOPE
+            } else {
+                h2::HEAD_CAP
+            };
+            if len > cap {
+                goaway(&mut stream, h2::E_FRAME_SIZE, last_id);
+                return;
+            }
+            let mut body = vec![0u8; len];
+            if stream.read_exact(&mut body).is_err() {
+                return;
+            }
             if id == 0 && matches!(kind, h2::T_HEADERS | h2::T_DATA | h2::T_CONT | h2::T_RST) {
                 goaway(&mut stream, h2::E_PROTOCOL, last_id);
                 return;
@@ -507,6 +501,7 @@ impl Api {
                         }
                         continue;
                     }
+                    flow.open(id);
                     let block = header_body(&body, flags);
                     if calls.len() + responses.len() >= API_CALLS && !calls.contains_key(&id) {
                         goaway(&mut stream, h2::E_REFUSED, last_id);
@@ -568,9 +563,7 @@ impl Api {
                 }
                 h2::T_DATA => {
                     if flow.cancelled(id) {
-                        if !credited {
-                            let _ = window_update(&mut stream, 0, body.len());
-                        }
+                        let _ = window_update(&mut stream, 0, body.len());
                         continue;
                     }
                     let Some(payload) = data_body(&body, flags) else {
@@ -589,9 +582,8 @@ impl Api {
                         return;
                     }
                     call.body.extend_from_slice(payload);
-                    if !credited
-                        && (!window_update(&mut stream, 0, body.len())
-                            || !window_update(&mut stream, id, body.len()))
+                    if !window_update(&mut stream, 0, body.len())
+                        || !window_update(&mut stream, id, body.len())
                     {
                         return;
                     }
@@ -1298,7 +1290,7 @@ fn settings() -> [u8; 12] {
 const MAX_WINDOW: i64 = 0x7fff_ffff;
 
 /// The part of a response still unsent because its stream or connection window had no room: the
-/// frame loop keeps serving other streams and resumes this one on the next WINDOW_UPDATE.
+/// frame loop keeps serving other streams and resumes this one on the next `WINDOW_UPDATE`.
 struct Response {
     framed: Vec<u8>,
     at: usize,
@@ -1311,8 +1303,6 @@ struct Flow {
     initial: i64,
     streams: HashMap<u32, i64>,
     opened: u32,
-    pending: VecDeque<(u8, u8, u32, Vec<u8>, bool)>,
-    pending_bytes: usize,
 }
 
 impl Flow {
@@ -1322,8 +1312,6 @@ impl Flow {
             initial: 65_535,
             streams: HashMap::new(),
             opened: 0,
-            pending: VecDeque::new(),
-            pending_bytes: 0,
         }
     }
 
@@ -1398,15 +1386,6 @@ impl Flow {
     fn available(&self, id: u32) -> i64 {
         self.connection
             .min(self.streams.get(&id).copied().unwrap_or(0))
-    }
-
-    fn defer(&mut self, frame: (u8, u8, u32, Vec<u8>, bool)) -> bool {
-        if self.pending.len() >= API_CALLS || self.pending_bytes + frame.3.len() > API_HELD {
-            return false;
-        }
-        self.pending_bytes += frame.3.len();
-        self.pending.push_back(frame);
-        true
     }
 }
 
