@@ -157,8 +157,7 @@ fn process_exe(pid: u32) -> Option<PathBuf> {
 fn expected_bin(paths: &Paths) -> PathBuf {
     read_trim(&bin_marker(paths))
         .filter(|text| !text.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| resolve_bin().unwrap_or_else(candidate_bin))
+        .map_or_else(|| resolve_bin().unwrap_or_else(candidate_bin), PathBuf::from)
 }
 
 fn canonical_exe(path: &Path) -> PathBuf {

@@ -879,7 +879,7 @@ fn reload_library(library: &Library) -> Result<Library, String> {
             library.source_path.display()
         );
         for diagnostic in reloaded.errors() {
-            message.push_str(&format!("\n  {diagnostic}"));
+            let _ = writeln!(message, "  {diagnostic}");
         }
         return Err(message);
     }
