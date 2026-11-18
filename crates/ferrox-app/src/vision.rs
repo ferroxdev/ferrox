@@ -612,12 +612,11 @@ impl<S: Read + Write + RecordAlignment> Read for Link<S> {
         let mut feed = tls
             .filter(|tls| tls.budget > 0)
             .map(|tls| Feeding::new(&tls));
-        let active = feed.is_some();
         #[cfg(test)]
         if feed.is_some() {
             self.feeds += 1;
         }
-        let n = self.drive_read(buf, feed.as_mut(), active)?;
+        let n = self.drive_read(buf, feed.as_mut())?;
         if let Some(feed) = feed {
             if feed.run > 0 {
                 self.spend(&feed);
@@ -638,13 +637,12 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         &mut self,
         buf: &mut [u8],
         mut feed: Option<&mut Feeding>,
-        active: bool,
     ) -> std::io::Result<usize> {
         loop {
             if self.read.padding {
                 if self.dot < self.have.len() {
                     let was = self.dot;
-                    match self.pump(Some(buf), feed.as_deref_mut(), active) {
+                    match self.pump(Some(buf), feed.as_deref_mut()) {
                         0 => {}
                         n => return Ok(n),
                     }
@@ -661,17 +659,17 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                     if self.walk.framed && self.read.padding {
                         return Ok(0);
                     }
-                    return Ok(self.drain_tail(buf, feed.as_deref_mut(), active));
+                    return Ok(self.drain_tail(buf, feed.as_deref_mut()));
                 }
             } else {
                 // the framing is over: what it left in the window is content, then raw
                 if self.dot < self.have.len() && !buf.is_empty() {
-                    return Ok(self.drain_tail(buf, feed.as_deref_mut(), active));
+                    return Ok(self.drain_tail(buf, feed.as_deref_mut()));
                 }
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                return self.read_direct(buf, active);
+                return self.read_direct(buf, feed.is_some());
             }
         }
     }
@@ -714,12 +712,11 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         }
     }
 
-    fn drain_tail(&mut self, buf: &mut [u8], feed: Option<&mut Feeding>, active: bool) -> usize {
+    fn drain_tail(&mut self, buf: &mut [u8], feed: Option<&mut Feeding>) -> usize {
         let n = (self.have.len() - self.dot).min(buf.len());
-        if n > 0 && active {
-            if let Some(feed) = feed {
-                feed_extent(&self.have[self.dot..self.dot + n], feed);
-            }
+        match feed {
+            Some(feed) if n > 0 => feed_extent(&self.have[self.dot..self.dot + n], feed),
+            _ => {}
         }
         buf[..n].copy_from_slice(&self.have[self.dot..self.dot + n]);
         self.dot += n;
@@ -732,13 +729,13 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     }
 
     /// Past the framing the payload lands in the caller's buffer: no copy, where the staged path needed two.
-    fn read_direct(&mut self, buf: &mut [u8], active: bool) -> std::io::Result<usize> {
+    fn read_direct(&mut self, buf: &mut [u8], observe: bool) -> std::io::Result<usize> {
         let raw = self.read.raw;
         let n = match self.raw.as_mut() {
             Some(handle) if raw => handle.read(buf)?,
             _ => self.session.read(buf)?,
         };
-        if n > 0 && !raw && active {
+        if n > 0 && !raw && observe {
             let (tls, observed) = self.filter_update(|tls| {
                 let observed = tls.budget > 0;
                 if observed {
@@ -765,17 +762,6 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         self.staged += n;
     }
 
-    /// One command byte validated. The count is the validator's row, and the production
-    /// arm folds away: the validator's own cost is in the match it makes.
-    #[cfg(test)]
-    fn validate(&mut self) {
-        self.validated += 1;
-    }
-
-    #[cfg(not(test))]
-    #[allow(clippy::unused_self)]
-    fn validate(&mut self) {}
-
     #[cfg(not(test))]
     #[allow(clippy::unused_self)]
     fn stage(&mut self, _n: usize) {}
@@ -794,12 +780,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     /// or the framing's first frame header. A walk that blocks mid-frame parks there
     /// and reports what it handed out.
     #[allow(clippy::too_many_lines)]
-    fn pump(
-        &mut self,
-        mut buf: Option<&mut [u8]>,
-        mut feed: Option<&mut Feeding>,
-        active: bool,
-    ) -> usize {
+    fn pump(&mut self, mut buf: Option<&mut [u8]>, mut feed: Option<&mut Feeding>) -> usize {
         let end = self.have.len();
         let mut dot = self.dot;
         let mut walk = self.walk;
@@ -824,25 +805,27 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         }
         let cap = buf.as_deref().map_or(usize::MAX, <[u8]>::len);
         let mut held = 0;
+        #[cfg(test)]
+        let mut validated = 0usize;
         let result = 'frames: loop {
             // the header is read whole when the window offers five bytes; the tail is byte-by-byte
             if walk.want_header == 5 && end - dot >= 5 {
                 let frame = &self.have[dot..dot + 5];
-                let body = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
                 let command = frame[0];
-                let content = (body >> 16) as usize;
-                let padding = (body & 0xffff) as usize;
-                self.validate();
+                let content = usize::from(u16::from_be_bytes([frame[1], frame[2]]));
+                let padding = usize::from(u16::from_be_bytes([frame[3], frame[4]]));
+                #[cfg(test)]
+                {
+                    validated += 1;
+                }
                 let at = dot + 5;
                 let next = at + content + padding;
                 if next <= end && cap - held >= content {
                     if content > 0 {
                         let fresh = &self.have[at..at + content];
-                        if active {
-                            if let Some(feed) = feed.as_deref_mut() {
-                                feed.run += content;
-                                feed_extent(fresh, feed);
-                            }
+                        if let Some(feed) = feed.as_deref_mut() {
+                            feed.run += content;
+                            feed_extent(fresh, feed);
                         }
                         if let Some(slot) = buf.as_deref_mut() {
                             slot[held..held + content].copy_from_slice(fresh);
@@ -880,7 +863,10 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 match walk.want_header {
                     5 => {
                         walk.command = byte;
-                        self.validate();
+                        #[cfg(test)]
+                        {
+                            validated += 1;
+                        }
                     }
                     4 => walk.want_content = usize::from(byte) << 8,
                     3 => walk.want_content |= usize::from(byte),
@@ -895,11 +881,9 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 let room = cap - held;
                 let take = walk.want_content.min(end - dot).min(room);
                 let fresh = &self.have[dot..dot + take];
-                if active {
-                    if let Some(feed) = feed.as_deref_mut() {
-                        feed.run += take;
-                        feed_extent(fresh, feed);
-                    }
+                if let Some(feed) = feed.as_deref_mut() {
+                    feed.run += take;
+                    feed_extent(fresh, feed);
                 }
                 if let Some(slot) = buf.as_deref_mut() {
                     slot[held..held + take].copy_from_slice(fresh);
@@ -939,6 +923,10 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         };
         self.dot = dot;
         self.walk = walk;
+        #[cfg(test)]
+        {
+            self.validated += validated;
+        }
         result
     }
 
@@ -1470,9 +1458,7 @@ mod tests {
             link.dot = 0;
             link.walk.framed = true;
             link.walk.want_header = 5;
-            let tls = link.tls.snapshot();
-            let mut feed = Feeding::new(&tls);
-            let runs = link.pump(None, Some(&mut feed), false);
+            let runs = link.pump(None, None);
             assert_eq!(runs, 48, "eight six-byte contents cross the walk");
             link.read.padding = true;
             link.read.raw = false;
