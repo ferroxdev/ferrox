@@ -7318,7 +7318,7 @@ fn fetch_tactics_from(
     let timeout = timing.timeout.unwrap_or(settings.ready);
     let deadline = (!timing.wait.is_zero()).then(|| Instant::now() + timing.wait);
     let mut index = 0usize;
-    let mut last = String::new();
+    let mut last;
     loop {
         match crate::psiphon_tactics::Tactics::fetch(
             entries[index],
