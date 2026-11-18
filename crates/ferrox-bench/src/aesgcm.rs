@@ -2,6 +2,7 @@ use std::fmt::Write as _;
 
 use aes_gcm::aead::AeadInOut as _;
 use aes_gcm::KeyInit as _;
+use ring::aead::{Aad, LessSafeKey, Nonce as RingNonce, UnboundKey, AES_128_GCM};
 
 use ferrox_core::aesgcm::{Aes128Gcm, Aes256Gcm};
 
@@ -72,6 +73,92 @@ pub(crate) fn gated_rows(rows: &[Row]) -> Vec<&Row> {
 /// Source-seal rows measure staging versus spare capacity, not a reference engine.
 fn is_reported_source(row: &Row) -> bool {
     row.name.contains("source seal")
+}
+
+/// The record layer seals with `ring`; this prices that AEAD against the fused engine at the
+/// sizes a record carries, so a provider swap rests on a measurement rather than an opinion.
+pub(crate) fn ring_rows() -> Vec<Row> {
+    [16_383, 8_192, 4_096].into_iter().map(ring_row).collect()
+}
+
+fn ring_row(len: usize) -> Row {
+    let key: [u8; 16] = std::array::from_fn(|i| (i as u8).wrapping_mul(23).wrapping_add(7));
+    let nonce: [u8; 12] = std::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(9));
+    let aad = [0x17_u8, 0x03, 0x03, (len >> 8) as u8, len as u8];
+
+    let ours = Aes128Gcm::new(&key);
+    let reference = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, &key).expect("key"));
+
+    let plain: Vec<u8> = (0..len)
+        .map(|i| (i as u8).wrapping_mul(29).wrapping_add(11))
+        .collect();
+
+    let mut ours_buf = plain.clone();
+    let tag = ours.seal_in_place(&nonce, &aad, &mut ours_buf);
+    let mut reference_buf = plain.clone();
+    reference
+        .seal_in_place_append_tag(
+            RingNonce::assume_unique_for_key(nonce),
+            Aad::from(&aad[..]),
+            &mut reference_buf,
+        )
+        .expect("seals");
+    assert_eq!(
+        &ours_buf[..],
+        &reference_buf[..len],
+        "{len}: the same ciphertext"
+    );
+    assert_eq!(&tag[..], &reference_buf[len..], "{len}: the same tag");
+    assert_eq!(
+        ours.open_in_place(&nonce, &aad, &mut ours_buf, &tag),
+        Some(len),
+        "{len}: opens"
+    );
+    assert_eq!(ours_buf, plain, "{len}: the same bytes back");
+
+    let iters = (BYTE_BUDGET / len.max(1) as u64).clamp(64, 200_000);
+
+    let mut ours_buf = plain.clone();
+    let mut ours_run = || {
+        let tag = ours.seal_in_place(
+            std::hint::black_box(&nonce),
+            &aad,
+            std::hint::black_box(&mut ours_buf),
+        );
+        ours.open_in_place(&nonce, &aad, std::hint::black_box(&mut ours_buf), &tag)
+            .expect("opens")
+    };
+
+    let mut reference_buf = plain.clone();
+    let mut reference_run = || {
+        reference
+            .seal_in_place_append_tag(
+                RingNonce::assume_unique_for_key(nonce),
+                Aad::from(std::hint::black_box(&aad[..])),
+                std::hint::black_box(&mut reference_buf),
+            )
+            .expect("seals");
+        let opened = {
+            let opened = reference
+                .open_in_place(
+                    RingNonce::assume_unique_for_key(nonce),
+                    Aad::from(std::hint::black_box(&aad[..])),
+                    std::hint::black_box(&mut reference_buf[..]),
+                )
+                .expect("opens");
+            opened.len()
+        };
+        reference_buf.truncate(opened);
+        opened
+    };
+
+    timed_row(
+        format!("tls record, {len}B"),
+        len,
+        iters,
+        &mut ours_run,
+        &mut reference_run,
+    )
 }
 
 fn check_and_time(len: usize, plain: &[u8], windows: &mut Vec<Window>) -> Row {
@@ -439,6 +526,55 @@ pub(crate) fn report(rows: &[Row], windows: &[Window], engine_backend: &str) -> 
             best.name
         );
         out.push_str(&crate::framing::confirmation_note(rows.iter()));
+    }
+    out
+}
+
+pub(crate) fn ring_report(rows: &[Row], engine_backend: &str) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "\n## Gate 10b — the record layer's AEAD\n");
+    let _ = writeln!(
+        out,
+        "What the TLS record layer seals with, `ring`'s AES-128-GCM, against the fused\n\
+         engine, at the plaintext sizes a record carries (16 KiB is the TLS 1.3 maximum).\n\
+         Each row asserts equal ciphertext and equal tag before either side is timed, and\n\
+         the buffers are sealed and opened in place so neither side pays a staging copy.\n\
+         These rows are printed only: a platform where `ring` wins is a platform where\n\
+         the provider stays as it is, and that decision is read from this table.\n\
+         \n\
+         | | |\n\
+         | --- | --- |\n\
+         | reference | `ring 0.17 / aes-128-gcm` |\n\
+         | ferrox | `{engine_backend}` |\n"
+    );
+    let _ = writeln!(
+        out,
+        "\n| comparison | bytes | reference ns | ferrox ns | speedup |"
+    );
+    let _ = writeln!(out, "| --- | ---: | ---: | ---: | ---: |");
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {:.1} | {:.1} | {:.2}x |",
+            r.name,
+            r.bytes,
+            r.base * 1e9,
+            r.ours * 1e9,
+            r.ratio()
+        );
+    }
+    if let (Some(worst), Some(best)) = (
+        rows.iter().min_by(|a, b| a.ratio().total_cmp(&b.ratio())),
+        rows.iter().max_by(|a, b| a.ratio().total_cmp(&b.ratio())),
+    ) {
+        let _ = writeln!(
+            out,
+            "\n**Worst {:.2}x ({}), best {:.2}x ({}).**",
+            worst.ratio(),
+            worst.name,
+            best.ratio(),
+            best.name
+        );
     }
     out
 }
