@@ -2034,10 +2034,10 @@ impl SlotWriter {
             .map_err(|error| {
                 self.release_room();
                 let message = format!("slot {seq} failed to start: {error}");
+                self.fail(message.clone());
                 if self.drained(seq).unwrap_or(false) {
                     let _ = self.set_frame(seq, SLOT_ERR, &[]);
                 }
-                self.fail(message.clone());
                 carrier_error(message)
             })?;
         Ok(())
@@ -2231,10 +2231,20 @@ impl SlotWriter {
             state.closed = true;
         }
         loop {
-            let empty = {
+            let (done, empty, err) = {
                 let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                state.buf.is_empty()
+                (
+                    self.done.load(Ordering::Acquire),
+                    state.buf.is_empty(),
+                    state.err.clone(),
+                )
             };
+            if let Some(message) = err {
+                return Err(carrier_error(message));
+            }
+            if done {
+                return Err(carrier_error("the writer aborted"));
+            }
             if empty {
                 break;
             }
