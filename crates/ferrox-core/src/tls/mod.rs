@@ -509,10 +509,128 @@ pub struct CertReload {
     pub key: String,
     pub interval: std::time::Duration,
     pub read: CertReader,
+    pub now: fn() -> std::time::Instant,
 }
 
 /// How a reload re-reads one file: the same resolution a config's path goes through.
 pub type CertReader = fn(&str) -> Option<Vec<u8>>;
+
+/// The CA one `AUTHORITY_ISSUE` entry names: the listener signs a leaf for the
+/// requested SNI with it when no served certificate matches.
+pub struct CertIssuer {
+    live: std::sync::Mutex<IssuerLive>,
+    reload: Option<CertReload>,
+    generation: std::sync::atomic::AtomicU64,
+}
+
+struct IssuerLive {
+    cert_chain: Vec<Vec<u8>>,
+    cert_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+    checked: Option<std::time::Instant>,
+}
+
+#[derive(Clone)]
+pub(crate) struct IssuerMaterial {
+    pub(crate) cert_chain: Vec<Vec<u8>>,
+    pub(crate) cert_pem: Vec<u8>,
+    pub(crate) key_pem: Vec<u8>,
+}
+
+impl CertIssuer {
+    pub fn new(
+        cert_chain: Vec<Vec<u8>>,
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+        reload: Option<CertReload>,
+    ) -> Self {
+        Self {
+            live: std::sync::Mutex::new(IssuerLive {
+                cert_chain,
+                cert_pem,
+                key_pem,
+                checked: reload.as_ref().map(|reload| (reload.now)()),
+            }),
+            reload,
+            generation: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The pair as the files read now: a file-backed issuer re-reads after its interval, keeps
+    /// the last usable pair when a read or validation fails, and bumps the generation when a
+    /// replacement lands so leaves signed by the old CA are not served again.
+    pub(crate) fn snapshot(&self) -> IssuerSnapshot {
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(reload) = &self.reload {
+            let now = (reload.now)();
+            if live
+                .checked
+                .is_none_or(|checked| now.saturating_duration_since(checked) >= reload.interval)
+            {
+                live.checked = Some(now);
+                if let (Some(cert_pem), Some(key_pem)) = (
+                    (reload.read)(&reload.certificate),
+                    (reload.read)(&reload.key),
+                ) {
+                    if rustls_backend::issuer_usable(&cert_pem, &key_pem).is_ok() {
+                        if let Ok(entry) = parse_pem_entry(&cert_pem, &key_pem) {
+                            if entry.cert_chain != live.cert_chain
+                                || cert_pem != live.cert_pem
+                                || key_pem != live.key_pem
+                            {
+                                live.cert_chain = entry.cert_chain;
+                                live.cert_pem = cert_pem;
+                                live.key_pem = key_pem;
+                                self.generation
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        IssuerSnapshot {
+            material: IssuerMaterial {
+                cert_chain: live.cert_chain.clone(),
+                cert_pem: live.cert_pem.clone(),
+                key_pem: live.key_pem.clone(),
+            },
+            generation: self.generation.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn material(&self) -> IssuerMaterial {
+        self.snapshot().material
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the signing backend can load this CA and key: rcgen refuses some subjects only when
+    /// it first signs, so a listener validates before it accepts a connection.
+    pub fn signing_ready(&self) -> Result<(), String> {
+        let material = self.material();
+        rustls_backend::issuer_usable(&material.cert_pem, &material.key_pem)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct IssuerSnapshot {
+    pub(crate) material: IssuerMaterial,
+    pub(crate) generation: u64,
+}
+
+impl std::fmt::Debug for CertIssuer {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("CertIssuer")
+            .field("cert_chain", &self.material().cert_chain.len())
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -545,6 +663,9 @@ pub struct TlsServerConfig {
     pub reject_unknown_sni: bool,
     /// Memoised server-config builds, one per identity kind.
     pub server_config_cache: crate::tls::rustls_backend::ServerConfigCache,
+    /// The CA an `AUTHORITY_ISSUE` certificate names, used to sign a leaf for
+    /// an SNI no served certificate covers.
+    pub issuer: Option<std::sync::Arc<CertIssuer>>,
     /// ECH server keys as the xray TLV: `u16 key || u16 config`, repeated.
     pub ech_server_keys: Option<std::sync::Arc<[u8]>>,
     /// The `masterKeyLog` file this listener's handshakes append to, or `None` to log none.
@@ -706,6 +827,7 @@ pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerCo
         send_tickets: true,
         reject_unknown_sni: false,
         server_config_cache: std::sync::Arc::default(),
+        issuer: None,
         ech_server_keys: None,
         master_key_log: None,
         kernel_tx: false,

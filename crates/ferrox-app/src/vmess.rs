@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, UdpSocket};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -783,7 +783,11 @@ fn encode_target(out: &mut Vec<u8>, target: &crate::proxy::Destination) {
     target.push_addr(out, 3, 2);
 }
 
-fn decode_target(header: &[u8], cursor: &mut usize) -> Option<(SocketAddr, bool)> {
+fn decode_target(
+    header: &[u8],
+    cursor: &mut usize,
+    users: Option<&Users>,
+) -> Option<(SocketAddr, bool, Option<Arc<crate::reverse::Portal>>)> {
     let port = u16::from_be_bytes(header.get(*cursor..*cursor + 2)?.try_into().ok()?);
     let rest = &header[*cursor + 2..];
     let kind = match rest.first()? {
@@ -798,16 +802,24 @@ fn decode_target(header: &[u8], cursor: &mut usize) -> Option<(SocketAddr, bool)
         crate::proxy::AddrBody::V4(ip) => (
             SocketAddr::new(std::net::IpAddr::V4(ip.into()), port),
             false,
+            None,
         ),
         crate::proxy::AddrBody::V6(ip) => (
             SocketAddr::new(std::net::IpAddr::V6(ip.into()), port),
             false,
+            None,
         ),
         crate::proxy::AddrBody::Domain(host) => {
             if crate::singmux::is_rendezvous(host, port) {
-                (SocketAddr::from(([0, 0, 0, 0], 0)), true)
+                (SocketAddr::from(([0, 0, 0, 0], 0)), true, None)
+            } else if let Some(portal) = crate::reverse::portal_for_domain(host) {
+                if users.is_none_or(|users| users.portal_allowed(portal.tag())) {
+                    (SocketAddr::from(([0, 0, 0, 0], 0)), false, Some(portal))
+                } else {
+                    (crate::proxy::resolve_endpoint(host, port)?, false, None)
+                }
             } else {
-                (crate::proxy::resolve_endpoint(host, port)?, false)
+                (crate::proxy::resolve_endpoint(host, port)?, false, None)
             }
         }
     })
@@ -1760,9 +1772,22 @@ fn read_open_header(
     let head_nonce: [u8; 12] = head_full[..12].try_into().unwrap();
     open_header(&head_key, &head_nonce, &sealed_head, auth_id)
 }
-type HeaderParts = (Option<SocketAddr>, Flow, Flow, Vec<u8>, u8, bool);
+type HeaderParts = (
+    Option<SocketAddr>,
+    Flow,
+    Flow,
+    Vec<u8>,
+    u8,
+    bool,
+    Option<Arc<crate::reverse::Portal>>,
+);
 
+#[cfg(test)]
 fn decode_header(header: &[u8]) -> Option<HeaderParts> {
+    decode_header_in(header, None)
+}
+
+fn decode_header_in(header: &[u8], users: Option<&Users>) -> Option<HeaderParts> {
     if header.len() < 38 || header[0] != 1 || header[34] & OPT_STREAM == 0 {
         return None;
     }
@@ -1782,11 +1807,15 @@ fn decode_header(header: &[u8]) -> Option<HeaderParts> {
     }
     let mut cursor = 38;
     // A mux request names the command alone: the reference reads no address for it (`proxy/vmess/encoding/server.go`).
-    let (target, rendezvous) = if cmd == 3 {
-        (None, false)
+    let (target, rendezvous, portal) = if cmd == 3 {
+        (None, false, None)
     } else {
-        let (target, rendezvous) = decode_target(header, &mut cursor)?;
-        (if rendezvous { None } else { Some(target) }, rendezvous)
+        let (target, rendezvous, portal) = decode_target(header, &mut cursor, users)?;
+        (
+            if rendezvous { None } else { Some(target) },
+            rendezvous,
+            portal,
+        )
     };
     let margin = usize::from(header[35] >> 4);
     if cursor + margin + 4 > header.len() {
@@ -1811,13 +1840,14 @@ fn decode_header(header: &[u8]) -> Option<HeaderParts> {
         recv.len_seal = Some(SizeAead::fresh(&data_key, actual, &data_iv)?);
         send.len_seal = Some(SizeAead::fresh(&data_key, actual, &data_iv)?);
     }
-    Some((target, send, recv, prefix, cmd, rendezvous))
+    Some((target, send, recv, prefix, cmd, rendezvous, portal))
 }
 /// The accounts one vmess inbound serves. A mutation lands on the next handshake; a flow already
 /// admitted keeps running, so `AlterInbound` never drops a session.
 #[derive(Debug, Default)]
 pub(crate) struct Users {
     entries: std::sync::Mutex<Vec<User>>,
+    portals: std::sync::Mutex<Option<Vec<String>>>,
 }
 
 /// One vmess account: the id the wire names, the email that names it to `RemoveUser`, and its level.
@@ -1837,6 +1867,7 @@ impl Users {
     pub(crate) fn with(entries: Vec<User>) -> UsersRef {
         std::sync::Arc::new(Self {
             entries: std::sync::Mutex::new(entries),
+            portals: std::sync::Mutex::new(None),
         })
     }
 
@@ -1861,6 +1892,22 @@ impl Users {
             (valid_auth_id(&auth_key, auth_id) && !replay_seen(auth_id))
                 .then(|| (instruction, user.clone()))
         })
+    }
+
+    /// Restrict the reverse portals this inbound may attach to the ones its rules name.
+    pub(crate) fn restrict_portals(&self, tags: Vec<String>) {
+        if let Ok(mut portals) = self.portals.lock() {
+            *portals = Some(tags);
+        }
+    }
+
+    pub(crate) fn portal_allowed(&self, tag: &str) -> bool {
+        match self.portals.lock() {
+            Ok(portals) => portals
+                .as_ref()
+                .is_none_or(|tags| tags.iter().any(|allowed| allowed == tag)),
+            Err(_) => false,
+        }
     }
 
     pub(crate) fn add(&self, user: User) -> bool {
@@ -1893,7 +1940,8 @@ pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Acc
     read_exact(stream, &mut auth_id).ok()?;
     let (instruction, user) = users.authenticate(&auth_id)?;
     let header = read_open_header(stream, &instruction, &auth_id)?;
-    let (target, mut send, recv, prefix, cmd, rendezvous) = decode_header(&header)?;
+    let (target, mut send, recv, prefix, cmd, rendezvous, portal) =
+        decode_header_in(&header, Some(users))?;
     let data_iv: [u8; 16] = header[1..17].try_into().unwrap();
     let data_key: [u8; 16] = header[17..33].try_into().unwrap();
     if session_seen(&user.id, &data_key, &data_iv) {
@@ -1908,6 +1956,7 @@ pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Acc
         prefix,
         cmd,
         rendezvous,
+        portal,
         user: meter,
     })
 }
@@ -2203,6 +2252,7 @@ pub(crate) struct Accepted {
     pub(crate) prefix: Vec<u8>,
     pub(crate) cmd: u8,
     pub(crate) rendezvous: bool,
+    pub(crate) portal: Option<Arc<crate::reverse::Portal>>,
     pub(crate) user: crate::stats::Meter,
 }
 pub(crate) type Close = std::sync::Arc<dyn Fn() + Send + Sync>;
@@ -2237,11 +2287,12 @@ pub(crate) fn serve_decoded_deferred<R, W>(
     decoded: Option<Accepted>,
     freedom: bool,
     abort: Option<Abort>,
-) where
+) -> bool
+where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    serve_decoded_impl(reader, writer, close, decoded, freedom, None, true, abort);
+    serve_decoded_impl(reader, writer, close, decoded, freedom, None, true, abort)
 }
 
 /// [`serve_decoded`] with the carrier's write-side finish for the clean EOF `NoTerminationSignal` leaves markerless.
@@ -2270,7 +2321,7 @@ fn abandon(close: &Close, abort: &mut Option<Abort>) {
 }
 
 /// Runs a decoded request over its uplink; `defer_prefix` holds the response head for the first body frame.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn serve_decoded_impl<R, W>(
     reader: R,
     mut writer: W,
@@ -2280,7 +2331,8 @@ fn serve_decoded_impl<R, W>(
     finish: Option<Close>,
     defer_prefix: bool,
     mut abort: Option<Abort>,
-) where
+) -> bool
+where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
@@ -2291,25 +2343,43 @@ fn serve_decoded_impl<R, W>(
         prefix,
         cmd,
         rendezvous,
+        portal,
         user,
     }) = decoded
     else {
         abandon(close, &mut abort);
-        return;
+        return false;
     };
+    if let Some(portal) = portal {
+        if cmd != 1 || !write_prefix(&mut writer, &prefix) {
+            abandon(close, &mut abort);
+            return false;
+        }
+        let Some(sealed) = CarriedWriter::new(writer, send) else {
+            abandon(close, &mut abort);
+            return false;
+        };
+        return portal
+            .attach(crate::reverse::Tunnel::new(
+                Box::new(CarriedReader::new(reader, recv)),
+                Box::new(sealed),
+                std::sync::Arc::clone(close),
+            ))
+            .is_some();
+    }
     if !freedom {
         abandon(close, &mut abort);
-        return;
+        return false;
     }
     if rendezvous && cmd == 1 {
         if !write_prefix(&mut writer, &prefix) {
             abandon(close, &mut abort);
-            return;
+            return false;
         }
         let meter = user.reversed();
         let Some(sealed) = CarriedWriter::new(writer, send) else {
             abandon(close, &mut abort);
-            return;
+            return false;
         };
         crate::proxy::serve_singmux_tunnel(
             Box::new(crate::proxy::metered(
@@ -2321,16 +2391,16 @@ fn serve_decoded_impl<R, W>(
             &[],
         );
         abandon(close, &mut abort);
-        return;
+        return false;
     }
     if cmd == 3 {
         if !write_prefix(&mut writer, &prefix) {
             abandon(close, &mut abort);
-            return;
+            return false;
         }
         let Some(sealed) = CarriedWriter::new(writer, send) else {
             abandon(close, &mut abort);
-            return;
+            return false;
         };
         crate::proxy::serve_mux_tunnel(
             Box::new(CarriedReader::new(reader, recv)),
@@ -2338,22 +2408,22 @@ fn serve_decoded_impl<R, W>(
             std::sync::Arc::clone(close),
             &[],
         );
-        return;
+        return false;
     }
     let Some(target) = target else {
         abandon(close, &mut abort);
-        return;
+        return false;
     };
     if !matches!(cmd, 1 | 2) {
         abandon(close, &mut abort);
-        return;
+        return false;
     }
     crate::accesslog::record_current(&target);
     match cmd {
         1 => {
             let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
                 abandon(close, &mut abort);
-                return;
+                return false;
             };
             let uplink = uplink.with_meter(user.reversed());
             let head = if defer_prefix {
@@ -2361,7 +2431,7 @@ fn serve_decoded_impl<R, W>(
             } else {
                 if !write_prefix(&mut writer, &prefix) {
                     abandon(close, &mut abort);
-                    return;
+                    return false;
                 }
                 None
             };
@@ -2374,6 +2444,7 @@ fn serve_decoded_impl<R, W>(
         ),
         _ => {}
     }
+    false
 }
 
 fn write_prefix<W: Write>(writer: &mut W, prefix: &[u8]) -> bool {
@@ -2472,7 +2543,7 @@ pub(crate) fn serve_grpc_with(
     let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.close());
-    serve_decoded_deferred(reader, writer, &close, decoded, freedom, None);
+    let _ = serve_decoded_deferred(reader, writer, &close, decoded, freedom, None);
 }
 
 /// Serves a TLS or REALITY gRPC listener as one muxed connection, arming the writer clock first.
@@ -2530,14 +2601,16 @@ pub(crate) fn serve_grpc_muxed(
     let reset = reader.reset_handle();
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.close());
-    serve_decoded_deferred(
+    if serve_decoded_deferred(
         reader,
         writer,
         &close,
         decoded,
         freedom,
         Some(Box::new(reset)),
-    );
+    ) {
+        opened.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -2620,8 +2693,19 @@ pub(crate) fn serve_xhttp_accepted(
     serve_decoded(reader, writer, &close, decoded, freedom);
 }
 
+#[cfg(test)]
 pub(crate) fn serve_httpheader(stream: Connection, path: &str, users: &Users, freedom: bool) {
-    let Some((mut reader, write)) = crate::httpheader::accept(stream, path) else {
+    serve_httpheader_with(stream, path, users, freedom, None);
+}
+
+pub(crate) fn serve_httpheader_with(
+    stream: Connection,
+    path: &str,
+    users: &Users,
+    freedom: bool,
+    response: Option<&[u8]>,
+) {
+    let Some((mut reader, write)) = crate::httpheader::accept(stream, path, response) else {
         return;
     };
     reader.set_poll(Some(crate::budgets::RELAY_POLL));
@@ -2636,18 +2720,22 @@ pub(crate) fn serve_httpheader(stream: Connection, path: &str, users: &Users, fr
     serve_decoded(reader, write, &close, decoded, freedom);
 }
 
-pub(crate) fn serve_httpheader_split<R, W>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn serve_httpheader_split_with<R, W>(
     reader: R,
     writer: W,
     path: &str,
     users: &Users,
     freedom: bool,
     close: &Close,
+    response: Option<&[u8]>,
 ) where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Some((mut reader, writer)) = crate::httpheader::accept_split(reader, writer, path) else {
+    let Some((mut reader, writer)) =
+        crate::httpheader::accept_split(reader, writer, path, response)
+    else {
         return;
     };
     let decoded = accept_request_bounded(&mut reader, users);
@@ -2739,11 +2827,35 @@ pub(crate) fn serve(mut stream: Connection, users: &Users, freedom: bool) {
         prefix,
         cmd,
         rendezvous,
+        portal,
         user,
     }) = request
     else {
         return;
     };
+    if let Some(portal) = portal {
+        if cmd != 1 || target.is_none() || stream.write_all(&prefix).is_err() {
+            return;
+        }
+        let Ok(reader) = stream.try_clone() else {
+            return;
+        };
+        let Ok(closer) = stream.try_clone() else {
+            return;
+        };
+        let close: Close = std::sync::Arc::new(move || {
+            let _ = closer.shutdown(Shutdown::Both);
+        });
+        let Some(writer) = CarriedWriter::new(stream, send) else {
+            return;
+        };
+        portal.attach(crate::reverse::Tunnel::new(
+            Box::new(CarriedReader::new(reader, recv)),
+            Box::new(writer),
+            close,
+        ));
+        return;
+    }
     if !freedom {
         return;
     }
@@ -4914,7 +5026,7 @@ mod tests {
         header.push(1);
         header.extend_from_slice(&[127, 0, 0, 1]);
         header.extend_from_slice(&fnv1a(&header).to_be_bytes());
-        let (got, _send, _recv, prefix, cmd, _) = decode_header(&header).expect("decodes");
+        let (got, _send, _recv, prefix, cmd, _, _) = decode_header(&header).expect("decodes");
         assert_eq!(got, Some(target));
         assert_eq!(cmd, 1);
         assert_eq!(prefix.len(), 38);
@@ -4926,7 +5038,7 @@ mod tests {
         let cut = udp.len() - 4;
         let sum = fnv1a(&udp[..cut]);
         udp[cut..].copy_from_slice(&sum.to_be_bytes());
-        let (got, _, _, _, cmd, _) = decode_header(&udp).expect("decodes udp");
+        let (got, _, _, _, cmd, _, _) = decode_header(&udp).expect("decodes udp");
         assert_eq!(got, Some(target));
         assert_eq!(cmd, 2);
         let mut bad = header.clone();
@@ -4971,7 +5083,8 @@ mod tests {
             OPT_STREAM | OPT_AUTH_LEN | OPT_MASK,
             OPT_STREAM | OPT_AUTH_LEN | OPT_MASK | OPT_PAD,
         ] {
-            let (_, send, recv, _, _, _) = decode_header(&header(0x04, options)).expect("decodes");
+            let (_, send, recv, _, _, _, _) =
+                decode_header(&header(0x04, options)).expect("decodes");
             assert_eq!(send.size_field(), SIZE_FIELD);
             assert_eq!(recv.size_field(), SIZE_FIELD);
         }
@@ -4987,7 +5100,7 @@ mod tests {
         // A body without a cipher leaves the sealed size without a key, and the reference refuses the option there too.
         assert!(decode_header(&header(0x05, OPT_STREAM | OPT_AUTH_LEN)).is_none());
         // A 2-octet size field stays the way the bit has always framed it.
-        let (_, send, recv, _, _, _) =
+        let (_, send, recv, _, _, _, _) =
             decode_header(&header(0x04, OPT_STREAM | OPT_MASK | OPT_PAD)).expect("decodes");
         assert_eq!(send.size_field(), HEADER_LEN);
         assert_eq!(recv.size_field(), HEADER_LEN);
@@ -5056,7 +5169,7 @@ mod tests {
 
                 // The staged framing is a server's response framing here: the body AEAD rides the response material while the sealed size rides the request's keys (`proxy/vmess/encoding/server.go` `EncodeResponseBody`), so a peer sealing the size with the wrong pair cannot open it.
                 let head = header(cipher.code(), options);
-                let (_, mut srv, _, _, _, _) = decode_header(&head).expect("decodes");
+                let (_, mut srv, _, _, _, _, _) = decode_header(&head).expect("decodes");
                 let (response_key, response_iv) = response_material(&[0x01; 16], &[0x02; 16]);
                 let mut peer =
                     Flow::fresh(cipher, &response_key, &response_iv, options, &response_iv)
@@ -5155,7 +5268,7 @@ mod tests {
                 let head_nonce: [u8; 12] = head_full[..12].try_into().expect("nonce");
                 let clear =
                     open_header(&head_key, &head_nonce, &request[42..], &auth_id).expect("opens");
-                let (got, _, _, _, _, _) = decode_header(&clear).expect("decodes");
+                let (got, _, _, _, _, _, _) = decode_header(&clear).expect("decodes");
                 assert_eq!(got, Some(target));
             }
         }

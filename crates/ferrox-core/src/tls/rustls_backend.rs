@@ -1867,6 +1867,197 @@ pub type ServerConfigCache = std::sync::Arc<std::sync::Mutex<ServerConfigCacheIn
 struct IdentityResolver {
     identities: Vec<(Arc<rustls::sign::CertifiedKey>, Vec<String>)>,
     reject: bool,
+    issuer: Option<Arc<super::CertIssuer>>,
+    issued: Mutex<std::collections::HashMap<String, IssuedKey>>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+const ISSUED_CACHE_LIMIT: usize = 64;
+
+type IssuedKey = (
+    Arc<rustls::sign::CertifiedKey>,
+    (i32, u8, u8, u8, u8, u8),
+    u64,
+);
+
+/// X.509's `UTCTime` window: `50`–`99` are 1950–1999 and `00`–`49` are 2000–2049.
+fn utc_year(two: &str) -> Option<i32> {
+    let year = two.parse::<i32>().ok()?;
+    Some(if year >= 50 { 1900 + year } else { 2000 + year })
+}
+
+/// A certificate's `notBefore`/`notAfter` as a UTC timestamp, in the encoded `YYMMDDhhmm[ss]Z`
+/// or `YYYYMMDDhhmmssZ` form `Asn1StringRef::as_utf8` returns.
+fn asn1_time(time: &boring::asn1::Asn1TimeRef) -> Option<(i32, u8, u8, u8, u8, u8)> {
+    let raw = time.as_ref().as_utf8().ok()?;
+    let text: &str = raw.as_ref();
+    let text = text.trim_end_matches('Z');
+    let (year, rest, second) = match text.len() {
+        10 => (utc_year(text.get(..2)?)?, text.get(2..)?, Some(0)),
+        12 => (utc_year(text.get(..2)?)?, text.get(2..)?, None),
+        14 => (text.get(..4)?.parse().ok()?, text.get(4..)?, None),
+        _ => return None,
+    };
+    let second = match second {
+        Some(second) => second,
+        None => rest.get(8..10)?.parse().ok()?,
+    };
+    Some((
+        year,
+        rest.get(0..2)?.parse().ok()?,
+        rest.get(2..4)?.parse().ok()?,
+        rest.get(4..6)?.parse().ok()?,
+        rest.get(6..8)?.parse().ok()?,
+        second,
+    ))
+}
+
+fn today_time() -> Option<(i32, u8, u8, u8, u8, u8)> {
+    let now = boring::asn1::Asn1Time::days_from_now(0).ok()?;
+    asn1_time(now.as_ref())
+}
+
+/// A UTC timestamp in the form `asn1_time` decodes, so a leaf's `notAfter` is the CA's own last
+/// instant rather than a rounded date that could leave the CA's window or overflow its year.
+fn date_time(
+    (year, month, day, hour, minute, second): (i32, u8, u8, u8, u8, u8),
+) -> Option<time::OffsetDateTime> {
+    let month = time::Month::try_from(month).ok()?;
+    let date = time::Date::from_calendar_date(year, month, day).ok()?;
+    let clock = time::Time::from_hms(hour, minute, second).ok()?;
+    Some(date.with_time(clock).assume_utc())
+}
+
+/// Whether the replacement CA can be published now: it parses, its validity window contains
+/// today, and the signing backend accepts a leaf from it.
+pub(crate) fn issuer_usable(cert_pem: &[u8], key_pem: &[u8]) -> Result<(), String> {
+    let ca_pem = std::str::from_utf8(cert_pem).map_err(|_| "ca is not utf-8")?;
+    let key_pem = std::str::from_utf8(key_pem).map_err(|_| "key is not utf-8")?;
+    let cert = boring::x509::X509::from_pem(cert_pem)
+        .map_err(|error| format!("ca does not parse: {error}"))?;
+    let mut seen = std::collections::HashSet::new();
+    for entry in cert.subject_name().entries() {
+        if !seen.insert(entry.object().to_string()) {
+            return Err("ca subject repeats an attribute type rcgen would fold".to_owned());
+        }
+    }
+    let starts = asn1_time(cert.not_before()).ok_or("ca notBefore does not parse")?;
+    let ends = asn1_time(cert.not_after()).ok_or("ca notAfter does not parse")?;
+    let today = today_time().ok_or("today does not parse")?;
+    if starts > today || ends <= today {
+        return Err("ca is not valid today".to_owned());
+    }
+    let der = cert
+        .to_der()
+        .map_err(|error| format!("ca does not serialize: {error}"))?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(&der)
+        .map_err(|error| format!("ca does not parse: {error}"))?;
+    let basic = parsed
+        .basic_constraints()
+        .map_err(|error| format!("ca basic constraints do not parse: {error}"))?;
+    if !basic.is_some_and(|basic| basic.value.ca) {
+        return Err("ca is not a certificate authority".to_owned());
+    }
+    let usage = parsed
+        .key_usage()
+        .map_err(|error| format!("ca key usage does not parse: {error}"))?;
+    if usage.is_some_and(|usage| !usage.value.key_cert_sign()) {
+        return Err("ca key usage does not permit certificate signing".to_owned());
+    }
+    let key = rcgen::KeyPair::from_pem(key_pem).map_err(|error| format!("{error}"))?;
+    let authority =
+        rcgen::Issuer::from_ca_cert_pem(ca_pem, key).map_err(|error| format!("{error}"))?;
+    let mut params = rcgen::CertificateParams::new(vec!["reload.test".to_owned()])
+        .map_err(|error| format!("{error}"))?;
+    params.not_before = date_time(starts).ok_or("ca notBefore is out of range")?;
+    params.not_after = date_time(ends).ok_or("ca notAfter is out of range")?;
+    let probe = rcgen::KeyPair::generate().map_err(|error| format!("{error}"))?;
+    params
+        .signed_by(&probe, &authority)
+        .map(|_| ())
+        .map_err(|error| format!("{error}"))
+}
+
+impl IdentityResolver {
+    /// Sign a leaf for an SNI no served certificate names, with the CA an `AUTHORITY_ISSUE`
+    /// entry supplies, and keep it for the next hello that names the same host.
+    fn issue(&self, sni: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        if sni.is_empty() {
+            return None;
+        }
+        let issuer = self.issuer.as_ref()?;
+        for _ in 0..2 {
+            let snapshot = issuer.snapshot();
+            let generation = snapshot.generation;
+            let today = today_time();
+            if let Some((key, expires, issued)) = self
+                .issued
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(sni)
+            {
+                if *issued == generation && today.is_none_or(|today| expires > &today) {
+                    return Some(Arc::clone(key));
+                }
+            }
+            let issuer = &snapshot.material;
+            let ca_pem = std::str::from_utf8(&issuer.cert_pem).ok()?;
+            let key_pem = std::str::from_utf8(&issuer.key_pem).ok()?;
+            let ca_key = rcgen::KeyPair::from_pem(key_pem).ok()?;
+            let authority = rcgen::Issuer::from_ca_cert_pem(ca_pem, ca_key).ok()?;
+            let mut params = rcgen::CertificateParams::new(vec![sni.to_owned()]).ok()?;
+            let ca = boring::x509::X509::from_pem(&issuer.cert_pem).ok();
+            let starts = ca.as_ref().and_then(|ca| asn1_time(ca.not_before()));
+            let ends = ca.as_ref().and_then(|ca| asn1_time(ca.not_after()));
+            let ends = ends?;
+            let today = today_time()?;
+            if starts.is_some_and(|starts| starts > today) || ends <= today {
+                return None;
+            }
+            if let Some(starts) = starts {
+                params.not_before = date_time(starts)?;
+            }
+            params.not_after = date_time(ends)?;
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, sni);
+            let leaf_key = rcgen::KeyPair::generate().ok()?;
+            let leaf = params.signed_by(&leaf_key, &authority).ok()?;
+            let mut chain = vec![leaf.der().clone()];
+            chain.extend(
+                issuer
+                    .cert_chain
+                    .iter()
+                    .cloned()
+                    .map(rustls::pki_types::CertificateDer::from),
+            );
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()),
+            );
+            let key =
+                rustls::sign::CertifiedKey::from_der(chain, key, self.provider.as_ref()).ok()?;
+            let key = Arc::new(key);
+            let mut cache = self
+                .issued
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.issuer.as_ref()?.generation() != generation {
+                continue;
+            }
+            let oldest = cache
+                .keys()
+                .next()
+                .cloned()
+                .filter(|_| cache.len() >= ISSUED_CACHE_LIMIT);
+            if let Some(oldest) = oldest {
+                cache.remove(&oldest);
+            }
+            cache.retain(|_, (_, _, issued)| *issued == generation);
+            cache.insert(sni.to_owned(), (Arc::clone(&key), ends, generation));
+            return Some(key);
+        }
+        None
+    }
 }
 
 impl rustls::server::ResolvesServerCert for IdentityResolver {
@@ -1875,15 +2066,19 @@ impl rustls::server::ResolvesServerCert for IdentityResolver {
         hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let sni = hello.server_name().unwrap_or("");
-        if !self.reject && (self.identities.len() == 1 || sni.is_empty()) {
-            return self.identities.first().map(|(key, _)| Arc::clone(key));
-        }
-        if let Some((key, _)) = self
+        let exact = self
             .identities
             .iter()
             .find(|(_, names)| sni_matches(names, sni))
-        {
-            return Some(Arc::clone(key));
+            .map(|(key, _)| Arc::clone(key));
+        if exact.is_some() {
+            return exact;
+        }
+        if let Some(key) = self.issue(sni) {
+            return Some(key);
+        }
+        if !self.reject && (self.identities.len() == 1 || sni.is_empty()) {
+            return self.identities.first().map(|(key, _)| Arc::clone(key));
         }
         if self.reject {
             return None;
@@ -1974,7 +2169,7 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
         None => builder.with_safe_default_protocol_versions(),
     }
     .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?;
-    let mut config = if cfg.certs.len() == 1 && !cfg.reject_unknown_sni {
+    let mut config = if cfg.certs.len() == 1 && !cfg.reject_unknown_sni && cfg.issuer.is_none() {
         let entry = cfg.certs.into_iter().next().expect("one identity");
         let key = key_of(&entry);
         match entry.ocsp.and_then(|ocsp| ocsp.response) {
@@ -2010,6 +2205,9 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
             .with_cert_resolver(Arc::new(IdentityResolver {
                 identities,
                 reject: cfg.reject_unknown_sni,
+                issuer: cfg.issuer.clone(),
+                issued: Mutex::new(std::collections::HashMap::new()),
+                provider: Arc::clone(&crypto_provider),
             }))
     };
     config.alpn_protocols.clear();
@@ -2776,6 +2974,34 @@ mod tests {
     const HANDSHAKE: u8 = 22;
     const CCS: u8 = 20;
     const APPLICATION: u8 = 23;
+    #[test]
+    fn a_non_ca_certificate_is_not_a_usable_issuer() {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let params =
+            rcgen::CertificateParams::new(vec!["not-a-ca.test".to_owned()]).expect("params");
+        let cert = params.self_signed(&key).expect("cert");
+        assert!(
+            issuer_usable(cert.pem().as_bytes(), key.serialize_pem().as_bytes()).is_err(),
+            "a leaf without basicConstraints CA cannot replace the authority"
+        );
+        let mut without_cert_sign =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+        without_cert_sign.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        without_cert_sign.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        let cert = without_cert_sign.self_signed(&key).expect("cert");
+        assert!(
+            issuer_usable(cert.pem().as_bytes(), key.serialize_pem().as_bytes()).is_err(),
+            "a CA that may not sign certificates cannot replace the authority"
+        );
+        let mut far = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+        far.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        far.not_after = date_time((9999, 12, 31, 23, 59, 59)).expect("last instant");
+        let cert = far.self_signed(&key).expect("cert");
+        assert!(
+            issuer_usable(cert.pem().as_bytes(), key.serialize_pem().as_bytes()).is_ok(),
+            "a CA whose last instant is the calendar's edge still signs leaves"
+        );
+    }
 
     #[test]
     fn a_verifier_that_skips_the_chain_still_rejects_a_forged_handshake_signature() {
@@ -4059,6 +4285,7 @@ mod tests {
             send_tickets: false,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
+            issuer: None,
             ech_server_keys: None,
             master_key_log: None,
             kernel_tx: false,
@@ -5395,6 +5622,7 @@ mod tests {
             send_tickets: false,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
+            issuer: None,
             ech_server_keys: None,
             master_key_log: None,
             kernel_tx: false,
@@ -5458,6 +5686,7 @@ mod tests {
             send_tickets: false,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
+            issuer: None,
             ech_server_keys: None,
             master_key_log: None,
             kernel_tx: false,
@@ -5518,6 +5747,7 @@ mod tests {
             send_tickets: true,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
+            issuer: None,
             ech_server_keys: None,
             master_key_log: None,
             kernel_tx: false,

@@ -685,7 +685,8 @@ pub(crate) fn tls_identity_from_settings(
         }
     };
     let certs = tls_cert_entries(settings)?;
-    if certs.is_empty() {
+    let issuer = tls_issue_authority(settings);
+    if certs.is_empty() && issuer.is_none() {
         return None;
     }
     let mut identity = ferrox_core::tls::TlsServerConfig {
@@ -698,6 +699,7 @@ pub(crate) fn tls_identity_from_settings(
         send_tickets: true,
         reject_unknown_sni: false,
         server_config_cache: std::sync::Arc::default(),
+        issuer,
         ech_server_keys: None,
         master_key_log: None,
         kernel_tx: false,
@@ -797,6 +799,73 @@ fn ech_server_keys(settings: &Json) -> Result<Option<Arc<[u8]>>, String> {
 /// Every `certificates` entry xray would serve, in block order: `usage` other than
 /// `encipherment` feeds no handshake, an entry with no key or an unparseable pair is skipped
 /// the way xray warns and moves on, and a named file that cannot be read refuses the listener.
+/// The first `AUTHORITY_ISSUE` entry: its CA signs a leaf for an SNI no served certificate covers.
+fn tls_issue_authority(settings: &Json) -> Option<Arc<ferrox_core::tls::CertIssuer>> {
+    let list = settings.get("tlsSettings")?.get("certificates")?.as_arr()?;
+    for (index, cert) in list.iter().enumerate() {
+        if !cert
+            .get("usage")
+            .and_then(Json::as_str)
+            .is_some_and(|usage| usage.eq_ignore_ascii_case("issue"))
+        {
+            continue;
+        }
+        let named = |field: &str| {
+            cert.get(field)
+                .and_then(Json::as_str)
+                .filter(|path| !path.is_empty())
+        };
+        let certificate = named("certificateFile");
+        let key = named("keyFile");
+        let cert_pem = match certificate {
+            Some(path) => read_cert_file(path)?,
+            None => inline_pem(cert, "certificate")?,
+        };
+        let key_pem = match key {
+            Some(path) => read_cert_file(path)?,
+            None => inline_pem(cert, "key")?,
+        };
+        let entry = match ferrox_core::tls::parse_pem_entry(&cert_pem, &key_pem) {
+            Ok(entry) => entry,
+            Err(error) => {
+                eprintln!("tls: skipping AUTHORITY_ISSUE entry {index}: {error}");
+                continue;
+            }
+        };
+        let reload = match certificate.zip(key) {
+            Some((certificate, key))
+                if !cert
+                    .get("oneTimeLoading")
+                    .and_then(Json::as_bool)
+                    .unwrap_or(false) =>
+            {
+                let seconds = cert
+                    .get("ocspStapling")
+                    .and_then(as_whole)
+                    .filter(|seconds| *seconds != 0)
+                    .unwrap_or(3600);
+                Some(ferrox_core::tls::CertReload {
+                    certificate: certificate.to_owned(),
+                    key: key.to_owned(),
+                    interval: Duration::from_secs(seconds),
+                    read: read_cert_file,
+                    now: std::time::Instant::now,
+                })
+            }
+            _ => None,
+        };
+        let issuer = ferrox_core::tls::CertIssuer::new(entry.cert_chain, cert_pem, key_pem, reload);
+        if let Err(error) = issuer.signing_ready() {
+            eprintln!(
+                "tls: skipping an AUTHORITY_ISSUE entry the signing backend refuses: {error}"
+            );
+            continue;
+        }
+        return Some(Arc::new(issuer));
+    }
+    None
+}
+
 fn tls_cert_entries(settings: &Json) -> Option<Vec<ferrox_core::tls::CertEntry>> {
     let list = settings.get("tlsSettings")?.get("certificates")?.as_arr()?;
     let mut entries = Vec::with_capacity(list.len());
@@ -851,6 +920,7 @@ fn tls_cert_entries(settings: &Json) -> Option<Vec<ferrox_core::tls::CertEntry>>
                     key: key.to_owned(),
                     interval: Duration::from_secs(seconds),
                     read: read_cert_file,
+                    now: std::time::Instant::now,
                 });
             }
         }
@@ -1763,22 +1833,90 @@ fn grpc_escape(service: &str) -> String {
     out
 }
 
-/// The tcp-http request block the config names: `rawSettings` replaces `tcpSettings` whole when it is present, as the reference does before it builds the transport.
-fn tcp_http_request(settings: Option<&Json>) -> Option<&Json> {
+/// The tcp-http header block the config names: `rawSettings` replaces `tcpSettings` whole when it is present, as the reference does before it builds the transport.
+fn tcp_http_header(settings: Option<&Json>) -> Option<&Json> {
     let settings = settings?;
     let block = match settings.get("rawSettings") {
         Some(raw) if !matches!(raw, Json::Null) => raw,
         _ => settings.get("tcpSettings")?,
     };
     let header = block.get("header")?;
-    if header.get("type").and_then(Json::as_str) != Some("http") {
+    (header.get("type").and_then(Json::as_str) == Some("http")).then_some(header)
+}
+
+fn tcp_http_request(settings: Option<&Json>) -> Option<&Json> {
+    tcp_http_header(settings)?.get("request")
+}
+
+/// The response bytes a config's `header.response` names, or the fixed default the carrier keeps
+/// when no response block is present. The reference always emits field 2, so an empty block is the
+/// same default rather than a refusal.
+fn tcp_http_response(settings: Option<&Json>) -> Option<Vec<u8>> {
+    let response = tcp_http_header(settings)?.get("response")?;
+    if matches!(response, Json::Null) {
         return None;
     }
-    header.get("request")
+    let Json::Obj(_) = response else {
+        return None;
+    };
+    let text: fn(Option<&Json>) -> Option<&str> = |node| node.and_then(Json::as_str);
+    let version = text(response.get("version"))
+        .filter(|version| !version.is_empty())
+        .unwrap_or("1.1");
+    let status = response.get("status");
+    let code = status
+        .and_then(|status| status.get("code"))
+        .and_then(|code| {
+            code.as_str()
+                .map(str::to_owned)
+                .or_else(|| as_whole(code).map(|code| code.to_string()))
+        })
+        .unwrap_or_else(|| "200".to_owned());
+    let reason = text(status.and_then(|status| status.get("reason")))
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or("OK");
+    let bodyless = code
+        .parse::<u16>()
+        .is_ok_and(|code| (100..200).contains(&code) || code == 204);
+    let mut head = format!("HTTP/{version} {code} {reason}\r\n");
+    let mut framed = false;
+    let mut connected = false;
+    let headers = match response.get("headers") {
+        Some(Json::Obj(pairs)) => pairs.as_slice(),
+        _ => &[],
+    };
+    for (name, value) in headers {
+        let value = match value {
+            Json::Arr(values) => values.iter().find_map(Json::as_str),
+            Json::Str(value) => Some(value.as_str()),
+            _ => None,
+        };
+        let Some(value) = value else {
+            continue;
+        };
+        let lowered = name.to_ascii_lowercase();
+        framed |= lowered == "content-length" || lowered == "transfer-encoding";
+        connected |= lowered == "connection";
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    if !framed && !bodyless {
+        head.push_str("Content-Length: 0\r\n");
+    }
+    if !connected {
+        head.push_str("Connection: keep-alive\r\n");
+    }
+    head.push_str("\r\n");
+    Some(head.into_bytes())
 }
 
 pub(crate) fn tcp_http_path(settings: Option<&Json>) -> Option<String> {
-    let request = tcp_http_request(settings)?;
+    tcp_http_header(settings)?;
+    let Some(request) = tcp_http_request(settings) else {
+        return Some("/".to_owned());
+    };
     if let Some(paths) = request.get("path").and_then(Json::as_arr) {
         let first = paths.iter().find_map(Json::as_str);
         if let Some(path) = first {
@@ -1894,6 +2032,7 @@ pub(crate) enum Carrier {
     },
     HttpHeader {
         path: String,
+        response: Option<Vec<u8>>,
     },
     Quic,
     Kcp(ferrox_core::kcp::Config),
@@ -2006,7 +2145,15 @@ pub(crate) fn has_tcp_mask(settings: Option<&Json>) -> bool {
 }
 
 fn resolve_ws(settings: Option<&Json>, _: &str) -> Carrier {
-    let early = EarlyData::split(&sub_path(settings, "wsSettings"));
+    let block = settings.and_then(|s| s.get("wsSettings"));
+    let mut early = EarlyData::split(&sub_path(settings, "wsSettings"));
+    if let Some(ed) = block
+        .and_then(|s| s.get("ed"))
+        .and_then(Json::as_u32)
+        .filter(|ed| *ed != 0)
+    {
+        early.budget = ed;
+    }
     Carrier::Ws {
         path: early.path,
         ed: early.budget,
@@ -2254,7 +2401,10 @@ fn resolve_tcp_or_header(settings: Option<&Json>, network: &str) -> Carrier {
         Some(_) if !mask.is_empty() => Carrier::Unknown {
             network: network.to_owned(),
         },
-        Some(path) => Carrier::HttpHeader { path },
+        Some(path) => Carrier::HttpHeader {
+            path,
+            response: tcp_http_response(settings),
+        },
         None => Carrier::Raw(mask),
     }
 }
@@ -5879,6 +6029,7 @@ mod tests {
             key: "key.pem".to_owned(),
             interval: Duration::from_secs(3600),
             read: reloaded_pair,
+            now: std::time::Instant::now,
         });
         let identity = Arc::new(identity);
         assert!(
@@ -6450,6 +6601,27 @@ mod tests {
         assert_eq!(
             carrier_headers(Some(&tcp)).0,
             vec![("X-Tcp".to_owned(), "1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_configured_http_response_reaches_the_carrier() {
+        let settings = crate::json::parse(
+            r#"{"network":"tcp","tcpSettings":{"header":{"type":"http","request":{"path":["/c"]},"response":{"version":"1.1","status":{"code":"204","reason":"No Content"},"headers":{"X-Camo":["a","b"],"Connection":"close"}}}}}"#,
+        )
+        .expect("response");
+        let response = tcp_http_response(Some(&settings)).expect("the response block builds");
+        assert_eq!(
+            String::from_utf8(response).expect("ascii"),
+            "HTTP/1.1 204 No Content\r\nX-Camo: a\r\nConnection: close\r\n\r\n"
+        );
+        let plain = crate::json::parse(
+            r#"{"network":"tcp","tcpSettings":{"header":{"type":"http","request":{"path":["/c"]}}}}"#,
+        )
+        .expect("plain");
+        assert!(
+            tcp_http_response(Some(&plain)).is_none(),
+            "no response block leaves the carrier's default"
         );
     }
 

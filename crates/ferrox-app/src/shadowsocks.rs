@@ -448,8 +448,19 @@ pub(crate) fn serve_xhttp_legacy(stream: Connection, users: &[SsUser], path: &st
     serve_accepted(accepted, reader, writer, close, meter);
 }
 
+#[cfg(test)]
 pub(crate) fn serve_httpheader(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
-    let Some((mut reader, mut writer)) = crate::httpheader::accept(stream, path) else {
+    serve_httpheader_with(stream, users, path, freedom, None);
+}
+
+pub(crate) fn serve_httpheader_with(
+    stream: Connection,
+    users: &[SsUser],
+    path: &str,
+    freedom: bool,
+    response: Option<&[u8]>,
+) {
+    let Some((mut reader, mut writer)) = crate::httpheader::accept(stream, path, response) else {
         return;
     };
     let Some((accepted, meter)) = accept_on(&mut reader, &mut writer, users, freedom) else {

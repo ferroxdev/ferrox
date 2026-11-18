@@ -575,6 +575,7 @@ const READ_SLICE: usize = 32 * 1024;
 /// carry one.
 pub(crate) struct Portal {
     tag: String,
+    domain: String,
     sessions: Mutex<Vec<Arc<Session>>>,
 }
 
@@ -588,14 +589,27 @@ impl std::fmt::Debug for Portal {
 
 impl Portal {
     pub(crate) fn new(tag: &str) -> Arc<Self> {
+        Self::named(tag, "")
+    }
+
+    pub(crate) fn named(tag: &str, domain: &str) -> Arc<Self> {
         Arc::new(Self {
             tag: tag.to_owned(),
+            domain: domain.to_owned(),
             sessions: Mutex::new(Vec::new()),
         })
     }
 
     pub(crate) fn tag(&self) -> &str {
         &self.tag
+    }
+
+    pub(crate) fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub(crate) fn matches(&self, domain: &str) -> bool {
+        !self.domain.is_empty() && self.domain.eq_ignore_ascii_case(domain)
     }
 
     pub(crate) fn attach(self: &Arc<Self>, tunnel: Tunnel) -> Option<Arc<Session>> {
@@ -639,9 +653,66 @@ impl Portals {
             .or_insert_with(|| Portal::new(tag));
     }
 
+    /// Register a portal's domain, rejecting a domain another tag already claims so a bridge can
+    /// never attach by domain to a portal the route proof did not select.
+    pub(crate) fn insert_domain(&mut self, tag: &str, domain: &str) -> Result<(), String> {
+        if let Some(existing) = self.by_tag.get(tag) {
+            if existing.domain().is_empty() {
+                // A tag can be registered by a user before its portal config names a domain.
+            } else if existing.domain().eq_ignore_ascii_case(domain) {
+                return Ok(());
+            } else {
+                return Err(format!(
+                    "portal `{tag}` already names `{}`, not `{domain}`",
+                    existing.domain()
+                ));
+            }
+        }
+        if let Some(portal) = self
+            .by_tag
+            .values()
+            .find(|portal| portal.tag() != tag && portal.matches(domain))
+        {
+            return Err(format!(
+                "portal domain `{domain}` is claimed by both `{}` and `{tag}`",
+                portal.tag()
+            ));
+        }
+        self.by_tag
+            .insert(tag.to_owned(), Portal::named(tag, domain));
+        Ok(())
+    }
+
+    pub(crate) fn for_domain(&self, domain: &str) -> Option<Arc<Portal>> {
+        self.by_tag
+            .values()
+            .find(|portal| portal.matches(domain))
+            .cloned()
+    }
+
     pub(crate) fn get(&self, tag: &str) -> Option<Arc<Portal>> {
         self.by_tag.get(tag).cloned()
     }
+}
+
+static REGISTRY: std::sync::OnceLock<Arc<Portals>> = std::sync::OnceLock::new();
+
+/// Publishes the portals one process serves so a protocol front can recognise a portal's domain
+/// before it resolves the name or dials anything.
+pub(crate) fn install_portals(portals: Arc<Portals>) {
+    let _ = REGISTRY.set(portals);
+}
+
+/// The portal whose domain names this destination, if the reverse app configured one.
+pub(crate) fn portal_for_domain(domain: &str) -> Option<Arc<Portal>> {
+    REGISTRY
+        .get()
+        .and_then(|portals| portals.for_domain(domain))
+}
+
+/// The registered portal a rule target names, even when no startup rule named it.
+pub(crate) fn portal_for_tag(tag: &str) -> Option<Arc<Portal>> {
+    REGISTRY.get().and_then(|portals| portals.get(tag))
 }
 
 /// One worker's state, written by its control stream and read by the monitor.
@@ -649,6 +720,8 @@ pub(crate) struct WorkerState {
     state: AtomicI32,
     closed: AtomicBool,
     connections: AtomicU32,
+    flows: AtomicU32,
+    rotated: AtomicU32,
     last_control: Mutex<Instant>,
 }
 
@@ -658,6 +731,8 @@ impl WorkerState {
             state: AtomicI32::new(ACTIVE),
             closed: AtomicBool::new(false),
             connections: AtomicU32::new(0),
+            flows: AtomicU32::new(0),
+            rotated: AtomicU32::new(0),
             last_control: Mutex::new(Instant::now()),
         })
     }
@@ -699,16 +774,43 @@ impl WorkerState {
             .map_or(true, |last| last.elapsed() >= after)
     }
 
-    pub(crate) fn note_connection(&self) {
+    pub(crate) fn note_connection(self: &Arc<Self>) -> ConnectionGuard {
         self.connections.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn release_connection(&self) {
-        self.connections.fetch_sub(1, Ordering::Relaxed);
+        self.flows.fetch_add(1, Ordering::Relaxed);
+        ConnectionGuard {
+            worker: Arc::clone(self),
+        }
     }
 
     pub(crate) fn connections(&self) -> u32 {
         self.connections.load(Ordering::Relaxed)
+    }
+
+    /// Flows this worker has carried over its lifetime; the monitor rotates a session before the
+    /// reference's per-session flow bound, so this counter only rises.
+    pub(crate) fn flows(&self) -> u32 {
+        self.flows.load(Ordering::Relaxed)
+    }
+
+    /// Flows already accounted for by the replacement this worker started, so completed lifetime
+    /// flows open at most one tunnel instead of one per monitor tick.
+    pub(crate) fn rotated(&self) -> u32 {
+        self.rotated.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_rotated(&self, at: u32) {
+        self.rotated.store(at, Ordering::Relaxed);
+    }
+}
+
+/// One live flow on a bridge worker; dropping it releases the slot the monitor counts.
+pub(crate) struct ConnectionGuard {
+    worker: Arc<WorkerState>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.worker.connections.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -716,6 +818,8 @@ impl WorkerState {
 pub(crate) struct BridgeHandle {
     pub(crate) tunnel: Tunnel,
     pub(crate) state: Arc<WorkerState>,
+    /// The worker this tunnel replaced, so one healthy replacement covers it until it drains.
+    pub(crate) replaces: Option<Arc<WorkerState>>,
 }
 
 /// Runs one bridge monitor until the process ends. `start` opens the tunnel the monitor then
@@ -741,18 +845,35 @@ where
                 }
                 live
             });
-            let live = workers
-                .iter()
-                .filter(|worker| worker.state.active())
-                .count();
-            let live = u32::try_from(live).unwrap_or(u32::MAX);
-            let connections: u32 = workers
-                .iter()
-                .filter(|worker| worker.state.active())
-                .map(|worker| worker.state.connections())
-                .sum();
-            if live == 0 || connections / live > 16 {
-                if let Some(handle) = start(&spawned) {
+            let mut live = 0u32;
+            let mut covered: Vec<Arc<WorkerState>> = Vec::new();
+            for worker in &workers {
+                if let Some(original) = &worker.replaces {
+                    if worker.state.active() && !worker.state.stale(WORKER_IDLE) {
+                        covered.push(Arc::clone(original));
+                    }
+                }
+            }
+            let mut marks: Vec<(Arc<WorkerState>, u32)> = Vec::new();
+            for worker in &workers {
+                if worker.state.active() {
+                    live = live.saturating_add(1);
+                    let flows = worker.state.flows();
+                    if flows.saturating_sub(worker.state.rotated()) > 16
+                        && !covered
+                            .iter()
+                            .any(|covered| Arc::ptr_eq(covered, &worker.state))
+                    {
+                        marks.push((Arc::clone(&worker.state), flows));
+                    }
+                }
+            }
+            if live == 0 || !marks.is_empty() {
+                if let Some(mut handle) = start(&spawned) {
+                    if let Some((state, at)) = marks.into_iter().next() {
+                        state.mark_rotated(at);
+                        handle.replaces = Some(state);
+                    }
                     workers.push(handle);
                 }
             }

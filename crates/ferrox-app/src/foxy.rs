@@ -4649,6 +4649,7 @@ pub(crate) mod loopback {
             send_tickets: true,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
+            issuer: None,
             ech_server_keys: None,
             master_key_log: None,
             kernel_tx: false,
