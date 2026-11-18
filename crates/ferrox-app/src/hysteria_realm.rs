@@ -1038,10 +1038,9 @@ fn heartbeat_loop(
         {
             return;
         }
-        let Some(base) = stun_discover_via_state(&state, &sock, &servers, family) else {
-            continue;
-        };
-        let mut next = base;
+        let mut next = stun_discover_via_state(&state, &sock, &servers, family)
+            .or_else(|| locals.lock().ok().map(|locals| locals.to_vec()))
+            .unwrap_or_default();
         if let Some(mapping) = mapping.filter(|mapping| mapping.enabled) {
             if let Some(external) =
                 port_mapping_external(sock.local_addr().ok(), mapping.timeout, mapping.lifetime)
@@ -1100,6 +1099,9 @@ fn map_via_gateway(
     let base = url_base.as_deref().unwrap_or(location);
     let control = ferrox_core::portmap::join_control(Some(base), &service.control_url);
     let (control_host, control_port, control_path) = ferrox_core::portmap::split_url(&control)?;
+    if !same_host(&gateway_host, &control_host) {
+        return None;
+    }
     let internal_client = reachable_client(internal_client, &control_host, control_port)?;
     let mut body = [0u8; 4096];
     let lease = u32::try_from(lifetime_secs).unwrap_or(u32::MAX);
@@ -1172,15 +1174,59 @@ fn ssdp_discover(deadline: Instant) -> Option<String> {
             let _ = sock.send_to(&buf[..written], ferrox_core::portmap::SSDP_MULTICAST);
         }
         let mut reply = [0u8; 2048];
-        if let Ok((len, _)) = sock.recv_from(&mut reply) {
-            if let Some(location) = ferrox_core::portmap::ssdp_location(&reply[..len]) {
-                return Some(location);
+        if let Ok((len, from)) = sock.recv_from(&mut reply) {
+            let reply = &reply[..len];
+            if ssdp_response(reply) {
+                if let Some(location) = ferrox_core::portmap::ssdp_location(reply) {
+                    let Some((host, _, _)) = ferrox_core::portmap::split_url(&location) else {
+                        continue;
+                    };
+                    if host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|host| host == from.ip())
+                    {
+                        return Some(location);
+                    }
+                }
             }
         }
         x = x.wrapping_add(1);
         let _ = x;
     }
     None
+}
+
+/// A datagram is an SSDP search response, not a search request or an unsolicited advert: it
+/// carries a success status rather than a search request's `MAN` header.
+fn ssdp_response(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    let Some(status) = lines.next() else {
+        return false;
+    };
+    if !(status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200")) {
+        return false;
+    }
+    !lines.any(|line| {
+        line.split_once(':')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("man"))
+    })
+}
+
+/// The description and its control URL must name the same gateway the SSDP reply came from.
+fn same_host(left: &str, right: &str) -> bool {
+    if left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+    matches!(
+        (
+            left.parse::<std::net::IpAddr>(),
+            right.parse::<std::net::IpAddr>()
+        ),
+        (Ok(left), Ok(right)) if left == right
+    )
 }
 
 /// One closed HTTP exchange to the gateway's description or control URL. `None` answers only a
@@ -1427,6 +1473,24 @@ mod tests {
             counts.allocs, 0,
             "a foreign packet allocated a pending-punch copy"
         );
+    }
+
+    #[test]
+    fn an_ssdp_search_request_is_not_a_response() {
+        assert!(ssdp_response(
+            b"HTTP/1.1 200 OK\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nUSN: uuid:1\r\nLOCATION: http://127.0.0.1/rootDesc.xml\r\n\r\n"
+        ));
+        assert!(!ssdp_response(
+            b"M-SEARCH * HTTP/1.1\r\nMAN: \"ssdp:discover\"\r\nST: ssdp:all\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn a_gateway_control_url_must_name_the_reply_host() {
+        assert!(same_host("192.0.2.1", "192.0.2.1"));
+        assert!(same_host("2001:db8::1", "2001:db8::1"));
+        assert!(!same_host("192.0.2.1", "192.0.2.2"));
+        assert!(!same_host("192.0.2.1", "example.test"));
     }
 
     /// The pending punch still reads its own hello and hands the source to the waiter.

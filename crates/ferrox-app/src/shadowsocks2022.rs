@@ -2375,7 +2375,6 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
             seen.insert(key);
             let session = key.0;
             let socket = &upstreams[&key];
-            let mut served = 0usize;
             for _ in 0..DRAIN_PER_TURN {
                 if drained >= TURN_DRAIN {
                     interrupted = true;
@@ -2385,7 +2384,6 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
                     break;
                 };
                 drained += 1;
-                served += 1;
                 used.insert(key, Instant::now());
                 let Some(client) = clients_of.get(&session) else {
                     continue;
@@ -2408,9 +2406,6 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
                 );
             }
             if interrupted {
-                if served == DRAIN_PER_TURN {
-                    index += 1;
-                }
                 break;
             }
             index += 1;

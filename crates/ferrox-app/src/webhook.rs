@@ -238,8 +238,12 @@ impl Webhook {
         let mut headers = self.headers.clone();
         let mut method = "POST";
         let mut body = body;
+        let mut redirected = false;
         for _ in 0..=10 {
             url.userinfo.clone_from(&credentials);
+            if redirected && !url.tls {
+                headers.retain(|(name, _)| !credential_header(name));
+            }
             if url.userinfo.is_some() && !url.tls {
                 return Err("refuses URL credentials over plaintext http".to_owned());
             }
@@ -287,6 +291,9 @@ impl Webhook {
                 if self.socket.is_some() && !same {
                     return Err("refuses a Unix-socket redirect to another origin".to_owned());
                 }
+                if !same && matches!(status, 307 | 308) && !body.is_empty() {
+                    return Err("refuses a cross-origin redirect that would resend the event body to an unapproved origin".to_owned());
+                }
                 if same {
                     credentials.clone_from(&url.userinfo);
                 } else {
@@ -294,6 +301,7 @@ impl Webhook {
                     headers.retain(|(name, _)| !credential_header(name));
                 }
                 url = next;
+                redirected = true;
                 if matches!(status, 301..=303) {
                     method = "GET";
                     body = "";
@@ -534,6 +542,7 @@ fn credential_header(name: &str) -> bool {
         "authorization",
         "proxy-authorization",
         "cookie",
+        "cookie2",
         "x-api-key",
         "api-key",
         "x-auth-token",
@@ -577,6 +586,12 @@ fn redirect_url(base: &HttpUrl, location: &str) -> Result<String, String> {
         let path = base.path.split('?').next().unwrap_or("/");
         return Ok(format!("{scheme}://{}{path}?{query}", base.authority));
     }
+    if location.starts_with('#') {
+        return Ok(format!(
+            "{scheme}://{}{}{}",
+            base.authority, base.path, location
+        ));
+    }
     let directory = base
         .path
         .split('?')
@@ -584,7 +599,6 @@ fn redirect_url(base: &HttpUrl, location: &str) -> Result<String, String> {
         .unwrap_or("/")
         .rsplit_once('/')
         .map_or("", |(directory, _)| directory);
-    let directory = directory.trim_end_matches('/');
     let path = if directory.is_empty() {
         format!("/{location}")
     } else {

@@ -1452,6 +1452,7 @@ struct Inbound {
     settings_sent: bool,
     settings_done: bool,
     auth_buf: Vec<u8>,
+    auth_fin: bool,
     wakes: Arc<Driver>,
     udp: HashMap<u32, UdpFlow>,
     /// The listener's `brutalDown`, answered as this client's `hysteria-cc-rx` hint.
@@ -1513,8 +1514,9 @@ fn serve_stream(
     let mut head = Vec::with_capacity(8);
     let mut room = Unfilled::<64>::new();
     let mut peer_fin = false;
+    let deadline = Instant::now() + ORIGIN_TIMEOUT;
     let prefix = loop {
-        if head.len() >= 8 {
+        if Instant::now() >= deadline || head.len() >= 8 {
             return;
         }
         let before = wake.seen();
@@ -1670,9 +1672,16 @@ fn read_h3_request(
 fn request_complete(request: &hysteria::H3Request, fin: bool) -> bool {
     let mut declared = None;
     for (name, value) in &request.headers {
-        if name.eq_ignore_ascii_case("content-length") {
-            declared = value.trim().parse::<usize>().ok();
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
         }
+        let Ok(length) = value.trim().parse::<usize>() else {
+            return false;
+        };
+        if declared.is_some_and(|declared| declared != length) {
+            return false;
+        }
+        declared = Some(length);
     }
     declared.map_or(fin, |length| request.body.len() == length)
 }
@@ -2014,11 +2023,16 @@ fn origin_request(
     let mut head = Vec::with_capacity(256 + request.body.len());
     let _ = write!(&mut head, "{method} {target} HTTP/1.1\r\n");
     let _ = write!(&mut head, "Host: {host}\r\n");
+    let mut has_content_length = false;
     for (name, value) in &request.headers {
         if is_hop_by_hop(name) {
             continue;
         }
+        has_content_length |= name.eq_ignore_ascii_case("content-length");
         let _ = write!(&mut head, "{name}: {value}\r\n");
+    }
+    if !has_content_length && !request.body.is_empty() {
+        let _ = write!(&mut head, "Content-Length: {}\r\n", request.body.len());
     }
     if x_forwarded {
         if let Some(for_ip) = peer {
@@ -2457,8 +2471,15 @@ fn auth_exchange(
     let mut room = Unfilled::<4096>::new();
     loop {
         match conn.stream_recv(AUTH_STREAM, room.as_mut()) {
-            Ok((0, _)) | Err(_) => break,
-            Ok((n, _)) => inbound.auth_buf.extend_from_slice(&room.as_mut()[..n]),
+            Ok((0, fin)) => {
+                inbound.auth_fin |= fin;
+                break;
+            }
+            Ok((n, fin)) => {
+                inbound.auth_fin |= fin;
+                inbound.auth_buf.extend_from_slice(&room.as_mut()[..n]);
+            }
+            Err(_) => break,
         }
     }
     if inbound.auth_buf.len() >= HEAD_CAP {
@@ -2470,7 +2491,10 @@ fn auth_exchange(
         .and_then(|frame| inbound.auth_buf.get(at..at + frame.length as usize))?;
     // A request that is not the hysteria handshake shape is a browser: it is answered as the cover site on this very stream — the plain not-found when no richer cover is configured — and the connection is kept for its later requests. A right-shape, wrong-password handshake still falls through below and refuses exactly as a plain hysteria server would.
     if !hysteria::is_hysteria_auth_shape(body) {
-        let request = hysteria::parse_h3_request(body).unwrap_or_default();
+        let request = assemble_request(&inbound.auth_buf)?;
+        if !request_complete(&request, inbound.auth_fin) {
+            return None;
+        }
         inbound.auth_buf.clear();
         let peer = peer.to_string();
         if let Some(shared) = background {
@@ -2558,6 +2582,7 @@ impl Router<'_> {
             settings_sent: false,
             settings_done: false,
             auth_buf: Vec::new(),
+            auth_fin: false,
             wakes: Driver::new(),
             udp: HashMap::new(),
             cc_rx: self.cc_rx,
@@ -3497,6 +3522,7 @@ mod tests {
             settings_sent: true,
             settings_done: true,
             auth_buf: Vec::new(),
+            auth_fin: false,
             wakes: Driver::new(),
             udp: HashMap::new(),
             cc_rx: 0,
@@ -3635,6 +3661,7 @@ mod tests {
                     settings_sent: true,
                     settings_done: true,
                     auth_buf: Vec::new(),
+                    auth_fin: false,
                     wakes: Driver::new(),
                     udp,
                     cc_rx: 0,
@@ -3817,6 +3844,7 @@ mod tests {
                     settings_sent: false,
                     settings_done: false,
                     auth_buf: Vec::new(),
+                    auth_fin: false,
                     wakes: Driver::new(),
                     udp: HashMap::new(),
                     cc_rx: 0,
