@@ -268,14 +268,14 @@ impl Window {
         self.take_up_to_while(size, None)
     }
 
-    fn take_up_to_while(&self, size: usize, alive: Option<&AtomicBool>) -> Option<usize> {
+    fn take_up_to_while(&self, size: usize, closed: Option<&AtomicBool>) -> Option<usize> {
         let limit = i64::try_from(size).unwrap_or(i64::MAX);
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
         loop {
-            if state.closed || alive.is_some_and(|alive| !alive.load(Ordering::Relaxed)) {
+            if state.closed || closed.is_some_and(|closed| closed.load(Ordering::Relaxed)) {
                 return None;
             }
             if state.value > 0 {
@@ -287,16 +287,6 @@ impl Window {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
-        }
-    }
-
-    fn snapshot(&self) -> (i64, bool) {
-        match self.state.lock() {
-            Ok(state) => (state.value, state.closed),
-            Err(poisoned) => {
-                let state = poisoned.into_inner();
-                (state.value, state.closed)
-            }
         }
     }
 
@@ -559,15 +549,6 @@ impl Inner {
 
     fn open(&self, _target: &Destination, expect_status: bool) -> Option<Stream> {
         if self.role != Role::Client || self.dead() {
-            crate::proxy::echo_trace(&format!(
-                "singmux open refused role {} dead {}",
-                if self.role == Role::Client {
-                    "client"
-                } else {
-                    "server"
-                },
-                self.dead()
-            ));
             return None;
         }
         let id = match self.protocol {
@@ -587,10 +568,6 @@ impl Inner {
             Protocol::H2Mux => self.write_headers(id, true),
         };
         if !opened {
-            crate::proxy::echo_trace(&format!(
-                "singmux open write failed id {id} protocol {:?}",
-                self.protocol
-            ));
             self.release(id);
             return None;
         }
@@ -788,7 +765,6 @@ impl Inner {
                 .as_ref()
                 .is_some_and(|sender| sender.try_send(id).is_err());
             if failed {
-                crate::proxy::echo_trace(&format!("singmux reset queue failed id {id}"));
                 drop(resets);
                 self.finish();
             }
@@ -823,12 +799,6 @@ impl Inner {
             Ok(mut sinks) => sinks.remove(&id),
             Err(poisoned) => poisoned.into_inner().remove(&id),
         };
-        if sink.is_some() {
-            crate::proxy::echo_trace(&format!(
-                "singmux release id {id} protocol {:?}",
-                self.protocol
-            ));
-        }
         if let Some(sink) = sink {
             sink.closed.store(true, Ordering::Relaxed);
             sink.window.close();
@@ -842,12 +812,6 @@ impl Inner {
             Ok(mut sinks) => sinks.remove(&id),
             Err(poisoned) => poisoned.into_inner().remove(&id),
         };
-        if sink.is_some() {
-            crate::proxy::echo_trace(&format!(
-                "singmux reap id {id} protocol {:?}",
-                self.protocol
-            ));
-        }
         if let Some(sink) = sink {
             sink.closed.store(true, Ordering::Relaxed);
             sink.window.close();
@@ -942,10 +906,6 @@ impl Inner {
                 }
             }
             Push::Full | Push::Closed => {
-                crate::proxy::echo_trace(&format!(
-                    "singmux deliver overflow id {id} protocol {:?}",
-                    self.protocol
-                ));
                 self.release(id);
                 self.defer_reset(id);
             }
@@ -957,23 +917,10 @@ impl Inner {
             Protocol::Smux => Some(size),
             Protocol::Yamux => window.take_up_to(size),
             Protocol::H2Mux => {
-                let (connection_value, connection_closed) = self.connection_window.snapshot();
-                let (stream_value, stream_closed) = window.snapshot();
-                crate::proxy::echo_trace(&format!(
-                    "singmux h2 windows size {size} connection {connection_value}/{connection_closed} stream {stream_value}/{stream_closed} alive {}",
-                    !closed.load(Ordering::Relaxed)
-                ));
-                let Some(connection) = self.connection_window.take_up_to_while(size, Some(closed))
-                else {
-                    crate::proxy::echo_trace(&format!(
-                        "singmux no connection window size {size} protocol H2Mux"
-                    ));
-                    return None;
-                };
+                let connection = self
+                    .connection_window
+                    .take_up_to_while(size, Some(closed))?;
                 let Some(stream) = window.take_up_to(connection) else {
-                    crate::proxy::echo_trace(&format!(
-                        "singmux no stream window size {size} connection {connection} protocol H2Mux"
-                    ));
                     self.connection_window
                         .add(i64::try_from(connection).unwrap_or(i64::MAX));
                     return None;
@@ -1026,15 +973,6 @@ impl Inner {
         if self.dead.swap(true, Ordering::Relaxed) {
             return;
         }
-        crate::proxy::echo_trace(&format!(
-            "singmux finish role {} protocol {:?}",
-            if self.role == Role::Client {
-                "client"
-            } else {
-                "server"
-            },
-            self.protocol
-        ));
         match self.resets.lock() {
             Ok(mut resets) => drop(resets.take()),
             Err(poisoned) => drop(poisoned.into_inner().take()),
@@ -1385,32 +1323,15 @@ pub(crate) struct Stream {
 impl Stream {
     pub(crate) fn send(&self, data: &[u8]) -> bool {
         if self.closed.load(Ordering::Relaxed) {
-            crate::proxy::echo_trace(&format!(
-                "singmux send closed id {} protocol {:?}",
-                self.id, self.inner.protocol
-            ));
             return false;
         }
         if !self.request_sent.swap(true, Ordering::Relaxed)
             && !self.request.is_empty()
             && !self.write_windowed(&self.request)
         {
-            crate::proxy::echo_trace(&format!(
-                "singmux request failed id {} protocol {:?}",
-                self.id, self.inner.protocol
-            ));
             return false;
         }
-        let sent = self.write_windowed(data);
-        if !sent {
-            crate::proxy::echo_trace(&format!(
-                "singmux send failed id {} len {} protocol {:?}",
-                self.id,
-                data.len(),
-                self.inner.protocol
-            ));
-        }
-        sent
+        self.write_windowed(data)
     }
 
     fn write_windowed(&self, data: &[u8]) -> bool {
@@ -1422,27 +1343,13 @@ impl Stream {
                 Protocol::Yamux | Protocol::H2Mux => left.min(H2_DATA_MAX),
             };
             let Some(taken) = self.inner.take_window(&self.window, chunk, &self.closed) else {
-                crate::proxy::echo_trace(&format!(
-                    "singmux take window none id {} protocol {:?} closed {}",
-                    self.id,
-                    self.inner.protocol,
-                    self.closed.load(Ordering::Relaxed)
-                ));
                 return false;
             };
             if self.closed.load(Ordering::Relaxed) {
-                crate::proxy::echo_trace(&format!(
-                    "singmux closed after credit id {} protocol {:?}",
-                    self.id, self.inner.protocol
-                ));
                 self.inner.refund_window(&self.window, taken);
                 return false;
             }
             if !self.write_chunk(&data[offset..offset + taken]) {
-                crate::proxy::echo_trace(&format!(
-                    "singmux chunk failed id {} len {} protocol {:?}",
-                    self.id, taken, self.inner.protocol
-                ));
                 self.inner.refund_window(&self.window, taken);
                 return false;
             }
@@ -1473,10 +1380,6 @@ impl Stream {
     }
 
     pub(crate) fn finish(&self) {
-        crate::proxy::echo_trace(&format!(
-            "singmux stream finish id {} protocol {:?}",
-            self.id, self.inner.protocol
-        ));
         if !self.closed.swap(true, Ordering::Relaxed) {
             self.inner.send_end(self.id);
         }
