@@ -7318,7 +7318,6 @@ fn fetch_tactics_from(
     let timeout = timing.timeout.unwrap_or(settings.ready);
     let deadline = (!timing.wait.is_zero()).then(|| Instant::now() + timing.wait);
     let mut index = 0usize;
-    let mut last;
     loop {
         match crate::psiphon_tactics::Tactics::fetch(
             entries[index],
@@ -7329,24 +7328,25 @@ fn fetch_tactics_from(
             settings.compress_tactics,
         ) {
             Ok(tactics) => return Ok(tactics),
-            Err(why) => last = why,
+            Err(why) => {
+                index += 1;
+                if index < entries.len() {
+                    continue;
+                }
+                index = 0;
+                let Some(deadline) = deadline else {
+                    return Err(why);
+                };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(why);
+                }
+                let base = timing.retry.min(remaining);
+                let span = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
+                let delay = base.mul_f64(1.0 + timing.jitter * span).min(remaining);
+                thread::sleep(delay);
+            }
         }
-        index += 1;
-        if index < entries.len() {
-            continue;
-        }
-        index = 0;
-        let Some(deadline) = deadline else {
-            return Err(last);
-        };
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(last);
-        }
-        let base = timing.retry.min(remaining);
-        let span = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
-        let delay = base.mul_f64(1.0 + timing.jitter * span).min(remaining);
-        thread::sleep(delay);
     }
 }
 
