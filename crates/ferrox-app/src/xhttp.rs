@@ -720,7 +720,18 @@ impl Packer {
                 let session = if self.settings.session_id_table.is_empty() {
                     36
                 } else {
-                    self.settings.session_id_length.1.max(36)
+                    let widest = self
+                        .settings
+                        .session_id_table
+                        .bytes()
+                        .map(|byte| char::from(byte).len_utf8())
+                        .max()
+                        .unwrap_or(1);
+                    self.settings
+                        .session_id_length
+                        .1
+                        .saturating_mul(widest)
+                        .max(36)
                 };
                 let target = path
                     .len()
