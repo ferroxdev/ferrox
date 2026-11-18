@@ -1191,6 +1191,7 @@ const SCENARIO_PROTOCOLS: &[&str] = &[
     "masque",
     "warp",
     "anytls",
+    "tuic",
 ];
 
 fn protocol_of(scenario: &str) -> Option<&str> {
