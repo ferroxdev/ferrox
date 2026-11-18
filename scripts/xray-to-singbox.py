@@ -321,6 +321,19 @@ def convert(document):
             user = _first(users, "`servers[0].users`")
             outbound["username"] = user.get("user", "")
             outbound["password"] = user.get("pass", "")
+    elif protocol == "anytls":
+        server = _first(settings.get("servers"), "`servers`")
+        outbound["server"] = server["address"]
+        outbound["server_port"] = server["port"]
+        outbound["password"] = server["password"]
+    elif protocol == "tuic":
+        server = _first(settings.get("servers"), "`servers`")
+        outbound["server"] = server["address"]
+        outbound["server_port"] = server["port"]
+        outbound["uuid"] = server["uuid"]
+        outbound["password"] = server["password"]
+        if "congestion_control" in server:
+            outbound["congestion_control"] = server["congestion_control"]
     elif protocol == "hysteria":
         if settings.get("version") != 1:
             raise ValueError("sing-box at this pin carries only Hysteria v1 here")
@@ -412,6 +425,31 @@ def _server_inbound(inbound):
             "listen": inbound.get("listen", "127.0.0.1"),
             "listen_port": inbound["port"],
         }
+    if protocol == "tuic":
+        settings = inbound.get("settings") or {}
+        users = settings.get("users") or settings.get("clients")
+        if not isinstance(users, list) or not users:
+            if not settings.get("uuid") or not settings.get("password"):
+                raise ValueError("the TUIC server needs at least one user")
+            users = [settings]
+        converted = {
+            "type": "tuic",
+            "tag": inbound.get("tag", "tuic-in"),
+            "listen": inbound.get("listen", "127.0.0.1"),
+            "listen_port": inbound["port"],
+            "users": [
+                {
+                    "name": user.get("name", f"user-{index}"),
+                    "uuid": user["uuid"],
+                    "password": user["password"],
+                }
+                for index, user in enumerate(users)
+            ],
+        }
+        tls = _server_tls(inbound.get("streamSettings") or {})
+        if tls is not None:
+            converted["tls"] = tls
+        return converted
     if protocol == "anytls":
         settings = inbound.get("settings") or {}
         users = settings.get("users") or settings.get("clients")

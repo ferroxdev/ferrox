@@ -132,6 +132,28 @@ selftest_gaps() {
   matrix_engine_skip_reason zeronet warp-masque-down-8 client \
     | grep -q "ADDRESS_ASSIGN" \
     || { echo "selftest: the ZeroNet WARP client skip lost its reason" >&2; failed=1; }
+  matrix_server_serves sing-box tuic-raw-down-8 \
+    || { echo "selftest: sing-box stopped serving TUIC" >&2; failed=1; }
+  matrix_server_serves sing-box anytls-tls-raw-down-8 \
+    || { echo "selftest: sing-box stopped serving AnyTLS" >&2; failed=1; }
+  matrix_engine_skip_reason xray-core-rust tuic-raw-down-8 client >/dev/null \
+    && { echo "selftest: the xray-core-rust TUIC client is skipped" >&2; failed=1; }
+  matrix_engine_skip_reason zeronet tuic-raw-down-8 client >/dev/null \
+    && { echo "selftest: the ZeroNet TUIC client is skipped" >&2; failed=1; }
+  matrix_engine_skip_reason sing-box tuic-raw-down-8 client >/dev/null \
+    && { echo "selftest: the sing-box TUIC client is skipped" >&2; failed=1; }
+  matrix_engine_skip_reason xray-core-rust anytls-tls-raw-down-8 client >/dev/null \
+    && { echo "selftest: the xray-core-rust AnyTLS client is skipped" >&2; failed=1; }
+  matrix_engine_skip_reason zeronet anytls-tls-raw-down-8 client >/dev/null \
+    && { echo "selftest: the ZeroNet AnyTLS client is skipped" >&2; failed=1; }
+  matrix_engine_skip_reason sing-box anytls-tls-raw-down-8 client >/dev/null \
+    && { echo "selftest: the sing-box AnyTLS client is skipped" >&2; failed=1; }
+  matrix_engine_skip_reason xray-core tuic-raw-down-8 client \
+    | grep -q "no TUIC client" \
+    || { echo "selftest: the xray-core TUIC client skip lost its reason" >&2; failed=1; }
+  matrix_engine_skip_reason zeronet tuic-raw-down-8 server \
+    | grep -q "TUIC server comparators" \
+    || { echo "selftest: the ZeroNet TUIC server skip lost its reason" >&2; failed=1; }
   ((failed == 0)) || return 1
   echo "run-benchmark-matrix selftest: ${#gap_bases[@]} filed gap(s), selection exact"
 }
@@ -416,6 +438,32 @@ json.dump(doc, open(sys.argv[2], "w"), indent=2)
 PY
 }
 
+# xray-core-rust reads AnyTLS and TUIC through its own settings shape: AnyTLS is flat,
+# TUIC carries an insecure switch per server, and neither reads the matrix's
+# certificate files. The handshake still names the certificate's host.
+matrix_xray_core_rust_config() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+for outbound in doc.get("outbounds", []):
+    protocol = outbound.get("protocol")
+    settings = outbound.get("settings") or {}
+    server = (settings.get("servers") or [settings])[0]
+    if protocol == "anytls":
+        outbound["settings"] = {
+            "server": server.get("address") or server.get("server"),
+            "server_port": server.get("port") or server.get("server_port"),
+            "sni": "carrier.test",
+            "insecure": True,
+            "password": server.get("password", ""),
+        }
+    elif protocol == "tuic":
+        server.setdefault("server_name", "carrier.test")
+        server["insecure"] = True
+json.dump(doc, open(sys.argv[2], "w"), indent=2)
+PY
+}
+
 # An MSYS pid is not a Windows pid: the sampler opens the process natively, so translate once.
 matrix_native_pid() {
   local native
@@ -623,6 +671,16 @@ while read -r id traffic connections iterations payload duration_ms; do
             continue 2
           }
           client_args+=(--outbound-config-for "leaf=$(cat "$celldir/client-leaf.json")")
+          ;;
+        xray-core-rust)
+          matrix_xray_core_rust_config \
+            "$celldir/client.json" "$celldir/client-xray-core-rust.json" || {
+            cells_failed+=("$cell (could not shape the AnyTLS/TUIC client for xray-core-rust)")
+            status=1
+            continue 2
+          }
+          client_args+=(--outbound-config-for \
+            "xray-core-rust=$(cat "$celldir/client-xray-core-rust.json")")
           ;;
         xray-rust)
           matrix_rust_client_config \
