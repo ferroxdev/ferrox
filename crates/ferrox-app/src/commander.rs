@@ -5,7 +5,7 @@
 //! five-byte message prefix itself. Nothing is dialed to answer a call in `listen` mode, and in
 //! outbound mode the routed link is the transport.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -432,6 +432,8 @@ impl Api {
         }
         let mut decoder = h2::Decoder::default();
         let mut calls: HashMap<u32, Call> = HashMap::new();
+        let mut scratch: HashMap<u32, Vec<u8>> = HashMap::new();
+        let mut responses: HashMap<u32, Response> = HashMap::new();
         let mut flow = Flow::new();
         let mut last_id = 0u32;
         loop {
@@ -491,12 +493,22 @@ impl Api {
                     }
                 }
                 h2::T_HEADERS => {
+                    let block = header_body(&body, flags);
                     if flow.cancelled(id) {
+                        if !absorb_headers(
+                            &mut decoder,
+                            &mut scratch,
+                            id,
+                            block,
+                            flags & h2::F_END_HEADERS != 0,
+                        ) {
+                            goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                            return;
+                        }
                         continue;
                     }
-                    flow.open(id);
                     let block = header_body(&body, flags);
-                    if calls.len() >= API_CALLS && !calls.contains_key(&id) {
+                    if calls.len() + responses.len() >= API_CALLS && !calls.contains_key(&id) {
                         goaway(&mut stream, h2::E_REFUSED, last_id);
                         return;
                     }
@@ -515,19 +527,29 @@ impl Api {
                     }
                     if flags & h2::F_END != 0 {
                         last_id = last_id.max(id);
-                        if self.answer(
+                        if !self.answer(
                             id,
                             &calls.remove(&id).unwrap_or_default(),
                             &mut stream,
                             &mut flow,
-                        ) == Write::Failed
-                        {
+                            &mut responses,
+                        ) {
                             return;
                         }
                     }
                 }
                 h2::T_CONT => {
                     if flow.cancelled(id) {
+                        if !absorb_headers(
+                            &mut decoder,
+                            &mut scratch,
+                            id,
+                            &body,
+                            flags & h2::F_END_HEADERS != 0,
+                        ) {
+                            goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                            return;
+                        }
                         continue;
                     }
                     if let Some(call) = calls.get_mut(&id) {
@@ -575,58 +597,61 @@ impl Api {
                     }
                     if flags & h2::F_END != 0 {
                         last_id = last_id.max(id);
-                        if self.answer(
+                        if !self.answer(
                             id,
                             &calls.remove(&id).unwrap_or_default(),
                             &mut stream,
                             &mut flow,
-                        ) == Write::Failed
-                        {
+                            &mut responses,
+                        ) {
                             return;
                         }
                     }
                 }
                 h2::T_RST => {
                     calls.remove(&id);
+                    responses.remove(&id);
                     flow.close(id);
                 }
                 h2::T_GOAWAY => return,
                 _ => {}
             }
+            if !flush_responses(&mut stream, &mut flow, &mut responses) {
+                return;
+            }
         }
     }
 
-    fn answer(&self, id: u32, call: &Call, stream: &mut Connection, flow: &mut Flow) -> Write {
+    fn answer(
+        &self,
+        id: u32,
+        call: &Call,
+        stream: &mut Connection,
+        flow: &mut Flow,
+        responses: &mut HashMap<u32, Response>,
+    ) -> bool {
         let request = grpc_message(&call.body).unwrap_or_default();
         match self.dispatch(&call.path, request) {
             Ok(answer) => {
                 let head = [(":status", "200"), ("content-type", "application/grpc")];
                 let block = h2::block_encode(&head);
                 if !h2::write_frame(stream, h2::T_HEADERS, h2::F_END_HEADERS, id, &block) {
-                    return Write::Failed;
+                    return false;
                 }
                 let mut framed = Vec::with_capacity(answer.len() + 5);
                 framed.push(0);
                 framed.extend_from_slice(&(answer.len() as u32).to_be_bytes());
                 framed.extend_from_slice(&answer);
-                match write_data(stream, id, &framed, flow) {
-                    Write::Done => {}
-                    other => return other,
-                }
                 let trailers = h2::block_encode(&[("grpc-status", "0")]);
-                let ok = h2::write_frame(
-                    stream,
-                    h2::T_HEADERS,
-                    h2::F_END_HEADERS | h2::F_END,
+                responses.insert(
                     id,
-                    &trailers,
+                    Response {
+                        framed,
+                        at: 0,
+                        trailers,
+                    },
                 );
-                if ok {
-                    flow.close(id);
-                    Write::Done
-                } else {
-                    Write::Failed
-                }
+                flush_response(stream, id, flow, responses)
             }
             Err((status, message)) => {
                 let code = status.to_string();
@@ -634,25 +659,23 @@ impl Api {
                 let head = [(":status", "200"), ("content-type", "application/grpc")];
                 let block = h2::block_encode(&head);
                 if !h2::write_frame(stream, h2::T_HEADERS, h2::F_END_HEADERS, id, &block) {
-                    return Write::Failed;
+                    return false;
                 }
                 let trailers = h2::block_encode(&[
                     ("grpc-status", code.as_str()),
                     ("grpc-message", message.as_str()),
                 ]);
-                let ok = h2::write_frame(
+                if !h2::write_frame(
                     stream,
                     h2::T_HEADERS,
                     h2::F_END_HEADERS | h2::F_END,
                     id,
                     &trailers,
-                );
-                if ok {
-                    flow.close(id);
-                    Write::Done
-                } else {
-                    Write::Failed
+                ) {
+                    return false;
                 }
+                flow.close(id);
+                true
             }
         }
     }
@@ -1274,11 +1297,12 @@ fn settings() -> [u8; 12] {
 
 const MAX_WINDOW: i64 = 0x7fff_ffff;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Write {
-    Done,
-    Cancelled,
-    Failed,
+/// The part of a response still unsent because its stream or connection window had no room: the
+/// frame loop keeps serving other streams and resumes this one on the next WINDOW_UPDATE.
+struct Response {
+    framed: Vec<u8>,
+    at: usize,
+    trailers: Vec<u8>,
 }
 
 /// The peer's send windows, from its `SETTINGS` and `WINDOW_UPDATE` frames: a response waits for room rather than overrunning the default 65,535.
@@ -1286,7 +1310,7 @@ struct Flow {
     connection: i64,
     initial: i64,
     streams: HashMap<u32, i64>,
-    closed: HashSet<u32>,
+    opened: u32,
     pending: VecDeque<(u8, u8, u32, Vec<u8>, bool)>,
     pending_bytes: usize,
 }
@@ -1297,27 +1321,25 @@ impl Flow {
             connection: 65_535,
             initial: 65_535,
             streams: HashMap::new(),
-            closed: HashSet::new(),
+            opened: 0,
             pending: VecDeque::new(),
             pending_bytes: 0,
         }
     }
 
     fn open(&mut self, id: u32) {
-        if id != 0 && !self.closed.contains(&id) {
+        if id != 0 && id >= self.opened {
             self.streams.entry(id).or_insert(self.initial);
+            self.opened = self.opened.max(id);
         }
     }
 
     fn close(&mut self, id: u32) {
         self.streams.remove(&id);
-        if id != 0 {
-            self.closed.insert(id);
-        }
     }
 
     fn cancelled(&self, id: u32) -> bool {
-        self.closed.contains(&id)
+        id != 0 && id <= self.opened && !self.streams.contains_key(&id)
     }
 
     fn window(&mut self, id: u32, increment: i64) -> bool {
@@ -1388,118 +1410,66 @@ impl Flow {
     }
 }
 
-fn await_window(stream: &mut Connection, id: u32, flow: &mut Flow) -> Write {
-    loop {
-        if flow.available(id) > 0 {
-            return Write::Done;
-        }
-        let Some((len, kind, flags, id_in)) = h2::read_head_bounded(stream) else {
-            return Write::Failed;
-        };
-        let cap = if kind == h2::T_DATA {
-            CALL_MAX + CALL_ENVELOPE
-        } else {
-            h2::HEAD_CAP
-        };
-        if len > cap {
-            return Write::Failed;
-        }
-        let mut body = vec![0u8; len];
-        if stream.read_exact(&mut body).is_err() {
-            return Write::Failed;
-        }
-        match kind {
-            h2::T_WINDOW => {
-                let valid = len == 4
-                    && flow.window(
-                        id_in,
-                        i64::from(u32::from_be_bytes(body[..4].try_into().unwrap()) & 0x7fff_ffff),
-                    );
-                if !valid {
-                    if id_in == 0 {
-                        return Write::Failed;
-                    }
-                    reset(stream, id_in, h2::E_FLOW);
-                    flow.close(id_in);
-                    if id_in == id {
-                        return Write::Cancelled;
-                    }
-                }
-            }
-            h2::T_SETTINGS if flags & h2::F_ACK == 0 => {
-                if !flow.settings(&body) {
-                    return Write::Failed;
-                }
-                if !h2::write_frame(stream, h2::T_SETTINGS, h2::F_ACK, 0, &[]) {
-                    return Write::Failed;
-                }
-            }
-            h2::T_PING if flags & h2::F_ACK == 0 => {
-                if !h2::write_frame(stream, h2::T_PING, h2::F_ACK, 0, &body) {
-                    return Write::Failed;
-                }
-            }
-            h2::T_RST => {
-                flow.close(id_in);
-                if id_in == id {
-                    return Write::Cancelled;
-                }
-            }
-            h2::T_GOAWAY => return Write::Failed,
-            h2::T_HEADERS => {
-                flow.open(id_in);
-                if !flow.cancelled(id_in) && !flow.defer((kind, flags, id_in, body, false)) {
-                    return Write::Failed;
-                }
-            }
-            h2::T_DATA | h2::T_CONT => {
-                if flow.cancelled(id_in) {
-                    if kind == h2::T_DATA {
-                        let _ = window_update(stream, 0, body.len());
-                    }
-                } else {
-                    let credited = kind == h2::T_DATA;
-                    if credited
-                        && (!window_update(stream, 0, body.len())
-                            || !window_update(stream, id_in, body.len()))
-                    {
-                        return Write::Failed;
-                    }
-                    if !flow.defer((kind, flags, id_in, body, credited)) {
-                        return Write::Failed;
-                    }
-                }
-            }
-            _ => {}
+fn flush_responses(
+    stream: &mut Connection,
+    flow: &mut Flow,
+    responses: &mut HashMap<u32, Response>,
+) -> bool {
+    for id in responses.keys().copied().collect::<Vec<_>>() {
+        if !flush_response(stream, id, flow, responses) {
+            return false;
         }
     }
+    true
 }
 
-fn write_data(stream: &mut Connection, id: u32, data: &[u8], flow: &mut Flow) -> Write {
-    let mut at = 0usize;
-    while at < data.len() {
-        match await_window(stream, id, flow) {
-            Write::Done => {}
-            other => return other,
+fn flush_response(
+    stream: &mut Connection,
+    id: u32,
+    flow: &mut Flow,
+    responses: &mut HashMap<u32, Response>,
+) -> bool {
+    let Some(response) = responses.get_mut(&id) else {
+        return true;
+    };
+    while response.at < response.framed.len() {
+        let room = flow.available(id);
+        if room <= 0 {
+            return true;
         }
-        let remaining = i64::try_from(data.len() - at).unwrap_or(i64::MAX);
-        let room = flow.available(id).min(remaining);
-        let take =
-            usize::try_from(room.min(i64::try_from(H2_MAX_FRAME).unwrap_or(i64::MAX))).unwrap_or(0);
+        let remaining = i64::try_from(response.framed.len() - response.at).unwrap_or(i64::MAX);
+        let take = usize::try_from(room.min(remaining).min(i64::from(H2_MAX_FRAME))).unwrap_or(0);
         if take == 0 {
-            continue;
+            return true;
         }
-        if !h2::write_frame(stream, h2::T_DATA, 0, id, &data[at..at + take]) {
-            return Write::Failed;
+        if !h2::write_frame(
+            stream,
+            h2::T_DATA,
+            0,
+            id,
+            &response.framed[response.at..response.at + take],
+        ) {
+            return false;
         }
-        at += take;
+        response.at += take;
         let taken = i64::try_from(take).unwrap_or(i64::MAX);
         flow.connection -= taken;
         if let Some(window) = flow.streams.get_mut(&id) {
             *window -= taken;
         }
     }
-    Write::Done
+    if !h2::write_frame(
+        stream,
+        h2::T_HEADERS,
+        h2::F_END_HEADERS | h2::F_END,
+        id,
+        &response.trailers,
+    ) {
+        return false;
+    }
+    flow.close(id);
+    responses.remove(&id);
+    true
 }
 
 fn reset(stream: &mut Connection, id: u32, code: u32) {
@@ -1523,6 +1493,32 @@ fn window_update(stream: &mut Connection, id: u32, increment: usize) -> bool {
             id,
             &(increment as u32).to_be_bytes(),
         )
+}
+
+/// Feeds a header block the call map will not answer into the connection's HPACK decoder, so an
+/// indexed field on a later stream still resolves: a closed stream still carries compression state.
+fn absorb_headers(
+    decoder: &mut h2::Decoder,
+    scratch: &mut HashMap<u32, Vec<u8>>,
+    id: u32,
+    block: &[u8],
+    end: bool,
+) -> bool {
+    if !end {
+        let held = scratch.get(&id).map_or(0, Vec::len);
+        if held + block.len() > h2::HEAD_CAP {
+            return false;
+        }
+        scratch.entry(id).or_default().extend_from_slice(block);
+        return true;
+    }
+    let mut held = scratch.remove(&id).unwrap_or_default();
+    if held.len() + block.len() > h2::HEAD_CAP {
+        return false;
+    }
+    held.extend_from_slice(block);
+    let _ = decoder.decode(&held, &mut |_, _| {});
+    true
 }
 
 fn data_body(body: &[u8], flags: u8) -> Option<&[u8]> {

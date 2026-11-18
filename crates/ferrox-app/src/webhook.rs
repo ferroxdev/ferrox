@@ -291,7 +291,7 @@ impl Webhook {
                     credentials.clone_from(&url.userinfo);
                 } else {
                     credentials = None;
-                    headers.clear();
+                    headers.retain(|(name, _)| !credential_header(name));
                 }
                 url = next;
                 if matches!(status, 301..=303) {
@@ -525,6 +525,24 @@ fn pop_segment(out: &mut String) {
     if let Some(at) = out.rfind('/') {
         out.truncate(at);
     }
+}
+
+/// A configured header that carries a credential is dropped when the redirect leaves the origin;
+/// the rest, including a media type, still describe the body the client resends.
+fn credential_header(name: &str) -> bool {
+    [
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+        "x-access-token",
+        "x-goog-api-key",
+        "x-amz-security-token",
+    ]
+    .iter()
+    .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
 fn same_origin(left: &HttpUrl, right: &HttpUrl) -> bool {

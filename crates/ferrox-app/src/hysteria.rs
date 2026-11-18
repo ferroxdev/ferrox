@@ -1623,14 +1623,18 @@ fn read_h3_request(
     mut fin: bool,
 ) -> Option<hysteria::H3Request> {
     let mut room = Unfilled::<4096>::new();
+    let deadline = Instant::now() + ORIGIN_TIMEOUT;
     loop {
+        if Instant::now() >= deadline {
+            return assemble_request(&buf).filter(|request| request_complete(request, fin));
+        }
         if let Some(request) = assemble_request(&buf) {
             if request_complete(&request, fin) {
                 return Some(request);
             }
         }
         if buf.len() >= HEAD_CAP {
-            return assemble_request(&buf);
+            return assemble_request(&buf).filter(|request| request_complete(request, fin));
         }
         let read_fin = {
             let Ok(mut conn) = shared.lock() else {
@@ -1664,7 +1668,7 @@ fn request_complete(request: &hysteria::H3Request, fin: bool) -> bool {
             declared = value.trim().parse::<usize>().ok();
         }
     }
-    declared.map_or(fin, |length| request.body.len() >= length)
+    declared.map_or(fin, |length| request.body.len() == length)
 }
 
 /// Walks a request stream's HTTP/3 frames once: the first `HEADERS` block becomes the request line and fields, and every `DATA` payload that follows becomes the body. `None` while any frame is still incomplete, so the reader keeps waiting rather than answering a half request.

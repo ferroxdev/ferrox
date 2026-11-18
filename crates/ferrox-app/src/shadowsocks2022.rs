@@ -16,6 +16,9 @@ use crate::shadowsocks::waited;
 const READ_CHUNK: usize = 0x4000;
 const SKEW: u64 = 30;
 const UPSTREAM_IDLE: Duration = Duration::from_secs(60);
+
+/// One turn drains at most this many replies from an upstream, so a busy socket cannot starve the client path or the other address family.
+const DRAIN_PER_TURN: usize = 32;
 const LENGTH_LEN: usize = 2;
 /// Room around one chunk's payload inside the caller's buffer: a sealed length before it and its tag after it, so both seals land beside the payload instead of the payload moving to them.
 const SEAL_HEAD: usize = LENGTH_LEN + TAG_LEN;
@@ -2247,7 +2250,10 @@ pub(crate) fn serve_udp_relay(
             Err(_) => break,
         }
         for socket in [&upstream].into_iter().chain(upstream6.as_ref()) {
-            while let Ok((n, from)) = socket.recv_from(&mut buf) {
+            for _ in 0..DRAIN_PER_TURN {
+                let Ok((n, from)) = socket.recv_from(&mut buf) else {
+                    break;
+                };
                 let Some(idx) = by_addr.get(&from).copied() else {
                     continue;
                 };
@@ -2301,36 +2307,23 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
                     {
                         clients_of.insert(session, src);
                         users.insert(session, idx);
-                        send_upstream(
-                            &mut upstreams,
-                            &mut used,
-                            &mut clients_of,
-                            &mut users,
-                            session,
-                            dest,
-                            payload,
-                        );
+                        send_upstream(&mut upstreams, &mut used, session, dest, payload);
                     }
                 } else if let Some((dest, payload, session)) =
                     datagrams.open(&psk, method, &mut buf[..n])
                 {
                     clients_of.insert(session, src);
-                    send_upstream(
-                        &mut upstreams,
-                        &mut used,
-                        &mut clients_of,
-                        &mut users,
-                        session,
-                        dest,
-                        payload,
-                    );
+                    send_upstream(&mut upstreams, &mut used, session, dest, payload);
                 }
             }
             Err(error) if crate::proxy::is_timeout(&error) => {}
             Err(_) => break,
         }
         for ((session, _), socket) in &upstreams {
-            while let Ok((n, from)) = socket.recv_from(&mut reply) {
+            for _ in 0..DRAIN_PER_TURN {
+                let Ok((n, from)) = socket.recv_from(&mut reply) else {
+                    break;
+                };
                 let Some(client) = clients_of.get(session) else {
                     continue;
                 };
@@ -2364,12 +2357,9 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn send_upstream(
     upstreams: &mut HashMap<(u64, bool), UdpSocket>,
     used: &mut HashMap<(u64, bool), Instant>,
-    clients_of: &mut HashMap<u64, SocketAddr>,
-    users: &mut HashMap<u64, usize>,
     session: u64,
     dest: SocketAddr,
     payload: &[u8],
@@ -2380,24 +2370,16 @@ fn send_upstream(
         used.insert(key, Instant::now());
         return;
     }
-    if upstreams.len() >= 4096 {
-        upstreams.clear();
-        used.clear();
-        clients_of.retain(|id, _| *id == session);
-        users.retain(|id, _| *id == session);
+    if upstreams.len() >= 4096 && !evict_upstream(upstreams, used) {
+        return;
     }
     let bind = if key.1 { "[::]:0" } else { "0.0.0.0:0" };
     let socket = if let Ok(socket) = UdpSocket::bind(bind) {
         socket
     } else {
-        let oldest = used.iter().min_by_key(|(_, at)| **at).map(|(key, _)| *key);
-        let Some(oldest) = oldest else {
+        if !evict_upstream(upstreams, used) {
             return;
-        };
-        upstreams.remove(&oldest);
-        used.remove(&oldest);
-        clients_of.remove(&oldest.0);
-        users.remove(&oldest.0);
+        }
         let Ok(socket) = UdpSocket::bind(bind) else {
             return;
         };
@@ -2409,6 +2391,18 @@ fn send_upstream(
     let _ = socket.send_to(payload, dest);
     upstreams.insert(key, socket);
     used.insert(key, Instant::now());
+}
+
+fn evict_upstream(
+    upstreams: &mut HashMap<(u64, bool), UdpSocket>,
+    used: &mut HashMap<(u64, bool), Instant>,
+) -> bool {
+    let Some(oldest) = used.iter().min_by_key(|(_, at)| **at).map(|(key, _)| *key) else {
+        return false;
+    };
+    upstreams.remove(&oldest);
+    used.remove(&oldest);
+    true
 }
 
 struct UdpAnswer<'a> {
