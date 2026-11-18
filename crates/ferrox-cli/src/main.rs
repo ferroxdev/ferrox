@@ -1121,10 +1121,12 @@ mod tests {
 
     #[test]
     fn only_explicit_ports_are_checked_for_duplicates_before_prepare() {
-        let mut options = Options::default();
-        options.instance = Some("work".to_owned());
-        options.socks = 8080;
-        options.socks_set = true;
+        let mut options = Options {
+            instance: Some("work".to_owned()),
+            socks: 8080,
+            socks_set: true,
+            ..Options::default()
+        };
         assert_eq!(duplicate_set_ports(&options), None);
         options.http = 8080;
         options.http_set = true;
@@ -1133,9 +1135,11 @@ mod tests {
 
     #[test]
     fn an_empty_generated_front_list_is_refused() {
-        let mut options = Options::default();
-        options.fronts.clear();
-        options.fronts_set = true;
+        let mut options = Options {
+            fronts: String::new(),
+            fronts_set: true,
+            ..Options::default()
+        };
         assert!(reject_empty_fronts(&options).is_err());
         options.outbound = Some(Outbound::Config);
         assert!(reject_empty_fronts(&options).is_ok());
@@ -1147,9 +1151,11 @@ mod tests {
         let mut paths = Paths::with_dirs(root.join("conf"), root.join("state"), None);
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let taken = listener.local_addr().unwrap().port();
-        let mut options = Options::default();
-        options.fronts = "socks".to_owned();
-        options.socks = taken;
+        let mut options = Options {
+            fronts: "socks".to_owned(),
+            socks: taken,
+            ..Options::default()
+        };
         let (ports, user_config) = prepare(&mut options, &mut paths);
         assert!(!user_config);
         assert_ne!(ports.socks, taken);

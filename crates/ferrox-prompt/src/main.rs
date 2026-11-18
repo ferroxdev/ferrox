@@ -868,11 +868,12 @@ fn reload_library(library: &Library) -> Result<Library, String> {
     let text = std::fs::read_to_string(&library.source_path)
         .map_err(|error| format!("could not read {}: {error}", library.source_path.display()))?;
     let mut reloaded = Library::parse(&library.path, &text);
-    reloaded.source_path = library.source_path.clone();
+    reloaded.source_path.clone_from(&library.source_path);
     Ok(reloaded)
 }
 
 /// `next`: fills a matrix template from its first unserved row, so repeat runs walk the matrix; `--set` still wins.
+#[allow(clippy::too_many_lines)]
 fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
     let Ok(_lock) = lock_state(&Ledger::path_for(root)) else {
         return ExitCode::from(1);
@@ -2555,12 +2556,21 @@ fix issue #{issue} at {priority=P0 or P1} priority
             ..Ledger::default()
         };
         library.prompts[0].status = Status::Doing;
-        assert!(spent_classes(&library, None, &state, &ledger).is_empty());
+        assert_eq!(
+            spent_classes(&library, None, &state, &ledger),
+            Vec::<u32>::new()
+        );
         library.prompts[0].status = Status::Done;
-        assert!(spent_classes(&library, None, &state, &ledger).is_empty());
+        assert_eq!(
+            spent_classes(&library, None, &state, &ledger),
+            Vec::<u32>::new()
+        );
         library.prompts[0].status = Status::Todo;
         library.prompts[0].effort = Effort::Large;
-        assert!(spent_classes(&library, Some(Effort::Medium), &state, &ledger).is_empty());
+        assert_eq!(
+            spent_classes(&library, Some(Effort::Medium), &state, &ledger),
+            Vec::<u32>::new()
+        );
         assert_eq!(
             spent_classes(&library, Some(Effort::Large), &state, &ledger),
             vec![1]
