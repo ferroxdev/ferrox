@@ -615,8 +615,12 @@ impl<R: Read> GrpcReader<R> {
                         Some(until) if std::time::Instant::now() < until => {
                             // SAFETY: as above; the tail below the watermark is unchanged by the truncate.
                             unsafe {
-                                ferrox_core::read::init_room(&mut self.msg, &mut self.msg_init, end)
-                            };
+                                ferrox_core::read::init_room(
+                                    &mut self.msg,
+                                    &mut self.msg_init,
+                                    end,
+                                );
+                            }
                         }
                         // The head's clock is spent: a hard end, so `read_exact` stops retrying.
                         Some(_) => return Ok(false),
@@ -626,8 +630,12 @@ impl<R: Read> GrpcReader<R> {
                             std::thread::sleep(crate::budgets::RELAY_POLL);
                             // SAFETY: as above.
                             unsafe {
-                                ferrox_core::read::init_room(&mut self.msg, &mut self.msg_init, end)
-                            };
+                                ferrox_core::read::init_room(
+                                    &mut self.msg,
+                                    &mut self.msg_init,
+                                    end,
+                                );
+                            }
                         }
                     }
                 }

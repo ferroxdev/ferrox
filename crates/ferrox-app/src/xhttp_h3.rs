@@ -198,8 +198,8 @@ impl H3Reader {
         let base = self.buf.len();
         // SAFETY: every byte below the watermark is initialised, and the read fills the room past it before the length counts it.
         unsafe {
-            ferrox_core::read::init_room(&mut self.buf, &mut self.buf_init, base + READ_ROOM)
-        };
+            ferrox_core::read::init_room(&mut self.buf, &mut self.buf_init, base + READ_ROOM);
+        }
         #[cfg(test)]
         {
             self.read_target = self.buf[base..].as_ptr() as usize;
