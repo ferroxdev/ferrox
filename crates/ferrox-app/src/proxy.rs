@@ -79426,12 +79426,16 @@ end
         );
         frame.extend_from_slice(b"drop");
         let (_blocked_client, relay) = associate(blocked);
-        udp.set_read_timeout(Some(Duration::from_millis(500)))
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        // A connected probe takes only this relay's datagrams, so another association on loopback cannot answer for it.
+        probe.connect(relay).expect("connects");
+        probe
+            .set_read_timeout(Some(Duration::from_millis(500)))
             .expect("timeout");
-        udp.send_to(&frame, relay).expect("sends");
+        probe.send(&frame).expect("sends");
         let mut back = vec![0u8; UDP_BUF];
         assert!(
-            udp.recv_from(&mut back).is_err(),
+            probe.recv(&mut back).is_err(),
             "the sender's process names the block"
         );
         let (_allowed_client, relay) = associate(allowed);
@@ -79470,9 +79474,9 @@ end
             std::net::IpAddr::V4([127, 0, 0, 1].into()),
             u16::from_be_bytes(reply[8..10].try_into().expect("port")),
         );
-        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
-        udp.set_read_timeout(Some(Duration::from_millis(500)))
-            .expect("timeout");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        // A connected probe takes only this relay's datagrams, and one source keeps the datagrams in order.
+        probe.connect(relay).expect("connects");
         let name_frame = |name: &str, port: u16| {
             let mut datagram = vec![0u8, 0, 0, 3, name.len() as u8];
             datagram.extend_from_slice(name.as_bytes());
@@ -79480,24 +79484,42 @@ end
             datagram.extend_from_slice(b"drop");
             datagram
         };
-        udp.send_to(&name_frame("blocked.test", 443), relay)
-            .expect("sends");
+        probe
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        probe.send(&name_frame("blocked.test", 443)).expect("sends");
         let mut back = vec![0u8; UDP_BUF];
         assert!(
-            udp.recv_from(&mut back).is_err(),
+            probe.recv(&mut back).is_err(),
             "a name rule drops it before a resolver sees it"
         );
-        udp.set_read_timeout(Some(Duration::from_secs(30)))
-            .expect("timeout");
         let mut frame = vec![0u8, 0, 0];
         push_socks_addr(
             &mut frame,
             &format!("127.0.0.1:{allowed}").parse().expect("addr"),
         );
         frame.extend_from_slice(b"ping");
-        udp.send_to(&frame, relay).expect("sends");
-        let (n, _) = udp.recv_from(&mut back).expect("echoes");
-        assert_eq!(parse_socks_udp(&back[..n]).expect("splits").1, b"ping");
+        probe
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("timeout");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            probe.send(&frame).expect("sends");
+            let Ok(n) = probe.recv(&mut back) else {
+                assert!(Instant::now() < deadline, "no echo to {frame:?}");
+                continue;
+            };
+            let Some((_, payload)) = parse_socks_udp(&back[..n]) else {
+                continue;
+            };
+            assert_ne!(
+                payload, b"drop",
+                "a name rule drops it before a resolver sees it"
+            );
+            if payload == b"ping" {
+                break;
+            }
+        }
     }
 
     /// A lane whose loop ended is retired, so the next datagram for its tag opens a fresh socket

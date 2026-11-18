@@ -2176,7 +2176,8 @@ impl Engine {
                     _ => break,
                 };
                 let pn_offset = cursor - at;
-                if self.open(space, &mut datagram[at..end], pn_offset, now)? {
+                // Initial keys are public, so only a Handshake packet proves the CID is the server's.
+                if self.open(space, &mut datagram[at..end], pn_offset, now)? && space != INITIAL {
                     self.accept_server_cid(&scid);
                 }
                 at = end;

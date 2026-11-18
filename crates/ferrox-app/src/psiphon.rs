@@ -1851,14 +1851,18 @@ impl Inner {
                             let Some(server) = server else {
                                 continue;
                             };
-                            let Some(server) = runtime_entry(server, &self.settings) else {
+                            let mut entries = lock(&self.entries);
+                            let region_available =
+                                entries_match_region(entries.as_slice(), &self.settings);
+                            let Some(server) =
+                                runtime_entry(server, &self.settings, region_available)
+                            else {
                                 continue;
                             };
                             let name = server.dsl_tag();
                             if name.is_empty() {
                                 continue;
                             }
-                            let mut entries = lock(&self.entries);
                             let list = Arc::make_mut(&mut *entries);
                             if let Some(existing) = list
                                 .iter()
@@ -1951,7 +1955,8 @@ impl Inner {
             else {
                 continue;
             };
-            let Some(server) = runtime_entry(server, &self.settings) else {
+            let region_available = entries_match_region(list.as_slice(), &self.settings);
+            let Some(server) = runtime_entry(server, &self.settings, region_available) else {
                 continue;
             };
             if !list
@@ -7941,55 +7946,83 @@ fn entry_allowed(server: &Server, protocols: &[String], fronted: bool) -> bool {
     })
 }
 
-/// Apply every startup policy to an entry learned at runtime.
-fn runtime_entry(server: Server, settings: &Settings) -> Option<Server> {
-    let mut servers = limit_quic_versions(vec![server], settings);
-    let server = servers.pop()?;
-    let server = runtime_protocol_entry(server, &settings.protocols, settings.fronted)?;
-    if settings
-        .region
-        .as_deref()
-        .is_some_and(|region| server.region.as_deref() != Some(region))
-    {
-        return None;
-    }
-    let mut servers = vec![server];
-    if coin(settings.dial_ports_probability) {
-        let normal = shape_filter(&settings.protocols, "LimitTunnelProtocols");
-        let named_meek = settings
-            .protocols
+/// Whether the live pool already satisfies the configured region, so a foreign learned entry would narrow it.
+fn entries_match_region(entries: &[Server], settings: &Settings) -> bool {
+    match settings.region.as_deref() {
+        Some(region) => entries
             .iter()
-            .any(|protocol| is_meek_protocol(protocol));
-        servers = apply_dial_port_limits(
-            servers,
-            &settings.dial_ports,
-            normal,
-            named_meek,
-            &settings.protocols,
-        );
-        if servers.is_empty() {
-            return None;
-        }
+            .any(|server| server.region.as_deref() == Some(region)),
+        None => true,
     }
-    apply_session_settings(&mut servers, settings);
-    servers.pop()
 }
 
-/// The runtime entry to insert, converted to the CDN carrier the limit names.
-fn runtime_protocol_entry(server: Server, protocols: &[String], fronted: bool) -> Option<Server> {
-    if !entry_allowed(&server, protocols, fronted) {
-        return None;
+/// Apply every startup policy to an entry learned at runtime; `region_available` carries the startup fallback.
+fn runtime_entry(server: Server, settings: &Settings, region_available: bool) -> Option<Server> {
+    let mut servers = limit_quic_versions(vec![server], settings);
+    let server = servers.pop()?;
+    let normal = shape_filter(&settings.protocols, "LimitTunnelProtocols");
+    let named_meek = settings
+        .protocols
+        .iter()
+        .any(|protocol| is_meek_protocol(protocol));
+    let limit_ports = coin(settings.dial_ports_probability);
+    // A sibling that fails the port limit is passed over for the next one that also shapes to the protocol limit.
+    for server in runtime_protocol_entries(server, &settings.protocols, settings.fronted) {
+        if region_available
+            && settings
+                .region
+                .as_deref()
+                .is_some_and(|region| server.region.as_deref() != Some(region))
+        {
+            continue;
+        }
+        let mut servers = vec![server];
+        if limit_ports {
+            servers = apply_dial_port_limits(
+                servers,
+                &settings.dial_ports,
+                normal,
+                named_meek,
+                &settings.protocols,
+            );
+            if servers.is_empty() {
+                continue;
+            }
+        }
+        apply_session_settings(&mut servers, settings);
+        if let Some(server) = servers.pop() {
+            return Some(server);
+        }
     }
+    None
+}
+
+/// The runtime entries to try, converted to the siblings a protocol limit can select.
+fn runtime_protocol_entries(server: Server, protocols: &[String], fronted: bool) -> Vec<Server> {
     let Some(filter) = shape_filter(protocols, "LimitTunnelProtocols") else {
-        return Some(server);
+        return entry_allowed(&server, protocols, fronted)
+            .then_some(server)
+            .into_iter()
+            .collect();
     };
     let named_meek = protocols.iter().any(|protocol| is_meek_protocol(protocol));
-    if matches_limit(&server, filter, named_meek, protocols) {
-        return Some(server);
+    // Try the siblings startup can select, not just the base shape and the CDN carriers.
+    let mut candidates = vec![server.clone()];
+    if protocols
+        .iter()
+        .any(|protocol| matches!(protocol.as_str(), "SSH" | "UNFRONTED-SSH"))
+    {
+        candidates.extend(ssh_variant(&server));
     }
-    cdn_variants(&server)
+    candidates.extend(tls_variant(&server));
+    candidates.extend(cdn_variants(&server));
+    candidates
         .into_iter()
-        .find(|variant| matches_limit(variant, filter, named_meek, protocols))
+        .filter(|candidate| {
+            entry_allowed(candidate, protocols, fronted)
+                && matches_limit(candidate, filter, named_meek, protocols)
+        })
+        .collect()
 }
 
 fn matches_limit(server: &Server, filter: Shape, meek_named: bool, protocols: &[String]) -> bool {
@@ -9036,8 +9069,13 @@ fn select_protocols_with(
     }
     let tls_named = normal.is_some_and(|shape| shape.tls)
         || (initial_active && initial.is_some_and(|shape| shape.tls));
-    let plain_named = normal.is_some_and(|shape| shape.plain)
-        || (initial_active && initial.is_some_and(|shape| shape.plain));
+    // Only a direct plain protocol asks for a direct plain SSH sibling; `INPROXY-WEBRTC-SSH` does not.
+    let direct_plain = |list: &[String]| {
+        list.iter()
+            .any(|protocol| matches!(protocol.as_str(), "SSH" | "UNFRONTED-SSH"))
+    };
+    let plain_named =
+        direct_plain(protocols) || (initial_active && direct_plain(initial_protocols));
     if plain_named {
         add_ssh_variants(&mut servers);
     }
@@ -13542,7 +13580,8 @@ mod tests {
         server.cdn_protocols = CDN_PROTOCOL_HTTP | CDN_PROTOCOL_QUIC;
         server.meek.as_mut().expect("fronted").protocol = "FRONTED-MEEK-QUIC-OSSH";
         let limit = vec!["FRONTED-MEEK-CDN-HTTP-OSSH".to_owned()];
-        let selected = runtime_protocol_entry(server, &limit, true).expect("allowed");
+        let selected = runtime_protocol_entries(server, &limit, true);
+        let selected = selected.first().expect("allowed");
         assert_eq!(
             selected.meek.as_ref().expect("fronted").protocol,
             "FRONTED-MEEK-CDN-HTTP-OSSH"
@@ -16014,7 +16053,77 @@ mod tests {
             &json::parse(r#"{"LimitTunnelDialPortNumbers":{"All":[80]}}"#).expect("settings"),
         ))
         .expect("settings");
-        assert!(runtime_entry(test_server(true), &settings).is_none());
+        assert!(runtime_entry(test_server(true), &settings, true).is_none());
+    }
+
+    #[test]
+    fn a_foreign_runtime_entry_is_kept_only_when_the_pool_has_no_region() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"EgressRegion":"US"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        let mut foreign = test_server(true);
+        foreign.region = Some("NL".to_owned());
+        let mut regional = test_server(true);
+        regional.region = Some("US".to_owned());
+        assert!(
+            !entries_match_region(std::slice::from_ref(&foreign), &settings),
+            "a pool without the configured region asks for the fallback"
+        );
+        assert!(
+            entries_match_region(std::slice::from_ref(&regional), &settings),
+            "a pool that carries the configured region does not"
+        );
+        assert!(
+            runtime_entry(foreign.clone(), &settings, true).is_none(),
+            "a pool that satisfies the region still drops the foreign entry"
+        );
+        assert!(
+            runtime_entry(foreign, &settings, false).is_some(),
+            "the startup fallback keeps the foreign entry when the pool has no regional one"
+        );
+    }
+
+    #[test]
+    fn an_inproxy_ssh_name_does_not_build_a_direct_ssh_sibling() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"LimitTunnelProtocols":["INPROXY-WEBRTC-SSH","TLS-OSSH"]}"#)
+                .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.port = 22;
+        server.ssh_port = Some(22);
+        server.tls_port = Some(8443);
+        server.tls_obfuscation_key = Some("tls".to_owned());
+        let selected = runtime_entry(server, &settings, true).expect("the TLS sibling");
+        assert!(
+            selected.tls,
+            "the in-proxy SSH name does not authorize a direct SSH sibling"
+        );
+        assert_eq!(selected.port, 8443);
+    }
+
+    #[test]
+    fn a_runtime_entry_tries_the_sibling_that_meets_the_dial_port_limit() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"LimitTunnelProtocols":["SSH","TLS-OSSH"],"LimitTunnelDialPortNumbers":{"All":[8443]}}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.port = 443;
+        server.ssh_port = Some(22);
+        server.tls_port = Some(8443);
+        server.tls_obfuscation_key = Some("tls".to_owned());
+        let selected = runtime_entry(server, &settings, true).expect("the TLS sibling");
+        assert!(
+            selected.tls,
+            "the SSH sibling is the one the port limit refuses"
+        );
+        assert_eq!(selected.port, 8443);
     }
 
     #[test]

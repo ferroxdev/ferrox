@@ -1236,6 +1236,10 @@ fn start_heartbeat(writer: &WsWriter, period: u32) {
             let Ok(mut stream) = shared.stream.lock() else {
                 return;
             };
+            // A close that won the lock wrote its CLOSE frame already: a PING here would land after it.
+            if shared.closed.load(Ordering::SeqCst) {
+                return;
+            }
             if shared.open.load(Ordering::Relaxed) > 0 || shared.cut.load(Ordering::Relaxed) > 0 {
                 // A data frame is half on the wire: a control frame here would land inside it.
                 continue;

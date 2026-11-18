@@ -103,7 +103,8 @@ pub fn list(paths: &Paths, filter: &str, ping: bool) -> Result<(), String> {
                 .and_modify(|entry| {
                     *entry = match (*entry, reading) {
                         (Some(current), Some(next)) => Some(current.min(next)),
-                        (None, _) => None,
+                        (None, Some(next)) => Some(next),
+                        (None, None) => None,
                         (Some(current), None) => Some(current),
                     };
                 })

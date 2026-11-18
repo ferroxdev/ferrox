@@ -68,7 +68,14 @@ fn main() {
 }
 
 fn reconcile(paths: &Paths) {
-    if paths.proxy_state.exists() && !lane::running(paths) {
+    if !paths.proxy_state.exists() {
+        return;
+    }
+    // Serialize with `up`/`down` before reading liveness and clearing the proxy.
+    let Ok(_lifecycle) = lane::lock(paths) else {
+        return;
+    };
+    if !lane::running(paths) {
         if let Err(error) = proxy::clear(paths) {
             eprintln!("ferrox-cli: {error}");
         }
@@ -266,13 +273,25 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
     if options.outbound == Some(Outbound::Foxy) {
         println!("carrier: {}", options.carrier);
     }
-    if !fronts(&options.fronts).is_empty() && !verify_flow(options, ports, paths) {
-        return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
+    let mut arm = true;
+    if !fronts(&options.fronts).is_empty() {
+        match verify_flow(options, ports, paths) {
+            Flow::Carry => {}
+            Flow::Skip => {
+                if options.vpn {
+                    println!("not arming the system proxy; the lane keeps its own routing.");
+                }
+                arm = false;
+            }
+            Flow::Fail => {
+                return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
+            }
+        }
     }
     if interrupted.load(Ordering::SeqCst) {
         return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
     }
-    if options.vpn {
+    if options.vpn && arm {
         // Hold the cancellation lock across the arm and handoff so a Ctrl-C either owns cleanup or looks at a finished start.
         let mut cancelled = cancelled
             .lock()
@@ -402,7 +421,13 @@ fn stop_and_forget(paths: &Paths, user_config: bool) -> i32 {
     i32::from(!restored)
 }
 
-fn verify_flow(options: &Options, ports: Ports, paths: &Paths) -> bool {
+enum Flow {
+    Carry,
+    Skip,
+    Fail,
+}
+
+fn verify_flow(options: &Options, ports: Ports, paths: &Paths) -> Flow {
     let front = fronts(&options.fronts)
         .first()
         .cloned()
@@ -414,17 +439,17 @@ fn verify_flow(options: &Options, ports: Ports, paths: &Paths) -> bool {
             && probe::probe_plain(&front, port, probe::trace_timeout()).contains("Example Domain")
         {
             println!("exit through {front}: a plain HTTP flow answered.");
-            return true;
+            return Flow::Carry;
         }
         if options.outbound == Some(Outbound::Config) {
             println!(
                 "the custom config did not answer the probe; leaving the lane to its own routing."
             );
-            return true;
+            return Flow::Skip;
         }
         println!("NOT CONNECTED: the fronts are up, but no flow got through them.");
         diagnose(options, paths);
-        return false;
+        return Flow::Fail;
     }
     println!("exit through {front}: {}", probe::exit_line(&answer));
     let want = options.country.to_uppercase();
@@ -444,9 +469,9 @@ fn verify_flow(options: &Options, ports: Ports, paths: &Paths) -> bool {
             if got.is_empty() { "unreadable" } else { &got }
         );
         diagnose(options, paths);
-        return false;
+        return Flow::Fail;
     }
-    true
+    Flow::Carry
 }
 
 fn diagnose(options: &Options, paths: &Paths) {
@@ -787,25 +812,37 @@ fn supervise(options: &Options, paths: &Paths) -> i32 {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     let pid = watched;
-    let watched_paths = paths.clone();
     let _ = ctrlc::set_handler(move || {
-        if let Err(error) = lane::kill(pid) {
-            eprintln!("ferrox-cli: {error}");
+        match lane::kill(pid) {
+            Ok(()) => flag.store(true, Ordering::SeqCst),
+            // A failed kill leaves the lane live: keep polling so its exit still clears the proxy, and a second Ctrl-C retries.
+            Err(error) => eprintln!("ferrox-cli: {error}"),
         }
-        if let Err(error) = proxy::clear(&watched_paths) {
-            eprintln!("ferrox-cli: {error}");
-        }
-        flag.store(true, Ordering::SeqCst);
     });
     while lane::alive(watched) && !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_secs(1));
     }
-    let current = lane::pid(paths);
-    if current.is_none() || current == Some(watched) {
-        if let Err(error) = proxy::clear(paths) {
-            eprintln!("ferrox-cli: {error}");
+    if !lane::alive(watched) || stop.load(Ordering::SeqCst) {
+        // Retry the lifecycle lock a status read may hold, then re-check the pid before clearing.
+        let mut lifecycle = None;
+        for _ in 0..20 {
+            match lane::lock(paths) {
+                Ok(lock) => {
+                    lifecycle = Some(lock);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
         }
-        let _ = std::fs::remove_file(&paths.pid_file);
+        if let Some(_lifecycle) = lifecycle {
+            let current = lane::pid(paths);
+            if current.is_none() || current == Some(watched) {
+                if let Err(error) = proxy::clear(paths) {
+                    eprintln!("ferrox-cli: {error}");
+                }
+                let _ = std::fs::remove_file(&paths.pid_file);
+            }
+        }
     }
     if read_trim(&paths.supervisor_file).as_deref() == Some(watched.to_string().as_str()) {
         let _ = std::fs::remove_file(&paths.supervisor_file);

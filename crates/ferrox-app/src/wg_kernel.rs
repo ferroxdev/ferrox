@@ -305,11 +305,13 @@ const IDENTITY_TRIES: usize = 8;
 fn identity() -> (String, u32, u32) {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let token = NEXT.fetch_add(1, Ordering::Relaxed);
-    let mut raw = [0u8; 2];
+    let mut raw = [0u8; 4];
     let _ = getrandom::fill(&mut raw);
-    let low = u16::from_ne_bytes(raw) ^ (std::process::id() as u16) ^ token as u16;
+    let random = u32::from_ne_bytes(raw);
+    let low = (random as u16) ^ (std::process::id() as u16) ^ token as u16;
     let name = format!("fwg{low:04x}{:04x}", token & 0xffff);
-    let table = 0x4645_0000 | u32::from(low);
+    // Twenty-four spread bits, not sixteen: two processes sharing a pid low half still get distinct tables and marks.
+    let table = 0x4600_0000 | u32::from(low) | (((random >> 16) & 0x00ff) << 16);
     (name, table, table)
 }
 

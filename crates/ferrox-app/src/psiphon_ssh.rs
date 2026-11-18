@@ -2481,8 +2481,13 @@ impl Inner {
     fn close_channel(&self, state: &ChannelState) {
         let mut writer = lock(&self.writer);
         let remote = state.remote.swap(NO_CHANNEL, Ordering::AcqRel);
-        if remote != NO_CHANNEL && !self.closed.load(Ordering::Acquire) {
-            let _ = writer.send(&channel_close(remote));
+        let failed = remote != NO_CHANNEL
+            && !self.closed.load(Ordering::Acquire)
+            && writer.send(&channel_close(remote)).is_err();
+        drop(writer);
+        if failed {
+            // A half-written close packet leaves the sequence advanced; the stream is unusable.
+            self.close();
         }
     }
 
