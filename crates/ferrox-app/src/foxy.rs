@@ -660,11 +660,12 @@ pub(crate) fn open_h2(dial: &FoxyDial, target: &str) -> Result<Tls2, Failure> {
     })
 }
 
-/// The bytes a session stages for a frame no lane of its class is reading: a TCP stream keeps them raw in `carry`, while CONNECT-UDP and CONNECT-IP keep capsules in `capsule_buf`. Two classes that parse differently cannot share one session.
+/// What one session carries: a TCP stream stages raw bytes in `carry`, while CONNECT-UDP and CONNECT-IP stage capsules in `capsule_buf` and parse a different capsule format, so each keeps its own pool.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PoolClass {
     Tcp,
-    Capsule,
+    Udp,
+    Ip,
 }
 
 /// Opens one stream on a session to this edge, reusing a session already open: the flow rides it on a stream of its own, and the handshake it paid is not paid again.
@@ -675,7 +676,7 @@ fn open_stream(
 ) -> Result<Tls2, Failure> {
     // A session already open to this edge is the cheap one: the flow rides it on a stream of its own, and the handshake it paid is not paid again.
     if let Some(session) = pool_find(dial, class) {
-        match attach(&session, &build) {
+        match attach(&session, class, &build) {
             Ok(lane) => return Ok(lane),
             // A session the edge closed while it was idle is the one handshake this reuse may cost; every other refusal is the edge's answer and is not retried on a new session.
             Err(Failure::Stream | Failure::Io) => pool_forget(&session),
@@ -683,7 +684,7 @@ fn open_stream(
         }
     }
     let session = open_session(dial)?;
-    let lane = attach(&session, &build)?;
+    let lane = attach(&session, class, &build)?;
     pool_register(SessionKey::of(dial, class), &session);
     Ok(lane)
 }
@@ -778,14 +779,14 @@ fn pool_register(key: SessionKey, session: &Arc<Session>) {
     pool.push((key, Instant::now(), Arc::clone(session)));
 }
 
-/// One UDP target as one CONNECT-UDP stream on a capsule session: a second target rides a new stream on the session the first opened, and a capsule session is kept apart from a TCP one because each stages a foreign frame its own way.
+/// One UDP target as one CONNECT-UDP stream on a UDP session: a second target rides a new stream on the session the first opened, and UDP is kept apart from TCP and CONNECT-IP because each stages and parses a foreign frame its own way.
 pub(crate) fn open_udp(
     dial: &FoxyDial,
     target_host: &str,
     target_port: u16,
 ) -> Result<Tls2, Failure> {
     let edge = edge_authority(&dial.host, dial.port);
-    open_stream(dial, PoolClass::Capsule, |block| {
+    open_stream(dial, PoolClass::Udp, |block| {
         masque::connect_udp(&edge, target_host, target_port, &dial.pass.token, block);
     })
 }
@@ -867,7 +868,11 @@ fn open_session(dial: &FoxyDial) -> Result<Arc<Session>, Failure> {
 }
 
 /// Opens a CONNECT stream on a session and waits for its status: the stream is the flow's, and the session outlives it. The block is built into the session's own scratch, so a warm flow allocates nothing for the head it writes.
-fn attach(session: &Arc<Session>, build: &impl Fn(&mut Vec<u8>)) -> Result<Tls2, Failure> {
+fn attach(
+    session: &Arc<Session>,
+    class: PoolClass,
+    build: &impl Fn(&mut Vec<u8>),
+) -> Result<Tls2, Failure> {
     let mut inner = session.inner.lock().map_err(|_| Failure::Io)?;
     if inner.gone {
         return Err(Failure::Stream);
@@ -881,6 +886,7 @@ fn attach(session: &Arc<Session>, build: &impl Fn(&mut Vec<u8>)) -> Result<Tls2,
     let mut lane = Tls2 {
         session: Arc::clone(session),
         stream,
+        class,
     };
     let mut block = std::mem::take(&mut inner.out);
     block.clear();
@@ -1023,14 +1029,35 @@ fn credit_stream(inner: &mut SessionInner, stream: u32, len: usize) -> Result<()
     flush_credit(inner, stream)
 }
 
-/// Stages a DATA payload that is not going into the caller's buffer, and holds the flow's window until its own reader takes it. An empty body has nothing to stage, so its wire octets are granted at once; a body that would push the flow past the window this lane advertised is a flow-control violation, and that stream is reset rather than allowed to grow for the session's life.
+/// Stages a DATA payload that is not going into the caller's buffer: a TCP lane holds the flow's window until its own reader takes the bytes, a capsule lane stages the capsules in the buffer its reader drains, and a frame that would push either past its cap is a flow-control violation, so that stream is reset rather than allowed to grow for the session's life.
 fn stage_foreign(
     inner: &mut SessionInner,
+    class: PoolClass,
     stream: u32,
     payload: &[u8],
     end: bool,
     wire: usize,
 ) -> Result<(), Failure> {
+    if class != PoolClass::Tcp {
+        let over = if let Some(entry) = inner.streams.get_mut(&stream) {
+            entry.fin = end;
+            if payload.is_empty() {
+                false
+            } else {
+                let over = entry.capsule_buf.len().saturating_add(payload.len()) > DATAGRAM_BUF_MAX;
+                if !over {
+                    entry.capsule_buf.extend_from_slice(payload);
+                }
+                over
+            }
+        } else {
+            return credit(inner, stream, wire);
+        };
+        if over {
+            reset_stream(inner, stream);
+        }
+        return credit(inner, stream, wire);
+    }
     let bytes = u32::try_from(wire).unwrap_or(u32::MAX);
     let mut overflow = false;
     if let Some(entry) = inner.streams.get_mut(&stream) {
@@ -1073,6 +1100,13 @@ fn reset_stream(inner: &mut SessionInner, stream: u32) {
     let _ = inner.tls.flush();
 }
 
+/// Ends one stream without touching the session: an edge's `RST_STREAM` names a flow, so only that flow's readers stop; a `GOAWAY` is the session's and still sets `gone`.
+fn end_stream(inner: &mut SessionInner, stream: u32) {
+    if let Some(entry) = inner.streams.get_mut(&stream) {
+        entry.fin = true;
+    }
+}
+
 /// The edge's `SETTINGS` applied to the session: a new `INITIAL_WINDOW_SIZE` moves every stream's window by the difference, and a new maximum frame size bounds what the session sends.
 fn apply_settings(inner: &mut SessionInner, payload: &[u8]) {
     let mut at = 0usize;
@@ -1094,7 +1128,7 @@ fn apply_settings(inner: &mut SessionInner, payload: &[u8]) {
 
 /// One UDP payload out as one DATAGRAM capsule, split over DATA frames when needed: the capsule stream is byte-oriented and the reader reassembles. The frame header and the capsule header ride a fixed buffer and the payload keeps the caller's bytes, so the whole datagram is never staged before the record takes it.
 fn write_capsule(inner: &mut SessionInner, stream: u32, payload: &[u8]) -> std::io::Result<()> {
-    if inner.streams.get(&stream).is_some_and(|s| s.fin) {
+    if inner.gone || inner.streams.get(&stream).is_none_or(|s| s.fin) {
         return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
     }
     let mut prefix = [0u8; 10];
@@ -1156,6 +1190,20 @@ fn status_of(inner: &SessionInner, stream: u32) -> Result<Option<u16>, Failure> 
     }
 }
 
+/// Takes the status one lane is waiting for and releases the block it was decoded from: a status is read once, and keeping the head alive after the open is memory no flow uses.
+fn take_status(inner: &mut SessionInner, stream: u32) -> Result<Option<u16>, Failure> {
+    if !inner.streams.contains_key(&stream) {
+        return Err(Failure::Stream);
+    }
+    let status = status_of(inner, stream)?;
+    if status.is_some() {
+        if let Some(entry) = inner.streams.get_mut(&stream) {
+            entry.head.clear();
+        }
+    }
+    Ok(status)
+}
+
 /// The credit one stream may spend on a frame: the edge grants the stream and the connection windows independently, so the tighter of the two is the limit.
 fn stream_spend(inner: &SessionInner, stream: u32) -> u32 {
     let own = inner.streams.get(&stream).map_or(0, |s| s.window.left());
@@ -1178,6 +1226,8 @@ pub(crate) struct Tls2 {
     session: Arc<Session>,
     /// The CONNECT stream this lane owns: `1` on a fresh session, then the next odd id each time the session is lent again.
     stream: u32,
+    /// What this session carries: a TCP stream stages raw bytes in `carry`, while a capsule stream stages into `capsule_buf`.
+    class: PoolClass,
 }
 
 /// One HTTP/2 session to the edge: the socket, the connection's own credit, and the streams that ride it.
@@ -1575,9 +1625,18 @@ impl Tls2 {
         body: impl FnOnce(&mut SessionInner, frames::H2Frame, &[u8], bool) -> R,
     ) -> std::io::Result<R> {
         let mut inner = self.inner().map_err(io)?;
+        Self::with_frame_locked(&mut *inner, self.stream, dst, body)
+    }
+
+    /// The frame read under a session lock the caller already holds: `await_status` checks the staged status and decides whether to read in the same lock, so a status staged by another lane between the two is not a frame this lane waits for.
+    fn with_frame_locked<R>(
+        inner: &mut SessionInner,
+        stream: u32,
+        dst: &mut [u8],
+        body: impl FnOnce(&mut SessionInner, frames::H2Frame, &[u8], bool) -> R,
+    ) -> std::io::Result<R> {
         let mut payload = std::mem::take(&mut inner.out);
         inner.frame.delivered = 0;
-        let stream = self.stream;
         let (frame, delivered) = {
             let SessionInner { tls, frame, .. } = &mut *inner;
             match read_frame(tls, frame, &mut payload, dst, stream) {
@@ -1597,15 +1656,43 @@ impl Tls2 {
                 end_headers,
                 ..
             } => {
-                if let Some(entry) = inner.streams.get_mut(&stream) {
-                    entry.head.extend_from_slice(block);
-                    entry.head_end = end_headers;
+                let over = {
+                    let Some(entry) = inner.streams.get_mut(&stream) else {
+                        false
+                    };
+                    if entry.head_end {
+                        false
+                    } else {
+                        let over = entry.head.len().saturating_add(block.len()) > MAX_HEAD;
+                        if !over {
+                            entry.head.extend_from_slice(block);
+                            entry.head_end = end_headers;
+                        }
+                        over
+                    }
+                };
+                if over {
+                    reset_stream(inner, stream);
                 }
             }
             frames::H2Routed::Continuation { stream, block, end } => {
-                if let Some(entry) = inner.streams.get_mut(&stream) {
-                    entry.head.extend_from_slice(block);
-                    entry.head_end = end;
+                let over = {
+                    let Some(entry) = inner.streams.get_mut(&stream) else {
+                        false
+                    };
+                    if entry.head_end {
+                        false
+                    } else {
+                        let over = entry.head.len().saturating_add(block.len()) > MAX_HEAD;
+                        if !over {
+                            entry.head.extend_from_slice(block);
+                            entry.head_end = end;
+                        }
+                        over
+                    }
+                };
+                if over {
+                    reset_stream(inner, stream);
                 }
             }
             frames::H2Routed::Settings {
@@ -1615,7 +1702,7 @@ impl Tls2 {
                 let mut ack = Vec::with_capacity(frames::H2_HEADER);
                 h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
                 let _ = inner.tls.write_all(&ack);
-                apply_settings(&mut inner, settings);
+                apply_settings(inner, settings);
             }
             frames::H2Routed::Ping {
                 ack: false,
@@ -1639,7 +1726,7 @@ impl Tls2 {
             }
             _ => {}
         }
-        let out = body(&mut inner, frame, &payload, delivered);
+        let out = body(&mut *inner, frame, &payload, delivered);
         inner.out = payload;
         Ok(out)
     }
@@ -1693,6 +1780,12 @@ impl Tls2 {
         };
         let peer_initial = inner.peer_initial;
         let stream = self.stream;
+        if inner.gone || inner.streams.get(&stream).is_none_or(|s| s.fin) {
+            return (
+                false,
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            );
+        }
         let built = {
             let entry = inner
                 .streams
@@ -1726,44 +1819,53 @@ impl Tls2 {
     fn await_status(&mut self) -> Result<u16, Failure> {
         // The status is the h2 form of the head, so it waits the named head budget; unset, that is the same twenty seconds.
         let deadline = Instant::now() + crate::budgets::head_arrival();
+        let own = self.stream;
+        let class = self.class;
         loop {
             if Instant::now() >= deadline {
                 return Err(Failure::Stream);
             }
-            let own = self.stream;
-            {
-                let inner = self.inner().map_err(|_| Failure::Io)?;
-                if let Some(status) = status_of(&inner, own)? {
-                    return Ok(status);
-                }
+            let mut inner = self.inner().map_err(|_| Failure::Io)?;
+            // The check and the read are one lock: a status another lane stages after this check is already in `head` when the read decides, so this lane never waits for a frame it has.
+            if let Some(status) = take_status(&mut inner, own)? {
+                return Ok(status);
             }
-            let status = self.with_frame(&mut [], |inner, frame, payload, _| {
-                match frames::h2_routed(frame, payload) {
-                    frames::H2Routed::Data {
-                        stream,
-                        payload,
-                        end,
-                        wire,
-                    } => {
-                        // A DATA frame that arrives while the status is still out is payload the edge sent early: stage it like any other foreign frame, so its flow's window is returned only when that flow's reader takes the bytes.
-                        stage_foreign(inner, stream, payload, end, wire)?;
-                        Ok(None)
-                    }
-                    frames::H2Routed::Window { stream, increment } => {
-                        if stream == 0 {
-                            inner.conn.add(increment);
-                        } else if let Some(entry) = inner.streams.get_mut(&stream) {
-                            entry.window.add(increment);
+            let status =
+                Self::with_frame_locked(&mut *inner, own, &mut [], |inner, frame, payload, _| {
+                    match frames::h2_routed(frame, payload) {
+                        frames::H2Routed::Data {
+                            stream,
+                            payload,
+                            end,
+                            wire,
+                        } => {
+                            // A DATA frame that arrives while the status is still out is payload the edge sent early: stage it like any other foreign frame, so its flow's window is returned only when that flow's reader takes the bytes.
+                            stage_foreign(inner, class, stream, payload, end, wire)?;
+                            take_status(inner, own)
                         }
-                        Ok(None)
+                        frames::H2Routed::Window { stream, increment } => {
+                            if stream == 0 {
+                                inner.conn.add(increment);
+                            } else if let Some(entry) = inner.streams.get_mut(&stream) {
+                                entry.window.add(increment);
+                            }
+                            take_status(inner, own)
+                        }
+                        frames::H2Routed::Reset { stream, .. } => {
+                            end_stream(inner, stream);
+                            if stream == own {
+                                Err(Failure::Stream)
+                            } else {
+                                take_status(inner, own)
+                            }
+                        }
+                        frames::H2Routed::GoAway { .. } => {
+                            inner.gone = true;
+                            Err(Failure::Stream)
+                        }
+                        _ => take_status(inner, own),
                     }
-                    frames::H2Routed::Reset { .. } | frames::H2Routed::GoAway { .. } => {
-                        inner.gone = true;
-                        Err(Failure::Stream)
-                    }
-                    _ => Ok(None),
-                }
-            });
+                });
             let status = status.map_err(|_| Failure::Stream)??;
             if let Some(status) = status {
                 return Ok(status);
@@ -1844,10 +1946,11 @@ impl Tls2 {
             }
             let fin = {
                 let inner = self.inner().map_err(io)?;
-                inner
-                    .streams
-                    .get(&self.stream)
-                    .is_none_or(|stream| stream.fin)
+                inner.gone
+                    || inner
+                        .streams
+                        .get(&self.stream)
+                        .is_none_or(|stream| stream.fin)
             };
             if fin {
                 return Ok(0);
@@ -1869,8 +1972,9 @@ impl Tls2 {
                     "foxy: a capsule stream that never parses",
                 ));
             }
+            let own = self.stream;
             let read = self.with_frame(&mut [], |inner, frame, payload, _| {
-                stage_datagram(inner, frame, payload, buf)
+                stage_datagram(inner, own, frame, payload, buf)
             });
             let read = read??;
             if read > 0 {
@@ -1883,6 +1987,7 @@ impl Tls2 {
 /// One routed frame for a CONNECT-UDP tunnel: a whole capsule is handed to the caller where it lies, and a split one waits in the stream's buffer.
 fn stage_datagram(
     inner: &mut SessionInner,
+    own: u32,
     frame: frames::H2Frame,
     payload: &[u8],
     buf: &mut [u8],
@@ -1894,6 +1999,11 @@ fn stage_datagram(
             end,
             wire,
         } => {
+            if stream != own {
+                // Another flow's frame belongs in that flow's own capsule buffer: handing it back here would deliver one flow's datagram to another's reader.
+                stage_foreign(inner, PoolClass::Udp, stream, payload, end, wire).map_err(io)?;
+                return Ok(0);
+            }
             let Some(entry) = inner.streams.get_mut(&stream) else {
                 return Ok(0);
             };
@@ -1922,7 +2032,11 @@ fn stage_datagram(
             }
             Ok(0)
         }
-        frames::H2Routed::Reset { .. } | frames::H2Routed::GoAway { .. } => {
+        frames::H2Routed::Reset { stream, .. } => {
+            end_stream(inner, stream);
+            Ok(0)
+        }
+        frames::H2Routed::GoAway { .. } => {
             inner.gone = true;
             Ok(0)
         }
@@ -1943,11 +2057,7 @@ fn stage_address(
             end,
             wire,
         } => {
-            if let Some(entry) = inner.streams.get_mut(&stream) {
-                entry.capsule_buf.extend_from_slice(payload);
-                entry.fin = end;
-            }
-            credit(inner, stream, wire).map_err(io)?;
+            stage_foreign(inner, PoolClass::Ip, stream, payload, end, wire).map_err(io)?;
             Ok(())
         }
         frames::H2Routed::Window { stream, increment } => {
@@ -1958,7 +2068,11 @@ fn stage_address(
             }
             Ok(())
         }
-        frames::H2Routed::Reset { .. } | frames::H2Routed::GoAway { .. } => {
+        frames::H2Routed::Reset { stream, .. } => {
+            end_stream(inner, stream);
+            Ok(())
+        }
+        frames::H2Routed::GoAway { .. } => {
             inner.gone = true;
             Ok(())
         }
@@ -1969,6 +2083,7 @@ fn stage_address(
 /// One routed frame for a CONNECT-IP tunnel: a packet whole inside a DATA frame is copied straight to the caller, and the bytes behind it staged for the next read.
 fn route_packet(
     inner: &mut SessionInner,
+    own: u32,
     frame: frames::H2Frame,
     payload: &[u8],
     into: &mut Vec<u8>,
@@ -1980,6 +2095,11 @@ fn route_packet(
             end,
             wire,
         } => {
+            if stream != own {
+                // A packet for another CONNECT-IP stream is staged in that stream, not handed to this lane's caller.
+                stage_foreign(inner, PoolClass::Ip, stream, payload, end, wire).map_err(io)?;
+                return Ok(false);
+            }
             if let Some(entry) = inner.streams.get_mut(&stream) {
                 entry.fin = end;
             }
@@ -2016,7 +2136,11 @@ fn route_packet(
             }
             Ok(false)
         }
-        frames::H2Routed::Reset { .. } | frames::H2Routed::GoAway { .. } => {
+        frames::H2Routed::Reset { stream, .. } => {
+            end_stream(inner, stream);
+            Ok(false)
+        }
+        frames::H2Routed::GoAway { .. } => {
             inner.gone = true;
             Ok(false)
         }
@@ -2062,10 +2186,11 @@ fn open_h2_with_raw(
 impl Write for Tls2 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut inner = self.inner().map_err(io)?;
-        let fin = inner
-            .streams
-            .get(&self.stream)
-            .is_none_or(|stream| stream.fin);
+        let fin = inner.gone
+            || inner
+                .streams
+                .get(&self.stream)
+                .is_none_or(|stream| stream.fin);
         if fin {
             return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         }
@@ -2109,16 +2234,18 @@ impl Read for Tls2 {
             }
             let fin = {
                 let inner = self.inner().map_err(io)?;
-                inner
-                    .streams
-                    .get(&self.stream)
-                    .is_none_or(|stream| stream.fin)
+                inner.gone
+                    || inner
+                        .streams
+                        .get(&self.stream)
+                        .is_none_or(|stream| stream.fin)
             };
             if fin {
                 return Ok(0);
             }
             // An unpadded payload is copied once, by the frame reader, straight into the caller's buffer: nothing is staged between the lane and its caller, and a frame the caller has no room left for resumes in the caller's own space on the next read.
             let own = self.stream;
+            let class = self.class;
             let read = self.with_frame(
                 buf,
                 |inner, frame, payload, delivered| -> std::io::Result<usize> {
@@ -2131,7 +2258,8 @@ impl Read for Tls2 {
                         } => {
                             if stream != own {
                                 // A frame for another flow is staged in that flow's own buffer and only the connection's credit is held, so a flow that is not reading yet does not lose its bytes, does not stall the one that is, and does not grow past the window it was granted.
-                                stage_foreign(inner, stream, payload, end, wire).map_err(io)?;
+                                stage_foreign(inner, class, stream, payload, end, wire)
+                                    .map_err(io)?;
                                 return Ok(0);
                             }
                             if delivered {
@@ -2147,7 +2275,7 @@ impl Read for Tls2 {
                                 return Ok(got);
                             }
                             // A caller that asked for nothing and a padded frame both land here: the padding comes off before the rest stages, so the stage holds the payload and the flow's window is returned when that payload is taken.
-                            stage_foreign(inner, own, payload, end, wire).map_err(io)?;
+                            stage_foreign(inner, class, own, payload, end, wire).map_err(io)?;
                             Ok(0)
                         }
                         frames::H2Routed::Window { stream, increment } => {
@@ -2158,11 +2286,13 @@ impl Read for Tls2 {
                             }
                             Ok(0)
                         }
-                        frames::H2Routed::Reset { .. } | frames::H2Routed::GoAway { .. } => {
+                        frames::H2Routed::Reset { stream, .. } => {
+                            end_stream(inner, stream);
+                            Ok(0)
+                        }
+                        frames::H2Routed::GoAway { .. } => {
                             inner.gone = true;
-                            if let Some(entry) = inner.streams.get_mut(&own) {
-                                entry.fin = true;
-                            }
+                            end_stream(inner, own);
                             Ok(0)
                         }
                         _ => Ok(0),
@@ -3660,12 +3790,12 @@ impl Ip {
     }
 }
 
-/// One CONNECT-IP lane as its own H2 connection: the tunnel carries UDP datagrams for every destination, so a lane is one connection rather than a stream per target.
+/// One CONNECT-IP lane as its own stream on a pooled H2 connection: the tunnel carries UDP datagrams for every destination, so a lane is one tunnel rather than a stream per target.
 pub(crate) fn open_ip_h2(
     dial: &FoxyDial,
 ) -> Result<(Tls2, Option<ferrox_core::foxy::connectip::Assigned>), Failure> {
     let edge = edge_authority(&dial.host, dial.port);
-    let mut lane = open_stream(dial, PoolClass::Capsule, |block| {
+    let mut lane = open_stream(dial, PoolClass::Ip, |block| {
         connectip::connect_ip(&edge, "*", 0, &dial.pass.token, block);
     })?;
     let assigned = lane.address_assign()?;
@@ -3770,7 +3900,7 @@ impl Tls2 {
             }
             let fin = {
                 let inner = self.inner()?;
-                inner.streams.get(&own).is_none_or(|stream| stream.fin)
+                inner.gone || inner.streams.get(&own).is_none_or(|stream| stream.fin)
             };
             if fin {
                 return Err(Failure::Stream);
@@ -3826,7 +3956,7 @@ impl Tls2 {
             }
             let fin = {
                 let inner = self.inner().map_err(io)?;
-                inner.streams.get(&own).is_none_or(|stream| stream.fin)
+                inner.gone || inner.streams.get(&own).is_none_or(|stream| stream.fin)
             };
             if fin {
                 return Ok(false);
@@ -3843,7 +3973,7 @@ impl Tls2 {
                 }
             }
             let read = self.with_frame(&mut [], |inner, frame, payload, _| {
-                route_packet(inner, frame, payload, into)
+                route_packet(inner, own, frame, payload, into)
             });
             if read?? && !into.is_empty() {
                 return Ok(true);
@@ -3986,20 +4116,32 @@ impl Tunnel {
     }
 }
 
+/// Ends an h2 lane that no `settle` handed back: a reusable stream is returned to the session, and one that did not end cleanly is reset and removed.
+fn end_lane(lane: &mut Tls2) {
+    if lane.reusable() {
+        lane.release();
+    } else {
+        let _ = lane.flush_credit();
+        lane.cancel();
+    }
+}
+
 impl Drop for Tunnel {
     /// Ends a lane no settle handed back — a client gone before its grant, a failed write — because an h2 stream left open keeps the edge fetching into a window nobody drains, charged to the account, and an h3 stream half-open is still being filled.
     fn drop(&mut self) {
         match self {
-            Self::H2(lane) => {
-                if lane.reusable() {
-                    lane.release();
-                } else {
-                    let _ = lane.flush_credit();
-                    lane.cancel();
-                }
-            }
+            Self::H2(lane) => end_lane(lane),
             Self::H3(lane) if !lane.closed && !lane.fin => lane.quic.cancel(),
             Self::H3(_) | Self::H1(_) => {}
+        }
+    }
+}
+
+impl Drop for Datagram {
+    /// A UDP flow that ends returns its stream to the pooled session, or resets it when it did not end cleanly: dropping only the handle used to close an exclusive session, and now it would leave the stream and its window on a session another flow rides.
+    fn drop(&mut self) {
+        if let Self::H2(lane) = self {
+            end_lane(lane);
         }
     }
 }
@@ -5626,6 +5768,52 @@ pub(crate) mod loopback {
         assert_eq!(back_two, two, "the second flow got its own bytes");
     }
 
+    /// A reset names one flow, not the session: the flow that was reset ends, and the flow beside it still reads its own bytes.
+    #[test]
+    fn a_reset_of_one_stream_leaves_the_session_to_the_others() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = reset_one_stream_h2_edge(listener, server);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut first = Tunnel::open(&dial, "one.test:80", None).expect("opens");
+        let mut second = Tunnel::open(&dial, "two.test:80", None).expect("opens");
+        let mut end = [0u8; 1];
+        assert_eq!(
+            first.read(&mut end).expect("reads the reset"),
+            0,
+            "the reset flow ended"
+        );
+        let mut back = [0u8; 2];
+        second
+            .read_exact(&mut back)
+            .expect("the flow beside it still reads");
+        assert_eq!(&back, b"ok");
+        let (Tunnel::H2(one), Tunnel::H2(two)) = (&first, &second) else {
+            panic!("two h2 lanes");
+        };
+        let inner = one.test_inner();
+        assert!(!inner.gone, "one reset ended the session");
+        assert!(
+            inner
+                .streams
+                .get(&one.stream)
+                .is_some_and(|stream| stream.fin),
+            "the reset stream ended"
+        );
+        assert!(
+            inner
+                .streams
+                .get(&two.stream)
+                .is_some_and(|stream| !stream.fin),
+            "the other stream was ended by the reset"
+        );
+        drop(inner);
+        drop(first);
+        drop(second);
+        edge.join().expect("joins");
+    }
+
     /// A warm open writes its CONNECT block and frame through the session's own scratch: the second flow reuses the buffer the first left, with the same base and capacity.
     #[test]
     fn a_warm_h2_open_reuses_the_session_scratch() {
@@ -5691,6 +5879,14 @@ pub(crate) mod loopback {
                 hpack::hpack_status(&foreign.head),
                 Some(200),
                 "the foreign status was not kept whole"
+            );
+            let own = inner
+                .streams
+                .get(&lane.stream)
+                .expect("the lane's own stream");
+            assert!(
+                own.head.is_empty(),
+                "the opened flow kept the head it had already read"
             );
         }
         drop(first);
@@ -8460,7 +8656,7 @@ pub(crate) mod loopback {
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let edge = masque_h2_two_stream_edge(listener, server, seen_tx);
         let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
-        let first = open_udp(&dial, "one.test", 443).expect("opens");
+        let mut first = open_udp(&dial, "one.test", 443).expect("opens");
         let mut second = open_udp(&dial, "two.test", 443).expect("opens on the session");
         assert!(
             std::sync::Arc::ptr_eq(&first.session, &second.session),
@@ -8477,11 +8673,42 @@ pub(crate) mod loopback {
             let text = String::from_utf8_lossy(&block);
             assert!(text.contains(want), "missing {want} in {text}");
         }
-        second.write_datagram(b"hello udp").expect("writes");
+        // The edge sent this on the first stream while the second lane was opening: its status walk read it, and it belongs in the first stream's capsule buffer, not the TCP carry.
+        read_datagram(&mut first, b"early");
+        first.write_datagram(b"first udp").expect("writes");
+        first.flush().expect("flushes");
+        second.write_datagram(b"second udp").expect("writes");
         second.flush().expect("flushes");
-        read_datagram(&mut second, b"hello udp");
+        // The edge answers the second flow first: the first lane's read sees a stream of the second and must leave it for that lane, not return it here.
+        read_datagram(&mut first, b"first udp");
+        read_datagram(&mut second, b"second udp");
         drop(first);
         drop(second);
+        edge.join().expect("joins");
+    }
+
+    /// A dropped UDP lane leaves the pooled session with no stream for it: the old exclusive session closed its socket, and the stream has to be reset and removed now that another flow may ride that session.
+    #[test]
+    fn a_dropped_udp_lane_returns_its_stream() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let edge = masque_h2_edge(listener, server, seen_tx, 1);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let lane = open_udp(&dial, "example.com", 443).expect("opens");
+        let _ = seen_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the edge read the block");
+        let session = std::sync::Arc::clone(&lane.session);
+        let stream = lane.stream;
+        drop(Datagram::H2(Box::new(lane)));
+        let inner = session.inner.lock().expect("the session lock");
+        assert!(
+            inner.streams.get(&stream).is_none(),
+            "the dropped lane left its stream on the session"
+        );
+        drop(inner);
         edge.join().expect("joins");
     }
 
@@ -8637,6 +8864,9 @@ pub(crate) mod loopback {
                 if !read_exact_poll(&mut tls, &mut payload) {
                     return;
                 }
+                if frame.kind == frames::RST_STREAM {
+                    return;
+                }
                 if frame.kind != frames::DATA {
                     continue;
                 }
@@ -8659,6 +8889,65 @@ pub(crate) mod loopback {
                     return;
                 }
             }
+        })
+    }
+
+    /// A loopback HTTP/2 edge that answers two CONNECTs, resets the first stream, and sends bytes on the second: one flow's reset is not the session's.
+    fn reset_one_stream_h2_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            let mut opened = Vec::new();
+            while opened.len() < 2 {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frame.kind {
+                    frames::SETTINGS if frame.flags & 0x1 == 0 => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::HEADERS => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x5, frame.stream, &[0x88], &mut out);
+                        tls.write_all(&out).expect("answers");
+                        opened.push(frame.stream);
+                    }
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            h2_frame(
+                frames::RST_STREAM,
+                0,
+                opened[0],
+                &3u32.to_be_bytes(),
+                &mut out,
+            );
+            h2_frame(frames::DATA, 0, opened[1], b"ok", &mut out);
+            tls.write_all(&out)
+                .expect("resets one and answers the other");
+            tls.flush().expect("flushes");
+            std::thread::sleep(Duration::from_millis(250));
         })
     }
 
@@ -8718,7 +9007,7 @@ pub(crate) mod loopback {
         })
     }
 
-    /// A loopback HTTP/2 edge that answers two CONNECT-UDP streams on one session, then echoes one datagram on the stream that sent it.
+    /// A loopback HTTP/2 edge that answers two CONNECT-UDP streams on one session, then echoes one datagram on each stream, the second flow's first: the first lane's read must skip a frame that belongs to the second.
     fn masque_h2_two_stream_edge(
         listener: Listener,
         server: ferrox_core::tls::TlsServerConfig,
@@ -8756,6 +9045,11 @@ pub(crate) mod loopback {
                     frames::HEADERS => {
                         seen.send(payload).expect("reports the block");
                         let mut out = Vec::new();
+                        if opened.len() == 1 {
+                            let mut early = Vec::new();
+                            masque::datagram_encode(b"early", &mut early);
+                            h2_frame(frames::DATA, 0, opened[0], &early, &mut out);
+                        }
                         h2_frame(frames::HEADERS, 0x5, frame.stream, &[0x88], &mut out);
                         tls.write_all(&out).expect("answers");
                         opened.push(frame.stream);
@@ -8765,7 +9059,8 @@ pub(crate) mod loopback {
             }
             let mut staged: std::collections::HashMap<u32, Vec<u8>> =
                 std::collections::HashMap::new();
-            loop {
+            let mut echoes = Vec::new();
+            while echoes.len() < 2 {
                 let mut header = [0u8; frames::H2_HEADER];
                 if !read_exact_poll(&mut tls, &mut header) {
                     return;
@@ -8778,19 +9073,28 @@ pub(crate) mod loopback {
                 if frame.kind != frames::DATA {
                     continue;
                 }
-                let carry = staged.entry(frame.stream).or_default();
-                carry.extend_from_slice(&payload);
-                if let Some((_, datagram)) = masque::datagram_split(carry) {
-                    let mut echo = Vec::new();
-                    masque::datagram_encode(datagram, &mut echo);
-                    let mut out = Vec::new();
-                    h2_frame(frames::DATA, 0, frame.stream, &echo, &mut out);
-                    tls.write_all(&out).expect("echoes");
-                    tls.flush().expect("flushes");
-                    std::thread::sleep(Duration::from_millis(250));
-                    return;
+                let mut whole = None;
+                {
+                    let carry = staged.entry(frame.stream).or_default();
+                    carry.extend_from_slice(&payload);
+                    if let Some((used, datagram)) = masque::datagram_split(carry) {
+                        let mut echo = Vec::new();
+                        masque::datagram_encode(datagram, &mut echo);
+                        whole = Some((used, echo));
+                    }
+                }
+                if let Some((used, echo)) = whole {
+                    staged.get_mut(&frame.stream).expect("carry").drain(..used);
+                    echoes.push((frame.stream, echo));
                 }
             }
+            for (stream, echo) in echoes.iter().rev() {
+                let mut out = Vec::new();
+                h2_frame(frames::DATA, 0, *stream, echo, &mut out);
+                tls.write_all(&out).expect("echoes");
+            }
+            tls.flush().expect("flushes");
+            std::thread::sleep(Duration::from_millis(250));
         })
     }
 

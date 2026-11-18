@@ -420,6 +420,10 @@ carrier-foxy edge-socket-dups-after-the-first-h1-park 0 ferrox-app-foxy::loopbac
 carrier-foxy edge-socket-dups-after-the-first-h2-park 0 ferrox-app-foxy::loopback::a_parked_http2_session_hands_out_one_socket
 carrier-foxy h2-open-scratch-reallocations-after-first-flow 0 ferrox-app-foxy::loopback::a_warm_h2_open_reuses_the_session_scratch
 carrier-foxy udp-session-handshakes-after-the-first-flow 0 ferrox-app-foxy::loopback::a_second_udp_flow_rides_the_first_session
+carrier-foxy foreign-capsules-handed-to-the-wrong-lane 0 ferrox-app-foxy::loopback::a_second_udp_flow_rides_the_first_session
+carrier-foxy session-killed-by-a-foreign-reset 0 ferrox-app-foxy::loopback::a_reset_of_one_stream_leaves_the_session_to_the_others
+carrier-foxy udp-streams-held-after-their-lane-drops 0 ferrox-app-foxy::loopback::a_dropped_udp_lane_returns_its_stream
+carrier-foxy status-head-bytes-held-after-the-open 0 ferrox-app-foxy::loopback::a_status_for_a_stream_opening_elsewhere_is_kept
 carrier-foxy foreign-status-heads-dropped 0 ferrox-app-foxy::loopback::a_status_for_a_stream_opening_elsewhere_is_kept
 carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads
 carrier-foxy window-update-frames-per-floor-crossing 2 ferrox-app-foxy::loopback::credit_crossing_the_floor_costs_one_pair_not_one_per_frame
