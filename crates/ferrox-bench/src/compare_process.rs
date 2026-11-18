@@ -1392,11 +1392,13 @@ pub fn run(
             let Some(engine) = engines.iter().find(|e| e.name == name) else {
                 continue;
             };
-            let (output, request) = write_request(workload, engine, out_dir, name, repeat)?;
-            if !cell.fits(&request) {
+            let planned = out_dir.join(format!("{name}-run{repeat}"));
+            let planned_request = Request::parse(workload.request(engine, &planned).as_bytes())?;
+            if !cell.fits(&planned_request) {
                 failures.push(window_ended(&by_engine, &names, repeats));
                 break 'measures;
             }
+            let (output, request) = write_request(workload, engine, out_dir, name, repeat)?;
             match parity::measure(
                 &request,
                 engine.config_arg,
