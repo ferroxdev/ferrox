@@ -163,6 +163,8 @@ pub struct SniSpoof {
     pub method: SniMethod,
     pub fooling: DecoyFooling,
     pub ttl: u8,
+    /// Rewrite the real hello's name in mixed case, `LxBox` 016's second cut at the same match.
+    pub mixed_case: bool,
 }
 
 /// The write-time methods that need no privilege.
@@ -172,6 +174,8 @@ pub enum SniShape {
     Record,
     /// One empty handshake record ahead of the hello.
     EmptyRecord,
+    /// One extra byte marked urgent in the middle of the name, sent with `MSG_OOB`.
+    Urgent,
 }
 
 /// The empty handshake record written ahead of a hello.
@@ -556,6 +560,117 @@ fn sockaddr_in(address: SocketAddr) -> libc::sockaddr_in {
     out
 }
 
+/// Where a `ClientHello`'s server name sits in the record, when the write is one whole handshake
+/// record that carries a DNS name. The range is into `record`, so a caller can rewrite the name or
+/// place a cut inside it without copying the hello first.
+pub fn server_name_range(record: &[u8]) -> Option<std::ops::Range<usize>> {
+    let u16_at = |at: usize| {
+        Some(usize::from(u16::from_be_bytes([
+            *record.get(at)?,
+            *record.get(at + 1)?,
+        ])))
+    };
+    if record.len() < 43 || record[0] != 0x16 || record[5] != 0x01 {
+        return None;
+    }
+    let record_len = 5 + u16_at(3)?;
+    if record_len > record.len() {
+        return None;
+    }
+    let handshake =
+        (usize::from(record[6]) << 16) | (usize::from(record[7]) << 8) | usize::from(record[8]);
+    if 9 + handshake != record_len {
+        return None;
+    }
+    let version = u16_at(9)?;
+    if version & 0xfffc != 0x0300 && version != 0x0304 {
+        return None;
+    }
+    let mut at = 43;
+    at += 1 + usize::from(*record.get(at)?);
+    at += 2 + u16_at(at)?;
+    at += 1 + usize::from(*record.get(at)?);
+    let end = at + 2 + u16_at(at)?;
+    at += 2;
+    if end > record_len {
+        return None;
+    }
+    while at + 4 <= end {
+        let (kind, length) = (u16_at(at)?, u16_at(at + 2)?);
+        at += 4;
+        if length > end - at {
+            return None;
+        }
+        if kind == 0 {
+            let name_len = u16_at(at + 3)?;
+            let start = at + 5;
+            return (*record.get(at + 2)? == 0 && name_len > 0 && start + name_len <= at + length)
+                .then_some(start..start + name_len);
+        }
+        at += length;
+    }
+    None
+}
+
+/// One cut inside every label of `name` that is long enough to hold two.
+///
+/// A censor that reads the name out of a single record reassembles nothing here: each label is
+/// split at a fresh random byte, so no record carries a whole label, and the TLD is split too.
+/// The result is sorted and in `1..name.len()`, so every piece is non-empty.
+pub fn label_cuts(name: &[u8]) -> Vec<usize> {
+    let mut cuts = Vec::new();
+    let mut start = 0;
+    while start < name.len() {
+        let end = name[start..]
+            .iter()
+            .position(|byte| *byte == b'.')
+            .map_or(name.len(), |at| start + at);
+        if end - start >= 2 {
+            let offset = usize::try_from(rand_between(1, (end - start) as u64)).unwrap_or(1);
+            cuts.push(start + offset);
+        }
+        start = end + 1;
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts
+}
+
+/// The server name a dial hands its TLS backend in mixed case, the way `LxBox` 016 does: the first
+/// letter of each label is upper case and every other letter draws its case. The backend hashes the
+/// hello it builds, so the name must be rewritten before the transcript, not below it; DNS names are
+/// case-insensitive, so the peer still routes the same host.
+pub fn mixed_case_name(name: &str) -> String {
+    let mut bytes = name.as_bytes().to_vec();
+    let mut draw = [0u8; 32];
+    let mut left = 0usize;
+    let mut first = true;
+    for byte in &mut bytes {
+        if *byte == b'.' {
+            first = true;
+            continue;
+        }
+        if byte.is_ascii_alphabetic() {
+            if left == 0 {
+                // One draw answers a run of letters, so a short name spends one syscall, not one a byte.
+                left = draw.len();
+                if getrandom::fill(&mut draw).is_err() {
+                    draw.fill(0);
+                }
+            }
+            let upper = first || draw[draw.len() - left] & 1 == 0;
+            left -= 1;
+            *byte = if upper {
+                byte.to_ascii_uppercase()
+            } else {
+                byte.to_ascii_lowercase()
+            };
+            first = false;
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| name.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +803,98 @@ mod tests {
             assert!(packet.iter().all(|byte| *byte == 7));
         }
         assert_eq!(noise.delay(), Duration::ZERO);
+    }
+
+    fn hello(name: &str) -> Vec<u8> {
+        let mut server = vec![0, 0, 0];
+        server.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        server.extend_from_slice(name.as_bytes());
+        let list = (name.len() + 3) as u16;
+        server[0..2].copy_from_slice(&list.to_be_bytes());
+        let mut ext = vec![0, 0];
+        ext.extend_from_slice(&(server.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&server);
+        let mut handshake = vec![0x01, 0, 0, 0, 0x03, 0x03];
+        handshake.extend_from_slice(&[0x11; 32]);
+        handshake.push(0);
+        handshake.extend_from_slice(&[0x00, 0x02, 0x13, 0x01, 0x01, 0x00]);
+        handshake.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        handshake.extend_from_slice(&ext);
+        let length = (handshake.len() - 4) as u32;
+        handshake[1..4].copy_from_slice(&length.to_be_bytes()[1..4]);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn a_server_name_is_found_and_never_guessed_on_a_cut_record() {
+        let record = hello("www.example.com");
+        let range = server_name_range(&record).expect("a name");
+        assert_eq!(&record[range.clone()], b"www.example.com");
+        for cut in 0..range.end {
+            assert!(
+                server_name_range(&record[..cut]).is_none(),
+                "a record cut at {cut} has no complete name"
+            );
+        }
+        let mut server_hello = record.clone();
+        server_hello[5] = 0x02;
+        assert!(server_name_range(&server_hello).is_none());
+        let mut longer = record.clone();
+        longer.push(0);
+        assert!(
+            server_name_range(&longer).is_some(),
+            "a trailing write is not part of the record"
+        );
+    }
+
+    #[test]
+    fn every_label_of_a_name_takes_a_cut_inside_it() {
+        let name = b"www.example.co.uk";
+        for _ in 0..16 {
+            let cuts = label_cuts(name);
+            assert_eq!(cuts.len(), 4, "one cut inside each of the four labels");
+            assert!(cuts.windows(2).all(|pair| pair[0] < pair[1]), "{cuts:?}");
+            for cut in &cuts {
+                assert!((1..name.len()).contains(cut));
+                assert_ne!(name[*cut], b'.', "a cut never lands on a label boundary");
+            }
+        }
+        assert_eq!(label_cuts(b"a"), Vec::<usize>::new());
+        assert_eq!(label_cuts(b"."), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_mixed_case_name_is_the_same_name_to_the_server() {
+        for _ in 0..16 {
+            let name = mixed_case_name("www.example.com");
+            assert_eq!(name.len(), 15);
+            assert!(name.eq_ignore_ascii_case("www.example.com"));
+            for label in name.split('.') {
+                assert!(
+                    label.starts_with(|first: char| first.is_ascii_uppercase()),
+                    "{name}: every label opens upper case"
+                );
+            }
+        }
+        assert_eq!(mixed_case_name(""), "");
+        assert_eq!(mixed_case_name("192.0.2.1"), "192.0.2.1");
+    }
+
+    #[test]
+    fn an_extension_length_past_the_record_is_refused_not_returned() {
+        let mut record = hello("www.example.com");
+        let range = server_name_range(&record).expect("a name");
+        let mut at = 43;
+        at += 1 + usize::from(record[at]);
+        at += 2 + usize::from(u16::from_be_bytes([record[at], record[at + 1]]));
+        at += 1 + usize::from(record[at]);
+        at += 2;
+        record[at + 2..at + 4].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(server_name_range(&record), None);
+        assert!(range.end <= record.len());
     }
 
     #[test]
