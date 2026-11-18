@@ -1589,6 +1589,7 @@ const ORIGIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MASQ_BODY_CAP: usize = hysteria::MAX_UDP_PAYLOAD;
 
 /// Answers a browser request that arrived on a flow slot: read the whole request off the stream, build the cover response, and finish the stream with it so the browser sees a complete reply while the connection stays up for its next request.
+#[allow(clippy::too_many_arguments)]
 fn serve_masquerade_stream(
     shared: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<crate::quic::Datagram>,

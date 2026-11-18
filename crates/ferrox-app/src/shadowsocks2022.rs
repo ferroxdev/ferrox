@@ -2364,6 +2364,7 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_upstream(
     upstreams: &mut HashMap<(u64, bool), UdpSocket>,
     used: &mut HashMap<(u64, bool), Instant>,
