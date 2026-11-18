@@ -2305,7 +2305,7 @@ mod tests {
         let mut decoder = h2::Decoder::default();
         let mut raw = Vec::new();
         let mut trailers = Vec::new();
-        while let Some((len, kind, flags, id)) = h2::read_head(&mut stream) {
+        while let Some((len, kind, flags, _id)) = h2::read_head(&mut stream) {
             let mut body = vec![0u8; len];
             if stream.read_exact(&mut body).is_err() {
                 break;
