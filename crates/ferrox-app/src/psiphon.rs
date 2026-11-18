@@ -7282,6 +7282,27 @@ fn fetch_tactics(settings: &Settings) -> Result<crate::psiphon_tactics::Tactics,
     fetch_tactics_from(settings, &servers, &session_id, None)
 }
 
+fn tactics_retry_wait(wait: Instant, until: Option<Instant>, timing: TacticsTiming) -> bool {
+    let mut remaining = wait.saturating_duration_since(Instant::now());
+    if let Some(until) = until {
+        remaining = remaining.min(until.saturating_duration_since(Instant::now()));
+    }
+    if remaining.is_zero() {
+        return false;
+    }
+    let base = timing.retry.min(remaining);
+    let span = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
+    let delay = base.mul_f64(1.0 + timing.jitter * span).min(remaining);
+    thread::sleep(delay);
+    true
+}
+
+fn tactics_attempt_timeout(remaining: Duration, left: usize, timeout: Duration) -> Duration {
+    let share = remaining / u32::try_from(left).unwrap_or(u32::MAX);
+    let floor = TACTICS_ATTEMPT_MIN.min(remaining / 2);
+    timeout.min(share.max(floor)).min(remaining)
+}
+
 fn fetch_tactics_from(
     settings: &Settings,
     servers: &[Server],
@@ -7345,31 +7366,20 @@ fn fetch_tactics_from(
             let Some(wait) = wait_deadline else {
                 return Err(last.unwrap_or_else(|| "psiphon: tactics request failed".to_owned()));
             };
-            let mut remaining = wait.saturating_duration_since(Instant::now());
-            if let Some(until) = until {
-                remaining = remaining.min(until.saturating_duration_since(Instant::now()));
-            }
-            if remaining.is_zero() {
+            if !tactics_retry_wait(wait, until, timing) {
                 return Err(last.unwrap_or_else(|| "psiphon: tactics wait expired".to_owned()));
             }
-            let base = timing.retry.min(remaining);
-            let span = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
-            let delay = base.mul_f64(1.0 + timing.jitter * span).min(remaining);
-            thread::sleep(delay);
         }
         let attempt = if let Some(deadline) = request_deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(last.unwrap_or_else(|| "psiphon: tactics wait expired".to_owned()));
             }
-            let share = if until.is_some() {
-                let left = u32::try_from(total - attempted).unwrap_or(u32::MAX);
-                remaining / left
+            if until.is_some() {
+                tactics_attempt_timeout(remaining, total - attempted, timeout)
             } else {
-                remaining
-            };
-            let floor = TACTICS_ATTEMPT_MIN.min(remaining / 2);
-            timeout.min(share.max(floor)).min(remaining)
+                timeout.min(remaining)
+            }
         } else {
             timeout
         };
