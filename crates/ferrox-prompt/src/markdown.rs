@@ -1123,8 +1123,14 @@ do the second thing with {scope}
     #[test]
     fn a_prompt_without_targets_is_an_error() {
         let library = load(&LIBRARY.replace("**Targets:** none\n", ""));
-        let named = library.errors().any(|error| error.message.contains("**Targets:**"));
-        assert!(named, "the missing target class is named: {:?}", library.diagnostics);
+        let named = library
+            .errors()
+            .any(|error| error.message.contains("**Targets:**"));
+        assert!(
+            named,
+            "the missing target class is named: {:?}",
+            library.diagnostics
+        );
     }
 
     #[test]

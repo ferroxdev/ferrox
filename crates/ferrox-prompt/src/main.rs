@@ -2460,8 +2460,14 @@ fix issue #{issue} at {priority=P0 or P1} priority
 
     #[test]
     fn json_wins_over_print_in_either_order() {
-        assert_eq!(parse_args(&["list", "--print", "--json"]).output, Output::Json);
-        assert_eq!(parse_args(&["list", "--json", "--print"]).output, Output::Json);
+        assert_eq!(
+            parse_args(&["list", "--print", "--json"]).output,
+            Output::Json
+        );
+        assert_eq!(
+            parse_args(&["list", "--json", "--print"]).output,
+            Output::Json
+        );
     }
 
     #[test]

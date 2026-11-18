@@ -2216,8 +2216,9 @@ fn run_hold_flow(plan: &HoldPlan, index: usize) -> FlowResult {
                 }
                 Ok(()) => match stream.peek(&mut probe) {
                     Ok(0) => {
-                        result.stopped =
-                            Some(format!("flow {index}: the engine closed the held connection"));
+                        result.stopped = Some(format!(
+                            "flow {index}: the engine closed the held connection"
+                        ));
                     }
                     Ok(_) => {
                         result.stopped = Some(format!(
@@ -4046,16 +4047,8 @@ mod tests {
         };
         let mut one_late = vec![Duration::from_millis(80); 7];
         one_late.push(Duration::from_millis(280));
-        let straggled = validate_transfer(
-            &moved(one_late.clone()),
-            expected,
-            0,
-            0,
-            0,
-            0,
-            &[],
-            &desync,
-        );
+        let straggled =
+            validate_transfer(&moved(one_late.clone()), expected, 0, 0, 0, 0, &[], &desync);
         assert!(
             matches!(&straggled, Err(Error::Transient(m)) if m.contains("runner straggler")),
             "one flow an RTO behind the rest is re-measured: {straggled:?}"
@@ -4454,7 +4447,9 @@ mod tests {
         let engine = std::thread::spawn(move || -> Result<(), String> {
             let (mut stream, _) = listener.accept().map_err(|e| e.to_string())?;
             let mut greeting = [0u8; 3];
-            stream.read_exact(&mut greeting).map_err(|e| e.to_string())?;
+            stream
+                .read_exact(&mut greeting)
+                .map_err(|e| e.to_string())?;
             stream.write_all(&[5, 0]).map_err(|e| e.to_string())?;
             let mut head = [0u8; 4];
             stream.read_exact(&mut head).map_err(|e| e.to_string())?;
@@ -4470,7 +4465,9 @@ mod tests {
             };
             let mut skip = vec![0u8; rest];
             stream.read_exact(&mut skip).map_err(|e| e.to_string())?;
-            stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).map_err(|e| e.to_string())?;
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .map_err(|e| e.to_string())?;
             stream.shutdown(Shutdown::Both).map_err(|e| e.to_string())
         });
         let plan = HoldPlan {
