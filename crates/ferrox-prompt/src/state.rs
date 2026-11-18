@@ -87,9 +87,6 @@ impl MethodRow {
 /// A state cell's gap class, split from [`is_implemented`] so an open row still says why it is open.
 pub fn gap_of(state: &str) -> Gap {
     let lower = state.to_ascii_lowercase();
-    if is_implemented(state) {
-        return Gap::Shipped;
-    }
     if lower.contains("not-scheduled") || lower.contains("not scheduled") {
         return Gap::NotScheduled;
     }
@@ -100,10 +97,14 @@ pub fn gap_of(state: &str) -> Gap {
     {
         return Gap::Partial;
     }
+    if is_implemented(state) {
+        return Gap::Shipped;
+    }
     if lower.contains("planned")
         || lower.contains("refused")
         || lower.contains("not implemented")
         || lower.contains("not parsed")
+        || lower.contains("unimplemented")
     {
         return Gap::Planned;
     }
@@ -138,10 +139,13 @@ impl Pin {
 pub fn is_implemented(state: &str) -> bool {
     let lower = state.to_ascii_lowercase();
     let negated = lower.contains("planned")
+        || lower.contains("partial")
         || lower.contains("not carried")
         || lower.contains("not parsed")
         || lower.contains("not implemented")
         || lower.contains("unimplemented")
+        || lower.contains("not yet")
+        || lower.contains("not fully")
         || lower.contains("refused");
     if lower.contains("implemented") && !negated {
         return true;
@@ -269,8 +273,20 @@ pub fn methods_from_text(text: &str) -> Vec<MethodRow> {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("### ") {
-            // `### A — proxy protocols` — the letter is the first token.
-            section = rest.trim().chars().next().filter(char::is_ascii_uppercase);
+            // `### A — proxy protocols` — one letter, then a separator; prose headings are not sections.
+            let rest = rest.trim();
+            let mut chars = rest.chars();
+            let first = chars.next();
+            let next = chars.next();
+            section = match first {
+                Some(letter)
+                    if letter.is_ascii_uppercase()
+                        && next.is_none_or(|next| !next.is_ascii_alphanumeric() && next != '_') =>
+                {
+                    Some(letter)
+                }
+                _ => None,
+            };
             continue;
         }
         if trimmed.starts_with("| # |") || trimmed.starts_with("|#|") {
@@ -278,10 +294,18 @@ pub fn methods_from_text(text: &str) -> Vec<MethodRow> {
         }
         // A separator row (`| --- | --- |`) or any non-table line: nothing to do.
         let Some(letter) = section else { continue };
-        if !trimmed.starts_with('|') || trimmed.contains("---") {
+        if !trimmed.starts_with('|') {
             continue;
         }
         let row = cells(trimmed);
+        if row.iter().all(|cell| {
+            !cell.is_empty()
+                && cell
+                    .chars()
+                    .all(|character| character == '-' || character == ':')
+        }) {
+            continue;
+        }
         let Some(first) = row.first() else { continue };
         let index = first.trim();
         // Matrix ids grow suffixes (`61b`, `71a`), so an id is alphanumeric and starts with a digit.
@@ -607,6 +631,57 @@ mod tests {
         assert!(!is_implemented("refused"));
         assert!(!is_implemented("**server only**"));
         assert!(!is_implemented("parsed, **not carried**"));
+    }
+
+    #[test]
+    fn a_partial_cell_is_open_even_when_it_names_both_roles() {
+        assert!(!is_implemented(
+            "partial — both roles carry the client wire; the server half is next"
+        ));
+        assert_eq!(
+            gap_of("partial — both roles carry the client wire; the server half is next"),
+            Gap::Partial
+        );
+        let rows = methods_from_text(include_str!("../../../README.md"));
+        for row in rows
+            .iter()
+            .filter(|row| row.state.to_ascii_lowercase().starts_with("partial"))
+        {
+            assert!(
+                !row.implemented,
+                "{} reads as shipped: {}",
+                row.key(),
+                row.state
+            );
+            assert_eq!(row.gap, Gap::Partial, "{}: {}", row.key(), row.state);
+        }
+    }
+
+    #[test]
+    fn unimplemented_is_planned_and_not_yet_is_not_shipped() {
+        assert!(!is_implemented("unimplemented"));
+        assert!(!is_implemented("not yet implemented"));
+        assert!(!is_implemented("not fully implemented"));
+        assert_eq!(gap_of("unimplemented"), Gap::Planned);
+    }
+
+    #[test]
+    fn a_prose_heading_does_not_open_a_matrix_section() {
+        let rows = methods_from_text(
+            "### A — proxy protocols\n\n| # | method | state |\n| --- | --- | --- |\n| 1 | one | planned |\n\n### Conformance, per row\n\n| 2 | two | planned |\n",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].section, 'A');
+        assert_eq!(rows[0].index, "1");
+    }
+
+    #[test]
+    fn three_hyphens_in_a_note_do_not_make_the_row_a_separator() {
+        let rows = methods_from_text(
+            "### A — proxy protocols\n\n| # | method | state | notes |\n| --- | --- | --- | --- |\n| 1 | one | planned | a --- b |\n",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "planned");
     }
 
     #[test]

@@ -125,21 +125,26 @@ pub fn handable<'a>(
 ) -> (Vec<&'a Prompt>, Vec<Skipped>) {
     let mut ready = Vec::new();
     let mut skipped = Vec::new();
+    let mut unresolved = Vec::new();
     for index in ranked(library, effort) {
         let prompt = &library.prompts[index];
         if exclude.contains(&prompt.id) {
             continue;
         }
         if !allow_unfilled {
-            let selected = crate::render::resolve_addons(prompt, requested_addons);
-            let inputs: Vec<&str> = match &selected {
-                Ok(addons) => prompt.required_inputs_for(addons).collect(),
-                Err(_) => prompt.required_inputs().collect(),
-            };
+            let inputs: Vec<String> =
+                if let Ok(addons) = crate::render::resolve_addons(prompt, requested_addons) {
+                    prompt
+                        .required_inputs_for(&addons)
+                        .map(str::to_owned)
+                        .collect()
+                } else {
+                    unresolved.push(prompt);
+                    continue;
+                };
             let missing: Vec<String> = inputs
                 .into_iter()
-                .filter(|name| !supplied.contains_key(*name))
-                .map(str::to_owned)
+                .filter(|name| !supplied.contains_key(name))
                 .collect();
             if !missing.is_empty() {
                 skipped.push(Skipped {
@@ -150,6 +155,9 @@ pub fn handable<'a>(
             }
         }
         ready.push(prompt);
+    }
+    if ready.is_empty() {
+        ready.append(&mut unresolved);
     }
     (ready, skipped)
 }
@@ -660,6 +668,45 @@ run {core}
             handable(&library, None, &[], &["extra".to_owned()], &supplied, false);
         assert_eq!(ready.len(), 0);
         assert_eq!(skipped[0].missing, vec!["extra".to_owned()]);
+    }
+
+    #[test]
+    fn an_unknown_addon_reaches_the_addon_error_instead_of_an_empty_handout() {
+        let library = load(
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · Add-on work
+
+**When to use:** now
+**Status:** todo
+**Leverage:** 5
+**Effort:** small
+**Gates:** `cargo test`
+
+```text
+run {core}
+```
+
+**Add-on — Extra:** needs {extra}
+",
+        );
+        let (ready, skipped) = handable(
+            &library,
+            None,
+            &[],
+            &["nope".to_owned()],
+            &BTreeMap::new(),
+            false,
+        );
+        assert_eq!(ready.len(), 1);
+        assert_eq!(skipped, Vec::<Skipped>::new());
+        let error = crate::render::resolve_addons(ready[0], &["nope".to_owned()]).unwrap_err();
+        assert!(error.contains("no add-on matching `nope`"), "{error}");
     }
 
     #[test]

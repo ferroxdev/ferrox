@@ -252,7 +252,7 @@ fn main() -> ExitCode {
                 Command::Issue => run_issue(&args, &library, &root),
                 Command::Show => run_show(&args, &library, &root),
                 Command::Rows => run_rows(&args, &library, &root),
-                Command::SetStatus => run_set_status(&args, &library),
+                Command::SetStatus => run_set_status(&args, &library, &root),
                 Command::Check | Command::Help | Command::Version => ExitCode::SUCCESS,
             }
         }
@@ -339,6 +339,9 @@ fn parse(arguments: &[String]) -> Result<Args, String> {
 
 /// The words after the flags: one prompt id for `render`/`show`, one status for `set-status`, one number for `issue`.
 fn parse_positional(parsed: &mut Args, mut positional: Vec<String>) -> Result<(), String> {
+    if parsed.command == Command::Next && parsed.id.is_some() {
+        return Err("`next` chooses by rank; use `--id <id>` for a specific slice".to_owned());
+    }
     if parsed.command == Command::SetStatus {
         return parse_set_status(parsed, &positional);
     }
@@ -429,6 +432,9 @@ fn assign(values: &mut BTreeMap<String, String>, assignment: &str) -> Result<(),
     };
     if name.trim().is_empty() {
         return Err(format!("`{assignment}` has no key"));
+    }
+    if value.trim().is_empty() {
+        return Err(format!("`{assignment}` has an empty value"));
     }
     values.insert(name.trim().to_owned(), value.to_owned());
     Ok(())
@@ -673,6 +679,7 @@ type Values = BTreeMap<String, String>;
 /// `--set` values plus `--issue`, so both spellings fill the same blank.
 fn requested_values(args: &Args) -> Values {
     let mut values = args.values.clone();
+    values.retain(|_, value| !value.trim().is_empty());
     if let Some(issue) = args.issue {
         values.insert("issue".to_owned(), issue.to_string());
     }
@@ -683,7 +690,11 @@ fn requested_values(args: &Args) -> Values {
 fn supplied_values(args: &Args, state: &ProjectState) -> Values {
     let mut supplied = requested_values(args);
     if state.has_matrix() {
+        let references = state.references();
         for name in expand::FILLABLE {
+            if *name == "references" && references.is_empty() {
+                continue;
+            }
             supplied.entry((*name).to_owned()).or_default();
         }
     }
@@ -755,6 +766,7 @@ fn merge_values(
             values.insert("references".to_owned(), references);
         }
     }
+    values.retain(|_, value| !value.trim().is_empty());
     values
 }
 
@@ -856,11 +868,38 @@ fn missing_input_refusal(
     Some(ExitCode::from(2))
 }
 
+fn reload_library(library: &Library) -> Result<Library, String> {
+    let text = std::fs::read_to_string(&library.source_path)
+        .map_err(|error| format!("could not read {}: {error}", library.source_path.display()))?;
+    let mut reloaded = Library::parse(&library.path, &text);
+    reloaded.source_path.clone_from(&library.source_path);
+    if reloaded.has_errors() {
+        let mut message = format!(
+            "{} has errors; fix them first:",
+            library.source_path.display()
+        );
+        for diagnostic in reloaded.errors() {
+            let _ = writeln!(message, "  {diagnostic}");
+        }
+        return Err(message);
+    }
+    Ok(reloaded)
+}
+
 /// `next`: fills a matrix template from its first unserved row, so repeat runs walk the matrix; `--set` still wins.
+#[allow(clippy::too_many_lines)]
 fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
     let Ok(_lock) = lock_state(&Ledger::path_for(root)) else {
         return ExitCode::from(1);
     };
+    let reloaded = match reload_library(library) {
+        Ok(reloaded) => reloaded,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+    let library = &reloaded;
     let ledger = load_ledger(root);
     let state = ProjectState::load(root);
 
@@ -1117,12 +1156,20 @@ fn join_capped(ids: &[String]) -> String {
 /// `render <id>`: a matrix template filled from its first unserved row, like `next`, not a page of holes.
 fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
     let id = args.id.expect("parse requires an id for render");
+    let Ok(_lock) = lock_state(&Ledger::path_for(root)) else {
+        return ExitCode::from(1);
+    };
+    let reloaded = match reload_library(library) {
+        Ok(reloaded) => reloaded,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+    let library = &reloaded;
     let Some(prompt) = library.prompt(id) else {
         eprintln!("{}", unknown_prompt(library, id));
         return ExitCode::from(2);
-    };
-    let Ok(_lock) = lock_state(&Ledger::path_for(root)) else {
-        return ExitCode::from(1);
     };
     let ledger = load_ledger(root);
     if let Some(message) = ledger_refusal(&ledger) {
@@ -1405,14 +1452,17 @@ fn ledger_refusal(ledger: &Ledger) -> Option<String> {
 }
 
 /// Record progress by rewriting exactly the prompt's `**Status:**` line: reflowing Markdown would fight the contributor's edits.
-fn run_set_status(args: &Args, library: &Library) -> ExitCode {
+fn run_set_status(args: &Args, library: &Library, root: &Path) -> ExitCode {
     let id = args.id.expect("parse requires an id for set-status");
     let to = args.set_to.expect("parse requires a status for set-status");
     if library.prompt(id).is_none() {
         eprintln!("{}", unknown_prompt(library, id));
         return ExitCode::from(2);
     }
-    let Ok(_lock) = lock_state(&library.source_path) else {
+    let Ok(_source_lock) = lock_state(&library.source_path) else {
+        return ExitCode::from(1);
+    };
+    let Ok(_lock) = lock_state(&Ledger::path_for(root)) else {
         return ExitCode::from(1);
     };
     let current = match std::fs::read_to_string(&library.source_path) {
@@ -1602,7 +1652,7 @@ fn nothing_to_hand_over(
             );
         }
     }
-    let spent = spent_classes(library, state, ledger);
+    let spent = spent_classes(library, effort, state, ledger);
     if !spent.is_empty() {
         let _ = writeln!(
             message,
@@ -1622,11 +1672,21 @@ fn nothing_to_hand_over(
 }
 
 /// The templates whose class has no row left, so the advisor walks past them.
-fn spent_classes(library: &Library, state: &ProjectState, ledger: &Ledger) -> Vec<u32> {
+fn spent_classes(
+    library: &Library,
+    effort: Option<Effort>,
+    state: &ProjectState,
+    ledger: &Ledger,
+) -> Vec<u32> {
     library
         .prompts
         .iter()
-        .filter(|prompt| prompt.targets.is_matrix() && expand::is_fillable(prompt, state))
+        .filter(|prompt| {
+            prompt.targets.is_matrix()
+                && advisor::readiness(library, prompt) == Readiness::Ready
+                && effort.is_none_or(|wanted| prompt.effort == wanted)
+                && expand::is_fillable(prompt, state)
+        })
         .filter(|prompt| {
             // A class with no row at all is empty, not spent; only a class whose every row was served is spent.
             !state.candidates(prompt.targets).is_empty()
@@ -2209,22 +2269,27 @@ fn selection_json(
         .position(|&index| library.prompts[index].id == prompt.id)
         .map_or(0, |at| at + 1);
     let count = |value: usize| Value::Number(i64::try_from(value).unwrap_or(i64::MAX));
+    let shown = args.command == Command::Show;
     Value::object([
         (
             "reason",
-            Value::text(match (args.forced, args.draw) {
-                (Some(id), _) if id == prompt.id => "asked for by id",
-                _ if args.draw == Draw::Rotate => {
-                    "rotated among ready slices, weighted by the library"
+            Value::text(if shown {
+                "shown by id"
+            } else {
+                match (args.forced, args.draw) {
+                    (Some(id), _) if id == prompt.id => "asked for by id",
+                    _ if args.draw == Draw::Rotate => {
+                        "rotated among ready slices, weighted by the library"
+                    }
+                    _ => "highest leverage, then the smaller slice",
                 }
-                _ => "highest leverage, then the smaller slice",
             }),
         ),
         ("rank", count(rank)),
         ("ready_count", count(ready.len())),
         (
             "seed",
-            if args.draw == Draw::Rotate {
+            if !shown && args.draw == Draw::Rotate {
                 Value::Number(i64::try_from(args.seed).unwrap_or(i64::MAX))
             } else {
                 Value::Null
@@ -2487,8 +2552,46 @@ fix issue #{issue} at {priority=P0 or P1} priority
         assert!(message.contains("no open row left"), "{message}");
         assert!(message.contains("--row A13"), "{message}");
         // And the class is reported as spent, so the advisor's silence is explained.
-        assert_eq!(spent_classes(&library, &state, &ledger), vec![1]);
+        assert_eq!(spent_classes(&library, None, &state, &ledger), vec![1]);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_spent_class_ignores_deferred_finished_and_other_effort() {
+        let mut library = library();
+        let state = ferrox_prompt::expand::ProjectState {
+            methods: vec![row('A', "13", "VLESS over QUIC", false)],
+            pins: Vec::new(),
+        };
+        let ledger = Ledger {
+            entries: vec![advisor::Entry {
+                at: "2026-10-02T00:00:00Z".to_owned(),
+                id: 1,
+                how: "next".to_owned(),
+                target: Some("A13".to_owned()),
+            }],
+            ..Ledger::default()
+        };
+        library.prompts[0].status = Status::Doing;
+        assert_eq!(
+            spent_classes(&library, None, &state, &ledger),
+            Vec::<u32>::new()
+        );
+        library.prompts[0].status = Status::Done;
+        assert_eq!(
+            spent_classes(&library, None, &state, &ledger),
+            Vec::<u32>::new()
+        );
+        library.prompts[0].status = Status::Todo;
+        library.prompts[0].effort = Effort::Large;
+        assert_eq!(
+            spent_classes(&library, Some(Effort::Medium), &state, &ledger),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            spent_classes(&library, Some(Effort::Large), &state, &ledger),
+            vec![1]
+        );
     }
 
     #[test]
@@ -2552,6 +2655,61 @@ fix issue #{issue} at {priority=P0 or P1} priority
         assert!(parse(&owned(&["render", "2", "3"])).is_err());
         assert!(parse(&owned(&["render", "2", "--prompt", "3"])).is_err());
         assert!(parse(&owned(&["list", "--memory"])).is_err());
+    }
+
+    #[test]
+    fn an_empty_set_value_is_rejected_and_renders_as_missing() {
+        let owned: Vec<String> = ["next", "--set", "method="]
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect();
+        assert!(parse(&owned).is_err());
+
+        let mut args = parse_args(&["render", "P1"]);
+        args.values.insert("method".to_owned(), "   ".to_owned());
+        let state = ferrox_prompt::expand::ProjectState {
+            methods: Vec::new(),
+            pins: Vec::new(),
+        };
+        let values = merge_values(&requested_values(&args), None, &state);
+        assert!(!values.contains_key("method"));
+        let library = library();
+        let prompt = library.prompt(1).expect("P1");
+        let rendered = render::render(&library, prompt, &values, &[], None, Options::default());
+        assert!(rendered.missing.iter().any(|name| name == "method"));
+    }
+
+    #[test]
+    fn an_empty_pin_file_does_not_supply_references_to_next() {
+        let args = parse_args(&["next"]);
+        let state = ProjectState {
+            methods: vec![row('A', "13", "VLESS over QUIC", false)],
+            pins: Vec::new(),
+        };
+        let supplied = supplied_values(&args, &state);
+        assert!(!supplied.contains_key("references"));
+    }
+
+    #[test]
+    fn next_takes_an_id_and_refuses_the_prompt_flag() {
+        assert_eq!(parse_args(&["next", "--id", "5"]).forced, Some(5));
+        let owned: Vec<String> = ["next", "--prompt", "5"]
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect();
+        let error = parse(&owned).expect_err("next does not take --prompt");
+        assert!(error.contains("--id"), "{error}");
+    }
+
+    #[test]
+    fn show_json_reports_a_by_id_selection_without_a_draw() {
+        let library = library();
+        let prompt = library.prompt(1).expect("P1");
+        let args = parse_args(&["show", "1", "--json"]);
+        let selection = selection_json(&library, prompt, &args, &[], &[]).to_pretty();
+        assert!(selection.contains("shown by id"), "{selection}");
+        assert!(selection.contains("\"seed\": null"), "{selection}");
+        assert!(selection.contains("\"suppressed\": []"), "{selection}");
     }
 
     #[test]

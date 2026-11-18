@@ -154,7 +154,7 @@ pub fn list(paths: &Paths, filter: &str, ping: bool) -> Result<(), String> {
         println!(
             " {mark} {country:<4} {:>3} edges{}",
             cities.values().sum::<usize>(),
-            readable(country_reading(&best, country), ping)
+            readable(country_reading(&best, country), ping, measured)
         );
         let mut city_names: Vec<&String> = cities.keys().collect();
         city_names.sort();
@@ -176,7 +176,8 @@ pub fn list(paths: &Paths, filter: &str, ping: bool) -> Result<(), String> {
                     best.get(&(country.clone(), city.clone()))
                         .copied()
                         .flatten(),
-                    ping
+                    ping,
+                    measured,
                 )
             );
         }
@@ -187,8 +188,8 @@ pub fn list(paths: &Paths, filter: &str, ping: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn readable(reading: Option<u64>, ping: bool) -> String {
-    if !ping {
+fn readable(reading: Option<u64>, ping: bool, measured: bool) -> String {
+    if !ping || !measured {
         return String::new();
     }
     reading.map_or_else(
@@ -238,7 +239,7 @@ pub fn remember(paths: &Paths, country: &str, city: &str) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
-    use super::country_reading;
+    use super::{country_reading, readable};
 
     #[test]
     fn a_silent_city_does_not_hide_a_measured_one() {
@@ -246,5 +247,13 @@ mod tests {
         best.insert(("US".to_owned(), "SFO".to_owned()), None);
         best.insert(("US".to_owned(), "IAD".to_owned()), Some(21));
         assert_eq!(country_reading(&best, "US"), Some(21));
+    }
+
+    #[test]
+    fn an_offline_ping_renders_no_latency_column() {
+        assert_eq!(readable(None, true, false), "");
+        assert_eq!(readable(Some(21), true, false), "");
+        assert!(readable(None, true, true).contains("no answer"));
+        assert!(readable(Some(21), true, true).contains("21 ms"));
     }
 }

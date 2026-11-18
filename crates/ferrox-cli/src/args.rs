@@ -486,6 +486,9 @@ pub fn parse() -> Options {
     if options.ping && options.action != Action::Locations {
         die("--ping belongs to 'locations' (ferrox-cli locations --ping); nothing was started.");
     }
+    if options.browser && options.action != Action::Login {
+        die("--browser belongs to 'login' (ferrox-cli login --browser); nothing was started.");
+    }
     if (!options.exclude_domains.is_empty() || !options.exclude_ports.is_empty())
         && options.outbound != Some(Outbound::Foxy)
     {
@@ -547,7 +550,7 @@ outbound (choose one)
 foxy options
   --email ADDR           Firefox account, else FOXY_EMAIL, else the credentials file
   --password PW          password, else FOXY_PASS
-  --browser              sign in through the system browser (no password sent here)
+  --browser              with login: sign in through the system browser (no password sent here)
   --code CODE            two-factor code
   --country CC           exit country; default is the remembered one, else US
   --city CODE            city tier inside the country

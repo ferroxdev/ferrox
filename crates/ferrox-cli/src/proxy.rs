@@ -128,11 +128,28 @@ fn same_owner(text: &str, paths: &Paths) -> Result<bool, String> {
             .is_some_and(|name| name == std::ffi::OsStr::new("system-proxy.state")))
 }
 
+#[cfg(any(windows, test))]
+fn arm_owner(paths: &Paths) -> Result<(), String> {
+    if owned(paths)? {
+        Ok(())
+    } else {
+        Err(format!(
+            "system proxy: another configuration root owns {}; it was not armed again.",
+            paths.proxy_state.display()
+        ))
+    }
+}
+
 /// A legacy owner names only the shared snapshot, so it cannot say which root armed it; clearing is safe only when every registered lane can be read and none is alive.
 fn another_lane_runs(paths: &Paths) -> Result<bool, String> {
     let text = match read_trim_checked(&paths.lanes_file) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "system proxy: cannot find {}; a legacy owner cannot prove no lane is live, so the snapshot was kept.",
+                paths.lanes_file.display()
+            ));
+        }
         Err(error) => {
             return Err(format!(
                 "system proxy: cannot read {}: {error}; the snapshot was kept.",
@@ -471,6 +488,7 @@ mod win {
     }
 
     pub fn arm(paths: &Paths, socks: Option<u16>, http: Option<u16>) -> Result<(), String> {
+        super::arm_owner(paths)?;
         let key = open().map_err(|error| {
             format!("system proxy: cannot read the current settings ({error}).")
         })?;
@@ -629,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_snapshot_owner_still_reads() {
+    fn a_legacy_snapshot_owner_without_a_registry_keeps_the_snapshot() {
         let dir = workspace("legacy-snapshot");
         let paths = Paths::with_dirs(dir.join("conf"), dir.join("state"), None);
         std::fs::create_dir_all(&paths.state_dir).expect("state");
@@ -638,8 +656,23 @@ mod tests {
             &serde_json::to_string(&paths.proxy_state).expect("owner"),
         )
         .expect("owner file");
-        assert_eq!(owned(&paths), Ok(true));
+        let error = owned(&paths).expect_err("a missing registry cannot prove a lane is gone");
+        assert!(error.contains("snapshot was kept"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_root_does_not_rearm_a_snapshot_it_does_not_own() {
+        let shared = workspace("arm-owner");
+        let first = Paths::with_dirs(shared.join("first"), shared.clone(), None);
+        let second = Paths::with_dirs(shared.join("second"), shared.clone(), None);
+        std::fs::create_dir_all(&shared).expect("state");
+        std::fs::write(&first.proxy_state, "{}").expect("snapshot");
+        crate::paths::write_private(&first.proxy_owner, &owner_text(&first)).expect("owner file");
+        assert_eq!(arm_owner(&first), Ok(()));
+        let error = arm_owner(&second).expect_err("a second root must not rearm the snapshot");
+        assert!(error.contains("another configuration root"));
+        let _ = std::fs::remove_dir_all(&shared);
     }
 
     #[test]

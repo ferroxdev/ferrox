@@ -4742,35 +4742,89 @@ mod tests {
     /// One `WireGuard` edge with another `WireGuard` peer behind it, driven until the inner
     /// handshake carries nine bytes back; the runner retries it on a fresh lane.
     #[allow(clippy::too_many_lines)]
-    fn wireguard_rides_inside_wireguard_attempt(timeout: Duration) -> std::io::Result<()> {
+    fn wireguard_rides_inside_wireguard_attempt(overall: Instant) -> std::io::Result<()> {
         use std::io::{Read as _, Write as _};
         use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
 
         use ferrox_core::foxy::account::hex_encode;
         use ferrox_core::wireguard::device::public_key;
 
+        struct EchoWorker {
+            stop: Arc<AtomicBool>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl Drop for EchoWorker {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Relaxed);
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+
+        let deadline = (Instant::now() + Duration::from_secs(20)).min(overall);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the attempt began after its deadline",
+            ));
+        }
+
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo");
+        echo.set_nonblocking(true).expect("nonblocking echo");
         let echo_address = echo.local_addr().expect("echo address");
         crate::proxy::echo_trace("wiw: echo bound");
-        std::thread::spawn(move || {
-            let Ok((mut stream, _)) = echo.accept() else {
-                return;
-            };
-            let mut buf = [0u8; 1024];
-            let mut seen = 0;
-            loop {
-                let Ok(n) = stream.read(&mut buf) else {
-                    return;
-                };
-                if n == 0 || stream.write_all(&buf[..n]).is_err() {
-                    return;
-                }
-                seen += n;
-                if seen >= 9 {
-                    return;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                match echo.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+                        let mut buf = [0u8; 1024];
+                        let mut seen = 0;
+                        loop {
+                            if worker_stop.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            match stream.read(&mut buf) {
+                                Ok(0) => return,
+                                Ok(n) => {
+                                    if stream.write_all(&buf[..n]).is_err() {
+                                        return;
+                                    }
+                                    seen += n;
+                                    if seen >= 9 {
+                                        return;
+                                    }
+                                }
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::TimedOut
+                                    ) => {}
+                                Err(_) => return,
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
                 }
             }
         });
+        let _echo = EchoWorker {
+            stop,
+            handle: Some(worker),
+        };
 
         let outer_client_private = [0x11; 32];
         let outer_server_private = [0x22; 32];
@@ -4840,23 +4894,60 @@ mod tests {
             .expect("the classic chain builds");
         crate::proxy::echo_trace("wiw: classic chain");
 
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the attempt deadline passed before the pair",
+            ));
+        }
         let listener = TcpListener::bind("127.0.0.1:0").expect("pair");
+        listener.set_nonblocking(true).expect("nonblocking pair");
         let tun =
-            TcpStream::connect(listener.local_addr().expect("pair address")).expect("connect");
-        let (mut app, _) = listener.accept().expect("accept");
+            TcpStream::connect_timeout(&listener.local_addr().expect("pair address"), remaining)?;
+        let (mut app, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "no pair before the attempt deadline",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        app.set_nonblocking(false)?;
         crate::proxy::echo_trace("wiw: pair");
-        app.set_read_timeout(Some(Duration::from_millis(200)))?;
-        app.set_write_timeout(Some(Duration::from_secs(5)))?;
         classic.inner.serve_tcp(
             crate::conn::Connection::from(tun),
             &crate::proxy::Destination::Address(echo_address),
             b"head",
         );
         crate::proxy::echo_trace("wiw: serving");
-        // Resend the trigger only after a read timeout, so a slow inner handshake does not fail the test.
-        let deadline = Instant::now() + timeout;
+        // Resend the trigger only after a read timeout, within the same budget, so a slow inner handshake does not fail the test.
         let mut answer = Vec::with_capacity(9);
         let mut found = [0u8; 9];
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no echo before the handshake budget",
+            ));
+        }
+        app.set_write_timeout(Some(
+            remaining
+                .min(Duration::from_secs(5))
+                .max(Duration::from_millis(1)),
+        ))?;
+        app.set_read_timeout(Some(
+            remaining
+                .min(Duration::from_millis(200))
+                .max(Duration::from_millis(1)),
+        ))?;
         app.write_all(b"hello")?;
         loop {
             match app.read(&mut found) {
@@ -4868,24 +4959,35 @@ mod tests {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
-                    if Instant::now() >= deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             "no echo before the handshake budget",
                         ));
                     }
+                    app.set_write_timeout(Some(
+                        remaining
+                            .min(Duration::from_secs(5))
+                            .max(Duration::from_millis(1)),
+                    ))?;
+                    app.set_read_timeout(Some(
+                        remaining
+                            .min(Duration::from_millis(200))
+                            .max(Duration::from_millis(1)),
+                    ))?;
                     app.write_all(b"hello")?;
                 }
                 Err(error) => return Err(error),
-            }
-            if answer.len() >= 9 {
-                break;
             }
             if Instant::now() >= deadline {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "no echo before the handshake budget",
                 ));
+            }
+            if answer.len() >= 9 {
+                break;
             }
         }
         crate::proxy::echo_trace("wiw: answer");
@@ -4899,12 +5001,18 @@ mod tests {
             return;
         }
         let budget = Duration::from_secs(60);
-        let started = Instant::now();
+        let deadline = Instant::now() + budget;
         let mut last = None;
-        while started.elapsed() < budget {
+        while Instant::now() < deadline {
             crate::proxy::echo_trace("wiw: attempt");
-            match wireguard_rides_inside_wireguard_attempt(Duration::from_secs(20)) {
-                Ok(()) => return,
+            match wireguard_rides_inside_wireguard_attempt(deadline) {
+                Ok(()) if Instant::now() < deadline => return,
+                Ok(()) => {
+                    last = Some(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the inner handshake finished after the budget",
+                    ));
+                }
                 Err(error) => last = Some(error),
             }
         }

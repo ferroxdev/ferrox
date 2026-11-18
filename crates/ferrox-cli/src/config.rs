@@ -135,6 +135,16 @@ fn split_ports(raw: &str) -> Result<Vec<u16>, String> {
     Ok(numbers)
 }
 
+pub fn validate_exclusions(options: &Options) -> Result<(), String> {
+    if !options.exclude_domains.is_empty() {
+        split_domains(&options.exclude_domains)?;
+    }
+    if !options.exclude_ports.is_empty() {
+        split_ports(&options.exclude_ports)?;
+    }
+    Ok(())
+}
+
 pub fn effective_region(options: &Options) -> String {
     let region = if options.region.is_empty() && options.country_set {
         options.country.clone()
@@ -370,6 +380,7 @@ fn vless_outbound(link: &str) -> Result<Value, String> {
     let service = get("serviceName");
     let mode = get("mode");
     let flow = get("flow");
+    let header_type = get("headerType").to_lowercase();
 
     let network = match kind.as_str() {
         "raw" => "tcp",
@@ -418,7 +429,40 @@ fn vless_outbound(link: &str) -> Result<Value, String> {
             }
             stream.insert("xhttpSettings".to_owned(), Value::Object(settings));
         }
-        "tcp" | "raw" => {}
+        "tcp" | "raw" => match header_type.as_str() {
+            "" | "none" => {}
+            "http" => {
+                let paths: Vec<&str> = path
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .collect();
+                let path_values: Vec<&str> = if paths.is_empty() { vec!["/"] } else { paths };
+                let mut request = Map::new();
+                request.insert("version".to_owned(), json!("1.1"));
+                request.insert("method".to_owned(), json!("GET"));
+                request.insert("path".to_owned(), json!(path_values));
+                if !host_header.is_empty() {
+                    let hosts: Vec<&str> = host_header
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|host| !host.is_empty())
+                        .collect();
+                    if !hosts.is_empty() {
+                        request.insert("headers".to_owned(), json!({"Host": hosts}));
+                    }
+                }
+                stream.insert(
+                    "tcpSettings".to_owned(),
+                    json!({"header": {"type": "http", "request": Value::Object(request)}}),
+                );
+            }
+            other => {
+                return Err(format!(
+                    "`headerType={other}` needs --config: this converter writes none and http"
+                ));
+            }
+        },
         other => {
             return Err(format!(
                 "`{other}` needs --config: this converter writes tcp, ws, grpc, httpupgrade and xhttp"
@@ -437,7 +481,19 @@ fn vless_outbound(link: &str) -> Result<Value, String> {
                     sni.as_str()
                 }),
             );
-            tls.insert("allowInsecure".to_owned(), json!(false));
+            let mut allow_insecure = false;
+            for name in ["allowInsecure", "insecure"] {
+                match get(name).to_lowercase().as_str() {
+                    "" | "0" | "false" => {}
+                    "1" | "true" => allow_insecure = true,
+                    other => {
+                        return Err(format!(
+                            "`{name}={other}` wants 0 or 1; nothing was started."
+                        ));
+                    }
+                }
+            }
+            tls.insert("allowInsecure".to_owned(), json!(allow_insecure));
             if !get("fp").is_empty() {
                 tls.insert("fingerprint".to_owned(), json!(get("fp")));
             }
@@ -879,6 +935,59 @@ mod tests {
     }
 
     #[test]
+    fn vless_tls_reads_allow_insecure_from_either_spelling() {
+        let permissive =
+            vless_outbound("vless://uuid@host.test:443?type=tcp&security=tls&allowInsecure=1")
+                .unwrap();
+        assert_eq!(
+            permissive["streamSettings"]["tlsSettings"]["allowInsecure"],
+            true
+        );
+        let legacy =
+            vless_outbound("vless://uuid@host.test:443?type=tcp&security=tls&insecure=true")
+                .unwrap();
+        assert_eq!(
+            legacy["streamSettings"]["tlsSettings"]["allowInsecure"],
+            true
+        );
+        let strict = vless_outbound("vless://uuid@host.test:443?type=tcp&security=tls").unwrap();
+        assert_eq!(
+            strict["streamSettings"]["tlsSettings"]["allowInsecure"],
+            false
+        );
+        assert!(vless_outbound(
+            "vless://uuid@host.test:443?type=tcp&security=tls&allowInsecure=maybe"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn vless_tcp_carries_the_http_header_type() {
+        let outbound = vless_outbound(
+            "vless://uuid@host.test:443?type=tcp&headerType=http&host=cdn.example&path=%2Fa",
+        )
+        .unwrap();
+        let header = &outbound["streamSettings"]["tcpSettings"]["header"];
+        assert_eq!(header["type"], "http");
+        assert_eq!(header["request"]["path"][0], "/a");
+        assert_eq!(header["request"]["headers"]["Host"][0], "cdn.example");
+        assert!(vless_outbound("vless://uuid@host.test:443?type=tcp&headerType=srtp").is_err());
+    }
+
+    #[test]
+    fn exclusions_are_validated_before_any_account_is_resolved() {
+        let mut options = options();
+        options.exclude_domains = "*.Example.COM, .lan".to_owned();
+        options.exclude_ports = "22,443".to_owned();
+        assert_eq!(validate_exclusions(&options), Ok(()));
+        options.exclude_domains = "a/b".to_owned();
+        assert!(validate_exclusions(&options).is_err());
+        options.exclude_domains.clear();
+        options.exclude_ports = "65536".to_owned();
+        assert!(validate_exclusions(&options).is_err());
+    }
+
+    #[test]
     fn vless_reality_without_a_key_is_refused() {
         let error = vless_outbound("vless://uuid@host:443?security=reality").unwrap_err();
         assert!(error.contains("pbk"));
@@ -909,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_ports_scans_only_when_an_instance_asked() {
+    fn plan_ports_scans_when_asked() {
         let dir = scratch("scan");
         let paths = Paths::with_dirs(dir.clone(), dir.join("state"), Some("work"));
         let mut options = options();
