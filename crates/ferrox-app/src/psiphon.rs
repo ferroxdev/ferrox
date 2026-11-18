@@ -13706,6 +13706,10 @@ mod tests {
         }
         apply_fronting_overrides(&mut servers, &settings);
         assert!(servers.len() <= FRONTED_SERVERS + 513);
+        assert!(servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref())
+            .any(|meek| meek.dial == "198.51.100.7"));
         let hosts: HashSet<String> = servers
             .iter()
             .filter_map(|server| server.meek.as_ref().map(|meek| meek.host.clone()))
