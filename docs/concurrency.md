@@ -34,11 +34,11 @@ A duration suggests; a thread count proves. `threads_peak` per engine per cell i
 | cell | ferrox before | ferrox now | xray-core | zeronet |
 | --- | ---: | ---: | ---: | ---: |
 | ubuntu x86_64, 8 connections | 31 | 10 | 17 | 5 |
-| ubuntu aarch64, 8 connections | — | 10 | 17 | 5 |
+| ubuntu aarch64, 8 connections | — | — | 17 | 5 |
 | windows x86_64, 8 connections | 39 | 11 | 11 | 9 |
 | macOS aarch64, 8 connections | — | 6 | 19 | 4 |
 
-The Linux peak is **10** (`threads_peak` in run `44254395118`, cells `http-raw-down-8` and `socks-raw-down-8`), and **11** on Windows; the pool is sized by cores, not by flows, so the number does not move with the flow count. Throughput gate passed in every cell (paired ferrox/xray-core midpoints 2.13×, 2.63×, 1.20×, and 1.28× at eight ties and 1.08× five-way median on macOS); CPU per GiB and peak RSS are lower than xray-core in the same cells.
+The x86_64 Linux peak is **10** (`threads_peak` in run `44254395118`, cells `http-raw-down-8` and `socks-raw-down-8`) and **11** on Windows; the aarch64 row is unread since the pool began sizing by cores. The pool is sized by cores, not by flows, so the number does not move with the flow count. Throughput gate passed in every cell (paired ferrox/xray-core midpoints 2.13×, 2.63×, 1.20×, and 1.28× at eight ties and 1.08× five-way median on macOS); CPU per GiB and peak RSS are lower than xray-core in the same cells.
 
 The **idle-leg** half is still open for the carriered paths below the VMess pump: the cell above carries active traffic, proving the fixed peak for raw TCP only. The pages' per-peer `pinned-threads` rows are the checker there, and `idle-legs-pinned-threads-per-connection` stays `UNBLESSED` until a carrier cell reads it. VMess's `a_live_vmess_session_costs_no_thread` and Shadowsocks's `a_live_session_costs_no_thread` (one in each of `shadowsocks` and `shadowsocks2022`) are the exceptions: each holds eight sessions with no traffic at all, which is the idle-leg shape for those pumps.
 
