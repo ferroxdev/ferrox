@@ -561,7 +561,7 @@ impl Api {
                         if let Some(call) = calls.get_mut(&id) {
                             call.end_stream |= end_stream;
                         }
-                        let pseudo = match absorb_headers(
+                        let invalid = match absorb_headers(
                             &mut decoder,
                             &mut discard,
                             id,
@@ -569,14 +569,14 @@ impl Api {
                             end,
                             true,
                         ) {
-                            Ok(pseudo) => pseudo,
+                            Ok(invalid) => invalid,
                             Err(code) => {
                                 goaway(&mut stream, code, last_id);
                                 return;
                             }
                         };
                         if end {
-                            if pseudo || !end_stream {
+                            if invalid || !end_stream {
                                 if !reset(&mut stream, id, h2::E_PROTOCOL) {
                                     return;
                                 }
@@ -636,7 +636,7 @@ impl Api {
                 h2::T_CONT => {
                     if discard.is_some() {
                         let trailers = calls.get(&id).is_some_and(|call| call.end_headers);
-                        let pseudo = match absorb_headers(
+                        let invalid = match absorb_headers(
                             &mut decoder,
                             &mut discard,
                             id,
@@ -644,7 +644,7 @@ impl Api {
                             flags & h2::F_END_HEADERS != 0,
                             trailers,
                         ) {
-                            Ok(pseudo) => pseudo,
+                            Ok(invalid) => invalid,
                             Err(code) => {
                                 goaway(&mut stream, code, last_id);
                                 return;
@@ -654,7 +654,7 @@ impl Api {
                             continuation = None;
                             if trailers {
                                 if let Some(call) = calls.remove(&id) {
-                                    if pseudo || !call.end_stream {
+                                    if invalid || !call.end_stream {
                                         if !reset(&mut stream, id, h2::E_PROTOCOL) {
                                             return;
                                         }
@@ -1656,17 +1656,17 @@ fn absorb_headers(
     end: bool,
     trailers: bool,
 ) -> Result<bool, u32> {
-    let mut pseudo = false;
+    let mut invalid = false;
     if end && discard.is_none() {
         if block.len() > h2::HEAD_CAP {
             return Err(h2::E_PROTOCOL);
         }
         decoder
             .decode(block, &mut |name, _| {
-                pseudo |= trailers && name.first() == Some(&b':');
+                invalid |= trailers && !trailer_field(name);
             })
             .ok_or(h2::E_COMPRESSION)?;
-        return Ok(pseudo);
+        return Ok(invalid);
     }
     let (held_id, mut held) = discard.take().unwrap_or_else(|| (id, Vec::new()));
     if held_id != id || held.len() + block.len() > h2::HEAD_CAP {
@@ -1676,13 +1676,23 @@ fn absorb_headers(
     if end {
         decoder
             .decode(&held, &mut |name, _| {
-                pseudo |= trailers && name.first() == Some(&b':');
+                invalid |= trailers && !trailer_field(name);
             })
             .ok_or(h2::E_COMPRESSION)?;
     } else {
         *discard = Some((id, held));
     }
-    Ok(pseudo)
+    Ok(invalid)
+}
+
+fn trailer_field(name: &[u8]) -> bool {
+    !name.is_empty()
+        && !name.iter().any(u8::is_ascii_uppercase)
+        && name.first() != Some(&b':')
+        && !matches!(
+            name,
+            b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding" | b"upgrade"
+        )
 }
 
 fn data_body(body: &[u8], flags: u8) -> Option<&[u8]> {
