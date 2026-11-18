@@ -219,6 +219,9 @@ struct Job {
 
 /// One worker per configured server: a lookup can start every server it has, and a storm of unique
 /// names queues behind the pool instead of starting `servers.len()` threads and sockets per lookup.
+/// The queued lookups one pool holds before fresh work fails fast instead of growing memory.
+const QUEUE_MAX: usize = 4096;
+
 struct Pool {
     queue: Mutex<VecDeque<Job>>,
     ready: Condvar,
@@ -280,13 +283,24 @@ impl Pool {
             .queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queue.len() >= QUEUE_MAX {
+            drop(queue);
+            let _ = job.answers.send((job.slot, Lookup::Failed));
+            return;
+        }
         queue.push_back(job);
         drop(queue);
         self.ready.notify_one();
     }
 
     fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        {
+            let _queue = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.closed.store(true, Ordering::SeqCst);
+        }
         self.ready.notify_all();
     }
 
@@ -600,7 +614,7 @@ impl Resolver {
             }
         }
         if order.is_empty() {
-            order.push(0);
+            return Lookup::Failed;
         }
         self.ask(&order, &name, v4, v6, fake_enabled, force_local)
     }
@@ -669,19 +683,6 @@ impl Resolver {
             .pool
             .get_or_init(|| Pool::spawn(&Arc::downgrade(self), self.servers.len().max(1)));
         let (sender, receiver) = mpsc::channel();
-        for (slot, &index) in order.iter().enumerate() {
-            pool.push(Job {
-                slot,
-                index,
-                name: name.to_owned(),
-                v4,
-                v6,
-                fake_enabled,
-                force_local,
-                answers: sender.clone(),
-            });
-        }
-        drop(sender);
         let mut results: Vec<Option<Lookup>> = (0..order.len()).map(|_| None).collect();
         let mut last_rcode = None;
         let mut empty = false;
@@ -693,6 +694,19 @@ impl Resolver {
                 && self.servers[order[end]].policy_id == self.servers[order[start]].policy_id
             {
                 end += 1;
+            }
+            // Only this policy's group is queued, so a later group's servers never see its answer.
+            for (slot, &index) in order.iter().enumerate().take(end).skip(start) {
+                pool.push(Job {
+                    slot,
+                    index,
+                    name: name.to_owned(),
+                    v4,
+                    v6,
+                    fake_enabled,
+                    force_local,
+                    answers: sender.clone(),
+                });
             }
             loop {
                 if let Some(slot) = (start..end).find(|&slot| {

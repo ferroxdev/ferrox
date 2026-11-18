@@ -5414,8 +5414,7 @@ fn serve_accepted(
     crate::sniff::install_current(sniffing);
     let (stream, role) = match role {
         Role::Proxied(inner) => {
-            let _ = stream.set_read_timeout(Some(budgets::handshake()));
-            let source = crate::conn::read_proxy_header(&mut stream);
+            let source = crate::conn::read_proxy_header(&mut stream, budgets::handshake());
             let _ = stream.set_read_timeout(None);
             let Ok(source) = source else { return };
             let stream = match source {
@@ -8446,16 +8445,20 @@ pub(crate) fn dns_stream(
     port: u16,
     tag: Option<&str>,
     timeout: Duration,
-) -> Option<Connection> {
+) -> Result<Option<Connection>, String> {
     let dest = dns_destination(host, port);
-    let out = dns_outbound(&dest, crate::router::Network::Tcp, tag)?;
+    let Some(out) = dns_outbound(&dest, crate::router::Network::Tcp, tag) else {
+        return Ok(None);
+    };
     // Freedom is the system dial under another name, so the direct path is shorter and the same.
     if let Outbound::Freedom(freedom) = &out {
         if freedom.is_plain() {
-            return None;
+            return Ok(None);
         }
     }
     dns_stream_with(&out, dest, timeout)
+        .map(Some)
+        .ok_or_else(|| "dns stream: the routed dial failed".to_owned())
 }
 
 fn dns_stream_with(out: &Outbound, dest: Destination, timeout: Duration) -> Option<Connection> {
@@ -8572,16 +8575,20 @@ pub(crate) fn dns_udp(
     tag: Option<&str>,
     query: &[u8],
     timeout: Duration,
-) -> Option<Vec<u8>> {
-    let target = dns_socket(host, port)?;
+) -> Result<Option<Vec<u8>>, String> {
+    let target = dns_socket(host, port).ok_or_else(|| "dns udp: no endpoint".to_owned())?;
     let dest = Destination::Address(target);
-    let out = dns_outbound(&dest, crate::router::Network::Udp, tag)?;
+    let Some(out) = dns_outbound(&dest, crate::router::Network::Udp, tag) else {
+        return Ok(None);
+    };
     if let Outbound::Freedom(freedom) = &out {
         if freedom.is_plain() {
-            return None;
+            return Ok(None);
         }
     }
     dns_udp_with(&out, target, query, timeout)
+        .map(Some)
+        .ok_or_else(|| "dns udp: the routed query failed".to_owned())
 }
 
 fn dns_udp_with(
@@ -9181,6 +9188,7 @@ fn teardown_mux(
     };
     // The session's own socket goes first: a flow parked in a Keep to a client that stopped reading wakes here instead of at its deadline.
     wire.shutdown();
+    let flow_count = u32::try_from(flows.len()).unwrap_or(u32::MAX);
     for flow in flows {
         flow.control.cancel();
     }
@@ -9189,6 +9197,12 @@ fn teardown_mux(
         session.done.store(true, Ordering::Relaxed);
     }
     if let Some(worker) = worker {
+        for _ in 0..flow_count {
+            worker.release_connection();
+        }
+        for _ in udp.values() {
+            worker.release_connection();
+        }
         worker.closed();
     }
     for done in handles {
@@ -19862,8 +19876,11 @@ fn relay_pool_flow(client: &Connection, mut flow: PooledFlow) {
     };
     let done = RelayPool::global().run(move || {
         let mut down = down;
-        mux_pool_downlink(&replies, &mut down);
-        let _ = down.shutdown(Shutdown::Write);
+        if mux_pool_downlink(&replies, &mut down) {
+            let _ = down.shutdown(Shutdown::Write);
+        } else {
+            let _ = down.shutdown(Shutdown::Both);
+        }
     });
     let mut chunk = vec![0u8; MUX_UPLOAD_SLICE];
     let Ok(mut plain) = up.try_clone() else {

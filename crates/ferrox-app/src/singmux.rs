@@ -404,6 +404,8 @@ struct Sink {
     queue: Arc<Queue>,
     window: Arc<Window>,
     awaiting_status: bool,
+    remote_end: bool,
+    local_end: bool,
 }
 
 pub(crate) struct Replies {
@@ -572,6 +574,8 @@ impl Inner {
                 queue: Arc::clone(&queue),
                 window: Arc::clone(&window),
                 awaiting_status: false,
+                remote_end: false,
+                local_end: false,
             },
         );
         drop(sinks);
@@ -727,6 +731,38 @@ impl Inner {
         };
     }
 
+    fn end_remote(&self, id: u32) {
+        let done = {
+            let Ok(mut sinks) = self.sinks.lock() else {
+                return;
+            };
+            let Some(sink) = sinks.get_mut(&id) else {
+                return;
+            };
+            sink.remote_end = true;
+            sink.local_end
+        };
+        if done {
+            self.reap(id);
+        }
+    }
+
+    fn end_local(&self, id: u32) {
+        let done = {
+            let Ok(mut sinks) = self.sinks.lock() else {
+                return;
+            };
+            let Some(sink) = sinks.get_mut(&id) else {
+                return;
+            };
+            sink.local_end = true;
+            sink.remote_end
+        };
+        if done {
+            self.reap(id);
+        }
+    }
+
     fn deliver(&self, id: u32, data: &[u8], end: bool) {
         self.deliver_credit(id, data, end, data.len());
     }
@@ -777,7 +813,7 @@ impl Inner {
         });
         if end {
             queue.close();
-            self.reap(id);
+            self.end_remote(id);
         } else if !queued {
             self.reap(id);
         }
@@ -1244,6 +1280,7 @@ impl Stream {
             self.inner.send_end(self.id);
         }
         self.window.close();
+        self.inner.end_local(self.id);
     }
 
     pub(crate) fn reset(&self) {
@@ -1334,6 +1371,7 @@ impl StreamWriter {
             self.inner.send_end(self.id);
         }
         self.window.close();
+        self.inner.end_local(self.id);
     }
 }
 
@@ -1864,6 +1902,47 @@ mod tests {
         flow.close();
         close();
         worker.join().expect("worker");
+    }
+
+    #[test]
+    fn a_remote_end_keeps_the_window_until_the_local_side_finishes() {
+        let (client, server) = pair();
+        let client_read = client.try_clone().expect("client read");
+        let client_write = client.try_clone().expect("client write");
+        let stop = client.try_clone().expect("client stop");
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = stop.shutdown(Shutdown::Both);
+        });
+        let session = Client::connect(
+            Protocol::Yamux,
+            false,
+            Box::new(client_read),
+            Box::new(client_write),
+            close,
+        )
+        .expect("client");
+        let target = Destination::Name("example.com".to_owned(), 443);
+        let flow = open_on(&session.session, &target).expect("flow");
+        let id = flow.stream.id;
+        session.session.deliver(id, b"", true);
+        assert!(
+            session
+                .session
+                .sinks
+                .lock()
+                .is_ok_and(|sinks| sinks.contains_key(&id)),
+            "a remote end does not unmap the window before the local send end"
+        );
+        flow.close();
+        assert!(
+            session
+                .session
+                .sinks
+                .lock()
+                .is_ok_and(|sinks| !sinks.contains_key(&id)),
+            "the local end releases the window after both directions finished"
+        );
+        drop(server);
     }
 
     #[test]

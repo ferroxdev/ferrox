@@ -804,13 +804,16 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         let mut dot = self.dot;
         let mut walk = self.walk;
         if !walk.framed {
-            if end - dot < SHORTEST_FRAME {
+            if end - dot < 16 {
                 return 0;
             }
             if self.have[dot..dot + 16] != self.uuid {
                 // the uuid is a window, not a gate: a raw-target proxy passes everything through, exactly as the staged path did
                 self.session.disarm_record_alignment();
                 self.read.padding = false;
+                return 0;
+            }
+            if end - dot < SHORTEST_FRAME {
                 return 0;
             }
             walk = Walk {
@@ -907,7 +910,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 dot += take;
                 walk.want_content -= take;
                 held += take;
-                if walk.want_content > 0 || held == cap {
+                if walk.want_content > 0 {
                     break 'frames held;
                 }
             }
@@ -992,7 +995,9 @@ impl Tls {
                 self.twelve_or_above = true;
                 if bytes.len() >= 79 && self.server_hello_left >= 79 {
                     let at = 44 + usize::from(bytes[43]);
-                    self.cipher = u16::from_be_bytes([bytes[at], bytes[at + 1]]);
+                    if let Some(pair) = bytes.get(at..at.saturating_add(2)) {
+                        self.cipher = u16::from_be_bytes([pair[0], pair[1]]);
+                    }
                 }
             } else if head[..2] == TLS_HANDSHAKE_START && head[5] == 0x01 {
                 self.present = true;

@@ -384,9 +384,13 @@ fn parse_standard(spec: &str) -> Result<Schedule, String> {
         let Some(rest) = spec.strip_prefix(prefix) else {
             continue;
         };
-        let (_, tail) = rest.split_once(char::is_whitespace).ok_or_else(|| {
+        let (zone, tail) = rest.split_once(char::is_whitespace).ok_or_else(|| {
             "provided bad location: the spec names no schedule after the zone".to_owned()
         })?;
+        if !zone.is_empty() {
+            // Only the host zone is carried; a named zone would run at the wrong hour if dropped.
+            return Err(format!("cron timezone `{zone}` is not carried"));
+        }
         spec = tail.trim();
         break;
     }
@@ -555,7 +559,10 @@ fn parse_uint(text: &str) -> Result<u32, String> {
 /// and optional fractional numbers, with `0` as the one unitless form.
 #[allow(clippy::cast_precision_loss)]
 fn parse_duration(text: &str) -> Option<Duration> {
-    let text = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let text = text.strip_prefix('+').unwrap_or(text);
+    if text.starts_with('-') {
+        return None;
+    }
     if text == "0" {
         return Some(Duration::ZERO);
     }
@@ -622,19 +629,27 @@ pub(crate) fn start(
     } = config;
     let _ = std::thread::Builder::new()
         .name("geodata".to_owned())
-        .spawn(move || loop {
-            let Some(delay) = schedule.delay(SystemTime::now()) else {
-                return;
-            };
-            std::thread::sleep(delay);
-            if let Err(reason) = run(
-                &assets,
-                route.as_deref(),
-                default.as_ref(),
-                &outbound,
-                &root,
-            ) {
-                eprintln!("geodata: scheduled reload failed: {reason}");
+        .spawn(move || {
+            let mut anchor = SystemTime::now();
+            loop {
+                let Some(delay) = schedule.delay(anchor) else {
+                    return;
+                };
+                anchor += delay;
+                std::thread::sleep(anchor.duration_since(SystemTime::now()).unwrap_or_default());
+                if let Err(reason) = run(
+                    &assets,
+                    route.as_deref(),
+                    default.as_ref(),
+                    &outbound,
+                    &root,
+                ) {
+                    eprintln!("geodata: scheduled reload failed: {reason}");
+                }
+                let now = SystemTime::now();
+                if now > anchor {
+                    anchor = now;
+                }
             }
         });
 }
@@ -919,6 +934,10 @@ fn request(url: &str, outbound: &Outbound) -> Result<Response, String> {
 /// of memory. The take caps the bytes the read may consume, and a line that does not
 /// end inside them is refused; a clean end of stream reads as an empty line, as before.
 fn capped_line(reader: &mut impl BufRead, what: &str) -> Result<String, String> {
+    Ok(capped_line_eof(reader, what)?.unwrap_or_default())
+}
+
+fn capped_line_eof(reader: &mut impl BufRead, what: &str) -> Result<Option<String>, String> {
     let mut buf = Vec::new();
     let read = reader
         .by_ref()
@@ -926,12 +945,14 @@ fn capped_line(reader: &mut impl BufRead, what: &str) -> Result<String, String> 
         .read_until(b'\n', &mut buf)
         .map_err(|error| error.to_string())?;
     if read == 0 {
-        return Ok(String::new());
+        return Ok(None);
     }
     if !buf.ends_with(b"\n") {
         return Err(format!("geodata {what} exceeds {MAX_HEAD_LINE} bytes"));
     }
-    String::from_utf8(buf).map_err(|_| format!("geodata {what} is not UTF-8"))
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| format!("geodata {what} is not UTF-8"))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1061,7 +1082,9 @@ fn read_chunked(reader: &mut impl BufRead, body: &mut Vec<u8>) -> Result<(), Str
         if size == 0 {
             let mut trailers = 0;
             loop {
-                let trailer = capped_line(reader, "chunk trailer")?;
+                let Some(trailer) = capped_line_eof(reader, "chunk trailer")? else {
+                    return Err("geodata chunk trailer is truncated".to_owned());
+                };
                 if trailer.trim().is_empty() {
                     break;
                 }
@@ -1095,16 +1118,30 @@ fn read_chunked(reader: &mut impl BufRead, body: &mut Vec<u8>) -> Result<(), Str
 }
 
 fn resolve_location(base: &str, location: &str) -> Result<String, String> {
-    if location.starts_with("https://") {
+    let prefix = location.get(..8).unwrap_or(location).to_ascii_lowercase();
+    if prefix.starts_with("https://") {
         return Ok(location.to_owned());
     }
-    if location.starts_with("http://") {
+    if prefix.starts_with("http://") {
         return Err("redirected to non-https URL".to_owned());
     }
     if let Some(rest) = location.strip_prefix("//") {
         return Ok(format!("https://{rest}"));
     }
     let url = HttpUrl::parse(base)?;
+    let (path, query) = match url.path.split_once('?') {
+        Some((path, query)) => (path, format!("?{query}")),
+        None => (url.path.as_str(), String::new()),
+    };
+    if location.starts_with('?') {
+        return Ok(format!("https://{}{}{}", url.authority, path, location));
+    }
+    if location.starts_with('#') {
+        return Ok(format!(
+            "https://{}{}{}{}",
+            url.authority, path, query, location
+        ));
+    }
     let path = if location.starts_with('/') {
         location.to_owned()
     } else {
@@ -1318,9 +1355,7 @@ mod tests {
             "*/15 0-6,22 1 jan-mar mon-fri",
             "5/10 * * * *",
             "+5 * * * *",
-            "TZ=UTC 0 3 * * *",
             "TZ= 0 3 * * *",
-            "CRON_TZ=Europe/Berlin @hourly",
             "@yearly",
             "@annually",
             "@monthly",
@@ -1354,6 +1389,9 @@ mod tests {
             "@sometimes",
             "@every 5",
             "@every",
+            "@every -5m",
+            "TZ=UTC 0 3 * * *",
+            "CRON_TZ=Europe/Berlin @hourly",
         ] {
             assert!(
                 parse_standard(spec).is_err(),
@@ -1492,6 +1530,22 @@ mod tests {
         );
         let error = parse(&root, &[dir]).expect_err("only the rules dataset carries .dat.gz");
         assert!(error.contains(".dat"), "{error}");
+    }
+
+    #[test]
+    fn a_query_redirect_replaces_the_query_it_names() {
+        assert_eq!(
+            resolve_location("https://example.test/a?old=1", "?new=2").expect("joined"),
+            "https://example.test/a?new=2"
+        );
+        assert_eq!(
+            resolve_location("https://example.test/a?old=1", "#part").expect("joined"),
+            "https://example.test/a?old=1#part"
+        );
+        assert_eq!(
+            resolve_location("https://example.test/a", "#part").expect("joined"),
+            "https://example.test/a#part"
+        );
     }
 
     #[test]

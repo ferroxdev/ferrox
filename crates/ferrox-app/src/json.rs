@@ -74,7 +74,12 @@ pub(crate) fn merge(base: &mut Json, over: &Json, name: &str) {
     let (Json::Obj(base), Json::Obj(pairs)) = (base, over) else {
         return;
     };
-    let tail = name.to_ascii_lowercase().contains("tail");
+    let tail = std::path::Path::new(name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(name)
+        .to_ascii_lowercase()
+        .contains("tail");
     for (key, value) in pairs {
         if matches!(value, Json::Null) {
             continue;
@@ -442,6 +447,98 @@ fn next_json_special_swar(bytes: &[u8]) -> Option<(usize, u8)> {
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
+/// JSONC: `//` and `/* */` comments and trailing commas, stripped outside strings so the
+/// strict parser sees the JSON the reference's jsonc decoder would.
+pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut changed = false;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if quoted {
+            out.push(byte);
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => quoted = false,
+                _ => {}
+            }
+            at += 1;
+        } else if byte == b'"' {
+            quoted = true;
+            out.push(byte);
+            at += 1;
+        } else if byte == b'/' && bytes.get(at + 1) == Some(&b'/') {
+            changed = true;
+            at += 2;
+            while at < bytes.len() && bytes[at] != b'\n' {
+                at += 1;
+            }
+        } else if byte == b'/' && bytes.get(at + 1) == Some(&b'*') {
+            changed = true;
+            at += 2;
+            while at + 1 < bytes.len() && !(bytes[at] == b'*' && bytes[at + 1] == b'/') {
+                at += 1;
+            }
+            at = (at + 2).min(bytes.len());
+        } else {
+            out.push(byte);
+            at += 1;
+        }
+    }
+    let comments = changed;
+    let mut kept = Vec::with_capacity(out.len());
+    let mut at = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut trimmed = false;
+    while at < out.len() {
+        let byte = out[at];
+        if quoted {
+            kept.push(byte);
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => quoted = false,
+                _ => {}
+            }
+            at += 1;
+            continue;
+        }
+        if byte == b'"' {
+            quoted = true;
+            kept.push(byte);
+            at += 1;
+            continue;
+        }
+        if byte == b',' {
+            let mut next = at + 1;
+            while next < out.len() && out[next].is_ascii_whitespace() {
+                next += 1;
+            }
+            let mut before = at;
+            while before > 0 && out[before - 1].is_ascii_whitespace() {
+                before -= 1;
+            }
+            let complete = before > 0 && !matches!(out[before - 1], b'[' | b'{' | b',' | b':');
+            if complete && matches!(out.get(next), Some(b'}' | b']')) {
+                at += 1;
+                trimmed = true;
+                continue;
+            }
+        }
+        kept.push(byte);
+        at += 1;
+    }
+    if !comments && !trimmed {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(String::from_utf8_lossy(&kept).into_owned())
+}
+
 pub(crate) fn parse(text: &str) -> Result<Json, String> {
     let mut cursor = Cursor {
         bytes: text.as_bytes(),
@@ -667,10 +764,35 @@ impl Cursor<'_> {
                     unit = unit * 16 + hex(self.bytes[self.pos + i], self.pos + i)?;
                 }
                 self.pos += 4;
+                if (0xD800..=0xDBFF).contains(&unit) {
+                    let low = self.low_surrogate()?;
+                    let scalar = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+                    return char::from_u32(scalar)
+                        .ok_or_else(|| format!("bad scalar at offset {}", self.pos));
+                }
                 char::from_u32(unit).ok_or_else(|| format!("bad scalar at offset {}", self.pos))
             }
             _ => Err(format!("bad escape at offset {}", self.pos)),
         }
+    }
+
+    fn low_surrogate(&mut self) -> Result<u32, String> {
+        if self.bytes.get(self.pos..self.pos + 2) != Some(b"\\u") {
+            return Err(format!("unpaired high surrogate at offset {}", self.pos));
+        }
+        self.pos += 2;
+        if self.pos + 4 > self.bytes.len() {
+            return Err(format!("short `\\u` escape at offset {}", self.pos));
+        }
+        let mut unit = 0u32;
+        for i in 0..4 {
+            unit = unit * 16 + hex(self.bytes[self.pos + i], self.pos + i)?;
+        }
+        self.pos += 4;
+        if !(0xDC00..=0xDFFF).contains(&unit) {
+            return Err(format!("unpaired high surrogate at offset {}", self.pos));
+        }
+        Ok(unit)
     }
 
     fn number(&mut self) -> Result<Json, String> {
@@ -678,8 +800,15 @@ impl Cursor<'_> {
         if self.bytes.get(self.pos) == Some(&b'-') {
             self.pos += 1;
         }
-        while self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
+        if self.bytes.get(self.pos) == Some(&b'0') {
             self.pos += 1;
+            if self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                return Err(format!("leading zero at offset {from}"));
+            }
+        } else {
+            while self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                self.pos += 1;
+            }
         }
         if self.bytes.get(self.pos) == Some(&b'.') {
             self.pos += 1;
@@ -906,6 +1035,16 @@ mod tests {
             .as_str()
             .expect("string");
         assert_eq!(id, "b831381d-6324-4d53-ad4f-8cda48b30811");
+    }
+
+    #[test]
+    fn a_trailing_comma_without_a_comment_still_goes() {
+        assert_eq!(strip_jsonc(r#"{"a":[1,2,],}"#), r#"{"a":[1,2]}"#);
+        assert_eq!(strip_jsonc(r#"{"a":[,]}"#), r#"{"a":[,]}"#);
+        assert_eq!(strip_jsonc(r#"{"a":[1,,]}"#), r#"{"a":[1,,]}"#);
+        assert_eq!(strip_jsonc(r#"{"a":{}}"#), r#"{"a":{}}"#);
+        let quoted = r#"{"a":",}"}"#;
+        assert_eq!(strip_jsonc(quoted), quoted);
     }
 
     #[test]

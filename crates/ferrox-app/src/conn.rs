@@ -1620,15 +1620,51 @@ impl Connection {
     }
 }
 
+/// Read a fixed-length prefix while one deadline covers every byte: a peer that drips a byte
+/// before each per-read timeout still runs out of the listener's budget.
+fn read_exact_within(
+    stream: &mut Connection,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the PROXY header outlasted its budget",
+            ));
+        }
+        stream.set_read_timeout(Some(deadline - now))?;
+        match stream.read(&mut buffer[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the PROXY header ended early",
+                ))
+            }
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Read the PROXY protocol header a listener's `acceptProxyProtocol` promised. A v1 text line or
 /// a v2 binary header is consumed in full and the source address it reports is returned; `None`
 /// means the header is valid but names no IP source (`UNKNOWN`, `LOCAL`, or a Unix/unspecified
 /// family), so the socket's own peer stays the source. A malformed or truncated header is an
 /// error, and the caller closes the connection rather than letting carrier bytes stand in for it.
-pub(crate) fn read_proxy_header(stream: &mut Connection) -> io::Result<Option<SocketAddr>> {
+pub(crate) fn read_proxy_header(
+    stream: &mut Connection,
+    budget: Duration,
+) -> io::Result<Option<SocketAddr>> {
     const V2_SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
+    let deadline = Instant::now() + budget;
     let mut first = [0u8; 12];
-    stream.read_exact(&mut first)?;
+    read_exact_within(stream, &mut first, deadline)?;
     if &first[..6] == b"PROXY " {
         let mut line = [0u8; 108];
         line[..12].copy_from_slice(&first);
@@ -1637,7 +1673,7 @@ pub(crate) fn read_proxy_header(stream: &mut Connection) -> io::Result<Option<So
             if len >= 2 && &line[len - 2..len] == b"\r\n" {
                 break;
             }
-            stream.read_exact(&mut line[len..=len])?;
+            read_exact_within(stream, &mut line[len..=len], deadline)?;
             len += 1;
         }
         if len < 2 || &line[len - 2..len] != b"\r\n" {
@@ -1653,14 +1689,14 @@ pub(crate) fn read_proxy_header(stream: &mut Connection) -> io::Result<Option<So
         ));
     }
     let mut head = [0u8; 4];
-    stream.read_exact(&mut head)?;
+    read_exact_within(stream, &mut head, deadline)?;
     if head[0] >> 4 != 2 {
         return Err(bad_proxy("the PROXY v2 header names another version"));
     }
     let command = head[0] & 0x0f;
     let length = usize::from(u16::from_be_bytes([head[2], head[3]]));
     let mut body = vec![0u8; length];
-    stream.read_exact(&mut body)?;
+    read_exact_within(stream, &mut body, deadline)?;
     if command == 0 {
         return Ok(None);
     }
@@ -1752,11 +1788,20 @@ fn set_socket_timeout(
     use std::os::fd::AsRawFd;
     let mut value: libc::timeval = unsafe { std::mem::zeroed() };
     if let Some(timeout) = timeout {
-        // Whole microseconds; the sub-microsecond remainder would only round the bound down.
+        // A zero `timeval` means "no bound", so zero is refused and a sub-microsecond wait rounds up.
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot set a zero-duration socket timeout",
+            ));
+        }
         value.tv_sec = timeout.as_secs().try_into().unwrap_or(i64::MAX);
         // `suseconds_t` is `i32` on macOS, where this conversion can fail, and `i64` on Linux, where it cannot.
         #[allow(clippy::unnecessary_fallible_conversions)]
-        let usec: libc::suseconds_t = timeout.subsec_micros().try_into().unwrap_or(0);
+        let mut usec: libc::suseconds_t = timeout.subsec_micros().try_into().unwrap_or(0);
+        if value.tv_sec == 0 && usec == 0 {
+            usec = 1;
+        }
         value.tv_usec = usec;
     }
     // SAFETY: `value` is a live `timeval`, sized as the kernel reads the option, on the stream's own descriptor.
@@ -1944,10 +1989,22 @@ impl HttpUrl {
             let (host, tail) = bracketed
                 .split_once(']')
                 .ok_or_else(|| "URL has an unclosed IPv6 host".to_owned())?;
-            let port = tail
-                .strip_prefix(':')
-                .and_then(|port| port.parse().ok())
-                .unwrap_or(if tls { 443 } else { 80 });
+            let port = if tail.is_empty() {
+                if tls {
+                    443
+                } else {
+                    80
+                }
+            } else {
+                let port = tail
+                    .strip_prefix(':')
+                    .ok_or_else(|| "URL has unexpected text after its IPv6 host".to_owned())?;
+                if port.is_empty() || !port.chars().all(|ch| ch.is_ascii_digit()) {
+                    return Err("URL has an invalid port".to_owned());
+                }
+                port.parse()
+                    .map_err(|_| "URL has an invalid port".to_owned())?
+            };
             (host.to_owned(), port)
         } else if let Some((host, port)) = authority.rsplit_once(':') {
             if port.chars().all(|ch| ch.is_ascii_digit()) {
@@ -2251,10 +2308,10 @@ fn split_permission(path: &std::path::Path) -> (&std::path::Path, Option<u32>) {
 /// socket is replaced and a file that is not a socket is refused, so a typo cannot delete data; a
 /// requested mode is applied inside a private staging directory beside the socket and then
 /// hard-linked into place, so nothing but our own socket ever takes the permission — or, when the
-/// directory leaves no room for a staged name, to the path itself.
+/// directory leaves no room for a staged name, to the bound socket after a no-follow check.
 #[cfg(unix)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
-    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some((name, padded)) = abstract_name(path) {
         return abstract_listener(name, padded);
@@ -2281,11 +2338,129 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
     // The directory leaves no room for a staged name, so the mode goes on the path itself.
     take_stale(path, stale)?;
     let listener = UnixListener::bind(path)?;
-    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
-        let _ = std::fs::remove_file(path);
-        return Err(error);
+    let bound = std::fs::symlink_metadata(path)?;
+    if !bound.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "a unix listen path names a file that is not a socket",
+        ));
     }
+    apply_socket_mode(&listener, path, mode, (bound.dev(), bound.ino()))?;
     Ok(listener)
+}
+
+/// Apply the mode to the socket inode itself, then re-check that the path still names it.
+#[cfg(unix)]
+fn apply_socket_mode(
+    _listener: &UnixListener,
+    path: &std::path::Path,
+    mode: u32,
+    bound: (u64, u64),
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let applied = {
+        use std::os::unix::ffi::OsStrExt as _;
+        let text = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the unix path has a NUL"))?;
+        // SAFETY: `text` is a live NUL-terminated path and the flag asks the kernel not to follow a replacement.
+        let rc = unsafe {
+            libc::fchmodat(
+                libc::AT_FDCWD,
+                text.as_ptr(),
+                mode as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            #[cfg(target_os = "linux")]
+            {
+                let error = io::Error::last_os_error();
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code)
+                        if code == libc::ENOTSUP || code == libc::EINVAL || code == libc::ENOSYS
+                ) {
+                    chmod_pinned(path, mode)
+                } else {
+                    Err(error)
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(io::Error::last_os_error())
+            }
+        }
+    };
+    #[cfg(target_vendor = "apple")]
+    let applied = {
+        use std::os::unix::ffi::OsStrExt as _;
+        let text = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the unix path has a NUL"))?;
+        // SAFETY: `text` is a live NUL-terminated path and `lchmod` never follows the last link.
+        let rc = unsafe { libc::lchmod(text.as_ptr(), mode as libc::mode_t) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+    #[cfg(all(
+        unix,
+        not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))
+    ))]
+    let applied = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    };
+    applied?;
+    let after = std::fs::symlink_metadata(path)?;
+    if (after.dev(), after.ino()) != bound {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "the unix listen path was replaced before its mode applied",
+        ));
+    }
+    if after.mode() & 0o7777 != mode & 0o7777 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the unix listen path did not take its mode",
+        ));
+    }
+    Ok(())
+}
+
+/// Older glibc spells `fchmodat`'s no-follow flag as `ENOTSUP`, so pin the inode with `O_PATH`
+/// and chmod through `/proc/self/fd` instead of ever re-resolving the path.
+#[cfg(target_os = "linux")]
+fn chmod_pinned(path: &std::path::Path, mode: u32) -> io::Result<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    let text = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the unix path has a NUL"))?;
+    // SAFETY: `text` is a live NUL-terminated path and `O_NOFOLLOW` pins the socket itself.
+    let raw = unsafe {
+        libc::open(
+            text.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a fresh descriptor this function owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let pinned = std::ffi::CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the fd has a NUL"))?;
+    // SAFETY: `pinned` names the inode the descriptor holds and `mode` is a file-mode bit set.
+    let rc = unsafe { libc::chmod(pinned.as_ptr(), mode as libc::mode_t) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Remove the socket the initial check saw, only while the same inode is still at the path, so two
@@ -2364,11 +2539,66 @@ fn staged_name(path: &std::path::Path) -> std::path::PathBuf {
 
 #[cfg(windows)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
-    if std::fs::symlink_metadata(path).is_ok() {
-        std::fs::remove_file(path)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) if !is_unix_socket(path)? => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "a unix listen path names a file that is not a socket",
+            ))
+        }
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     let listener = UnixListener::bind(path)?;
     Ok(listener)
+}
+
+#[cfg(windows)]
+fn is_unix_socket(path: &std::path::Path) -> io::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_SHARE_ALL: u32 = 0x7;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
+    #[repr(C)]
+    struct AttributeTag {
+        _attributes: u32,
+        tag: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandleEx(
+            handle: *mut core::ffi::c_void,
+            class: i32,
+            info: *mut core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let mut info = AttributeTag {
+        _attributes: 0,
+        tag: 0,
+    };
+    // SAFETY: the handle is live, `info` is writable and its size is the class's structure.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            9,
+            (&raw mut info).cast(),
+            std::mem::size_of::<AttributeTag>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.tag == IO_REPARSE_TAG_AF_UNIX)
 }
 
 /// One nonblocking `connect` waited out with `poll`, so a full backlog costs the budget and not the

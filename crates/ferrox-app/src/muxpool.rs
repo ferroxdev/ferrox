@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,9 @@ const IDLE: Duration = Duration::from_secs(16);
 
 /// The reference's `Dispatch` retries a pick this many times when the last slot fills under it.
 const PICKS: usize = 16;
+
+/// One flow's reply queue; a flow that cannot keep up is ended without stalling the demux.
+const REPLIES: usize = 64;
 
 /// A carrier's two halves and the close that tears its socket down.
 pub(crate) struct Uplink {
@@ -39,12 +42,17 @@ pub(crate) struct Flow {
     carrier: Arc<Carrier>,
     id: u16,
     replies: Option<Receiver<Msg>>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+    ended: std::sync::atomic::AtomicBool,
 }
 
 impl Flow {
     /// One bulk `Keep`; the carrier's writer lock keeps concurrent sessions from interleaving and
     /// the whole payload leaves in one vectored write.
     pub(crate) fn send(&self, data: &[u8]) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
         self.carrier.keep(self.id, data)
     }
 
@@ -53,10 +61,17 @@ impl Flow {
         self.replies.take()
     }
 
-    pub(crate) fn close(self) {
-        // End is on the wire before the id returns to the table; the writer lock orders every frame.
+    pub(crate) fn end_upload(&self) {
+        if self.ended.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         self.carrier
             .frame(self.id, mux::Status::End, 0, None, None, &[]);
+    }
+
+    pub(crate) fn close(self) {
+        // End is on the wire before the id returns to the table; the writer lock orders every frame.
+        self.end_upload();
         self.carrier.release(self.id);
     }
 }
@@ -97,7 +112,7 @@ pub(crate) type Deliver = Arc<dyn Fn(&[u8], Option<SocketAddr>) + Send + Sync>;
 
 #[derive(Clone)]
 enum Sink {
-    Tcp(Sender<Msg>),
+    Tcp(SyncSender<Msg>, Arc<std::sync::atomic::AtomicBool>),
     Udp(Deliver, Arc<std::sync::atomic::AtomicBool>),
 }
 
@@ -201,6 +216,7 @@ impl Writer {
 struct Table {
     ids: mux::Ids,
     sinks: HashMap<u16, Sink>,
+    pending: std::collections::HashSet<u16>,
     full: bool,
     last_active: Instant,
 }
@@ -235,6 +251,7 @@ impl Carrier {
             table: Mutex::new(Table {
                 ids: mux::Ids::new(0),
                 sinks: HashMap::new(),
+                pending: std::collections::HashSet::new(),
                 full: false,
                 last_active: Instant::now(),
             }),
@@ -282,7 +299,12 @@ impl Carrier {
         let Ok(mut writer) = self.write.lock() else {
             return false;
         };
-        writer.frame(id, status, options, target, global_id, data)
+        let written = writer.frame(id, status, options, target, global_id, data);
+        drop(writer);
+        if !written {
+            self.retire();
+        }
+        written
     }
 
     /// The client's bulk path: one head per frame-sized chunk, one vectored write for the batch.
@@ -302,7 +324,9 @@ impl Carrier {
             let Ok(mut table) = self.table.lock() else {
                 return;
             };
-            if table.sinks.remove(&id).is_none() {
+            let sink = table.sinks.remove(&id).is_some();
+            let pending = table.pending.remove(&id);
+            if !sink && !pending {
                 return;
             }
             table.ids.give_back();
@@ -314,6 +338,15 @@ impl Carrier {
         }
     }
 
+    fn drop_sink(&self, id: u16) {
+        let Ok(mut table) = self.table.lock() else {
+            return;
+        };
+        if table.sinks.remove(&id).is_some() {
+            table.pending.insert(id);
+        }
+    }
+
     fn begin_idle_retire(&self) -> Option<bool> {
         let table = match self.table.lock() {
             Ok(table) => table,
@@ -322,7 +355,10 @@ impl Carrier {
         if self.dead() {
             return Some(false);
         }
-        if !table.sinks.is_empty() || table.last_active.elapsed() < self.idle {
+        if !table.sinks.is_empty()
+            || !table.pending.is_empty()
+            || table.last_active.elapsed() < self.idle
+        {
             return None;
         }
         Some(!self.dead.swap(true, std::sync::atomic::Ordering::Relaxed))
@@ -335,8 +371,8 @@ impl Carrier {
             Err(poisoned) => poisoned.into_inner(),
         };
         for (_, sink) in table.sinks.drain() {
-            if let Sink::Tcp(sender) = sink {
-                let _ = sender.send(Msg {
+            if let Sink::Tcp(sender, _) = sink {
+                let _ = sender.try_send(Msg {
                     data: Vec::new(),
                     end: true,
                 });
@@ -408,12 +444,19 @@ impl Carrier {
         };
         let target = frame.target.as_ref().and_then(sockaddr);
         match sink {
-            Sink::Tcp(sender) => {
+            Sink::Tcp(sender, closed) => {
                 let data = frame.data.unwrap_or(&[]);
-                let _ = sender.send(Msg {
+                let msg = Msg {
                     data: data.to_vec(),
                     end: frame.status == mux::Status::End,
-                });
+                };
+                if matches!(
+                    sender.try_send(msg),
+                    Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
+                ) {
+                    closed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.drop_sink(frame.id);
+                }
             }
             Sink::Udp(deliver, ended) => {
                 if frame.status == mux::Status::End {
@@ -590,9 +633,10 @@ impl Manager {
 
     /// One TCP session, on the first carrier with room or on a fresh one.
     pub(crate) fn dial(&self, target: &mux::Target<'_>) -> Option<Flow> {
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (carrier, id, replies) = self.reserve(|_| {
-            let (send, replies) = channel();
-            (Sink::Tcp(send), replies)
+            let (send, replies) = sync_channel(REPLIES);
+            (Sink::Tcp(send, Arc::clone(&closed)), replies)
         })?;
         if !carrier.frame(id, mux::Status::New, mux::DATA, Some(*target), None, &[]) {
             carrier.release(id);
@@ -602,6 +646,8 @@ impl Manager {
             carrier,
             id,
             replies: Some(replies),
+            closed,
+            ended: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

@@ -133,8 +133,8 @@ fn test_refuses_json_it_cannot_parse() {
     let _ = std::fs::remove_file(&path);
 }
 
-fn geodata_config(url: &str) -> (String, std::path::PathBuf) {
-    let file = format!("ferrox-test-geodata-{}.dat", std::process::id());
+fn geodata_config(kind: &str, url: &str) -> (String, std::path::PathBuf) {
+    let file = format!("ferrox-test-geodata-{}-{kind}.dat", std::process::id());
     let asset = std::path::Path::new(env!("CARGO_BIN_EXE_ferrox-app"))
         .parent()
         .expect("binary directory")
@@ -155,7 +155,7 @@ fn geodata_config(url: &str) -> (String, std::path::PathBuf) {
 /// The reference refuses an asset URL that is not HTTPS while building the config, so `-test` does too.
 #[test]
 fn test_refuses_a_geodata_asset_over_plain_http() {
-    let (text, asset) = geodata_config("http://example.test/geosite.dat");
+    let (text, asset) = geodata_config("http", "http://example.test/geosite.dat");
     let path = config_path("geodata-http", &text);
     let named = path.to_string_lossy().into_owned();
     let output = run(&["-test", "-c", &named]);
@@ -177,7 +177,7 @@ fn test_refuses_a_geodata_asset_over_plain_http() {
 /// A schedule the reference builds and starts is a config this tree accepts too.
 #[test]
 fn test_accepts_a_geodata_schedule() {
-    let (text, asset) = geodata_config("https://example.test/geosite.dat");
+    let (text, asset) = geodata_config("cron", "https://example.test/geosite.dat");
     let path = config_path("geodata-cron", &text);
     let named = path.to_string_lossy().into_owned();
     let output = run(&["-test", "-c", &named]);

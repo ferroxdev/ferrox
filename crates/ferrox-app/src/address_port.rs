@@ -227,7 +227,8 @@ fn ask_udp(server: SocketAddr, query: &[u8], id: u16) -> Option<ferrox_core::dns
     let socket = UdpSocket::bind(bind).ok()?;
     socket.set_read_timeout(Some(TIMEOUT)).ok()?;
     socket.set_write_timeout(Some(TIMEOUT)).ok()?;
-    socket.send_to(query, server).ok()?;
+    socket.connect(server).ok()?;
+    socket.send(query).ok()?;
     let mut answer = vec![0u8; ANSWER_MAX];
     let read = socket.recv(&mut answer).ok()?;
     let parsed = ferrox_core::dns::parse_answer(&answer[..read])?;

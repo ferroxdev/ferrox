@@ -19,6 +19,8 @@ struct Plane {
     lists: HashMap<String, (Arc<Servers>, u64)>,
     /// The optimal region the plane named, shared with every flow that reads it.
     region: Option<(Arc<str>, u64)>,
+    /// Bumped by `forget`, so a refresh that started before the invalidation cannot restore it.
+    generation: u64,
 }
 
 /// One region's upstreams, and one silence deadline per entry. The deadlines are atomics rather than a map behind the plane's lock because a flow reads all of them before it dials: an atomic load per entry costs the walk nothing it was not already paying, and a lock per flow would be new.
@@ -100,12 +102,15 @@ pub(crate) struct VeepnOut {
     roots: ferrox_core::tls::Anchors,
     /// A region lists a dozen upstreams; every flow does not go to the first of them.
     picked: Arc<AtomicUsize>,
+    /// One refresh at a time, so a cold cache is fetched once rather than once per waiting flow.
+    refresh: Arc<Mutex<()>>,
 }
 
 /// What one walk of the rotation came back with: an answer, or the plane's name for the token it carried.
 enum Walked {
     Carried(foxy_account::Reply),
     Token,
+    Refused(String),
 }
 
 impl VeepnOut {
@@ -142,6 +147,7 @@ impl VeepnOut {
         }
         Ok(Self {
             plane: Arc::new(Mutex::new(Plane::default())),
+            refresh: Arc::new(Mutex::new(())),
             domains: origins.into(),
             cursor: Arc::new(AtomicUsize::new(0)),
             region: Arc::from(region),
@@ -241,15 +247,31 @@ impl VeepnOut {
             }
             held = Some(named);
         }
+        let _refresh = self.refresh.lock();
+        let generation = self.plane.lock().map_or(0, |plane| plane.generation);
+        let now = foxy_account::epoch();
+        if let Some((named, until)) = self
+            .plane
+            .lock()
+            .ok()
+            .and_then(|plane| plane.region.clone())
+        {
+            if until > now {
+                return Ok(named);
+            }
+            held = Some(named);
+        }
         let reply = match self.ask(veepn::OPTIMAL, &[]) {
             Ok(reply) => reply,
             Err(miss) => {
                 if let (false, Some(named)) = (miss.answered, held) {
                     if let Ok(mut plane) = self.plane.lock() {
-                        plane.region = Some((
-                            Arc::clone(&named),
-                            foxy_account::epoch().saturating_add(veepn::PLANE_RETRY),
-                        ));
+                        if plane.generation == generation {
+                            plane.region = Some((
+                                Arc::clone(&named),
+                                foxy_account::epoch().saturating_add(veepn::PLANE_RETRY),
+                            ));
+                        }
                     }
                     return Ok(named);
                 }
@@ -287,18 +309,34 @@ impl VeepnOut {
         let mut body = vec![0u8; veepn::server_list_len(region)];
         let text = veepn::server_list_into(region, &mut body)
             .map_err(|why| format!("region {region:?} cannot be written: {why}"))?;
+        let _refresh = self.refresh.lock();
+        let generation = self.plane.lock().map_or(0, |plane| plane.generation);
+        let now = foxy_account::epoch();
+        if let Some((list, until)) = self
+            .plane
+            .lock()
+            .ok()
+            .and_then(|plane| plane.lists.get(region).cloned())
+        {
+            if until > now {
+                return Ok(list);
+            }
+            held = Some(list);
+        }
         let found = match self.ask(veepn::SERVER_LIST, text) {
             Ok(found) => found,
             Err(miss) => {
                 if let (false, Some(list)) = (miss.answered, held) {
                     if let Ok(mut plane) = self.plane.lock() {
-                        plane.lists.insert(
-                            region.to_owned(),
-                            (
-                                Arc::clone(&list),
-                                foxy_account::epoch().saturating_add(veepn::PLANE_RETRY),
-                            ),
-                        );
+                        if plane.generation == generation {
+                            plane.lists.insert(
+                                region.to_owned(),
+                                (
+                                    Arc::clone(&list),
+                                    foxy_account::epoch().saturating_add(veepn::PLANE_RETRY),
+                                ),
+                            );
+                        }
                     }
                     return Ok(list);
                 }
@@ -315,10 +353,12 @@ impl VeepnOut {
             silence,
         });
         if let Ok(mut plane) = self.plane.lock() {
-            plane.lists.insert(
-                region.to_owned(),
-                (Arc::clone(&list), now.saturating_add(veepn::SERVERS_TTL)),
-            );
+            if plane.generation == generation {
+                plane.lists.insert(
+                    region.to_owned(),
+                    (Arc::clone(&list), now.saturating_add(veepn::SERVERS_TTL)),
+                );
+            }
         }
         Ok(list)
     }
@@ -328,6 +368,7 @@ impl VeepnOut {
         if let Ok(mut plane) = self.plane.lock() {
             plane.lists.remove(region);
             plane.access = None;
+            plane.generation = plane.generation.wrapping_add(1);
         }
     }
 
@@ -345,11 +386,14 @@ impl VeepnOut {
                 return Ok(value);
             }
         }
+        let generation = self.plane.lock().map_or(0, |plane| plane.generation);
         let mut body = vec![0u8; veepn::launch_len(&self.udid, &self.zone)];
         let text = veepn::launch_into(&self.udid, &self.zone, &mut body)
             .map_err(|why| format!("launch body: {why}"))?;
-        let Walked::Carried(reply) = self.walk(veepn::LAUNCH, text, None)? else {
-            return Err(Miss::spoken("launch carries no token"));
+        let reply = match self.walk(veepn::LAUNCH, text, None)? {
+            Walked::Carried(reply) => reply,
+            Walked::Refused(why) => return Err(Miss::spoken(why)),
+            Walked::Token => return Err(Miss::spoken("launch carries no token")),
         };
         if let Some(denied) = reply.denied() {
             return Err(Miss::spoken(format!("launch refused: {denied}")));
@@ -362,7 +406,9 @@ impl VeepnOut {
             .ok_or_else(|| Miss::spoken("launch answers no access token"))?;
         let value = format!("Bearer {token}");
         if let Ok(mut plane) = self.plane.lock() {
-            plane.access = Some((value.clone(), now.saturating_add(veepn::TOKEN_TTL)));
+            if plane.generation == generation {
+                plane.access = Some((value.clone(), now.saturating_add(veepn::TOKEN_TTL)));
+            }
         }
         Ok(value)
     }
@@ -370,12 +416,15 @@ impl VeepnOut {
     /// One plane ask with the token in front of it: a plane that refuses the token is the cache's problem, so it is relaunched and the same ask repeats once. Only a plane that answers again about the *pair* after that is a fact the cache cannot fix; every other miss leaves the held answer alone.
     fn ask(&self, path: &str, body: &[u8]) -> Result<foxy_account::Reply, Miss> {
         let value = self.access(false)?;
-        if let Walked::Carried(reply) = self.walk(path, body, Some(&value))? {
-            return Ok(reply);
+        match self.walk(path, body, Some(&value))? {
+            Walked::Carried(reply) => return Ok(reply),
+            Walked::Refused(why) => return Err(Miss::spoken(why)),
+            Walked::Token => {}
         }
         let fresh = self.access(true)?;
         match self.walk(path, body, Some(&fresh))? {
             Walked::Carried(reply) => Ok(reply),
+            Walked::Refused(why) => Err(Miss::spoken(why)),
             Walked::Token => Err(Miss {
                 answered: true,
                 why: format!("{path} refuses a fresh token"),
@@ -422,10 +471,10 @@ impl VeepnOut {
                         patience = true;
                     }
                     other => {
-                        return Err(format!(
+                        return Ok(Walked::Refused(format!(
                             "{path} answers {other}: {}",
                             String::from_utf8_lossy(&reply.body)
-                        ))
+                        )))
                     }
                 },
             }
@@ -559,7 +608,7 @@ pub(crate) fn udid(named: &str) -> String {
     raw[8] = (raw[8] & 0x3f) | 0x80;
     let mut text = String::with_capacity(36);
     for (at, byte) in raw.iter().enumerate() {
-        if matches!(at, 4 | 6 | 8 | 11) {
+        if matches!(at, 4 | 6 | 8 | 10) {
             text.push('-');
         }
         text.push(HEX[usize::from(byte >> 4)] as char);
@@ -832,7 +881,17 @@ mod tests {
         let drawn = udid("");
         let bytes = drawn.as_bytes();
         assert_eq!(bytes.len(), 36, "{drawn}");
-        assert_eq!(bytes[8], b'-', "and the hyphens sit where a uuid puts them");
+        let hyphens: Vec<usize> = bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'-')
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            hyphens,
+            [8, 13, 18, 23],
+            "and the hyphens sit where a uuid puts them: {drawn}"
+        );
         assert!(matches!(&drawn[14..15], "4"), "version four: {drawn}");
         assert!(
             matches!(&drawn[19..20], "8" | "9" | "a" | "b"),

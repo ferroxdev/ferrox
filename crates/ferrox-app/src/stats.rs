@@ -426,10 +426,10 @@ pub(crate) struct Snapshot {
 
 impl Snapshot {
     fn traffic(&mut self, name: &str, value: i64) {
-        let mut parts = name.split(">>>");
-        let (Some(kind), Some(tag), Some("traffic"), Some(direction)) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
+        let Some((kind, rest)) = name.split_once(">>>") else {
+            return;
+        };
+        let Some((tag, direction)) = rest.rsplit_once(">>>traffic>>>") else {
             return;
         };
         let map = match kind {

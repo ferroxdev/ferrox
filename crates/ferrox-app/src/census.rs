@@ -191,6 +191,7 @@ pub(crate) fn number(line: &str, field: &str) -> u64 {
 mod tests {
     use super::*;
 
+    #[cfg(debug_assertions)]
     #[test]
     fn a_registered_wait_dumps_and_a_returned_one_does_not() {
         let this = std::thread::current().id();
@@ -207,6 +208,7 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn a_wait_without_a_descriptor_or_a_budget_says_so() {
         let this = std::thread::current().id();
@@ -216,6 +218,7 @@ mod tests {
         assert!(line.contains("armed=none "), "{line}");
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn a_returned_wait_leaves_the_others_it_crossed_in_place() {
         let this = std::thread::current().id();
@@ -234,6 +237,7 @@ mod tests {
         assert!(held("census-order-first", this).is_none(), "{}", dump());
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn a_wait_held_past_its_age_is_told_once_and_a_returned_one_never() {
         let this = std::thread::current().id();

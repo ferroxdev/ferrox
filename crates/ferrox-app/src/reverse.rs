@@ -36,6 +36,10 @@ const MONITOR: Duration = Duration::from_secs(2);
 /// The reference's bridge worker idle bound: a portal that stops heartbeating for this long is gone.
 const WORKER_IDLE: Duration = Duration::from_secs(60);
 
+/// A draining worker's heartbeat ended with its drain, so its open connections get this longer
+/// bound instead of the active window; when it passes, the same half-open rule closes the tunnel.
+const DRAIN_IDLE: Duration = Duration::from_secs(600);
+
 /// One protobuf `Control`: a state and a random pad the reference writes to look unlike a
 /// fixed shape. Unknown fields are skipped, and an absent state means `ACTIVE` — proto3 leaves
 /// a zero field off the wire.
@@ -328,8 +332,18 @@ impl Session {
             };
             loop {
                 let n = match reader.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(n) => n,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        std::thread::sleep(MONITOR);
+                        continue;
+                    }
+                    Err(_) => break,
                 };
                 if carry.is_empty() {
                     let data = &chunk[..n];
@@ -673,6 +687,10 @@ impl WorkerState {
         self.state.load(Ordering::Relaxed) == ACTIVE && !self.closed.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn draining(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == DRAIN && !self.closed.load(Ordering::Relaxed)
+    }
+
     /// A worker the portal stopped heartbeating carries no flow the monitor can route, and its
     /// tunnel may be half-open, so the monitor closes it instead of keeping it forever.
     pub(crate) fn stale(&self, after: Duration) -> bool {
@@ -712,15 +730,25 @@ where
         let mut workers: Vec<BridgeHandle> = Vec::new();
         loop {
             workers.retain(|worker| {
-                let live = worker.state.active() && !worker.state.stale(WORKER_IDLE);
+                let state = &worker.state;
+                let live = if state.draining() {
+                    state.connections() > 0 && !state.stale(DRAIN_IDLE)
+                } else {
+                    !state.stale(WORKER_IDLE) && (state.active() || state.connections() > 0)
+                };
                 if !live {
                     worker.tunnel.close();
                 }
                 live
             });
-            let live = u32::try_from(workers.len()).unwrap_or(u32::MAX);
+            let live = workers
+                .iter()
+                .filter(|worker| worker.state.active())
+                .count();
+            let live = u32::try_from(live).unwrap_or(u32::MAX);
             let connections: u32 = workers
                 .iter()
+                .filter(|worker| worker.state.active())
                 .map(|worker| worker.state.connections())
                 .sum();
             if live == 0 || connections / live > 16 {
