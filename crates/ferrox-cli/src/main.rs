@@ -36,9 +36,9 @@ fn main() {
         Action::Up => up(&mut options, &mut paths, false),
         Action::Serve => up(&mut options, &mut paths, true),
         Action::Down => down(&options, &mut paths),
-        Action::Status => status(&options, &mut paths),
+        Action::Status => status(&mut options, &mut paths),
         Action::Ports => {
-            ports(&options, &mut paths);
+            ports(&mut options, &mut paths);
             0
         }
         Action::Tun => {
@@ -125,6 +125,30 @@ fn duplicate_fronts(list: &str, ports: Ports) {
 fn ensure_config(options: &Options) {
     if options.outbound == Some(Outbound::Config) && !Path::new(&options.config_file).is_file() {
         args::die(&format!("no such config: {}", options.config_file));
+    }
+}
+
+fn adopt_lane_config(options: &Options, paths: &mut Paths) {
+    if options.outbound == Some(Outbound::Config) && !options.config_file.is_empty() {
+        let path = Path::new(&options.config_file);
+        paths.cfg = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    } else {
+        lane::adopt_config(paths);
+    }
+}
+
+fn load_saved_fronts(options: &mut Options, paths: &Paths) {
+    if !paths.cfg.is_file() {
+        return;
+    }
+    let path = paths.cfg.to_string_lossy();
+    if let Ok(saved) = config::config_fronts(
+        &path,
+        options.vpn,
+        options.fronts_set,
+        options.fronts.as_str(),
+    ) {
+        options.fronts = saved;
     }
 }
 
@@ -583,7 +607,14 @@ fn diagnose(options: &Options, paths: &Paths) {
 }
 
 fn down(options: &Options, paths: &mut Paths) -> i32 {
-    lane::adopt_config(paths);
+    let explicit_config =
+        options.outbound == Some(Outbound::Config) && !options.config_file.is_empty();
+    adopt_lane_config(options, paths);
+    if explicit_config {
+        if let Err(error) = lane::remember_user_config(paths) {
+            eprintln!("ferrox-cli: {error}");
+        }
+    }
     if options.all {
         let mut rc = stop_all_lanes(paths);
         if rc == 0 {
@@ -600,7 +631,7 @@ fn down(options: &Options, paths: &mut Paths) -> i32 {
     }
     let user_config = lane::user_config(paths).is_some();
     let rc = stop_lane(paths);
-    if rc == 0 {
+    if rc == 0 && !explicit_config {
         forget_config(paths);
     }
     let name = options
@@ -665,6 +696,13 @@ fn forget_config(paths: &Paths) {
 }
 
 fn prune_lanes(paths: &Paths, missing: &[PathBuf]) {
+    let Ok(_lock) = lane::port_lock(paths) else {
+        eprintln!(
+            "ferrox-cli: cannot lock {}; stale lanes were not pruned.",
+            paths.lanes_file.display()
+        );
+        return;
+    };
     let Ok(text) = read_trim_checked(&paths.lanes_file) else {
         return;
     };
@@ -676,11 +714,7 @@ fn prune_lanes(paths: &Paths, missing: &[PathBuf]) {
         })
         .collect();
     let result = if kept.is_empty() {
-        match std::fs::remove_file(&paths.lanes_file) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        crate::paths::write_private(&paths.lanes_file, "")
     } else {
         crate::paths::write_private(&paths.lanes_file, &format!("{}\n", kept.join("\n")))
     };
@@ -770,8 +804,9 @@ fn stop_all_lanes(paths: &Paths) -> i32 {
     rc
 }
 
-fn status(options: &Options, paths: &mut Paths) -> i32 {
-    lane::adopt_config(paths);
+fn status(options: &mut Options, paths: &mut Paths) -> i32 {
+    adopt_lane_config(options, paths);
+    load_saved_fronts(options, paths);
     if let Err(error) = reconcile(paths) {
         eprintln!("ferrox-cli: {error}");
     }
@@ -853,8 +888,9 @@ fn status(options: &Options, paths: &mut Paths) -> i32 {
     0
 }
 
-fn ports(options: &Options, paths: &mut Paths) {
-    lane::adopt_config(paths);
+fn ports(options: &mut Options, paths: &mut Paths) {
+    adopt_lane_config(options, paths);
+    load_saved_fronts(options, paths);
     let ports = config::plan_ports(options, paths, false);
     let routes = proxy::routes(&options.fronts, ports);
     println!("----------------------------------------------------------------");
@@ -998,8 +1034,9 @@ fn supervise(options: &Options, paths: &Paths) -> i32 {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     let pid = watched;
+    let lane_paths = (*paths).clone();
     let _ = ctrlc::set_handler(move || {
-        match lane::kill(pid) {
+        match lane::kill(&lane_paths, pid) {
             Ok(()) => flag.store(true, Ordering::SeqCst),
             // A failed kill leaves the lane live: keep polling so its exit still clears the proxy, and a second Ctrl-C retries.
             Err(error) => eprintln!("ferrox-cli: {error}"),

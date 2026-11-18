@@ -104,7 +104,7 @@ pub fn alive(pid: u32) -> bool {
 }
 
 pub fn running(paths: &Paths) -> bool {
-    pid(paths).is_some_and(|pid| alive(pid) && is_ferrox(pid))
+    pid(paths).is_some_and(|pid| alive(pid) && is_ferrox(paths, pid))
 }
 
 fn process_exe(pid: u32) -> Option<PathBuf> {
@@ -154,8 +154,11 @@ fn process_exe(pid: u32) -> Option<PathBuf> {
     }
 }
 
-fn expected_bin() -> PathBuf {
-    resolve_bin().unwrap_or_else(candidate_bin)
+fn expected_bin(paths: &Paths) -> PathBuf {
+    read_trim(&bin_marker(paths))
+        .filter(|text| !text.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| resolve_bin().unwrap_or_else(candidate_bin))
 }
 
 fn canonical_exe(path: &Path) -> PathBuf {
@@ -185,14 +188,14 @@ fn same_exe(actual: &Path, expected: &Path) -> bool {
     }
 }
 
-fn is_ferrox(pid: u32) -> bool {
+fn is_ferrox(paths: &Paths, pid: u32) -> bool {
     let Some(actual) = process_exe(pid) else {
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         return true;
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         return false;
     };
-    same_exe(&actual, &expected_bin())
+    same_exe(&actual, &expected_bin(paths))
 }
 
 #[cfg(any(unix, windows))]
@@ -206,8 +209,8 @@ fn wait_exit(pid: u32, attempts: u32) -> bool {
     !alive(pid)
 }
 
-pub fn kill(pid: u32) -> Result<(), String> {
-    if !is_ferrox(pid) {
+pub fn kill(paths: &Paths, pid: u32) -> Result<(), String> {
+    if !is_ferrox(paths, pid) {
         return Err(format!(
             "process {pid} is not ferrox-app; it was not stopped. If the binary was renamed, set FERROX_BIN."
         ));
@@ -366,6 +369,14 @@ fn config_marker(paths: &Paths) -> PathBuf {
     paths.conf_dir.join(format!(".{name}.provenance"))
 }
 
+fn bin_marker(paths: &Paths) -> PathBuf {
+    let name = paths.pid_file.file_stem().map_or_else(
+        || String::from("lane"),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
+    paths.conf_dir.join(format!(".{name}.bin"))
+}
+
 pub fn remember_user_config(paths: &Paths) -> Result<(), String> {
     write_private(
         &config_marker(paths),
@@ -400,6 +411,10 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
         .map_err(|error| format!("cannot create the config dir: {error}"))?;
     secure_dir(&paths.state_dir)
         .map_err(|error| format!("cannot create the state dir: {error}"))?;
+    let bin = canonical_exe(bin);
+    write_private(&bin_marker(paths), &format!("{}\n", bin.display())).map_err(|error| {
+        format!("cannot record the lane binary {}: {error}", bin.display())
+    })?;
     register(paths)?;
     let out = OpenOptions::new()
         .create(true)
@@ -410,7 +425,7 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
     let err = out
         .try_clone()
         .map_err(|error| format!("cannot open {}: {error}", paths.log.display()))?;
-    let mut command = Command::new(bin);
+    let mut command = Command::new(&bin);
     command
         .arg("run")
         .arg("-c")
@@ -444,8 +459,8 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
 
 pub fn stop(paths: &Paths) -> Result<(), String> {
     if let Some(pid) = pid(paths) {
-        if alive(pid) && is_ferrox(pid) {
-            kill(pid)?;
+        if alive(pid) && is_ferrox(paths, pid) {
+            kill(paths, pid)?;
         }
     }
     match std::fs::remove_file(&paths.pid_file) {
@@ -586,7 +601,9 @@ pub fn other_lanes(paths: &Paths) -> Vec<(String, u32)> {
             continue;
         };
         if let Some(pid) = read_trim(&entry.path()).and_then(|text| text.parse().ok()) {
-            if alive(pid) && is_ferrox(pid) {
+            let lane_paths =
+                Paths::with_dirs(paths.conf_dir.clone(), paths.state_dir.clone(), Some(instance));
+            if alive(pid) && is_ferrox(&lane_paths, pid) {
                 lanes.push((instance.to_owned(), pid));
             }
         }
@@ -653,7 +670,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ferrox-foreign-{}", std::process::id()));
         let paths = Paths::with_dirs(root.join("conf"), root.join("state"), None);
         let current = std::process::id();
-        assert!(!is_ferrox(current), "the test process looks like the lane");
+        assert!(!is_ferrox(&paths, current), "the test process looks like the lane");
         write_private(&paths.pid_file, &format!("{current}\n")).unwrap();
         assert!(!running(&paths));
         assert!(stop(&paths).is_ok());
