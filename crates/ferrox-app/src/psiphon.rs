@@ -8352,6 +8352,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 builtin_cap,
                 scan_start,
             );
+            overrides.truncate(override_take);
             interleave_fronted(&mut group, builtin, overrides);
             group.truncate(candidate_cap);
             // The entry's own front leads, so the first batch dials it before a scan can stall.
