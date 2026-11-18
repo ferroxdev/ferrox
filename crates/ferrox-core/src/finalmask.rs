@@ -222,16 +222,35 @@ impl Fragment {
                 self.hello_skip = self.hello_skip.saturating_sub(p.len());
                 return raw.write(p);
             }
-            let Some(record_len) = Self::hello_shape(p) else {
-                self.forward_unshaped(p);
-                return raw.write(p);
-            };
-            self.hello_done = true;
-            return if self.sni {
-                self.write_sni(raw, p, record_len)
-            } else {
-                self.write_hello(raw, p, record_len)
-            };
+            let mut rest = p;
+            let mut done = 0usize;
+            loop {
+                if self.hello_done {
+                    return Ok(done + raw.write(rest)?);
+                }
+                if self.hello_skip > 0 {
+                    self.hello_skip = self.hello_skip.saturating_sub(rest.len());
+                    return Ok(done + raw.write(rest)?);
+                }
+                let Some(record_len) = Self::hello_shape(rest) else {
+                    self.forward_unshaped(rest);
+                    return Ok(done + raw.write(rest)?);
+                };
+                if record_len == HEADER && rest.len() > HEADER {
+                    // An empty decoy ahead of the hello in the same write: send it, keep the slot.
+                    raw.write_all(&rest[..HEADER])?;
+                    done += HEADER;
+                    rest = &rest[HEADER..];
+                    continue;
+                }
+                self.hello_done = true;
+                let taken = if self.sni {
+                    self.write_sni(raw, rest, record_len)?
+                } else {
+                    self.write_hello(raw, rest, record_len)?
+                };
+                return Ok(done + taken);
+            }
         }
         if self.packets_from != 0
             && (self.count < self.packets_from || self.count > self.packets_to)
@@ -264,11 +283,19 @@ impl Fragment {
     /// The reference parks between pieces when its delay range can answer above zero, and so does
     /// this: a mask that cut faster would look like a different schedule to anything watching the
     /// wire. One draw of the cached supply decides both the test and the duration.
-    fn park(&mut self, delay: Range) {
-        let Some(ms) = delay.pick_from(&mut self.ent).filter(|ms| *ms > 0) else {
-            return;
+    /// The delay between two records, after the record before it has left every stage below this
+    /// one: a stage that retained it would otherwise sleep and then send it beside the next.
+    fn park_after<W: Write>(&mut self, raw: &mut W, segment: usize) -> io::Result<()> {
+        let Some(ms) = self
+            .delay_at(segment)
+            .pick_from(&mut self.ent)
+            .filter(|ms| *ms > 0)
+        else {
+            return Ok(());
         };
+        raw.flush()?;
         std::thread::sleep(Duration::from_millis(ms as u64));
+        Ok(())
     }
 
     /// Why this write is not a hello the mask may cut: too short for a header, not a handshake
@@ -334,8 +361,7 @@ impl Fragment {
                     break;
                 };
                 write_record(raw, &head_of(p, to - from), &p[from..to])?;
-                let delay = self.delay_at(segment);
-                self.park(delay);
+                self.park_after(raw, segment)?;
                 from = to;
                 segment += 1;
             }
@@ -506,7 +532,7 @@ impl Fragment {
                 return Ok(self.retain_sni(p, parts, &cuts, segment, *to, record_len));
             }
             if segment + 1 < cuts.len() {
-                self.park(self.delay_at(segment));
+                self.park_after(raw, segment)?;
             }
             from = *to;
         }
@@ -646,7 +672,7 @@ impl Fragment {
                 return write_progress(raw, &p[from..]).map(|written| from + written);
             };
             if from == to {
-                self.park(self.delay_at(segment));
+                self.park_after(raw, segment)?;
                 segment += 1;
                 continue;
             }
@@ -666,8 +692,7 @@ impl Fragment {
                 Err(error) => return Err(error),
             };
             from += written;
-            let delay = self.delay_at(segment);
-            self.park(delay);
+            self.park_after(raw, segment)?;
             segment += 1;
             if from >= p.len() {
                 return Ok(from);
@@ -1828,6 +1853,63 @@ mod tests {
             &update,
             "a handshake record after the hello is not cut a second time"
         );
+    }
+
+    #[test]
+    fn a_decoy_sharing_the_write_leaves_the_hello_cut() {
+        let mut mask =
+            Fragment::new(0, 1, vec![range(3, 3)], vec![range(0, 0)], range(0, 0)).expect("valid");
+        let mut whole = [0x16, 3, 3, 0, 0].to_vec();
+        let hello = hello(30);
+        whole.extend_from_slice(&hello);
+        let mut wire = Wire::default();
+        assert_eq!(mask.write(&mut wire, &whole).expect("writes"), whole.len());
+        assert_eq!(&wire.bytes[..HEADER], &whole[..HEADER], "the decoy is sent");
+        let (widths, message) = records(&wire.bytes[HEADER..]);
+        assert_eq!(widths, vec![3; 10], "the hello beside it is still cut");
+        assert_eq!(message, hello[HEADER..]);
+    }
+
+    #[test]
+    fn a_delay_waits_for_the_stage_below_to_send() {
+        let sni = Fragment::new(0, 1, vec![range(3, 3)], vec![range(20, 20)], range(0, 0))
+            .expect("valid")
+            .sni();
+        let below =
+            Fragment::new(0, 1, vec![range(3, 3)], vec![range(0, 0)], range(0, 0)).expect("valid");
+        let mut chain = Chain::default();
+        chain.push(below);
+        let mut chain = chain.with_front(&sni);
+        let mut wire = RefuseOnce {
+            wire: Wire::default(),
+            left: 1,
+        };
+        let p = client_hello("retained.example");
+        assert_eq!(chain.write(&mut wire, &p).expect("writes"), p.len());
+        assert!(
+            wire.wire.bytes.len() >= HEADER,
+            "the record the delay separated left before the delay"
+        );
+    }
+
+    /// A wire that refuses the first write with `WouldBlock`, so a stage below retains it.
+    struct RefuseOnce {
+        wire: Wire,
+        left: usize,
+    }
+
+    impl Write for RefuseOnce {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.left > 0 {
+                self.left -= 1;
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            self.wire.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
