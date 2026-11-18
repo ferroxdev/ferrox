@@ -216,6 +216,10 @@ impl UserSelector {
         self.literal.iter().any(|literal| literal == user)
             || self.patterns.iter().any(|pattern| pattern.is_match(user))
     }
+
+    fn is_empty(&self) -> bool {
+        self.literal.is_empty() && self.patterns.is_empty()
+    }
 }
 
 /// A rule's `process` list, split once at startup the way the reference's matcher splits it: `self/`
@@ -356,6 +360,8 @@ pub(crate) struct Routing {
 pub(crate) struct ServerProof<'a> {
     pub inbound: Option<&'a str>,
     pub default_direct: bool,
+    /// The target networks the inbound serves: a stream-only lane cannot reach a datagram rule.
+    pub networks: &'a [Network],
     /// Whether a plain outbound tag dials direct: the default tag or a freedom outbound.
     pub direct: &'a dyn Fn(&str) -> bool,
     /// Each balancer's resolved candidate tags, so every tag it can pick is checked too.
@@ -1550,6 +1556,7 @@ impl Routing {
         let ServerProof {
             inbound,
             default_direct,
+            networks,
             direct,
             candidates,
             fallbacks,
@@ -1560,25 +1567,38 @@ impl Routing {
                 inbound.unwrap_or("<untagged>")
             ));
         }
+        // Stop at the first direct rule covering a network; later rules cannot decide it.
+        let mut open = [false; 2];
+        for network in networks {
+            match network {
+                Network::Tcp => open[0] = true,
+                Network::Udp => open[1] = true,
+                Network::Other(_) => {}
+            }
+        }
         for rule in rules {
-            if !rule.reachable(inbound, Network::Tcp) || !rule.local_os_matches() {
+            if !rule.local_os_matches() {
                 continue;
             }
-            // A server inbound never evaluates a rule, reads no sent route id and carries no HTTP head.
-            if rule.users.is_some()
-                || rule.vless_routes.is_some()
-                || rule.attrs.is_some()
-                || rule.process.is_some()
-            {
+            let reaches = [
+                open[0] && rule.server_reachable(inbound, Network::Tcp),
+                open[1] && rule.server_reachable(inbound, Network::Udp),
+            ];
+            if !reaches[0] && !reaches[1] {
                 continue;
             }
+            // A rule naming a fact the server flow does not carry still gates the target.
             let dials_direct = if rule.balancer {
-                candidates.get(&rule.target).is_some_and(|list| {
-                    list.iter()
-                        .map(String::as_str)
-                        .chain(fallbacks.get(&rule.target).map(String::as_str))
-                        .all(direct)
-                }) && forced(&rule.target).is_none_or(|tag| direct(&tag))
+                let forced_tag = forced(&rule.target);
+                if let Some(tag) = forced_tag.as_deref() {
+                    direct(tag)
+                } else {
+                    let list = candidates.get(&rule.target).map_or(&[][..], Vec::as_slice);
+                    let fallback = fallbacks.get(&rule.target);
+                    list.iter().all(|tag| direct(tag))
+                        && fallback.is_none_or(|tag| direct(tag))
+                        && (fallback.is_some() || default_direct)
+                }
             } else {
                 direct(&rule.target)
             };
@@ -1595,9 +1615,17 @@ impl Routing {
                     inbound.unwrap_or("<untagged>")
                 );
             }
-            if rule.server_always() {
-                return Ok(());
+            if rule.catch_all() {
+                if reaches[0] {
+                    open[0] = false;
+                }
+                if reaches[1] {
+                    open[1] = false;
+                }
             }
+        }
+        if !open[0] && !open[1] {
+            return Ok(());
         }
         if default_direct {
             Ok(())
@@ -1772,7 +1800,13 @@ impl Rule {
                 "localPort" => local_ports = port_set(field, "localPort")?,
                 "inboundTag" => inbound_tags = string_list(field, "inboundTag")?,
                 "localOS" => local_os = string_list(field, "localOS")?,
-                "protocol" => protocols = string_list(field, "protocol")?,
+                "protocol" => {
+                    protocols = string_list(field, "protocol")?.map(|list| {
+                        list.into_iter()
+                            .filter(|listed| !listed.is_empty())
+                            .collect()
+                    });
+                }
                 "user" => {
                     users = string_list(field, "user")?.map(|names| UserSelector::parse(&names));
                 }
@@ -1866,14 +1900,6 @@ impl Rule {
         !self.balancer && self.catch_all()
     }
 
-    fn server_always(&self) -> bool {
-        !self.balancer
-            && self.inbound_tags.is_some()
-            && self.networks.is_none()
-            && self.local_os.is_none()
-            && self.association_stable()
-    }
-
     fn local_os_matches(&self) -> bool {
         let current = local_os();
         self.local_os
@@ -1893,6 +1919,18 @@ impl Rule {
         self.networks
             .as_ref()
             .is_none_or(|list| list.contains(&network))
+    }
+
+    /// Whether a server flow on `network` could reach this rule. A selector that never holds and
+    /// a rule set with no branch on this network both make it unreachable.
+    fn server_reachable(&self, inbound: Option<&str>, network: Network) -> bool {
+        self.reachable(inbound, network)
+            && !self.protocols.as_ref().is_some_and(Vec::is_empty)
+            && !self.users.as_ref().is_some_and(UserSelector::is_empty)
+            && self
+                .sets
+                .as_ref()
+                .is_none_or(|sets| sets.iter().any(|set| set.can_reach_on(network)))
     }
 
     fn matches(&self, flow: &Flow, names: Option<Names<'_>>, ips: &mut Ips<'_>) -> bool {
@@ -2041,6 +2079,10 @@ impl Rule {
 }
 
 impl RuleSet {
+    fn can_reach_on(&self, network: Network) -> bool {
+        self.rules.iter().any(|rule| rule.can_reach_on(network))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn parse(value: &Json, assets: &mut Assets, dirs: &[PathBuf]) -> Result<Self, String> {
         let pairs = object(value, "routing rule set")?;
@@ -2551,6 +2593,22 @@ impl SetRule {
                 .rules
                 .iter()
                 .any(|rule| rule.invert || rule.reachable_on(network))
+        }
+    }
+
+    /// Whether a flow on `network` could match this rule. An inverted rule can turn a network miss
+    /// into a hit, so only a non-inverted branch proves the network is impossible.
+    fn can_reach_on(&self, network: Network) -> bool {
+        if self.invert {
+            return true;
+        }
+        let Some(logical) = &self.logical else {
+            return self.matches_network(network);
+        };
+        if logical.all {
+            logical.rules.iter().all(|rule| rule.can_reach_on(network))
+        } else {
+            logical.rules.iter().any(|rule| rule.can_reach_on(network))
         }
     }
 
@@ -5220,6 +5278,37 @@ mod tests {
         assert_eq!(parsed.route(&bare), Some("direct"));
     }
 
+    #[test]
+    fn an_empty_protocol_entry_matches_nothing() {
+        let root = object(vec![(
+            "routing",
+            routing(vec![
+                rule("block", vec![("protocol", array(vec![text("")]))]),
+                rule("direct", Vec::new()),
+            ]),
+        )]);
+        let parsed = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: None,
+            ip: None,
+            port: Some(443),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol: Some("http1"),
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        assert_eq!(parsed.route(&flow), Some("direct"));
+    }
+
     /// A `user` rule names an account's email literally or as a `regexp:` pattern; a flow without
     /// an email never matches. An empty list is no selector, while a list whose entries are all
     /// empty or invalid patterns is a matcher that matches nothing — the reference's split.
@@ -5675,9 +5764,12 @@ mod tests {
         let direct = |tag: &str| tag == "direct";
         let candidates = HashMap::new();
         let fallbacks = HashMap::new();
-        let proof = |inbound: Option<&'static str>, default_direct| ServerProof {
+        let both = [Network::Tcp, Network::Udp];
+        let stream = [Network::Tcp];
+        let proof = |inbound, default_direct, networks| ServerProof {
             inbound,
             default_direct,
+            networks,
             direct: &direct,
             candidates: &candidates,
             fallbacks: &fallbacks,
@@ -5691,24 +5783,53 @@ mod tests {
             .expect("parses")
             .expect("routing");
         routing
-            .server_routes(&proof(Some("server"), false))
+            .server_routes(&proof(Some("server"), false, &both))
             .expect("the tag's rule pins every flow to direct");
-        let by_user = root(vec![rule(
-            "proxy",
+        for selector in [
+            ("user", array(vec![text("a@x")])),
+            ("vlessRoute", array(vec![number(7)])),
+            ("attrs", object(vec![(":path", text("/x"))])),
+            ("process", array(vec![text("self/")])),
+        ] {
+            let skipped_field = root(vec![rule("proxy", vec![selector])]);
+            let routing = Routing::parse_in(&skipped_field, vec![dir()])
+                .expect("parses")
+                .expect("routing");
+            let error = routing
+                .server_routes(&proof(Some("server"), true, &both))
+                .expect_err("a rule the server flow cannot evaluate still names a proxy");
+            assert!(error.contains("proxy"), "{error}");
+        }
+        let direct_by_user = root(vec![rule(
+            "direct",
             vec![("user", array(vec![text("a@x")]))],
         )]);
-        let routing = Routing::parse_in(&by_user, vec![dir()])
+        let routing = Routing::parse_in(&direct_by_user, vec![dir()])
             .expect("parses")
             .expect("routing");
         routing
-            .server_routes(&proof(Some("server"), true))
-            .expect("a server flow carries no account email for the rule to read");
+            .server_routes(&proof(Some("server"), true, &both))
+            .expect("a rule that still targets direct changes nothing");
+        let by_udp = root(vec![rule(
+            "proxy",
+            vec![("network", array(vec![text("udp")]))],
+        )]);
+        let routing = Routing::parse_in(&by_udp, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let error = routing
+            .server_routes(&proof(Some("server"), true, &both))
+            .expect_err("a UDP-only rule can reach the server too");
+        routing
+            .server_routes(&proof(Some("server"), true, &stream))
+            .expect("a UDP-only rule cannot reach a stream-only inbound");
+        assert!(error.contains("proxy"), "{error}");
         let proxy = root(vec![rule("proxy", vec![("port", number(443))])]);
         let routing = Routing::parse_in(&proxy, vec![dir()])
             .expect("parses")
             .expect("routing");
         let error = routing
-            .server_routes(&proof(Some("server"), true))
+            .server_routes(&proof(Some("server"), true, &both))
             .expect_err("a per-flow rule can reach the server");
         assert!(error.contains("proxy"), "{error}");
         let default_proxy = root(Vec::new());
@@ -5716,9 +5837,222 @@ mod tests {
             .expect("parses")
             .expect("routing");
         let error = routing
-            .server_routes(&proof(Some("server"), false))
+            .server_routes(&proof(Some("server"), false, &both))
             .expect_err("the default is not direct");
         assert!(error.contains("default"), "{error}");
+    }
+
+    #[test]
+    fn a_server_inbound_stops_checking_a_network_a_direct_rule_covers() {
+        let direct = |tag: &str| tag == "direct";
+        let candidates = HashMap::new();
+        let fallbacks = HashMap::new();
+        let both = [Network::Tcp, Network::Udp];
+        let proof = ServerProof {
+            inbound: Some("server"),
+            default_direct: true,
+            networks: &both,
+            direct: &direct,
+            candidates: &candidates,
+            fallbacks: &fallbacks,
+        };
+        let root = |rules| object(vec![("routing", routing(rules))]);
+        let covered_udp = root(vec![
+            rule("direct", vec![("network", array(vec![text("udp")]))]),
+            rule("proxy", vec![("network", array(vec![text("udp")]))]),
+        ]);
+        let routing = Routing::parse_in(&covered_udp, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        routing
+            .server_routes(&proof)
+            .expect("the first UDP rule decides every UDP flow");
+        let covered_tcp_only = root(vec![
+            rule("direct", vec![("network", array(vec![text("tcp")]))]),
+            rule("proxy", Vec::new()),
+        ]);
+        let routing = Routing::parse_in(&covered_tcp_only, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let error = routing
+            .server_routes(&proof)
+            .expect_err("the all-network proxy rule still decides UDP");
+        assert!(error.contains("proxy"), "{error}");
+        let covered_both = root(vec![rule("direct", Vec::new()), rule("proxy", Vec::new())]);
+        let routing = Routing::parse_in(&covered_both, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        routing
+            .server_routes(&proof)
+            .expect("the first catch-all rule decides both networks");
+        let proxy_first = root(vec![
+            rule("proxy", vec![("network", array(vec![text("udp")]))]),
+            rule("direct", vec![("network", array(vec![text("udp")]))]),
+        ]);
+        let routing = Routing::parse_in(&proxy_first, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let error = routing
+            .server_routes(&proof)
+            .expect_err("the first UDP rule names a proxy");
+        assert!(error.contains("proxy"), "{error}");
+    }
+
+    #[test]
+    fn a_rule_set_outside_the_served_networks_is_not_a_refusal() {
+        let direct = |tag: &str| tag == "direct";
+        let candidates = HashMap::new();
+        let fallbacks = HashMap::new();
+        let both = [Network::Tcp, Network::Udp];
+        let proof = ServerProof {
+            inbound: Some("server"),
+            default_direct: true,
+            networks: &both,
+            direct: &direct,
+            candidates: &candidates,
+            fallbacks: &fallbacks,
+        };
+        let set = object(vec![
+            ("tag", text("tcp")),
+            (
+                "rules",
+                array(vec![object(vec![("network", array(vec![text("tcp")]))])]),
+            ),
+        ]);
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                ("ruleSets", array(vec![set])),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "proxy",
+                        vec![
+                            ("network", array(vec![text("udp")])),
+                            ("ruleSet", array(vec![text("tcp")])),
+                        ],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        routing
+            .server_routes(&proof)
+            .expect("a TCP-only rule set cannot reach a UDP-only rule");
+    }
+
+    #[test]
+    fn a_balancer_without_candidates_checks_its_direct_fallback() {
+        let direct = |tag: &str| tag == "direct";
+        let candidates = HashMap::new();
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert("pool".to_owned(), "direct".to_owned());
+        let both = [Network::Tcp, Network::Udp];
+        let proof = ServerProof {
+            inbound: Some("server"),
+            default_direct: false,
+            networks: &both,
+            direct: &direct,
+            candidates: &candidates,
+            fallbacks: &fallbacks,
+        };
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                (
+                    "balancers",
+                    array(vec![object(vec![
+                        ("tag", text("pool")),
+                        ("selector", array(vec![text("node")])),
+                        ("fallbackTag", text("direct")),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![object(vec![("balancerTag", text("pool"))])]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        routing
+            .server_routes(&proof)
+            .expect("an empty candidate list falls back to direct");
+        let scoped = object(vec![(
+            "routing",
+            object(vec![
+                (
+                    "balancers",
+                    array(vec![object(vec![
+                        ("tag", text("pool")),
+                        ("selector", array(vec![text("node")])),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![object(vec![
+                        ("balancerTag", text("pool")),
+                        ("port", number(443)),
+                    ])]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&scoped, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let candidates = HashMap::from([("pool".to_owned(), vec!["direct".to_owned()])]);
+        let no_fallback = HashMap::new();
+        let proxy_default = ServerProof {
+            candidates: &candidates,
+            fallbacks: &no_fallback,
+            default_direct: false,
+            ..proof
+        };
+        let error = routing
+            .server_routes(&proxy_default)
+            .expect_err("a strategy with no pick falls to the proxy default");
+        assert!(error.contains("pool"), "{error}");
+        let direct_default = ServerProof {
+            default_direct: true,
+            ..proxy_default
+        };
+        routing
+            .server_routes(&direct_default)
+            .expect("a direct default covers a strategy with no pick");
+    }
+
+    #[test]
+    fn an_empty_user_or_protocol_entry_never_reaches_a_server_inbound() {
+        let direct = |tag: &str| tag == "direct";
+        let candidates = HashMap::new();
+        let fallbacks = HashMap::new();
+        let both = [Network::Tcp, Network::Udp];
+        let proof = ServerProof {
+            inbound: Some("server"),
+            default_direct: true,
+            networks: &both,
+            direct: &direct,
+            candidates: &candidates,
+            fallbacks: &fallbacks,
+        };
+        for selector in [
+            ("user", array(vec![text("")])),
+            ("protocol", array(vec![text("")])),
+        ] {
+            let root = object(vec![(
+                "routing",
+                routing(vec![rule("proxy", vec![selector])]),
+            )]);
+            let routing = Routing::parse_in(&root, vec![dir()])
+                .expect("parses")
+                .expect("routing");
+            routing
+                .server_routes(&proof)
+                .expect("a selector with no value matches no server flow");
+        }
     }
 
     #[test]
@@ -5912,9 +6246,11 @@ mod tests {
             .expect("parses")
             .expect("routing");
         assert_eq!(routing.source_refusal(Some("tun")), None);
+        let both = [Network::Tcp, Network::Udp];
         let proof = ServerProof {
             inbound: Some("server"),
             default_direct: true,
+            networks: &both,
             direct: &|_| true,
             candidates: &HashMap::new(),
             fallbacks: &HashMap::new(),
