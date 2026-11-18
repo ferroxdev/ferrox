@@ -214,12 +214,12 @@ impl Gate {
         }
     }
 
-    /// The reference ran and the runner starved only the engine under test: the pair was never measured because of the machine, so it cannot read as a regression the engine caused. `detail` names what the machine starved.
+    /// The reference ran and the runner starved only the engine under test: the pair was never measured because of the machine, so it cannot be read as a regression the engine caused. A missing measurement is not parity, so it reports `unproven` and cannot pass. `detail` names what the machine starved.
     pub fn unmeasured_by_runner(detail: impl Into<String>) -> Self {
         Self {
-            passed: true,
+            passed: false,
             lines: vec![format!(
-                "unmeasured by the runner: {}; reported inconclusive because of the machine, \
+                "unmeasured by the runner: {}; reported unproven because of the machine, \
                  not a regression in the engine under test",
                 detail.into()
             )],

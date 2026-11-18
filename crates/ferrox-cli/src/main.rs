@@ -35,10 +35,10 @@ fn main() {
     let code = match options.action {
         Action::Up => up(&mut options, &mut paths, false),
         Action::Serve => up(&mut options, &mut paths, true),
-        Action::Down => down(&options, &paths),
-        Action::Status => status(&options, &paths),
+        Action::Down => down(&options, &mut paths),
+        Action::Status => status(&options, &mut paths),
         Action::Ports => {
-            ports(&options, &paths);
+            ports(&options, &mut paths);
             0
         }
         Action::Tun => {
@@ -46,7 +46,9 @@ fn main() {
             0
         }
         Action::Login => {
-            reconcile(&paths);
+            if let Err(error) = reconcile(&paths) {
+                eprintln!("ferrox-cli: {error}");
+            }
             credentials::login(&options, &paths).unwrap_or_else(|error| args::die(&error));
             0
         }
@@ -67,19 +69,16 @@ fn main() {
     exit(code);
 }
 
-fn reconcile(paths: &Paths) {
+fn reconcile(paths: &Paths) -> Result<(), String> {
     if !paths.proxy_state.exists() {
-        return;
+        return Ok(());
     }
     // Serialize with `up`/`down` before reading liveness and clearing the proxy.
-    let Ok(_lifecycle) = lane::lock(paths) else {
-        return;
-    };
+    let _lifecycle = lane::lock(paths)?;
     if !lane::running(paths) {
-        if let Err(error) = proxy::clear(paths) {
-            eprintln!("ferrox-cli: {error}");
-        }
+        proxy::clear(paths)?;
     }
+    Ok(())
 }
 
 fn choose_carrier(options: &Options) -> String {
@@ -129,10 +128,43 @@ fn ensure_config(options: &Options) {
     }
 }
 
-fn reject_duplicate_ports(options: &Options, paths: &Paths) {
-    if options.outbound != Some(Outbound::Config) {
-        duplicate_fronts(&options.fronts, config::plan_ports(options, paths, false));
+fn duplicate_set_ports(options: &Options) -> Option<String> {
+    let listed = fronts(&options.fronts);
+    let mut seen: Vec<(u16, &str)> = Vec::new();
+    for (name, port, set) in [
+        ("socks", options.socks, options.socks_set),
+        ("http", options.http, options.http_set),
+        ("mixed", options.mixed, options.mixed_set),
+    ] {
+        if !set || !listed.iter().any(|front| front == name) {
+            continue;
+        }
+        if let Some((_, other)) = seen.iter().find(|(taken, _)| *taken == port) {
+            return Some(format!(
+                "two fronts cannot share port {port} ({other} and {name}); nothing was started."
+            ));
+        }
+        seen.push((port, name));
     }
+    None
+}
+
+fn reject_duplicate_ports(options: &Options) {
+    if options.outbound == Some(Outbound::Config) {
+        return;
+    }
+    if let Some(message) = duplicate_set_ports(options) {
+        args::die(&message);
+    }
+}
+
+fn reject_empty_fronts(options: &Options) -> Result<(), String> {
+    if options.outbound != Some(Outbound::Config) && fronts(&options.fronts).is_empty() {
+        return Err(
+            "--fronts names no front; give socks, http, mixed, or a combination; nothing was started.".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn prepare(options: &mut Options, paths: &mut Paths) -> (Ports, bool) {
@@ -147,7 +179,8 @@ fn prepare(options: &mut Options, paths: &mut Paths) -> (Ports, bool) {
         )
         .unwrap_or_else(|error| args::die(&error));
         options.fronts = list;
-        paths.cfg = PathBuf::from(&options.config_file);
+        paths.cfg = std::fs::canonicalize(&options.config_file)
+            .unwrap_or_else(|_| PathBuf::from(&options.config_file));
         options.socks_set = false;
         options.http_set = false;
         options.mixed_set = false;
@@ -155,7 +188,7 @@ fn prepare(options: &mut Options, paths: &mut Paths) -> (Ports, bool) {
         duplicate_fronts(&options.fronts, ports);
         (ports, true)
     } else {
-        let ports = config::plan_ports(options, paths, options.instance.is_some());
+        let ports = config::plan_ports(options, paths, true);
         duplicate_fronts(&options.fronts, ports);
         (ports, false)
     }
@@ -166,6 +199,13 @@ fn foxy_account(options: &mut Options, paths: &Paths) -> FoxyAccount {
     credentials::resolve(options, paths).unwrap_or_else(|error| args::die(&error))
 }
 
+fn user_config_at_default(paths: &Paths) -> bool {
+    paths.cfg.exists()
+        && lane::user_config(paths).is_some_and(|cfg| {
+            std::fs::canonicalize(&cfg).ok() == std::fs::canonicalize(&paths.cfg).ok()
+        })
+}
+
 fn write_lane_config(
     options: &Options,
     paths: &Paths,
@@ -173,19 +213,30 @@ fn write_lane_config(
     account: Option<&FoxyAccount>,
 ) {
     if options.outbound == Some(Outbound::Config) {
+        lane::remember_user_config(paths).unwrap_or_else(|error| args::die(&error));
         return;
+    }
+    if user_config_at_default(paths) {
+        args::die(&format!(
+            "{} is a user config started with --config; refusing to overwrite it. Pass --config again or remove the file.",
+            paths.cfg.display()
+        ));
     }
     let outbound =
         config::build_outbound(options, paths, account).unwrap_or_else(|error| args::die(&error));
     config::write_config(&paths.cfg, &outbound, &options.fronts, ports)
         .unwrap_or_else(|error| args::die(&error));
+    lane::forget_user_config(paths);
     if options.outbound == Some(Outbound::Foxy) {
         config::save_foxy_location(options, paths).unwrap_or_else(|error| args::die(&error));
     }
 }
 
 fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
-    reconcile(paths);
+    if let Err(error) = reconcile(paths) {
+        eprintln!("ferrox-cli: {error}");
+        return 1;
+    }
     let lifecycle = match lane::lock(paths) {
         Ok(lock) => lock,
         Err(error) => {
@@ -194,7 +245,9 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         }
     };
     ensure_config(options);
-    reject_duplicate_ports(options, paths);
+    reject_duplicate_ports(options);
+    reject_empty_fronts(options).unwrap_or_else(|error| args::die(&error));
+    config::validate_exclusions(options).unwrap_or_else(|error| args::die(&error));
     options.carrier = choose_carrier(options);
     let bin = lane::require_bin();
     let account = if options.outbound == Some(Outbound::Foxy) {
@@ -343,6 +396,9 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             return 130;
         }
         drop(cancelled);
+        if interrupted.load(Ordering::SeqCst) {
+            return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 130);
+        }
     }
     println!("log:  {}", paths.log.display());
     drop(lifecycle);
@@ -420,6 +476,7 @@ fn stop_and_forget(paths: &Paths, user_config: bool) -> i32 {
         return 1;
     }
     if !user_config {
+        lane::forget_user_config(paths);
         let _ = std::fs::remove_file(&paths.cfg);
     }
     let restored = match proxy::clear(paths) {
@@ -525,7 +582,8 @@ fn diagnose(options: &Options, paths: &Paths) {
     }
 }
 
-fn down(options: &Options, paths: &Paths) -> i32 {
+fn down(options: &Options, paths: &mut Paths) -> i32 {
+    lane::adopt_config(paths);
     if options.all {
         let mut rc = stop_all_lanes(paths);
         if rc == 0 {
@@ -536,24 +594,31 @@ fn down(options: &Options, paths: &Paths) -> i32 {
         }
         if rc == 0 {
             let _ = std::fs::remove_file(&paths.lanes_file);
-            println!("every lane is stopped and its config removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it.");
+            println!("every lane is stopped; generated configs are removed and a user config is kept. The stored foxy session is kept; 'ferrox-cli logout' forgets it.");
         }
         return rc;
     }
+    let user_config = lane::user_config(paths).is_some();
     let rc = stop_lane(paths);
     if rc == 0 {
         forget_config(paths);
     }
+    let name = options
+        .instance
+        .as_ref()
+        .map_or_else(String::new, |name| format!(" '{name}'"));
     if rc != 0 {
         eprintln!(
             "the lane was not fully stopped or the system proxy was not cleared; run 'ferrox-cli down' again."
         );
+    } else if user_config {
+        println!(
+            "lane{name} stopped; the user config is kept. The stored foxy session is kept; 'ferrox-cli logout' forgets it."
+        );
     } else {
-        println!("lane{} stopped; the lane config is removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it.",
-            options
-                .instance
-                .as_ref()
-                .map_or_else(String::new, |name| format!(" '{name}'")));
+        println!(
+            "lane{name} stopped; the lane config is removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it."
+        );
     }
     rc
 }
@@ -582,6 +647,9 @@ fn stop_lane(paths: &Paths) -> i32 {
 }
 
 fn forget_config(paths: &Paths) {
+    if lane::user_config(paths).is_some() {
+        return;
+    }
     let name = paths
         .cfg
         .file_name()
@@ -593,6 +661,34 @@ fn forget_config(paths: &Paths) {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
     if paths.cfg.parent() == Some(paths.conf_dir.as_path()) && name.starts_with("lane") && is_json {
         let _ = std::fs::remove_file(&paths.cfg);
+    }
+}
+
+fn prune_lanes(paths: &Paths, missing: &[PathBuf]) {
+    let Ok(text) = read_trim_checked(&paths.lanes_file) else {
+        return;
+    };
+    let kept: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty() && !missing.iter().any(|dir| Path::new(*line) == dir.as_path())
+        })
+        .collect();
+    let result = if kept.is_empty() {
+        match std::fs::remove_file(&paths.lanes_file) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    } else {
+        crate::paths::write_private(&paths.lanes_file, &format!("{}\n", kept.join("\n")))
+    };
+    if let Err(error) = result {
+        eprintln!(
+            "ferrox-cli: cannot prune {}: {error}",
+            paths.lanes_file.display()
+        );
     }
 }
 
@@ -617,10 +713,20 @@ fn stop_all_lanes(paths: &Paths) -> i32 {
     if !dirs.iter().any(|(dir, _)| dir == &paths.conf_dir) {
         dirs.push((paths.conf_dir.clone(), false));
     }
+    let mut missing: Vec<PathBuf> = Vec::new();
     for (dir, registered) in dirs {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !registered => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if registered {
+                    eprintln!(
+                        "ferrox-cli: the registered lane directory {} is gone; pruning it.",
+                        dir.display()
+                    );
+                    missing.push(dir);
+                }
+                continue;
+            }
             Err(error) => {
                 eprintln!(
                     "ferrox-cli: cannot read {}: {error}; its lanes were not stopped.",
@@ -658,11 +764,17 @@ fn stop_all_lanes(paths: &Paths) -> i32 {
             }
         }
     }
+    if !missing.is_empty() {
+        prune_lanes(paths, &missing);
+    }
     rc
 }
 
-fn status(options: &Options, paths: &Paths) -> i32 {
-    reconcile(paths);
+fn status(options: &Options, paths: &mut Paths) -> i32 {
+    lane::adopt_config(paths);
+    if let Err(error) = reconcile(paths) {
+        eprintln!("ferrox-cli: {error}");
+    }
     if !lane::running(paths) {
         println!(
             "lane{} not running.",
@@ -741,8 +853,10 @@ fn status(options: &Options, paths: &Paths) -> i32 {
     0
 }
 
-fn ports(options: &Options, paths: &Paths) {
+fn ports(options: &Options, paths: &mut Paths) {
+    lane::adopt_config(paths);
     let ports = config::plan_ports(options, paths, false);
+    let routes = proxy::routes(&options.fronts, ports);
     println!("----------------------------------------------------------------");
     println!("local fronts (127.0.0.1 only):");
     port_map(options, ports);
@@ -759,23 +873,30 @@ fn ports(options: &Options, paths: &Paths) {
         println!("unnamed lane).");
         return;
     }
+    if routes.http.is_none() && routes.socks.is_none() {
+        return;
+    }
     println!("----------------------------------------------------------------");
     println!("Windows, Settings > Network & Internet > Proxy > Manual proxy setup:");
-    println!("  Use a proxy server: 127.0.0.1:{} (HTTP)", ports.http);
-    println!("  SOCKS proxy:        127.0.0.1:{}", ports.socks);
+    if let Some(port) = routes.http {
+        println!("  Use a proxy server: 127.0.0.1:{port} (HTTP)");
+    }
+    if let Some(port) = routes.socks {
+        println!("  SOCKS proxy:        127.0.0.1:{port}");
+    }
     println!("Leave authentication off (the fronts are unauthenticated and loopback-only).");
     println!();
     println!("One app instead of the whole system:");
-    println!(
-        "  curl --socks5-hostname 127.0.0.1:{} https://example.com",
-        ports.socks
-    );
-    println!(
-        "  curl -x http://127.0.0.1:{} https://example.com",
-        ports.http
-    );
-    println!("  set HTTPS_PROXY=http://127.0.0.1:{}", ports.http);
-    println!("  set ALL_PROXY=socks5h://127.0.0.1:{}", ports.socks);
+    if let Some(port) = routes.socks {
+        println!("  curl --socks5-hostname 127.0.0.1:{port} https://example.com");
+    }
+    if let Some(port) = routes.http {
+        println!("  curl -x http://127.0.0.1:{port} https://example.com");
+        println!("  set HTTPS_PROXY=http://127.0.0.1:{port}");
+    }
+    if let Some(port) = routes.socks {
+        println!("  set ALL_PROXY=socks5h://127.0.0.1:{port}");
+    }
 }
 
 fn port_map(options: &Options, ports: Ports) {
@@ -827,6 +948,14 @@ fn version(paths: &Paths) -> i32 {
         .map_or(1, |status| status.code().unwrap_or(1))
 }
 
+fn remove_private_file(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot remove {}: {error}", path.display())),
+    }
+}
+
 fn logout(paths: &Paths) -> i32 {
     let rc = stop_all_lanes(paths);
     if rc != 0 {
@@ -839,10 +968,19 @@ fn logout(paths: &Paths) -> i32 {
         eprintln!("ferrox-cli: {error}");
         return 1;
     }
-    let _ = std::fs::remove_file(&paths.token_file);
-    let _ = std::fs::remove_file(&paths.creds);
+    let mut rc = 0;
+    for path in [&paths.token_file, &paths.creds] {
+        if let Err(error) = remove_private_file(path) {
+            eprintln!("ferrox-cli: {error}");
+            rc = 1;
+        }
+    }
+    if rc != 0 {
+        eprintln!("ferrox-cli: the stored session or saved account could not be removed; it was kept.");
+        return rc;
+    }
     forget_config(paths);
-    println!("signed out: every lane is stopped, and the stored session, the saved account and the lane configs are gone.");
+    println!("signed out: every lane is stopped, generated configs are removed and a user config is kept; the stored session and saved account are gone.");
     println!(
         "the remembered exit stays in {}; 'ferrox-cli login' signs in again.",
         paths.location_file.display()
@@ -942,5 +1080,107 @@ fn tail(path: &Path, lines: usize) {
     let start = all.len().saturating_sub(lines);
     for line in &all[start..] {
         println!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-main-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |span| span.as_nanos())
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_user_config_marker_survives_forget_config() {
+        let root = scratch("user-config");
+        let paths = Paths::with_dirs(root.join("conf"), root.join("state"), None);
+        std::fs::create_dir_all(&paths.conf_dir).unwrap();
+        std::fs::write(&paths.cfg, "{}").unwrap();
+        lane::remember_user_config(&paths).unwrap();
+        assert!(user_config_at_default(&paths));
+        forget_config(&paths);
+        assert!(paths.cfg.exists());
+        assert!(lane::user_config(&paths).is_some());
+        assert!(user_config_at_default(&paths));
+        forget_config(&paths);
+        assert!(paths.cfg.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_explicit_ports_are_checked_for_duplicates_before_prepare() {
+        let mut options = Options::default();
+        options.instance = Some("work".to_owned());
+        options.socks = 8080;
+        options.socks_set = true;
+        assert_eq!(duplicate_set_ports(&options), None);
+        options.http = 8080;
+        options.http_set = true;
+        assert!(duplicate_set_ports(&options).is_some());
+    }
+
+    #[test]
+    fn an_empty_generated_front_list_is_refused() {
+        let mut options = Options::default();
+        options.fronts.clear();
+        options.fronts_set = true;
+        assert!(reject_empty_fronts(&options).is_err());
+        options.outbound = Some(Outbound::Config);
+        assert!(reject_empty_fronts(&options).is_ok());
+    }
+
+    #[test]
+    fn an_unnamed_lane_scans_off_a_port_a_named_lane_already_took() {
+        let root = scratch("scan-unnamed");
+        let mut paths = Paths::with_dirs(root.join("conf"), root.join("state"), None);
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = listener.local_addr().unwrap().port();
+        let mut options = Options::default();
+        options.fronts = "socks".to_owned();
+        options.socks = taken;
+        let (ports, user_config) = prepare(&mut options, &mut paths);
+        assert!(!user_config);
+        assert_ne!(ports.socks, taken);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_registered_missing_lane_directory_is_pruned_not_fatal() {
+        let root = scratch("prune");
+        let paths = Paths::with_dirs(root.join("conf"), root.join("state"), None);
+        std::fs::create_dir_all(&paths.conf_dir).unwrap();
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let missing = root.join("gone");
+        crate::paths::write_private(
+            &paths.lanes_file,
+            &format!("{}\n{}\n", missing.display(), paths.conf_dir.display()),
+        )
+        .unwrap();
+        assert_eq!(stop_all_lanes(&paths), 0);
+        let text = read_trim_checked(&paths.lanes_file).unwrap();
+        let conf = paths.conf_dir.to_string_lossy().into_owned();
+        assert!(!text.contains("gone"));
+        assert!(text.contains(&conf));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_missing_private_file_is_already_gone() {
+        let root = scratch("remove");
+        assert_eq!(remove_private_file(&root.join("nope")), Ok(()));
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        assert!(remove_private_file(&root.join("dir")).is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -152,6 +152,7 @@ pub struct Comparison {
     pub repeats: usize,
     pub by_engine: Vec<EngineRuns>,
     pub ceilings_mib_s: Vec<f64>,
+    pub ceiling_failures: Vec<String>,
     pub gated: Option<&'static str>,
     pub failures: Vec<(String, String)>,
     pub skipped: Vec<(String, String)>,
@@ -503,11 +504,11 @@ impl Comparison {
         stats::gate_rows(&self.rows())
     }
 
-    /// Whether the machine, not one engine, is responsible for a shortfall: the runner ran out of its cell window, or took a workload disturbance on an engine other than `candidate`. A disturbance is per-machine, so one seen across engines cannot be read as the candidate's fault.
+    /// Whether the machine, not one engine, is responsible for a shortfall: the runner ran out of its cell window. A workload fault on another engine is that engine's own failure, not evidence the machine starved the candidate.
     fn runner_disturbed_beyond_the_candidate(&self, candidate: &str) -> bool {
-        self.failures.iter().any(|(engine, reason)| {
-            engine != candidate && (engine == "cell" || reason.starts_with("workload"))
-        })
+        self.failures
+            .iter()
+            .any(|(engine, _)| engine == "cell" && engine != candidate)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -728,12 +729,23 @@ impl Comparison {
                     .collect(),
             ),
         );
+        root.insert(
+            "ceiling_failures",
+            Json::Arr(
+                self.ceiling_failures
+                    .iter()
+                    .map(|reason| Json::Str(reason.clone()))
+                    .collect(),
+            ),
+        );
         root.to_string()
     }
 
     pub fn report(&self) -> String {
         let mut s = self.preamble();
         s.push_str(&self.failure_note());
+        s.push_str(&self.skipped_note());
+        s.push_str(&self.ceiling_failure_note());
         s.push_str(&self.headline_table());
         s.push_str(&self.per_repeat_table());
         s.push_str(&self.medians_table());
@@ -791,7 +803,23 @@ impl Comparison {
                     spread_text((high - low) / median),
                     stats::HARNESS_BOUND * 100.0
                 ),
-                None => "not measured, so no row below can be called generator-saturated".into(),
+                None => {
+                    let because = if self.workload.measures_ceiling() {
+                        self.ceiling_failures.first().map_or_else(
+                            || "the harness ran no probe for this cell".to_owned(),
+                            |reason| format!("the harness probe failed: {reason}"),
+                        )
+                    } else {
+                        format!(
+                            "a {} cell has no TCP stream for the one-hop generator to bound",
+                            self.workload.traffic
+                        )
+                    };
+                    format!(
+                        "not measured, because {because}; no row below can be called \
+                         generator-saturated"
+                    )
+                }
             }
         );
         let _ = writeln!(
@@ -834,6 +862,38 @@ impl Comparison {
         );
         for (engine, reason) in &self.failures {
             let _ = writeln!(s, "> - `{engine}`: {reason}");
+        }
+        let _ = writeln!(s);
+        s
+    }
+
+    fn skipped_note(&self) -> String {
+        if self.skipped.is_empty() {
+            return String::new();
+        }
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "> **Engines not run in this cell.** Each carries the reason it was left out:\n"
+        );
+        for (engine, reason) in &self.skipped {
+            let _ = writeln!(s, "> - `{engine}`: {reason}");
+        }
+        let _ = writeln!(s);
+        s
+    }
+
+    fn ceiling_failure_note(&self) -> String {
+        if self.ceiling_failures.is_empty() {
+            return String::new();
+        }
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "> **One-hop ceiling not measured.** The harness recorded:\n"
+        );
+        for reason in &self.ceiling_failures {
+            let _ = writeln!(s, "> - {reason}");
         }
         let _ = writeln!(s);
         s
@@ -1303,6 +1363,7 @@ pub fn run(
     }
 
     let mut ceilings: Vec<f64> = Vec::new();
+    let mut ceiling_failures: Vec<String> = Vec::new();
     // The measures of one cell share one wall clock, so the re-measuring of a storm is bounded by the cell and not by each measure: a job cut off at its CI timeout prints no verdict and uploads no bundle.
     let cell = parity::Cell::new(parity::CELL_WINDOW);
 
@@ -1319,12 +1380,13 @@ pub fn run(
 
     'measures: for repeat in 1..=repeats {
         if measure_ceiling && workload.measures_ceiling() {
-            if let Ok(ceiling) = parity::harness_ceiling(
+            match parity::harness_ceiling(
                 workload.connections,
                 workload.payload_size,
                 workload.flow_bytes(),
             ) {
-                ceilings.push(ceiling);
+                Ok(ceiling) => ceilings.push(ceiling),
+                Err(e) => ceiling_failures.push(e.to_string()),
             }
         }
         for name in stats::rotate(&names, repeat) {
@@ -1381,6 +1443,7 @@ pub fn run(
         repeats,
         by_engine,
         ceilings_mib_s: ceilings,
+        ceiling_failures,
         gated: engines.iter().find(|e| e.gated).map(|e| e.name),
         failures,
         skipped,
@@ -2452,6 +2515,7 @@ mod tests {
                 ("ferrox".to_owned(), "workload: transient".to_owned()),
             ],
             skipped: Vec::new(),
+            ceiling_failures: Vec::new(),
             machine: "test".into(),
         };
         let gate = comparison.gate();
@@ -2496,6 +2560,7 @@ mod tests {
                 ("xray-core".to_owned(), startup_failure.to_owned()),
             ],
             skipped: Vec::new(),
+            ceiling_failures: Vec::new(),
             machine: "test".into(),
         };
         let gate = comparison.gate();
@@ -2536,6 +2601,7 @@ mod tests {
             gated: Some("ferrox"),
             failures: vec![("ferrox".to_owned(), "workload: transient".to_owned())],
             skipped: Vec::new(),
+            ceiling_failures: Vec::new(),
             machine: "test".into(),
         };
         assert!(
@@ -2564,6 +2630,7 @@ mod tests {
             gated: Some("ferrox"),
             failures: Vec::new(),
             skipped: vec![("ferrox".to_owned(), "no binary".to_owned())],
+            ceiling_failures: Vec::new(),
             machine: "test".into(),
         };
         let gate = comparison.gate();
@@ -2577,9 +2644,9 @@ mod tests {
         );
     }
 
-    /// The storm of a saturated runner is per-machine, so a workload fault seen on an engine other than the one under test means the candidate was starved by the machine, not bested: a gated candidate that lands nothing while a comparator took the same fault is unmeasured, not a regression.
+    /// A workload fault on another engine is that engine's own failure, not evidence the machine starved the gated candidate: a gated candidate that lands nothing still has no pair, so it cannot pass.
     #[test]
-    fn a_candidate_starved_by_a_machine_wide_workload_storm_is_unmeasured() {
+    fn another_engines_workload_failure_does_not_make_an_unmeasured_candidate_pass() {
         let comparison = Comparison {
             workload: workload(),
             repeats: 3,
@@ -2598,27 +2665,25 @@ mod tests {
             gated: Some("ferrox"),
             failures: vec![("xray-core".to_owned(), "workload: desync".to_owned())],
             skipped: Vec::new(),
+            ceiling_failures: Vec::new(),
             machine: "test".into(),
         };
         let gate = comparison.gate();
         assert!(
-            gate.passed,
-            "a ferrox starved by a storm the reference also hit is not its regression: {:?}",
+            !gate.passed,
+            "a missing gated measurement is not parity, whatever another engine did: {:?}",
             gate.lines
         );
         assert!(
-            gate.lines
-                .iter()
-                .any(|line| line.contains("unmeasured by the runner")
-                    && line.contains("engine under test")),
-            "the line names the engine under test starved by the machine, not the reference: {:?}",
+            gate.lines.iter().any(|line| line.contains("UNPROVEN")),
+            "the missing pair is reported unproven: {:?}",
             gate.lines
         );
     }
 
-    /// A cell that ran out of its CI window is the clearest machine-wide shortfall: no engine was fairly measured, so the gated candidate landing nothing while the window-end failure names `cell` is unmeasured, not a regression.
+    /// A cut-off cell window explains the missing run, but an unmeasured gated engine still has no pair to judge: it carries the runner's cause and fails instead of passing.
     #[test]
-    fn a_candidate_starved_when_the_cell_window_ended_is_unmeasured() {
+    fn a_candidate_starved_when_the_cell_window_ended_cannot_pass() {
         let comparison = Comparison {
             workload: workload(),
             repeats: 3,
@@ -2640,12 +2705,13 @@ mod tests {
                 "the cell's window ended before every measure ran".to_owned(),
             )],
             skipped: Vec::new(),
+            ceiling_failures: Vec::new(),
             machine: "test".into(),
         };
         let gate = comparison.gate();
         assert!(
-            gate.passed,
-            "a ferrox starved by a cut-off cell window is not its regression: {:?}",
+            !gate.passed,
+            "a ferrox the cell window starved was never measured, so it cannot pass: {:?}",
             gate.lines
         );
         assert!(
@@ -2656,6 +2722,44 @@ mod tests {
             "the window-end case names the engine under test starved by the machine: {:?}",
             gate.lines
         );
+    }
+
+    /// Neither a cut-off cell window nor another engine's workload fault leaves the gated engine with a pair, so neither can turn an empty gated run set into a pass.
+    #[test]
+    fn an_unmeasured_gated_engine_fails_on_a_machine_disturbance() {
+        for failures in [
+            vec![(
+                "cell".to_owned(),
+                "the cell's window ended before every measure ran".to_owned(),
+            )],
+            vec![("xray-core".to_owned(), "workload: desync".to_owned())],
+        ] {
+            let comparison = Comparison {
+                workload: workload(),
+                repeats: 3,
+                by_engine: vec![
+                    synth_engine(
+                        "xray-core",
+                        [(100, 6000, 20480), (110, 6200, 20500), (120, 6400, 20600)],
+                    ),
+                    EngineRuns {
+                        engine: "ferrox",
+                        dialect: parity::Dialect::Xray,
+                        runs: Vec::new(),
+                    },
+                ],
+                ceilings_mib_s: vec![900.0, 950.0, 1000.0],
+                gated: Some("ferrox"),
+                failures,
+                skipped: Vec::new(),
+                ceiling_failures: Vec::new(),
+                machine: "test".into(),
+            };
+            assert!(
+                !comparison.gate().passed,
+                "an empty gated run set cannot pass whatever disturbed the runner"
+            );
+        }
     }
 
     /// A candidate that recorded its own failures and then ran out of the cell window was measured as failing: the window ended because those retries consumed it, so it is not independent machine-wide evidence. The escape must not turn that into a pass.
@@ -2699,6 +2803,7 @@ mod tests {
                 ),
             ],
             skipped: Vec::new(),
+            ceiling_failures: Vec::new(),
             machine: "test".into(),
         };
         let gate = comparison.gate();
@@ -2728,6 +2833,7 @@ mod tests {
             gated: Some("ferrox"),
             failures: Vec::new(),
             skipped: Vec::new(),
+            ceiling_failures: Vec::new(),
             machine: "test".into(),
         };
         let text = comparison
@@ -2814,6 +2920,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_report_names_skipped_engines_and_a_failed_ceiling_probe() {
+        let comparison = Comparison {
+            workload: workload(),
+            repeats: 3,
+            by_engine: vec![
+                synth_engine(
+                    "xray-core",
+                    [(100, 6000, 20480), (110, 6200, 20500), (120, 6400, 20600)],
+                ),
+                synth_engine(
+                    "ferrox",
+                    [(200, 3000, 10240), (220, 3100, 10250), (240, 3200, 10260)],
+                ),
+            ],
+            ceilings_mib_s: Vec::new(),
+            ceiling_failures: vec![
+                "harness ceiling: the generator did not answer".to_owned(),
+            ],
+            gated: Some("ferrox"),
+            failures: Vec::new(),
+            skipped: vec![(
+                "sing-box".to_owned(),
+                "hysteria is not a carrier sing-box has at its pin".to_owned(),
+            )],
+            machine: "test".into(),
+        };
+        let report = comparison.report();
+        assert!(
+            report.contains("sing-box")
+                && report.contains("hysteria is not a carrier sing-box has at its pin"),
+            "the skipped engine's reason is not lost: {report}"
+        );
+        assert!(
+            report.contains("the generator did not answer"),
+            "the ceiling failure is not lost: {report}"
+        );
+    }
+
     /// One connection crossing 8 KiB in the whole run, the shape of `vless-raw-setup-1k`: the
     /// reference burns `cpu_millis` per repeat, the candidate finishes inside a single tick.
     fn micro_comparison(cpu_millis: [u64; 3]) -> Comparison {
@@ -2843,6 +2988,7 @@ mod tests {
             gated: Some("ferrox"),
             failures: Vec::new(),
             skipped: Vec::new(),
+            ceiling_failures: Vec::new(),
             machine: "test".into(),
         }
     }
@@ -2934,6 +3080,7 @@ mod tests {
             gated: Some("ferrox"),
             failures: Vec::new(),
             skipped: Vec::new(),
+            ceiling_failures: Vec::new(),
             machine: "test".into(),
         };
         let cpu = gated_row(&comparison, "cpu per GiB");
@@ -2976,6 +3123,7 @@ mod tests {
             gated: Some("ferrox"),
             failures: Vec::new(),
             skipped: Vec::new(),
+            ceiling_failures: Vec::new(),
             machine: "test".into(),
         }
     }

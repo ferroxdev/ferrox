@@ -245,67 +245,75 @@ fn footer(library: &Library, prompt: &Prompt, with_provenance: bool) -> String {
 /// `{name}` and `{name=default}` substitute; `{{`/`}}` escape one brace, lone braces are prose, and an unfilled placeholder stays as written.
 pub fn substitute(text: &str, values: &BTreeMap<String, String>) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(character) = chars.next() {
+    let mut index = 0;
+    while index < text.len() {
+        let Some(character) = text[index..].chars().next() else {
+            break;
+        };
         if character == '}' {
-            if chars.peek() == Some(&'}') {
-                chars.next();
+            if text[index + 1..].starts_with('}') {
                 out.push('}');
+                index += 2;
             } else {
                 out.push('}');
+                index += 1;
             }
             continue;
         }
         if character != '{' {
             out.push(character);
+            index += character.len_utf8();
             continue;
         }
-        if chars.peek() == Some(&'{') {
-            chars.next();
+        let after = index + 1;
+        if text[after..].starts_with('{') {
             out.push('{');
+            index = after + 1;
             continue;
         }
-        let mut body = String::new();
-        let mut closed = false;
-        for inner in chars.by_ref() {
-            if inner == '}' {
-                closed = true;
-                break;
-            }
-            body.push(inner);
-        }
-        // No closing brace: the `{` was prose, so emit what was read and stop scanning for placeholders.
-        if !closed {
+        let Some(close) = text[after..].find('}').map(|offset| after + offset) else {
             out.push('{');
-            out.push_str(&body);
+            index = after;
+            continue;
+        };
+        let body = &text[after..close];
+        if !is_placeholder_name(placeholder_name(body)) {
+            out.push('{');
+            index = after;
             continue;
         }
         // An unfilled placeholder stays exactly as written, so the gap is visible in the output, not in a footnote.
-        if let Some(value) = resolved(&body, values) {
+        if let Some(value) = resolved(body, values) {
             out.push_str(&value);
         } else {
             out.push('{');
-            out.push_str(&body);
+            out.push_str(body);
             out.push('}');
         }
+        index = close + 1;
     }
     out
 }
 
+fn placeholder_name(body: &str) -> &str {
+    match body.split_once('=') {
+        Some((name, _)) => name.trim(),
+        None => body.trim(),
+    }
+}
+
 /// The text for one placeholder body, or `None` to leave the placeholder alone.
 fn resolved(body: &str, values: &BTreeMap<String, String>) -> Option<String> {
-    let (name, default) = match body.split_once('=') {
-        Some((name, default)) => (name.trim(), Some(default)),
-        None => (body.trim(), None),
-    };
+    let name = placeholder_name(body);
     if !is_placeholder_name(name) {
         return None;
     }
+    let default = body.split_once('=').map(|(_, default)| default);
     match values.get(name) {
         Some(value) => Some(value.clone()),
         // An empty default reads as no default so the placeholder stays visible; `check` reports it separately.
         None => default
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.trim().is_empty())
             .map(ToOwned::to_owned),
     }
 }
@@ -701,7 +709,16 @@ fix issue #{issue}
         assert_eq!(substitute("{} {a b}", &values), "{} {a b}");
         // Unfilled stays as written; a supplied value wins over an empty default.
         assert_eq!(substitute("{b=}", &values), "{b=}");
+        assert_eq!(substitute("{b= }", &values), "{b= }");
         assert_eq!(substitute("{a=}", &values), "1");
+        assert_eq!(substitute("{a= }", &values), "1");
+    }
+
+    #[test]
+    fn a_lone_brace_does_not_swallow_a_later_placeholder() {
+        let values = values(&[("name", "value")]);
+        assert_eq!(substitute("a { b {name}", &values), "a { b value");
+        assert_eq!(substitute("a { b {name}", &values(&[])), "a { b {name}");
     }
 
     #[test]

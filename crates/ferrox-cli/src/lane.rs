@@ -104,7 +104,7 @@ pub fn alive(pid: u32) -> bool {
 }
 
 pub fn running(paths: &Paths) -> bool {
-    pid(paths).is_some_and(alive)
+    pid(paths).is_some_and(|pid| alive(pid) && is_ferrox(pid))
 }
 
 fn process_exe(pid: u32) -> Option<PathBuf> {
@@ -195,6 +195,17 @@ fn is_ferrox(pid: u32) -> bool {
     same_exe(&actual, &expected_bin())
 }
 
+#[cfg(any(unix, windows))]
+fn wait_exit(pid: u32, attempts: u32) -> bool {
+    for _ in 0..attempts {
+        if !alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !alive(pid)
+}
+
 pub fn kill(pid: u32) -> Result<(), String> {
     if !is_ferrox(pid) {
         return Err(format!(
@@ -203,16 +214,29 @@ pub fn kill(pid: u32) -> Result<(), String> {
     }
     #[cfg(unix)]
     {
-        let pid = i32::try_from(pid).map_err(|_| "the pid does not fit a process id".to_owned())?;
-        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        let process =
+            i32::try_from(pid).map_err(|_| "the pid does not fit a process id".to_owned())?;
+        if unsafe { libc::kill(process, libc::SIGTERM) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
                 return Err(format!("cannot stop process {pid}: {error}"));
             }
+            return Ok(());
         }
-        std::thread::sleep(Duration::from_secs(1));
-        if unsafe { libc::kill(pid, 0) } == 0 {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+        if wait_exit(pid, 10) {
+            return Ok(());
+        }
+        if unsafe { libc::kill(process, libc::SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("cannot stop process {pid}: {error}"));
+            }
+            return Ok(());
+        }
+        if !wait_exit(pid, 50) {
+            return Err(format!(
+                "process {pid} did not exit after SIGKILL; its pid file was kept."
+            ));
         }
     }
     #[cfg(windows)]
@@ -233,9 +257,14 @@ pub fn kill(pid: u32) -> Result<(), String> {
         let stopped = unsafe { TerminateProcess(handle, 1) };
         unsafe { CloseHandle(handle) };
         if stopped == 0 {
+            let error = std::io::Error::last_os_error();
+            if !wait_exit(pid, 5) {
+                return Err(format!("cannot stop process {pid}: {error}"));
+            }
+        }
+        if !wait_exit(pid, 50) {
             return Err(format!(
-                "cannot stop process {pid}: {}",
-                std::io::Error::last_os_error()
+                "process {pid} did not exit after it was terminated; its pid file was kept."
             ));
         }
     }
@@ -264,14 +293,14 @@ pub fn lock(paths: &Paths) -> Result<File, String> {
 }
 
 fn port_lock_path(paths: &Paths) -> PathBuf {
-    paths.conf_dir.join("ports.lock")
+    paths.state_dir.join("ports.lock")
 }
 
-/// Serialize the free-port scan and engine start across every lane in this root: a lane that
-/// releases its probe before the next one scans can hand the same port to both.
+/// Serialize the free-port scan and engine start across every lane sharing this state directory: a
+/// lane that releases its probe before the next one scans can hand the same port to both.
 pub fn port_lock(paths: &Paths) -> Result<File, String> {
-    secure_dir(&paths.conf_dir)
-        .map_err(|error| format!("cannot create the config dir: {error}"))?;
+    secure_dir(&paths.state_dir)
+        .map_err(|error| format!("cannot create the state dir: {error}"))?;
     let path = port_lock_path(paths);
     let file = OpenOptions::new()
         .create(true)
@@ -329,6 +358,38 @@ fn register(paths: &Paths) -> Result<(), String> {
     Ok(())
 }
 
+fn config_marker(paths: &Paths) -> PathBuf {
+    let name = paths
+        .pid_file
+        .file_stem()
+        .map_or_else(|| String::from("lane"), |stem| stem.to_string_lossy().into_owned());
+    paths.conf_dir.join(format!(".{name}.provenance"))
+}
+
+pub fn remember_user_config(paths: &Paths) -> Result<(), String> {
+    write_private(
+        &config_marker(paths),
+        &format!("{}\n", paths.cfg.to_string_lossy()),
+    )
+    .map_err(|error| format!("cannot record the lane config {}: {error}", paths.cfg.display()))
+}
+
+pub fn forget_user_config(paths: &Paths) {
+    let _ = std::fs::remove_file(config_marker(paths));
+}
+
+pub fn user_config(paths: &Paths) -> Option<PathBuf> {
+    read_trim(&config_marker(paths))
+        .filter(|text| !text.is_empty())
+        .map(PathBuf::from)
+}
+
+pub fn adopt_config(paths: &mut Paths) {
+    if let Some(cfg) = user_config(paths) {
+        paths.cfg = cfg;
+    }
+}
+
 pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
     secure_dir(&paths.conf_dir)
         .map_err(|error| format!("cannot create the config dir: {error}"))?;
@@ -378,7 +439,7 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
 
 pub fn stop(paths: &Paths) -> Result<(), String> {
     if let Some(pid) = pid(paths) {
-        if alive(pid) {
+        if alive(pid) && is_ferrox(pid) {
             kill(pid)?;
         }
     }
@@ -520,7 +581,7 @@ pub fn other_lanes(paths: &Paths) -> Vec<(String, u32)> {
             continue;
         };
         if let Some(pid) = read_trim(&entry.path()).and_then(|text| text.parse().ok()) {
-            if alive(pid) {
+            if alive(pid) && is_ferrox(pid) {
                 lanes.push((instance.to_owned(), pid));
             }
         }
@@ -546,6 +607,52 @@ mod tests {
         assert!(probe.try_lock().is_err());
         drop(held);
         assert!(probe.try_lock().is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lanes_in_two_roots_sharing_state_share_the_port_probe_lock() {
+        let root = std::env::temp_dir().join(format!("ferrox-ports-roots-{}", std::process::id()));
+        let one = Paths::with_dirs(root.join("one"), root.join("state"), None);
+        let two = Paths::with_dirs(root.join("two"), root.join("state"), None);
+        let held = port_lock(&one).unwrap();
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(port_lock_path(&two))
+            .unwrap();
+        assert!(probe.try_lock().is_err());
+        drop(held);
+        assert!(probe.try_lock().is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_user_config_marker_round_trips_and_can_be_forgotten() {
+        let root = std::env::temp_dir().join(format!("ferrox-config-{}", std::process::id()));
+        let mut paths = Paths::with_dirs(root.join("conf"), root.join("state"), Some("work"));
+        paths.cfg = root.join("custom.json");
+        remember_user_config(&paths).unwrap();
+        assert_eq!(user_config(&paths), Some(paths.cfg.clone()));
+        let mut adopted = Paths::with_dirs(root.join("conf"), root.join("state"), Some("work"));
+        adopt_config(&mut adopted);
+        assert_eq!(adopted.cfg, paths.cfg);
+        forget_user_config(&paths);
+        assert_eq!(user_config(&paths), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn a_live_foreign_pid_is_stale_not_a_running_lane() {
+        let root = std::env::temp_dir().join(format!("ferrox-foreign-{}", std::process::id()));
+        let paths = Paths::with_dirs(root.join("conf"), root.join("state"), None);
+        let current = std::process::id();
+        assert!(!is_ferrox(current), "the test process looks like the lane");
+        write_private(&paths.pid_file, &format!("{current}\n")).unwrap();
+        assert!(!running(&paths));
+        assert!(stop(&paths).is_ok());
+        assert_eq!(pid(&paths), None);
         let _ = std::fs::remove_dir_all(root);
     }
 

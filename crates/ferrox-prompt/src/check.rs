@@ -324,7 +324,11 @@ fn check_placeholders(prompt: &Prompt, findings: &mut Vec<Diagnostic>) {
                 ),
             ));
         }
-        if placeholder.default.as_deref() == Some("") {
+        if placeholder
+            .default
+            .as_deref()
+            .is_some_and(|default| default.trim().is_empty())
+        {
             findings.push(Diagnostic::warning(
                 prompt.line,
                 format!(
@@ -396,13 +400,13 @@ pub struct Contention {
 /// Files `prompt` shares with a prompt the advisor could also be asked for.
 pub fn contention(library: &Library, prompt: &Prompt) -> Vec<Contention> {
     let mut found: Vec<Contention> = Vec::new();
-    for path in prompt.existing_paths() {
+    for path in prompt.touches.iter().map(Touch::path) {
         let also: Vec<u32> = library
             .prompts
             .iter()
             .filter(|other| other.id != prompt.id)
             .filter(|other| is_available(library, other))
-            .filter(|other| other.existing_paths().any(|claimed| claimed == path))
+            .filter(|other| other.touches.iter().any(|touch| touch.path() == path))
             .map(|other| other.id)
             .collect();
         if !also.is_empty() {
@@ -599,6 +603,37 @@ body
             findings
                 .iter()
                 .any(|finding| finding.message.contains("both claim")),
+            "{findings:#?}"
+        );
+    }
+
+    #[test]
+    fn a_created_file_claimed_by_two_open_prompts_is_reported() {
+        let touched = GOOD.replace(
+            "**Touches:** Cargo.toml",
+            "**Touches:** +crates/ferrox-prompt/src/contended.rs",
+        );
+        let text = format!(
+            "{touched}\n## P2 · Two\n\n**When to use:** now\n**Status:** todo\n**Leverage:** 1\n\
+             **Effort:** small\n**Gates:** `cargo test`\n**Touches:** +crates/ferrox-prompt/src/contended.rs\n\n```text\nb\n```\n"
+        );
+        let findings = run(&load(&text), &crate::manifest_root(), true);
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("both claim `crates/ferrox-prompt/src/contended.rs`")),
+            "{findings:#?}"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_default_is_a_warning() {
+        let library = load(&GOOD.replace("```text\nbody", "```text\nbody {a= }"));
+        let findings = run(&library, &crate::manifest_root(), true);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty default")),
             "{findings:#?}"
         );
     }

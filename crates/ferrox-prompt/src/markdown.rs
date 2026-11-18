@@ -294,7 +294,11 @@ impl Prompt {
         self.placeholders
             .iter()
             .filter(move |placeholder| {
-                placeholder.default.is_none() && active.contains(&placeholder.name)
+                placeholder
+                    .default
+                    .as_deref()
+                    .is_none_or(|default| default.trim().is_empty())
+                    && active.contains(&placeholder.name)
             })
             .map(|placeholder| placeholder.name.as_str())
     }
@@ -1033,30 +1037,30 @@ fn collect_placeholders(prompt: &mut Prompt, diagnostics: &mut Vec<Diagnostic>) 
 /// One scanner shared with [`placeholders_in`], so two callers cannot answer differently.
 fn scanned_placeholders(text: &str) -> Vec<(String, Option<String>)> {
     let mut found = Vec::new();
-    let mut chars = text.chars().peekable();
-    while let Some(character) = chars.next() {
-        if character != '{' {
-            continue;
-        }
-        if chars.peek() == Some(&'{') {
-            chars.next();
-            continue;
-        }
-        let mut body = String::new();
-        let mut closed = false;
-        for inner in chars.by_ref() {
-            if inner == '}' {
-                closed = true;
-                break;
-            }
-            body.push(inner);
-        }
-        if !closed {
+    let mut index = 0;
+    while index < text.len() {
+        let Some(character) = text[index..].chars().next() else {
             break;
+        };
+        if character != '{' {
+            index += character.len_utf8();
+            continue;
         }
+        let after = index + 1;
+        if text[after..].starts_with('{') {
+            index = after + 1;
+            continue;
+        }
+        let Some(close) = text[after..].find('}').map(|offset| after + offset) else {
+            break;
+        };
+        let body = &text[after..close];
         let name = body.split('=').next().unwrap_or("").trim();
         if is_placeholder_name(name) {
             found.push((name.to_owned(), placeholder_default(body.trim())));
+            index = close + 1;
+        } else {
+            index = after;
         }
     }
     found
@@ -1288,6 +1292,22 @@ b
         assert_eq!(slugify("miri  limits!"), "miri-limits");
         assert_eq!(slugify("Isa's ISA matrix"), "isa-s-isa-matrix");
         assert_eq!(slugify("---"), "");
+    }
+
+    #[test]
+    fn a_lone_brace_does_not_swallow_a_later_placeholder() {
+        assert_eq!(
+            scanned_placeholders("a { b {name}"),
+            vec![("name".to_owned(), None)]
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_default_is_a_required_input() {
+        let library = load(&LIBRARY.replace("{len=40}", "{len= }"));
+        let first = library.prompt(1).unwrap();
+        assert_eq!(first.placeholders[0].default.as_deref(), Some(""));
+        assert_eq!(first.required_inputs().collect::<Vec<_>>(), vec!["len"]);
     }
 
     #[test]

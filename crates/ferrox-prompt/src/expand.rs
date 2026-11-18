@@ -74,6 +74,9 @@ pub fn fill(prompt: &Prompt, row: &MethodRow, pins: &[Pin]) -> BTreeMap<String, 
             "references" => state::references_for(pins, &row.text),
             _ => continue,
         };
+        if value.is_empty() {
+            continue;
+        }
         values.insert(placeholder.name.clone(), value);
     }
     values
@@ -366,6 +369,17 @@ update the pins, nothing per-method here
         assert_eq!(values["references"], "xray-core, sing-box, amneziawg-go");
         // A template with no row gets the core set.
         assert_eq!(state().references(), "xray-core, sing-box");
+    }
+
+    #[test]
+    fn an_empty_pin_file_leaves_references_unfilled() {
+        let library = library();
+        let prompt = library.prompt(1).unwrap();
+        let made = state();
+        let row = select_row(&made, "A13").unwrap();
+        let values = fill(prompt, row, &[]);
+        assert!(!values.contains_key("references"));
+        assert_eq!(values["method"], "VLESS over QUIC");
     }
 
     #[test]
