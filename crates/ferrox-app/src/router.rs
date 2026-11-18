@@ -6025,7 +6025,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_user_or_protocol_list_never_reaches_a_server_inbound() {
+    fn an_empty_user_or_protocol_entry_never_reaches_a_server_inbound() {
         let direct = |tag: &str| tag == "direct";
         let candidates = HashMap::new();
         let fallbacks = HashMap::new();
@@ -6038,7 +6038,10 @@ mod tests {
             candidates: &candidates,
             fallbacks: &fallbacks,
         };
-        for selector in [("user", array(Vec::new())), ("protocol", array(Vec::new()))] {
+        for selector in [
+            ("user", array(vec![text("")])),
+            ("protocol", array(vec![text("")])),
+        ] {
             let root = object(vec![(
                 "routing",
                 routing(vec![rule("proxy", vec![selector])]),
