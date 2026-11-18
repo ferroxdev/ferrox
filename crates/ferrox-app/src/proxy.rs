@@ -12088,7 +12088,7 @@ fn relay_stream<A: Read + Write + Send + 'static, B: Read + Write + Send + 'stat
     b: Half<B>,
     close: &Arc<dyn Fn() + Send + Sync>,
 ) {
-    relay_stream_handoff(a, b, close, None, true).wait();
+    relay_stream_handoff(a, b, close, None, true, Tails::default()).wait();
 }
 
 /// The relay a served or dialled flow hands to the fixed lanes and returns from: the caller's
@@ -12098,7 +12098,18 @@ fn relay_shared<A: Read + Write + Send + 'static, B: Read + Write + Send + 'stat
     b: Half<B>,
     close: &Arc<dyn Fn() + Send + Sync>,
 ) {
-    let _ = relay_stream_handoff(a, b, close, None, true);
+    let _ = relay_stream_handoff(a, b, close, None, true, Tails::default());
+}
+
+/// One half of this handoff is a paced writer: its lane offers bytes only into room and drains the
+/// tail before it reports the direction finished, so a peer that reads slowly parks it rather than a worker.
+fn relay_shared_tailed<A: Read + Write + Send + 'static, B: Read + Write + Send + 'static>(
+    a: Half<A>,
+    b: Half<B>,
+    close: &Arc<dyn Fn() + Send + Sync>,
+    tails: Tails,
+) {
+    let _ = relay_stream_handoff(a, b, close, None, true, tails);
 }
 
 /// A flow whose first lane may end while the other still owes a reply: the close waits for
@@ -12108,7 +12119,16 @@ fn relay_shared_late<A: Read + Write + Send + 'static, B: Read + Write + Send + 
     b: Half<B>,
     close: &Arc<dyn Fn() + Send + Sync>,
 ) {
-    let _ = relay_stream_handoff(a, b, close, None, false);
+    let _ = relay_stream_handoff(a, b, close, None, false, Tails::default());
+}
+
+fn relay_shared_late_tailed<A: Read + Write + Send + 'static, B: Read + Write + Send + 'static>(
+    a: Half<A>,
+    b: Half<B>,
+    close: &Arc<dyn Fn() + Send + Sync>,
+    tails: Tails,
+) {
+    let _ = relay_stream_handoff(a, b, close, None, false, tails);
 }
 
 /// The same hand-off with work that belongs after both directions ended, such as a QUIC stream's FIN.
@@ -12118,7 +12138,7 @@ fn relay_shared_then<A: Read + Write + Send + 'static, B: Read + Write + Send + 
     close: &Arc<dyn Fn() + Send + Sync>,
     then: impl FnOnce() + Send + 'static,
 ) {
-    let _ = relay_stream_handoff(a, b, close, Some(Box::new(then)), true);
+    let _ = relay_stream_handoff(a, b, close, Some(Box::new(then)), true, Tails::default());
 }
 
 /// A socket the relay spills an end through: the front's own close ends within the pump
@@ -21336,6 +21356,36 @@ impl Sealed {
         }
     }
 
+    /// A writer whose socket carries a clock: a full socket leaves its suffix in `bytes` for the
+    /// next settle instead of parking a relay lane in the write.
+    fn paced(out: Connection) -> Self {
+        let Ok(wire) = out.try_clone() else {
+            return Self::new(out);
+        };
+        let _ = wire.set_write_timeout(Some(RELAY_POLL));
+        Self {
+            transport: Box::new(out),
+            wire: Some(wire),
+            bytes: Vec::new(),
+            paced: true,
+        }
+    }
+
+    /// The bytes still owed to the socket after one drain attempt; a full tail parks the lane and
+    /// names the handle it waits on, and a finished direction waits here until it is clear.
+    fn settle_len(&mut self) -> usize {
+        if self.paced && !self.bytes.is_empty() {
+            let _ = self.settle();
+        }
+        #[cfg(unix)]
+        if !self.bytes.is_empty() {
+            if let Some(wire) = self.wire.as_ref() {
+                crate::proxy::note_wait_fd_write(wait_key(wire));
+            }
+        }
+        self.bytes.len()
+    }
+
     /// The record goes out with no session lock held, so a peer that is not draining this
     /// direction parks this write alone.
     fn send(&mut self) -> std::io::Result<()> {
@@ -21429,6 +21479,33 @@ impl Sealed {
             Err(_) => Settle::Lost,
         }
     }
+}
+
+/// A paced writer's tail as a lane sees it: sealed bytes the socket has not taken. The probe
+/// drains what fits without waiting, so a full tail parks the lane and an EOF waits for it.
+#[derive(Clone)]
+struct Tail(Arc<Mutex<Sealed>>);
+
+impl Tail {
+    fn len(&self) -> Option<usize> {
+        self.0.lock().ok().map(|mut sealed| sealed.settle_len())
+    }
+
+    fn room(&self) -> bool {
+        self.len().is_none_or(|len| len < PACED_TAIL)
+    }
+}
+
+/// The paced writers on a handoff's two sides: the destination half whose tail its lane drains.
+#[derive(Clone, Default)]
+struct Tails {
+    a: Option<Tail>,
+    b: Option<Tail>,
+}
+
+fn paced_room(tail: &Tail) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    let tail = tail.clone();
+    Arc::new(move || tail.room())
 }
 
 /// Seals under the session's lock and sends after it drops: the transport write is the one wait
@@ -21932,7 +22009,8 @@ fn driven_link<S>(
     uuid: &[u8; 16],
     grain: Duration,
     prefix: &mut Vec<u8>,
-) -> Result<DrivenLink<S>, S>
+    paced: bool,
+) -> Result<(DrivenLink<S>, Tail), S>
 where
     S: Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + 'static,
 {
@@ -21960,12 +22038,20 @@ where
         None => CipherReader::Plain(cipher),
     };
     let cipher = Arc::new(Mutex::new(cipher));
-    let out = Arc::new(Mutex::new(Sealed::new(out)));
+    let out = Arc::new(Mutex::new(if paced {
+        Sealed::paced(out)
+    } else {
+        Sealed::new(out)
+    }));
     let read = DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher), Arc::clone(&out));
-    let write = DrivenHalf::new(session, cipher, out);
-    let (mut read, write) = crate::vision::Link::split(read, write, raw_read, raw_write, uuid);
+    let write = DrivenHalf::new(session, cipher, Arc::clone(&out));
+    let (mut read, mut write) = crate::vision::Link::split(read, write, raw_read, raw_write, uuid);
+    let tail = Tail(Arc::clone(&out));
+    if paced {
+        write.paced(paced_room(&tail));
+    }
     read.preload(std::mem::take(prefix));
-    Ok(Half::split(read, write))
+    Ok((Half::split(read, write), tail))
 }
 
 /// The server's Vision link split into a reader and a writer, so the mux decoder's read never holds
@@ -21978,8 +22064,15 @@ fn vision_stream<S>(
 where
     S: Read + Write + Send + ferrox_core::tls::RecordAlignment + Drivable + CipherOpen + 'static,
 {
-    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL, &mut Vec::new()) {
-        Ok(vision) => split_stream(vision),
+    match driven_link(
+        session,
+        raw.as_ref(),
+        uuid,
+        RELAY_POLL,
+        &mut Vec::new(),
+        false,
+    ) {
+        Ok((vision, _)) => split_stream(vision),
         Err(session) => {
             let transport = session.transport();
             split_stream(Half::shared_armed_capped(
@@ -22041,8 +22134,16 @@ fn relay_vision<S, B>(
     S: Read + Write + Send + ferrox_core::tls::RecordAlignment + Drivable + CipherOpen + 'static,
     B: Read + Write + Send + 'static,
 {
-    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL, &mut prefix) {
-        Ok(vision) => relay_shared(vision, peer, close),
+    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL, &mut prefix, true) {
+        Ok((vision, tail)) => relay_shared_tailed(
+            vision,
+            peer,
+            close,
+            Tails {
+                a: Some(tail),
+                b: None,
+            },
+        ),
         Err(session) => {
             let transport = session.transport();
             let mut link = crate::vision::Link::new(session, raw, uuid);
@@ -22808,7 +22909,7 @@ fn dial_vless_tls(
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
             let refused = answer_refused(Some(*server));
-            let Some(half) = vision_answer_link(session, &vless.id, refused) else {
+            let Some((half, tail)) = vision_answer_link(session, &vless.id, refused) else {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             };
             let Ok(downstream) = client.try_clone() else {
@@ -22818,7 +22919,15 @@ fn dial_vless_tls(
                 return;
             }
             let close = shutdown_pair(downstream.try_clone().ok(), None);
-            relay_shared_late(Half::socket(downstream), half, &close);
+            relay_shared_late_tailed(
+                Half::socket(downstream),
+                half,
+                &close,
+                Tails {
+                    a: None,
+                    b: Some(tail),
+                },
+            );
         }
         Carrier::Xhttp { settings }
             if settings.mode == crate::xhttp::XhttpMode::StreamOne
@@ -22862,7 +22971,7 @@ fn vision_answer_link(
     session: ferrox_core::tls::ClientSession<Connection>,
     id: &[u8; 16],
     refused: Arc<dyn Fn() + Send + Sync>,
-) -> Option<VisionTlsLink> {
+) -> Option<(VisionTlsLink, Tail)> {
     let Ok(out) = session.get_ref().try_clone() else {
         return None;
     };
@@ -22882,7 +22991,7 @@ fn vision_answer_link(
         return None;
     };
     let shared = Arc::new(Mutex::new(session));
-    let out = Arc::new(Mutex::new(Sealed::new(out)));
+    let out = Arc::new(Mutex::new(Sealed::paced(out)));
     let reader = TlsHalf {
         session: Arc::clone(&shared),
         out: Arc::clone(&out),
@@ -22901,10 +23010,12 @@ fn vision_answer_link(
         driven: None,
         sleep_on_timeout: false,
     };
-    let (mut reader, writer) =
+    let (mut reader, mut writer) =
         crate::vision::Link::split(reader, writer, Some(raw_read), Some(raw_write), id);
+    let tail = Tail(Arc::clone(&out));
+    writer.paced(paced_room(&tail));
     reader.expecting_answer(Some(refused));
-    Some(Half::split(reader, writer))
+    Some((Half::split(reader, writer), tail))
 }
 
 fn tls_lane(
@@ -35502,24 +35613,114 @@ impl RelayFinish {
     }
 }
 
+/// What a lane still owes its paced writer: bytes the tail refused, or a tail a finished source
+/// must not drop before the socket has taken it. `owed` is the tail length the last park left, so
+/// a drain that moved bytes restarts the reply grace instead of reading a slow peer as silence.
+enum Pending {
+    None,
+    Bytes { n: usize, owed: usize },
+    Drain { owed: usize, end: bool },
+}
+
 /// The one step of a plain half-to-half direction: read on the source's own clock, write the
-/// prefix the read reported, and end on EOF, a read the sibling ended, or a write error.
+/// prefix the read reported, and end on EOF, a read the sibling ended, or a write error. A paced
+/// writer at its bound parks with the same bytes owed, so a peer that reads nothing holds no worker.
 fn stream_lane_step<R, W>(
     from: &Half<R>,
     to: &Half<W>,
     buffer: &mut RelayBuf,
+    pending: &mut Pending,
+    into: Option<&Tail>,
     ended: &Arc<RelayFinish>,
 ) -> Next
 where
     R: Read,
     W: Write,
 {
+    match pending {
+        Pending::Bytes { n, owed } => {
+            let (n, owed) = (*n, *owed);
+            let offered = to.write_once(buffer.prefix(n));
+            let after = into.and_then(Tail::len);
+            let refused = matches!(&offered, Err(error) if crate::vision::is_tail_parked(error));
+            if !refused || after.is_some_and(|after| after < owed) {
+                ended.mark_progress();
+            }
+            return match offered {
+                Ok(()) => {
+                    *pending = Pending::None;
+                    Next::More
+                }
+                Err(_) if refused => {
+                    *pending = Pending::Bytes {
+                        n,
+                        owed: after.unwrap_or(owed),
+                    };
+                    park_tail(ended)
+                }
+                Err(_) => Next::Done,
+            };
+        }
+        Pending::Drain { owed, end } => {
+            let (owed, end) = (*owed, *end);
+            let Some(tail) = into else {
+                *pending = Pending::None;
+                return if end { Next::Done } else { Next::More };
+            };
+            let now = tail.len();
+            if now == Some(0) {
+                *pending = Pending::None;
+                return if end { Next::Done } else { Next::More };
+            }
+            let now = now.unwrap_or(owed);
+            if now < owed {
+                ended.mark_progress();
+            }
+            *pending = Pending::Drain { owed: now, end };
+            return park_tail(ended);
+        }
+        Pending::None => {
+            // A paced destination that still owes bytes is settled before the source is read again, so no flow waits on a source for a tail it could put on the wire.
+            if let Some(tail) = into {
+                if let Some(owed) = tail.len().filter(|owed| *owed > 0) {
+                    *pending = Pending::Drain { owed, end: false };
+                    return park_tail(ended);
+                }
+            }
+        }
+    }
     match from.read_once(buffer.as_mut()) {
-        Ok(0) => Next::Done,
-        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => Next::More,
+        Ok(0) => {
+            // The source is done, but a paced writer may still owe sealed bytes: drain them before the flow closes.
+            let owed = into.and_then(Tail::len).unwrap_or(0);
+            if owed == 0 {
+                Next::Done
+            } else {
+                *pending = Pending::Drain { owed, end: true };
+                park_tail(ended)
+            }
+        }
+        Ok(n) => match to.write_once(buffer.filled(n)) {
+            Ok(()) => {
+                ended.mark_progress();
+                Next::More
+            }
+            Err(error) if crate::vision::is_tail_parked(&error) => {
+                let owed = into.and_then(Tail::len).unwrap_or(0);
+                *pending = Pending::Bytes { n, owed };
+                park_tail(ended)
+            }
+            Err(_) => Next::Done,
+        },
         // A record still arriving has progress behind it, so the step already spent its turn: the lane requeues rather than reading the yield as an idle peer.
         Err(error) if is_driven_yield(&error) => Next::Retry,
         Err(error) if is_timeout(&error) => {
+            // A quiet source still owes its tail to the peer: settle it before idling on a read that has nothing.
+            let owed = into.and_then(Tail::len).unwrap_or(0);
+            if owed > 0 {
+                *pending = Pending::Drain { owed, end: false };
+                return park_tail(ended);
+            }
             if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                 Next::Done
             } else {
@@ -35528,7 +35729,18 @@ where
                 Next::Idle
             }
         }
-        Ok(_) | Err(_) => Next::Done,
+        Err(_) => Next::Done,
+    }
+}
+
+/// A lane whose paced writer refused its bytes waits on the socket's writability, not the clock;
+/// once the sibling has ended and the reply grace is spent, the flow is done instead.
+fn park_tail(ended: &Arc<RelayFinish>) -> Next {
+    if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+        Next::Done
+    } else {
+        note_wait_finish(ended);
+        Next::Idle
     }
 }
 
@@ -35547,20 +35759,43 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     close: &Arc<dyn Fn() + Send + Sync>,
     finish: Option<Box<dyn FnOnce() + Send>>,
     close_first: bool,
+    tails: Tails,
 ) -> Arc<RelayFinish> {
     let a = Arc::new(a);
     let b = Arc::new(b);
     let flow = RelayFinish::new(close_first, Arc::clone(close), finish);
     let (up_a, up_b, up_flow) = (Arc::clone(&a), Arc::clone(&b), Arc::clone(&flow));
+    let into_b = tails.b;
     let mut forward = RelayBuf::new();
+    let mut forward_pending = Pending::None;
     lane_pool::submit(
-        Box::new(move || stream_lane_step(&up_a, &up_b, &mut forward, &up_flow)),
+        Box::new(move || {
+            stream_lane_step(
+                &up_a,
+                &up_b,
+                &mut forward,
+                &mut forward_pending,
+                into_b.as_ref(),
+                &up_flow,
+            )
+        }),
         Box::new(stream_lane_done(&flow)),
     );
+    let into_a = tails.a;
     let mut backward = RelayBuf::new();
+    let mut backward_pending = Pending::None;
     let parked = Arc::clone(&flow);
     lane_pool::submit(
-        Box::new(move || stream_lane_step(&b, &a, &mut backward, &parked)),
+        Box::new(move || {
+            stream_lane_step(
+                &b,
+                &a,
+                &mut backward,
+                &mut backward_pending,
+                into_a.as_ref(),
+                &parked,
+            )
+        }),
         Box::new(stream_lane_done(&flow)),
     );
     flow
@@ -43830,8 +44065,9 @@ mod tests {
         let from = Half::split(Yielding, Yielding);
         let to = Half::split(std::io::sink(), std::io::sink());
         let mut buffer = RelayBuf::new();
+        let mut pending = Pending::None;
         assert_eq!(
-            stream_lane_step(&from, &to, &mut buffer, &finish),
+            stream_lane_step(&from, &to, &mut buffer, &mut pending, None, &finish),
             lane_pool::Next::Retry,
             "a yield is progress, not the end of the flow"
         );
@@ -54741,6 +54977,178 @@ mod tests {
         relay.join().expect("joins");
         server.join().expect("joins");
         filler.join().expect("joins");
+    }
+
+    /// Bulk full-duplex flows over the plain-TLS Vision dial and the ferrox server move both
+    /// directions to the end; the matrix stalls the download once the upload is done.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn vision_full_duplex_bulk_moves_both_directions_to_the_end() {
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        const FLOWS: usize = 8;
+        const TOTAL: usize = 8 << 20;
+        const CHUNK: usize = 64 << 10;
+        const PATTERN: usize = 251;
+        const WAIT: Duration = Duration::from_secs(30);
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x48u8; 16];
+
+        let target = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target_addr = target.local_addr().expect("addr");
+        let sinks = thread::spawn(move || {
+            for _ in 0..FLOWS {
+                let (mut stream, _) = target.accept().expect("accepts");
+                thread::spawn(move || {
+                    stream.set_read_timeout(Some(WAIT)).expect("read timeout");
+                    stream.set_write_timeout(Some(WAIT)).expect("write timeout");
+                    let mut upload = stream.try_clone().expect("clones");
+                    let sink = thread::spawn(move || {
+                        let mut chunk = vec![0u8; CHUNK];
+                        let mut left = TOTAL;
+                        let mut sent = 0usize;
+                        while left > 0 {
+                            let n = left.min(CHUNK);
+                            for (at, byte) in chunk[..n].iter_mut().enumerate() {
+                                *byte = ((sent + at) % PATTERN) as u8;
+                            }
+                            stream.write_all(&chunk[..n]).expect("writes the download");
+                            sent += n;
+                            left -= n;
+                        }
+                        stream.flush().expect("flushes");
+                    });
+                    let mut got = 0;
+                    let mut buf = vec![0u8; CHUNK];
+                    while got < TOTAL {
+                        match upload.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => got += n,
+                            Err(error) => panic!("the upload read failed after {got}: {error}"),
+                        }
+                    }
+                    sink.join().expect("the download joins");
+                    assert_eq!(got, TOTAL, "the upload reached the target whole");
+                    // The relay may still owe its paced tail: hold the target open until the client's close, or the drop resets a download the relay had not read.
+                    let mut held = vec![0u8; CHUNK];
+                    while matches!(upload.read(&mut held), Ok(n) if n > 0) {}
+                });
+            }
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            for _ in 0..FLOWS {
+                let (stream, _) = listener.accept().expect("accepts");
+                let server_config = Arc::clone(&server_config);
+                thread::spawn(move || {
+                    serve_vless_tls(
+                        stream,
+                        &[VlessUser {
+                            id,
+                            flow: Flow::Vision,
+                            email: String::new(),
+                            level: 0,
+                            reverse: None,
+                        }],
+                        true,
+                        &Carrier::Raw(Chain::default()),
+                        &server_config,
+                        None,
+                        None,
+                    );
+                });
+            }
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relays = thread::spawn(move || {
+            for _ in 0..FLOWS {
+                let (client, _) = downstream.accept().expect("accepts");
+                let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+                let client_config = client_config.clone();
+                thread::spawn(move || {
+                    let vless = VlessOut {
+                        address: "127.0.0.1".to_owned(),
+                        port,
+                        id,
+                        carrier: Carrier::Raw(Chain::default()),
+                        host: String::new(),
+                        mux: Mux::default(),
+                        pool: Pools::default(),
+                        quic_roots: None,
+                        quic_ech: None,
+                        hysteria_roots: None,
+                        tls: Some(Arc::new(client_config)),
+                        flow: ferrox_core::vless::VISION_FLOW.to_owned(),
+                        reality: None,
+                        headers: Vec::new(),
+                        heartbeat: 0,
+                        encryption: None,
+                    };
+                    dial_vless(
+                        &client,
+                        &server,
+                        &vless,
+                        Some(&Destination::from(target_addr)),
+                        Ladder::global(),
+                    );
+                });
+            }
+        });
+        let mut flows = Vec::new();
+        for _ in 0..FLOWS {
+            flows.push(thread::spawn(move || {
+                let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+                sock.set_read_timeout(Some(WAIT)).expect("read timeout");
+                sock.set_write_timeout(Some(WAIT)).expect("write timeout");
+                let mut download = sock.try_clone().expect("clones");
+                let upload = thread::spawn(move || {
+                    let mut chunk = vec![0u8; CHUNK];
+                    let mut left = TOTAL;
+                    let mut sent = 0usize;
+                    while left > 0 {
+                        let n = left.min(CHUNK);
+                        for (at, byte) in chunk[..n].iter_mut().enumerate() {
+                            *byte = ((sent + at) % PATTERN) as u8;
+                        }
+                        sock.write_all(&chunk[..n]).expect("writes the upload");
+                        sent += n;
+                        left -= n;
+                    }
+                    sock.flush().expect("flushes");
+                });
+                let mut got = 0;
+                let mut buf = vec![0u8; CHUNK];
+                while got < TOTAL {
+                    match download.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            for (at, byte) in buf[..n].iter().enumerate() {
+                                assert_eq!(
+                                    *byte,
+                                    ((got + at) % PATTERN) as u8,
+                                    "download byte {} differs",
+                                    got + at
+                                );
+                            }
+                            got += n;
+                        }
+                        Err(error) => panic!("the download read failed after {got}: {error}"),
+                    }
+                }
+                assert_eq!(got, TOTAL, "the download reached the client whole");
+                upload.join().expect("the upload joins");
+            }));
+        }
+        for flow in flows {
+            flow.join().expect("a flow completes");
+        }
+        relays.join().expect("the relays join");
+        server.join().expect("the server joins");
+        sinks.join().expect("the sinks join");
     }
 
     /// The plain-TLS dial hands the raw socket to the same Link the answer pump framed, so an inner TLS record reaches the server unframed after the direct command.
