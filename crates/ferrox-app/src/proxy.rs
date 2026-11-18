@@ -35684,7 +35684,7 @@ where
                 Next::Idle
             };
         }
-        Ok(_) | Err(_) => return Next::Done,
+        Err(_) => return Next::Done,
     };
     // A burst holds the destination's lock across the reads that feed it, so it never nests two halves' locks: a source that shares a lock of its own keeps the one-window step, where the two directions could otherwise take the pair in opposite orders.
     let fed = if to.shares_lock() && !from.shares_lock() {
