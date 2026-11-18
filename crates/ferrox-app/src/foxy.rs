@@ -8801,6 +8801,10 @@ pub(crate) mod loopback {
         };
         let first = crate::quic::pooled_stream_within(&dial, crate::quic::HANDSHAKE_TIMEOUT)
             .expect("a pooled stream");
+        assert!(
+            !first.local.ip().is_unspecified(),
+            "a pooled dial binds the source the kernel picks"
+        );
         let lane = std::sync::Arc::clone(&first.conn);
         assert!(crate::quic::pool_holds(&dial), "a live lease holds it");
         let second = crate::quic::pooled_stream_within(&dial, crate::quic::HANDSHAKE_TIMEOUT)

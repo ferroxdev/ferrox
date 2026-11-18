@@ -322,6 +322,13 @@ struct QueueState {
     closed: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Push {
+    Queued,
+    Full,
+    Closed,
+}
+
 impl Queue {
     fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
@@ -335,28 +342,23 @@ impl Queue {
         })
     }
 
-    fn push(&self, msg: Msg) -> bool {
+    fn push(&self, msg: Msg) -> Push {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        while !state.closed
-            && !state.messages.is_empty()
-            && state.queued.saturating_add(msg.data.len()) > self.limit
-        {
-            state = match self.space.wait(state) {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-        }
         if state.closed {
-            return false;
+            return Push::Closed;
+        }
+        // The demux thread is shared: a stream that overruns its queue is reset, never waited on.
+        if !state.messages.is_empty() && state.queued.saturating_add(msg.data.len()) > self.limit {
+            return Push::Full;
         }
         state.queued += msg.data.len();
         state.messages.push_back(msg);
         drop(state);
         self.space.notify_all();
-        true
+        Push::Queued
     }
 
     fn pop(&self) -> Option<Msg> {
@@ -806,16 +808,22 @@ impl Inner {
             self.credit(id, credit);
             return;
         }
-        let queued = queue.push(Msg {
+        match queue.push(Msg {
             data: data.to_vec(),
             end,
             credit,
-        });
-        if end {
-            queue.close();
-            self.end_remote(id);
-        } else if !queued {
-            self.reap(id);
+        }) {
+            Push::Queued => {
+                if end {
+                    queue.close();
+                    self.end_remote(id);
+                }
+            }
+            Push::Full => {
+                self.send_reset(id);
+                self.release(id);
+            }
+            Push::Closed => self.reap(id),
         }
     }
 
@@ -1951,6 +1959,42 @@ mod tests {
         assert_eq!(window.take_up_to(16_384), Some(1_024));
         window.close();
         assert_eq!(window.take_up_to(1), None);
+    }
+
+    #[test]
+    fn a_full_queue_refuses_a_message_instead_of_blocking_the_session() {
+        let queue = Queue::new(4);
+        assert_eq!(
+            queue.push(Msg {
+                data: b"1234".to_vec(),
+                end: false,
+                credit: 0,
+            }),
+            Push::Queued
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let pushed = Arc::clone(&queue);
+        std::thread::spawn(move || {
+            let _ = sender.send(pushed.push(Msg {
+                data: b"5".to_vec(),
+                end: false,
+                credit: 0,
+            }));
+        });
+        assert_eq!(
+            receiver.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(Push::Full),
+            "a full queue must refuse the message instead of blocking the demux thread"
+        );
+        queue.close();
+        assert_eq!(
+            queue.push(Msg {
+                data: b"6".to_vec(),
+                end: false,
+                credit: 0,
+            }),
+            Push::Closed
+        );
     }
 
     #[test]
