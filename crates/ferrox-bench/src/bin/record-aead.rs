@@ -71,7 +71,7 @@ fn row(len: usize) -> Row {
         Some(len),
         "{len}: opens"
     );
-    assert!(ours_buf == plain, "{len}: the same bytes back");
+    assert_eq!(ours_buf, plain, "{len}: the same bytes back");
 
     let iters = (BYTE_BUDGET / len.max(1) as u64).clamp(64, 200_000);
     let mut ours_buf = plain.clone();
@@ -154,7 +154,10 @@ fn report(rows: &[Row], engine_backend: &str) -> String {
         "What the TLS record layer seals with, `ring`'s AES-128-GCM, against the fused\n\
          engine, at the plaintext sizes a record carries (16 KiB is the TLS 1.3 maximum).\n\
          Each row asserts equal ciphertext and equal tag before either side is timed, and\n\
-         the buffers are sealed and opened in place so neither side pays a staging copy.\n\
+         the buffers are sealed and opened in place so neither side pays a staging copy. The\n\
+         reference appends its tag in place and truncates the buffer for the next round, the only\n\
+         shape `ring` offers and the one rustls runs, while the fused engine returns the tag\n\
+         detached: the asymmetry favours the fused engine, and its loss stands with it.\n\
          These rows are printed only: a platform where `ring` wins is a platform where\n\
          the provider stays as it is, and that decision is read from this table. It runs in\n\
          its own binary (`--bin record-aead`) so linking `ring` cannot move the gated rows\n\

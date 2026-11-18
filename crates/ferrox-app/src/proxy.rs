@@ -44512,6 +44512,9 @@ mod tests {
             opens: Arc<AtomicUsize>,
             records: Arc<AtomicUsize>,
         }
+        // A TLS 1.3 record: five header bytes, the content, its inner type byte and a 16-byte tag,
+        // so the scratch has to hold the overhead of every record, not just their plaintext.
+        const OVERHEAD: usize = 5 + 1 + 16;
         impl CipherOpen for RecordOpen {
             fn open(
                 &mut self,
@@ -44522,9 +44525,9 @@ mod tests {
                 if ciphertext.is_empty() {
                     return Ok((0, 0));
                 }
-                let record = ciphertext.len().min(SESSION_WINDOW);
-                let plain = record.min(buf.len());
-                buf[..plain].copy_from_slice(&ciphertext[..plain]);
+                let record = ciphertext.len().min(SESSION_WINDOW + OVERHEAD);
+                let plain = (record - OVERHEAD).min(buf.len());
+                buf[..plain].copy_from_slice(&ciphertext[OVERHEAD..OVERHEAD + plain]);
                 if plain > 0 {
                     self.records.fetch_add(1, Ordering::Relaxed);
                 }
