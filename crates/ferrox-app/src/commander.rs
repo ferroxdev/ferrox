@@ -436,10 +436,7 @@ impl Api {
         let mut responses: HashMap<u32, Response> = HashMap::new();
         let mut flow = Flow::new();
         let mut last_id = 0u32;
-        loop {
-            let Some((len, kind, flags, id)) = h2::read_head_bounded(&mut stream) else {
-                break;
-            };
+        while let Some((len, kind, flags, id)) = h2::read_head_bounded(&mut stream) {
             let cap = if kind == h2::T_DATA {
                 CALL_MAX + CALL_ENVELOPE
             } else {
