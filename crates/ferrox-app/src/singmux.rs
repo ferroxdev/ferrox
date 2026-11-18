@@ -862,8 +862,6 @@ impl Inner {
                 return;
             };
             let Some(sink) = sinks.get_mut(&id) else {
-                drop(sinks);
-                self.defer_credit(credit);
                 return;
             };
             sink.remote_end = true;
@@ -901,6 +899,8 @@ impl Inner {
                 Err(poisoned) => poisoned.into_inner(),
             };
             let Some(sink) = sinks.get_mut(&id) else {
+                drop(sinks);
+                self.defer_credit(credit);
                 return;
             };
             let awaiting = sink.awaiting_status;
