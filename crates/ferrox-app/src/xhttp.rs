@@ -715,9 +715,18 @@ impl Packer {
                     .iter()
                     .map(|(key, value)| key.len() + value.len() + 4)
                     .sum();
+                // The path rides the target and again in the Referer; the target also carries the query and the session/seq meta.
+                let path = normalized_path(&self.settings);
+                let target = path
+                    .len()
+                    .saturating_add(self.settings.query.len())
+                    .saturating_add(self.settings.session_id_length.1)
+                    .saturating_add(64);
                 let fixed = (4 * 1024usize)
                     .saturating_add(padding)
-                    .saturating_add(headers);
+                    .saturating_add(headers)
+                    .saturating_add(path.len())
+                    .saturating_add(target);
                 let budget = HEAD_LIMIT.saturating_sub(fixed);
                 let chunk = self.settings.uplink_chunk.0.max(1);
                 let field = self.settings.uplink_data_key.len().saturating_add(16);
