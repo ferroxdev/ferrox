@@ -540,7 +540,7 @@ impl Inner {
         }
         drop(write);
         if result.is_err() {
-            self.finish();
+            self.abort();
         }
         result
     }
@@ -712,7 +712,7 @@ impl Inner {
         }
         drop(write);
         if !ok {
-            self.finish();
+            self.abort();
         }
         ok
     }
@@ -1090,6 +1090,15 @@ impl Inner {
     }
 
     fn finish(&self) {
+        self.teardown(true);
+    }
+
+    /// A failed carrier write ends the session without the graceful write drain its closer runs.
+    fn abort(&self) {
+        self.teardown(false);
+    }
+
+    fn teardown(&self, carrier: bool) {
         self.dead.store(true, Ordering::Relaxed);
         if self.finished.swap(true, Ordering::Relaxed) {
             return;
@@ -1116,7 +1125,9 @@ impl Inner {
             sink.window.close();
             sink.queue.close();
         }
-        (self.close)();
+        if carrier {
+            (self.close)();
+        }
     }
 
     fn smux_loop(&self, mut read: Box<dyn Read + Send>) {
