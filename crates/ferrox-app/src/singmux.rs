@@ -472,6 +472,7 @@ struct Inner {
     initial_window: Mutex<i64>,
     connection_window: Window,
     dead: AtomicBool,
+    finished: AtomicBool,
     close: Arc<dyn Fn() + Send + Sync>,
     decoder: Mutex<h2::Decoder>,
     self_ref: OnceLock<Weak<Inner>>,
@@ -508,6 +509,7 @@ impl Inner {
                 i64::MAX
             }),
             dead: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
             close,
             decoder: Mutex::new(h2::Decoder::default()),
             self_ref: OnceLock::new(),
@@ -1088,7 +1090,8 @@ impl Inner {
     }
 
     fn finish(&self) {
-        if self.dead.swap(true, Ordering::Relaxed) {
+        self.dead.store(true, Ordering::Relaxed);
+        if self.finished.swap(true, Ordering::Relaxed) {
             return;
         }
         match self.resets.lock() {
@@ -2224,7 +2227,34 @@ mod tests {
     fn a_failed_carrier_write_stops_the_next_writer() {
         let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
         let calls = Arc::new(AtomicUsize::new(0));
-        let (session, held) = held_session(Box::new(std::io::sink()));
+        let (session, held) = held_h2_session(Box::new(std::io::sink()));
+        let stream = session.attach(1);
+        assert_eq!(
+            session.take_window(&stream.window, 65_535, &stream.closed),
+            Some(65_535),
+            "the test starts with an exhausted connection window"
+        );
+        let (started, waiting) = channel();
+        let (released, done) = channel();
+        let waiter = {
+            let session = Arc::clone(&session);
+            let window = Arc::clone(&stream.window);
+            let closed = Arc::clone(&stream.closed);
+            std::thread::spawn(move || {
+                started.send(()).expect("started");
+                released
+                    .send(session.take_window(&window, 1, &closed).is_none())
+                    .expect("released");
+            })
+        };
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("waiter started");
+        assert!(
+            done.recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "a credit waiter blocks while the connection window is exhausted"
+        );
         *session.write.lock().expect("write") = Box::new(PartialFailWriter {
             gate: Arc::clone(&gate),
             calls: Arc::clone(&calls),
@@ -2254,6 +2284,12 @@ mod tests {
             !first.join().expect("first"),
             "the partially written frame reports failure"
         );
+        assert_eq!(
+            done.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(true),
+            "finish releases a credit waiter after the carrier fails"
+        );
+        waiter.join().expect("waiter");
         assert!(
             !second.join().expect("second"),
             "a writer waiting on the failed frame must not reach the carrier"
@@ -2385,6 +2421,19 @@ mod tests {
         let (held, reader) = channel();
         let session = Inner::start(
             Protocol::Smux,
+            Role::Client,
+            Box::new(HeldReader(reader)),
+            write,
+            Arc::new(|| {}),
+        )
+        .expect("session");
+        (session, held)
+    }
+
+    fn held_h2_session(write: Box<dyn Write + Send>) -> (Arc<Inner>, Sender<()>) {
+        let (held, reader) = channel();
+        let session = Inner::start(
+            Protocol::H2Mux,
             Role::Client,
             Box::new(HeldReader(reader)),
             write,
