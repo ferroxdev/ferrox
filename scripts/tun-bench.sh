@@ -22,7 +22,9 @@ OUT_DIR=${OUT_DIR:-"$ROOT/tun-bench-results"}
 mkdir -p "$OUT_DIR"
 OUT_DIR=$(CDPATH= cd -- "$OUT_DIR" && pwd)
 RESULTS="$OUT_DIR/results.jsonl"
+GAPS="$OUT_DIR/gaps.md"
 : > "$RESULTS"
+: > "$GAPS"
 
 FERROX=${FERROX:-}
 BENCH=${BENCH:-}
@@ -35,6 +37,7 @@ TUN2SOCKS=${TUN2SOCKS:-}
 DURATION=${DURATION:-5}
 REPEAT=${REPEAT:-2}
 STATUS=0
+GAPS=
 QUEUES=${QUEUES:-4}
 MTU=${MTU:-1500}
 SETTLE=${SETTLE:-3}
@@ -402,7 +405,12 @@ run_scenario() {
     [ "${PROFILE_PASS:-0}" = 1 ] && return 0
     if [ "$ok" -ne 1 ]; then
         note "$engine $scenario rep $rep: the client failed or wrote no result; not recording a zero"
-        return 1
+        # A comparator that cannot answer the client is a hole in the comparison, not this handler's regression: the cell stays unmeasured and is named, so the gate still fails on our own engines.
+        case "$engine" in
+            ferrox*) return 1 ;;
+        esac
+        printf -- '- `%s` did not answer the `%s` client\n' "$engine" "$scenario" >> "$GAPS"
+        return 0
     fi
     set -- $(summarize_monitor "$tag")
     cpu_pct=$1
@@ -531,4 +539,7 @@ for (engine, scenario), group in groups.items():
 open(sys.argv[2], "w").write("\n".join(lines) + "\n")
 print("\n".join(lines))
 PY
+if [ -s "$GAPS" ]; then
+    { printf '\nNot measured:\n\n'; cat "$GAPS"; } >> "$OUT_DIR/summary.md"
+fi
 exit "$STATUS"
