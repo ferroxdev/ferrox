@@ -3043,6 +3043,7 @@ pub(crate) fn add_rule_request(bytes: &[u8]) -> Result<(Vec<Json>, bool), String
 
 /// `xray.app.router.RoutingRule`: the outbound a flow goes to and every selector
 /// this tree's router reads. The selectors it does not read stay refused by name.
+#[allow(clippy::too_many_lines)]
 fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.app.router.RoutingRule");
     let mut tag = None;
