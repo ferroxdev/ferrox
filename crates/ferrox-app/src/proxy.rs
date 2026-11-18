@@ -11941,7 +11941,7 @@ impl<T> Half<T> {
 
     /// Whether both directions of this half wait on one lock: the only shape whose write pays a
     /// handoff per step, and so the only one a burst is for.
-    fn shared(&self) -> bool {
+    fn shares_lock(&self) -> bool {
         matches!(self, Self::Shared { .. })
     }
 
@@ -35687,7 +35687,7 @@ where
         Ok(_) | Err(_) => return Next::Done,
     };
     // A burst holds the destination's lock across the reads that feed it, so it never nests two halves' locks: a source that shares a lock of its own keeps the one-window step, where the two directions could otherwise take the pair in opposite orders.
-    let fed = if to.shared() && !from.shared() {
+    let fed = if to.shares_lock() && !from.shares_lock() {
         to.fed_write(from, buffer, first)
     } else {
         to.write_once(buffer.filled(first)).map(|()| false)
