@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -450,10 +450,8 @@ impl Carrier {
                     data: data.to_vec(),
                     end: frame.status == mux::Status::End,
                 };
-                if matches!(
-                    sender.try_send(msg),
-                    Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
-                ) {
+                // A full channel is the app not draining yet: park the demux, so the carrier's own window carries the back-pressure instead of a dropped reply ending the download.
+                if sender.send(msg).is_err() {
                     closed.store(true, std::sync::atomic::Ordering::Relaxed);
                     self.drop_sink(frame.id);
                 }
@@ -1043,5 +1041,101 @@ mod tests {
             assert!(flow.send(b"payload"));
         }
         assert_eq!(manager.staged_identity(), before, "the header reallocated");
+    }
+
+    /// Every reply the carrier reads reaches its flow, in order, even before the app drains a slot:
+    /// a full channel parks the demux, where a dropped reply ends an eight-flow download short.
+    #[test]
+    fn a_full_reply_channel_parks_the_demux_and_keeps_every_reply() {
+        let peers: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let held = Arc::clone(&peers);
+        let manager = Manager::with_lifetime(1, LIFETIME, move || {
+            let (mine, peer) = UnixStream::pair().ok()?;
+            let read = mine.try_clone().ok()?;
+            held.lock().ok()?.push(peer);
+            Some(Uplink {
+                read: Box::new(read),
+                write: Box::new(mine),
+                close: Arc::new(|| {}),
+            })
+        });
+        let mut flow = manager.dial(&target()).expect("a flow");
+        let id = flow.id;
+        let replies = flow.take_replies().expect("the flow's replies");
+        let over = REPLIES + 16;
+        let mut wire = Vec::new();
+        for at in 0..over {
+            let keep = mux::Outgoing::bare(id, mux::Status::Keep, mux::DATA);
+            let mut frame = Vec::new();
+            let header = keep.encode_header_into(&mut frame);
+            keep.patch_payload_len(&mut frame, header, 1);
+            frame.push(at as u8);
+            wire.extend_from_slice(&frame);
+        }
+        peers
+            .lock()
+            .expect("the peer")
+            .last_mut()
+            .expect("a peer")
+            .write_all(&wire)
+            .expect("the reply burst");
+        for at in 0..over {
+            let msg = replies
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("reply {at} of {over} never arrived"));
+            assert_eq!(msg.data, vec![at as u8], "reply {at} crossed in order");
+            assert!(!msg.end, "a keep is not an end");
+        }
+    }
+
+    /// A downlink that gives up drops its receiver, and the demux parked on that flow's full channel
+    /// resumes for every other flow, where a park with no exit would hold the carrier's whole window.
+    #[test]
+    fn a_dropped_reply_receiver_unparks_the_demux_for_another_flow() {
+        let peers: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let held = Arc::clone(&peers);
+        let manager = Manager::with_lifetime(2, LIFETIME, move || {
+            let (mine, peer) = UnixStream::pair().ok()?;
+            let read = mine.try_clone().ok()?;
+            held.lock().ok()?.push(peer);
+            Some(Uplink {
+                read: Box::new(read),
+                write: Box::new(mine),
+                close: Arc::new(|| {}),
+            })
+        });
+        let mut stalled = manager.dial(&target()).expect("a flow");
+        let mut other = manager.dial(&target()).expect("a flow");
+        let (stalled_id, other_id) = (stalled.id, other.id);
+        assert_ne!(stalled_id, other_id);
+        let replies = stalled.take_replies().expect("the flow's replies");
+        let other_replies = other.take_replies().expect("the flow's replies");
+        let mut wire = Vec::new();
+        for _ in 0..=REPLIES {
+            let keep = mux::Outgoing::bare(stalled_id, mux::Status::Keep, mux::DATA);
+            let mut frame = Vec::new();
+            let header = keep.encode_header_into(&mut frame);
+            keep.patch_payload_len(&mut frame, header, 1);
+            frame.push(7);
+            wire.extend_from_slice(&frame);
+        }
+        let keep = mux::Outgoing::bare(other_id, mux::Status::Keep, mux::DATA);
+        let mut frame = Vec::new();
+        let header = keep.encode_header_into(&mut frame);
+        keep.patch_payload_len(&mut frame, header, 1);
+        frame.push(9);
+        wire.extend_from_slice(&frame);
+        peers
+            .lock()
+            .expect("the peer")
+            .last_mut()
+            .expect("a peer")
+            .write_all(&wire)
+            .expect("the reply burst");
+        drop(replies);
+        let msg = other_replies
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the other flow's reply never arrived");
+        assert_eq!(msg.data, vec![9], "the demux resumed for the other flow");
     }
 }
