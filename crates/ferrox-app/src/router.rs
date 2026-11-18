@@ -1767,7 +1767,10 @@ impl Rule {
                 "localPort" => local_ports = port_set(field, "localPort")?,
                 "inboundTag" => inbound_tags = string_list(field, "inboundTag")?,
                 "localOS" => local_os = string_list(field, "localOS")?,
-                "protocol" => protocols = string_list(field, "protocol")?,
+                "protocol" => {
+                    protocols = string_list(field, "protocol")?
+                        .map(|list| list.into_iter().filter(|listed| !listed.is_empty()).collect());
+                }
                 "user" => {
                     users = string_list(field, "user")?.map(|names| UserSelector::parse(&names));
                 }
@@ -5213,6 +5216,37 @@ mod tests {
             process: None,
         };
         assert_eq!(parsed.route(&bare), Some("direct"));
+    }
+
+    #[test]
+    fn an_empty_protocol_entry_matches_nothing() {
+        let root = object(vec![(
+            "routing",
+            routing(vec![
+                rule("block", vec![("protocol", array(vec![text("")]))]),
+                rule("direct", Vec::new()),
+            ]),
+        )]);
+        let parsed = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: None,
+            ip: None,
+            port: Some(443),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol: Some("http1"),
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        assert_eq!(parsed.route(&flow), Some("direct"));
     }
 
     /// A `user` rule names an account's email literally or as a `regexp:` pattern; a flow without

@@ -3054,6 +3054,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     let mut source_ips = Vec::new();
     let mut source_ports = None;
     let mut inbound_tags = Vec::new();
+    let mut protocols = Vec::new();
     let mut local_ips = Vec::new();
     let mut local_ports = None;
     let mut local_os = Vec::new();
@@ -3076,7 +3077,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
             (2, 2) => domains.push(Json::Str(domain_rule(reader.bytes()?)?)),
             (7, 2) => users.push(Json::Str(account_text(&mut reader)?)),
             (8, 2) => inbound_tags.push(Json::Str(account_text(&mut reader)?)),
-            (9, 2) => return Err(reader.uncarried("a protocol rule")),
+            (9, 2) => protocols.push(Json::Str(account_text(&mut reader)?)),
             (10, 2) => ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
             (11, 2) => source_ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
             (12, 2) => return Err(reader.uncarried("a balancer tag")),
@@ -3110,6 +3111,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
         ("ip", ips),
         ("sourceIP", source_ips),
         ("inboundTag", inbound_tags),
+        ("protocol", protocols),
         ("localIP", local_ips),
         ("localOS", local_os),
         ("user", users),
@@ -7865,6 +7867,55 @@ mod tests {
         assert_eq!(routing.route(&flow), Some("blocked"));
     }
 
+    /// A pb protocol rule reaches the same router the JSON spelling does: the
+    /// selector is decoded, not refused, and the flow it names lands on its outbound.
+    #[test]
+    fn a_pb_protocol_rule_reaches_the_router() {
+        let rule = message(&[bytes_field(1, b"blocked"), bytes_field(9, b"http")]);
+        let router = message(&[bytes_field(2, &rule)]);
+        let outbound = message(&[
+            bytes_field(1, b"blocked"),
+            bytes_field(3, &typed("xray.proxy.blackhole.Config", &[])),
+        ]);
+        let config = message(&[
+            bytes_field(1, &socks_inbound(5000, 0, &[])),
+            bytes_field(2, &outbound),
+            bytes_field(4, &typed("xray.app.router.Config", &router)),
+        ]);
+        let json = to_json(&config).expect("decodes");
+        let rules = json
+            .get("routing")
+            .expect("routing")
+            .get("rules")
+            .and_then(Json::as_arr)
+            .expect("rules");
+        assert_eq!(
+            rules[0].get("protocol"),
+            Some(&Json::Arr(vec![Json::Str("http".to_owned())]))
+        );
+        let routing = crate::router::Routing::parse(&json)
+            .expect("parses")
+            .expect("routing");
+        let flow = |protocol| crate::router::Flow {
+            network: crate::router::Network::Tcp,
+            domain: None,
+            ip: None,
+            port: Some(443),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        assert_eq!(routing.route(&flow(Some("http1"))), Some("blocked"));
+        assert_eq!(routing.route(&flow(Some("h2"))), None);
+    }
+
     /// Every selector the JSON router reads survives the protobuf walk with the
     /// key and spelling that router expects.
     #[test]
@@ -7907,6 +7958,7 @@ mod tests {
             bytes_field(2, &custom_domain),
             bytes_field(7, b"a@x"),
             bytes_field(8, b"in"),
+            bytes_field(9, b"http"),
             bytes_field(10, &cidr),
             bytes_field(11, &source_cidr),
             bytes_field(13, &packed),
@@ -7953,6 +8005,7 @@ mod tests {
             Some(&[Json::Str("127.0.0.1/32".to_owned())][..])
         );
         assert_eq!(list("inboundTag"), Some(&[Json::Str("in".to_owned())][..]));
+        assert_eq!(list("protocol"), Some(&[Json::Str("http".to_owned())][..]));
         assert_eq!(list("user"), Some(&[Json::Str("a@x".to_owned())][..]));
         assert_eq!(list("localOS"), Some(&[Json::Str("linux".to_owned())][..]));
         assert_eq!(rule.get("network").and_then(Json::as_str), Some("tcp,udp"));
