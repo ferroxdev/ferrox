@@ -1756,7 +1756,7 @@ enum Fast {
     Off,
     /// A direct leg that could not ask: the kernel lacks `TCP_FASTOPEN_CONNECT`.
     Absent,
-    /// The kernel held the SYN back for the first write, which carries the hello.
+    /// The kernel held the SYN back: the handshake has not run and the first write starts it.
     Deferred,
     /// The handshake completed outright: this server sent no cookie, so the record is rewritten.
     Refused,
