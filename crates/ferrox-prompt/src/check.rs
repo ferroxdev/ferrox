@@ -42,7 +42,12 @@ fn content_tokens(text: &str) -> Vec<String> {
                 index = close + width;
             }
             b'{' => {
-                in_blank = true;
+                // A `{` with no `}` behind it is literal text, not a blank that swallows the rest.
+                if bytes[index..].contains(&b'}') {
+                    in_blank = true;
+                } else {
+                    stripped.push('{');
+                }
                 index += 1;
             }
             b'}' => {

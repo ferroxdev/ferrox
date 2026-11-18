@@ -1850,8 +1850,9 @@ fn stream_recv_exact_parked(
     stream: u64,
     want: usize,
     deadline: Instant,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, bool)> {
     let mut out = Vec::with_capacity(want);
+    let mut fin = false;
     let mut chunk = [0u8; 8192];
     while out.len() < want {
         let end = (want - out.len()).min(chunk.len());
@@ -1868,8 +1869,9 @@ fn stream_recv_exact_parked(
                 Err(_) => return None,
             }
         };
-        if let Some((n, fin)) = found {
+        if let Some((n, ended)) = found {
             out.extend_from_slice(&chunk[..n]);
+            fin = ended;
             if fin {
                 break;
             }
@@ -1879,7 +1881,7 @@ fn stream_recv_exact_parked(
             std::thread::sleep(STREAM_POLL);
         }
     }
-    (out.len() == want).then_some(out)
+    (out.len() == want).then_some((out, fin))
 }
 
 pub(crate) fn stream_recv_exact(
@@ -4465,7 +4467,16 @@ pub(crate) fn dial_pooled_with(
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let opened = stream_send_all_parked(&pooled.conn, &flush_sock, id, header, false, deadline)
         && (!expect_reply
-            || stream_recv_exact_parked(&pooled.conn, id, 2, deadline).as_deref() == Some(&[0, 0]));
+            || match stream_recv_exact_parked(&pooled.conn, id, 2, deadline) {
+                Some((reply, fin)) => {
+                    // The opening read drains the stream, so a FIN it saw is the only chance to record it.
+                    if fin {
+                        finish_session(&pooled.table, id, false);
+                    }
+                    reply.as_slice() == &[0u8, 0u8][..]
+                }
+                None => false,
+            });
     #[cfg(test)]
     qstage(format!("{} t={} header {id} {opened}", dial.port, qms()));
     if !opened {

@@ -368,6 +368,8 @@ pub fn resolve_addons(prompt: &Prompt, requests: &[String]) -> Result<Vec<Addon>
             }
         }
     }
+    let mut seen_addons = std::collections::HashSet::new();
+    resolved_addons.retain(|addon| seen_addons.insert(addon.slug.clone()));
     Ok(resolved_addons)
 }
 

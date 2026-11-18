@@ -1624,7 +1624,10 @@ struct Moved {
 /// A hold's own duration is the workload, so its fan-in cap leaves room for a hold thread scheduled after the clock starts.
 fn fan_in_cap(request: &Request) -> Duration {
     if request.traffic == Traffic::HeldOpen {
-        request.duration.saturating_add(FLOW_IO_TIMEOUT)
+        request
+            .duration
+            .saturating_add(FLOW_IO_TIMEOUT)
+            .max(RUN_TIMEOUT)
     } else {
         RUN_TIMEOUT
     }

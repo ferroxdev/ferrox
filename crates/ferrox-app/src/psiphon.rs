@@ -1851,7 +1851,13 @@ impl Inner {
                             let Some(server) = server else {
                                 continue;
                             };
-                            let Some(server) = runtime_entry(server, &self.settings) else {
+                            let region_available = {
+                                let known = lock(&self.entries);
+                                entries_match_region(known.as_slice(), &self.settings)
+                            };
+                            let Some(server) =
+                                runtime_entry(server, &self.settings, region_available)
+                            else {
                                 continue;
                             };
                             let name = server.dsl_tag();
@@ -1951,7 +1957,8 @@ impl Inner {
             else {
                 continue;
             };
-            let Some(server) = runtime_entry(server, &self.settings) else {
+            let region_available = entries_match_region(list.as_slice(), &self.settings);
+            let Some(server) = runtime_entry(server, &self.settings, region_available) else {
                 continue;
             };
             if !list
@@ -7941,15 +7948,26 @@ fn entry_allowed(server: &Server, protocols: &[String], fronted: bool) -> bool {
     })
 }
 
-/// Apply every startup policy to an entry learned at runtime.
-fn runtime_entry(server: Server, settings: &Settings) -> Option<Server> {
+/// Whether the live pool already satisfies the configured region, so a foreign learned entry would narrow it.
+fn entries_match_region(entries: &[Server], settings: &Settings) -> bool {
+    match settings.region.as_deref() {
+        Some(region) => entries
+            .iter()
+            .any(|server| server.region.as_deref() == Some(region)),
+        None => true,
+    }
+}
+
+/// Apply every startup policy to an entry learned at runtime; `region_available` carries the startup fallback.
+fn runtime_entry(server: Server, settings: &Settings, region_available: bool) -> Option<Server> {
     let mut servers = limit_quic_versions(vec![server], settings);
     let server = servers.pop()?;
     let server = runtime_protocol_entry(server, &settings.protocols, settings.fronted)?;
-    if settings
-        .region
-        .as_deref()
-        .is_some_and(|region| server.region.as_deref() != Some(region))
+    if region_available
+        && settings
+            .region
+            .as_deref()
+            .is_some_and(|region| server.region.as_deref() != Some(region))
     {
         return None;
     }
@@ -7977,19 +7995,19 @@ fn runtime_entry(server: Server, settings: &Settings) -> Option<Server> {
 
 /// The runtime entry to insert, converted to the CDN carrier the limit names.
 fn runtime_protocol_entry(server: Server, protocols: &[String], fronted: bool) -> Option<Server> {
-    if !entry_allowed(&server, protocols, fronted) {
-        return None;
-    }
     let Some(filter) = shape_filter(protocols, "LimitTunnelProtocols") else {
-        return Some(server);
+        return entry_allowed(&server, protocols, fronted).then_some(server);
     };
     let named_meek = protocols.iter().any(|protocol| is_meek_protocol(protocol));
-    if matches_limit(&server, filter, named_meek, protocols) {
-        return Some(server);
-    }
-    cdn_variants(&server)
-        .into_iter()
-        .find(|variant| matches_limit(variant, filter, named_meek, protocols))
+    // Try the siblings startup can select, not just the base shape and the CDN carriers.
+    let mut candidates = vec![server.clone()];
+    candidates.extend(ssh_variant(&server));
+    candidates.extend(tls_variant(&server));
+    candidates.extend(cdn_variants(&server));
+    candidates.into_iter().find(|candidate| {
+        entry_allowed(candidate, protocols, fronted)
+            && matches_limit(candidate, filter, named_meek, protocols)
+    })
 }
 
 fn matches_limit(server: &Server, filter: Shape, meek_named: bool, protocols: &[String]) -> bool {
@@ -9036,8 +9054,13 @@ fn select_protocols_with(
     }
     let tls_named = normal.is_some_and(|shape| shape.tls)
         || (initial_active && initial.is_some_and(|shape| shape.tls));
-    let plain_named = normal.is_some_and(|shape| shape.plain)
-        || (initial_active && initial.is_some_and(|shape| shape.plain));
+    // Only a direct plain protocol asks for a direct plain SSH sibling; `INPROXY-WEBRTC-SSH` does not.
+    let direct_plain = |list: &[String]| {
+        list.iter()
+            .any(|protocol| matches!(protocol.as_str(), "SSH" | "UNFRONTED-SSH"))
+    };
+    let plain_named =
+        direct_plain(protocols) || (initial_active && direct_plain(initial_protocols));
     if plain_named {
         add_ssh_variants(&mut servers);
     }
@@ -16014,7 +16037,35 @@ mod tests {
             &json::parse(r#"{"LimitTunnelDialPortNumbers":{"All":[80]}}"#).expect("settings"),
         ))
         .expect("settings");
-        assert!(runtime_entry(test_server(true), &settings).is_none());
+        assert!(runtime_entry(test_server(true), &settings, true).is_none());
+    }
+
+    #[test]
+    fn a_foreign_runtime_entry_is_kept_only_when_the_pool_has_no_region() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"EgressRegion":"US"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        let mut foreign = test_server(true);
+        foreign.region = Some("NL".to_owned());
+        let mut regional = test_server(true);
+        regional.region = Some("US".to_owned());
+        assert!(
+            !entries_match_region(std::slice::from_ref(&foreign), &settings),
+            "a pool without the configured region asks for the fallback"
+        );
+        assert!(
+            entries_match_region(std::slice::from_ref(&regional), &settings),
+            "a pool that carries the configured region does not"
+        );
+        assert!(
+            runtime_entry(foreign.clone(), &settings, true).is_none(),
+            "a pool that satisfies the region still drops the foreign entry"
+        );
+        assert!(
+            runtime_entry(foreign, &settings, false).is_some(),
+            "the startup fallback keeps the foreign entry when the pool has no regional one"
+        );
     }
 
     #[test]

@@ -1589,7 +1589,12 @@ fn nothing_to_hand_over(
         );
     }
     if withheld.is_empty() && skipped.is_empty() && spent.is_empty() {
-        return advisor::next_index(library, effort, &[]).unwrap_err();
+        return match advisor::next_index(library, effort, &[]) {
+            Err(reason) => reason,
+            Ok(_) => "no ready template draws an available row: every ready template's class \
+                      has no outstanding row, so name one with `--row <id>`"
+                .to_owned(),
+        };
     }
     message
 }
@@ -1939,8 +1944,20 @@ fn lock_state(path: &Path) -> Result<std::fs::File, String> {
 /// Replace a file by a same-directory rename, so a reader sees the old text or the new one, never
 /// a half-written file.
 fn replace_file(path: &Path, contents: &str) -> std::io::Result<()> {
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&temp, contents)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let temp = path.with_extension(format!("tmp-{}-{stamp}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let written = std::io::Write::write_all(&mut file, contents.as_bytes());
+    drop(file);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
     #[cfg(not(windows))]
     {
         match std::fs::rename(&temp, path) {
@@ -1962,7 +1979,7 @@ fn replace_file(path: &Path, contents: &str) -> std::io::Result<()> {
                 }
             };
         }
-        let backup = path.with_extension(format!("bak-{}", std::process::id()));
+        let backup = path.with_extension(format!("bak-{}-{stamp}", std::process::id()));
         if let Err(error) = std::fs::rename(path, &backup) {
             let _ = std::fs::remove_file(&temp);
             return Err(error);

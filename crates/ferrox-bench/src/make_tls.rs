@@ -116,13 +116,13 @@ fn write_temp(
             Err(error) => return Err(format!("{}: {error}", path.display())),
         };
         let result = file.write_all(bytes);
-        drop(file);
         #[cfg(unix)]
         let result = result.and_then(|()| {
             use std::os::unix::fs::PermissionsExt as _;
             let mode = if private { 0o600 } else { 0o644 };
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
         });
+        drop(file);
         if let Err(error) = result {
             let _ = std::fs::remove_file(&path);
             return Err(format!("{}: {error}", path.display()));

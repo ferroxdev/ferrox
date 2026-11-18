@@ -491,6 +491,7 @@ pub(crate) struct Client {
     queued: VecDeque<Vec<u8>>,
     queued_at: usize,
     credit: usize,
+    frame: Vec<u8>,
     capsules: Vec<u8>,
     capsule_at: usize,
     pub(crate) addresses: Vec<IpAddr>,
@@ -592,6 +593,7 @@ fn handshake(
         queued: VecDeque::new(),
         queued_at: 0,
         credit: 0,
+        frame: Vec::new(),
         capsules: Vec::new(),
         capsule_at: 0,
         addresses: Vec::new(),
@@ -1128,18 +1130,23 @@ impl Client {
         if self.end || self.wire.closed {
             return;
         }
+        let mut frame = std::mem::take(&mut self.frame);
         while let Some(answer) = self.queued.pop_front() {
             let start = self.queued_at;
             let room = self.send_window.min(self.connection_window);
             if room <= 0 {
                 self.queued.push_front(answer);
+                self.frame = frame;
                 return;
             }
             let take = (answer.len() - start).min(usize::try_from(room).unwrap_or(usize::MAX));
-            if !self
-                .wire
-                .send(h2::T_DATA, 0, self.stream, &answer[start..start + take])
-            {
+            // A queued body leaves in one write: its head and the credited slice share a frame.
+            frame.clear();
+            frame.resize(FRAME_HEAD, 0);
+            frame.extend_from_slice(&answer[start..start + take]);
+            frame[..FRAME_HEAD].copy_from_slice(&h2::frame_head(take, h2::T_DATA, 0, self.stream));
+            if !self.wire.send_frame(&frame) {
+                self.frame = frame;
                 return;
             }
             self.send_window -= i64::try_from(take).unwrap_or(i64::MAX);
@@ -1151,6 +1158,7 @@ impl Client {
                 self.queued_at = 0;
             }
         }
+        self.frame = frame;
     }
 }
 
@@ -1572,9 +1580,11 @@ impl Session {
         if self.end || wire.closed {
             return;
         }
+        let mut frame = std::mem::take(&mut self.frame);
         while let Some(answer) = self.queued.pop_front() {
             let Some(id) = self.request else {
                 self.queued.push_front(answer);
+                self.frame = frame;
                 return;
             };
             let start = self.queued_at;
@@ -1584,7 +1594,13 @@ impl Session {
                 break;
             }
             let take = (answer.len() - start).min(usize::try_from(room).unwrap_or(usize::MAX));
-            if !wire.send(h2::T_DATA, 0, id, &answer[start..start + take]) {
+            // A queued body leaves in one write: its head and the credited slice share a frame.
+            frame.clear();
+            frame.resize(FRAME_HEAD, 0);
+            frame.extend_from_slice(&answer[start..start + take]);
+            frame[..FRAME_HEAD].copy_from_slice(&h2::frame_head(take, h2::T_DATA, 0, id));
+            if !wire.send_frame(&frame) {
+                self.frame = frame;
                 return;
             }
             let sent = i64::try_from(take).unwrap_or(i64::MAX);
@@ -1597,7 +1613,6 @@ impl Session {
                 self.queued_at = 0;
             }
         }
-        let mut frame = std::mem::take(&mut self.frame);
         for _ in 0..QUEUED_CAP {
             // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
             if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
@@ -1775,6 +1790,7 @@ mod tests {
             queued: std::collections::VecDeque::new(),
             queued_at: 0,
             credit: 0,
+            frame: Vec::new(),
             capsules: Vec::new(),
             capsule_at: 0,
             addresses: Vec::new(),
@@ -2064,15 +2080,22 @@ mod tests {
     #[test]
     fn a_download_credits_a_batch_of_frames_in_one_write() {
         let out = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
         let mut client = bare_client();
         client.wire.stream = Box::new(Recorder {
             out: Arc::clone(&out),
+            writes: Arc::clone(&writes),
         });
         let stream = client.stream;
         let frame = vec![0u8; 16 * 1024];
         for _ in 0..4 {
             client.on(h2::T_DATA, 0, stream, &frame);
         }
+        assert_eq!(
+            writes.load(Ordering::Relaxed),
+            1,
+            "the pair leaves in one write, not two"
+        );
         let written = out.lock().expect("a recorder");
         assert_eq!(
             written.len(),
@@ -2220,6 +2243,7 @@ mod tests {
 
     struct Recorder {
         out: Arc<Mutex<Vec<u8>>>,
+        writes: Arc<AtomicUsize>,
     }
 
     impl Read for Recorder {
@@ -2230,6 +2254,7 @@ mod tests {
 
     impl Write for Recorder {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
             self.out.lock().expect("a recorder").extend_from_slice(buf);
             Ok(buf.len())
         }
@@ -2295,6 +2320,7 @@ mod tests {
         let mut wire = Wire {
             stream: Box::new(Recorder {
                 out: Arc::clone(&out),
+                writes: Arc::new(AtomicUsize::new(0)),
             }),
             pending,
             closed: false,
@@ -2387,6 +2413,7 @@ mod tests {
         let mut wire = Wire {
             stream: Box::new(Recorder {
                 out: Arc::clone(&out),
+                writes: Arc::new(AtomicUsize::new(0)),
             }),
             pending: Vec::new(),
             closed: false,
@@ -2410,7 +2437,13 @@ mod tests {
         session.request = Some(1);
         session.send_window = 0;
         session.connection_window = 0;
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
         let mut wire = bare_client().wire;
+        wire.stream = Box::new(Recorder {
+            out,
+            writes: Arc::clone(&writes),
+        });
         wire.deadline.arm(Instant::now() + Duration::from_secs(1));
         for _ in 0..QUEUED_CAP {
             client.capsule(&capsule);
@@ -2430,7 +2463,13 @@ mod tests {
         session.on(&mut wire, h2::T_WINDOW, 0, 0, &window);
         session.on(&mut wire, h2::T_WINDOW, 0, 1, &window);
         client.flush();
+        let before = writes.load(Ordering::Relaxed);
         session.flush(&mut wire);
+        assert_eq!(
+            writes.load(Ordering::Relaxed) - before,
+            QUEUED_CAP,
+            "each drained capsule leaves in one write, not a header and a body"
+        );
         assert!(client.queued.is_empty());
         assert!(session.queued.is_empty());
         assert!(
@@ -2528,6 +2567,7 @@ mod tests {
         let mut client = bare_client();
         client.wire.stream = Box::new(Recorder {
             out: Arc::clone(&out),
+            writes: Arc::new(AtomicUsize::new(0)),
         });
         let (sender, receiver) = mpsc::sync_channel(masque::QUEUE);
         drop(sender);
