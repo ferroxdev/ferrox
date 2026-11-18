@@ -2196,18 +2196,17 @@ impl SlotWriter {
 
     /// Leave the peer a terminal frame once the slot it names is safe to reuse, without holding up the caller that saw the failure.
     fn signal_error(self: &Arc<Self>, seq: u64) {
-        if self.drained(seq).unwrap_or(false) {
-            let _ = self.set_frame(seq, SLOT_ERR, &[]);
-            return;
-        }
         let writer = Arc::clone(self);
         let _ = std::thread::Builder::new()
             .stack_size(WORKER_STACK)
             .spawn(move || {
                 let started = Instant::now();
-                while started.elapsed() < SLOT_STALL && !writer.ended.load(Ordering::Acquire) {
+                while !writer.ended.load(Ordering::Acquire) {
                     if writer.drained(seq).unwrap_or(false) {
                         let _ = writer.set_frame(seq, SLOT_ERR, &[]);
+                        return;
+                    }
+                    if started.elapsed() >= SLOT_STALL {
                         return;
                     }
                     std::thread::sleep(SLOT_ACK_RETRY);
