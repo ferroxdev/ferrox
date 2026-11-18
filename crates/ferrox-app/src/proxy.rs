@@ -32195,8 +32195,8 @@ fn dial_http_outbound(
     if s.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
-    let _ = http_connect(client, s, http, target, |stream, downstream, close| {
-        relay_shared(Half::socket(stream), Half::socket(downstream), &close);
+    let _ = http_connect(client, s, http, target, |stream, downstream, _close| {
+        relay_handoff(&downstream, &stream);
     });
 }
 
@@ -76127,6 +76127,65 @@ mod tests {
         hop_thread.join().expect("hop returns");
     }
 
+    /// A plain HTTP hop is two raw descriptors, so its relay must splice rather than copy: the
+    /// pipes are the count a user-space buffer cannot produce.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_plain_http_hop_relays_without_a_user_space_copy() {
+        let hop = crate::conn::test_bind("127.0.0.1:0").expect("bind hop");
+        let hop_addr = hop.local_addr().expect("hop addr");
+        let hop_thread = thread::spawn(move || {
+            let (mut stream, _) = hop.accept().expect("hop accepts");
+            let mut asked = Vec::new();
+            let mut byte = [0u8; 1];
+            while !asked.ends_with(b"\r\n\r\n") {
+                let read = stream.read(&mut byte).expect("hop reads");
+                assert_ne!(read, 0, "hop saw an eof");
+                asked.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\n")
+                .expect("hop answers");
+            let mut echoed = [0u8; 4];
+            stream.read_exact(&mut echoed).expect("hop echoes");
+            stream.write_all(&echoed).expect("hop replies");
+        });
+
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("bind front");
+        let front_addr = front.local_addr().expect("front addr");
+        let pipes = splice_pipes_allocated();
+        let spliced = poll_relay::spliced_bytes();
+        let relay = thread::spawn(move || {
+            let (client, _) = front.accept().expect("front accepts");
+            dial_http_outbound(
+                &client,
+                &hop_addr,
+                &http_out(None, None, &[]),
+                &"127.0.0.1:1".parse().expect("target"),
+                Ladder::global(),
+            );
+        });
+
+        let mut sock = Connection::connect(front_addr).expect("join");
+        sock.write_all(b"ping").expect("client writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "the hop echoes the payload");
+        let allocated = splice_pipes_allocated() - pipes;
+        assert!(
+            allocated >= 2,
+            "the plain hop allocated {allocated} splice pipes: its relay is still copying every \
+             byte through a user-space buffer"
+        );
+        let moved = poll_relay::spliced_bytes() - spliced;
+        assert!(
+            moved >= 4,
+            "the plain hop spliced {moved} bytes: a hand-off that armed no pipes falls back to \
+             relay_owned, and this count is what tells the two apart"
+        );
+        let _ = sock.shutdown(Shutdown::Write);
+        relay.join().expect("relay returns");
+        hop_thread.join().expect("hop returns");
+    }
+
     /// An HTTP hop carries no datagrams, so QUIC is refused rather than falling to a carrier nobody asked for.
     #[test]
     fn an_http_hop_refuses_the_quic_carrier_before_any_dial() {
@@ -80646,6 +80705,25 @@ mod poll_relay {
     #[inline]
     fn note_idle_ingest(_pending: usize, _capacity: usize) {}
 
+    /// Bytes the pump has moved with `splice` rather than through a buffer: the one count a
+    /// relay that fell back to `relay_owned` cannot produce.
+    #[cfg(test)]
+    static SPLICED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(test)]
+    pub(crate) fn spliced_bytes() -> usize {
+        SPLICED_BYTES.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn note_spliced(moved: usize) {
+        SPLICED_BYTES.fetch_add(moved, Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn note_spliced(_moved: usize) {}
+
     /// A blocking socket parks the worker inside a splice when a wake arrives for a
     /// queue that has gone — `SPLICE_F_NONBLOCK` guards the pipe half only. `held` stops
     /// the descriptor being recycled under a restore that writes back the flags it found.
@@ -80866,6 +80944,7 @@ mod poll_relay {
                     };
                     if moved > 0 {
                         self.pending += moved as usize;
+                        note_spliced(moved as usize);
                         self.ingest_stalled = false;
                         progressed = true;
                     } else if moved == 0 {

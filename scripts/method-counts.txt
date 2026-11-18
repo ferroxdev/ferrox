@@ -882,6 +882,7 @@ http-proxy connect-request-allocations 0 ferrox-app-proxy::tests::the_connect_re
 http-proxy forwarded-head-allocations 0 ferrox-app-proxy::tests::an_origin_form_head_reaches_the_uplink_where_it_landed
 http-proxy forwarded-head-copies 0 ferrox-app-proxy::tests::a_forwarded_head_is_the_head_that_was_read
 http-proxy pb-client-endpoints-decoded 1 ferrox-app-xray_pb::tests::a_socks_http_fallback_scenario_decodes_both_sides
+http-proxy hop-relay-splice-pipes 2 ferrox-app-proxy::tests::a_plain_http_hop_relays_without_a_user_space_copy
 
 # --- Routing rules and geosite/geoip -----------------------------------------
 engine-router ops-retired-instructions UNBLESSED scripts/count-ops.sh
