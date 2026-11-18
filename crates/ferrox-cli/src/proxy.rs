@@ -142,7 +142,10 @@ fn another_lane_runs(paths: &Paths) -> bool {
             let Some(rest) = name.to_str().and_then(|name| name.strip_prefix("lane")) else {
                 continue;
             };
-            if !rest.ends_with(".pid") || entry.path() == paths.pid_file {
+            let pid = std::path::Path::new(rest)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pid"));
+            if !pid || entry.path() == paths.pid_file {
                 continue;
             }
             if read_trim(&entry.path())
