@@ -655,15 +655,26 @@ fn hand_back(carried: &mut Vec<u8>, at: &mut usize, buf: &mut [u8]) -> usize {
 
 /// HTTP/2 CONNECT: preface, settings, one stream and the status in its first header block. A session that carried a flow is kept and lent to the next flow as a new stream, so a warm flow pays one round trip instead of a TCP and a TLS handshake.
 pub(crate) fn open_h2(dial: &FoxyDial, target: &str) -> Result<Tls2, Failure> {
-    open_stream(dial, |block| {
+    open_stream(dial, PoolClass::Tcp, |block| {
         hpack::hpack_connect(target, &dial.pass.token, block);
     })
 }
 
+/// The bytes a session stages for a frame no lane of its class is reading: a TCP stream keeps them raw in `carry`, while CONNECT-UDP and CONNECT-IP keep capsules in `capsule_buf`. Two classes that parse differently cannot share one session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PoolClass {
+    Tcp,
+    Capsule,
+}
+
 /// Opens one stream on a session to this edge, reusing a session already open: the flow rides it on a stream of its own, and the handshake it paid is not paid again.
-fn open_stream(dial: &FoxyDial, build: impl Fn(&mut Vec<u8>)) -> Result<Tls2, Failure> {
+fn open_stream(
+    dial: &FoxyDial,
+    class: PoolClass,
+    build: impl Fn(&mut Vec<u8>),
+) -> Result<Tls2, Failure> {
     // A session already open to this edge is the cheap one: the flow rides it on a stream of its own, and the handshake it paid is not paid again.
-    if let Some(session) = pool_find(dial) {
+    if let Some(session) = pool_find(dial, class) {
         match attach(&session, &build) {
             Ok(lane) => return Ok(lane),
             // A session the edge closed while it was idle is the one handshake this reuse may cost; every other refusal is the edge's answer and is not retried on a new session.
@@ -673,13 +684,14 @@ fn open_stream(dial: &FoxyDial, build: impl Fn(&mut Vec<u8>)) -> Result<Tls2, Fa
     }
     let session = open_session(dial)?;
     let lane = attach(&session, &build)?;
-    pool_register(SessionKey::of(dial), &session);
+    pool_register(SessionKey::of(dial, class), &session);
     Ok(lane)
 }
 
 /// The identity one pooled session is lent under: a CONNECT stream names any target, so only the edge, the hop, the anchors, the pins and the account have to match.
 #[derive(Clone)]
 struct SessionKey {
+    class: PoolClass,
     host: std::sync::Arc<str>,
     port: u16,
     address: Option<SocketAddr>,
@@ -691,8 +703,9 @@ struct SessionKey {
 }
 
 impl SessionKey {
-    fn of(dial: &FoxyDial) -> Self {
+    fn of(dial: &FoxyDial, class: PoolClass) -> Self {
         Self {
+            class,
             host: dial.host.clone(),
             port: dial.port,
             address: dial.address,
@@ -704,8 +717,9 @@ impl SessionKey {
     }
 
     /// Whether a stored key names the same edge this dial is about: the lookup borrows the dial, so a warm flow costs no name of its own.
-    fn names(&self, dial: &FoxyDial) -> bool {
-        self.host == dial.host
+    fn names(&self, dial: &FoxyDial, class: PoolClass) -> bool {
+        self.class == class
+            && self.host == dial.host
             && self.port == dial.port
             && self.address == dial.address
             && self.upstream == dial.upstream
@@ -730,12 +744,14 @@ fn pool() -> &'static std::sync::Mutex<Vec<PoolEntry>> {
 }
 
 /// A session open to this edge, if one is: the flow rides it on a stream of its own, and the handshake it paid is not paid again. The session stays in the registry while it is ridden — a flow that took it did not take it away from the others.
-fn pool_find(dial: &FoxyDial) -> Option<Arc<Session>> {
+fn pool_find(dial: &FoxyDial, class: PoolClass) -> Option<Arc<Session>> {
     let mut pool = pool().lock().ok()?;
     let now = Instant::now();
     // A session older than the TTL is a handshake the lane would rather pay than trust, and one the edge has closed is no session at all.
     pool.retain(|(_, at, _)| now.duration_since(*at) < POOL_TTL);
-    let at = pool.iter().rposition(|(held, _, _)| held.names(dial))?;
+    let at = pool
+        .iter()
+        .rposition(|(held, _, _)| held.names(dial, class))?;
     let session = pool[at].2.clone();
     if session.is_gone() {
         return None;
@@ -762,18 +778,16 @@ fn pool_register(key: SessionKey, session: &Arc<Session>) {
     pool.push((key, Instant::now(), Arc::clone(session)));
 }
 
-/// One UDP target as its own H2 connection carrying CONNECT-UDP: a lane stays one stream on one connection, so a second target is a second connection.
+/// One UDP target as one CONNECT-UDP stream on a capsule session: a second target rides a new stream on the session the first opened, and a capsule session is kept apart from a TCP one because each stages a foreign frame its own way.
 pub(crate) fn open_udp(
     dial: &FoxyDial,
     target_host: &str,
     target_port: u16,
 ) -> Result<Tls2, Failure> {
     let edge = edge_authority(&dial.host, dial.port);
-    let build = |block: &mut Vec<u8>| {
+    open_stream(dial, PoolClass::Capsule, |block| {
         masque::connect_udp(&edge, target_host, target_port, &dial.pass.token, block);
-    };
-    let session = open_session(dial)?;
-    attach(&session, &build)
+    })
 }
 
 /// One UDP target as its own HTTP/1.1 upgrade carrying CONNECT-UDP: RFC 9298 §4's fallback for an edge whose TLS answers no HTTP/2 or HTTP/3.
@@ -3646,7 +3660,7 @@ pub(crate) fn open_ip_h2(
     dial: &FoxyDial,
 ) -> Result<(Tls2, Option<ferrox_core::foxy::connectip::Assigned>), Failure> {
     let edge = edge_authority(&dial.host, dial.port);
-    let mut lane = open_stream(dial, |block| {
+    let mut lane = open_stream(dial, PoolClass::Capsule, |block| {
         connectip::connect_ip(&edge, "*", 0, &dial.pass.token, block);
     })?;
     let assigned = lane.address_assign()?;
@@ -8398,6 +8412,40 @@ pub(crate) mod loopback {
         edge.join().expect("joins");
     }
 
+    /// A second UDP target rides a new stream on the session the first opened: a capsule flow does not pay a TCP and a TLS handshake per target.
+    #[test]
+    fn a_second_udp_flow_rides_the_first_session() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let edge = masque_h2_two_stream_edge(listener, server, seen_tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut first = open_udp(&dial, "one.test", 443).expect("opens");
+        let mut second = open_udp(&dial, "two.test", 443).expect("opens on the session");
+        assert!(
+            std::sync::Arc::ptr_eq(&first.session, &second.session),
+            "the second UDP flow paid a second handshake"
+        );
+        assert_ne!(
+            first.stream, second.stream,
+            "two flows on one session are two streams"
+        );
+        for want in ["one.test", "two.test"] {
+            let block = seen_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("block");
+            let text = String::from_utf8_lossy(&block);
+            assert!(text.contains(want), "missing {want} in {text}");
+        }
+        second.write_datagram(b"hello udp").expect("writes");
+        second.flush().expect("flushes");
+        read_datagram(&mut second, b"hello udp");
+        drop(first);
+        drop(second);
+        edge.join().expect("joins");
+    }
+
     /// A capsule the edge split over several DATA frames arrives as one datagram, and the only bytes staged are the ones the split made it stage: the reassembly is the copy that cannot be avoided.
     #[test]
     fn a_capsule_split_over_frames_reassembles_as_one_datagram() {
@@ -8568,6 +8616,82 @@ pub(crate) mod loopback {
                         at = cut;
                     }
                     // The echo is not the end of the edge: a lane that has to read a second frame to find the rest of its capsule must find the edge still there, and a TLS peer that drops on a reader's next syscall is one the runner decides.
+                    std::thread::sleep(Duration::from_millis(250));
+                    return;
+                }
+            }
+        })
+    }
+
+    /// A loopback HTTP/2 edge that answers two CONNECT-UDP streams on one session, then echoes one datagram on the stream that sent it.
+    fn masque_h2_two_stream_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        seen: std::sync::mpsc::Sender<Vec<u8>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            let mut opened = Vec::new();
+            while opened.len() < 2 {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frame.kind {
+                    frames::SETTINGS if frame.flags & 0x1 == 0 => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::HEADERS => {
+                        seen.send(payload).expect("reports the block");
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x5, frame.stream, &[0x88], &mut out);
+                        tls.write_all(&out).expect("answers");
+                        opened.push(frame.stream);
+                    }
+                    _ => {}
+                }
+            }
+            let mut staged: std::collections::HashMap<u32, Vec<u8>> =
+                std::collections::HashMap::new();
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if frame.kind != frames::DATA {
+                    continue;
+                }
+                let carry = staged.entry(frame.stream).or_default();
+                carry.extend_from_slice(&payload);
+                if let Some((_, datagram)) = masque::datagram_split(carry) {
+                    let mut echo = Vec::new();
+                    masque::datagram_encode(datagram, &mut echo);
+                    let mut out = Vec::new();
+                    h2_frame(frames::DATA, 0, frame.stream, &echo, &mut out);
+                    tls.write_all(&out).expect("echoes");
+                    tls.flush().expect("flushes");
                     std::thread::sleep(Duration::from_millis(250));
                     return;
                 }

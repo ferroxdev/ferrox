@@ -93,6 +93,9 @@ graph TD
 | edge-socket-dups-after-the-first-h1-park | 0 | ferrox-app-foxy::loopback::a_parked_http11_lane_hands_out_one_socket |
 | edge-socket-dups-after-the-first-h2-park | 0 | ferrox-app-foxy::loopback::a_parked_http2_session_hands_out_one_socket |
 | h2-open-scratch-reallocations-after-first-flow | 0 | ferrox-app-foxy::loopback::a_warm_h2_open_reuses_the_session_scratch |
+| udp-session-handshakes-after-the-first-flow | 0 | ferrox-app-foxy::loopback::a_second_udp_flow_rides_the_first_session |
+- **A TCP and TLS handshake for every UDP target.** `open_udp` opened a fresh session per CONNECT-UDP stream, so a browser's DNS, QUIC and STUN targets each paid a full handshake to an edge that was already reachable on the previous flow. UDP and CONNECT-IP now ride a capsule session pool, where the second target is a new stream on the session the first opened; TCP CONNECT keeps its own pool because a foreign TCP frame stages raw bytes in `carry` while a capsule frame stages into `capsule_buf`, and a session that mixed them would hand one lane's frame to the wrong buffer. `udp-session-handshakes-after-the-first-flow 0` is gated by `a_second_udp_flow_rides_the_first_session`, which opens two targets on one dial and holds the session's `Arc` identical and the stream ids apart, then echoes a datagram on the second. What is **not** removed: the first UDP flow still dials; a session older than `POOL_TTL` still pays a handshake; and a capsule session and a TCP session to the same edge are two connections rather than one.
+
 | h2-upload-bytes-blocked-by-an-unread-grant | 0 | ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads |
 | window-update-frames-per-floor-crossing | 2 | ferrox-app-foxy::loopback::credit_crossing_the_floor_costs_one_pair_not_one_per_frame |
 | window-update-frames-below-the-floor | 0 | ferrox-app-foxy::loopback::credit_held_under_the_floor_never_reaches_the_wire |
