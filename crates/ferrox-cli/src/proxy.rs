@@ -139,10 +139,13 @@ fn another_lane_runs(paths: &Paths) -> bool {
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let Some(rest) = name.to_str().and_then(|name| name.strip_prefix("lane")) else {
+            let Some(name) = name.to_str() else {
                 continue;
             };
-            let pid = std::path::Path::new(rest)
+            if !name.starts_with("lane") {
+                continue;
+            }
+            let pid = std::path::Path::new(name)
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("pid"));
             if !pid || entry.path() == paths.pid_file {
