@@ -350,7 +350,12 @@ ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_co
 # continuation out of the cutter: one branch per turn, no new draw, copy or
 # write, and the probe still resets every counter it uses. ops.yml run
 # 44130371666.
-ferrox_core::finalmask::tests::merged_hello_probe 349989 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
+# Re-blessed 347940 by two removals in the hello path: the gate hands the parsed
+# record length to the cutter instead of asking `hello_shape` twice, and the
+# label cuts are shifted and filtered in their own vec instead of collected into
+# a second one. Eight instructions and one allocation fewer per hello, same
+# bytes, same draws, same writes. ops.yml run 44215224558.
+ferrox_core::finalmask::tests::merged_hello_probe 347940 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
 # The client request built by `request`: one address type byte, the address and
 # the port, written in one match with the vector's room reserved exactly once,
 # through `spare_capacity_mut` and one `copy_nonoverlapping` per field so no
