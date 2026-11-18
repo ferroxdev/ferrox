@@ -233,15 +233,18 @@ impl Webhook {
     fn send(&self, body: &str) -> Result<(), String> {
         let deadline = Instant::now() + BUDGET;
         let mut url = HttpUrl::parse(&self.url)?;
+        let mut credentials = url.userinfo.clone();
+        let mut headers = self.headers.clone();
         let mut method = "POST";
         let mut body = body;
         for _ in 0..=10 {
+            url.userinfo = credentials.clone();
             if url.userinfo.is_some() && !url.tls {
                 return Err("refuses URL credentials over plaintext http".to_owned());
             }
             let connection = self.dial(&url, deadline)?;
             let mut connection = DeadlineConnection::new(connection, deadline);
-            let request = request_bytes_method(&url, &self.headers, body, method);
+            let request = request_bytes_method(&url, &headers, body, method);
             let (status, location) = if url.tls {
                 let config = ferrox_core::tls::TlsConfig {
                     server_name: url.host.clone(),
@@ -274,8 +277,18 @@ impl Webhook {
                 let location = location.ok_or_else(|| {
                     format!("POST returned redirect status {status} without a Location")
                 })?;
-                let next = redirect_url(&url, &location)?;
-                url = HttpUrl::parse(&next)?;
+                let next = HttpUrl::parse(&redirect_url(&url, &location)?)?;
+                let same = same_origin(&url, &next);
+                if self.socket.is_some() && !same {
+                    return Err("refuses a Unix-socket redirect to another origin".to_owned());
+                }
+                if same {
+                    credentials = url.userinfo.clone();
+                } else {
+                    credentials = None;
+                    headers.retain(|(name, _)| !sensitive_header(name));
+                }
+                url = next;
                 if matches!(status, 301..=303) {
                     method = "GET";
                     body = "";
@@ -460,6 +473,17 @@ fn request_bytes_method(
     crate::foxy_account::request(method, &url.authority, &url.path, &wire, body.as_bytes())
 }
 
+fn same_origin(left: &HttpUrl, right: &HttpUrl) -> bool {
+    left.tls == right.tls && left.host.eq_ignore_ascii_case(&right.host) && left.port == right.port
+}
+
+fn sensitive_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("cookie2")
+}
+
 fn redirect_url(base: &HttpUrl, location: &str) -> Result<String, String> {
     let location = location.trim();
     if location.is_empty() {
@@ -526,9 +550,12 @@ fn exchange_status(
             });
         if let Some(end) = end {
             let block = &head[..end];
-            let status = block
-                .split(|byte| *byte == b' ' || *byte == b'\n' || *byte == b'\r')
-                .find(|part| part.len() == 3 && part.iter().all(u8::is_ascii_digit))
+            let line = block.split(|byte| *byte == b'\n').next().unwrap_or(block);
+            let status = line
+                .split(|byte| *byte == b' ' || *byte == b'\r')
+                .filter(|part| !part.is_empty())
+                .nth(1)
+                .filter(|code| code.len() == 3 && code.iter().all(u8::is_ascii_digit))
                 .and_then(|code| std::str::from_utf8(code).ok())
                 .and_then(|code| code.parse::<u16>().ok())
                 .ok_or("the reply carries no status")?;
@@ -951,6 +978,19 @@ mod tests {
             }
         }
         String::from_utf8_lossy(&head).into_owned()
+    }
+
+    #[test]
+    fn a_status_code_is_read_only_from_the_status_line() {
+        let mut malformed =
+            std::io::Cursor::new(b"HTTP/1.1\r\nX-Code: 302\r\nLocation: /next\r\n\r\n".to_vec());
+        assert!(exchange_status(&mut malformed, b"").is_err());
+        let mut valid =
+            std::io::Cursor::new(b"HTTP/1.1 302 Found\r\nLocation: /next\r\n\r\n".to_vec());
+        assert_eq!(
+            exchange_status(&mut valid, b"").expect("a status line"),
+            (302, Some("/next".to_owned()))
+        );
     }
 
     #[test]

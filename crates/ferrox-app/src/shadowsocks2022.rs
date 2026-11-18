@@ -2203,12 +2203,12 @@ pub(crate) fn serve_udp_relay(
     let Ok(upstream) = UdpSocket::bind("0.0.0.0:0") else {
         return;
     };
-    let upstream6 = UdpSocket::bind("[::]:0").ok();
-    for sock in [&upstream].into_iter().chain(upstream6.as_ref()) {
-        if sock.set_read_timeout(Some(RELAY_POLL)).is_err() {
-            return;
-        }
+    if upstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
     }
+    let upstream6 = UdpSocket::bind("[::]:0")
+        .ok()
+        .filter(|socket| socket.set_read_timeout(Some(RELAY_POLL)).is_ok());
     if clients.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }

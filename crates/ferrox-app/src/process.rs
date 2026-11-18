@@ -33,8 +33,11 @@ pub(crate) fn owner(network: Network, source: SocketAddr) -> Option<Owner> {
 
 #[cfg(target_os = "linux")]
 fn process_start(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = stat.rsplit_once(") ")?.1;
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let at = stat
+        .windows(2)
+        .rposition(|window| window.first() == Some(&b')') && window.get(1) == Some(&b' '))?;
+    let rest = std::str::from_utf8(&stat[at + 2..]).ok()?;
     rest.split_ascii_whitespace().nth(19)?.parse().ok()
 }
 

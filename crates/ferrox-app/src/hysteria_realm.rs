@@ -1026,6 +1026,11 @@ fn heartbeat_loop(
             return;
         }
         std::thread::sleep(interval);
+        if stop.load(std::sync::atomic::Ordering::Relaxed)
+            || session_stop.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
         let Some(base) = stun_discover_via_state(&state, &sock, &servers, family) else {
             continue;
         };

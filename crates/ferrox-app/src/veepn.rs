@@ -598,6 +598,10 @@ fn zone_name() -> String {
 const HEX: &[u8; 16] = b"0123456789abcdef";
 static FALLBACK_ID: AtomicU64 = AtomicU64::new(1);
 
+fn fallback_seed(epoch: u64, pid: u32, sequence: u64) -> u64 {
+    epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (u64::from(pid) << 32) ^ (sequence & 0xffff_ffff)
+}
+
 /// The id the launch publishes as `udid`: the one configured, or a version-4 drawn for this process so the plane's free pool sees one device rather than one per flow. Written a byte at a time — no formatter runs.
 pub(crate) fn udid(named: &str) -> String {
     if !named.is_empty() {
@@ -605,9 +609,11 @@ pub(crate) fn udid(named: &str) -> String {
     }
     let mut raw = [0u8; 16];
     if getrandom::fill(&mut raw).is_err() {
-        let mut state = foxy_account::epoch().wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ FALLBACK_ID.fetch_add(1, Ordering::Relaxed)
-            ^ u64::from(std::process::id());
+        let mut state = fallback_seed(
+            foxy_account::epoch(),
+            std::process::id(),
+            FALLBACK_ID.fetch_add(1, Ordering::Relaxed),
+        );
         for byte in &mut raw {
             state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut mixed = state;
@@ -634,6 +640,11 @@ mod tests {
     use ferrox_core::tls::TlsProvider as _;
 
     use super::*;
+
+    #[test]
+    fn fallback_seed_keeps_pid_and_counter_in_separate_bits() {
+        assert_ne!(fallback_seed(1, 100, 2), fallback_seed(1, 103, 1));
+    }
 
     fn lane(domains: &[&str]) -> Result<VeepnOut, String> {
         let named: Vec<String> = domains.iter().map(|url| (*url).to_owned()).collect();

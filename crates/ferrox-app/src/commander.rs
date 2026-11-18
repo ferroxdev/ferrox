@@ -432,6 +432,7 @@ impl Api {
         }
         let mut decoder = h2::Decoder::default();
         let mut calls: HashMap<u32, Call> = HashMap::new();
+        let mut last_id = 0u32;
         while let Some((len, kind, flags, id)) = h2::read_head_bounded(&mut stream) {
             let cap = if kind == h2::T_DATA {
                 CALL_MAX + CALL_ENVELOPE
@@ -439,7 +440,7 @@ impl Api {
                 h2::HEAD_CAP
             };
             if len > cap {
-                goaway(&mut stream, h2::E_FRAME_SIZE);
+                goaway(&mut stream, h2::E_FRAME_SIZE, last_id);
                 return;
             }
             let mut body = vec![0u8; len];
@@ -460,12 +461,12 @@ impl Api {
                 h2::T_HEADERS => {
                     let block = header_body(&body, flags);
                     if calls.len() >= API_CALLS && !calls.contains_key(&id) {
-                        goaway(&mut stream, h2::E_REFUSED);
+                        goaway(&mut stream, h2::E_REFUSED, last_id);
                         return;
                     }
                     let held = calls.get(&id).map_or(0, |call| call.headers.len());
                     if held + block.len() > h2::HEAD_CAP {
-                        goaway(&mut stream, h2::E_PROTOCOL);
+                        goaway(&mut stream, h2::E_PROTOCOL, last_id);
                         return;
                     }
                     let call = calls.entry(id).or_default();
@@ -477,13 +478,16 @@ impl Api {
                         call.read_path(&mut decoder);
                     }
                     if flags & h2::F_END != 0 {
-                        self.answer(id, &calls.remove(&id).unwrap_or_default(), &mut stream);
+                        last_id = last_id.max(id);
+                        if !self.answer(id, &calls.remove(&id).unwrap_or_default(), &mut stream) {
+                            return;
+                        }
                     }
                 }
                 h2::T_CONT => {
                     if let Some(call) = calls.get_mut(&id) {
                         if call.headers.len() + body.len() > h2::HEAD_CAP {
-                            goaway(&mut stream, h2::E_PROTOCOL);
+                            goaway(&mut stream, h2::E_PROTOCOL, last_id);
                             return;
                         }
                         call.headers.extend_from_slice(&body);
@@ -497,26 +501,31 @@ impl Api {
                 }
                 h2::T_DATA => {
                     let Some(payload) = data_body(&body, flags) else {
-                        goaway(&mut stream, h2::E_PROTOCOL);
+                        goaway(&mut stream, h2::E_PROTOCOL, last_id);
                         return;
                     };
                     let held: usize = calls.values().map(|call| call.body.len()).sum();
-                    let known = calls.contains_key(&id);
-                    if let Some(call) = calls.get_mut(&id) {
-                        if call.body.len() + payload.len() > CALL_MAX + CALL_ENVELOPE
-                            || held + payload.len() > API_HELD
-                        {
-                            goaway(&mut stream, h2::E_REFUSED);
+                    let Some(call) = calls.get_mut(&id) else {
+                        goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                        return;
+                    };
+                    if call.body.len() + payload.len() > CALL_MAX + CALL_ENVELOPE
+                        || held + payload.len() > API_HELD
+                    {
+                        goaway(&mut stream, h2::E_REFUSED, last_id);
+                        return;
+                    }
+                    call.body.extend_from_slice(payload);
+                    if !window_update(&mut stream, 0, body.len())
+                        || !window_update(&mut stream, id, body.len())
+                    {
+                        return;
+                    }
+                    if flags & h2::F_END != 0 {
+                        last_id = last_id.max(id);
+                        if !self.answer(id, &calls.remove(&id).unwrap_or_default(), &mut stream) {
                             return;
                         }
-                        call.body.extend_from_slice(payload);
-                    }
-                    window_update(&mut stream, 0, body.len());
-                    if known {
-                        window_update(&mut stream, id, body.len());
-                    }
-                    if flags & h2::F_END != 0 && known {
-                        self.answer(id, &calls.remove(&id).unwrap_or_default(), &mut stream);
                     }
                 }
                 h2::T_RST => {
@@ -528,19 +537,23 @@ impl Api {
         }
     }
 
-    fn answer(&self, id: u32, call: &Call, stream: &mut Connection) {
+    fn answer(&self, id: u32, call: &Call, stream: &mut Connection) -> bool {
         let request = grpc_message(&call.body).unwrap_or_default();
         match self.dispatch(&call.path, request) {
             Ok(answer) => {
                 let head = [(":status", "200"), ("content-type", "application/grpc")];
                 let block = h2::block_encode(&head);
-                h2::write_frame(stream, h2::T_HEADERS, h2::F_END_HEADERS, id, &block);
+                if !h2::write_frame(stream, h2::T_HEADERS, h2::F_END_HEADERS, id, &block) {
+                    return false;
+                }
                 let mut framed = Vec::with_capacity(answer.len() + 5);
                 framed.push(0);
                 framed.extend_from_slice(&(answer.len() as u32).to_be_bytes());
                 framed.extend_from_slice(&answer);
                 for chunk in framed.chunks(H2_MAX_FRAME) {
-                    h2::write_frame(stream, h2::T_DATA, 0, id, chunk);
+                    if !h2::write_frame(stream, h2::T_DATA, 0, id, chunk) {
+                        return false;
+                    }
                 }
                 let trailers = h2::block_encode(&[("grpc-status", "0")]);
                 h2::write_frame(
@@ -549,14 +562,16 @@ impl Api {
                     h2::F_END_HEADERS | h2::F_END,
                     id,
                     &trailers,
-                );
+                )
             }
             Err((status, message)) => {
                 let code = status.to_string();
                 let message = percent(&message);
                 let head = [(":status", "200"), ("content-type", "application/grpc")];
                 let block = h2::block_encode(&head);
-                h2::write_frame(stream, h2::T_HEADERS, h2::F_END_HEADERS, id, &block);
+                if !h2::write_frame(stream, h2::T_HEADERS, h2::F_END_HEADERS, id, &block) {
+                    return false;
+                }
                 let trailers = h2::block_encode(&[
                     ("grpc-status", code.as_str()),
                     ("grpc-message", message.as_str()),
@@ -567,7 +582,7 @@ impl Api {
                     h2::F_END_HEADERS | h2::F_END,
                     id,
                     &trailers,
-                );
+                )
             }
         }
     }
@@ -1186,22 +1201,22 @@ fn settings() -> [u8; 6] {
 }
 
 /// Refuse a peer that exceeded a bound: the GOAWAY names the reason before the connection closes.
-fn goaway(stream: &mut Connection, code: u32) {
+fn goaway(stream: &mut Connection, code: u32, last: u32) {
     let mut frame = [0u8; 8];
+    frame[..4].copy_from_slice(&last.to_be_bytes());
     frame[4..].copy_from_slice(&code.to_be_bytes());
     let _ = h2::write_frame(stream, h2::T_GOAWAY, 0, 0, &frame);
 }
 
-fn window_update(stream: &mut Connection, id: u32, increment: usize) {
-    if increment != 0 {
-        let _ = h2::write_frame(
+fn window_update(stream: &mut Connection, id: u32, increment: usize) -> bool {
+    increment == 0
+        || h2::write_frame(
             stream,
             h2::T_WINDOW,
             0,
             id,
             &(increment as u32).to_be_bytes(),
-        );
-    }
+        )
 }
 
 fn data_body(body: &[u8], flags: u8) -> Option<&[u8]> {

@@ -1627,26 +1627,27 @@ fn read_h3_request(
             }
         }
         if buf.len() >= HEAD_CAP {
-            return assemble_request(&buf);
+            return assemble_request(&buf).filter(request_complete);
         }
         let fin = {
             let Ok(mut conn) = shared.lock() else {
                 return assemble_request(&buf);
             };
             if conn.is_closed() {
-                return assemble_request(&buf);
+                return assemble_request(&buf).filter(request_complete);
             }
             match conn.stream_recv(stream, room.as_mut()) {
-                Ok((0, _)) | Err(quiche::Error::Done) => false,
+                Ok((0, fin)) => fin,
                 Ok((n, fin)) => {
                     buf.extend_from_slice(&room.as_mut()[..n]);
                     fin
                 }
-                Err(_) => return assemble_request(&buf),
+                Err(quiche::Error::Done) => false,
+                Err(_) => return assemble_request(&buf).filter(request_complete),
             }
         };
         if fin {
-            return assemble_request(&buf);
+            return assemble_request(&buf).filter(request_complete);
         }
         std::thread::sleep(STREAM_POLL);
     }
