@@ -239,7 +239,7 @@ impl Webhook {
         let mut method = "POST";
         let mut body = body;
         for _ in 0..=10 {
-            url.userinfo = credentials.clone();
+            url.userinfo.clone_from(&credentials);
             if url.userinfo.is_some() && !url.tls {
                 return Err("refuses URL credentials over plaintext http".to_owned());
             }
@@ -285,7 +285,7 @@ impl Webhook {
                     return Err("refuses a Unix-socket redirect to another origin".to_owned());
                 }
                 if same {
-                    credentials = url.userinfo.clone();
+                    credentials.clone_from(&url.userinfo);
                 } else {
                     credentials = None;
                     headers.retain(|(name, _)| !sensitive_header(name));
@@ -484,11 +484,11 @@ fn normalize_path(path: &str) -> String {
             input = rest;
         } else if let Some(rest) = input.strip_prefix("./") {
             input = rest;
-        } else if let Some(rest) = input.strip_prefix("/./") {
+        } else if input.starts_with("/./") {
             input = &input[2..];
         } else if input == "/." {
             input = "/";
-        } else if let Some(rest) = input.strip_prefix("/../") {
+        } else if input.starts_with("/../") {
             input = &input[3..];
             pop_segment(&mut out);
         } else if input == "/.." {

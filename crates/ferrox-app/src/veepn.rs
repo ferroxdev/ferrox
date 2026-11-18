@@ -8,7 +8,7 @@ use ferrox_core::veepn::{self, BASIC_HEAD};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The plane's cached state: the token as the plane wants it, and one server list per region. The origins a walk reads are not here — they are fixed at boot, so they sit beside the lock rather than behind it.
 #[derive(Debug, Default)]
@@ -598,8 +598,16 @@ fn zone_name() -> String {
 const HEX: &[u8; 16] = b"0123456789abcdef";
 static FALLBACK_ID: AtomicU64 = AtomicU64::new(1);
 
-fn fallback_seed(epoch: u64, pid: u32, sequence: u64) -> u64 {
-    epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (u64::from(pid) << 32) ^ (sequence & 0xffff_ffff)
+fn fallback_seed(nanos: u128, pid: u32, sequence: u64, salt: usize) -> u64 {
+    let mut state = (nanos as u64)
+        ^ ((nanos >> 64) as u64)
+        ^ u64::from(pid).rotate_left(32)
+        ^ sequence.rotate_left(17)
+        ^ (salt as u64).rotate_left(43);
+    state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    state = (state ^ (state >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    state = (state ^ (state >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    state ^ (state >> 31)
 }
 
 /// The id the launch publishes as `udid`: the one configured, or a version-4 drawn for this process so the plane's free pool sees one device rather than one per flow. Written a byte at a time — no formatter runs.
@@ -609,10 +617,14 @@ pub(crate) fn udid(named: &str) -> String {
     }
     let mut raw = [0u8; 16];
     if getrandom::fill(&mut raw).is_err() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
         let mut state = fallback_seed(
-            foxy_account::epoch(),
+            nanos,
             std::process::id(),
             FALLBACK_ID.fetch_add(1, Ordering::Relaxed),
+            std::ptr::addr_of!(FALLBACK_ID) as usize,
         );
         for byte in &mut raw {
             state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -642,8 +654,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallback_seed_keeps_pid_and_counter_in_separate_bits() {
-        assert_ne!(fallback_seed(1, 100, 2), fallback_seed(1, 103, 1));
+    fn fallback_seed_moves_with_the_launch() {
+        assert_ne!(fallback_seed(1, 100, 2, 7), fallback_seed(2, 100, 2, 7));
+        assert_ne!(fallback_seed(1, 100, 2, 7), fallback_seed(1, 100, 2, 8));
     }
 
     fn lane(domains: &[&str]) -> Result<VeepnOut, String> {

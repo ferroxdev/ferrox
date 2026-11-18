@@ -1236,7 +1236,7 @@ fn settings() -> [u8; 6] {
     out
 }
 
-/// The peer's send windows, from its SETTINGS and WINDOW_UPDATE frames: a response waits for room rather than overrunning the default 65,535.
+/// The peer's send windows, from its `SETTINGS` and `WINDOW_UPDATE` frames: a response waits for room rather than overrunning the default 65,535.
 struct Flow {
     connection: i64,
     initial: i64,
@@ -1273,7 +1273,10 @@ impl Flow {
     }
 
     fn settings(&mut self, body: &[u8]) {
-        for entry in body.chunks_exact(6) {
+        let mut at = 0usize;
+        while at + 6 <= body.len() {
+            let entry = &body[at..at + 6];
+            at += 6;
             if u16::from_be_bytes([entry[0], entry[1]]) == h2::S_WINDOW {
                 let value = i64::from(u32::from_be_bytes(entry[2..6].try_into().unwrap()));
                 let change = value - self.initial;

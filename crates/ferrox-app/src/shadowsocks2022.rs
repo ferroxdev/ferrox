@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrox_core::failure::Kind;
 use ferrox_core::shadowsocks2022::{self, Cipher, Method, BLOCK_LEN, MAX_CHUNK, TAG_LEN};
@@ -15,6 +15,7 @@ use crate::shadowsocks::waited;
 
 const READ_CHUNK: usize = 0x4000;
 const SKEW: u64 = 30;
+const UPSTREAM_IDLE: Duration = Duration::from_secs(60);
 const LENGTH_LEN: usize = 2;
 /// Room around one chunk's payload inside the caller's buffer: a sealed length before it and its tag after it, so both seals land beside the payload instead of the payload moving to them.
 const SEAL_HEAD: usize = LENGTH_LEN + TAG_LEN;
@@ -2285,6 +2286,7 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
         return;
     }
     let mut upstreams: HashMap<(SocketAddr, bool), UdpSocket> = HashMap::new();
+    let mut used: HashMap<(SocketAddr, bool), Instant> = HashMap::new();
     let mut users: HashMap<SocketAddr, usize> = HashMap::new();
     let mut sessions: HashMap<SocketAddr, u64> = HashMap::new();
     let mut buf = crate::proxy::udp_buffer();
@@ -2300,14 +2302,30 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
                         reserve_upstream(&mut upstreams, &mut users, &mut sessions, src, dest);
                         users.insert(src, idx);
                         sessions.insert(src, session);
-                        send_upstream(&mut upstreams, src, dest, payload);
+                        send_upstream(
+                            &mut upstreams,
+                            &mut used,
+                            &mut users,
+                            &mut sessions,
+                            src,
+                            dest,
+                            payload,
+                        );
                     }
                 } else if let Some((dest, payload, session)) =
                     datagrams.open(&psk, method, &mut buf[..n])
                 {
                     reserve_upstream(&mut upstreams, &mut users, &mut sessions, src, dest);
                     sessions.insert(src, session);
-                    send_upstream(&mut upstreams, src, dest, payload);
+                    send_upstream(
+                        &mut upstreams,
+                        &mut used,
+                        &mut users,
+                        &mut sessions,
+                        src,
+                        dest,
+                        payload,
+                    );
                 }
             }
             Err(error) if crate::proxy::is_timeout(&error) => {}
@@ -2326,6 +2344,12 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
                 answer_udp(clients, &mut datagrams, &state, &reply[..n], from, *client);
             }
         }
+        let now = Instant::now();
+        upstreams.retain(|key, _| {
+            used.get(key)
+                .is_some_and(|at| now.saturating_duration_since(*at) < UPSTREAM_IDLE)
+        });
+        used.retain(|key, _| upstreams.contains_key(key));
     }
 }
 
@@ -2345,25 +2369,32 @@ fn reserve_upstream(
 
 fn send_upstream(
     upstreams: &mut HashMap<(SocketAddr, bool), UdpSocket>,
+    used: &mut HashMap<(SocketAddr, bool), Instant>,
+    users: &mut HashMap<SocketAddr, usize>,
+    sessions: &mut HashMap<SocketAddr, u64>,
     client: SocketAddr,
     dest: SocketAddr,
     payload: &[u8],
 ) {
-    let ipv6 = dest.is_ipv6();
-    let key = (client, ipv6);
-    if let std::collections::hash_map::Entry::Vacant(entry) = upstreams.entry(key) {
-        let bind = if ipv6 { "[::]:0" } else { "0.0.0.0:0" };
-        let Ok(socket) = UdpSocket::bind(bind) else {
-            return;
-        };
-        if socket.set_nonblocking(true).is_err() {
-            return;
-        }
-        entry.insert(socket);
-    }
+    let key = (client, dest.is_ipv6());
     if let Some(socket) = upstreams.get(&key) {
         let _ = socket.send_to(payload, dest);
+        used.insert(key, Instant::now());
+        return;
     }
+    let bind = if key.1 { "[::]:0" } else { "0.0.0.0:0" };
+    let Ok(socket) = UdpSocket::bind(bind) else {
+        upstreams.clear();
+        users.clear();
+        sessions.clear();
+        return;
+    };
+    if socket.set_nonblocking(true).is_err() {
+        return;
+    }
+    let _ = socket.send_to(payload, dest);
+    upstreams.insert(key, socket);
+    used.insert(key, Instant::now());
 }
 
 struct UdpAnswer<'a> {
