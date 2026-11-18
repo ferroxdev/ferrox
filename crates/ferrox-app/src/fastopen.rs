@@ -1,5 +1,7 @@
-//! TCP Fast Open, where the `ClientHello` rides the SYN instead of following the handshake. A
-//! filter that reads names out of an established stream never sees the one in the SYN.
+//! TCP Fast Open, where the `ClientHello`'s first bytes ride the SYN instead of following the
+//! handshake. A filter that reads names out of an established stream never sees the ones the SYN
+//! carried; how much of the hello fits is the route's MSS and TCP option room, and the rest
+//! follows once the handshake completes.
 //!
 //! `TCP_FASTOPEN_CONNECT` defers the handshake to the first write, and only when the kernel holds
 //! a cookie for the destination: the first connect to a server is an ordinary handshake that asks

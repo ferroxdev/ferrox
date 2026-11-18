@@ -1507,7 +1507,7 @@ fn dial_from(
     source: Option<IpAddr>,
     sockopts: Option<&crate::sockopt::SocketOptions>,
     fast: bool,
-) -> std::io::Result<std::net::TcpStream> {
+) -> std::io::Result<(std::net::TcpStream, bool)> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     let domain = if target.is_ipv4() {
         Domain::IPV4
@@ -1521,11 +1521,9 @@ fn dial_from(
     if let Some(source) = source {
         socket.bind(&SockAddr::from(SocketAddr::new(source, 0)))?;
     }
-    if fast {
-        let _ = crate::fastopen::arm(&socket);
-    }
+    let armed = fast && crate::fastopen::arm(&socket).is_ok();
     crate::conn::connect_bounded(&socket, &SockAddr::from(*target), budgets::dial())?;
-    Ok(std::net::TcpStream::from(socket))
+    Ok((std::net::TcpStream::from(socket), armed))
 }
 
 /// Hand the target to the outbound a `dialerProxy` names over a loopback pipe, then return the
@@ -1756,7 +1754,8 @@ enum Fast {
     Off,
     /// A direct leg that could not ask: the kernel lacks `TCP_FASTOPEN_CONNECT`.
     Absent,
-    /// The kernel held the SYN back: the handshake has not run and the first write starts it.
+    /// The kernel held the SYN back: establishment starts at the first write, whose bytes ride the
+    /// SYN as far as its payload room allows.
     Deferred,
     /// The handshake completed outright: this server sent no cookie, so the record is rewritten.
     Refused,
@@ -1783,11 +1782,15 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
         let mut outcome = Fast::Refused;
         for round in 0..2 {
             match dial_from(target, source, sockopts.as_deref(), true) {
-                Ok(stream) => {
-                    let deferred = crate::fastopen::deferred(&stream);
+                Ok((stream, armed)) => {
+                    let deferred = armed && crate::fastopen::deferred(&stream);
                     kept = Some(stream);
                     if deferred {
                         outcome = Fast::Deferred;
+                        break;
+                    }
+                    if !armed {
+                        outcome = Fast::Absent;
                         break;
                     }
                 }
@@ -1810,7 +1813,8 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
             .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
         (source, sockopts) => Connection::Tcp(
             dial_from(target, source, sockopts.as_deref(), false)
-                .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
+                .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?
+                .0,
         ),
     };
     no_delay(&stream);
