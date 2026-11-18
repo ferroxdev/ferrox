@@ -512,6 +512,8 @@ pub const IPV6_HEADER: usize = 40;
 pub const UDP_HEADER: usize = 8;
 /// The protocol number UDP carries in both versions.
 pub const PROTOCOL_UDP: u8 = 17;
+/// The protocol number TCP carries in both versions.
+const PROTOCOL_TCP: u8 = 6;
 /// The hop limit this lane writes, a reasonable default rather than a value a proxy asks for.
 pub const HOP_LIMIT: u8 = 64;
 /// The largest datagram this lane will build: a UDP length field is sixteen bits, so a longer one cannot be named in a header.
@@ -608,8 +610,13 @@ const BLOCK: usize = 32;
 /// A big-endian word is `high * 256 + low`, so the sum over a whole run is `256 * (even octets) + (odd octets)`: two byte sums and no per-word arithmetic at all. `vpsadbw` is exactly a byte sum — eight octets into one 64-bit lane, sixteen lanes a block — so a block costs one load, one shift that moves the odd octets into lanes a sum can see, two sums and two accumulating adds, and the whole run ends in the one subtraction `256 * all - 255 * odd`. Every term is an exact integer, so no octet is rounded away and the folded number this returns is the definition's own residue: an octet at an odd offset is the high half of its word and nothing else moves. The kernel's unwrapped accumulator is the word sum itself, while an aligned eight-octet lane folds to `hi32 + lo32`, which is congruent to its four words and about twenty-eight thousand times larger, so the fold and not the accumulator is what both sides share — `the_vector_block_sum_is_the_walk_sum` pins the kernel's magnitude against sixteen-bit words and its residue against the walk. Witnessed by `the_word_sum_costs_the_words_it_reads` against `the_serial_word_sum_costs_the_same_answer` over the same buffer, and by `the_parallel_accumulators_hold_the_single_accumulator_word_sum`, `word_sum_is_the_word_at_a_time_sum_at_every_tail` and `the_word_fold_is_the_byte_at_a_time_sum` at every length and tail.
 fn word_sum(bytes: &[u8]) -> u32 {
     // The split is on a block boundary, so the octets the tail reads are at the offsets they held in the whole run.
-    let wide = bytes.len() & !(BLOCK - 1);
-    let acc = block_sum(&bytes[..wide]) + lane_sum(&bytes[wide..]);
+    let (head, tail) = bytes.split_at(bytes.len() & !(BLOCK - 1));
+    // A run shorter than a block is an address or a port pair, where the vector kernel's feature probe and two zeroed accumulators cost more than the words they would read.
+    let acc = if head.is_empty() {
+        lane_sum(tail)
+    } else {
+        block_sum(head) + lane_sum(tail)
+    };
     // Fold the 64-bit residue into a 32-bit one (`2^32` is again congruent to `1`), then drain the carries twice: two steps bound any run past `0xffff` and callers fold once more.
     let mut sum = (acc >> 32) + (acc & 0xffff_ffff);
     sum = (sum >> 16) + (sum & 0xffff);
@@ -771,19 +778,30 @@ pub fn checksum_update(checksum: u16, old: &[u8], new: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-/// The TCP checksum of a segment this lane builds (RFC 793), summed without materialising the twelve-byte pseudo-header: the addresses contribute their word runs, the protocol (6) and the segment length their own words, and the segment — header with its checksum field read as zero plus payload — is summed where it already lies. The same one's-complement sum the materialised pseudo-header and a copy of the whole segment reached, so the bytes on the device are unchanged and the throwaway vector and its copy are gone.
-pub fn tcp_checksum(source: &[u8], destination: &[u8], segment: &[u8]) -> u16 {
-    const TCP_PROTOCOL: u32 = 6;
-    let sum = word_sum(source) + word_sum(destination) + (segment.len() as u32) + TCP_PROTOCOL;
-    let sum = (sum & 0xffff) + (sum >> 16);
-    !fold(sum + word_sum(segment))
+/// The pseudo-header a checksum covers, summed without writing it down and folded once: a one's-complement sum is position-independent, so the addresses contribute their word runs, the length its value (sixteen bits by construction, IPv6's wider field adding an unchanged zero word) and the protocol a lone word whose high half is zero — the same words the materialised header held, so both versions agree with no branch.
+fn pseudo_term(source: &[u8], destination: &[u8], protocol: u8, length: usize) -> u32 {
+    let sum = word_sum(source) + word_sum(destination) + (length as u32) + u32::from(protocol);
+    (sum & 0xffff) + (sum >> 16)
 }
 
-/// The pseudo-header a UDP checksum covers (RFC 768, RFC 8200 §8.1) summed without writing it: a one's-complement sum is position-independent, so the addresses contribute their word runs, the length its value (sixteen bits by construction, IPv6's wider field adding an unchanged zero word) and the protocol a lone word whose high half is zero — the same words the materialised header held, so both versions agree with no branch.
+/// The pseudo-header checksum a GSO frame carries into the kernel: the term above complemented, with the segment left for the kernel to fold its own bytes onto.
+pub fn pseudo_header_checksum(
+    source: &[u8],
+    destination: &[u8],
+    protocol: u8,
+    segment_len: usize,
+) -> u16 {
+    !fold(pseudo_term(source, destination, protocol, segment_len))
+}
+
+/// The TCP checksum of a segment this lane builds (RFC 793), summed without materialising the twelve-byte pseudo-header: the addresses contribute their word runs, the protocol (6) and the segment length their own words, and the segment — header with its checksum field read as zero plus payload — is summed where it already lies. The same one's-complement sum the materialised pseudo-header and a copy of the whole segment reached, so the bytes on the device are unchanged and the throwaway vector and its copy are gone.
+pub fn tcp_checksum(source: &[u8], destination: &[u8], segment: &[u8]) -> u16 {
+    !fold(pseudo_term(source, destination, PROTOCOL_TCP, segment.len()) + word_sum(segment))
+}
+
+/// The UDP pseudo-header length a datagram's checksum covers, which includes the header itself.
 fn pseudo_sum(source: &[u8], destination: &[u8], payload: usize) -> u32 {
-    let length = (UDP_HEADER + payload) as u32;
-    let sum = word_sum(source) + word_sum(destination) + length + u32::from(PROTOCOL_UDP);
-    (sum & 0xffff) + (sum >> 16)
+    pseudo_term(source, destination, PROTOCOL_UDP, UDP_HEADER + payload)
 }
 
 /// The UDP checksum of a datagram this lane builds: header fields, pseudo-header and payload summed with the checksum field read as zero, complemented — and a zero answer is never written, because a receiver reads it as "not computed", so the protocol's illegal value goes instead and verifies at either version.
@@ -966,9 +984,7 @@ pub fn icmp_echo_reply(
 
 /// A checksum over a pseudo-header plus a payload, summed without writing the pseudo-header down.
 fn pseudo_checksum(source: &[u8], destination: &[u8], protocol: u8, payload: &[u8]) -> u16 {
-    let sum = word_sum(source) + word_sum(destination) + payload.len() as u32 + u32::from(protocol);
-    let sum = (sum & 0xffff) + (sum >> 16);
-    !fold(sum + word_sum(payload))
+    !fold(pseudo_term(source, destination, protocol, payload.len()) + word_sum(payload))
 }
 
 /// Whether an incoming datagram's checksum verifies: pseudo-header, the whole UDP header including its checksum field, and payload must sum to all ones; over IPv4 a zero field means "not computed" and is accepted, over IPv6 the field is mandatory and a zero is refused.

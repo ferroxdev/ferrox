@@ -27,8 +27,8 @@ use std::os::unix::net::UnixStream;
 use crate::budgets;
 use crate::conn::Connection;
 use ferrox_core::foxy::connectip::{
-    checksum, icmp_echo_reply, ipv4_checksum, ipv4_head, ipv6_head, tcp_checksum, udp_datagram,
-    udp_head, UdpDatagram, IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP, UDP_HEADER,
+    icmp_echo_reply, ipv4_checksum, ipv4_head, ipv6_head, pseudo_header_checksum, tcp_checksum,
+    udp_datagram, udp_head, UdpDatagram, IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP, UDP_HEADER,
 };
 
 const DEFAULT_MTU: usize = 1500;
@@ -1120,25 +1120,15 @@ fn offload_refused(error: &io::Error) -> bool {
 
 /// The pseudo-header checksum a GSO segment carries into the kernel: the field holds the folded sum before the segment, and the kernel folds the payload onto it.
 fn partial_tcp_checksum(source: IpAddr, destination: IpAddr, tcp_len: usize) -> u16 {
-    let mut pseudo = [0u8; IPV6_HEADER + 8];
-    let len = match (source, destination) {
+    match (source, destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
-            pseudo[..4].copy_from_slice(&source.octets());
-            pseudo[4..8].copy_from_slice(&destination.octets());
-            pseudo[9] = TCP_PROTO;
-            pseudo[10..12].copy_from_slice(&(tcp_len as u16).to_be_bytes());
-            12
+            pseudo_header_checksum(&source.octets(), &destination.octets(), TCP_PROTO, tcp_len)
         }
         (IpAddr::V6(source), IpAddr::V6(destination)) => {
-            pseudo[..16].copy_from_slice(&source.octets());
-            pseudo[16..32].copy_from_slice(&destination.octets());
-            pseudo[32..36].copy_from_slice(&(tcp_len as u32).to_be_bytes());
-            pseudo[39] = TCP_PROTO;
-            40
+            pseudo_header_checksum(&source.octets(), &destination.octets(), TCP_PROTO, tcp_len)
         }
-        _ => return 0,
-    };
-    !checksum(&pseudo[..len])
+        _ => 0,
+    }
 }
 
 fn write_tcp_checksum(source: IpAddr, destination: IpAddr, partial: bool, out: &mut [u8]) {
@@ -3530,6 +3520,62 @@ mod tests {
             build_icmp_reply([10, 0, 0, 1], [10, 0, 0, 2], &request),
             "a reused icmp render is byte-identical to a fresh one"
         );
+    }
+
+    /// The field a GSO frame hands the kernel is the folded pseudo-header sum, at either family: the in-place sum reads only the address runs, so the twelve- and forty-byte headers it replaces must still name the same value.
+    #[test]
+    fn a_gso_frame_carries_the_folded_pseudo_sum() {
+        fn materialised(source: IpAddr, destination: IpAddr, tcp_len: usize) -> u16 {
+            let mut pseudo = [0u8; IPV6_HEADER + 8];
+            let len = match (source, destination) {
+                (IpAddr::V4(source), IpAddr::V4(destination)) => {
+                    pseudo[..4].copy_from_slice(&source.octets());
+                    pseudo[4..8].copy_from_slice(&destination.octets());
+                    pseudo[9] = TCP_PROTO;
+                    pseudo[10..12].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+                    12
+                }
+                (IpAddr::V6(source), IpAddr::V6(destination)) => {
+                    pseudo[..16].copy_from_slice(&source.octets());
+                    pseudo[16..32].copy_from_slice(&destination.octets());
+                    pseudo[32..36].copy_from_slice(&(tcp_len as u32).to_be_bytes());
+                    pseudo[39] = TCP_PROTO;
+                    40
+                }
+                _ => unreachable!("one family"),
+            };
+            !ferrox_core::foxy::connectip::checksum(&pseudo[..len])
+        }
+        let segment = [0x5au8; 64];
+        for (src, dst, head) in [
+            (
+                IpAddr::from([10, 0, 0, 1]),
+                IpAddr::from([10, 0, 0, 2]),
+                IPV4_HEADER,
+            ),
+            (
+                IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]),
+                IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 2]),
+                IPV6_HEADER,
+            ),
+        ] {
+            let mut out = vec![0u8; head + 20 + segment.len()];
+            out[head + 20..].copy_from_slice(&segment);
+            assert!(render_tcp_headers_ip(
+                (src, 443),
+                (dst, 55555),
+                1,
+                2,
+                FLAG_PSH | FLAG_ACK,
+                65535,
+                &[],
+                segment.len(),
+                true,
+                &mut out,
+            ));
+            let field = u16::from_be_bytes([out[head + 16], out[head + 17]]);
+            assert_eq!(field, materialised(src, dst, 20 + segment.len()), "{src}");
+        }
     }
 
     /// One reply packet, built the way the lane builds it.
