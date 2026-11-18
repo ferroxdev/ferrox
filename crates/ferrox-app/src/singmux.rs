@@ -1885,6 +1885,47 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_end_keeps_the_window_until_the_local_side_finishes() {
+        let (client, server) = pair();
+        let client_read = client.try_clone().expect("client read");
+        let client_write = client.try_clone().expect("client write");
+        let stop = client.try_clone().expect("client stop");
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = stop.shutdown(Shutdown::Both);
+        });
+        let session = Client::connect(
+            Protocol::Yamux,
+            false,
+            Box::new(client_read),
+            Box::new(client_write),
+            close,
+        )
+        .expect("client");
+        let target = Destination::Name("example.com".to_owned(), 443);
+        let flow = open_on(&session.session, &target).expect("flow");
+        let id = flow.id;
+        session.session.deliver(id, b"", true);
+        assert!(
+            session
+                .session
+                .sinks
+                .lock()
+                .is_ok_and(|sinks| sinks.contains_key(&id)),
+            "a remote end does not unmap the window before the local send end"
+        );
+        flow.close();
+        assert!(
+            session
+                .session
+                .sinks
+                .lock()
+                .is_ok_and(|sinks| !sinks.contains_key(&id)),
+            "the local end releases the window after both directions finished"
+        );
+        drop(server);
+    }
+
+    #[test]
     fn a_window_hands_back_only_the_credit_it_has() {
         let window = Window::new(1_024);
         assert_eq!(window.take_up_to(16_384), Some(1_024));
