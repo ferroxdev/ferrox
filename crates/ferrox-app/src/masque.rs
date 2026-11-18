@@ -683,9 +683,11 @@ impl MasqueOut {
                     &inner.routes,
                     target,
                     0,
-                    &thread_stop,
-                    None,
-                    preclaimed,
+                    crate::wg_stack::ForwardControl {
+                        stop: Arc::clone(&thread_stop),
+                        ready: None,
+                        preclaimed,
+                    },
                 );
                 if !routed {
                     eprintln!("masque: the UDP relay could not be served");

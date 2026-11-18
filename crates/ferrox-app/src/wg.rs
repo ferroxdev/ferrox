@@ -412,9 +412,11 @@ impl WireGuardOut {
                 &routes,
                 target,
                 WG_HEADER_SIZE,
-                &thread_stop,
-                None,
-                Some(reply_rx),
+                crate::wg_stack::ForwardControl {
+                    stop: thread_stop,
+                    ready: None,
+                    preclaimed: Some(reply_rx),
+                },
             );
         });
         Ok(wg_stack::UdpForwarder::new(local, stop))

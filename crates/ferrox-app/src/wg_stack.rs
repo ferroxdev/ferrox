@@ -2722,11 +2722,17 @@ fn lane_over(associate: Option<&Connection>, quiet: StdInstant) -> bool {
     associate.is_some_and(crate::proxy::peer_left) || quiet.elapsed() >= crate::budgets::udp_idle()
 }
 
+pub(crate) type UdpRouteClaim = (Sender<Vec<u8>>, Receiver<Vec<u8>>);
+
+/// The lifecycle controls of a fixed-target datagram lane.
+pub(crate) struct ForwardControl {
+    pub(crate) stop: Arc<AtomicBool>,
+    pub(crate) ready: Option<Sender<Result<(), String>>>,
+    pub(crate) preclaimed: Option<Receiver<Vec<u8>>>,
+}
+
 /// Claims one relay port for a datagram lane, so a second owner reports the collision before it reads.
-pub(crate) fn claim_udp_route(
-    routes: &UdpRoutes,
-    port: u16,
-) -> Result<(Sender<Vec<u8>>, Receiver<Vec<u8>>), String> {
+pub(crate) fn claim_udp_route(routes: &UdpRoutes, port: u16) -> Result<UdpRouteClaim, String> {
     let (reply_tx, reply_rx) = mpsc::channel();
     let mut table = routes
         .lock()
@@ -2757,9 +2763,8 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
         return false;
     };
     let port = local.port();
-    let (reply_tx, reply_rx) = match claim_udp_route(routes, port) {
-        Ok(claim) => claim,
-        Err(_) => return false,
+    let Ok((reply_tx, reply_rx)) = claim_udp_route(routes, port) else {
+        return false;
     };
     let _ = relay.set_read_timeout(Some(LANE_TICK));
     if let Some(associate) = associate {
@@ -2864,10 +2869,13 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
     routes: &UdpRoutes,
     target: SocketAddr,
     headroom: usize,
-    stop: &Arc<AtomicBool>,
-    ready: Option<Sender<Result<(), String>>>,
-    preclaimed: Option<Receiver<Vec<u8>>>,
+    control: ForwardControl,
 ) -> bool {
+    let ForwardControl {
+        stop,
+        ready,
+        preclaimed,
+    } = control;
     let to_tunnel: ToTunnel = to_tunnel.clone().into();
     let Ok(local) = relay.local_addr() else {
         if let Some(ready) = ready {
@@ -5223,9 +5231,11 @@ mod client_tests {
                 &thread_routes,
                 target,
                 0,
-                &thread_stop,
-                None,
-                None,
+                ForwardControl {
+                    stop: thread_stop,
+                    ready: None,
+                    preclaimed: None,
+                },
             );
         });
         let port = relay_address.port();
