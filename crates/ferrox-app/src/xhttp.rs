@@ -717,10 +717,15 @@ impl Packer {
                     .sum();
                 // The path rides the target and again in the Referer; the target also carries the query and the session/seq meta.
                 let path = normalized_path(&self.settings);
+                let session = if self.settings.session_id_table.is_empty() {
+                    36
+                } else {
+                    self.settings.session_id_length.1.max(36)
+                };
                 let target = path
                     .len()
                     .saturating_add(self.settings.query.len())
-                    .saturating_add(self.settings.session_id_length.1)
+                    .saturating_add(session)
                     .saturating_add(64);
                 let fixed = (4 * 1024usize)
                     .saturating_add(padding)
