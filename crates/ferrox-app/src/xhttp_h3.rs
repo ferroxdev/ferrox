@@ -1,9 +1,9 @@
 // xHTTP over HTTP/3: one QUIC connection carries the same request streams the H2 lane does, so stream-one, stream-up and packet-up keep their shapes and only the framing under them changes.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -78,29 +78,29 @@ impl Wire {
 
 /// What a lane's empty read did: handed the lane back, or slept the transport tick, counted only under `cfg(test)`.
 #[cfg(test)]
-static LANE_GRANTS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(test)]
-static LANE_TICKS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static LANE_GRANTS: Cell<usize> = const { Cell::new(0) };
+    static LANE_TICKS: Cell<usize> = const { Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn lane_grants() -> usize {
-    LANE_GRANTS.load(Ordering::Relaxed)
+    LANE_GRANTS.with(Cell::get)
 }
 
 #[cfg(test)]
 pub(crate) fn lane_ticks() -> usize {
-    LANE_TICKS.load(Ordering::Relaxed)
+    LANE_TICKS.with(Cell::get)
 }
 
 #[cfg(test)]
 fn note_lane_grant() {
-    LANE_GRANTS.fetch_add(1, Ordering::Relaxed);
+    LANE_GRANTS.with(|count| count.set(count.get() + 1));
 }
 
 #[cfg(test)]
 fn note_lane_tick() {
-    LANE_TICKS.fetch_add(1, Ordering::Relaxed);
+    LANE_TICKS.with(|count| count.set(count.get() + 1));
 }
 
 #[cfg(not(test))]
