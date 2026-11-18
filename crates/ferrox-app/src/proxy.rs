@@ -18579,8 +18579,6 @@ fn udp_carried_session<S: Dialed>(
         }
         Carrier::Xhttp { settings } => {
             let (first, up, raw) = session.into_halves()?;
-            let pad = crate::xhttp::referer_pad_value(settings);
-            let headers = &settings.headers;
             if settings.mode == crate::xhttp::XhttpMode::StreamOne {
                 // An ALPN-negotiated h2 session expects the preface; `decideHTTPVersion` (dialer.go:82) takes the negotiated protocol, not the offer.
                 let (reader, writer): (Box<dyn Read + Send>, crate::xhttp::XhttpWriter) = if h2 {
@@ -18594,9 +18592,8 @@ fn udp_carried_session<S: Dialed>(
                     )?;
                     (Box::new(reader), writer)
                 } else {
-                    let head = crate::xhttp::dial_path(settings);
                     let (reader, writer) =
-                        crate::xhttp::connect_split(first, up, host, &head, headers, &pad)?;
+                        crate::xhttp::connect_split_settings(first, up, host, settings)?;
                     (Box::new(reader), writer)
                 };
                 if !writer.send(header) {
@@ -21278,9 +21275,7 @@ fn tls_xhttp<S: Dialed, D: Dialed>(
             .or_else(|| tls_unreachable(server));
     }
     if settings.mode == crate::xhttp::XhttpMode::StreamOne {
-        let head = crate::xhttp::dial_path(settings);
-        let pad = crate::xhttp::referer_pad_value(settings);
-        return crate::xhttp::connect_split(reader, writer, host, &head, &settings.headers, &pad)
+        return crate::xhttp::connect_split_settings(reader, writer, host, settings)
             .map(|(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer))
             .or_else(|| tls_unreachable(server));
     }
@@ -21519,15 +21514,8 @@ fn xhttp_pair(
         return pair.map(|(reader, writer)| (XhttpPairRead::H2(reader), writer));
     }
     if settings.mode == crate::xhttp::XhttpMode::StreamOne {
-        let pad = crate::xhttp::referer_pad_value(settings);
-        return crate::xhttp::connect(
-            uplink,
-            host,
-            &crate::xhttp::dial_path(settings),
-            &settings.headers,
-            &pad,
-        )
-        .map(|(reader, writer)| (XhttpPairRead::H1(reader), writer));
+        return crate::xhttp::connect_settings(uplink, host, settings)
+            .map(|(reader, writer)| (XhttpPairRead::H1(reader), writer));
     }
     let down = dial(&uplink.peer_addr().ok()?).ok()?;
     crate::xhttp::connect_dual(down, uplink, host, settings)

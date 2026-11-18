@@ -2232,12 +2232,16 @@ impl H2Client {
 }
 
 fn request_block(host: &str, settings: &XhttpSettings, scheme: &str) -> Vec<u8> {
-    let path = crate::xhttp::dial_path(settings);
-    let referer = crate::xhttp::referer_value(host, settings);
+    let mut path = crate::xhttp::dial_path(settings);
+    let pad = crate::xhttp::referer_pad_value(settings);
+    crate::xhttp::pad_target(settings, &pad, &mut path);
+    let referer = crate::xhttp::referer_value_with(host, settings, &pad);
     let capacity = 16
         + path.len()
         + host.len()
         + referer.len()
+        + pad.len()
+        + settings.x_padding_key.len()
         + crate::headers::masked_len(&settings.headers, crate::headers::FETCH);
     let mut out = Vec::with_capacity(capacity);
     crate::h2::push_header(&mut out, ":method", "POST");
@@ -2255,6 +2259,24 @@ fn request_block(host: &str, settings: &XhttpSettings, scheme: &str) -> Vec<u8> 
         }
         crate::h2::push_lower(&mut out, name, value);
     });
+    if settings.x_padding_obfs {
+        match settings.x_padding_placement {
+            crate::xhttp::Placement::Header if !settings.x_padding_header.is_empty() => {
+                crate::h2::push_lower(&mut out, &settings.x_padding_header, &pad);
+            }
+            crate::xhttp::Placement::Cookie if !settings.x_padding_key.is_empty() => {
+                let value = format!("{}={pad}", settings.x_padding_key);
+                crate::h2::push_lower(&mut out, "cookie", &value);
+            }
+            crate::xhttp::Placement::QueryInHeader
+                if !settings.x_padding_header.is_empty() && !settings.x_padding_key.is_empty() =>
+            {
+                let value = format!("{}={pad}", settings.x_padding_key);
+                crate::h2::push_lower(&mut out, &settings.x_padding_header, &value);
+            }
+            _ => {}
+        }
+    }
     crate::h2::push_header(&mut out, "referer", &referer);
     crate::h2::push_header(&mut out, "content-type", "application/octet-stream");
     out

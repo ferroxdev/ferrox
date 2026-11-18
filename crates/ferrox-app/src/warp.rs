@@ -525,7 +525,7 @@ impl WarpSpec {
     /// The identity a config names: inline wins, then a saved file, then a new
     /// registration saved into `identityFile`. A saved file is checked against
     /// the API; a refused one is replaced unless `AETHER_REPROVISION=0`.
-    fn identity(&self) -> Result<Identity, String> {
+    fn identity_in(&self, test: bool) -> Result<Identity, String> {
         if let Some(identity) = &self.inline {
             return Ok(identity.clone());
         }
@@ -537,7 +537,7 @@ impl WarpSpec {
                 "warp: `register: true` needs an `identityFile` to save the account".into(),
             );
         };
-        self.identity_at(path, false)
+        self.identity_at_in(path, false, test)
     }
 
     /// The identity files this spec names, in the same shape the register command plans.
@@ -570,17 +570,21 @@ impl WarpSpec {
 
     /// The inner `WireGuard` identity, registered beside the outer one when absent.
     fn gool_identity(&self) -> Result<Identity, String> {
+        self.gool_identity_in(false)
+    }
+
+    fn gool_identity_in(&self, test: bool) -> Result<Identity, String> {
         if let Some(identity) = &self.gool.inline {
             return Ok(identity.clone());
         }
         if let Some(file) = &self.gool.identity_file {
-            return self.identity_at(file, true);
+            return self.identity_at_in(file, true, test);
         }
         let paths = self.key_paths().ok_or_else(|| {
             "warp gool needs `goolIdentityFile`, an inline `goolIdentity`, or an `identityFile`"
                 .to_owned()
         })?;
-        self.identity_at(&self.gool_path(&paths)?, true)
+        self.identity_at_in(&self.gool_path(&paths)?, true, test)
     }
 
     /// The path the inner MASQUE identity is saved to, the sibling Aether uses.
@@ -597,19 +601,26 @@ impl WarpSpec {
 
     /// The inner MASQUE identity, registered beside the outer one when absent.
     fn mim_identity(&self) -> Result<Identity, String> {
+        self.mim_identity_in(false)
+    }
+
+    fn mim_identity_in(&self, test: bool) -> Result<Identity, String> {
         if let Some(identity) = &self.mim.inline {
             return Ok(identity.clone());
         }
-        self.identity_at(&self.mim_path()?, false)
+        self.identity_at_in(&self.mim_path()?, false, test)
     }
 
     /// A saved identity's lifecycle, shared by the outer device and gool's inner one.
-    fn identity_at(&self, path: &Path, inner: bool) -> Result<Identity, String> {
+    fn identity_at_in(&self, path: &Path, inner: bool, test: bool) -> Result<Identity, String> {
         let enroll = !inner && !matches!(self.mode, Mode::WireGuard | Mode::GoolClassic);
         if path.is_file() {
             let saved = match Identity::load(path) {
                 Ok(saved) => saved,
                 Err(error) if error.corrupt() && self.register && reprovision_enabled() => {
+                    if test {
+                        return Err(error.into_message());
+                    }
                     let identity = register(self, enroll)?;
                     quarantine(path);
                     identity.save(path)?;
@@ -617,6 +628,9 @@ impl WarpSpec {
                 }
                 Err(error) => return Err(error.into_message()),
             };
+            if test {
+                return Ok(saved);
+            }
             return match refresh_saved(self, &saved) {
                 Ok(fresh) if fresh != saved => {
                     if let Err(error) = fresh.save(path) {
@@ -638,6 +652,12 @@ impl WarpSpec {
                     Ok(saved)
                 }
             };
+        }
+        if test {
+            return Err(format!(
+                "warp: the identity file `{}` does not exist",
+                path.display()
+            ));
         }
         if !self.register {
             return Err(format!(
@@ -1022,6 +1042,11 @@ where
     })?;
     let bearer = format!("Bearer {}", registered.token);
     let path = format!("/reg/{}", registered.device_id);
+    let discard = || {
+        let headers = registration_headers(Some(&bearer));
+        let headers = borrow_headers(&headers);
+        let _ = call("DELETE", &path, &headers, &[]);
+    };
     let mut masque = None;
 
     if enroll {
@@ -1031,10 +1056,23 @@ where
             .ok_or_else(|| RegisterError::fatal("warp MASQUE key: no public key"))?;
         let headers = registration_headers(Some(&bearer));
         let headers = borrow_headers(&headers);
-        let reply = call("PATCH", &path, &headers, &enrollment_body(&spki)).map_err(|error| {
-            RegisterError::fatal(format!("the WARP key enrollment failed: {}", error.reason))
-        })?;
-        let server = parse_masque_server(&reply)?;
+        let reply = match call("PATCH", &path, &headers, &enrollment_body(&spki)) {
+            Ok(reply) => reply,
+            Err(error) => {
+                discard();
+                return Err(RegisterError::fatal(format!(
+                    "the WARP key enrollment failed: {}",
+                    error.reason
+                )));
+            }
+        };
+        let server = match parse_masque_server(&reply) {
+            Ok(server) => server,
+            Err(error) => {
+                discard();
+                return Err(error);
+            }
+        };
         masque = Some(MasqueIdentity {
             private: key.serialize_der(),
             server,
@@ -1046,17 +1084,19 @@ where
     let headers = borrow_headers(&headers);
     match call("PATCH", &path, &headers, ENABLE_BODY) {
         Err(error) => {
+            discard();
             return Err(RegisterError::fatal(format!(
                 "the WARP enable failed: {}",
                 error.reason
-            )))
+            )));
         }
         Ok(reply) if reply.status / 100 != 2 => {
+            discard();
             return Err(RegisterError::fatal(format!(
                 "the WARP enable answered {}: {}",
                 reply.status,
                 reply_snippet(&reply.body)
-            )))
+            )));
         }
         Ok(_) => {}
     }
@@ -2262,7 +2302,7 @@ fn configured_identity(spec: &WarpSpec, test: bool) -> Result<Option<Identity>, 
     {
         return Ok(None);
     }
-    Ok(Some(spec.identity()?))
+    Ok(Some(spec.identity_in(test)?))
 }
 
 fn resolve_for_mode(
@@ -2271,13 +2311,13 @@ fn resolve_for_mode(
     test: bool,
 ) -> Result<Option<Identity>, String> {
     if spec.mode == Mode::GoolClassic {
-        let mut inner = spec.gool_identity()?;
+        let mut inner = spec.gool_identity_in(test)?;
         if !test {
             resolve_classic_edges(identity, &mut inner, spec)?;
         }
         Ok(Some(inner))
     } else if spec.mode == Mode::Mim {
-        let inner = spec.mim_identity()?;
+        let inner = spec.mim_identity_in(test)?;
         if !test {
             resolve_edges(identity, spec)?;
         }
@@ -3913,10 +3953,15 @@ mod tests {
         let spec = WarpSpec::for_command(Mode::Auto, None, None);
         let wireguard_reply = sample_reply(&b64(&[0x42; 32]));
         let posts = Mutex::new(0usize);
+        let deletes = Mutex::new(0usize);
         let call = |method: &str, _path: &str, _headers: &[(&str, &str)], _body: &[u8]| {
             if method == "POST" {
                 *posts.lock().expect("the post count") += 1;
                 return Ok::<_, RegisterError>(wireguard_reply.clone());
+            }
+            if method == "DELETE" {
+                *deletes.lock().expect("the delete count") += 1;
+                return Ok(wireguard_reply.clone());
             }
             Err::<Reply, _>(RegisterError::retryable("the enrollment leg is down"))
         };
@@ -3928,6 +3973,7 @@ mod tests {
             error.reason
         );
         assert_eq!(*posts.lock().expect("the post count"), 1);
+        assert_eq!(*deletes.lock().expect("the delete count"), 1);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use ferrox_core::foxy::Candidate;
 use std::net::{TcpStream, ToSocketAddrs as _};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 /// An edge that has not answered a handshake by now is not a location to pin a flow to.
@@ -14,23 +14,42 @@ const WORKERS: usize = 16;
 
 /// One reading per edge, in the order given: `None` is an edge that did not answer, which is itself the answer.
 pub(crate) fn readings(edges: &[Candidate]) -> Vec<Option<u64>> {
-    let next = AtomicUsize::new(0);
-    let readings = Mutex::new(vec![None; edges.len()]);
-    std::thread::scope(|scope| {
-        for _ in 0..WORKERS.min(edges.len()) {
-            scope.spawn(|| loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                let Some(edge) = edges.get(index) else {
-                    break;
-                };
-                let reading = probe(&edge.host, edge.port, BUDGET);
-                if let Ok(mut readings) = readings.lock() {
-                    readings[index] = reading;
-                }
-            });
+    let targets: Vec<(usize, Arc<str>, u16)> = edges
+        .iter()
+        .enumerate()
+        .map(|(index, edge)| (index, Arc::clone(&edge.host), edge.port))
+        .collect();
+    let targets = Arc::new(targets);
+    let next = Arc::new(AtomicUsize::new(0));
+    let (sender, receiver) = mpsc::channel();
+    for _ in 0..WORKERS.min(edges.len()) {
+        let sender = sender.clone();
+        let targets = Arc::clone(&targets);
+        let next = Arc::clone(&next);
+        std::thread::spawn(move || loop {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some((index, host, port)) = targets.get(index) else {
+                break;
+            };
+            if sender.send((*index, probe(host, *port, BUDGET))).is_err() {
+                break;
+            }
+        });
+    }
+    drop(sender);
+    let mut readings = vec![None; edges.len()];
+    let deadline = Instant::now() + BUDGET;
+    for _ in 0..edges.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
         }
-    });
-    readings.into_inner().unwrap_or_default()
+        let Ok((index, reading)) = receiver.recv_timeout(left) else {
+            break;
+        };
+        readings[index] = reading;
+    }
+    readings
 }
 
 /// The first address that answers, timed to the handshake; a name that does not resolve is a silence like any other.
