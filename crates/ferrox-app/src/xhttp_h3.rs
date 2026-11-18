@@ -428,31 +428,16 @@ impl H3Reader {
             return Ok(true);
         }
         if self.ended {
-            if self.frame_left > 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "h3 data frame ended early",
-                ));
-            }
-            if self.reset {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    "h3 stream was reset",
-                ));
-            }
-            if !self.expect_request && !self.head_seen {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "h3 response head is missing",
-                ));
-            }
-            return Ok(false);
+            return self.finish();
         }
         if self.frame_left > 0 {
             self.fill_data()?;
             return Ok(self.data_available());
         }
         self.step()?;
+        if self.ended {
+            return self.finish();
+        }
         if self.reset {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
@@ -460,6 +445,29 @@ impl H3Reader {
             ));
         }
         Ok(self.data_available())
+    }
+
+    /// The stream's own end, checked wherever `step` can reach it: a clean EOF still needs a response head.
+    fn finish(&self) -> std::io::Result<bool> {
+        if self.frame_left > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "h3 data frame ended early",
+            ));
+        }
+        if self.reset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "h3 stream was reset",
+            ));
+        }
+        if !self.expect_request && !self.head_seen {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "h3 response head is missing",
+            ));
+        }
+        Ok(false)
     }
 }
 
