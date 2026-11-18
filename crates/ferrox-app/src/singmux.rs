@@ -549,6 +549,11 @@ impl Inner {
 
     fn open(&self, _target: &Destination, expect_status: bool) -> Option<Stream> {
         if self.role != Role::Client || self.dead() {
+            crate::proxy::echo_trace(&format!(
+                "singmux open refused role {:?} dead {}",
+                self.role,
+                self.dead()
+            ));
             return None;
         }
         let id = match self.protocol {
@@ -568,6 +573,10 @@ impl Inner {
             Protocol::H2Mux => self.write_headers(id, true),
         };
         if !opened {
+            crate::proxy::echo_trace(&format!(
+                "singmux open write failed id {id} protocol {:?}",
+                self.protocol
+            ));
             self.release(id);
             return None;
         }
@@ -765,6 +774,7 @@ impl Inner {
                 .as_ref()
                 .is_some_and(|sender| sender.try_send(id).is_err());
             if failed {
+                crate::proxy::echo_trace(&format!("singmux reset queue failed id {id}"));
                 drop(resets);
                 self.finish();
             }
@@ -906,6 +916,10 @@ impl Inner {
                 }
             }
             Push::Full | Push::Closed => {
+                crate::proxy::echo_trace(&format!(
+                    "singmux deliver overflow id {id} protocol {:?}",
+                    self.protocol
+                ));
                 self.release(id);
                 self.defer_reset(id);
             }
@@ -973,6 +987,10 @@ impl Inner {
         if self.dead.swap(true, Ordering::Relaxed) {
             return;
         }
+        crate::proxy::echo_trace(&format!(
+            "singmux finish role {:?} protocol {:?}",
+            self.role, self.protocol
+        ));
         match self.resets.lock() {
             Ok(mut resets) => drop(resets.take()),
             Err(poisoned) => drop(poisoned.into_inner().take()),
@@ -1323,15 +1341,32 @@ pub(crate) struct Stream {
 impl Stream {
     pub(crate) fn send(&self, data: &[u8]) -> bool {
         if self.closed.load(Ordering::Relaxed) {
+            crate::proxy::echo_trace(&format!(
+                "singmux send closed id {} protocol {:?}",
+                self.id, self.inner.protocol
+            ));
             return false;
         }
         if !self.request_sent.swap(true, Ordering::Relaxed)
             && !self.request.is_empty()
             && !self.write_windowed(&self.request)
         {
+            crate::proxy::echo_trace(&format!(
+                "singmux request failed id {} protocol {:?}",
+                self.id, self.inner.protocol
+            ));
             return false;
         }
-        self.write_windowed(data)
+        let sent = self.write_windowed(data);
+        if !sent {
+            crate::proxy::echo_trace(&format!(
+                "singmux send failed id {} len {} protocol {:?}",
+                self.id,
+                data.len(),
+                self.inner.protocol
+            ));
+        }
+        sent
     }
 
     fn write_windowed(&self, data: &[u8]) -> bool {
@@ -1343,13 +1378,27 @@ impl Stream {
                 Protocol::Yamux | Protocol::H2Mux => left.min(H2_DATA_MAX),
             };
             let Some(taken) = self.inner.take_window(&self.window, chunk, &self.closed) else {
+                crate::proxy::echo_trace(&format!(
+                    "singmux take window none id {} protocol {:?} closed {}",
+                    self.id,
+                    self.inner.protocol,
+                    self.closed.load(Ordering::Relaxed)
+                ));
                 return false;
             };
             if self.closed.load(Ordering::Relaxed) {
+                crate::proxy::echo_trace(&format!(
+                    "singmux closed after credit id {} protocol {:?}",
+                    self.id, self.inner.protocol
+                ));
                 self.inner.refund_window(&self.window, taken);
                 return false;
             }
             if !self.write_chunk(&data[offset..offset + taken]) {
+                crate::proxy::echo_trace(&format!(
+                    "singmux chunk failed id {} len {} protocol {:?}",
+                    self.id, taken, self.inner.protocol
+                ));
                 self.inner.refund_window(&self.window, taken);
                 return false;
             }
