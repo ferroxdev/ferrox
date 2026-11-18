@@ -433,7 +433,7 @@ impl Api {
         }
         let mut decoder = h2::Decoder::default();
         let mut calls: HashMap<u32, Call> = HashMap::new();
-        let mut scratch: HashMap<u32, Vec<u8>> = HashMap::new();
+        let mut discard: Option<(u32, Vec<u8>)> = None;
         let mut responses: HashMap<u32, Response> = HashMap::new();
         let mut flow = Flow::new();
         let mut last_id = 0u32;
@@ -497,7 +497,9 @@ impl Api {
                             goaway(&mut stream, h2::E_PROTOCOL, last_id);
                             return;
                         }
-                        reset(&mut stream, id, h2::E_PROTOCOL);
+                        if !reset(&mut stream, id, h2::E_PROTOCOL) {
+                            return;
+                        }
                         calls.remove(&id);
                         flow.close(id);
                     }
@@ -508,11 +510,15 @@ impl Api {
                     }
                 }
                 h2::T_HEADERS => {
+                    if discard.is_some() {
+                        goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                        return;
+                    }
                     let block = header_body(&body, flags);
                     if responses.contains_key(&id) {
                         if !absorb_headers(
                             &mut decoder,
-                            &mut scratch,
+                            &mut discard,
                             id,
                             block,
                             flags & h2::F_END_HEADERS != 0,
@@ -525,7 +531,7 @@ impl Api {
                     if flow.cancelled(id) {
                         if !absorb_headers(
                             &mut decoder,
-                            &mut scratch,
+                            &mut discard,
                             id,
                             block,
                             flags & h2::F_END_HEADERS != 0,
@@ -536,7 +542,6 @@ impl Api {
                         continue;
                     }
                     flow.open(id);
-                    let block = header_body(&body, flags);
                     if calls.len() + responses.len() >= API_CALLS && !calls.contains_key(&id) {
                         goaway(&mut stream, h2::E_REFUSED, last_id);
                         return;
@@ -568,10 +573,23 @@ impl Api {
                     }
                 }
                 h2::T_CONT => {
+                    if discard.is_some() {
+                        if !absorb_headers(
+                            &mut decoder,
+                            &mut discard,
+                            id,
+                            &body,
+                            flags & h2::F_END_HEADERS != 0,
+                        ) {
+                            goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                            return;
+                        }
+                        continue;
+                    }
                     if flow.cancelled(id) {
                         if !absorb_headers(
                             &mut decoder,
-                            &mut scratch,
+                            &mut discard,
                             id,
                             &body,
                             flags & h2::F_END_HEADERS != 0,
@@ -671,10 +689,22 @@ impl Api {
                 framed.extend_from_slice(&answer);
                 let buffered: usize = responses
                     .values()
-                    .map(|response| response.framed.len() - response.at)
+                    .map(|response| response.framed.capacity())
                     .sum();
-                if buffered.saturating_add(framed.len()) > API_HELD {
-                    reset(stream, id, h2::E_REFUSED);
+                if buffered.saturating_add(framed.capacity()) > API_HELD {
+                    let trailers = h2::block_encode(&[
+                        ("grpc-status", "8"),
+                        ("grpc-message", "response budget exhausted"),
+                    ]);
+                    if !h2::write_frame(
+                        stream,
+                        h2::T_HEADERS,
+                        h2::F_END_HEADERS | h2::F_END,
+                        id,
+                        &trailers,
+                    ) {
+                        return false;
+                    }
                     flow.close(id);
                     return true;
                 }
@@ -1499,8 +1529,8 @@ fn flush_response(
     true
 }
 
-fn reset(stream: &mut Connection, id: u32, code: u32) {
-    let _ = h2::write_frame(stream, h2::T_RST, 0, id, &code.to_be_bytes());
+fn reset(stream: &mut Connection, id: u32, code: u32) -> bool {
+    h2::write_frame(stream, h2::T_RST, 0, id, &code.to_be_bytes())
 }
 
 /// Refuse a peer that exceeded a bound: the GOAWAY names the reason before the connection closes.
@@ -1526,25 +1556,28 @@ fn window_update(stream: &mut Connection, id: u32, increment: usize) -> bool {
 /// indexed field on a later stream still resolves: a closed stream still carries compression state.
 fn absorb_headers(
     decoder: &mut h2::Decoder,
-    scratch: &mut HashMap<u32, Vec<u8>>,
+    discard: &mut Option<(u32, Vec<u8>)>,
     id: u32,
     block: &[u8],
     end: bool,
 ) -> bool {
-    if !end {
-        let held = scratch.get(&id).map_or(0, Vec::len);
-        if held + block.len() > h2::HEAD_CAP {
+    if end && discard.is_none() {
+        if block.len() > h2::HEAD_CAP {
             return false;
         }
-        scratch.entry(id).or_default().extend_from_slice(block);
+        let _ = decoder.decode(block, &mut |_, _| {});
         return true;
     }
-    let mut held = scratch.remove(&id).unwrap_or_default();
-    if held.len() + block.len() > h2::HEAD_CAP {
+    let (held_id, mut held) = discard.take().unwrap_or_else(|| (id, Vec::new()));
+    if held_id != id || held.len() + block.len() > h2::HEAD_CAP {
         return false;
     }
     held.extend_from_slice(block);
-    let _ = decoder.decode(&held, &mut |_, _| {});
+    if end {
+        let _ = decoder.decode(&held, &mut |_, _| {});
+    } else {
+        *discard = Some((id, held));
+    }
     true
 }
 

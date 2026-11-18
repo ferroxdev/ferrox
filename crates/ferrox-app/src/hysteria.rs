@@ -1603,6 +1603,7 @@ fn serve_masquerade_stream(
         let Ok(mut conn) = shared.lock() else {
             return;
         };
+        let _ = conn.stream_shutdown(stream, quiche::Shutdown::Read, 0);
         let _ = conn.stream_shutdown(stream, quiche::Shutdown::Write, 0);
         crate::quic::flush_egress(&mut conn, sock);
         return;

@@ -1746,6 +1746,17 @@ impl Datagrams {
             if body.len() < 11 + pad {
                 return None;
             }
+            if !self
+                .sessions
+                .get(&session)
+                .is_none_or(|entry| entry.window.check(packet_id))
+            {
+                return None;
+            }
+            let (target, used) = parse_addr_header(&body[11 + pad..])?;
+            if body.len() < 11 + pad + used {
+                return None;
+            }
             let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
                 window: shadowsocks2022::SlidingWindow::new(),
                 cipher: None,
@@ -1754,13 +1765,7 @@ impl Datagrams {
                 server_packet: 0,
                 server_cipher: None,
             });
-            if !entry.window.check_and_add(packet_id) {
-                return None;
-            }
-            let (target, used) = parse_addr_header(&body[11 + pad..])?;
-            if body.len() < 11 + pad + used {
-                return None;
-            }
+            entry.window.add(packet_id);
             Some((
                 target,
                 &packet[24 + 16 + 11 + pad + used..24 + len],
@@ -2262,8 +2267,11 @@ pub(crate) fn serve_udp_relay(
         let mut drained = 0usize;
         let sockets = [Some(&upstream), upstream6.as_ref()];
         let start = rotate % sockets.len();
-        for socket in sockets.iter().cycle().skip(start).take(sockets.len()) {
-            let Some(socket) = *socket else {
+        let mut index = start;
+        while drained < TURN_DRAIN && index < start + sockets.len() {
+            let socket = sockets[index % sockets.len()];
+            index += 1;
+            let Some(socket) = socket else {
                 continue;
             };
             for _ in 0..DRAIN_PER_TURN {
@@ -2287,7 +2295,7 @@ pub(crate) fn serve_udp_relay(
                 }
             }
         }
-        rotate = rotate.wrapping_add(1);
+        rotate = index % sockets.len();
     }
 }
 
@@ -2321,6 +2329,7 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
     let mut reply = crate::proxy::udp_buffer();
     let mut datagrams = Datagrams::new();
     let mut order: Vec<(u64, bool)> = Vec::new();
+    let mut seen: HashSet<(u64, bool)> = HashSet::new();
     let mut rotate = 0usize;
     loop {
         match clients.recv_from(&mut buf) {
@@ -2346,14 +2355,16 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
         let mut drained = 0usize;
         order.clear();
         order.extend(upstreams.keys().copied());
-        let start = if order.is_empty() {
-            0
-        } else {
-            rotate % order.len()
-        };
-        for key in order[start..].iter().chain(order[..start].iter()) {
+        let len = order.len();
+        let start = if len == 0 { 0 } else { rotate % len };
+        seen.clear();
+        let mut index = start;
+        while drained < TURN_DRAIN && index < start + len {
+            let key = order[index % len];
+            index += 1;
+            seen.insert(key);
             let session = key.0;
-            let socket = &upstreams[key];
+            let socket = &upstreams[&key];
             for _ in 0..DRAIN_PER_TURN {
                 if drained >= TURN_DRAIN {
                     break;
@@ -2383,11 +2394,13 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
                 );
             }
         }
-        rotate = rotate.wrapping_add(1);
+        rotate = if len == 0 { 0 } else { index % len };
         let now = Instant::now();
         upstreams.retain(|key, _| {
-            used.get(key)
-                .is_some_and(|at| now.saturating_duration_since(*at) < UPSTREAM_IDLE)
+            seen.contains(key)
+                || used
+                    .get(key)
+                    .is_some_and(|at| now.saturating_duration_since(*at) < UPSTREAM_IDLE)
         });
         used.retain(|key, _| upstreams.contains_key(key));
         let live: HashSet<u64> = upstreams.keys().map(|(session, _)| *session).collect();
