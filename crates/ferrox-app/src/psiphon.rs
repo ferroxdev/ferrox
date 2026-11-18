@@ -8455,10 +8455,7 @@ fn push_scan_candidates(
             return;
         }
         emitted += 1;
-        number = next.max(number.saturating_add(1));
-        if number >= count {
-            number = 0;
-        }
+        number = next.max(number.saturating_add(1)) % count;
     }
 }
 
@@ -8499,10 +8496,7 @@ fn push_scan_builtin_candidates(
                 return;
             }
             emitted += 1;
-            number = next.max(number.saturating_add(1));
-            if number >= total {
-                number = 0;
-            }
+            number = next.max(number.saturating_add(1)) % total;
         }
     }
 }
