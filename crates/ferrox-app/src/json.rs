@@ -519,7 +519,12 @@ pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
             while next < out.len() && out[next].is_ascii_whitespace() {
                 next += 1;
             }
-            if matches!(out.get(next), Some(b'}' | b']')) {
+            let mut before = at;
+            while before > 0 && out[before - 1].is_ascii_whitespace() {
+                before -= 1;
+            }
+            let complete = before > 0 && !matches!(out[before - 1], b'[' | b'{' | b',' | b':');
+            if complete && matches!(out.get(next), Some(b'}' | b']')) {
                 at += 1;
                 trimmed = true;
                 continue;
@@ -1035,6 +1040,9 @@ mod tests {
     #[test]
     fn a_trailing_comma_without_a_comment_still_goes() {
         assert_eq!(strip_jsonc(r#"{"a":[1,2,],}"#), r#"{"a":[1,2]}"#);
+        assert_eq!(strip_jsonc(r#"{"a":[,]}"#), r#"{"a":[,]}"#);
+        assert_eq!(strip_jsonc(r#"{"a":[1,,]}"#), r#"{"a":[1,,]}"#);
+        assert_eq!(strip_jsonc(r#"{"a":{}}"#), r#"{"a":{}}"#);
         let quoted = r#"{"a":",}"}"#;
         assert_eq!(strip_jsonc(quoted), quoted);
     }

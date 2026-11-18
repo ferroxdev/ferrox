@@ -683,6 +683,10 @@ impl WorkerState {
         self.state.load(Ordering::Relaxed) == ACTIVE && !self.closed.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn draining(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == DRAIN && !self.closed.load(Ordering::Relaxed)
+    }
+
     /// A worker the portal stopped heartbeating carries no flow the monitor can route, and its
     /// tunnel may be half-open, so the monitor closes it instead of keeping it forever.
     pub(crate) fn stale(&self, after: Duration) -> bool {
@@ -723,7 +727,11 @@ where
         loop {
             workers.retain(|worker| {
                 let state = &worker.state;
-                let live = !state.stale(WORKER_IDLE) && (state.active() || state.connections() > 0);
+                let live = if state.draining() {
+                    state.connections() > 0
+                } else {
+                    !state.stale(WORKER_IDLE) && (state.active() || state.connections() > 0)
+                };
                 if !live {
                     worker.tunnel.close();
                 }

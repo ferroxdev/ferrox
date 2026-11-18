@@ -2308,10 +2308,10 @@ fn split_permission(path: &std::path::Path) -> (&std::path::Path, Option<u32>) {
 /// socket is replaced and a file that is not a socket is refused, so a typo cannot delete data; a
 /// requested mode is applied inside a private staging directory beside the socket and then
 /// hard-linked into place, so nothing but our own socket ever takes the permission — or, when the
-/// directory leaves no room for a staged name, to the path itself.
+/// directory leaves no room for a staged name, to the bound socket after a no-follow check.
 #[cfg(unix)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
-    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some((name, padded)) = abstract_name(path) {
         return abstract_listener(name, padded);
@@ -2340,34 +2340,70 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
     let listener = UnixListener::bind(path)?;
     let bound = std::fs::symlink_metadata(path)?;
     if !bound.file_type().is_socket() {
-        let _ = std::fs::remove_file(path);
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             "a unix listen path names a file that is not a socket",
         ));
     }
-    let applied =
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).and_then(|()| {
-            let after = std::fs::symlink_metadata(path)?;
-            if (after.dev(), after.ino()) != (bound.dev(), bound.ino()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    "the unix listen path was replaced before its mode applied",
-                ));
-            }
-            if after.mode() & 0o7777 != mode & 0o7777 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "the unix listen path did not take its mode",
-                ));
-            }
-            Ok(())
-        });
-    if let Err(error) = applied {
-        let _ = std::fs::remove_file(path);
-        return Err(error);
-    }
+    apply_socket_mode(&listener, path, mode, (bound.dev(), bound.ino()))?;
     Ok(listener)
+}
+
+/// Apply the mode to the socket inode itself, then re-check that the path still names it.
+#[cfg(unix)]
+fn apply_socket_mode(
+    _listener: &UnixListener,
+    path: &std::path::Path,
+    mode: u32,
+    bound: (u64, u64),
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let applied = {
+        use std::os::unix::ffi::OsStrExt as _;
+        let text = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the unix path has a NUL"))?;
+        // SAFETY: `text` is a live NUL-terminated path and the flag asks the kernel not to follow a replacement.
+        let rc = unsafe {
+            libc::fchmodat(
+                libc::AT_FDCWD,
+                text.as_ptr(),
+                mode as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let applied = {
+        use std::os::unix::io::AsRawFd as _;
+        // SAFETY: the listener owns a live descriptor and `mode` is a file-mode bit set.
+        let rc = unsafe { libc::fchmod(_listener.as_raw_fd(), mode as libc::mode_t) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+    applied?;
+    let after = std::fs::symlink_metadata(path)?;
+    if (after.dev(), after.ino()) != bound {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "the unix listen path was replaced before its mode applied",
+        ));
+    }
+    if after.mode() & 0o7777 != mode & 0o7777 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the unix listen path did not take its mode",
+        ));
+    }
+    Ok(())
 }
 
 /// Remove the socket the initial check saw, only while the same inode is still at the path, so two
@@ -2446,13 +2482,8 @@ fn staged_name(path: &std::path::Path) -> std::path::PathBuf {
 
 #[cfg(windows)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
-    use std::os::windows::fs::MetadataExt as _;
-    let is_socket = |meta: &std::fs::Metadata| {
-        let kind = meta.file_type();
-        meta.file_attributes() & 0x400 != 0 && !kind.is_symlink() && !kind.is_dir()
-    };
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if !is_socket(&meta) => {
+        Ok(_) if !is_unix_socket(path)? => {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "a unix listen path names a file that is not a socket",
@@ -2464,6 +2495,53 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
     }
     let listener = UnixListener::bind(path)?;
     Ok(listener)
+}
+
+#[cfg(windows)]
+fn is_unix_socket(path: &std::path::Path) -> io::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_SHARE_ALL: u32 = 0x7;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
+    #[repr(C)]
+    struct AttributeTag {
+        _attributes: u32,
+        tag: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandleEx(
+            handle: *mut core::ffi::c_void,
+            class: i32,
+            info: *mut core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let mut info = AttributeTag {
+        _attributes: 0,
+        tag: 0,
+    };
+    // SAFETY: the handle is live, `info` is writable and its size is the class's structure.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            9,
+            (&raw mut info).cast(),
+            std::mem::size_of::<AttributeTag>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.tag == IO_REPARSE_TAG_AF_UNIX)
 }
 
 /// One nonblocking `connect` waited out with `poll`, so a full backlog costs the budget and not the

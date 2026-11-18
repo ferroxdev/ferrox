@@ -43,6 +43,7 @@ pub(crate) struct Flow {
     id: u16,
     replies: Option<Receiver<Msg>>,
     closed: Arc<std::sync::atomic::AtomicBool>,
+    ended: std::sync::atomic::AtomicBool,
 }
 
 impl Flow {
@@ -61,7 +62,7 @@ impl Flow {
     }
 
     pub(crate) fn end_upload(&self) {
-        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.ended.swap(true, std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         self.carrier
@@ -211,6 +212,7 @@ impl Writer {
 struct Table {
     ids: mux::Ids,
     sinks: HashMap<u16, Sink>,
+    pending: std::collections::HashSet<u16>,
     full: bool,
     last_active: Instant,
 }
@@ -245,6 +247,7 @@ impl Carrier {
             table: Mutex::new(Table {
                 ids: mux::Ids::new(0),
                 sinks: HashMap::new(),
+                pending: std::collections::HashSet::new(),
                 full: false,
                 last_active: Instant::now(),
             }),
@@ -317,7 +320,9 @@ impl Carrier {
             let Ok(mut table) = self.table.lock() else {
                 return;
             };
-            if table.sinks.remove(&id).is_none() {
+            let sink = table.sinks.remove(&id).is_some();
+            let pending = table.pending.remove(&id);
+            if !sink && !pending {
                 return;
             }
             table.ids.give_back();
@@ -329,6 +334,15 @@ impl Carrier {
         }
     }
 
+    fn drop_sink(&self, id: u16) {
+        let Ok(mut table) = self.table.lock() else {
+            return;
+        };
+        if table.sinks.remove(&id).is_some() {
+            table.pending.insert(id);
+        }
+    }
+
     fn begin_idle_retire(&self) -> Option<bool> {
         let table = match self.table.lock() {
             Ok(table) => table,
@@ -337,7 +351,10 @@ impl Carrier {
         if self.dead() {
             return Some(false);
         }
-        if !table.sinks.is_empty() || table.last_active.elapsed() < self.idle {
+        if !table.sinks.is_empty()
+            || !table.pending.is_empty()
+            || table.last_active.elapsed() < self.idle
+        {
             return None;
         }
         Some(!self.dead.swap(true, std::sync::atomic::Ordering::Relaxed))
@@ -432,8 +449,7 @@ impl Carrier {
                     Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
                 ) {
                     closed.store(true, std::sync::atomic::Ordering::Relaxed);
-                    self.frame(frame.id, mux::Status::End, 0, None, None, &[]);
-                    self.release(frame.id);
+                    self.drop_sink(frame.id);
                 }
             }
             Sink::Udp(deliver, ended) => {
@@ -625,6 +641,7 @@ impl Manager {
             id,
             replies: Some(replies),
             closed,
+            ended: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

@@ -1129,9 +1129,18 @@ fn resolve_location(base: &str, location: &str) -> Result<String, String> {
         return Ok(format!("https://{rest}"));
     }
     let url = HttpUrl::parse(base)?;
-    if location.starts_with(['?', '#']) {
-        let path = url.path.split('?').next().unwrap_or("/");
+    let (path, query) = match url.path.split_once('?') {
+        Some((path, query)) => (path, format!("?{query}")),
+        None => (url.path.as_str(), String::new()),
+    };
+    if location.starts_with('?') {
         return Ok(format!("https://{}{}{}", url.authority, path, location));
+    }
+    if location.starts_with('#') {
+        return Ok(format!(
+            "https://{}{}{}{}",
+            url.authority, path, query, location
+        ));
     }
     let path = if location.starts_with('/') {
         location.to_owned()
@@ -1528,6 +1537,14 @@ mod tests {
         assert_eq!(
             resolve_location("https://example.test/a?old=1", "?new=2").expect("joined"),
             "https://example.test/a?new=2"
+        );
+        assert_eq!(
+            resolve_location("https://example.test/a?old=1", "#part").expect("joined"),
+            "https://example.test/a?old=1#part"
+        );
+        assert_eq!(
+            resolve_location("https://example.test/a", "#part").expect("joined"),
+            "https://example.test/a#part"
         );
     }
 

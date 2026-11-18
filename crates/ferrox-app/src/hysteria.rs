@@ -2651,11 +2651,23 @@ impl Router<'_> {
                 };
                 let thread_shared = Arc::clone(&shared);
                 let thread_sock = Arc::clone(sock);
-                let thread_serve = (inbound.standing != Standing::Cover).then(|| Arc::clone(serve));
+                let cover = inbound.standing == Standing::Cover;
+                let thread_serve = (!cover).then(|| Arc::clone(serve));
+                let slot = if cover {
+                    let Some(slot) = CoverSlot::acquire() else {
+                        let _ = conn.close(false, 0, b"refused");
+                        crate::quic::flush_egress(&mut conn, sock);
+                        return true;
+                    };
+                    Some(slot)
+                } else {
+                    None
+                };
                 let thread_masq = Arc::clone(masq);
                 let local = *local;
                 let peer = from;
                 std::thread::spawn(move || {
+                    let _slot = slot;
                     serve_stream(
                         &thread_shared,
                         &thread_sock,

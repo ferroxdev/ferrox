@@ -392,6 +392,8 @@ struct Sink {
     queue: Arc<Queue>,
     window: Arc<Window>,
     awaiting_status: bool,
+    remote_end: bool,
+    local_end: bool,
 }
 
 pub(crate) struct Replies {
@@ -552,6 +554,8 @@ impl Inner {
                 queue: Arc::clone(&queue),
                 window: Arc::clone(&window),
                 awaiting_status: false,
+                remote_end: false,
+                local_end: false,
             },
         );
         drop(sinks);
@@ -707,6 +711,38 @@ impl Inner {
         };
     }
 
+    fn end_remote(&self, id: u32) {
+        let done = {
+            let Ok(mut sinks) = self.sinks.lock() else {
+                return;
+            };
+            let Some(sink) = sinks.get_mut(&id) else {
+                return;
+            };
+            sink.remote_end = true;
+            sink.local_end
+        };
+        if done {
+            self.reap(id);
+        }
+    }
+
+    fn end_local(&self, id: u32) {
+        let done = {
+            let Ok(mut sinks) = self.sinks.lock() else {
+                return;
+            };
+            let Some(sink) = sinks.get_mut(&id) else {
+                return;
+            };
+            sink.local_end = true;
+            sink.remote_end
+        };
+        if done {
+            self.reap(id);
+        }
+    }
+
     fn deliver(&self, id: u32, data: &[u8], end: bool) {
         self.deliver_credit(id, data, end, data.len());
     }
@@ -757,7 +793,7 @@ impl Inner {
         });
         if end {
             queue.close();
-            self.reap(id);
+            self.end_remote(id);
         } else if !queued {
             self.reap(id);
         }
@@ -1224,6 +1260,7 @@ impl Stream {
             self.inner.send_end(self.id);
         }
         self.window.close();
+        self.inner.end_local(self.id);
     }
 
     pub(crate) fn reset(&self) {
@@ -1314,6 +1351,7 @@ impl StreamWriter {
             self.inner.send_end(self.id);
         }
         self.window.close();
+        self.inner.end_local(self.id);
     }
 }
 

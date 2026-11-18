@@ -598,9 +598,6 @@ impl SizeAead {
     }
     /// The wire's 18 bytes open to the frame's total: the two plain octets are sealed here (`AEADChunkSizeParser::Decode`) and the overhead is added back.
     fn unseal_len(&mut self, sealed: &mut [u8; SIZE_FIELD]) -> Option<u16> {
-        if self.counter == u16::MAX {
-            return None;
-        }
         let (size, tag) = sealed.split_at_mut(HEADER_LEN);
         let tag: [u8; TAG_LEN] = <[u8; TAG_LEN]>::try_from(tag).ok()?;
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
@@ -621,9 +618,6 @@ impl SizeAead {
     }
     /// The wire's 18 bytes seal the frame's body total less the tag, the shape the reference's encoder writes (`AEADChunkSizeParser::Encode`) and its nonce steps beside the body's.
     fn seal_len(&mut self, total: u16, sealed: &mut [u8; SIZE_FIELD]) -> bool {
-        if self.counter == u16::MAX {
-            return false;
-        }
         let mut plain = total.wrapping_sub(TAG_LEN as u16).to_be_bytes();
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         let nonce = &self.nonce;
@@ -718,9 +712,6 @@ impl Flow {
         &self.nonce
     }
     fn seal_onto(&mut self, plain: &[u8], out: &mut Vec<u8>) -> bool {
-        if !matches!(self.aead, Aead::Plain) && self.counter == u16::MAX {
-            return false;
-        }
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         let nonce = &self.nonce;
         match &self.aead {
@@ -755,9 +746,6 @@ impl Flow {
         true
     }
     fn open_chunk(&mut self, chunk: &mut [u8]) -> Option<usize> {
-        if !matches!(self.aead, Aead::Plain) && self.counter == u16::MAX {
-            return None;
-        }
         let plain_len = match &self.aead {
             Aead::Aes(aes) => {
                 if chunk.len() < TAG_LEN {
@@ -4609,8 +4597,8 @@ mod tests {
     }
 
     #[test]
-    fn counter_exhaustion_refuses_before_the_nonce_repeats() {
-        for cipher in [Cipher::Chacha, Cipher::Aes] {
+    fn counter_wrap_matches_the_reference() {
+        for cipher in [Cipher::Chacha, Cipher::Aes, Cipher::None] {
             let mut send = Flow::fresh(
                 cipher,
                 &[0x55u8; 16],
@@ -4627,22 +4615,19 @@ mod tests {
                 &[0x66u8; 16],
             )
             .expect("fresh");
-            send.counter = u16::MAX - 1;
-            recv.counter = u16::MAX - 1;
+            send.counter = u16::MAX;
+            recv.counter = u16::MAX;
             let mut sealed = Vec::new();
             assert!(send.seal_onto(b"ping", &mut sealed));
             let back = recv.open_chunk(&mut sealed).expect("opens");
             assert_eq!(&sealed[..back], b"ping");
-            assert_eq!(send.counter, u16::MAX);
-            assert_eq!(recv.counter, u16::MAX);
-            let mut refused = Vec::new();
-            assert!(!send.seal_onto(b"pong", &mut refused));
-            assert_eq!(refused, [] as [u8; 0]);
-            assert_eq!(send.counter, u16::MAX);
+            assert_eq!(send.counter, 0);
+            assert_eq!(recv.counter, 0);
             let mut field = [0u8; SIZE_FIELD];
             if let Some(sizes) = send.len_seal.as_mut() {
                 sizes.counter = u16::MAX;
-                assert!(!sizes.seal_len(32, &mut field));
+                assert!(sizes.seal_len(32, &mut field));
+                assert_eq!(sizes.counter, 0);
             }
         }
     }
