@@ -704,6 +704,7 @@ impl Manager {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+    use std::sync::mpsc::{channel, Sender};
 
     fn target() -> mux::Target<'static> {
         mux::Target {
