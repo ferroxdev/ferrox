@@ -1794,12 +1794,19 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
                         break;
                     }
                 }
-                Err(error) => {
-                    if round == 0 {
-                        return Err(Failure::new(Stage::SocketConnected, Kind::of(&error)));
+                Err(error) if round == 0 => {
+                    match dial_from(target, source, sockopts.as_deref(), false) {
+                        Ok((stream, _)) => {
+                            kept = Some(stream);
+                            outcome = Fast::Absent;
+                            break;
+                        }
+                        Err(plain) => {
+                            return Err(Failure::new(Stage::SocketConnected, Kind::of(&plain)));
+                        }
                     }
-                    break;
                 }
+                Err(_) => break,
             }
         }
         let stream =
