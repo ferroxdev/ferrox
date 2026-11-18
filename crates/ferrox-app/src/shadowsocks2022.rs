@@ -2330,7 +2330,7 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
     let mut datagrams = Datagrams::new();
     let mut order: Vec<(u64, bool)> = Vec::new();
     let mut seen: HashSet<(u64, bool)> = HashSet::new();
-    let mut rotate = 0usize;
+    let mut resume: Option<(u64, bool)> = None;
     loop {
         match clients.recv_from(&mut buf) {
             Ok((n, src)) => {
@@ -2356,7 +2356,9 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
         order.clear();
         order.extend(upstreams.keys().copied());
         let len = order.len();
-        let start = if len == 0 { 0 } else { rotate % len };
+        let start = resume
+            .and_then(|key| order.iter().position(|held| *held == key))
+            .unwrap_or(0);
         seen.clear();
         let mut index = start;
         while drained < TURN_DRAIN && index < start + len {
@@ -2373,6 +2375,7 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
                     break;
                 };
                 drained += 1;
+                used.insert(key, Instant::now());
                 let Some(client) = clients_of.get(&session) else {
                     continue;
                 };
@@ -2394,10 +2397,14 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
                 );
             }
         }
-        rotate = if len == 0 { 0 } else { index % len };
+        resume = if index < start + len {
+            order.get(index % len).copied()
+        } else {
+            None
+        };
         let now = Instant::now();
         upstreams.retain(|key, _| {
-            seen.contains(key)
+            !seen.contains(key)
                 || used
                     .get(key)
                     .is_some_and(|at| now.saturating_duration_since(*at) < UPSTREAM_IDLE)
@@ -2426,16 +2433,8 @@ fn send_upstream(
         return;
     }
     let bind = if key.1 { "[::]:0" } else { "0.0.0.0:0" };
-    let socket = if let Ok(socket) = UdpSocket::bind(bind) {
-        socket
-    } else {
-        if !evict_upstream(upstreams, used) {
-            return;
-        }
-        let Ok(socket) = UdpSocket::bind(bind) else {
-            return;
-        };
-        socket
+    let Ok(socket) = UdpSocket::bind(bind) else {
+        return;
     };
     if socket.set_nonblocking(true).is_err() {
         return;

@@ -478,6 +478,12 @@ impl Api {
                 goaway(&mut stream, h2::E_PROTOCOL, last_id);
                 return;
             }
+            if let Some((owner, _)) = &discard {
+                if kind != h2::T_CONT || id != *owner {
+                    goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                    return;
+                }
+            }
             match kind {
                 h2::T_SETTINGS => {
                     if flags & h2::F_ACK == 0 {
@@ -510,33 +516,29 @@ impl Api {
                     }
                 }
                 h2::T_HEADERS => {
-                    if discard.is_some() {
-                        goaway(&mut stream, h2::E_PROTOCOL, last_id);
-                        return;
-                    }
                     let block = header_body(&body, flags);
                     if responses.contains_key(&id) {
-                        if !absorb_headers(
+                        if let Err(code) = absorb_headers(
                             &mut decoder,
                             &mut discard,
                             id,
                             block,
                             flags & h2::F_END_HEADERS != 0,
                         ) {
-                            goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                            goaway(&mut stream, code, last_id);
                             return;
                         }
                         continue;
                     }
                     if flow.cancelled(id) {
-                        if !absorb_headers(
+                        if let Err(code) = absorb_headers(
                             &mut decoder,
                             &mut discard,
                             id,
                             block,
                             flags & h2::F_END_HEADERS != 0,
                         ) {
-                            goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                            goaway(&mut stream, code, last_id);
                             return;
                         }
                         continue;
@@ -574,30 +576,21 @@ impl Api {
                 }
                 h2::T_CONT => {
                     if discard.is_some() {
-                        if !absorb_headers(
+                        if let Err(code) = absorb_headers(
                             &mut decoder,
                             &mut discard,
                             id,
                             &body,
                             flags & h2::F_END_HEADERS != 0,
                         ) {
-                            goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                            goaway(&mut stream, code, last_id);
                             return;
                         }
                         continue;
                     }
-                    if flow.cancelled(id) {
-                        if !absorb_headers(
-                            &mut decoder,
-                            &mut discard,
-                            id,
-                            &body,
-                            flags & h2::F_END_HEADERS != 0,
-                        ) {
-                            goaway(&mut stream, h2::E_PROTOCOL, last_id);
-                            return;
-                        }
-                        continue;
+                    if !calls.get(&id).is_some_and(|call| !call.end_headers) {
+                        goaway(&mut stream, h2::E_PROTOCOL, last_id);
+                        return;
                     }
                     if let Some(call) = calls.get_mut(&id) {
                         if call.headers.len() + body.len() > h2::HEAD_CAP {
@@ -615,6 +608,9 @@ impl Api {
                 }
                 h2::T_DATA => {
                     if flow.cancelled(id) {
+                        if !reset(&mut stream, id, h2::E_CLOSED) {
+                            return;
+                        }
                         if !window_update(&mut stream, 0, body.len()) {
                             return;
                         }
@@ -1560,25 +1556,28 @@ fn absorb_headers(
     id: u32,
     block: &[u8],
     end: bool,
-) -> bool {
+) -> Result<(), u32> {
     if end && discard.is_none() {
         if block.len() > h2::HEAD_CAP {
-            return false;
+            return Err(h2::E_PROTOCOL);
         }
-        let _ = decoder.decode(block, &mut |_, _| {});
-        return true;
+        return decoder
+            .decode(block, &mut |_, _| {})
+            .ok_or(h2::E_COMPRESSION);
     }
     let (held_id, mut held) = discard.take().unwrap_or_else(|| (id, Vec::new()));
     if held_id != id || held.len() + block.len() > h2::HEAD_CAP {
-        return false;
+        return Err(h2::E_PROTOCOL);
     }
     held.extend_from_slice(block);
     if end {
-        let _ = decoder.decode(&held, &mut |_, _| {});
+        decoder
+            .decode(&held, &mut |_, _| {})
+            .ok_or(h2::E_COMPRESSION)?;
     } else {
         *discard = Some((id, held));
     }
-    true
+    Ok(())
 }
 
 fn data_body(body: &[u8], flags: u8) -> Option<&[u8]> {
