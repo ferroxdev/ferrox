@@ -890,10 +890,11 @@ impl Read for ClientStream {
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
             }
             drop(conn);
-            if Instant::now() >= deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
-            std::thread::sleep(POLL);
+            std::thread::sleep(left.min(POLL));
         }
     }
 }
@@ -1978,6 +1979,33 @@ mod tests {
             );
         }
         assert_eq!(&got, b"hello");
+    }
+
+    /// A lane's empty h3 read hands the lane back on `RELAY_POLL`, not on the transport tick: the
+    /// cell's eight download streams share one connection, and a lane asleep for the tick makes
+    /// the receiver's window update late.
+    #[test]
+    fn a_waiting_h3_stream_read_returns_on_the_relay_poll_budget() {
+        let (identity, roots) = minted_identity("localhost");
+        let settings = settings();
+        let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
+            .expect("the h3 listener binds");
+        let client = client(port, roots);
+        let mut wire = raw_stream(&client);
+        let mut room = [0u8; 4096];
+        let began = Instant::now();
+        let outcome = wire.read(&mut room);
+        let took = began.elapsed();
+        assert!(
+            matches!(&outcome, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "an empty h3 stream read handed back {outcome:?}"
+        );
+        assert!(
+            took < POLL,
+            "an empty h3 stream read held its lane {took:?}, past the {POLL:?} transport tick \
+             rather than the {} it owes a lane",
+            crate::budgets::RELAY_POLL.as_millis()
+        );
     }
 
     #[test]
