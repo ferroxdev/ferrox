@@ -9,8 +9,11 @@ import sys
 
 MEEK_PROTOCOLS = {
     "FRONTED-MEEK-OSSH": "FRONTED-MEEK",
+    "FRONTED-MEEK-CDN-OSSH": "FRONTED-MEEK",
     "FRONTED-MEEK-HTTP-OSSH": "FRONTED-MEEK-HTTP",
+    "FRONTED-MEEK-CDN-HTTP-OSSH": "FRONTED-MEEK-HTTP",
     "FRONTED-MEEK-QUIC-OSSH": "FRONTED-MEEK-QUIC",
+    "FRONTED-MEEK-CDN-QUIC-OSSH": "FRONTED-MEEK-QUIC",
     "UNFRONTED-MEEK-HTTPS-OSSH": "UNFRONTED-MEEK-HTTPS",
     "UNFRONTED-MEEK-OSSH": "UNFRONTED-MEEK",
 }
@@ -244,6 +247,11 @@ def selftest():
             "sshObfuscatedPort": None,
             "sshObfuscatedKey": "k",
         },
+        {
+            "ipAddress": "192.0.2.19",
+            "capabilities": ["FRONTED-MEEK-HTTP", "FRONTED-MEEK-QUIC"],
+            "meekFrontingDomain": "front.example",
+        },
     ]
     assert port(443) == 443
     assert port(443.0) == 0
@@ -268,6 +276,7 @@ def selftest():
         assert entry(state, "192.0.2.6", 22, "SSH") is None
         assert entry(state, "192.0.2.7", 443, "OSSH") is None
         assert entry(state, "192.0.2.8", 443, "FRONTED-MEEK-OSSH") is not None
+        assert entry(state, "192.0.2.8", 443, "FRONTED-MEEK-CDN-OSSH") is not None
         assert entry(state, "192.0.2.8", 443, "FRONTED-MEEK-HTTP-OSSH") is None
         assert entry(state, "192.0.2.8", 443, "UNFRONTED-MEEK-HTTPS-OSSH") is None
         assert entry(state, "192.0.2.9", 443, "UNFRONTED-MEEK-HTTPS-OSSH") is None
@@ -277,6 +286,9 @@ def selftest():
         assert entry(state, "192.0.2.11", 443, "FRONTED-MEEK-OSSH") is None
         assert entry(state, "192.0.2.12", 8443, "UNFRONTED-MEEK-HTTPS-OSSH") is not None
         assert entry(state, "192.0.2.17", 443, "FRONTED-MEEK-QUIC-OSSH") is not None
+        assert entry(state, "192.0.2.19", 80, "FRONTED-MEEK-CDN-HTTP-OSSH") is not None
+        assert entry(state, "192.0.2.19", 443, "FRONTED-MEEK-CDN-QUIC-OSSH") is not None
+        assert entry(state, "192.0.2.19", 443, "FRONTED-MEEK-CDN-OSSH") is None
         assert entry(state, "192.0.2.12", 443, "UNFRONTED-MEEK-HTTPS-OSSH") is None
         assert entry(state, "192.0.2.13", 443, "FRONTED-MEEK-OSSH") is None
         assert entry(state, "192.0.2.14", 443, "FRONTED-MEEK-OSSH") is None
@@ -290,6 +302,7 @@ def selftest():
             "psiphon: tunnel up via [2001:db8::1]:443 OSSH\n"
             "psiphon: tunnel up via 192.0.2.2:22 SSH\n"
             "psiphon: tunnel up via 192.0.2.8:443 FRONTED-MEEK-OSSH\n"
+            "psiphon: tunnel up via 192.0.2.19:80 FRONTED-MEEK-CDN-HTTP-OSSH\n"
             "psiphon: tunnel up via 192.0.2.17:443 FRONTED-MEEK-QUIC-OSSH\n"
             "psiphon: tunnel up via 192.0.2.18:443 QUIC-OSSH\n"
         )
@@ -300,6 +313,7 @@ def selftest():
             ("2001:db8::1", 443, "OSSH"),
             ("192.0.2.2", 22, "SSH"),
             ("192.0.2.8", 443, "FRONTED-MEEK-OSSH"),
+            ("192.0.2.19", 80, "FRONTED-MEEK-CDN-HTTP-OSSH"),
             ("192.0.2.17", 443, "FRONTED-MEEK-QUIC-OSSH"),
             ("192.0.2.18", 443, "QUIC-OSSH"),
         }

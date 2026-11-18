@@ -62,7 +62,7 @@ impl Tactics {
         tactics_from_json(payload)
     }
 
-    /// Fetch tactics from the first entry that advertises a tactics capability.
+    /// Fetch tactics through one entry that advertises a tactics capability.
     pub(crate) fn fetch(
         server: &crate::psiphon_ssh::Server,
         identity: &Identity<'_>,

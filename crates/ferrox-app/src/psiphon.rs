@@ -61,6 +61,10 @@ const FRONTED_SERVERS: usize = 512;
 /// The reference's aggressive queue: three fronted CDN protocols at an
 /// eight-way fanout per server entry before the next entry.
 const CDN_SCAN_STRIDE: usize = 24;
+/// The first tactics entry to try on the next establishment pass.
+static TACTICS_CURSOR: AtomicUsize = AtomicUsize::new(0);
+/// The least time one tactics entry gets before the pass moves on.
+const TACTICS_ATTEMPT_MIN: Duration = Duration::from_secs(10);
 
 const CDN_FRONTING_PROTOCOLS: &[&str] = &[
     "FRONTED-MEEK-CDN-OSSH",
@@ -1465,7 +1469,7 @@ impl Inner {
                     .iter()
                     .any(|server| server.inproxy.is_some() || server.tls_inproxy.is_some())
             {
-                match self.conduit() {
+                match self.conduit(deadline) {
                     Ok(conduit) => Some(conduit),
                     Err(error) => {
                         eprintln!("psiphon: conduit unavailable: {error}");
@@ -1990,7 +1994,7 @@ impl Inner {
 
     /// Build the broker conduit once from the tactics payload and selected compartments.
     #[allow(clippy::too_many_lines)]
-    fn conduit(&self) -> Result<Arc<crate::psiphon_webrtc::Conduit>, String> {
+    fn conduit(&self, until: Instant) -> Result<Arc<crate::psiphon_webrtc::Conduit>, String> {
         let mode = self.conduit_mode();
         if let Some((cached, conduit)) = lock(&self.conduit).clone() {
             if cached == mode {
@@ -2012,7 +2016,7 @@ impl Inner {
         };
         let servers = load_tactics_entries(&self.settings)?;
         let session_id = hex(&random::<16>());
-        let tactics = fetch_tactics_from(&self.settings, &servers, &session_id)?;
+        let tactics = fetch_tactics_from(&self.settings, &servers, &session_id, Some(until))?;
         let personal = decode_compartment(&self.settings.compartment)?;
         let configured_compartments = configured_inproxy_compartments(&self.settings);
         let common = if configured_compartments.is_empty() {
@@ -6934,7 +6938,7 @@ pub(crate) fn broker_offer(
     }
     let servers = load_tactics_entries(&settings)?;
     let session_id = hex(&random::<16>());
-    let tactics = fetch_tactics_from(&settings, &servers, &session_id)?;
+    let tactics = fetch_tactics_from(&settings, &servers, &session_id, None)?;
     let personal: [u8; 32] = compartment32(&settings.compartment, "personal compartment")?;
     let server = servers
         .iter()
@@ -7085,7 +7089,7 @@ pub(crate) fn broker_offer(
         let offer_settings = crate::psiphon_broker::OfferSettings {
             secret: offer_secret,
             traffic_shaping: shaping,
-            use_media_streams: webrtc.is_some() && media_secret.is_some(),
+            use_media_streams: crate::psiphon_webrtc::offers_media(&generated),
         };
         match client.client_offer(
             destination,
@@ -7275,23 +7279,48 @@ fn fetch_tactics(settings: &Settings) -> Result<crate::psiphon_tactics::Tactics,
     }
     let servers = load_tactics_entries(settings)?;
     let session_id = hex(&random::<16>());
-    fetch_tactics_from(settings, &servers, &session_id)
+    fetch_tactics_from(settings, &servers, &session_id, None)
+}
+
+fn tactics_retry_wait(wait: Instant, until: Option<Instant>, timing: TacticsTiming) -> bool {
+    let mut remaining = wait.saturating_duration_since(Instant::now());
+    if let Some(until) = until {
+        remaining = remaining.min(until.saturating_duration_since(Instant::now()));
+    }
+    if remaining.is_zero() {
+        return false;
+    }
+    let base = timing.retry.min(remaining);
+    let span = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
+    let delay = base.mul_f64(1.0 + timing.jitter * span).min(remaining);
+    thread::sleep(delay);
+    true
+}
+
+fn tactics_attempt_timeout(remaining: Duration, left: usize, timeout: Duration) -> Duration {
+    let share = remaining / u32::try_from(left).unwrap_or(u32::MAX);
+    let floor = TACTICS_ATTEMPT_MIN.min(remaining / 2);
+    timeout.min(share.max(floor)).min(remaining)
 }
 
 fn fetch_tactics_from(
     settings: &Settings,
     servers: &[Server],
     session_id: &str,
+    until: Option<Instant>,
 ) -> Result<crate::psiphon_tactics::Tactics, String> {
     if settings.disable_tactics {
         return Err(
             "psiphon: DisableTactics is set and no embedded tactics are bundled".to_owned(),
         );
     }
-    let server = servers
+    let entries: Vec<&Server> = servers
         .iter()
-        .find(|server| server.tactics.is_some())
-        .ok_or_else(|| "psiphon: the server list holds no tactics entry".to_owned())?;
+        .filter(|server| server.tactics.is_some())
+        .collect();
+    if entries.is_empty() {
+        return Err("psiphon: the server list holds no tactics entry".to_owned());
+    }
     let identity = Identity {
         session_id,
         authorizations: &settings.authorizations,
@@ -7313,30 +7342,62 @@ fn fetch_tactics_from(
     };
     let timing = tactics_timing(settings.raw.as_ref());
     let timeout = timing.timeout.unwrap_or(settings.ready);
-    let deadline = (!timing.wait.is_zero()).then(|| Instant::now() + timing.wait);
+    let wait_deadline = (!timing.wait.is_zero()).then(|| Instant::now() + timing.wait);
+    let request_deadline = match (wait_deadline, until) {
+        (Some(wait), Some(until)) => Some(wait.min(until)),
+        (Some(wait), None) => Some(wait),
+        (None, until) => until,
+    };
+    let total = entries.len();
+    let mut index = if until.is_some() {
+        TACTICS_CURSOR.load(Ordering::Relaxed) % total
+    } else {
+        0
+    };
+    let mut attempted = 0usize;
+    let mut last = None;
     loop {
+        if attempted == total {
+            attempted = 0;
+            index = 0;
+            if until.is_some() {
+                TACTICS_CURSOR.store(0, Ordering::Relaxed);
+            }
+            let Some(wait) = wait_deadline else {
+                return Err(last.unwrap_or_else(|| "psiphon: tactics request failed".to_owned()));
+            };
+            if !tactics_retry_wait(wait, until, timing) {
+                return Err(last.unwrap_or_else(|| "psiphon: tactics wait expired".to_owned()));
+            }
+        }
+        let attempt = if let Some(deadline) = request_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(last.unwrap_or_else(|| "psiphon: tactics wait expired".to_owned()));
+            }
+            if until.is_some() {
+                tactics_attempt_timeout(remaining, total - attempted, timeout)
+            } else {
+                timeout.min(remaining)
+            }
+        } else {
+            timeout
+        };
         match crate::psiphon_tactics::Tactics::fetch(
-            server,
+            entries[index],
             &identity,
-            timeout,
+            attempt,
             settings.proxy.as_ref(),
             &settings.dns,
             settings.compress_tactics,
         ) {
             Ok(tactics) => return Ok(tactics),
-            Err(why) => {
-                let Some(deadline) = deadline else {
-                    return Err(why);
-                };
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(why);
-                }
-                let base = timing.retry.min(remaining);
-                let span = f64::from(u16::from_be_bytes(random::<2>())) / 65_536.0;
-                let delay = base.mul_f64(1.0 + timing.jitter * span).min(remaining);
-                thread::sleep(delay);
-            }
+            Err(why) => last = Some(why),
+        }
+        attempted += 1;
+        index = (index + 1) % total;
+        if until.is_some() && attempted < total {
+            TACTICS_CURSOR.store(index, Ordering::Relaxed);
         }
     }
 }
@@ -8274,9 +8335,11 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
     } else {
         1
     };
-    // Every scan group keeps a slice of the native cap, so no group is dropped.
+    // Every scan group keeps its own front plus a slice of the native cap.
     let scan_cap = if scan.is_some() {
-        (FRONTED_SERVERS / scan_groups).clamp(1, FRONTED_VARIANTS)
+        (FRONTED_SERVERS / scan_groups)
+            .clamp(1, FRONTED_VARIANTS)
+            .max(2)
     } else {
         FRONTED_VARIANTS
     };
@@ -8298,6 +8361,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
             continue;
         }
         if let Some((preferred, skipped, shuffle_key)) = &scan {
+            let candidate_cap = scan_cap.saturating_sub(1);
             let mut group = Vec::with_capacity(scan_cap.min(16));
             let mut variants = 0;
             push_scan_candidates(
@@ -8309,7 +8373,7 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 shuffle_key,
                 &mut group,
                 &mut variants,
-                scan_cap,
+                candidate_cap,
                 scan_start,
             );
             let mut overrides = Vec::new();
@@ -8324,8 +8388,8 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 &mut overrides,
                 &mut override_variants,
             );
-            let remaining = scan_cap.saturating_sub(group.len());
-            let override_take = overrides.len().min(remaining.div_ceil(2));
+            let remaining = candidate_cap.saturating_sub(group.len());
+            let override_take = overrides.len().min(remaining.saturating_sub(1).div_ceil(2));
             let builtin_cap = remaining.saturating_sub(override_take);
             let mut builtin = Vec::new();
             let mut builtin_variants = 0;
@@ -8340,14 +8404,14 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
                 builtin_cap,
                 scan_start,
             );
+            overrides.truncate(override_take);
             interleave_fronted(&mut group, builtin, overrides);
-            group.truncate(scan_cap);
-            if group.is_empty() {
-                group.push(server);
-            }
-            let emitted = group.len();
+            group.truncate(candidate_cap);
+            let consumed = group.len();
+            // The entry's own front leads, so the first batch dials it before a scan can stall.
+            group.insert(0, server);
             groups.push(group);
-            scan_start = scan_start.saturating_add(emitted.min(CDN_SCAN_STRIDE));
+            scan_start = scan_start.saturating_add(consumed.min(CDN_SCAN_STRIDE));
             continue;
         }
         let mut group = Vec::with_capacity(FRONTED_VARIANTS.min(16));
@@ -8430,17 +8494,32 @@ fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) 
     }
     let mut expanded = Vec::new();
     let mut fronted = 0;
-    let depth = groups.iter().map(Vec::len).max().unwrap_or(0);
-    let stride = if scan.is_some() { CDN_SCAN_STRIDE } else { 1 };
-    for base in (0..depth).step_by(stride) {
+    let server_cap = if scan.is_some() {
+        FRONTED_SERVERS.saturating_add(groups.len())
+    } else {
+        FRONTED_SERVERS
+    };
+    if scan.is_some() {
         for group in &groups {
-            let end = base.saturating_add(stride).min(group.len());
-            if base >= end {
-                continue;
-            }
-            for server in &group[base..end] {
+            for server in group {
                 if front.present(server) {
-                    if fronted >= FRONTED_SERVERS {
+                    if fronted >= server_cap {
+                        continue;
+                    }
+                    fronted += 1;
+                }
+                expanded.push(server.clone());
+            }
+        }
+    } else {
+        let depth = groups.iter().map(Vec::len).max().unwrap_or(0);
+        for base in 0..depth {
+            for group in &groups {
+                let Some(server) = group.get(base) else {
+                    continue;
+                };
+                if front.present(server) {
+                    if fronted >= server_cap {
                         continue;
                     }
                     fronted += 1;
@@ -13064,6 +13143,27 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn a_scan_group_keeps_the_entry_front() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "FrontedMeekCDNScanSpec": {
+                        "IPCandidates": ["198.51.100.7"],
+                        "SNIServerNames": ["scan.example"]
+                    }
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut servers = vec![scan_test_server()];
+        apply_fronting_overrides(&mut servers, &settings);
+        let first = servers[0].meek.as_ref().expect("fronted");
+        assert_eq!(first.dial, "front.example");
+        assert_eq!(first.sni, "front.example");
+    }
+
     fn scan_test_server() -> Server {
         let mut server = test_server(true);
         server.meek = Some(crate::psiphon_meek::Meek {
@@ -13131,11 +13231,11 @@ mod tests {
         let mut servers = vec![scan_test_server()];
         apply_fronting_overrides(&mut servers, &settings);
         let first = servers[0].meek.as_ref().expect("fronted");
-        assert!(
-            first.dial.starts_with("192.0.2."),
-            "the scan candidate leads: {}",
-            first.dial
-        );
+        assert_eq!(first.dial, "front.example");
+        assert!(servers.iter().any(|server| {
+            let meek = server.meek.as_ref().expect("fronted");
+            meek.dial.starts_with("192.0.2.")
+        }));
         assert!(servers.iter().any(|server| {
             let meek = server.meek.as_ref().expect("fronted");
             meek.dial == "edge.example" && meek.sni == "sni.example"
@@ -13187,7 +13287,7 @@ mod tests {
         lock(&settings.cdn_scan_state).record(&candidate, true);
         let mut servers = vec![scan_test_server()];
         apply_fronting_overrides(&mut servers, &settings);
-        let first = servers[0].meek.as_ref().expect("fronted");
+        let first = servers[1].meek.as_ref().expect("fronted");
         assert_eq!(first.dial, "192.0.2.9");
         assert_eq!(first.sni, "scan.example");
     }
@@ -13212,9 +13312,16 @@ mod tests {
         lock(&settings.cdn_scan_state).record(&first, false);
         let mut servers = vec![scan_test_server()];
         apply_fronting_overrides(&mut servers, &settings);
-        let meek = servers[0].meek.as_ref().expect("fronted");
+        let candidates: Vec<_> = servers
+            .iter()
+            .skip(1)
+            .filter_map(|server| server.meek.as_ref())
+            .collect();
+        assert!(!candidates.is_empty(), "the scan keeps a candidate");
         assert!(
-            meek.dial != first.ip || meek.sni != first.sni,
+            candidates
+                .iter()
+                .all(|meek| meek.dial != first.ip || meek.sni != first.sni),
             "the failed candidate is skipped"
         );
     }
@@ -13332,7 +13439,7 @@ mod tests {
     fn a_scan_keeps_the_entry_sni_setting() {
         let settings = Settings::from_json(Some(
             &json::parse(
-                r#"{"FrontedMeekCDNScanSpec":{"IPCandidates":["192.0.2.9:443"],"SNIServerNames":["a.example","b.example"]}}"#,
+                r#"{"FrontedMeekCDNScanSpec":{"IPCandidates":["192.0.2.9"],"SNIServerNames":["a.example","b.example"]}}"#,
             )
             .expect("settings"),
         ))
@@ -13362,7 +13469,7 @@ mod tests {
         });
         let mut servers = vec![server];
         apply_fronting_overrides(&mut servers, &settings);
-        assert_eq!(servers.len(), 1);
+        assert!(servers.len() > 1);
         assert!(servers
             .iter()
             .filter_map(|server| server.meek.as_ref())
@@ -13639,6 +13746,102 @@ mod tests {
     }
 
     #[test]
+    fn more_than_the_fronted_cap_keeps_every_scan_groups_front() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "FrontedMeekCDNScanSpec": {
+                        "IPCandidates": ["198.51.100.7"],
+                        "SNIServerNames": ["scan.example"]
+                    }
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut servers = Vec::new();
+        for index in 0..513 {
+            let mut server = scan_test_server();
+            let meek = server.meek.as_mut().expect("fronted");
+            meek.host = format!("cdn{index}.example");
+            meek.hosts = vec![format!("cdn{index}.example")];
+            servers.push(server);
+        }
+        apply_fronting_overrides(&mut servers, &settings);
+        assert!(servers.len() <= FRONTED_SERVERS + 513);
+        assert!(servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref())
+            .any(|meek| meek.dial == "198.51.100.7"));
+        assert!(
+            servers
+                .iter()
+                .take(64)
+                .filter_map(|server| server.meek.as_ref())
+                .any(|meek| meek.dial == "198.51.100.7"),
+            "the opening dial pass reached no scan candidate"
+        );
+        assert_eq!(
+            servers
+                .iter()
+                .filter_map(|server| server.meek.as_ref())
+                .filter(|meek| meek.dial == "front.example")
+                .count(),
+            513
+        );
+        let hosts: HashSet<String> = servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref().map(|meek| meek.host.clone()))
+            .collect();
+        for index in 0..513 {
+            assert!(
+                hosts.contains(&format!("cdn{index}.example")),
+                "server {index} fell outside the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn an_even_scan_spec_reaches_both_candidates() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "FrontedMeekCDNScanSpec": {
+                        "IPCandidates": ["198.51.100.7"],
+                        "SNIServerNames": ["scan.example"]
+                    }
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut servers = Vec::new();
+        for index in 0..257 {
+            let mut server = scan_test_server();
+            let meek = server.meek.as_mut().expect("fronted");
+            meek.host = format!("cdn{index}.example");
+            meek.hosts = vec![format!("cdn{index}.example")];
+            servers.push(server);
+        }
+        apply_fronting_overrides(&mut servers, &settings);
+        let candidates: Vec<_> = servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref())
+            .filter(|meek| meek.dial == "198.51.100.7")
+            .collect();
+        assert!(
+            candidates
+                .iter()
+                .any(|meek| meek.sni == "scan.example" && !meek.disable_sni),
+            "the named candidate was never probed"
+        );
+        assert!(
+            candidates.iter().any(|meek| meek.disable_sni),
+            "the empty-SNI candidate was never probed"
+        );
+    }
+
+    #[test]
     fn every_builtin_set_survives_a_capped_scan_group() {
         let settings = Settings::from_json(Some(
             &json::parse(
@@ -13800,23 +14003,37 @@ mod tests {
         let next = next_dial_start(0, taken, servers.len());
         let (second, _) =
             take_dial_batch(&servers, next, 0, DIAL_ATTEMPTS, DIAL_ATTEMPTS, 0, false);
-        let dialled: HashSet<&str> = first
+        let dialled: HashSet<(&str, &str, &str)> = first
             .iter()
-            .filter_map(|server| server.meek.as_ref().map(|meek| meek.host.as_str()))
+            .filter_map(|server| {
+                server
+                    .meek
+                    .as_ref()
+                    .map(|meek| (meek.host.as_str(), meek.dial.as_str(), meek.sni.as_str()))
+            })
             .collect();
         assert!(
-            second.iter().any(|server| server
-                .meek
-                .as_ref()
-                .is_some_and(|meek| !dialled.contains(meek.host.as_str()))),
+            second
+                .iter()
+                .any(|server| server.meek.as_ref().is_some_and(|meek| {
+                    !dialled.contains(&(meek.host.as_str(), meek.dial.as_str(), meek.sni.as_str()))
+                })),
             "the retry repeated the first pass"
         );
-        assert!(
-            second.iter().any(|server| server
-                .meek
-                .as_ref()
-                .is_some_and(|meek| meek.host == "cdn3.example")),
-            "the retry did not reach the fourth server group"
+        let expected = servers[next].meek.as_ref().expect("fronted");
+        let actual = second[0].meek.as_ref().expect("fronted");
+        assert_eq!(
+            (
+                actual.host.as_str(),
+                actual.dial.as_str(),
+                actual.sni.as_str()
+            ),
+            (
+                expected.host.as_str(),
+                expected.dial.as_str(),
+                expected.sni.as_str()
+            ),
+            "the retry did not start where the first stopped"
         );
     }
 
