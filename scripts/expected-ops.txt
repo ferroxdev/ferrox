@@ -217,7 +217,9 @@ ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_n
 # caller buffer's length once instead of matching the Option per frame, and one
 # at/next pair advances the cursor where two dot updates stood. The probe drops
 # 4608 (14.9%); the frames, commands and bytes are unchanged.
-ferrox_app::vision::tests::Fake::pump 26240 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
+# Re-blessed 26304 by the PR 31/44 landing (e92912b) on main, not by this
+# branch: the probe measures that tree's frame walk. ops.yml run 44245430676.
+ferrox_app::vision::tests::Fake::pump 26304 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
 
 # Blessed 1170 by the mux rendezvous: the domain arm compares the host against
 # `v1.mux.cool` before the resolver, which is three instructions on every domain
@@ -227,7 +229,9 @@ ferrox_app::vision::tests::Fake::pump 26240 vision::tests::the_frame_parser_prob
 # for a real name are unchanged.
 # The stats landing (#1722) split the parser into `decode_trojan_request_index`, so
 # the wrapper the probe names now pays one call and a destructure: 1170 -> 1182.
-proxy::decode_trojan_request 1182 proxy::tests::the_trojan_header_costs_two_reads_not_seven
+# Re-blessed 1292 by the proxy landings on main (a737c11, 4f4658a, ce26e56),
+# not by this branch: main's own ops is red on this row. ops.yml run 44245430676.
+proxy::decode_trojan_request 1292 proxy::tests::the_trojan_header_costs_two_reads_not_seven
 
 # Blessed 73251 by grpc-common-varint: the probe's one-byte varints and sub-128
 # envelope lengths now take a straight path instead of the loop; the same row
@@ -355,7 +359,11 @@ ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_co
 # label cuts are shifted and filtered in their own vec instead of collected into
 # a second one. Eight instructions and one allocation fewer per hello, same
 # bytes, same draws, same writes. ops.yml run 44215224558.
-ferrox_core::finalmask::tests::merged_hello_probe 347940 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
+# Re-blessed 347421 after the decoy scan moved out of the merged path and the
+# branch rebased onto ce26e56: 256 hellos, 10 instructions fewer than the 349989
+# the hello gate left, same bytes, same draws, same writes. ops.yml run
+# 44245430676.
+ferrox_core::finalmask::tests::merged_hello_probe 347421 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
 # The client request built by `request`: one address type byte, the address and
 # the port, written in one match with the vector's room reserved exactly once,
 # through `spare_capacity_mut` and one `copy_nonoverlapping` per field so no
