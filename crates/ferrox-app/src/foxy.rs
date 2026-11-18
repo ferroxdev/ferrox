@@ -3646,9 +3646,9 @@ pub(crate) fn open_ip_h2(
     dial: &FoxyDial,
 ) -> Result<(Tls2, Option<ferrox_core::foxy::connectip::Assigned>), Failure> {
     let edge = edge_authority(&dial.host, dial.port);
-    let mut block = Vec::with_capacity(160 + dial.pass.token.len());
-    connectip::connect_ip(&edge, "*", 0, &dial.pass.token, &mut block);
-    let mut lane = open_stream(dial, &block)?;
+    let mut lane = open_stream(dial, |block| {
+        connectip::connect_ip(&edge, "*", 0, &dial.pass.token, block);
+    })?;
     let assigned = lane.address_assign()?;
     Ok((lane, assigned))
 }
