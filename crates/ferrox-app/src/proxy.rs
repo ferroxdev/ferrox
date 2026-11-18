@@ -11939,6 +11939,12 @@ impl<T> Half<T> {
         }
     }
 
+    /// Whether both directions of this half wait on one lock: the only shape whose write pays a
+    /// handoff per step, and so the only one a burst is for.
+    fn shared(&self) -> bool {
+        matches!(self, Self::Shared { .. })
+    }
+
     /// The reader hands the lock to a writer that is waiting for it, so the writer takes
     /// the lock the moment the read is done rather than after the reader's next wait.
     fn hand_off(&self) {
@@ -12074,6 +12080,16 @@ impl<T: Read> Half<T> {
     }
 }
 
+/// The acquisitions a shared half's writer took, counted under `cfg(test)` so a step can be told
+/// from a window: the burst's claim is one acquisition carrying the windows its source holds.
+#[cfg(test)]
+static SHARED_ACQUISITIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn shared_acquisitions() -> usize {
+    SHARED_ACQUISITIONS.load(Ordering::Relaxed)
+}
+
 impl<T: Write> Half<T> {
     fn write_once(&self, buf: &[u8]) -> std::io::Result<()> {
         let Ok(mut guard) = self.writer_lock() else {
@@ -12091,10 +12107,50 @@ impl<T: Write> Half<T> {
         Ok(())
     }
 
+    /// Writes the window it was handed and every window the source already holds under the one
+    /// acquisition of the write side's lock: a shared half hands that lock to its sibling's read
+    /// on each release, so the burst is the difference between a step and a stream. Returns
+    /// whether the source ended inside it.
+    fn fed_write<R: Read>(
+        &self,
+        from: &Half<R>,
+        buffer: &mut RelayBuf,
+        first: usize,
+    ) -> std::io::Result<bool> {
+        let Ok(mut guard) = self.writer_lock() else {
+            return Err(std::io::Error::other("relay half poisoned"));
+        };
+        let mut window = first;
+        let mut reads = 0usize;
+        loop {
+            guard.write_all(buffer.filled(window))?;
+            guard.flush()?;
+            if let Self::Shared {
+                grain: Some(grain), ..
+            } = self
+            {
+                grain.moved();
+            }
+            if reads == RELAY_LOCK_WINDOWS {
+                return Ok(false);
+            }
+            window = match from.read_once(buffer.as_mut()) {
+                Ok(0) => return Ok(true),
+                Ok(n) => n,
+                // The source has nothing left this round: the sibling's wait gets the lock back now rather than after a read that had already spent its own timeout holding it, so the burst ends here.
+                Err(error) if is_timeout(&error) => return Ok(false),
+                Err(_) => return Ok(true),
+            };
+            reads += 1;
+        }
+    }
+
     fn writer_lock(&self) -> Result<MutexGuard<'_, T>, ()> {
         match self {
             Self::Split { write, .. } => write.lock().map_err(|_| ()),
             Self::Shared { inner, wanted, .. } => {
+                #[cfg(test)]
+                SHARED_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
                 wanted.store(true, Ordering::Relaxed);
                 let taken = Self::spin_lock(inner);
                 wanted.store(false, Ordering::Relaxed);
@@ -32663,6 +32719,12 @@ pub(crate) const RELAY_BUFFER: usize = 64 * 1024;
 
 pub(crate) const RELAY_SMALL_BUFFER: usize = 16 * 1024;
 
+/// Windows a shared write feeds under the one lock acquisition it was handed, beside that first
+/// window: the sibling hands the lock back on every release, and a step that paid a handoff per
+/// 64 KiB spent more wall clock handing it over than encrypting. Bytes cap the hold, so a
+/// sibling's byte arriving mid-burst waits on nine windows rather than on the stream.
+const RELAY_LOCK_WINDOWS: usize = 8;
+
 /// One pool per window quantum; thread-local spares drain to the shared pool at thread exit.
 struct RelaySpare {
     small: Vec<Vec<u8>>,
@@ -35595,7 +35657,9 @@ impl RelayFinish {
 }
 
 /// The one step of a plain half-to-half direction: read on the source's own clock, write the
-/// prefix the read reported, and end on EOF, a read the sibling ended, or a write error.
+/// prefix the read reported, and end on EOF, a read the sibling ended, or a write error. A
+/// destination that shares one lock with its sibling's read is fed every window the source
+/// already holds, because that half pays a handoff per write.
 fn stream_lane_step<R, W>(
     from: &Half<R>,
     to: &Half<W>,
@@ -35606,21 +35670,31 @@ where
     R: Read,
     W: Write,
 {
-    match from.read_once(buffer.as_mut()) {
-        Ok(0) => Next::Done,
-        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => Next::More,
+    let first = match from.read_once(buffer.as_mut()) {
+        Ok(0) => return Next::Done,
+        Ok(n) => n,
         // A record still arriving has progress behind it, so the step already spent its turn: the lane requeues rather than reading the yield as an idle peer.
-        Err(error) if is_driven_yield(&error) => Next::Retry,
+        Err(error) if is_driven_yield(&error) => return Next::Retry,
         Err(error) if is_timeout(&error) => {
-            if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+            return if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                 Next::Done
             } else {
                 note_wait_finish(ended);
                 buffer.release();
                 Next::Idle
-            }
+            };
         }
-        Ok(_) | Err(_) => Next::Done,
+        Ok(_) | Err(_) => return Next::Done,
+    };
+    // A burst holds the destination's lock across the reads that feed it, so it never nests two halves' locks: a source that shares a lock of its own keeps the one-window step, where the two directions could otherwise take the pair in opposite orders.
+    let fed = if to.shared() && !from.shared() {
+        to.fed_write(from, buffer, first)
+    } else {
+        to.write_once(buffer.filled(first)).map(|()| false)
+    };
+    match fed {
+        Ok(true) | Err(_) => Next::Done,
+        Ok(false) => Next::More,
     }
 }
 
@@ -45509,6 +45583,103 @@ mod tests {
             arms.lock().expect("arms").last(),
             Some(&SESSION_POLL),
             "the quiet grain stops at the cap"
+        );
+    }
+
+    /// The upload leg through a session: one lock acquisition carries every window the source
+    /// already holds, where a plain half's step carries one. Both counts are the lock's own.
+    #[test]
+    fn a_shared_write_carries_the_windows_its_source_holds_in_one_lock() {
+        struct Source {
+            left: usize,
+        }
+        impl Read for Source {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(self.left);
+                self.left -= n;
+                buf[..n].fill(b'x');
+                Ok(n)
+            }
+        }
+        impl Write for Source {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct Sink {
+            wrote: Arc<AtomicUsize>,
+        }
+        impl Read for Sink {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.wrote.fetch_add(buf.len(), Ordering::Relaxed);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let windows = 4;
+        let source = || {
+            Half::split(
+                Source {
+                    left: windows * RELAY_BUFFER,
+                },
+                Source { left: 0 },
+            )
+        };
+        let end = RelayFinish::new(false, Arc::new(|| {}), None);
+
+        // A plain half costs no lock, so its step is one window: the burst is what carries the rest.
+        let plain_wrote = Arc::new(AtomicUsize::new(0));
+        let plain = Half::split(
+            Sink {
+                wrote: Arc::clone(&plain_wrote),
+            },
+            Sink {
+                wrote: Arc::clone(&plain_wrote),
+            },
+        );
+        let mut buffer = RelayBuf::with_len(RELAY_BUFFER);
+        let next = stream_lane_step(&source(), &plain, &mut buffer, &end);
+        assert!(matches!(next, Next::More), "a plain step keeps the lane");
+        assert_eq!(
+            plain_wrote.load(Ordering::Relaxed),
+            RELAY_BUFFER,
+            "one window per step, one step per lock"
+        );
+
+        let shared_wrote = Arc::new(AtomicUsize::new(0));
+        let shared = Half::shared(Sink {
+            wrote: Arc::clone(&shared_wrote),
+        });
+        let mut buffer = RelayBuf::with_len(RELAY_BUFFER);
+        let before = shared_acquisitions();
+        let next = stream_lane_step(&source(), &shared, &mut buffer, &end);
+        assert!(
+            matches!(next, Next::Done),
+            "the source ended inside the burst"
+        );
+        assert_eq!(
+            shared_acquisitions() - before,
+            1,
+            "one acquisition carried the burst"
+        );
+        assert_eq!(
+            shared_wrote.load(Ordering::Relaxed),
+            windows * RELAY_BUFFER,
+            "every window the source held left on that one acquisition"
         );
     }
 
