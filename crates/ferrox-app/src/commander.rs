@@ -588,7 +588,7 @@ impl Api {
                         }
                         continue;
                     }
-                    if !calls.get(&id).is_some_and(|call| !call.end_headers) {
+                    if calls.get(&id).is_none_or(|call| call.end_headers) {
                         goaway(&mut stream, h2::E_PROTOCOL, last_id);
                         return;
                     }
