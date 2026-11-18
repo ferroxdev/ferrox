@@ -513,6 +513,14 @@ impl SocketOptions {
         self.apply(socket, target, true, false)
     }
 
+    /// The same options without `TCP_FASTOPEN_CONNECT`, for a retry after a Fast Open setup
+    /// failure that the socket options would otherwise repeat.
+    pub(crate) fn without_fast_open(&self) -> Self {
+        let mut options = self.clone();
+        options.tfo = None;
+        options
+    }
+
     /// The options a datagram dial's socket takes before it binds and connects.
     pub(crate) fn apply_to_datagram(&self, socket: &Socket, target: SocketAddr) -> io::Result<()> {
         self.apply(socket, target, false, false)

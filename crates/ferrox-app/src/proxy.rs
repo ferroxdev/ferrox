@@ -1507,6 +1507,7 @@ fn dial_from(
     source: Option<IpAddr>,
     sockopts: Option<&crate::sockopt::SocketOptions>,
     fast: bool,
+    timeout: std::time::Duration,
 ) -> std::io::Result<(std::net::TcpStream, bool)> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     let domain = if target.is_ipv4() {
@@ -1522,7 +1523,7 @@ fn dial_from(
         socket.bind(&SockAddr::from(SocketAddr::new(source, 0)))?;
     }
     let armed = fast && crate::fastopen::arm(&socket).is_ok();
-    crate::conn::connect_bounded(&socket, &SockAddr::from(*target), budgets::dial())?;
+    crate::conn::connect_bounded(&socket, &SockAddr::from(*target), timeout)?;
     Ok((std::net::TcpStream::from(socket), armed))
 }
 
@@ -1780,8 +1781,11 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
     if fast && crate::fastopen::supported() {
         let mut kept = None;
         let mut outcome = Fast::Refused;
+        let budget = budgets::dial();
+        let started = std::time::Instant::now();
         for round in 0..2 {
-            match dial_from(target, source, sockopts.as_deref(), true) {
+            let left = budget.saturating_sub(started.elapsed());
+            match dial_from(target, source, sockopts.as_deref(), true, left) {
                 Ok((stream, armed)) => {
                     let deferred = armed && crate::fastopen::deferred(&stream);
                     kept = Some(stream);
@@ -1795,7 +1799,9 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
                     }
                 }
                 Err(_) if round == 0 => {
-                    match dial_from(target, source, sockopts.as_deref(), false) {
+                    let plain = sockopts.map(crate::sockopt::SocketOptions::without_fast_open);
+                    let left = budget.saturating_sub(started.elapsed());
+                    match dial_from(target, source, plain.as_ref(), false, left) {
                         Ok((stream, _)) => {
                             kept = Some(stream);
                             outcome = Fast::Absent;
@@ -1819,7 +1825,7 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
         (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
             .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
         (source, sockopts) => Connection::Tcp(
-            dial_from(target, source, sockopts.as_deref(), false)
+            dial_from(target, source, sockopts.as_deref(), false, budgets::dial())
                 .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?
                 .0,
         ),
