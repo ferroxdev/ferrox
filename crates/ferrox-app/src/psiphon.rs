@@ -8447,15 +8447,18 @@ fn push_scan_candidates(
     }
     let mut number = u64::try_from(start).unwrap_or(u64::MAX) % count;
     let mut emitted = 0;
+    let mut seen = HashSet::new();
     while emitted < count && *variants < cap {
         let Some((candidate, next)) = spec.select_probe(number, skipped, shuffle_key) else {
             return;
         };
-        if !push_scan_variant(server, &candidate, front, expanded, variants, cap) {
-            return;
-        }
         emitted += 1;
         number = next.max(number.saturating_add(1)) % count;
+        if seen.insert(candidate.key())
+            && !push_scan_variant(server, &candidate, front, expanded, variants, cap)
+        {
+            return;
+        }
     }
 }
 
@@ -8488,15 +8491,18 @@ fn push_scan_builtin_candidates(
         let want = total.min(slots);
         let mut number = u64::try_from(start).unwrap_or(u64::MAX) % total;
         let mut emitted = 0;
+        let mut seen = HashSet::new();
         while emitted < want && *variants < cap {
             let Some((candidate, next)) = spec.select_probe(number, skipped, shuffle_key) else {
                 break;
             };
-            if !push_scan_variant(server, &candidate, front, expanded, variants, cap) {
-                return;
-            }
             emitted += 1;
             number = next.max(number.saturating_add(1)) % total;
+            if seen.insert(candidate.key())
+                && !push_scan_variant(server, &candidate, front, expanded, variants, cap)
+            {
+                return;
+            }
         }
     }
 }
