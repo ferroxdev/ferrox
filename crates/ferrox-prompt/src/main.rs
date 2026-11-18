@@ -862,9 +862,6 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
         return ExitCode::from(1);
     };
     let ledger = load_ledger(root);
-    if let Some(code) = ledger_refusal(&ledger) {
-        return code;
-    }
     let state = ProjectState::load(root);
 
     // A named row is the work; the template that draws it is then the advisor's choice.
@@ -983,6 +980,12 @@ fn choose_slice<'p>(
     supplied: &Values,
     named: Option<&'p MethodRow>,
 ) -> Result<(Offer<'p>, Vec<advisor::Skipped>), Refusal> {
+    if let Some(error) = &ledger.read_error {
+        return Err((
+            format!("{error}; refusing to choose a slice from an unreadable history"),
+            1,
+        ));
+    }
     if let Some(id) = args.forced {
         let Some(prompt) = library.prompt(id) else {
             return Err((unknown_prompt(library, id), 2));
