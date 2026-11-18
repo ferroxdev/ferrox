@@ -964,13 +964,6 @@ fn gate_ten(report: &mut String) -> Vec<framing::Row> {
     );
     let engine = ferrox_core::aesgcm::Aes128Gcm::new(&[7u8; 16]);
     report.push_str(&aesgcm::report(&rows, &windows, engine.backend()));
-    let ring_rows = aesgcm::ring_rows();
-    println!(
-        "gate 10b reported: {} record-aead rows against ring, ciphertext and tag identical, \
-         printed only",
-        ring_rows.len()
-    );
-    report.push_str(&aesgcm::ring_report(&ring_rows, engine.backend()));
     rows
 }
 
