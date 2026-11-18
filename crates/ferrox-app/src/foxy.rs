@@ -1588,8 +1588,26 @@ impl Tls2 {
                 }
             }
         };
-        // A SETTINGS is applied and answered, a PING is echoed, and a PUSH_PROMISE is refused, on whichever stream's read took the frame: all belong to the connection, not to the flow that happened to read them.
+        // A SETTINGS is applied and answered, a PING is echoed, and a push is refused, on whichever stream's read took the frame: all belong to the connection, not to the flow that happened to read them.
         match frames::h2_routed(frame, &payload) {
+            // A status for a stream that is still opening belongs to that stream, wherever the read that took it was: a lane that dropped it would leave the flow that owns it waiting for a frame it already saw.
+            frames::H2Routed::Headers {
+                stream,
+                block,
+                end_headers,
+                ..
+            } => {
+                if let Some(entry) = inner.streams.get_mut(&stream) {
+                    entry.head.extend_from_slice(block);
+                    entry.head_end = end_headers;
+                }
+            }
+            frames::H2Routed::Continuation { stream, block, end } => {
+                if let Some(entry) = inner.streams.get_mut(&stream) {
+                    entry.head.extend_from_slice(block);
+                    entry.head_end = end;
+                }
+            }
             frames::H2Routed::Settings {
                 ack: false,
                 payload: settings,
@@ -1704,7 +1722,7 @@ impl Tls2 {
         (true, sent)
     }
 
-    /// Waits for the status of this lane's CONNECT: the head block is this stream's own, and a fragment of it arrives as a CONTINUATION on the same id.
+    /// Waits for the status of this lane's CONNECT: the head is staged on the stream it names, wherever the read that took it was, and a fragment arrives as a CONTINUATION on the same id.
     fn await_status(&mut self) -> Result<u16, Failure> {
         // The status is the h2 form of the head, so it waits the named head budget; unset, that is the same twenty seconds.
         let deadline = Instant::now() + crate::budgets::head_arrival();
@@ -1713,27 +1731,14 @@ impl Tls2 {
                 return Err(Failure::Stream);
             }
             let own = self.stream;
+            {
+                let inner = self.inner().map_err(|_| Failure::Io)?;
+                if let Some(status) = status_of(&inner, own)? {
+                    return Ok(status);
+                }
+            }
             let status = self.with_frame(&mut [], |inner, frame, payload, _| {
                 match frames::h2_routed(frame, payload) {
-                    frames::H2Routed::Headers {
-                        stream,
-                        block,
-                        end_headers,
-                        ..
-                    } if stream == own => {
-                        if let Some(entry) = inner.streams.get_mut(&stream) {
-                            entry.head.extend_from_slice(block);
-                            entry.head_end = end_headers;
-                        }
-                        status_of(inner, own)
-                    }
-                    frames::H2Routed::Continuation { stream, block, end } if stream == own => {
-                        if let Some(entry) = inner.streams.get_mut(&stream) {
-                            entry.head.extend_from_slice(block);
-                            entry.head_end = end;
-                        }
-                        status_of(inner, own)
-                    }
                     frames::H2Routed::Data {
                         stream,
                         payload,
@@ -5659,6 +5664,40 @@ pub(crate) mod loopback {
         );
     }
 
+    /// A status for a stream that is still opening is kept on that stream even when the read that took it was another lane's: a lane that dropped it would leave the flow that owns it waiting for a frame it already saw.
+    #[test]
+    fn a_status_for_a_stream_opening_elsewhere_is_kept() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = foreign_head_h2_edge(listener, server);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let first = Tunnel::open(&dial, "one.test:80", None).expect("opens");
+        let Tunnel::H2(lane) = &first else {
+            panic!("an h2 lane");
+        };
+        lane.test_inner()
+            .streams
+            .insert(7, Stream::new(frames::DEFAULT_WINDOW));
+        let second = Tunnel::open(&dial, "two.test:80", None).expect("opens on the session");
+        {
+            let Tunnel::H2(lane) = &first else {
+                panic!("an h2 lane");
+            };
+            let inner = lane.test_inner();
+            let foreign = inner.streams.get(&7).expect("the stream opening elsewhere");
+            assert!(foreign.head_end, "a foreign status was dropped");
+            assert_eq!(
+                hpack::hpack_status(&foreign.head),
+                Some(200),
+                "the foreign status was not kept whole"
+            );
+        }
+        drop(first);
+        drop(second);
+        edge.join().expect("joins");
+    }
+
     /// Every park on one h2 session waits on the one socket the session was dialled with: the lane that parks second and the lane that parks again take the same descriptor, not a new dup and a close each quantum.
     #[test]
     fn a_parked_http2_session_hands_out_one_socket() {
@@ -8618,6 +8657,62 @@ pub(crate) mod loopback {
                     // The echo is not the end of the edge: a lane that has to read a second frame to find the rest of its capsule must find the edge still there, and a TLS peer that drops on a reader's next syscall is one the runner decides.
                     std::thread::sleep(Duration::from_millis(250));
                     return;
+                }
+            }
+        })
+    }
+
+    /// A loopback HTTP/2 edge that answers the first CONNECT, then answers the second only after putting a status for stream 7 on the wire: the reader of the second lane is the one that sees the foreign status.
+    fn foreign_head_h2_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            let mut answered = 0usize;
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frame.kind {
+                    frames::SETTINGS if frame.flags & 0x1 == 0 => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::HEADERS => {
+                        answered += 1;
+                        if answered == 2 {
+                            let mut foreign = Vec::new();
+                            h2_frame(frames::HEADERS, 0x5, 7, &[0x88], &mut foreign);
+                            tls.write_all(&foreign).expect("answers elsewhere");
+                        }
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x5, frame.stream, &[0x88], &mut out);
+                        tls.write_all(&out).expect("answers");
+                        tls.flush().expect("flushes");
+                        if answered == 2 {
+                            std::thread::sleep(Duration::from_millis(250));
+                            return;
+                        }
+                    }
+                    _ => {}
                 }
             }
         })
