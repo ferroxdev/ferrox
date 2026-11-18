@@ -261,6 +261,11 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         eprintln!("ferrox-cli: {error}");
         return 1;
     }
+    ensure_config(options);
+    reject_duplicate_ports(options);
+    reject_empty_fronts(options).unwrap_or_else(|error| args::die(&error));
+    config::validate_exclusions(options).unwrap_or_else(|error| args::die(&error));
+    options.carrier = choose_carrier(options);
     let lifecycle = match lane::lock(paths) {
         Ok(lock) => lock,
         Err(error) => {
@@ -268,11 +273,6 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             return 1;
         }
     };
-    ensure_config(options);
-    reject_duplicate_ports(options);
-    reject_empty_fronts(options).unwrap_or_else(|error| args::die(&error));
-    config::validate_exclusions(options).unwrap_or_else(|error| args::die(&error));
-    options.carrier = choose_carrier(options);
     let bin = lane::require_bin();
     let account = if options.outbound == Some(Outbound::Foxy) {
         Some(foxy_account(options, paths))
