@@ -4753,13 +4753,15 @@ mod tests {
 
         struct EchoWorker {
             stop: Arc<AtomicBool>,
-            handle: std::thread::JoinHandle<()>,
+            handle: Option<std::thread::JoinHandle<()>>,
         }
 
         impl Drop for EchoWorker {
             fn drop(&mut self) {
                 self.stop.store(true, Ordering::Relaxed);
-                let _ = self.handle.join();
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
             }
         }
 
@@ -4821,7 +4823,7 @@ mod tests {
         });
         let _echo = EchoWorker {
             stop,
-            handle: worker,
+            handle: Some(worker),
         };
 
         let outer_client_private = [0x11; 32];

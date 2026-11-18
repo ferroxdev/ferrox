@@ -132,17 +132,16 @@ pub fn handable<'a>(
             continue;
         }
         if !allow_unfilled {
-            let inputs: Vec<String> = match crate::render::resolve_addons(prompt, requested_addons)
-            {
-                Ok(addons) => prompt
-                    .required_inputs_for(&addons)
-                    .map(str::to_owned)
-                    .collect(),
-                Err(_) => {
+            let inputs: Vec<String> =
+                if let Ok(addons) = crate::render::resolve_addons(prompt, requested_addons) {
+                    prompt
+                        .required_inputs_for(&addons)
+                        .map(str::to_owned)
+                        .collect()
+                } else {
                     unresolved.push(prompt);
                     continue;
-                }
-            };
+                };
             let missing: Vec<String> = inputs
                 .into_iter()
                 .filter(|name| !supplied.contains_key(name))
