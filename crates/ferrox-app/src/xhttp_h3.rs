@@ -2,7 +2,6 @@
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-#[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -75,12 +74,11 @@ impl Wire {
     }
 }
 
-/// What a lane's empty read did on this thread: handed the lane back, or slept the transport tick,
-/// counted only under `cfg(test)`, because a lane is a thread and a process-wide count sees other
-/// tests' lanes.
 #[cfg(test)]
 thread_local! {
+    /// A lane is a thread, so the count is the lane's own: a process-wide one sees other tests' lanes.
     static LANE_GRANTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The same lane's empty reads that slept the transport tick instead of handing the lane back.
     static LANE_TICKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
