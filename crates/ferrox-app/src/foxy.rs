@@ -655,16 +655,16 @@ fn hand_back(carried: &mut Vec<u8>, at: &mut usize, buf: &mut [u8]) -> usize {
 
 /// HTTP/2 CONNECT: preface, settings, one stream and the status in its first header block. A session that carried a flow is kept and lent to the next flow as a new stream, so a warm flow pays one round trip instead of a TCP and a TLS handshake.
 pub(crate) fn open_h2(dial: &FoxyDial, target: &str) -> Result<Tls2, Failure> {
-    let mut block = Vec::with_capacity(96 + dial.pass.token.len());
-    hpack::hpack_connect(target, &dial.pass.token, &mut block);
-    open_stream(dial, &block)
+    open_stream(dial, |block| {
+        hpack::hpack_connect(target, &dial.pass.token, block);
+    })
 }
 
 /// Opens one stream on a session to this edge, reusing a session already open: the flow rides it on a stream of its own, and the handshake it paid is not paid again.
-fn open_stream(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
+fn open_stream(dial: &FoxyDial, build: impl Fn(&mut Vec<u8>)) -> Result<Tls2, Failure> {
     // A session already open to this edge is the cheap one: the flow rides it on a stream of its own, and the handshake it paid is not paid again.
     if let Some(session) = pool_find(dial) {
-        match attach(&session, block) {
+        match attach(&session, &build) {
             Ok(lane) => return Ok(lane),
             // A session the edge closed while it was idle is the one handshake this reuse may cost; every other refusal is the edge's answer and is not retried on a new session.
             Err(Failure::Stream | Failure::Io) => pool_forget(&session),
@@ -672,7 +672,7 @@ fn open_stream(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
         }
     }
     let session = open_session(dial)?;
-    let lane = attach(&session, block)?;
+    let lane = attach(&session, &build)?;
     pool_register(SessionKey::of(dial), &session);
     Ok(lane)
 }
@@ -769,16 +769,11 @@ pub(crate) fn open_udp(
     target_port: u16,
 ) -> Result<Tls2, Failure> {
     let edge = edge_authority(&dial.host, dial.port);
-    let mut block = Vec::with_capacity(160 + dial.pass.token.len() + target_host.len());
-    masque::connect_udp(
-        &edge,
-        target_host,
-        target_port,
-        &dial.pass.token,
-        &mut block,
-    );
+    let build = |block: &mut Vec<u8>| {
+        masque::connect_udp(&edge, target_host, target_port, &dial.pass.token, block);
+    };
     let session = open_session(dial)?;
-    attach(&session, &block)
+    attach(&session, &build)
 }
 
 /// One UDP target as its own HTTP/1.1 upgrade carrying CONNECT-UDP: RFC 9298 §4's fallback for an edge whose TLS answers no HTTP/2 or HTTP/3.
@@ -857,8 +852,8 @@ fn open_session(dial: &FoxyDial) -> Result<Arc<Session>, Failure> {
     }))
 }
 
-/// Opens a CONNECT stream on a session and waits for its status: the stream is the flow's, and the session outlives it.
-fn attach(session: &Arc<Session>, block: &[u8]) -> Result<Tls2, Failure> {
+/// Opens a CONNECT stream on a session and waits for its status: the stream is the flow's, and the session outlives it. The block is built into the session's own scratch, so a warm flow allocates nothing for the head it writes.
+fn attach(session: &Arc<Session>, build: &impl Fn(&mut Vec<u8>)) -> Result<Tls2, Failure> {
     let mut inner = session.inner.lock().map_err(|_| Failure::Io)?;
     if inner.gone {
         return Err(Failure::Stream);
@@ -873,9 +868,19 @@ fn attach(session: &Arc<Session>, block: &[u8]) -> Result<Tls2, Failure> {
         session: Arc::clone(session),
         stream,
     };
-    let mut opening = Vec::with_capacity(frames::H2_HEADER + block.len());
-    h2_frame(frames::HEADERS, 0x4, stream, block, &mut opening);
-    inner.tls.write_all(&opening).map_err(|_| Failure::Io)?;
+    let mut block = std::mem::take(&mut inner.out);
+    block.clear();
+    build(&mut block);
+    let head = frames::H2Frame {
+        kind: frames::HEADERS,
+        flags: 0x4,
+        stream,
+        length: block.len() as u32,
+    }
+    .header();
+    let written = inner.tls.write_all_slices(&[&head[..], &block]);
+    inner.out = block;
+    written.map_err(|_| Failure::Io)?;
     inner.tls.flush().map_err(|_| Failure::Io)?;
     inner
         .streams
@@ -5600,6 +5605,44 @@ pub(crate) mod loopback {
         second.read_exact(&mut back_two).expect("reads the second");
         assert_eq!(back_one, one, "the first flow got its own bytes");
         assert_eq!(back_two, two, "the second flow got its own bytes");
+    }
+
+    /// A warm open writes its CONNECT block and frame through the session's own scratch: the second flow reuses the buffer the first left, with the same base and capacity.
+    #[test]
+    fn a_warm_h2_open_reuses_the_session_scratch() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _edge = h2_session_edge(listener, server, accepts);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let first = Tunnel::open(&dial, "one.test:80", None).expect("opens");
+        let (base, capacity) = {
+            let Tunnel::H2(lane) = &first else {
+                panic!("an h2 lane");
+            };
+            let inner = lane.test_inner();
+            (inner.out.as_ptr(), inner.out.capacity())
+        };
+        assert!(
+            capacity >= frames::H2_HEADER,
+            "the first open allocated a scratch"
+        );
+        let _second = Tunnel::open(&dial, "two.test:80", None).expect("opens on the session");
+        let Tunnel::H2(lane) = &first else {
+            panic!("an h2 lane");
+        };
+        let inner = lane.test_inner();
+        assert_eq!(
+            inner.out.as_ptr(),
+            base,
+            "the second open moved the session's write scratch"
+        );
+        assert_eq!(
+            inner.out.capacity(),
+            capacity,
+            "the second open grew the session's write scratch"
+        );
     }
 
     /// Every park on one h2 session waits on the one socket the session was dialled with: the lane that parks second and the lane that parks again take the same descriptor, not a new dup and a close each quantum.
