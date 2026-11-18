@@ -690,7 +690,11 @@ fn requested_values(args: &Args) -> Values {
 fn supplied_values(args: &Args, state: &ProjectState) -> Values {
     let mut supplied = requested_values(args);
     if state.has_matrix() {
+        let references = state.references();
         for name in expand::FILLABLE {
+            if *name == "references" && references.is_empty() {
+                continue;
+            }
             supplied.entry((*name).to_owned()).or_default();
         }
     }
@@ -869,6 +873,16 @@ fn reload_library(library: &Library) -> Result<Library, String> {
         .map_err(|error| format!("could not read {}: {error}", library.source_path.display()))?;
     let mut reloaded = Library::parse(&library.path, &text);
     reloaded.source_path.clone_from(&library.source_path);
+    if reloaded.has_errors() {
+        let mut message = format!(
+            "{} has errors; fix them first:",
+            library.source_path.display()
+        );
+        for diagnostic in reloaded.errors() {
+            message.push_str(&format!("\n  {diagnostic}"));
+        }
+        return Err(message);
+    }
     Ok(reloaded)
 }
 
@@ -1445,6 +1459,9 @@ fn run_set_status(args: &Args, library: &Library, root: &Path) -> ExitCode {
         eprintln!("{}", unknown_prompt(library, id));
         return ExitCode::from(2);
     }
+    let Ok(_source_lock) = lock_state(&library.source_path) else {
+        return ExitCode::from(1);
+    };
     let Ok(_lock) = lock_state(&Ledger::path_for(root)) else {
         return ExitCode::from(1);
     };
@@ -2660,6 +2677,17 @@ fix issue #{issue} at {priority=P0 or P1} priority
         let prompt = library.prompt(1).expect("P1");
         let rendered = render::render(&library, prompt, &values, &[], None, Options::default());
         assert!(rendered.missing.iter().any(|name| name == "method"));
+    }
+
+    #[test]
+    fn an_empty_pin_file_does_not_supply_references_to_next() {
+        let args = parse_args(&["next"]);
+        let state = ProjectState {
+            methods: vec![row('A', "13", "VLESS over QUIC", false)],
+            pins: Vec::new(),
+        };
+        let supplied = supplied_values(&args, &state);
+        assert!(!supplied.contains_key("references"));
     }
 
     #[test]
