@@ -79876,9 +79876,9 @@ end
             .expect("timeout");
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
+            assert!(Instant::now() < deadline, "no echo to {frame:?}");
             probe.send(&frame).expect("sends");
             let Ok(n) = probe.recv(&mut back) else {
-                assert!(Instant::now() < deadline, "no echo to {frame:?}");
                 continue;
             };
             let Some((_, payload)) = parse_socks_udp(&back[..n]) else {
