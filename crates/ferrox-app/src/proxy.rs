@@ -1804,6 +1804,7 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
         no_delay(&stream);
         return Ok((outbound_metered(stream), outcome));
     }
+    let outcome = if fast { Fast::Absent } else { Fast::Off };
     let stream = match (source, sockopts) {
         (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
             .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
