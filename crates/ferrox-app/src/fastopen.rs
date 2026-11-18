@@ -3,7 +3,7 @@
 //!
 //! `TCP_FASTOPEN_CONNECT` defers the handshake to the first write, and only when the kernel holds
 //! a cookie for the destination: the first connect to a server is an ordinary handshake that asks
-//! for one, so [`crate::proxy::dial_kind`] throws it away and dials again. A deferred socket has no
+//! for one, so `crate::proxy::dial_kind` throws it away and dials again. A deferred socket has no
 //! peer until that first write, which is why nothing here asks for one.
 
 use std::io;
