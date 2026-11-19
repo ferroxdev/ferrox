@@ -499,7 +499,10 @@ mod tests {
             dials.push(conn);
         }
         let deadline = Instant::now() + Duration::from_secs(5);
-        while listener.inner.sessions.lock().unwrap().len() < 4 && Instant::now() < deadline {
+        while (listener.inner.sessions.lock().unwrap().len() < 4
+            || listener.inner.ready.lock().unwrap().len() < 4)
+            && Instant::now() < deadline
+        {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(
