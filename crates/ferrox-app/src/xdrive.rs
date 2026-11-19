@@ -887,6 +887,7 @@ enum Woke {
 /// The wait every xdrive loop parks on: a poll interval, a ring from the peer's write, or the lane's halt, all on one condvar so closing a stream ends every loop without a join.
 struct Wake {
     stopped: AtomicBool,
+    cancelled: AtomicBool,
     rung: AtomicBool,
     lock: Mutex<()>,
     cv: Condvar,
@@ -896,6 +897,7 @@ impl Wake {
     fn new() -> Self {
         Self {
             stopped: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
             rung: AtomicBool::new(false),
             lock: Mutex::new(()),
             cv: Condvar::new(),
@@ -915,6 +917,15 @@ impl Wake {
     fn halt(&self) {
         self.stopped.store(true, Ordering::Release);
         self.cv.notify_all();
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.halt();
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 
     /// Wait out `longest`, or until rung, or until halted; a flag set while nobody waited is read here, so a wake is never lost between two polls.
@@ -1046,12 +1057,15 @@ impl Pool {
         self.run.notify_all();
     }
 
-    /// Wait for every promised job, giving up if the lane ends underneath: a relay tearing down has no reader left to wait for.
-    fn wait_settled(&self) -> bool {
+    /// Wait for every promised job, giving up if the lane is cancelled underneath: a relay tearing down has no reader left to wait for.
+    fn wait_settled(&self, wake: &Wake) -> bool {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         for _ in 0..DRAIN_TRIES {
             if queue.left == 0 {
                 return true;
+            }
+            if wake.cancelled() {
+                return false;
             }
             census!("xdrive-drain", crate::census::NO_FD, Some(DRAIN_WAIT));
             let (guard, _timeout) = self
@@ -1406,7 +1420,7 @@ impl Writer {
         self.ticker.done.store(true, Ordering::Release);
         Clock::global().wakeup();
         self.uploads.shut();
-        if !self.uploads.wait_settled() {
+        if !self.uploads.wait_settled(&self.sink.wake) {
             self.uploads.abort();
             return Err(carrier_error(
                 "the store stopped answering the last segments".to_owned(),
@@ -2361,7 +2375,7 @@ impl SlotReader {
 
 impl Reader {
     fn abort(&self) {
-        self.rd.wake.halt();
+        self.rd.wake.cancel();
         self.inbox.end(None);
     }
 }
@@ -2622,6 +2636,7 @@ impl Conn {
 
     /// Interrupt both halves after a failed write: no segment drain and no reader left parked.
     pub(crate) fn abort(&self) {
+        self.wake.cancel();
         match &self.writer {
             WriterSide::Wal(writer) => writer.abort(),
             WriterSide::Slot(writer) => writer.abort(),
