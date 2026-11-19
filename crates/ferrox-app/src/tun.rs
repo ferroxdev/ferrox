@@ -794,7 +794,7 @@ impl Handle {
             #[cfg(unix)]
             Self::File(file) => Ok(Self::File(file.try_clone()?)),
             #[cfg(windows)]
-            Self::Session(device) => Ok(Self::Session(device.try_clone()?)),
+            Self::Session(device) => Ok(Self::Session(device.clone())),
         }
     }
 }
@@ -855,6 +855,7 @@ pub(crate) struct Device {
 impl Device {
     /// One device per configured queue; every handler reads its own queue and passes the same flow table, so a segment that lands on another queue still finds its flow.
     pub(crate) fn open_all(spec: &Spec) -> io::Result<Vec<Self>> {
+        #[cfg(unix)]
         if let Some(handle) = inherited_handle() {
             let framing = inherited_framing(&handle);
             return Ok(vec![Self {
@@ -1189,24 +1190,20 @@ fn inherited_framing(_handle: &std::fs::File) -> Framing {
     Framing::Utun
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn inherited_framing(_handle: &std::fs::File) -> Framing {
     Framing::Raw
 }
 
+#[cfg(unix)]
 fn inherited_handle() -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd;
     let fd_str = std::env::var_os("FERROX_TUN_FD")?;
     let fd: i32 = fd_str.to_str()?.parse().ok()?;
     if fd < 3 {
         return None;
     }
-    #[cfg(unix)]
-    return Some(unsafe { std::fs::File::from_raw_fd(fd) });
-    #[cfg(not(unix))]
-    {
-        let _ = fd;
-        None
-    }
+    Some(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// A Linux open refused the optional offload, so the same spec is retried without it.
@@ -2065,10 +2062,10 @@ impl Handler {
             udp.destination_port,
         );
         // A hijacked query's answer must keep the address the device asked, so that address is the leg's render target while its frame carries the resolver.
-        let render = if self.hijack(ip.destination, udp.destination_port) != ip.destination {
-            Some((ip.destination, udp.destination_port))
-        } else {
+        let render = if self.hijack(ip.destination, udp.destination_port) == ip.destination {
             None
+        } else {
+            Some((ip.destination, udp.destination_port))
         };
         // An endpoint-independent mapping keys on the client source alone; the frame still names each datagram's destination, and the reply's source comes back off that frame.
         let (key, pinned) = if self.endpoint_independent_nat {
