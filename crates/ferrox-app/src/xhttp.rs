@@ -35,6 +35,7 @@ fn bare_path(target: &str) -> &str {
 }
 
 /// The head, the octets that arrived with it, and where the head ends: this read consumes what it proves, so a body pipelined behind the head is already in hand.
+#[cfg(test)]
 fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
     crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
 }
@@ -1191,6 +1192,7 @@ impl Write for XhttpWriter {
     }
 }
 
+#[cfg(test)]
 fn split(read: Connection, prefix: Vec<u8>, at: usize) -> Option<(XhttpReader, XhttpWriter)> {
     let Ok(write) = read.try_clone() else {
         return None;
@@ -1226,6 +1228,16 @@ fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
         stream: OnceLock::new(),
         lease: None,
     };
+    (reader, writer)
+}
+
+// The head the settings dial writes is read by the first `read`: a peer that drains the request before flushing its 200 otherwise deadlocks the dial against its own writer.
+fn split_deferred<R: Read, W: crate::proxy::FrameWrite + 'static>(
+    read: R,
+    write: W,
+) -> (Reader<R>, XhttpWriter) {
+    let (mut reader, writer) = split_halves(read, write, Vec::new(), 0);
+    reader.pending_head = true;
     (reader, writer)
 }
 
@@ -3488,6 +3500,7 @@ thread_local! {
 }
 
 // The stream-one dial: one POST, chunked framing both ways, staged in the thread's own room.
+#[cfg(test)]
 fn send_dial_head<W: crate::proxy::FrameWrite>(
     write: &mut W,
     host: &str,
@@ -3495,32 +3508,47 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
     headers: &[(String, String)],
     pad: &str,
 ) -> Option<()> {
+    send_dial_head_padded(write, host, target, headers, "", "?x_padding=", pad)
+}
+
+fn send_dial_head_padded<W: crate::proxy::FrameWrite>(
+    write: &mut W,
+    host: &str,
+    target: &str,
+    headers: &[(String, String)],
+    padding: &str,
+    referer_prefix: &str,
+    referer_pad: &str,
+) -> Option<()> {
     const BEFORE_PATH: &str = "POST ";
     const BEFORE_HOST: &str = " HTTP/1.1\r\nHost: ";
     const BEFORE_REFERER: &str = "\r\nReferer: http://";
-    const BEFORE_PADDING: &str = "?x_padding=";
     // The reference dialer disables keep-alives (dialer.go:272), and a chunked request whose first chunk waits on the 200 hangs a peer that drains the body before it flushes.
     const TAIL: &str = "Transfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
-    // The default padding's longest shape stays in the room, so a configured pad only grows it when it exceeds the default's ceiling.
-    const PADDING_ROOM: usize = 1000;
     let referer = target.split_once('?').map_or(target, |(path, _)| path);
-    let room = pad.len().max(PADDING_ROOM);
+    let padding_is_referer = padding
+        .split_once(':')
+        .is_some_and(|(name, _)| name.eq_ignore_ascii_case("referer"));
     let headers_len = crate::headers::masked_len(headers, crate::headers::FETCH);
     DIAL_HEAD.with(|cell| {
         let mut head = cell.borrow_mut();
         head.clear();
-        // The room is the head's longest shape, so the allocator is entered once and a default padding never grows it.
+        // The room is the head's exact shape, so the allocator is entered once.
         head.reserve(
             BEFORE_PATH.len()
                 + target.len()
                 + BEFORE_HOST.len()
                 + host.len()
-                + BEFORE_REFERER.len()
-                + host.len()
-                + referer.len()
-                + BEFORE_PADDING.len()
-                + room
-                + 2
+                + if padding_is_referer {
+                    0
+                } else {
+                    BEFORE_REFERER.len()
+                        + host.len()
+                        + referer.len()
+                        + referer_prefix.len()
+                        + referer_pad.len()
+                }
+                + padding.len()
                 + headers_len
                 + TAIL.len(),
         );
@@ -3528,13 +3556,16 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
         head.extend_from_slice(target.as_bytes());
         head.extend_from_slice(BEFORE_HOST.as_bytes());
         head.extend_from_slice(host.as_bytes());
-        head.extend_from_slice(BEFORE_REFERER.as_bytes());
-        head.extend_from_slice(host.as_bytes());
-        head.extend_from_slice(referer.as_bytes());
-        head.extend_from_slice(BEFORE_PADDING.as_bytes());
-        head.extend_from_slice(pad.as_bytes());
-        head.extend_from_slice(b"\r\n");
+        if !padding_is_referer {
+            head.extend_from_slice(BEFORE_REFERER.as_bytes());
+            head.extend_from_slice(host.as_bytes());
+            head.extend_from_slice(referer.as_bytes());
+            head.extend_from_slice(referer_prefix.as_bytes());
+            head.extend_from_slice(referer_pad.as_bytes());
+            head.extend_from_slice(b"\r\n");
+        }
         crate::headers::write_masked(&mut head, headers, crate::headers::FETCH);
+        head.extend_from_slice(padding.as_bytes());
         head.extend_from_slice(TAIL.as_bytes());
         write.write_all(&head).ok()
     })
@@ -3544,12 +3575,75 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
 /// padded referer, and the body's type. H2 encodes the same fields as HEADERS.
 /// The `Referer` an H2 dial encodes: the normalized path and the pad, in one string because HPACK
 /// measures the value it writes before it writes it.
+#[cfg(test)]
 pub(crate) fn referer_value(host: &str, settings: &XhttpSettings) -> String {
-    format!(
-        "http://{host}{}?x_padding={}",
-        normalized_path(settings),
-        referer_pad_value(settings)
-    )
+    let pad = referer_pad_value(settings);
+    referer_value_with(host, settings, &pad)
+}
+
+pub(crate) fn referer_value_with(host: &str, settings: &XhttpSettings, pad: &str) -> String {
+    if settings.x_padding_obfs {
+        format!("http://{host}{}", normalized_path(settings))
+    } else {
+        format!("http://{host}{}?x_padding={pad}", normalized_path(settings))
+    }
+}
+
+/// Whether the pad rides the `Referer` field itself, so the head writes one such field and not two.
+pub(crate) fn padding_is_referer(settings: &XhttpSettings) -> bool {
+    if !settings.x_padding_obfs || !settings.x_padding_header.eq_ignore_ascii_case("referer") {
+        return false;
+    }
+    match settings.x_padding_placement {
+        Placement::Header => !settings.x_padding_header.is_empty(),
+        Placement::QueryInHeader => !settings.x_padding_key.is_empty(),
+        _ => false,
+    }
+}
+
+/// The pad where `xPaddingPlacement` asks for it, so a head the same config reads back finds it.
+fn pad_head(settings: &XhttpSettings, pad: &str) -> String {
+    if !settings.x_padding_obfs {
+        return String::new();
+    }
+    match settings.x_padding_placement {
+        Placement::Header if !settings.x_padding_header.is_empty() => {
+            format!("{}: {pad}\r\n", settings.x_padding_header)
+        }
+        Placement::Cookie if !settings.x_padding_key.is_empty() => {
+            format!("Cookie: {}={pad}\r\n", settings.x_padding_key)
+        }
+        Placement::QueryInHeader
+            if !settings.x_padding_header.is_empty() && !settings.x_padding_key.is_empty() =>
+        {
+            format!(
+                "{}: ?{}={pad}\r\n",
+                settings.x_padding_header, settings.x_padding_key
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+pub(crate) fn pad_target(settings: &XhttpSettings, pad: &str, target: &mut String) {
+    if !settings.x_padding_obfs
+        || settings.x_padding_placement != Placement::Query
+        || settings.x_padding_key.is_empty()
+    {
+        return;
+    }
+    target.push(if target.contains('?') { '&' } else { '?' });
+    target.push_str(&settings.x_padding_key);
+    target.push('=');
+    target.push_str(pad);
+}
+
+fn pad_referer(settings: &XhttpSettings, pad: &str) -> String {
+    if settings.x_padding_obfs {
+        String::new()
+    } else {
+        format!("?x_padding={pad}")
+    }
 }
 
 // The reference's `appendToPath` (config.go:529): a segment lands under the trailing slash, never beside it.
@@ -3651,14 +3745,26 @@ pub(crate) fn dial_head(
     let mut query = settings.query.clone();
     let mut extra = String::new();
     meta_request(settings, session, seq, &mut target, &mut query, &mut extra);
-    let target = target_of(&target, &query);
+    let mut target = target_of(&target, &query);
+    let pad = referer_pad_value(settings);
+    pad_target(settings, &pad, &mut target);
+    let padding = pad_head(settings, &pad);
+    let referer = pad_referer(settings, &pad);
     let content_type = if settings.no_grpc_header {
         "application/octet-stream"
     } else {
         "application/grpc"
     };
     let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
-    format!("{} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Referer: http://{host}{}?x_padding={}\r\nTransfer-Encoding: chunked\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n", settings.uplink_method, normalized_path(settings), referer_pad_value(settings))
+    let referer_line = if padding_is_referer(settings) {
+        String::new()
+    } else {
+        format!(
+            "Referer: http://{host}{}{referer}\r\n",
+            normalized_path(settings)
+        )
+    };
+    format!("{} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}{padding}{referer_line}Transfer-Encoding: chunked\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n", settings.uplink_method)
 }
 
 /// The downlink a packet-up or stream-up dial opens beside its upload (dialer.go:411).
@@ -3667,9 +3773,21 @@ pub(crate) fn downlink_head(host: &str, settings: &XhttpSettings, session: &str)
     let mut query = settings.query.clone();
     let mut extra = String::new();
     meta_request(settings, session, None, &mut target, &mut query, &mut extra);
-    let target = target_of(&target, &query);
+    let mut target = target_of(&target, &query);
+    let pad = referer_pad_value(settings);
+    pad_target(settings, &pad, &mut target);
+    let padding = pad_head(settings, &pad);
+    let referer = pad_referer(settings, &pad);
     let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
-    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Referer: http://{host}{}?x_padding={}\r\nConnection: close\r\n\r\n", normalized_path(settings), referer_pad_value(settings))
+    let referer_line = if padding_is_referer(settings) {
+        String::new()
+    } else {
+        format!(
+            "Referer: http://{host}{}{referer}\r\n",
+            normalized_path(settings)
+        )
+    };
+    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}{padding}{referer_line}Connection: close\r\n\r\n")
 }
 
 /// The referer's pad the dial-side heads draw: a run in the configured range and method, the shape the hub's own check validates (`xpadding.go`'s `MakeXPadding`).
@@ -3696,9 +3814,12 @@ pub(crate) fn packet_head<'a>(
         &mut query,
         &mut extra,
     );
-    let target = combine_target(target, &query);
+    let mut target = combine_target(target, &query);
     let method = settings.uplink_method.as_str();
     let pad = referer_pad_value(settings);
+    pad_target(settings, &pad, &mut target);
+    let padding = pad_head(settings, &pad);
+    let referer = pad_referer(settings, &pad);
     match settings.uplink_data_placement {
         Placement::Header | Placement::Cookie => {
             let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(piece);
@@ -3749,21 +3870,29 @@ pub(crate) fn packet_head<'a>(
                 "Content-Length: 0\r\n"
             };
             let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
+            let referer_line = if padding_is_referer(settings) {
+                String::new()
+            } else {
+                format!("Referer: http://{host}{}{referer}\r\n", settings.path)
+            };
             (
                 format!(
-                    "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Referer: http://{host}{}?x_padding={pad}\r\n{zero}Connection: keep-alive\r\n\r\n",
-                    settings.path
+                    "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}{padding}{referer_line}{zero}Connection: keep-alive\r\n\r\n"
                 ),
                 None,
             )
         }
         _ => {
             let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
+            let referer_line = if padding_is_referer(settings) {
+                String::new()
+            } else {
+                format!("Referer: http://{host}{}{referer}\r\n", settings.path)
+            };
             (
             format!(
-                "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Content-Length: {}\r\nReferer: http://{host}{}?x_padding={pad}\r\nConnection: keep-alive\r\n\r\n",
-                piece.len(),
-                settings.path
+                "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}{padding}Content-Length: {}\r\n{referer_line}Connection: keep-alive\r\n\r\n",
+                piece.len()
             ),
             Some(piece),
             )
@@ -3848,6 +3977,7 @@ pub(crate) fn connect_dual_split<
     Some((reader, writer))
 }
 
+#[cfg(test)]
 pub(crate) fn connect(
     stream: Connection,
     host: &str,
@@ -3863,6 +3993,7 @@ pub(crate) fn connect(
 }
 
 // The same connect over halves that cannot peek: pipelined bytes arrive as a prefix.
+#[cfg(test)]
 pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut read: R,
     mut write: W,
@@ -3876,6 +4007,56 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head[..at])?;
     Some(split_halves(read, write, head, at))
+}
+
+fn dial_head_parts(settings: &XhttpSettings) -> (String, String, String) {
+    let mut target = dial_path(settings);
+    let pad = referer_pad_value(settings);
+    pad_target(settings, &pad, &mut target);
+    let padding = pad_head(settings, &pad);
+    let referer = pad_referer(settings, &pad);
+    (target, padding, referer)
+}
+
+pub(crate) fn connect_settings(
+    stream: Connection,
+    host: &str,
+    settings: &XhttpSettings,
+) -> Option<(XhttpReader, XhttpWriter)> {
+    let mut read = stream;
+    let Ok(write) = read.try_clone() else {
+        return None;
+    };
+    let (target, padding, referer) = dial_head_parts(settings);
+    send_dial_head_padded(
+        &mut read,
+        host,
+        &target,
+        &settings.headers,
+        &padding,
+        "",
+        &referer,
+    )?;
+    Some(split_deferred(read, write))
+}
+
+pub(crate) fn connect_split_settings<R: Read, W: crate::proxy::FrameWrite + 'static>(
+    read: R,
+    mut write: W,
+    host: &str,
+    settings: &XhttpSettings,
+) -> Option<(Reader<R>, XhttpWriter)> {
+    let (target, padding, referer) = dial_head_parts(settings);
+    send_dial_head_padded(
+        &mut write,
+        host,
+        &target,
+        &settings.headers,
+        &padding,
+        "",
+        &referer,
+    )?;
+    Some(split_deferred(read, write))
 }
 
 impl crate::proxy::CarrierSink for XhttpWriter {
@@ -5011,6 +5192,86 @@ mod tests {
             r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "mode": "stream-one", "sessionIDPlacement": "query", "seqPlacement": "query"}}}"#,
         );
         assert_eq!(dial_path(&query), "/share");
+    }
+
+    /// The outgoing pad follows `xPaddingPlacement`, so a hub running the same settings finds it where its extractor looks.
+    #[test]
+    fn outgoing_padding_follows_the_configured_placement() {
+        let mut settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up/"}}}"#,
+        );
+        settings.x_padding_obfs = true;
+        settings.x_padding_method = PadMethod::RepeatX;
+        settings.x_padding_bytes = (8, 8);
+        settings.x_padding_header = "X-Pad".to_owned();
+        settings.x_padding_key = "pad".to_owned();
+        for (placement, marker) in [
+            (Placement::Header, "X-Pad: XXXXXXXX\r\n"),
+            (Placement::Cookie, "Cookie: pad=XXXXXXXX\r\n"),
+            (Placement::QueryInHeader, "X-Pad: ?pad=XXXXXXXX\r\n"),
+            (Placement::Query, "?pad=XXXXXXXX"),
+        ] {
+            settings.x_padding_placement = placement;
+            let pad = referer_pad_value(&settings);
+            assert_eq!(pad, "XXXXXXXX", "the pad is the configured run");
+            for head in [
+                dial_head("front.example", &settings, "session", None),
+                downlink_head("front.example", &settings, "session"),
+                packet_head("front.example", &settings, "session", 0, b"payload").0,
+            ] {
+                assert!(head.contains(marker), "{placement:?}: {head}");
+                assert!(
+                    !head.contains("?x_padding="),
+                    "{placement:?} keeps the pad out of the referer: {head}"
+                );
+                let target = head.split_ascii_whitespace().nth(1).unwrap_or_default();
+                assert_eq!(
+                    extract_padding(&head, target, &settings),
+                    Some("XXXXXXXX"),
+                    "{placement:?} writes a pad the hub reads back: {head}"
+                );
+            }
+        }
+
+        let mut defaulted = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up/", "xPaddingObfsMode": true}}}"#,
+        );
+        defaulted.x_padding_method = PadMethod::RepeatX;
+        defaulted.x_padding_bytes = (8, 8);
+        let head = dial_head("front.example", &defaulted, "session", None);
+        assert!(
+            head.contains("X-Padding: ?x_padding=XXXXXXXX\r\n"),
+            "the default placement is queryInHeader: {head}"
+        );
+        let target = head.split_ascii_whitespace().nth(1).unwrap_or_default();
+        assert_eq!(
+            extract_padding(&head, target, &defaulted),
+            Some("XXXXXXXX"),
+            "the hub reads the default placement back: {head}"
+        );
+
+        for placement in [Placement::Header, Placement::QueryInHeader] {
+            let mut named = settings.clone();
+            named.x_padding_placement = placement;
+            named.x_padding_header = "Referer".to_owned();
+            for head in [
+                dial_head("front.example", &named, "session", None),
+                downlink_head("front.example", &named, "session"),
+                packet_head("front.example", &named, "session", 0, b"payload").0,
+            ] {
+                assert_eq!(
+                    head.matches("Referer:").count(),
+                    1,
+                    "{placement:?} names the referer once: {head}"
+                );
+                let target = head.split_ascii_whitespace().nth(1).unwrap_or_default();
+                assert_eq!(
+                    extract_padding(&head, target, &named),
+                    Some("XXXXXXXX"),
+                    "{placement:?} keeps the pad in the referer: {head}"
+                );
+            }
+        }
     }
 
     /// The pad hangs off the referer's path alone: the configured query rides on the request line, so the hub's extractor still finds `x_padding` when both are set.

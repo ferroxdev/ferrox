@@ -2232,12 +2232,16 @@ impl H2Client {
 }
 
 fn request_block(host: &str, settings: &XhttpSettings, scheme: &str) -> Vec<u8> {
-    let path = crate::xhttp::dial_path(settings);
-    let referer = crate::xhttp::referer_value(host, settings);
+    let mut path = crate::xhttp::dial_path(settings);
+    let pad = crate::xhttp::referer_pad_value(settings);
+    crate::xhttp::pad_target(settings, &pad, &mut path);
+    let referer = crate::xhttp::referer_value_with(host, settings, &pad);
     let capacity = 16
         + path.len()
         + host.len()
         + referer.len()
+        + pad.len()
+        + settings.x_padding_key.len()
         + crate::headers::masked_len(&settings.headers, crate::headers::FETCH);
     let mut out = Vec::with_capacity(capacity);
     crate::h2::push_header(&mut out, ":method", "POST");
@@ -2255,7 +2259,27 @@ fn request_block(host: &str, settings: &XhttpSettings, scheme: &str) -> Vec<u8> 
         }
         crate::h2::push_lower(&mut out, name, value);
     });
-    crate::h2::push_header(&mut out, "referer", &referer);
+    if settings.x_padding_obfs {
+        match settings.x_padding_placement {
+            crate::xhttp::Placement::Header if !settings.x_padding_header.is_empty() => {
+                crate::h2::push_lower(&mut out, &settings.x_padding_header, &pad);
+            }
+            crate::xhttp::Placement::Cookie if !settings.x_padding_key.is_empty() => {
+                let value = format!("{}={pad}", settings.x_padding_key);
+                crate::h2::push_lower(&mut out, "cookie", &value);
+            }
+            crate::xhttp::Placement::QueryInHeader
+                if !settings.x_padding_header.is_empty() && !settings.x_padding_key.is_empty() =>
+            {
+                let value = format!("?{}={pad}", settings.x_padding_key);
+                crate::h2::push_lower(&mut out, &settings.x_padding_header, &value);
+            }
+            _ => {}
+        }
+    }
+    if !crate::xhttp::padding_is_referer(settings) {
+        crate::h2::push_header(&mut out, "referer", &referer);
+    }
     crate::h2::push_header(&mut out, "content-type", "application/octet-stream");
     out
 }
@@ -3874,10 +3898,36 @@ mod tests {
             name.make_ascii_lowercase();
             fields.push((name, value.to_owned()));
         });
-        fields.push((
-            "referer".to_owned(),
-            crate::xhttp::referer_value(host, settings),
-        ));
+        if settings.x_padding_obfs {
+            let pad = crate::xhttp::referer_pad_value(settings);
+            match settings.x_padding_placement {
+                crate::xhttp::Placement::Header if !settings.x_padding_header.is_empty() => {
+                    fields.push((settings.x_padding_header.to_ascii_lowercase(), pad));
+                }
+                crate::xhttp::Placement::Cookie if !settings.x_padding_key.is_empty() => {
+                    fields.push((
+                        "cookie".to_owned(),
+                        format!("{}={pad}", settings.x_padding_key),
+                    ));
+                }
+                crate::xhttp::Placement::QueryInHeader
+                    if !settings.x_padding_header.is_empty()
+                        && !settings.x_padding_key.is_empty() =>
+                {
+                    fields.push((
+                        settings.x_padding_header.to_ascii_lowercase(),
+                        format!("?{}={pad}", settings.x_padding_key),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if !crate::xhttp::padding_is_referer(settings) {
+            fields.push((
+                "referer".to_owned(),
+                crate::xhttp::referer_value(host, settings),
+            ));
+        }
         fields.push((
             "content-type".to_owned(),
             "application/octet-stream".to_owned(),
@@ -3921,6 +3971,40 @@ mod tests {
             staged_request_block("example.test", &carrier, "https"),
             "the in-place encoder changed a carrier head"
         );
+    }
+
+    #[test]
+    fn query_in_header_padding_is_a_query_value() {
+        let mut settings = XhttpSettings::stream_one();
+        settings.x_padding_obfs = true;
+        settings.x_padding_placement = crate::xhttp::Placement::QueryInHeader;
+        settings.x_padding_method = crate::xhttp::PadMethod::RepeatX;
+        settings.x_padding_bytes = (8, 8);
+        assert_eq!(
+            request_block("example.test", &settings, "https"),
+            staged_request_block("example.test", &settings, "https"),
+            "queryInHeader carries the delimiter query_param reads"
+        );
+    }
+
+    #[test]
+    fn referer_padding_header_keeps_a_single_referer_field() {
+        let mut settings = XhttpSettings::stream_one();
+        settings.x_padding_obfs = true;
+        settings.x_padding_method = crate::xhttp::PadMethod::RepeatX;
+        settings.x_padding_bytes = (8, 8);
+        settings.x_padding_header = "Referer".to_owned();
+        for placement in [
+            crate::xhttp::Placement::Header,
+            crate::xhttp::Placement::QueryInHeader,
+        ] {
+            settings.x_padding_placement = placement;
+            assert_eq!(
+                request_block("example.test", &settings, "https"),
+                staged_request_block("example.test", &settings, "https"),
+                "{placement:?} keeps the pad in the referer the hub reads"
+            );
+        }
     }
 
     #[test]
