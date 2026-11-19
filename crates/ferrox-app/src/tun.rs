@@ -779,7 +779,7 @@ pub(crate) enum Handle {
     #[cfg(unix)]
     File(std::fs::File),
     #[cfg(windows)]
-    Session(tun_rs::SyncDevice),
+    Session(std::sync::Arc<tun_rs::SyncDevice>),
 }
 
 impl Handle {
@@ -794,7 +794,7 @@ impl Handle {
             #[cfg(unix)]
             Self::File(file) => Ok(Self::File(file.try_clone()?)),
             #[cfg(windows)]
-            Self::Session(device) => Ok(Self::Session(device.clone())),
+            Self::Session(device) => Ok(Self::Session(std::sync::Arc::clone(device))),
         }
     }
 }
@@ -908,7 +908,7 @@ impl Device {
             let (device, _, _) = crate::tun_stack::build(spec, false, false)?;
             let name = device.name().unwrap_or_default();
             Ok(vec![Self {
-                handle: Handle::Session(device),
+                handle: Handle::Session(std::sync::Arc::new(device)),
                 name,
                 mtu: spec.mtu,
                 framing: Framing::Raw,
