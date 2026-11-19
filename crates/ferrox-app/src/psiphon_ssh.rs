@@ -4926,6 +4926,7 @@ fn handshake_key_name(key: u64) -> Option<&'static str> {
 }
 
 /// The SSH API handshake every Psiphon server requires before it permits a port forward.
+#[allow(clippy::too_many_arguments)]
 fn handshake(
     writer: &mut PacketWriter,
     reader: &mut PacketReader,
