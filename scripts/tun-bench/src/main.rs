@@ -14,6 +14,8 @@ const DOWNLOAD: u8 = 1;
 const ECHO: u8 = 2;
 const RR: u8 = 3;
 
+const LEASE: Duration = Duration::from_millis(250);
+
 const USAGE: &str = "usage: ferrox-tun-bench <command> [options]
 
   tcp-server --listen ADDR:PORT
@@ -215,6 +217,8 @@ fn stream_run(
         return;
     };
     let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(LEASE));
+    let _ = stream.set_write_timeout(Some(LEASE));
     let mode = if reverse { DOWNLOAD } else { UPLOAD };
     if stream.write_all(&header(mode, 0)).is_err() {
         failed.fetch_add(1, Ordering::SeqCst);
@@ -231,7 +235,17 @@ fn stream_run(
         match step {
             Ok(0) => break,
             Ok(n) => moved += n as u64,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A full pipe is a stall, not the deadline: the loop asks again until the clock says stop.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
             Err(_) => {
                 failed.fetch_add(1, Ordering::SeqCst);
                 break;
@@ -288,6 +302,8 @@ fn round_trips(endpoint: SocketAddr, size: u16, deadline: Instant) -> (Vec<u64>,
         return (Vec::new(), 1);
     };
     let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(LEASE));
+    let _ = stream.set_write_timeout(Some(LEASE));
     if stream.write_all(&header(RR, size as u16)).is_err() {
         return (Vec::new(), 1);
     }
@@ -443,6 +459,11 @@ fn udp_client(args: &Args) {
         ),
     );
     println!("{received} of {sent} echoed, {measured:.0} pps");
+    // An echo that answers nothing is the engine's hole, not a zero to record for it.
+    let echo = args.flag("--echo");
+    if echo && received == 0 {
+        exit(1);
+    }
 }
 
 /// Stamps and sends one batch, so a 100k pps offer does not pay a syscall a datagram.
