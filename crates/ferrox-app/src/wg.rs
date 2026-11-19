@@ -1186,7 +1186,7 @@ pub(crate) fn serve_inbound(
     let io_recycle = recycle.clone();
     let io_config = config.clone();
     let io_packets = packets_tx.clone();
-    let io_stop = stop.map(crate::proxy::Stop::shared);
+    let io_stop = stop.map(|stop| stop.shared());
     let io_closed = stop.cloned();
     std::thread::spawn(move || {
         io(
@@ -3047,7 +3047,7 @@ mod tests {
         let inbound =
             crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let port = serve_inbound(&inbound, &out, "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None).expect("serve");
         assert_ne!(port, 0);
 
         let client = DeviceConfig::from_json(
@@ -3160,7 +3160,7 @@ mod tests {
         let inbound =
             crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let port = serve_inbound(&inbound, &out, "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None).expect("serve");
 
         let dead = UdpSocket::bind("127.0.0.1:0").expect("dead endpoint");
         let client = DeviceConfig {
@@ -3521,7 +3521,7 @@ mod tests {
         let inbound =
             crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let port = serve_inbound(&inbound, &out, "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None).expect("serve");
 
         let client = DeviceConfig::from_json(
             &crate::json::parse(&format!(

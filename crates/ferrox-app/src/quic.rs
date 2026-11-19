@@ -5205,6 +5205,7 @@ pub(crate) fn serve_loop(
         fresh: Vec::new(),
         learned: Vec::new(),
         closed: Vec::new(),
+        retired_owners: Vec::new(),
         epoch: 0,
         deadline: None,
     };
