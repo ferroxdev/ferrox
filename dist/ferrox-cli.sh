@@ -2604,21 +2604,22 @@ choose_carrier() {
 }
 
 start_lane() {
-  local new_cfg new_fronts old_exit
+  local new_cfg new_fronts old_exit lane_pid reg_dir status=0
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
+  require_bin
+  proxy_lock || return 1
   # Validate first: an invocation that cannot start must not stop a healthy lane,
   # and a bad link must not send the user to a build before saying what is wrong.
   old_exit="$(trap -p EXIT)"
-  trap '[ "$WARP_STARTED" = 1 ] && stop_warp_hop' EXIT
+  trap 'status=$?; [ "$WARP_STARTED" = 1 ] && stop_warp_hop; proxy_unlock; exit $status' EXIT
   build_config
   if [ -n "$old_exit" ]; then eval "$old_exit"; else trap - EXIT; fi
-  require_bin
-  proxy_lock || return 1
+  reg_dir="$(absolute_path "$CONF_DIR")"
   if ! { touch "$LANES_FILE" &&
-         { grep -Fxq "$CONF_DIR" "$LANES_FILE" || printf '%s\n' "$CONF_DIR" >> "$LANES_FILE"; }; }; then
+         { grep -Fxq "$reg_dir" "$LANES_FILE" || printf '%s\n' "$reg_dir" >> "$LANES_FILE"; }; }; then
     proxy_unlock
-    say "lane: cannot record $CONF_DIR in $LANES_FILE." >&2
+    say "lane: cannot record $reg_dir in $LANES_FILE." >&2
     return 1
   fi
   # stop_lane reads the old meta to name the process it must kill, so keep the
@@ -2638,7 +2639,10 @@ start_lane() {
   else
     "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
   fi
-  if ! echo "$!" > "$PID_FILE"; then
+  lane_pid=$!
+  if ! echo "$lane_pid" > "$PID_FILE"; then
+    kill "$lane_pid" 2>/dev/null || true
+    wait "$lane_pid" 2>/dev/null || true
     proxy_unlock
     return 1
   fi
@@ -2768,17 +2772,17 @@ forget_lane_config() {
 stop_all_lanes() {
   local saved_conf="$CONF_DIR" saved_instance="$INSTANCE" dir pidfile base rc=0
   local -a forget=()
-  local pending="$STATE_DIR/logout.pending"
+  local pending="$STATE_DIR/logout.pending" pending_tmp
   proxy_lock || return 1
   if [ -r "$pending" ]; then
     while IFS= read -r dir; do
-      [ -n "$dir" ] && forget+=("$dir")
+      [ -n "$dir" ] && forget+=("$(absolute_path "$dir")")
     done <"$pending"
   fi
   if [ -r "$LANES_FILE" ]; then
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue
-      CONF_DIR="$dir"
+      CONF_DIR="$(absolute_path "$dir")"
       INSTANCE=""
       apply_instance
       for pidfile in "$CONF_DIR"/lane*.pid; do
@@ -2799,7 +2803,7 @@ stop_all_lanes() {
       done
     done < "$LANES_FILE"
   fi
-  CONF_DIR="$saved_conf"
+  CONF_DIR="$(absolute_path "$saved_conf")"
   INSTANCE=""
   apply_instance
   for pidfile in "$CONF_DIR"/lane*.pid; do
@@ -2822,10 +2826,19 @@ stop_all_lanes() {
   apply_instance
   system_proxy_off 1 || rc=1
   if [ "$rc" -eq 0 ]; then
-    if [ "${#forget[@]}" -gt 0 ]; then rm -f "${forget[@]}"; fi
-    rm -f "$pending"
-  elif [ "${#forget[@]}" -gt 0 ]; then
-    printf '%s\n' "${forget[@]}" >"$pending"
+    if [ "${#forget[@]}" -gt 0 ] && ! rm -f "${forget[@]}"; then
+      rc=1
+    fi
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$pending"
+    fi
+  fi
+  if [ "$rc" -ne 0 ] && [ "${#forget[@]}" -gt 0 ]; then
+    pending_tmp="$pending.$$"
+    if ! { printf '%s\n' "${forget[@]}" >"$pending_tmp" && mv -f "$pending_tmp" "$pending"; }; then
+      rm -f "$pending_tmp"
+      rc=1
+    fi
   fi
   proxy_unlock
   CONF_DIR="$saved_conf"

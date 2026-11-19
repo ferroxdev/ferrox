@@ -101,6 +101,7 @@ def main() -> int:
             f"{path.name}/{item.name}"
             for path in (conf, state)
             for item in path.iterdir()
+            if item.name != "system-proxy.lock.d"
         )
         if left:
             print(
