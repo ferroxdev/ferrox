@@ -202,6 +202,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.plan.outputs.version }}
+          REF: ${{ needs.plan.outputs.ref }}
           BODY: |-
             ## Ferrox VERSION_PLACEHOLDER
 
@@ -338,7 +339,7 @@ jobs:
 
             `README.md` in each package is the quickstart; `USAGE.md` is the full manual. `GeoLite2-Country.mmdb` is a separate optional asset for configs that ask the binary for country data; it is not unpacked by the lane packages. Its checksum is in the same `SHA256SUMS`.
         run: |
-          printf "%s\n\nBuilt by \`release.yml\` from commit \`%s\`.\n" "$BODY" "${GITHUB_SHA::8}" \
+          printf "%s\n\nBuilt by \`release.yml\` from commit \`%s\`.\n" "$BODY" "${REF::8}" \
             | sed "s/VERSION_PLACEHOLDER/${VERSION#v}/g" >RELEASE-BODY.md
           head -5 RELEASE-BODY.md
       - name: open the release
