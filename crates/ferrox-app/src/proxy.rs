@@ -547,6 +547,28 @@ fn inbound_is_xhttp_h3(inbound: &Json) -> bool {
     names.as_slice() == ["h3"]
 }
 
+fn stop_covers_inbound(inbound: &Json, protocol: &str) -> bool {
+    let carrier = inbound_carrier(inbound);
+    match protocol {
+        "vless" | "trojan" | "vmess" => !matches!(
+            carrier,
+            Carrier::Kcp(_) | Carrier::Xdrive { .. } | Carrier::Hysteria(_)
+        ),
+        "shadowsocks" => match carrier {
+            Carrier::Raw(_) => {
+                let (tcp, udp) = inbound_ss_networks(inbound);
+                tcp && !udp
+            }
+            Carrier::Kcp(_) | Carrier::Xdrive { .. } | Carrier::Hysteria(_) | Carrier::Quic => {
+                false
+            }
+            _ => inbound_ss_networks(inbound).0,
+        },
+        "socks" | "http" | "mixed" => true,
+        _ => false,
+    }
+}
+
 #[allow(
     clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
@@ -634,7 +656,7 @@ fn serve_inbounds_counted(
             let before = inbounds;
             let mut armed_addresses: Vec<String> = Vec::new();
             let mut bind_failure = false;
-            let h3_stop = if inbound_is_xhttp_h3(inbound) {
+            let recorded_stop = if stop_covers_inbound(inbound, protocol) {
                 handler_stop.as_ref()
             } else {
                 None
@@ -652,7 +674,7 @@ fn serve_inbounds_counted(
                             portals,
                             handler_stop.as_ref(),
                         ) {
-                            if let Some(stop) = h3_stop {
+                            if let Some(stop) = recorded_stop {
                                 handler_stops.push((Arc::clone(stop), address.clone()));
                             }
                             inbounds += 1;
@@ -660,7 +682,7 @@ fn serve_inbounds_counted(
                     }
                     "trojan" => {
                         if serve_trojan_inbound(address, inbound, freedom, handler_stop.as_ref()) {
-                            if let Some(stop) = h3_stop {
+                            if let Some(stop) = recorded_stop {
                                 handler_stops.push((Arc::clone(stop), address.clone()));
                             }
                             inbounds += 1;
@@ -675,16 +697,8 @@ fn serve_inbounds_counted(
                             handler_stop.as_ref().map(Arc::clone),
                             users,
                         ) {
-                            if let Some(stop) = &handler_stop {
-                                if !matches!(
-                                    inbound_carrier(inbound),
-                                    Carrier::Kcp(_)
-                                        | Carrier::Xdrive { .. }
-                                        | Carrier::Quic
-                                        | Carrier::Hysteria(_)
-                                ) {
-                                    handler_stops.push((Arc::clone(stop), address.clone()));
-                                }
+                            if let Some(stop) = recorded_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
                             }
                             inbounds += 1;
                         }
@@ -697,7 +711,7 @@ fn serve_inbounds_counted(
                             &configured,
                             handler_stop.as_ref(),
                         ) {
-                            if let Some(stop) = h3_stop {
+                            if let Some(stop) = recorded_stop {
                                 handler_stops.push((Arc::clone(stop), address.clone()));
                             }
                             inbounds += 1;
@@ -772,6 +786,9 @@ fn serve_inbounds_counted(
                             inbound_tag(inbound),
                             handler_stop.clone(),
                         );
+                        if let Some(stop) = recorded_stop {
+                            handler_stops.push((Arc::clone(stop), address.clone()));
+                        }
                         inbounds += 1;
                     }
                     "dokodemo-door" => {
@@ -1008,7 +1025,7 @@ fn inbound_sockets(inbound: &Json, protocol: &str) -> (bool, bool) {
             let (tcp, udp) = inbound_ss_networks(inbound);
             match inbound_carrier(inbound) {
                 Carrier::Kcp(_) | Carrier::Hysteria(_) => (false, tcp),
-                // A stream carrier keeps serving tcp when the optional datagram front cannot bind.
+                // CR-029: a tcp carrier still serves when its optional udp front loses the bind, so only preflight a udp-only inbound.
                 Carrier::Raw(_) => (tcp, udp && !tcp),
                 _ => (tcp, false),
             }
@@ -10462,14 +10479,20 @@ fn serve_vless_quic_inbound(
             decryption.as_deref(),
         );
     });
-    let stop = stop.map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
+    let stop = stop.cloned();
+    let poll = stop
+        .as_ref()
+        .map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
     thread::spawn(move || {
         crate::quic::serve_loop(
             crate::quic::Datagram::plain(sock),
             &Arc::new(Mutex::new(config)),
             &serve,
-            &stop,
+            &poll,
         );
+        if let Some(stop) = stop {
+            stop.mark_closed();
+        }
     });
     true
 }
@@ -16239,14 +16262,20 @@ fn serve_trojan_quic_inbound(
     let serve: crate::quic::Serve = Arc::new(move |stream| {
         serve_trojan_quic(stream.with_meter(meter.clone()), &key, freedom);
     });
-    let stop = stop.map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
+    let stop = stop.cloned();
+    let poll = stop
+        .as_ref()
+        .map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
     thread::spawn(move || {
         crate::quic::serve_loop(
             crate::quic::Datagram::plain(sock),
             &Arc::new(Mutex::new(config)),
             &serve,
-            &stop,
+            &poll,
         );
+        if let Some(stop) = stop {
+            stop.mark_closed();
+        }
     });
     true
 }
@@ -16643,14 +16672,20 @@ fn serve_vmess_quic_inbound(
     let serve: crate::quic::Serve = Arc::new(move |stream| {
         serve_vmess_quic(stream.with_meter(meter.clone()), &users, freedom);
     });
-    let stop = stop.map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
+    let stop = stop.cloned();
+    let poll = stop
+        .as_ref()
+        .map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
     thread::spawn(move || {
         crate::quic::serve_loop(
             crate::quic::Datagram::plain(sock),
             &Arc::new(Mutex::new(config)),
             &serve,
-            &stop,
+            &poll,
         );
+        if let Some(stop) = stop {
+            stop.mark_closed();
+        }
     });
     true
 }
@@ -17019,6 +17054,9 @@ fn serve_dokodemo(
             armed += 1;
         }
     }
+    if fallible && dokodemo_has(&networks, "tcp") && !tcp_armed {
+        return (armed, tcp_armed);
+    }
     if dokodemo_has(&networks, "udp") {
         // The door's own socket is bound before the inbound is armed: a port nobody holds answers a datagram with a refusal.
         let mut listen = None;
@@ -17341,6 +17379,7 @@ fn serve_ss_relay_inbound(
     inbound: &Json,
     password: &str,
     method: &str,
+    stop: Option<&Arc<Stop>>,
 ) -> RelayFront {
     let relay_dests = inbound_ss_destinations(inbound, method);
     if relay_dests.is_empty() {
@@ -17387,9 +17426,16 @@ fn serve_ss_relay_inbound(
         let method = method.to_owned();
         let psk = psk.clone();
         let relay_dests = relay_dests.clone();
+        let stop = stop.cloned();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
+                if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+                    break;
+                }
                 crate::shadowsocks2022::serve_relay(stream, &method, &psk, &relay_dests);
+            }
+            if let Some(stop) = stop {
+                stop.mark_closed();
             }
         });
     }
@@ -17413,6 +17459,7 @@ fn serve_ss_relay_front(
     accounts: &Arc<crate::shadowsocks::SsAccounts>,
     carrier: &Carrier,
     freedom: bool,
+    stop: Option<&Arc<Stop>>,
 ) -> Option<bool> {
     if let Carrier::Hysteria(config) = carrier {
         let tcp = inbound_ss_networks(inbound).0;
@@ -17423,7 +17470,7 @@ fn serve_ss_relay_front(
     if !matches!(carrier, Carrier::Raw(_)) {
         return None;
     }
-    match serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method) {
+    match serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method, stop) {
         RelayFront::Served => Some(true),
         RelayFront::Refused => Some(false),
         RelayFront::NotRelay => None,
@@ -17594,7 +17641,8 @@ fn serve_shadowsocks_inbound(
         );
     }
     // The 2022 relay opens each listener the inbound's network list names, so a tcp-only relay binds no udp socket.
-    if let Some(served) = serve_ss_relay_front(address, inbound, &accounts, &carrier, freedom) {
+    if let Some(served) = serve_ss_relay_front(address, inbound, &accounts, &carrier, freedom, stop)
+    {
         return served;
     }
     // Bind the datagram front here: a worker that binds after this function answers true would turn a lost race for the port into a live inbound that never answers.
@@ -65201,7 +65249,8 @@ mod tests {
                 "203.0.113.1:9",
                 &inbound,
                 "MDEyMzQ1Njc4OUFCQ0RFRg==",
-                "2022-blake3-aes-128-gcm"
+                "2022-blake3-aes-128-gcm",
+                None
             ),
             RelayFront::Refused,
             "a udp-only relay that cannot bind is not served"

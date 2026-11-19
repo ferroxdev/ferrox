@@ -394,7 +394,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, owner: Option<IpAddr>) {
         let Some((dest, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
             continue;
         };
-        if owner.is_some_and(|owner| owner != src.ip()) {
+        if owner.is_some_and(|owner| owner.to_canonical() != src.ip().to_canonical()) {
             continue;
         }
         let Ok(mut client) = lane.client.lock() else {

@@ -73,7 +73,6 @@ impl UdpMessage<'_> {
     pub fn validate(&self) -> bool {
         !self.host.is_empty()
             && self.host.len() <= MAX_ADDRESS
-            && !self.payload.is_empty()
             && self.payload.len() <= MAX_UDP_PAYLOAD
             && self.frags != 0
             && (self.frags == 1 || (self.packet != 0 && self.frag < self.frags))
@@ -286,12 +285,22 @@ pub struct Fragments<'a> {
     chunks: core::slice::Chunks<'a, u8>,
     next: u8,
     total: u8,
+    empty: bool,
 }
 
 impl<'a> Iterator for Fragments<'a> {
     type Item = UdpMessage<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.empty {
+            self.empty = false;
+            return Some(UdpMessage {
+                frag: 0,
+                frags: 1,
+                payload: &[],
+                ..self.message
+            });
+        }
         let payload = self.chunks.next()?;
         let message = UdpMessage {
             frag: self.next,
@@ -304,7 +313,11 @@ impl<'a> Iterator for Fragments<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.chunks.size_hint()
+        if self.empty {
+            (1, Some(1))
+        } else {
+            self.chunks.size_hint()
+        }
     }
 }
 
@@ -319,8 +332,11 @@ pub fn fragments_udp<'a>(
         .checked_sub(message.header_len())
         .filter(|room| *room > 0)
         .ok_or(RequestError::Invalid)?;
-    let total = u8::try_from(message.payload.len().div_ceil(capacity))
-        .map_err(|_| RequestError::Invalid)?;
+    let total = if message.payload.is_empty() {
+        1
+    } else {
+        u8::try_from(message.payload.len().div_ceil(capacity)).map_err(|_| RequestError::Invalid)?
+    };
     if total > 1 && message.packet == 0 {
         return Err(RequestError::Invalid);
     }
@@ -329,6 +345,7 @@ pub fn fragments_udp<'a>(
         chunks: message.payload.chunks(capacity),
         next: 0,
         total,
+        empty: message.payload.is_empty(),
     })
 }
 
@@ -618,8 +635,29 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_udp_payload_is_one_empty_fragment() {
+        let message = UdpMessage {
+            session: 3,
+            host: "example.org",
+            port: 53,
+            packet: 0,
+            frag: 0,
+            frags: 1,
+            payload: &[],
+        };
+        let fragments: Vec<_> = fragments_udp(&message, 40).expect("fragments").collect();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].frag, 0);
+        assert_eq!(fragments[0].frags, 1);
+        assert!(fragments[0].payload.is_empty());
+        let mut wire = Vec::new();
+        encode_udp(&fragments[0], &mut wire).expect("encodes");
+        assert!(decode_udp(&wire).expect("decodes").payload.is_empty());
+    }
+
+    #[test]
     fn every_length_survives_fragment_then_defrag_intact() {
-        for len in 1..=200usize {
+        for len in 0..=200usize {
             let payload = vec![len as u8; len];
             let message = UdpMessage {
                 session: 9,
