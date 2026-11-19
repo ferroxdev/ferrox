@@ -180,10 +180,23 @@ fn another_lane_runs(paths: &Paths) -> Result<bool, String> {
             if !pid || entry.path() == paths.pid_file {
                 continue;
             }
-            if read_trim(&entry.path())
-                .and_then(|text| text.parse().ok())
-                .is_some_and(crate::lane::alive)
-            {
+            let text = match read_trim_checked(&entry.path()) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "system proxy: cannot read {}: {error}; the snapshot was kept.",
+                        entry.path().display()
+                    ));
+                }
+            };
+            let Ok(pid) = text.parse() else {
+                return Err(format!(
+                    "system proxy: cannot parse {}; the snapshot was kept.",
+                    entry.path().display()
+                ));
+            };
+            if crate::lane::alive(pid) {
                 return Ok(true);
             }
         }

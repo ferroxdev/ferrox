@@ -54,7 +54,7 @@ A second frame prices the head walk: `the_head_walk_costs_the_head_and_nothing_e
 
 ## Time
 
-**Not measured.** `scripts/lib-matrix.sh` carries no benchmark cell for this row — no `http-*` scenario id exists — so `bench.yml` and `compare.yml` gate nothing here; the live shape is the `foxy-relay.yml` http-front legs, which download 1 MB through the front and do not gate on duration either.
+The matrix cell `http-raw-down-8` in `scripts/lib-matrix.sh` is the duration gate for the raw HTTP front; `bench.yml` and `compare.yml` compare it against the reference. Per-request handler time remains unmeasured, so no duration for the handler itself is claimed here.
 
 ## What we removed
 

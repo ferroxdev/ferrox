@@ -3062,12 +3062,21 @@ impl Runtime {
         let Some(route) = &self.route else {
             return Err("routing not configured".to_owned());
         };
+        let server_inbounds = route
+            .server_inbounds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let direct = |named: &str| direct_tag(route, named);
+        let proofs: Vec<crate::router::ServerProof<'_>> = server_inbounds
+            .iter()
+            .map(|inbound| server_proof(route, inbound.tag.as_deref(), &inbound.networks, &direct))
+            .collect();
         route
             .routing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove_rules(tag);
-        Ok(())
+            .remove_rules(tag, &proofs)
     }
 
     /// The tag a `RoutingService.TestRoute` context routes to, or `None` for xray's no-clue.
@@ -14726,17 +14735,21 @@ fn xdrive_relay_until(app: &Connection, mut down: crate::xdrive::Conn, response_
     let done = RelayPool::global().run(move || {
         let mut app_read = app_read;
         let mut buf = RelayBuf::new().into_vec();
+        let mut wrote = true;
         loop {
             match app_read.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if up.write_all(&buf[..n]).is_err() {
+                        wrote = false;
                         break;
                     }
                 }
             }
         }
-        let _ = up.end_write();
+        if !wrote || up.end_write().is_err() {
+            up.abort();
+        }
     });
     let mut ended = false;
     let mut response_deadline = None;

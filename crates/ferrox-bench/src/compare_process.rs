@@ -1118,11 +1118,10 @@ impl Comparison {
              a run with an unproven gating row fails, because the comparison \
              never happened. A cell whose reference landed no run is reported \
              `no-reference` and fails: zero reference runs is missing data, and \
-             missing data must never read as parity. The one pair-less cell that \
-             passes is the engine under test landing none while the same runner \
-             disturbed the other engines — that pair was starved by the machine, \
-             not the engine, and is reported `unmeasured by the runner` \
-             (`.../zbench/report.py:968`).\n\
+             missing data must never read as parity. A cell whose engine under test \
+             landed none while the same runner disturbed the other engines is \
+             reported `unmeasured by the runner`; it is unproven and fails because \
+             no pair was measured (`.../zbench/report.py:968`).\n\
              Only the rows for `{}` decide this gate. Every other engine here is a \
              pinned comparator: it is measured and published so a reader can see \
              where it sits, but a comparator measuring worse than the reference is \

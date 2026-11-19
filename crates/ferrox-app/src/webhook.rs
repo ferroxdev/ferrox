@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrox_core::tls::TlsProvider as _;
@@ -18,6 +19,36 @@ const BUDGET: Duration = Duration::from_secs(5);
 
 /// One notifier's POST threads, capped because each is an OS thread held for up to [`BUDGET`].
 const MAX_IN_FLIGHT: usize = 32;
+
+static RESOLVERS: AtomicUsize = AtomicUsize::new(0);
+
+struct ResolverSlot;
+
+impl ResolverSlot {
+    fn acquire() -> Option<Self> {
+        let mut workers = RESOLVERS.load(Ordering::Relaxed);
+        loop {
+            if workers >= MAX_IN_FLIGHT {
+                return None;
+            }
+            match RESOLVERS.compare_exchange_weak(
+                workers,
+                workers + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(current) => workers = current,
+            }
+        }
+    }
+}
+
+impl Drop for ResolverSlot {
+    fn drop(&mut self) {
+        RESOLVERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// What a stage still has to spend, floored at a millisecond because `std` refuses a zero wait.
 fn left(deadline: Instant) -> Duration {
@@ -238,10 +269,9 @@ impl Webhook {
         let mut headers = self.headers.clone();
         let mut method = "POST";
         let mut body = body;
-        let mut redirected = false;
         for _ in 0..=10 {
             url.userinfo.clone_from(&credentials);
-            if redirected && !url.tls {
+            if !url.tls {
                 headers.retain(|(name, _)| !credential_header(name));
             }
             if url.userinfo.is_some() && !url.tls {
@@ -301,7 +331,6 @@ impl Webhook {
                     headers.retain(|(name, _)| !credential_header(name));
                 }
                 url = next;
-                redirected = true;
                 if matches!(status, 301..=303) {
                     method = "GET";
                     body = "";
@@ -329,7 +358,7 @@ impl Webhook {
     }
 
     /// The address the URL names: the socket path it carries, or the first address its host resolves
-    /// to. Each attempt spends only what the one deadline has left, and resolution is untimed.
+    /// to. Each attempt spends only what the one deadline has left, including resolution.
     fn dial(&self, url: &HttpUrl, deadline: Instant) -> Result<Connection, String> {
         if Instant::now() >= deadline {
             return Err("the webhook budget ended before a dial".to_owned());
@@ -338,10 +367,26 @@ impl Webhook {
             return dial_socket(path, left(deadline));
         }
         let mut last = format!("{} resolved to no address", url.host);
-        for address in (url.host.as_str(), url.port)
-            .to_socket_addrs()
-            .map_err(|error| format!("{}: {error}", url.host))?
-        {
+        let host = url.host.clone();
+        let port = url.port;
+        let slot = ResolverSlot::acquire()
+            .ok_or_else(|| "webhook resolution workers are saturated".to_owned())?;
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("webhook-dns".to_owned())
+            .spawn(move || {
+                let _slot = slot;
+                let _ = sender.send(
+                    (host.as_str(), port)
+                        .to_socket_addrs()
+                        .map(Iterator::collect::<Vec<_>>),
+                );
+            })
+            .map_err(|error| format!("cannot start webhook resolution: {error}"))?;
+        let resolved = receiver
+            .recv_timeout(left(deadline))
+            .map_err(|_| format!("{} resolution ran past the webhook budget", url.host))?;
+        for address in resolved.map_err(|error| format!("{}: {error}", url.host))? {
             if Instant::now() >= deadline {
                 break;
             }
@@ -572,16 +617,7 @@ fn redirect_url(base: &HttpUrl, location: &str) -> Result<String, String> {
     if location.is_empty() {
         return Err("a redirect Location is empty".to_owned());
     }
-    if location.contains("://") {
-        return Ok(location.to_owned());
-    }
     let scheme = if base.tls { "https" } else { "http" };
-    if location.starts_with("//") {
-        return Ok(format!("{scheme}:{location}"));
-    }
-    if location.starts_with('/') {
-        return Ok(format!("{scheme}://{}{location}", base.authority));
-    }
     if let Some(query) = location.strip_prefix('?') {
         let path = base.path.split('?').next().unwrap_or("/");
         return Ok(format!("{scheme}://{}{path}?{query}", base.authority));
@@ -591,6 +627,24 @@ fn redirect_url(base: &HttpUrl, location: &str) -> Result<String, String> {
             "{scheme}://{}{}{}",
             base.authority, base.path, location
         ));
+    }
+    let absolute = location.split_once("://").is_some_and(|(scheme, _)| {
+        scheme
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic())
+            && scheme
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    });
+    if absolute {
+        return Ok(location.to_owned());
+    }
+    if location.starts_with("//") {
+        return Ok(format!("{scheme}:{location}"));
+    }
+    if location.starts_with('/') {
+        return Ok(format!("{scheme}://{}{location}", base.authority));
     }
     let directory = base
         .path
