@@ -1691,7 +1691,7 @@ impl Session {
     }
 
     /// Heads a built body with its length and hands it to `send`.
-    fn frame_body(&mut self, wire: &mut Wire, frame: &mut Vec<u8>, id: u32) {
+    fn frame_body(&mut self, wire: &mut Wire, frame: &mut [u8], id: u32) {
         let body = frame.len() - FRAME_HEAD;
         frame[..FRAME_HEAD].copy_from_slice(&h2::frame_head(body, h2::T_DATA, 0, id));
         self.send(wire, frame);
