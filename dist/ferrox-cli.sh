@@ -76,8 +76,9 @@ else
 fi
 LANES_FILE="$STATE_DIR/lanes"
 PROXY_OWNER="$STATE_DIR/system-proxy.owner"
-PROXY_LOCK=""
 PROXY_LOCK_DEPTH=0
+PROXY_LOCK_PID=""
+PROXY_LOCK_READY=""
 CREDS="${FOXY_CREDENTIALS:-$CONF_DIR/credentials}"
 CFG="$CONF_DIR/lane.json"
 # The signed-in session FxA handed back, so a launch after the first signs in
@@ -1887,64 +1888,58 @@ proxy_restore_snapshot() {
 }
 
 proxy_lock() {
-  local dir pid tmp recover
+  local dir ready
   if [ "${PROXY_LOCK_DEPTH:-0}" -gt 0 ]; then
     PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH + 1))
     return 0
   fi
-  dir="$(absolute_path "$STATE_DIR")/system-proxy.lock"
-  ( umask 077; mkdir -p "$(dirname "$dir")" ) 2>/dev/null ||
+  command -v python3 >/dev/null 2>&1 ||
+    { say "system proxy: python3 is needed to serialize proxy changes." >&2; return 1; }
+  dir="$(absolute_path "$STATE_DIR")/system-proxy.lock.d"
+  ( umask 077; mkdir -p "$dir" ) 2>/dev/null ||
     { say "system proxy: cannot create $STATE_DIR." >&2; return 1; }
+  ready="$dir/ready.$$"
+  rm -f "$ready"
+  python3 -c '
+import fcntl, os, signal, sys, time
+lock = open(sys.argv[1], "a+")
+fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+with open(sys.argv[2], "w") as ready:
+    ready.write("locked\n")
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+parent = os.getppid()
+while parent != 1 and os.getppid() == parent:
+    time.sleep(0.1)
+' "$dir/lock" "$ready" &
+  PROXY_LOCK_PID=$!
   for _ in $(seq 1 300); do
-    if [ -d "$dir" ]; then
-      pid="$(cat "$dir/pid" 2>/dev/null || true)"
-      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        sleep 0.1
-      else
-        rm -f "$dir/pid"
-        rmdir "$dir/recover" 2>/dev/null || true
-        rmdir "$dir" 2>/dev/null || true
-      fi
-      continue
-    fi
-    tmp="$dir.$$"
-    ( umask 077; printf '%s\n' "$$" >"$tmp" ) 2>/dev/null ||
-      { rm -f "$tmp"; say "system proxy: cannot record the lock owner." >&2; return 1; }
-    if ln "$tmp" "$dir" 2>/dev/null; then
-      rm -f "$tmp"
-      PROXY_LOCK="$dir"
-      PROXY_LOCK_DEPTH=1
-      return 0
-    fi
-    rm -f "$tmp"
-    pid="$(cat "$dir" 2>/dev/null || true)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      sleep 0.1
-      continue
-    fi
-    recover="$dir.recover.$$"
-    rm -f "$recover"
-    if ln "$dir" "$recover" 2>/dev/null; then
-      pid="$(cat "$dir" 2>/dev/null || true)"
-      if [ "$dir" -ef "$recover" ] &&
-         { [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; }; then
-        rm -f "$dir"
-      fi
-      rm -f "$recover"
-    else
-      sleep 0.1
-    fi
+    [ -s "$ready" ] && break
+    kill -0 "$PROXY_LOCK_PID" 2>/dev/null || break
+    sleep 0.1
   done
-  say "system proxy: another ferrox-cli is changing the proxy; try again." >&2
-  return 1
+  if [ ! -s "$ready" ]; then
+    kill "$PROXY_LOCK_PID" 2>/dev/null || true
+    wait "$PROXY_LOCK_PID" 2>/dev/null || true
+    rm -f "$ready"
+    PROXY_LOCK_PID=""
+    say "system proxy: the lock owner did not start." >&2
+    return 1
+  fi
+  PROXY_LOCK_READY="$ready"
+  PROXY_LOCK_DEPTH=1
+  return 0
 }
 
 proxy_unlock() {
   [ "${PROXY_LOCK_DEPTH:-0}" -gt 0 ] || return 0
   PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH - 1))
-  if [ "$PROXY_LOCK_DEPTH" -eq 0 ] && [ -n "$PROXY_LOCK" ]; then
-    rm -rf "$PROXY_LOCK"
-    PROXY_LOCK=""
+  if [ "$PROXY_LOCK_DEPTH" -eq 0 ] && [ -n "$PROXY_LOCK_PID" ]; then
+    kill "$PROXY_LOCK_PID" 2>/dev/null || true
+    wait "$PROXY_LOCK_PID" 2>/dev/null || true
+    rm -f "$PROXY_LOCK_READY"
+    PROXY_LOCK_PID=""
+    PROXY_LOCK_READY=""
   fi
 }
 
@@ -2548,8 +2543,14 @@ start_lane() {
   # and a bad link must not send the user to a build before saying what is wrong.
   build_config
   require_bin
-  touch "$LANES_FILE"
-  grep -Fxq "$CONF_DIR" "$LANES_FILE" || printf '%s\n' "$CONF_DIR" >> "$LANES_FILE"
+  proxy_lock || return 1
+  if ! { touch "$LANES_FILE" &&
+         { grep -Fxq "$CONF_DIR" "$LANES_FILE" || printf '%s\n' "$CONF_DIR" >> "$LANES_FILE"; }; }; then
+    proxy_unlock
+    say "lane: cannot record $CONF_DIR in $LANES_FILE." >&2
+    return 1
+  fi
+  proxy_unlock
   # stop_lane reads the old meta to name the process it must kill, so keep the
   # new lane's settings aside until that process is gone.
   new_cfg="$CFG"; new_fronts="$FRONTS"
@@ -2689,6 +2690,7 @@ forget_lane_config() {
 # The registry makes a lane armed under a moved FERROX_CONF_DIR visible here.
 stop_all_lanes() {
   local saved_conf="$CONF_DIR" saved_instance="$INSTANCE" dir pidfile base rc=0
+  proxy_lock || return 1
   if [ -r "$LANES_FILE" ]; then
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue
@@ -2733,7 +2735,7 @@ stop_all_lanes() {
   INSTANCE=""
   apply_instance
   system_proxy_off 1 || rc=1
-  rm -f "$LANES_FILE" "$PROXY_OWNER"
+  proxy_unlock
   CONF_DIR="$saved_conf"
   INSTANCE="$saved_instance"
   apply_instance
