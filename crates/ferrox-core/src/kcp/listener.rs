@@ -258,6 +258,8 @@ struct ListenerInner {
     ready_cv: Condvar,
     config: Config,
     closed: AtomicBool,
+    feed_done: Mutex<bool>,
+    feed_cv: Condvar,
     addr: SocketAddr,
 }
 
@@ -282,6 +284,8 @@ impl Listener {
             ready_cv: Condvar::new(),
             config,
             closed: AtomicBool::new(false),
+            feed_done: Mutex::new(false),
+            feed_cv: Condvar::new(),
             addr: local,
         });
         let sock_r = sock;
@@ -402,6 +406,10 @@ impl Listener {
                     Err(_) => break,
                 }
             }
+            if let Some(inner) = weak.upgrade() {
+                *inner.feed_done.lock().unwrap() = true;
+                inner.feed_cv.notify_all();
+            }
         });
         Ok(Self { inner })
     }
@@ -433,6 +441,14 @@ impl Listener {
         }
         self.inner.ready.lock().unwrap().clear();
         self.inner.ready_cv.notify_all();
+    }
+
+    /// Wait for the feed thread to drop the socket it read from, so a closed listener has released its port.
+    pub fn wait_closed(&self) {
+        let mut done = self.inner.feed_done.lock().unwrap();
+        while !*done {
+            done = self.inner.feed_cv.wait(done).unwrap();
+        }
     }
 }
 

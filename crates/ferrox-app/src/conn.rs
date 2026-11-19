@@ -2215,6 +2215,30 @@ pub(crate) fn parse_target(address: &str) -> io::Result<Target> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "address resolved to nothing"))
 }
 
+#[cfg(unix)]
+fn unix_socket_is_live(path: &std::path::Path) -> io::Result<bool> {
+    match unix_connect(path, Duration::from_millis(50)) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Probe a unix listen path without creating or removing it: a live socket refuses the name, a stale one and an absent path pass, and a file that is not a socket is refused.
 #[cfg(any(unix, windows))]
 pub(crate) fn probe_unix(path: &std::path::Path) -> io::Result<()> {
@@ -2231,21 +2255,15 @@ pub(crate) fn probe_unix(path: &std::path::Path) -> io::Result<()> {
                 io::ErrorKind::AddrInUse,
                 "a unix listen path names a file that is not a socket",
             )),
-            Ok(_) => match std::os::unix::net::UnixStream::connect(path) {
-                Ok(_) => Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    "a unix listen path names a live socket",
-                )),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                    ) =>
-                {
-                    Ok(())
+            Ok(_) => {
+                if unix_socket_is_live(path)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "a unix listen path names a live socket",
+                    ));
                 }
-                Err(error) => Err(error),
-            },
+                Ok(())
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
@@ -2701,21 +2719,11 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    if stale.is_some() {
-        match std::os::unix::net::UnixStream::connect(path) {
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    "a unix listen path names a live socket",
-                ))
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) => {}
-            Err(error) => return Err(error),
-        }
+    if stale.is_some() && unix_socket_is_live(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "a unix listen path names a live socket",
+        ));
     }
     let Some(mode) = perm else {
         take_stale(path, stale)?;

@@ -550,18 +550,16 @@ fn inbound_is_xhttp_h3(inbound: &Json) -> bool {
 fn stop_covers_inbound(inbound: &Json, protocol: &str) -> bool {
     let carrier = inbound_carrier(inbound);
     match protocol {
-        "vless" | "trojan" | "vmess" => !matches!(
-            carrier,
-            Carrier::Kcp(_) | Carrier::Xdrive { .. } | Carrier::Hysteria(_)
-        ),
+        "vless" | "trojan" | "vmess" => {
+            !matches!(carrier, Carrier::Xdrive { .. } | Carrier::Hysteria(_))
+        }
         "shadowsocks" => match carrier {
             Carrier::Raw(_) => {
                 let (tcp, udp) = inbound_ss_networks(inbound);
                 tcp || udp
             }
-            Carrier::Kcp(_) | Carrier::Xdrive { .. } | Carrier::Hysteria(_) | Carrier::Quic => {
-                false
-            }
+            Carrier::Kcp(_) => true,
+            Carrier::Xdrive { .. } | Carrier::Hysteria(_) | Carrier::Quic => false,
             Carrier::Xhttp { .. } if inbound_is_xhttp_h3(inbound) => true,
             _ => inbound_ss_networks(inbound).0,
         },
@@ -933,12 +931,14 @@ fn serve_inbounds_counted(
             }
             if bind_failure {
                 if let Some(stop) = &handler_stop {
+                    if !handler_stops.is_empty() {
+                        stop.expect_listeners(handler_stops.len());
+                    }
                     stop.stop();
                     for address in &armed_addresses {
                         wake_listener(stop, address);
                     }
                     if !handler_stops.is_empty() {
-                        stop.expect_listeners(handler_stops.len());
                         let _ = stop.wait_closed();
                     }
                 }
@@ -1355,7 +1355,7 @@ fn serve_vless_inbound(
                     let _flow = crate::accesslog::flow(Some(conn.remote_addr()), "", 0);
                     serve_vless_kcp(conn, &users, freedom, meter.clone());
                 });
-                return serve_kcp_bound(&owned, config, &serve, inbound);
+                return serve_kcp_bound(&owned, config, &serve, inbound, stop);
             }
             let fallbacks = match server_fallbacks(inbound) {
                 Ok(fallbacks) => fallbacks.map(Arc::from),
@@ -10805,7 +10805,7 @@ fn serve_vless_tls_inbound(
             let _flow = crate::accesslog::flow(Some(conn.remote_addr()), "", 0);
             serve_vless_kcp_tls(conn, &users, freedom, &server, meter.clone());
         });
-        return serve_kcp_bound(&owned, config, &serve, inbound);
+        return serve_kcp_bound(&owned, config, &serve, inbound, stop);
     }
     let role = inbound_role(
         inbound,
@@ -10868,7 +10868,7 @@ fn serve_vless_reality_inbound(
             let _flow = crate::accesslog::flow(Some(conn.remote_addr()), "", 0);
             serve_vless_kcp_reality(conn, &users, freedom, &server, meter.clone());
         });
-        return serve_kcp_bound(&owned, config, &serve, inbound);
+        return serve_kcp_bound(&owned, config, &serve, inbound, stop);
     }
     let role = inbound_role(
         inbound,
@@ -15759,6 +15759,7 @@ fn serve_kcp_bound(
     config: ferrox_core::kcp::Config,
     serve: &KcpServe,
     inbound: &Json,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let Some(server) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
         return false;
@@ -15777,16 +15778,32 @@ fn serve_kcp_bound(
     let Ok(listener) = ferrox_core::kcp::Listener::with_socket(sock, config) else {
         return false;
     };
+    let listener = Arc::new(listener);
+    let worker = Arc::clone(&listener);
     let serve = Arc::clone(serve);
-    thread::spawn(move || serve_kcp_each(&listener, &serve));
+    let worker_stop = stop.cloned();
+    thread::spawn(move || {
+        serve_kcp_each(&worker, &serve);
+        worker.wait_closed();
+        if let Some(stop) = worker_stop {
+            stop.mark_closed();
+        }
+    });
+    if let Some(stop) = stop {
+        let listener = Arc::clone(&listener);
+        let stop = Arc::clone(stop);
+        thread::spawn(move || {
+            while !stop.stopped() {
+                thread::sleep(RELAY_POLL);
+            }
+            listener.close();
+        });
+    }
     true
 }
 
 fn serve_kcp_each(listener: &ferrox_core::kcp::Listener, serve: &KcpServe) {
-    loop {
-        let Ok(session) = listener.accept() else {
-            continue;
-        };
+    while let Ok(session) = listener.accept() {
         let serve = Arc::clone(serve);
         std::thread::spawn(move || serve(&session));
     }
@@ -16112,7 +16129,7 @@ fn serve_trojan_inbound(
                     serve_trojan_kcp(conn, &key, &accounts, freedom, meter.clone());
                 })
             };
-            serve_kcp_bound(address, config, &serve, inbound)
+            serve_kcp_bound(address, config, &serve, inbound, stop)
         }
         Carrier::Xdrive { settings } => {
             let email = account.email.clone();
@@ -16497,7 +16514,7 @@ fn serve_vmess_inbound_users(
                 })
             };
             let owned = address.to_owned();
-            serve_kcp_bound(&owned, config, &serve, inbound)
+            serve_kcp_bound(&owned, config, &serve, inbound, stop.as_ref())
         }
         Carrier::Xdrive { settings } => {
             let email = account.email.clone();
@@ -17318,6 +17335,7 @@ fn serve_ss_kcp_listener(
     freedom: bool,
     email: &str,
     level: u32,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let accounts = Arc::clone(accounts);
     let email = email.to_owned();
@@ -17352,7 +17370,7 @@ fn serve_ss_kcp_listener(
             }
         })
     };
-    serve_kcp_bound(address, config, &serve, inbound)
+    serve_kcp_bound(address, config, &serve, inbound, stop)
 }
 
 /// The datagram half a shadowsocks listener owns before it reports served: bound here, refused here, or never asked for.
@@ -17478,6 +17496,7 @@ fn serve_ss_relay_inbound(
                 &udp_dests,
                 udp_cancel.as_deref(),
             );
+            drop(clients);
             if let Some(stop) = udp_stop {
                 stop.mark_closed();
             }
@@ -17703,6 +17722,7 @@ fn serve_shadowsocks_inbound(
                     freedom,
                     &account.email,
                     account.level,
+                    stop,
                 ) {
                     return 0;
                 }
@@ -17783,6 +17803,7 @@ fn serve_ss_udp_front(
                 udp_cancel.as_deref(),
             );
         }
+        drop(clients);
         if let Some(stop) = udp_stop {
             stop.mark_closed();
         }
@@ -59463,7 +59484,8 @@ mod tests {
             &format!("127.0.0.1:{port}"),
             config,
             &serve,
-            &inbound
+            &inbound,
+            None
         ));
         thread::sleep(Duration::from_millis(50));
         let root = crate::json::parse(&format!(
@@ -71664,9 +71686,29 @@ mod tests {
         };
         let serve: KcpServe = Arc::new(|conn| conn.close());
         assert!(
-            !serve_kcp_bound("127.0.0.1:0", config, &serve, &inbound),
+            !serve_kcp_bound("127.0.0.1:0", config, &serve, &inbound, None),
             "a sockopt the socket refused must refuse the listener, not bind without it"
         );
+    }
+
+    #[test]
+    fn a_stopped_kcp_listener_releases_its_port() {
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("finds a port");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let inbound = crate::json::parse("{}").expect("parses");
+        let stop = Arc::new(Stop::new());
+        let serve: KcpServe = Arc::new(|conn| conn.close());
+        assert!(serve_kcp_bound(
+            &format!("127.0.0.1:{port}"),
+            ferrox_core::kcp::Config::default(),
+            &serve,
+            &inbound,
+            Some(&stop)
+        ));
+        stop.stop();
+        assert!(stop.wait_closed(), "the worker drops its socket");
+        drop(UdpSocket::bind(("127.0.0.1", port)).expect("the port is free again"));
     }
 
     #[cfg(target_os = "linux")]
