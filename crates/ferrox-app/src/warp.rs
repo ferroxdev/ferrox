@@ -2641,12 +2641,12 @@ fn validate_gool(identity: &Identity, spec: &WarpSpec) -> Result<(), String> {
         return Err("warp gool: the identity has no MASQUE key".to_owned());
     }
     let inner = spec.gool_identity_in(true)?;
-    let _ = build_masque(identity, spec)?;
+    build_masque(identity, spec)?;
     let remote = spec.gool.peer.unwrap_or(inner.wireguard.endpoint);
     let settings =
         wireguard_settings_with_endpoint(&inner, spec, remote, spec.mtu.min(GOOL_INNER_MTU));
     let config = crate::wireguard::DeviceConfig::from_json(&settings)?;
-    let _ = crate::wg::WireGuardOut::with_noise(config, spec.noize.wireguard())?;
+    crate::wg::WireGuardOut::with_noise(config, spec.noize.wireguard())?;
     Ok(())
 }
 
