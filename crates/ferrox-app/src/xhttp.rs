@@ -35,6 +35,7 @@ fn bare_path(target: &str) -> &str {
 }
 
 /// The head, the octets that arrived with it, and where the head ends: this read consumes what it proves, so a body pipelined behind the head is already in hand.
+#[cfg(test)]
 fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
     crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
 }
@@ -1191,6 +1192,7 @@ impl Write for XhttpWriter {
     }
 }
 
+#[cfg(test)]
 fn split(read: Connection, prefix: Vec<u8>, at: usize) -> Option<(XhttpReader, XhttpWriter)> {
     let Ok(write) = read.try_clone() else {
         return None;
@@ -4039,7 +4041,7 @@ pub(crate) fn connect_settings(
 }
 
 pub(crate) fn connect_split_settings<R: Read, W: crate::proxy::FrameWrite + 'static>(
-    mut read: R,
+    read: R,
     mut write: W,
     host: &str,
     settings: &XhttpSettings,
