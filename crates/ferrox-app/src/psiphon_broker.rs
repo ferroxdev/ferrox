@@ -648,8 +648,18 @@ impl Client {
         Ok(())
     }
 
-    /// Relay one server packet to the broker, bounded by the handshake deadline,
-    /// and return the broker's next packet, empty when the exchange is complete.
+    /// Relay one server packet to the broker and return the broker's next packet,
+    /// empty when the exchange is complete.
+    pub(crate) fn relay_packet(
+        &mut self,
+        connection_id: &[u8],
+        packet: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.transport.set_timeout(self.relay_timeout);
+        self.relay_packet_reply(connection_id, packet)
+    }
+
+    /// Relay one server packet, bounded by the handshake deadline.
     pub(crate) fn relay_packet_until(
         &mut self,
         connection_id: &[u8],
@@ -658,6 +668,14 @@ impl Client {
     ) -> Result<Vec<u8>, String> {
         let cap = Instant::now() + self.relay_timeout;
         self.transport.set_deadline(Some(deadline.min(cap)));
+        self.relay_packet_reply(connection_id, packet)
+    }
+
+    fn relay_packet_reply(
+        &mut self,
+        connection_id: &[u8],
+        packet: &[u8],
+    ) -> Result<Vec<u8>, String> {
         let request = Value::Map(vec![
             (Value::UInt(1), Value::Bytes(connection_id.to_vec())),
             (Value::UInt(2), Value::Bytes(packet.to_vec())),

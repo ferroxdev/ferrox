@@ -2543,8 +2543,13 @@ impl Inner {
     }
 
     fn relay_round_trip(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let packet = crate::psiphon_broker::relay_request_packet(payload)?;
         let mut relay = lock(&self.relay);
-        relay_round_trip(&mut relay, payload)
+        let relay = relay
+            .as_mut()
+            .ok_or_else(|| "psiphon ssh: no in-proxy relay".to_owned())?;
+        let next = relay.relay(&packet)?;
+        Ok(crate::psiphon_broker::relay_response(&next))
     }
 
     /// Record the read clock the keep-alive inactivity gate compares against.

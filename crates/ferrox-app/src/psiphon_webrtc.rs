@@ -2184,6 +2184,11 @@ impl Relay {
         &self.connection_id
     }
 
+    /// Relay one server packet with the configured relay timeout.
+    pub(crate) fn relay(&mut self, packet: &[u8]) -> Result<Vec<u8>, String> {
+        lock(&self.client).relay_packet(&self.connection_id, packet)
+    }
+
     /// Relay one server packet, bounded by the handshake's absolute deadline.
     pub(crate) fn relay_until(
         &mut self,
