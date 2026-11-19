@@ -49,11 +49,16 @@ resolve_bin() {
   done
   cargo_target="$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps 2>/dev/null | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -1)"
   cargo_target="${cargo_target:-$ROOT/target}"
-  case "${FERROX_PROFILE:-release}" in
-    release) profiles=(release debug) ;;
-    debug) profiles=(debug release) ;;
-    *) die "FERROX_PROFILE must be debug or release, not '$FERROX_PROFILE'" ;;
-  esac
+  if [ -n "${FERROX_PROFILE:-}" ]; then
+    case "$FERROX_PROFILE" in
+      release|debug) profiles=("$FERROX_PROFILE") ;;
+      *) die "FERROX_PROFILE must be debug or release, not '$FERROX_PROFILE'" ;;
+    esac
+  elif [ "${FERROX_RELEASE:-0}" = 1 ]; then
+    profiles=(release)
+  else
+    profiles=(release debug)
+  fi
   for dir in "${profiles[@]}"; do
     [ -x "$cargo_target/$dir/ferrox-app" ] && { BIN="$cargo_target/$dir/ferrox-app"; return 0; }
   done
@@ -71,6 +76,11 @@ else
 fi
 LANES_FILE="$STATE_DIR/lanes"
 PROXY_OWNER="$STATE_DIR/system-proxy.owner"
+PROXY_LOCK_DEPTH=0
+PROXY_LOCK_PID=""
+PROXY_LOCK_READY=""
+PROXY_LOCK_RELEASE=""
+PROXY_LOCK_ACQUIRING=0
 CREDS="${FOXY_CREDENTIALS:-$CONF_DIR/credentials}"
 CFG="$CONF_DIR/lane.json"
 # The signed-in session FxA handed back, so a launch after the first signs in
@@ -416,13 +426,56 @@ resolve_real() {
   printf '%s/%s\n' "${dir%/}" "$base"
 }
 
+absolute_path() {
+  local path="$1" dir base
+  dir="$(dirname "$path")"
+  base="$(basename "$path")"
+  if dir="$(cd -P "$dir" 2>/dev/null && pwd)"; then
+    printf '%s/%s\n' "${dir%/}" "$base"
+    return 0
+  fi
+  case "$path" in /*) printf '%s\n' "$path" ;; *) printf '%s/%s\n' "$PWD" "$path" ;; esac
+}
+
+repo_root_of_path() {
+  local path="$1" dir root
+  dir="$(dirname "$path")"
+  while [ ! -d "$dir" ]; do
+    [ "$dir" = / ] && return 1
+    dir="$(dirname "$dir")"
+  done
+  root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  resolve_real "$root"
+}
+
 credentials_inside_repo() {
-  local real root
-  root="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  local real lex root
   real="$(resolve_real "$CREDS")"
-  root="$(resolve_real "$root")"
-  case "$real" in "$root"/*) return 0 ;; esac
+  lex="$(absolute_path "$CREDS")"
+  if root="$(repo_root_of_path "$lex")"; then
+    case "$lex" in "$root"/*) return 0 ;; esac
+  fi
+  if [ "$real" != "$lex" ] && root="$(repo_root_of_path "$real")"; then
+    case "$real" in "$root"/*) return 0 ;; esac
+  fi
   return 1
+}
+
+credential_ancestors_trusted() {
+  local cur="$1" uid unsafe sticky owner
+  uid="$(id -u)"
+  cur="$(dirname "$cur")"
+  while :; do
+    owner="$(find "$cur" -maxdepth 0 \( -user 0 -o -user "$uid" \) -print -quit 2>/dev/null)"
+    [ -n "$owner" ] || return 1
+    unsafe="$(find "$cur" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print -quit 2>/dev/null)"
+    if [ -n "$unsafe" ]; then
+      sticky="$(find "$cur" -maxdepth 0 -perm -1000 -print -quit 2>/dev/null)"
+      [ -n "$sticky" ] || return 1
+    fi
+    [ "$cur" = / ] && return 0
+    cur="$(dirname "$cur")"
+  done
 }
 
 action_login() {
@@ -437,18 +490,46 @@ action_login() {
     printf 'password (hidden, not echoed): ' && read -rs pass && printf '\n'
   fi
   [ -n "$email" ] && [ -n "$pass" ] || die "an account is an email and a password"
-  mkdir -p "$CONF_DIR"
+  local cred_dir save_dir tmp unsafe login_epoch
+  if [ "${LOGIN_GUARD_SET:-0}" = 1 ]; then
+    login_epoch="$LOGIN_GUARD_EPOCH"
+  else
+    login_epoch="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)"
+  fi
+  cred_dir="$(dirname "$CREDS")"
+  [ -d "$CREDS" ] && die "$CREDS is a directory; FOXY_CREDENTIALS must name a file"
+  mkdir -p "$CONF_DIR" || die "cannot create $CONF_DIR; the saved session was kept."
   chmod 700 "$CONF_DIR" 2>/dev/null || true
+  if [ "$cred_dir" != "$CONF_DIR" ]; then
+    ( umask 077; mkdir -p "$cred_dir" ) || die "cannot create $cred_dir; the saved session was kept."
+  fi
+  save_dir="$(resolve_real "$cred_dir")"
+  [ -O "$save_dir" ] || die "$cred_dir is not owned by you; choose an owner-only directory"
+  unsafe="$(find "$save_dir" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print -quit 2>/dev/null)"
+  [ -z "$unsafe" ] || die "$cred_dir is writable by another user; choose an owner-only directory"
+  credential_ancestors_trusted "$save_dir" ||
+    die "$cred_dir has an ancestor writable by another user; choose a private directory"
+  tmp="$(mktemp "$save_dir/.ferrox-credentials.XXXXXX")" ||
+    die "cannot create a temporary credentials file in $cred_dir; the saved session was kept."
   (
     umask 077
     {
       printf "FOXY_EMAIL=%s\n" "$(shell_quote "$email")"
       printf "FOXY_PASS=%s\n" "$(shell_quote "$pass")"
-    } >"$CREDS"
-  )
-  chmod 600 "$CREDS"
+    } >"$tmp"
+  ) || { rm -f "$tmp"; die "cannot write $CREDS; the saved session was kept."; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; die "cannot set owner-only mode on $CREDS; the saved session was kept."; }
+  [ -d "$CREDS" ] && { rm -f "$tmp"; die "$CREDS is a directory; FOXY_CREDENTIALS must name a file"; }
+  proxy_lock || { rm -f "$tmp"; die "login: the system proxy lock was unavailable; the saved session was kept."; }
+  if [ "$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)" != "$login_epoch" ]; then
+    rm -f "$tmp"; proxy_unlock
+    die "login: a concurrent down or logout cancelled this sign-in."
+  fi
+  mv -f "$tmp" "$save_dir/$(basename "$CREDS")" ||
+    { rm -f "$tmp"; proxy_unlock; die "cannot replace $CREDS; the saved session was kept."; }
   # A login is the user asking for this account now: the grant the last one left is not the one to resume.
   rm -f "$TOKEN_FILE"
+  proxy_unlock
   if [ "${LOGIN_QUIET:-0}" != 1 ]; then
     say "account saved to $CREDS: owner-only, outside the repository, read by every future up."
     say "the next up --foxy signs in once and keeps the session in $TOKEN_FILE."
@@ -486,9 +567,13 @@ same_stored_account() {
 }
 
 action_logout() {
-  stop_all_lanes
-  rm -f "$TOKEN_FILE" "$CREDS" "$CONF_DIR"/lane*.json
-  say "signed out: every lane is stopped, and the stored session, the saved account and the lane configs are gone."
+  stop_all_lanes ||
+    die "logout: the lanes or system proxy could not be stopped; the saved account was kept."
+  proxy_lock ||
+    die "logout: the account lock was unavailable; the saved account was kept."
+  rm -f "$TOKEN_FILE" "$CREDS"
+  proxy_unlock
+  say "signed out: every lane is stopped, and the stored session, the saved account and generated lane configs are gone."
   say "the remembered exit stays in $LOCATION_FILE; 'ferrox-cli login' signs in again."
 }
 
@@ -916,21 +1001,27 @@ adopt_lane_ports() {
 # The running lane's config path and fronts, so a later status or ports reads
 # the addresses it actually serves instead of the defaults.
 write_lane_meta() {
+  local tmp="$META_FILE.$$" rc=0
   ( umask 077
     {
       printf 'config=%s\n' "$(resolve_real "$CFG")"
       printf 'fronts=%s\n' "$FRONTS"
-    } >"$META_FILE"
-  )
+      printf 'generated=%s\n' "$([ "$OUTBOUND" = config ] && echo 0 || echo 1)"
+    } >"$tmp"
+  ) || rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$tmp"; return "$rc"; fi
+  mv -f "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
 }
 
 load_lane_meta() {
   [ -f "$META_FILE" ] || return 1
   local line
+  GENERATED=0
   while IFS= read -r line; do
     case "$line" in
       config=*) CFG="${line#config=}" ;;
       fronts=*) FRONTS="${line#fronts=}"; FRONTS_SET=1 ;;
+      generated=*) GENERATED="${line#generated=}" ;;
     esac
   done <"$META_FILE"
 }
@@ -1552,6 +1643,19 @@ proxy_bypass_join() {
 }
 
 system_proxy_preflight() {
+  local platform rc=0
+  platform="$(uname -s 2>/dev/null || true)"
+  case "$platform" in
+    Darwin) ;;
+    *) _system_proxy_preflight; return $? ;;
+  esac
+  proxy_lock || return 1
+  _system_proxy_preflight || rc=$?
+  proxy_unlock
+  return "$rc"
+}
+
+_system_proxy_preflight() {
   local platform https="" all="" svc state
   platform="$(uname -s 2>/dev/null || true)"
   case "$platform" in
@@ -1806,9 +1910,144 @@ proxy_restore_snapshot() {
   return 2
 }
 
+proxy_lock() {
+  local dir ready release old_int old_term old_hup
+  if [ "${PROXY_LOCK_DEPTH:-0}" -gt 0 ]; then
+    PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH + 1))
+    if [ "${PROXY_LOCK_ACQUIRING:-0}" = 1 ]; then
+      for _ in $(seq 1 300); do
+        [ -s "$PROXY_LOCK_READY" ] && break
+        kill -0 "$PROXY_LOCK_PID" 2>/dev/null || break
+        sleep 0.1
+      done
+      if [ ! -s "$PROXY_LOCK_READY" ]; then
+        PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH - 1))
+        return 1
+      fi
+    fi
+    return 0
+  fi
+  command -v python3 >/dev/null 2>&1 ||
+    { say "system proxy: python3 is needed to serialize proxy changes." >&2; return 1; }
+  dir="$(absolute_path "$STATE_DIR")/system-proxy.lock.d"
+  ( umask 077; mkdir -p "$dir" ) 2>/dev/null ||
+    { say "system proxy: cannot create $STATE_DIR." >&2; return 1; }
+  ready="$dir/ready.$$"
+  release="$dir/release.$$"
+  rm -f "$ready" "$release"
+  old_int="$(trap -p INT)"; old_term="$(trap -p TERM)"; old_hup="$(trap -p HUP)"
+  PROXY_LOCK_SIGNAL=""
+  trap 'PROXY_LOCK_SIGNAL=INT' INT
+  trap 'PROXY_LOCK_SIGNAL=TERM' TERM
+  trap 'PROXY_LOCK_SIGNAL=HUP' HUP
+  PROXY_LOCK_DEPTH=1
+  PROXY_LOCK_ACQUIRING=1
+  PROXY_LOCK_READY="$ready"
+  PROXY_LOCK_RELEASE="$release"
+  python3 -c '
+import os, signal, sys, time
+try:
+    import fcntl
+    def acquire(lock):
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+except ImportError:
+    import msvcrt
+    def acquire(lock):
+        while True:
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError:
+                time.sleep(0.1)
+lock = open(sys.argv[1], "a+b")
+if os.name == "nt":
+    lock.seek(0, os.SEEK_END)
+    if lock.tell() == 0:
+        lock.write(b"\0")
+        lock.flush()
+    lock.seek(0)
+def parent_alive(pid):
+    if os.name != "nt":
+        return os.getppid() == pid
+    import ctypes
+    handle = ctypes.windll.kernel32.OpenProcess(0x101000, False, pid)
+    if not handle:
+        return False
+    try:
+        return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == 0x102
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+    sig = getattr(signal, name, None)
+    if sig is not None:
+        signal.signal(sig, signal.SIG_IGN)
+parent = int(sys.argv[4])
+acquire(lock)
+if not parent_alive(parent):
+    sys.exit(0)
+with open(sys.argv[2], "w") as ready:
+    ready.write("locked\n")
+while parent_alive(parent) and not os.path.exists(sys.argv[3]):
+    time.sleep(0.1)
+ ' "$dir/lock" "$ready" "$release" "$$" &
+  PROXY_LOCK_PID=$!
+  if [ -n "$old_int" ]; then eval "$old_int"; else trap - INT; fi
+  if [ -n "$old_term" ]; then eval "$old_term"; else trap - TERM; fi
+  if [ -n "$old_hup" ]; then eval "$old_hup"; else trap - HUP; fi
+  if [ -n "$PROXY_LOCK_SIGNAL" ]; then
+    kill -s "$PROXY_LOCK_SIGNAL" "$$"
+    PROXY_LOCK_SIGNAL=""
+  fi
+  for _ in $(seq 1 300); do
+    [ -s "$ready" ] && break
+    kill -0 "$PROXY_LOCK_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [ ! -s "$ready" ]; then
+    : >"$release"
+    kill -KILL "$PROXY_LOCK_PID" 2>/dev/null || true
+    wait "$PROXY_LOCK_PID" 2>/dev/null || true
+    rm -f "$ready" "$release"
+    PROXY_LOCK_PID=""
+    PROXY_LOCK_DEPTH=0
+    PROXY_LOCK_ACQUIRING=0
+    say "system proxy: the lock owner did not start." >&2
+    return 1
+  fi
+  PROXY_LOCK_ACQUIRING=0
+  return 0
+}
+
+proxy_unlock() {
+  [ "${PROXY_LOCK_DEPTH:-0}" -gt 0 ] || return 0
+  PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH - 1))
+  if [ "$PROXY_LOCK_DEPTH" -eq 0 ] && [ -n "$PROXY_LOCK_PID" ]; then
+    : >"$PROXY_LOCK_RELEASE"
+    wait "$PROXY_LOCK_PID" 2>/dev/null || true
+    rm -f "$PROXY_LOCK_READY" "$PROXY_LOCK_RELEASE"
+    PROXY_LOCK_PID=""
+    PROXY_LOCK_READY=""
+    PROXY_LOCK_RELEASE=""
+  fi
+}
+
 system_proxy_on() {
+  local rc=0
+  proxy_lock || return 1
+  _system_proxy_on || rc=$?
+  proxy_unlock
+  return "$rc"
+}
+
+_system_proxy_on() {
   command -v networksetup >/dev/null 2>&1 || { say "system proxy: no networksetup; nothing was armed." >&2; return 1; }
   command -v scutil >/dev/null 2>&1 || { say "system proxy: no scutil to read the proxy back; nothing was armed." >&2; return 1; }
+  local owner_pidfile
+  if owner_pidfile="$(proxy_owner_pidfile)" && lane_running_at "$owner_pidfile" &&
+     [ "$(resolve_real "$owner_pidfile")" != "$(resolve_real "$PID_FILE")" ]; then
+    say "system proxy: owned by the lane at $owner_pidfile; nothing was armed." >&2
+    return 1
+  fi
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
   local any=0 svc want_socks="" want_http="" front bypass readback bad
   for front in ${FRONTS//,/ }; do
@@ -1919,7 +2158,7 @@ system_proxy_on() {
   done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
   [ "$any" = 1 ] || { system_proxy_off; say "no network service took the proxy" >&2; return 1; }
   printf '%s %s\n' "${want_socks:--}" "${want_http:--}" > "$PROXY_PORTS"
-  printf '%s\n' "$CONF_DIR" > "$PROXY_OWNER"
+  printf '%s\n' "$(absolute_path "$PID_FILE")" > "$PROXY_OWNER"
   readback="$(scutil --proxy 2>/dev/null)" || readback=""
   bad=""
   proxy_readback_has "$readback" ProxyAutoConfigEnable 0 || bad="PAC"
@@ -1962,7 +2201,7 @@ proxy_field() {
 # The loopback ports a lane of this config dir can own: its marker, the inbounds
 # of its served config, and the three defaults a lane with neither still uses.
 proxy_owned_ports() {
-  local ports=" $SOCKS_PORT $HTTP_PORT $MIXED_PORT " first="" second="" file from_config port
+  local ports=" " first="" second="" file from_config port from_lane=0
   if [ -r "$PROXY_PORTS" ]; then
     read -r first second < "$PROXY_PORTS" || true
     for port in "$first" "$second"; do
@@ -1984,15 +2223,31 @@ for inbound in document.get("inbounds", []):
             print(port)
 PY
 )" || from_config=""
-    for port in $from_config; do ports="$ports$port "; done
+    for port in $from_config; do ports="$ports$port "; from_lane=1; done
   fi
+  [ "$from_lane" = 1 ] || ports="$ports$SOCKS_PORT $HTTP_PORT $MIXED_PORT "
   printf '%s' "$ports"
 }
 
 system_proxy_off() {
-  local svc kind get set line enabled server port owned failed=0 cleared=0 restored=0
-  local pac_on pac_url auto_on bypass
+  local rc=0
+  proxy_lock || return 1
+  _system_proxy_off "${1:-0}" || rc=$?
+  proxy_unlock
+  return "$rc"
+}
+
+_system_proxy_off() {
+  local svc kind get set line enabled server port owned owner_pidfile failed=0 cleared=0 restored=0
+  local pac_on pac_url auto_on bypass force="${1:-0}"
   owned="$(proxy_owned_ports)"
+  if [ "$force" != 1 ] && owner_pidfile="$(proxy_owner_pidfile)"; then
+    if lane_running_at "$owner_pidfile" &&
+       [ "$(resolve_real "$owner_pidfile")" != "$(resolve_real "$PID_FILE")" ]; then
+      say "system proxy: owned by the lane at $owner_pidfile; leaving it armed." >&2
+      return 0
+    fi
+  fi
   if ! command -v networksetup >/dev/null 2>&1; then
     rm -f "$PROXY_PORTS" "$PROXY_STATE" "$PROXY_OWNER"
     return 0
@@ -2118,19 +2373,26 @@ lane_pid_runs() {
   return 1
 }
 
-lane_running_in() {
-  local dir="$1" pidfile="$1/lane.pid" pid
+lane_running_at() {
+  local pidfile="$1" pid
   [ -f "$pidfile" ] || return 1
   pid="$(cat "$pidfile" 2>/dev/null || true)"
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
+proxy_owner_pidfile() {
+  local owner
+  owner="$(cat "$PROXY_OWNER" 2>/dev/null || true)"
+  [ -n "$owner" ] || return 1
+  [ -d "$owner" ] && owner="$owner/lane.pid"
+  printf '%s\n' "$owner"
+}
+
 reconcile_stale_proxy() {
   lane_running && return 0
-  local owner=""
-  if [ -r "$PROXY_OWNER" ]; then
-    owner="$(cat "$PROXY_OWNER" 2>/dev/null || true)"
-    [ -n "$owner" ] && lane_running_in "$owner" && return 0
+  local owner_pidfile
+  if owner_pidfile="$(proxy_owner_pidfile)" && lane_running_at "$owner_pidfile"; then
+    return 0
   fi
   # A marker left by a lane that is not alive is a dead arm: restore it before
   # anything else, whether or not the services still show the endpoint.
@@ -2218,7 +2480,7 @@ foxy_lane_configured() {
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && exec 3>&- ; }
 
 wait_fronts() {
-  local front port i
+  local front port
   for front in ${FRONTS//,/ }; do
     case "$front" in
       socks) port="$SOCKS_PORT" ;;
@@ -2226,7 +2488,7 @@ wait_fronts() {
       mixed) port="$MIXED_PORT" ;;
       *) continue ;;
     esac
-    for i in $(seq 1 90); do
+    for _ in $(seq 1 90); do
       port_open "$port" && break
       lane_running || return 1
       sleep 1
@@ -2256,7 +2518,6 @@ build_outbound() {
 }
 
 build_config() {
-  local outbound
   case "$OUTBOUND" in
     foxy)
       read_credentials
@@ -2278,7 +2539,7 @@ build_config() {
         require_bin
         start_warp_hop || die "the warp hop did not start; nothing was chained."
       fi
-      outbound="$(build_outbound foxy)" || exit 1
+      BUILT_OUTBOUND="$(build_outbound foxy)" || exit 1
       save_lane_location
       ;;
     vless)
@@ -2287,16 +2548,16 @@ build_config() {
         *) die "--vless wants a vless:// share link, got '$VLESS'; nothing was started.
   example: ferrox-cli up --vless 'vless://uuid@host:443?type=ws&security=tls&sni=host&path=/ws'" ;;
       esac
-      outbound="$(build_outbound vless)" || exit 1
+      BUILT_OUTBOUND="$(build_outbound vless)" || exit 1
       ;;
     veepn)
       load_lane_location
-      outbound="$(build_outbound veepn)" || exit 1
+      BUILT_OUTBOUND="$(build_outbound veepn)" || exit 1
       save_lane_location
       ;;
     psiphon)
       load_lane_location
-      outbound="$(build_outbound psiphon)" || exit 1
+      BUILT_OUTBOUND="$(build_outbound psiphon)" || exit 1
       save_lane_location
       ;;
     vmess)
@@ -2309,10 +2570,10 @@ build_config() {
   example: ferrox-cli up --vmess 'vmess://base64-json'
   or: ferrox-cli up --vmess host:443 --uuid UUID" ;;
       esac
-      outbound="$(build_outbound vmess)" || exit 1
+      BUILT_OUTBOUND="$(build_outbound vmess)" || exit 1
       ;;
-    trojan) outbound="$(build_outbound trojan)" || exit 1 ;;
-    ss) outbound="$(build_outbound ss)" || exit 1 ;;
+    trojan) BUILT_OUTBOUND="$(build_outbound trojan)" || exit 1 ;;
+    ss) BUILT_OUTBOUND="$(build_outbound ss)" || exit 1 ;;
     config)
       [ -f "$CONFIG_FILE" ] || die "no such config: $CONFIG_FILE"
       CFG="$CONFIG_FILE"
@@ -2334,7 +2595,6 @@ EOF
       exit 2
       ;;
   esac
-  write_config "$outbound" || die "cannot write $CFG"
 }
 
 # The carrier is a choice, not a default: h2 is the rung auto opens on and h3 is
@@ -2362,15 +2622,62 @@ choose_carrier() {
 }
 
 start_lane() {
-  local new_cfg new_fronts
+  local new_cfg new_fronts old_exit lane_pid reg_dir status=0 start_epoch final_cfg warp_port
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
+  start_epoch="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)"
+  LOGIN_GUARD_SET=1; LOGIN_GUARD_EPOCH="$start_epoch"
+  WARP_SELECTED=0
+  final_cfg="$CFG"; CFG_STAGE=""
   # Validate first: an invocation that cannot start must not stop a healthy lane,
   # and a bad link must not send the user to a build before saying what is wrong.
+  old_exit="$(trap -p EXIT)"
+  trap 'status=$?; [ "$WARP_STARTED" = 1 ] && stop_owned_warp; exit $status' EXIT
   build_config
   require_bin
-  touch "$LANES_FILE"
-  grep -Fxq "$CONF_DIR" "$LANES_FILE" || printf '%s\n' "$CONF_DIR" >> "$LANES_FILE"
+  if [ -n "$old_exit" ]; then eval "$old_exit"; else trap - EXIT; fi
+  proxy_lock || {
+    [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"
+    [ "$OUTBOUND" = config ] || CFG="$final_cfg"
+    return 1
+  }
+  if [ "$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)" != "$start_epoch" ]; then
+    [ "$WARP_STARTED" = 1 ] && stop_owned_warp
+    [ "$OUTBOUND" = config ] || CFG="$final_cfg"
+    proxy_unlock
+    say "a concurrent down or logout cancelled this start; try again." >&2
+    return 1
+  fi
+  if [ "$WARP_SELECTED" = 1 ]; then
+    warp_port="$(cat "$WARP_PORT_FILE" 2>/dev/null || true)"
+    if ! warp_hop_running || [ "$UPSTREAM" != "socks5://127.0.0.1:$warp_port" ]; then
+      [ "$OUTBOUND" = config ] || CFG="$final_cfg"
+      proxy_unlock
+      say "the warp hop was stopped by a concurrent down; try again." >&2
+      return 1
+    fi
+  fi
+  save_lane_location
+  reg_dir="$(resolve_real "$CONF_DIR")"
+  if ! { touch "$LANES_FILE" &&
+         { grep -Fxq "$reg_dir" "$LANES_FILE" || printf '%s\n' "$reg_dir" >> "$LANES_FILE"; }; }; then
+    proxy_unlock
+    say "lane: cannot record $reg_dir in $LANES_FILE." >&2
+    return 1
+  fi
+  if [ "$OUTBOUND" != config ]; then
+    CFG_STAGE="$(dirname "$final_cfg")/.$(basename "$final_cfg").stage.$$"
+    rm -f "$CFG_STAGE"
+    CFG="$CFG_STAGE"
+    if ! write_config "$BUILT_OUTBOUND"; then
+      rm -f "$CFG_STAGE"; CFG_STAGE=""
+      CFG="$final_cfg"
+      proxy_unlock
+      say "cannot write $final_cfg" >&2
+      return 1
+    fi
+    CFG="$final_cfg"
+  fi
   # stop_lane reads the old meta to name the process it must kill, so keep the
   # new lane's settings aside until that process is gone.
   new_cfg="$CFG"; new_fronts="$FRONTS"
@@ -2379,13 +2686,33 @@ start_lane() {
     stop_lane 0
   fi
   CFG="$new_cfg"; FRONTS="$new_fronts"
-  write_lane_meta
+  if ! write_lane_meta; then
+    [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"
+    proxy_unlock
+    return 1
+  fi
+  if [ "$OUTBOUND" != config ]; then
+    if ! mv -f "$CFG_STAGE" "$final_cfg"; then
+      rm -f "$CFG_STAGE"; CFG_STAGE=""
+      proxy_unlock
+      say "cannot publish $final_cfg" >&2
+      return 1
+    fi
+    CFG_STAGE=""
+  fi
   if [ "$DEBUG" = 1 ]; then
     FOXY_DEBUG=1 "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
   else
     "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
   fi
-  echo "$!" > "$PID_FILE"
+  lane_pid=$!
+  if ! echo "$lane_pid" > "$PID_FILE"; then
+    kill "$lane_pid" 2>/dev/null || true
+    wait "$lane_pid" 2>/dev/null || true
+    proxy_unlock
+    return 1
+  fi
+  proxy_unlock
 }
 
 supervise_lane() {
@@ -2446,8 +2773,11 @@ warp_hop_running() {
 
 start_warp_hop() {
   WARP_STARTED=0
+  WARP_SELECTED=0
+  WARP_OWN_PID=""
   if warp_hop_running; then
     UPSTREAM="socks5://127.0.0.1:$(cat "$WARP_PORT_FILE")"
+    WARP_SELECTED=1
     say "warp hop already up (pid $(cat "$WARP_PID_FILE")); the lane chains through it."
     return 0
   fi
@@ -2471,6 +2801,7 @@ PY
   "$BIN" run -c "$WARP_CFG" >"$WARP_LOG" 2>&1 &
   pid=$!
   WARP_STARTED=1
+  WARP_OWN_PID="$pid"
   echo "$pid" > "$WARP_PID_FILE"
   echo "$port" > "$WARP_PORT_FILE"
   for _ in $(seq 1 120); do
@@ -2481,10 +2812,11 @@ PY
   if ! port_open "$port"; then
     say "the warp hop did not open; last lines of $WARP_LOG:"
     tail -n 20 "$WARP_LOG" 2>/dev/null || true
-    stop_warp_hop
+    stop_owned_warp
     return 1
   fi
   UPSTREAM="socks5://127.0.0.1:$port"
+  WARP_SELECTED=1
   say "warp hop up (pid $pid) on 127.0.0.1:$port; the account plane and the carrier egress through it."
 }
 
@@ -2499,21 +2831,115 @@ stop_warp_hop() {
   rm -f "$WARP_PID_FILE" "$WARP_PORT_FILE" "$WARP_CFG"
 }
 
+stop_owned_warp() {
+  local pid="${WARP_OWN_PID:-}"
+  [ -n "$pid" ] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  fi
+  if [ "$(cat "$WARP_PID_FILE" 2>/dev/null || true)" = "$pid" ]; then
+    rm -f "$WARP_PID_FILE" "$WARP_PORT_FILE" "$WARP_CFG"
+  fi
+  WARP_OWN_PID=""; WARP_STARTED=0
+}
+
 forget_lane_config() {
-  case "$CFG" in
-    "$CONF_DIR"/lane*.json) rm -f "$CFG" ;;
-  esac
+  [ "${GENERATED:-0}" = 1 ] && rm -f "$CFG"
   rm -f "$META_FILE"
+}
+
+bump_stop_epoch() {
+  local n
+  n="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || echo 0)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s\n' "$((n + 1))" >"$STATE_DIR/stop-epoch"
 }
 
 # The account is shared, so signing out ends every lane; each owns its pid and config.
 # The registry makes a lane armed under a moved FERROX_CONF_DIR visible here.
 stop_all_lanes() {
   local saved_conf="$CONF_DIR" saved_instance="$INSTANCE" dir pidfile base rc=0
+  local -a forget=()
+  local pending="$STATE_DIR/logout.pending" pending_tmp
+  proxy_lock || return 1
+  if ! bump_stop_epoch; then
+    proxy_unlock
+    say "cannot record the stop generation; nothing was stopped." >&2
+    return 1
+  fi
+  if [ -r "$pending" ]; then
+    while IFS= read -r dir; do
+      [ -n "$dir" ] && forget+=("$(resolve_real "$dir")")
+    done <"$pending"
+  fi
   if [ -r "$LANES_FILE" ]; then
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue
-      CONF_DIR="$dir"
+      CONF_DIR="$(resolve_real "$dir")"
+      for pidfile in "$CONF_DIR"/lane*.pid; do
+        [ -f "$pidfile" ] || continue
+        base="${pidfile##*/}"; base="${base#lane}"; base="${base%.pid}"
+        INSTANCE="${base#-}"
+        apply_instance
+        GENERATED=0
+        load_lane_meta || true
+        [ "$GENERATED" = 1 ] && forget+=("$CFG")
+        forget+=("$META_FILE")
+      done
+      for pidfile in "$CONF_DIR"/lane.meta "$CONF_DIR"/lane-*.meta; do
+        [ -f "$pidfile" ] || continue
+        base="${pidfile##*/}"; base="${base#lane}"; base="${base%.meta}"
+        INSTANCE="${base#-}"
+        apply_instance
+        GENERATED=0
+        load_lane_meta || true
+        [ "$GENERATED" = 1 ] && forget+=("$CFG")
+        forget+=("$META_FILE")
+      done
+      for staged in "$CONF_DIR"/.lane*.json.stage.*; do
+        [ -e "$staged" ] && forget+=("$staged")
+      done
+    done < "$LANES_FILE"
+  fi
+  CONF_DIR="$(resolve_real "$saved_conf")"
+  for pidfile in "$CONF_DIR"/lane*.pid; do
+    [ -f "$pidfile" ] || continue
+    base="${pidfile##*/}"; base="${base#lane}"; base="${base%.pid}"
+    INSTANCE="${base#-}"
+    apply_instance
+    GENERATED=0
+    load_lane_meta || true
+    [ "$GENERATED" = 1 ] && forget+=("$CFG")
+    forget+=("$META_FILE")
+  done
+  for pidfile in "$CONF_DIR"/lane.meta "$CONF_DIR"/lane-*.meta; do
+    [ -f "$pidfile" ] || continue
+    base="${pidfile##*/}"; base="${base#lane}"; base="${base%.meta}"
+    INSTANCE="${base#-}"
+    apply_instance
+    GENERATED=0
+    load_lane_meta || true
+    [ "$GENERATED" = 1 ] && forget+=("$CFG")
+    forget+=("$META_FILE")
+  done
+  for staged in "$CONF_DIR"/.lane*.json.stage.*; do
+    [ -e "$staged" ] && forget+=("$staged")
+  done
+  if [ "${#forget[@]}" -gt 0 ]; then
+    pending_tmp="$pending.$$"
+    if ! { printf '%s\n' "${forget[@]}" >"$pending_tmp" && mv -f "$pending_tmp" "$pending"; }; then
+      rm -f "$pending_tmp"
+      proxy_unlock
+      say "cannot record the configs to remove; nothing was stopped." >&2
+      return 1
+    fi
+  fi
+  if [ -r "$LANES_FILE" ]; then
+    while IFS= read -r dir; do
+      [ -n "$dir" ] || continue
+      CONF_DIR="$(resolve_real "$dir")"
       INSTANCE=""
       apply_instance
       for pidfile in "$CONF_DIR"/lane*.pid; do
@@ -2522,7 +2948,6 @@ stop_all_lanes() {
         INSTANCE="${base#-}"
         apply_instance
         stop_lane 0 || rc=1
-        forget_lane_config
       done
       for pidfile in "$CONF_DIR"/warp-hop*.pid; do
         [ -f "$pidfile" ] || continue
@@ -2533,7 +2958,7 @@ stop_all_lanes() {
       done
     done < "$LANES_FILE"
   fi
-  CONF_DIR="$saved_conf"
+  CONF_DIR="$(resolve_real "$saved_conf")"
   INSTANCE=""
   apply_instance
   for pidfile in "$CONF_DIR"/lane*.pid; do
@@ -2542,7 +2967,6 @@ stop_all_lanes() {
     INSTANCE="${base#-}"
     apply_instance
     stop_lane 0 || rc=1
-    forget_lane_config
   done
   for pidfile in "$CONF_DIR"/warp-hop*.pid; do
     [ -f "$pidfile" ] || continue
@@ -2553,8 +2977,17 @@ stop_all_lanes() {
   done
   INSTANCE=""
   apply_instance
-  system_proxy_off || rc=1
-  rm -f "$LANES_FILE" "$PROXY_OWNER"
+  system_proxy_off 1 || rc=1
+  if [ "$rc" -eq 0 ]; then
+    if [ "${#forget[@]}" -gt 0 ] && ! rm -f "${forget[@]}"; then
+      rc=1
+    fi
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$pending"
+    fi
+  fi
+  bump_stop_epoch || rc=1
+  proxy_unlock
   CONF_DIR="$saved_conf"
   INSTANCE="$saved_instance"
   apply_instance
@@ -2757,7 +3190,7 @@ warp_ladder() {
 # An interruption before the lane exists can still leave the warp hop this
 # attempt started; stop only that, never a lane that was already running.
 interrupt_before_lane() {
-  [ "$WARP_STARTED" = 1 ] && stop_warp_hop
+  [ "$WARP_STARTED" = 1 ] && stop_owned_warp
   say "interrupted: the attempt was stopped; the log stays at $LOG."
 }
 
@@ -2767,7 +3200,10 @@ action_up() {
   choose_carrier
   for _ in 1 2; do
     trap 'interrupt_before_lane; exit 130' INT TERM
-    start_lane
+    if ! start_lane; then
+      [ "$WARP_STARTED" = 1 ] && stop_owned_warp
+      exit 1
+    fi
     # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
     trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
     if [ -n "$FRONTS" ] && ! wait_fronts; then
@@ -2815,7 +3251,10 @@ action_serve() {
   choose_carrier
   for _ in 1 2; do
     trap 'interrupt_before_lane; exit 130' INT TERM
-    start_lane
+    if ! start_lane; then
+      [ "$WARP_STARTED" = 1 ] && stop_owned_warp
+      exit 1
+    fi
     # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.
     trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
     if [ -n "$FRONTS" ] && ! wait_fronts; then
@@ -3213,7 +3652,7 @@ require_bin() {
   # measured binary.
   if [ -f "$ROOT/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
     profile="${FERROX_PROFILE:-debug}"
-    [ "${FERROX_RELEASE:-0}" = 1 ] && profile=release
+    if [ -z "${FERROX_PROFILE:-}" ] && [ "${FERROX_RELEASE:-0}" = 1 ]; then profile=release; fi
     case "$profile" in
       release)
         say "building ferrox-app (release; minutes, not seconds)..."
