@@ -553,17 +553,17 @@ mod tests {
     #[test]
     fn a_references_list_draws_the_core_set_plus_what_the_row_names() {
         let pins = pins_from_text(
-            "[sources.sing-box]\nalways        = true\n\n[sources.quiche]\ntopics        = \"quic, h3, masque\"\n\n[sources.zeptun]\ntopics        = \"tun2socks\"\n",
+            "[sources.sing-box]\nalways        = true\n\n[sources.quiche]\ntopics        = \"quic, h3, masque\"\n\n[sources.leaf]\ntopics        = \"tun2socks\"\n",
         );
         let quic_row = "| 13 | VLESS over QUIC | client only | quiche with ALPN `h3` |";
         assert_eq!(references_for(&pins, quic_row), "sing-box, quiche");
         assert_eq!(
             references_for(&pins, "| 58 | tun2socks engine |"),
-            "sing-box, zeptun"
+            "sing-box, leaf"
         );
         // A row that matches nothing falls back to the full list rather than a blank.
-        let no_core = pins_from_text("[sources.quiche]\ntopics        = \"quic\"\n\n[sources.zeptun]\ntopics        = \"tun2socks\"\n");
-        assert_eq!(references_for(&no_core, "no topic here"), "quiche, zeptun");
+        let no_core = pins_from_text("[sources.quiche]\ntopics        = \"quic\"\n\n[sources.leaf]\ntopics        = \"tun2socks\"\n");
+        assert_eq!(references_for(&no_core, "no topic here"), "quiche, leaf");
         // The no-row fallback is the core set.
         assert_eq!(references_for(&pins, ""), "sing-box");
     }
@@ -596,7 +596,7 @@ mod tests {
         let refs = references_for(&pins, &quic.text).to_ascii_lowercase();
         assert!(refs.contains("quiche"), "{refs}");
         assert!(refs.contains("xray-core"), "core set always rides: {refs}");
-        for unrelated in ["zeptun", "slipstream", "mqvpn", "amnezia-client"] {
+        for unrelated in ["leaf", "slipstream", "mqvpn", "amnezia-client"] {
             assert!(
                 !refs.contains(unrelated),
                 "{unrelated} rode into a QUIC row: {refs}"
@@ -607,7 +607,7 @@ mod tests {
             .find(|row| row.method.starts_with("tun2socks"))
             .expect("the tun2socks row is in the matrix");
         let tun_refs = references_for(&pins, &tun.text).to_ascii_lowercase();
-        assert!(tun_refs.contains("zeptun"), "{tun_refs}");
+        assert!(tun_refs.contains("leaf"), "{tun_refs}");
         assert!(
             !tun_refs.contains("quiche"),
             "quiche rode into a tun row: {tun_refs}"

@@ -48,15 +48,15 @@ graph TD
 | ops-retired-instructions | 32598 | scripts/count-ops.sh |
 | syscalls-per-tun-packet | UNBLESSED | no syscall checker yet |
 | user-space-copies-per-tun-packet | UNBLESSED | no copy checker yet |
-| time-tcp-down-1 | ferrox=13.694Gbit/s,zeptun=24.779Gbit/s,ratio=0.55 | tun-bench.yml |
-| time-tcp-down-10 | ferrox=20.155Gbit/s,zeptun=37.995Gbit/s,ratio=0.53 | tun-bench.yml |
-| time-tcp-up-1 | ferrox=18.249Gbit/s,zeptun=25.497Gbit/s,ratio=0.72 | tun-bench.yml |
-| time-tcp-up-10 | ferrox=21.682Gbit/s,zeptun=34.407Gbit/s,ratio=0.63 | tun-bench.yml |
-| time-rr | ferrox=8777tps,zeptun=20447tps,ratio=0.43 | tun-bench.yml |
-| time-rr-8x1k | ferrox=57098tps,zeptun=113654tps,ratio=0.50 | tun-bench.yml |
-| time-udp-100k | ferrox=96226pps,zeptun=99950pps,ratio=0.96 | tun-bench.yml |
-| cpu-cores-at-tcp-down-10 | ferrox=2.9cores,zeptun=1.8cores | tun-bench.yml |
-| rss-mb-at-ten-flows | ferrox=74MB,zeptun=5MB | tun-bench.yml |
+| time-tcp-down-1 | ferrox=13.767Gbit/s,hev=16.039Gbit/s,ratio=0.86 | tun-bench.yml |
+| time-tcp-down-10 | ferrox=20.363Gbit/s,hev=43.298Gbit/s,ratio=0.47 | tun-bench.yml |
+| time-tcp-up-1 | ferrox=17.848Gbit/s,hev=23.474Gbit/s,ratio=0.76 | tun-bench.yml |
+| time-tcp-up-10 | ferrox=21.132Gbit/s,hev=40.103Gbit/s,ratio=0.53 | tun-bench.yml |
+| time-rr | ferrox=8591tps,hev=17785tps,ratio=0.48 | tun-bench.yml |
+| time-rr-8x1k | ferrox=61292tps,hev=93763tps,ratio=0.65 | tun-bench.yml |
+| time-udp-100k | ferrox=99268pps,hev=99301pps,ratio=1.00 | tun-bench.yml |
+| cpu-cores-at-tcp-down-10 | ferrox=2.98cores,hev=2.06cores | tun-bench.yml |
+| rss-mb-at-ten-flows | ferrox=75.2MB,hev=2.5MB | tun-bench.yml |
 | writes-after-a-refused-packet | 2 | ferrox-app-tun-stack::tests::a_refused_packet_is_dropped_and_the_next_still_goes_out |
 <!-- counts:end -->
 
@@ -90,10 +90,10 @@ Against the pinned references, xray-core and sing-box open the platform device a
 | --- | --- |
 | the device API, multi-queue, GSO and GRO | `tun-rs` 2.8.18 (`platform/linux/device.rs`, `platform/linux/offload.rs`) |
 | the TCP state machine and socket buffers | `smoltcp` 0.14 |
-| the stack tuning reference | `upstream/zeptun/src/stack/tcp.zig`, `src/engine.zig` |
+| the stack tuning reference | `upstream/sing-box/transport/device`, `upstream/xray-core/proxy/tun/tcp_lightweight.go` |
 | the native fallback | `docs/function/front-tun.md`, `crates/ferrox-app/src/tun.rs` |
 | the system NAT loop, accepted flow and relay | `crates/ferrox-app/src/tun_system.rs` |
-| the kernel-TCP stack shape | `upstream/zeptun/src/stack/system.zig`, `upstream/zeptun/src/flow/nat.zig` |
+| the kernel-TCP stack shape | `upstream/leaf/leaf/src/proxy/tun`, `upstream/sing-box/option/tun.go` |
 
 ## CI scope
 
