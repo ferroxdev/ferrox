@@ -449,12 +449,14 @@ action_login() {
   [ -n "$email" ] && [ -n "$pass" ] || die "an account is an email and a password"
   local cred_dir tmp
   cred_dir="$(dirname "$CREDS")"
+  [ -d "$CREDS" ] && die "$CREDS is a directory; FOXY_CREDENTIALS must name a file"
   mkdir -p "$CONF_DIR" || die "cannot create $CONF_DIR; the saved session was kept."
   chmod 700 "$CONF_DIR" 2>/dev/null || true
   if [ "$cred_dir" != "$CONF_DIR" ]; then
     mkdir -p "$cred_dir" || die "cannot create $cred_dir; the saved session was kept."
   fi
-  tmp="$CREDS.tmp.$$"
+  tmp="$(mktemp "$cred_dir/.ferrox-credentials.XXXXXX")" ||
+    die "cannot create a temporary credentials file in $cred_dir; the saved session was kept."
   (
     umask 077
     {
@@ -463,6 +465,7 @@ action_login() {
     } >"$tmp"
   ) || { rm -f "$tmp"; die "cannot write $CREDS; the saved session was kept."; }
   chmod 600 "$tmp" || { rm -f "$tmp"; die "cannot set owner-only mode on $CREDS; the saved session was kept."; }
+  [ -d "$CREDS" ] && { rm -f "$tmp"; die "$CREDS is a directory; FOXY_CREDENTIALS must name a file"; }
   mv -f "$tmp" "$CREDS" || { rm -f "$tmp"; die "cannot replace $CREDS; the saved session was kept."; }
   # A login is the user asking for this account now: the grant the last one left is not the one to resume.
   rm -f "$TOKEN_FILE"
@@ -1826,6 +1829,12 @@ proxy_restore_snapshot() {
 system_proxy_on() {
   command -v networksetup >/dev/null 2>&1 || { say "system proxy: no networksetup; nothing was armed." >&2; return 1; }
   command -v scutil >/dev/null 2>&1 || { say "system proxy: no scutil to read the proxy back; nothing was armed." >&2; return 1; }
+  local owner_pidfile
+  if owner_pidfile="$(proxy_owner_pidfile)" && lane_running_at "$owner_pidfile" &&
+     [ "$(resolve_real "$owner_pidfile")" != "$(resolve_real "$PID_FILE")" ]; then
+    say "system proxy: owned by the lane at $owner_pidfile; nothing was armed." >&2
+    return 1
+  fi
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
   local any=0 svc want_socks="" want_http="" front bypass readback bad
   for front in ${FRONTS//,/ }; do
