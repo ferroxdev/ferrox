@@ -1346,7 +1346,7 @@ impl Session {
                         } else {
                             self.request(wire, id, &block);
                         }
-                        if stream == self.request && head_flags & h2::F_END != 0 {
+                        if Some(stream) == self.request && head_flags & h2::F_END != 0 {
                             self.half_close();
                         }
                     } else {
