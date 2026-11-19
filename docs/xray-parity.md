@@ -2,7 +2,7 @@
 
 Pinned reference: `upstream/xray-core` @ `c456141` (`upstream/pins.toml`). This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
 
-What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BINARY`), `zeronet` `xray_oracle` (9 tests, seam `ZRAY_XRAY_BINARY`), and `xray-core`'s `testing/scenarios` built at run time and spawned with `-config=stdin: -format=pb` via `go -overlay` (`scripts/xray-scenarios.sh`), which `ferrox-app` reads in `crates/ferrox-app/src/xray_pb.rs`. The gate is every scenario test the map answers green — 44 of 73 at this pin, across http, socks, dokodemo, dns, feature, policy, shadowsocks (legacy AEAD and 2022), tls, vless, vmess and masque; all 73 run into the `conformance.yml` scenario map. `xray-core`'s own unit tests are in-process with no seam and stay in `xray-baseline.yml`.
+What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BINARY`), `zeronet` `xray_oracle` (9 tests, seam `ZRAY_XRAY_BINARY`), and `xray-core`'s `testing/scenarios` built at run time and spawned with `-config=stdin: -format=pb` via `go -overlay` (`scripts/xray-scenarios.sh`), which `ferrox-app` reads in `crates/ferrox-app/src/xray_pb.rs`. At this pin the map answers 44 of 73, across http, socks, dokodemo, dns, feature, policy, shadowsocks (legacy AEAD and 2022), tls, vless, vmess and masque; `conformance.yml` gates those 44, plus two `dialerProxy` tests and five commander tests (51 in all). All 73 run into the scenario map. `xray-core`'s own unit tests are in-process with no seam and stay in `xray-baseline.yml`.
 
 ## What ferrox has that xray-core does not
 
