@@ -3584,7 +3584,7 @@ fn pad_head(settings: &XhttpSettings, pad: &str) -> String {
             if !settings.x_padding_header.is_empty() && !settings.x_padding_key.is_empty() =>
         {
             format!(
-                "{}: {}={pad}\r\n",
+                "{}: ?{}={pad}\r\n",
                 settings.x_padding_header, settings.x_padding_key
             )
         }
@@ -5153,6 +5153,7 @@ mod tests {
         for (placement, marker) in [
             (Placement::Header, "X-Pad: XXXXXXXX\r\n"),
             (Placement::Cookie, "Cookie: pad=XXXXXXXX\r\n"),
+            (Placement::QueryInHeader, "X-Pad: ?pad=XXXXXXXX\r\n"),
             (Placement::Query, "?pad=XXXXXXXX"),
         ] {
             settings.x_padding_placement = placement;
@@ -5168,8 +5169,31 @@ mod tests {
                     !head.contains("?x_padding="),
                     "{placement:?} keeps the pad out of the referer: {head}"
                 );
+                let target = head.split_ascii_whitespace().nth(1).unwrap_or_default();
+                assert_eq!(
+                    extract_padding(&head, target, &settings),
+                    Some("XXXXXXXX"),
+                    "{placement:?} writes a pad the hub reads back: {head}"
+                );
             }
         }
+
+        let mut defaulted = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up/", "xPaddingObfsMode": true}}}"#,
+        );
+        defaulted.x_padding_method = PadMethod::RepeatX;
+        defaulted.x_padding_bytes = (8, 8);
+        let head = dial_head("front.example", &defaulted, "session", None);
+        assert!(
+            head.contains("X-Padding: ?x_padding=XXXXXXXX\r\n"),
+            "the default placement is queryInHeader: {head}"
+        );
+        let target = head.split_ascii_whitespace().nth(1).unwrap_or_default();
+        assert_eq!(
+            extract_padding(&head, target, &defaulted),
+            Some("XXXXXXXX"),
+            "the hub reads the default placement back: {head}"
+        );
     }
 
     /// The pad hangs off the referer's path alone: the configured query rides on the request line, so the hub's extractor still finds `x_padding` when both are set.

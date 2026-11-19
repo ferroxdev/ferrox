@@ -2271,7 +2271,7 @@ fn request_block(host: &str, settings: &XhttpSettings, scheme: &str) -> Vec<u8> 
             crate::xhttp::Placement::QueryInHeader
                 if !settings.x_padding_header.is_empty() && !settings.x_padding_key.is_empty() =>
             {
-                let value = format!("{}={pad}", settings.x_padding_key);
+                let value = format!("?{}={pad}", settings.x_padding_key);
                 crate::h2::push_lower(&mut out, &settings.x_padding_header, &value);
             }
             _ => {}
@@ -3942,6 +3942,21 @@ mod tests {
             request_block("example.test", &carrier, "https"),
             staged_request_block("example.test", &carrier, "https"),
             "the in-place encoder changed a carrier head"
+        );
+    }
+
+    #[test]
+    fn query_in_header_padding_is_a_query_value() {
+        let mut settings = XhttpSettings::stream_one();
+        settings.x_padding_obfs = true;
+        settings.x_padding_placement = crate::xhttp::Placement::QueryInHeader;
+        settings.x_padding_method = crate::xhttp::PadMethod::RepeatX;
+        settings.x_padding_bytes = (8, 8);
+        let block = request_block("example.test", &settings, "https");
+        let text = String::from_utf8_lossy(&block);
+        assert!(
+            text.contains("?x_padding=XXXXXXXX"),
+            "queryInHeader carries the delimiter query_param reads: {text:?}"
         );
     }
 

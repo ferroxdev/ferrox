@@ -1045,7 +1045,17 @@ where
     let discard = || {
         let headers = registration_headers(Some(&bearer));
         let headers = borrow_headers(&headers);
-        let _ = call("DELETE", &path, &headers, &[]);
+        match call("DELETE", &path, &headers, &[]) {
+            Ok(reply) if (200..300).contains(&reply.status) => {}
+            Ok(reply) => eprintln!(
+                "warp: could not delete the failed device registration: {}",
+                reply.status
+            ),
+            Err(error) => eprintln!(
+                "warp: could not delete the failed device registration: {}",
+                error.reason
+            ),
+        }
     };
     let mut masque = None;
 
@@ -2394,7 +2404,7 @@ impl WarpOut {
             }
         };
         let gool = if spec.mode == Mode::Gool {
-            Some(Arc::new(build_gool(&identity, &spec)?))
+            Some(Arc::new(build_gool(&identity, &spec, test)?))
         } else {
             None
         };
@@ -2654,13 +2664,13 @@ impl GoolOut {
     }
 }
 
-fn build_gool(identity: &Identity, spec: &WarpSpec) -> Result<GoolOut, String> {
+fn build_gool(identity: &Identity, spec: &WarpSpec, test: bool) -> Result<GoolOut, String> {
     if identity.masque.is_none() {
         return Err(
             "warp gool: the outer identity has no MASQUE key to carry WireGuard".to_owned(),
         );
     }
-    let inner_identity = spec.gool_identity()?;
+    let inner_identity = spec.gool_identity_in(test)?;
     let remote = spec.gool.peer.unwrap_or(inner_identity.wireguard.endpoint);
     let outer = build_masque(identity, spec)?;
     GoolOut::new(outer, &inner_identity, spec, remote)
