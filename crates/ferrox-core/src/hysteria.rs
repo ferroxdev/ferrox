@@ -2342,13 +2342,13 @@ mod tests {
         );
         let head = parse_origin_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n", b"HEAD")
             .expect("a HEAD reply has no body");
-        assert!(head.body.is_empty());
+        assert_eq!(head.body, Vec::<u8>::new());
         let not_modified = parse_origin_response(
             b"HTTP/1.1 304 Not Modified\r\nContent-Length: 9\r\n\r\n",
             b"GET",
         )
         .expect("a 304 has no body");
-        assert!(not_modified.body.is_empty());
+        assert_eq!(not_modified.body, Vec::<u8>::new());
     }
 
     /// The doubling form `dechunk` grew through, kept as the byte oracle the one buffer has to equal.

@@ -349,6 +349,10 @@ fn canceled(
     Ok(())
 }
 
+fn unsettled(carrier: Carrier) -> String {
+    format!("{carrier:?}: the allowance did not settle before the clock")
+}
+
 /// One carrier's charge with every other cost held still: an idle window, a head, a small payload and a large one, each read only after the counter has stopped moving.
 fn brackets(
     account: &Account,
@@ -361,22 +365,16 @@ fn brackets(
         .quota_remaining
         .ok_or("the plane names no allowance; without one there is nothing to charge")?;
     let Some(next) = settled(account, was, deadline) else {
-        return Err(format!(
-            "{carrier:?}: the allowance did not settle before the clock"
-        ));
+        return Err(unsettled(carrier));
     };
     was = next;
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
-        return Err(format!(
-            "{carrier:?}: the allowance did not settle before the clock"
-        ));
+        return Err(unsettled(carrier));
     }
     std::thread::sleep(IDLE.min(left));
     let Some(idle) = settled(account, was, deadline) else {
-        return Err(format!(
-            "{carrier:?}: the allowance did not settle before the clock"
-        ));
+        return Err(unsettled(carrier));
     };
     let drained = was.saturating_sub(idle);
     println!(
@@ -403,9 +401,7 @@ fn brackets(
         until,
     )?;
     let Some(now) = settled(account, was, deadline) else {
-        return Err(format!(
-            "{carrier:?}: the allowance did not settle before the clock"
-        ));
+        return Err(unsettled(carrier));
     };
     let fixed = was.saturating_sub(now);
     println!(
@@ -435,9 +431,7 @@ fn brackets(
         }
         let bytes = bytes as u64;
         let Some(now) = settled(account, was, deadline) else {
-            return Err(format!(
-                "{carrier:?}: the allowance did not settle before the clock"
-            ));
+            return Err(unsettled(carrier));
         };
         let charged = was.saturating_sub(now);
         let (whole, fraction) = per_byte(charged, bytes);
