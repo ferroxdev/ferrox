@@ -656,6 +656,21 @@ impl UdpFlow {
     }
 }
 
+impl UdpLane {
+    fn start_waiting(&mut self, room: usize) -> Vec<(u32, String, u16)> {
+        let mut spawn = Vec::new();
+        for (session, flow) in &mut self.flows {
+            if spawn.len() >= room {
+                break;
+            }
+            for (host, port) in flow.start_waiting(room - spawn.len()) {
+                spawn.push((*session, host, port));
+            }
+        }
+        spawn
+    }
+}
+
 #[derive(Default)]
 struct UdpLane {
     sessions: HashSet<u32>,
@@ -982,15 +997,14 @@ fn relay_datagrams(
                     Ok(None) => {}
                     Err(_) => flow.stop.store(true, Ordering::Relaxed),
                 }
-                if !forged {
-                    spawn = flow.start_waiting(room);
-                }
             }
             if forged {
                 lane.flows.remove(&session);
+            } else {
+                spawn = lane.start_waiting(room);
             }
             lane.resolving += spawn.len();
-            for (host, port) in spawn {
+            for (session, host, port) in spawn {
                 std::thread::spawn({
                     let lane = Arc::clone(&lane_handle);
                     move || resolve_dest(lane, session, host, port)
@@ -1119,7 +1133,6 @@ fn resolve_pending(
     }
     flow.used.insert(first.clone(), now);
     let room = MAX_PENDING_RESOLVERS.saturating_sub(guard.resolving.saturating_sub(1));
-    let mut spawns = Vec::new();
     for (key, packets) in pending.packets {
         if key == first {
             for payload in packets {
@@ -1128,17 +1141,14 @@ fn resolve_pending(
                     .send_to(&payload, target_addr(&flow.target, peer));
             }
         } else {
-            if spawns.len() < room {
-                flow.resolving.insert(key.clone());
-                spawns.push(key.clone());
-            }
             flow.waiting.insert(key, packets);
         }
     }
-    guard.resolving += spawns.len();
     guard.flows.insert(session, flow);
+    let spawns = guard.start_waiting(room);
+    guard.resolving += spawns.len();
     drop(guard);
-    for (host, port) in spawns {
+    for (session, host, port) in spawns {
         std::thread::spawn({
             let lane = Arc::clone(&lane);
             move || resolve_dest(lane, session, host, port)
@@ -1160,7 +1170,7 @@ fn resolve_dest(handle: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u
         return;
     };
     let room = MAX_PENDING_RESOLVERS.saturating_sub(lane.resolving.saturating_sub(1));
-    let spawn = {
+    {
         let Some(flow) = lane.flows.get_mut(&session) else {
             return;
         };
@@ -1180,11 +1190,11 @@ fn resolve_dest(handle: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u
             flow.defrags.remove(&key);
             flow.used.remove(&key);
         }
-        flow.start_waiting(room)
-    };
+    }
+    let spawn = lane.start_waiting(room);
     lane.resolving += spawn.len();
     drop(lane);
-    for (host, port) in spawn {
+    for (session, host, port) in spawn {
         std::thread::spawn({
             let handle = Arc::clone(&handle);
             move || resolve_dest(handle, session, host, port)
