@@ -2988,7 +2988,7 @@ impl RouteShared {
             return Ok(());
         };
         let next_script = next.script_shared();
-        // Script flows hold the router read guard while they run, so taking the write guard first swaps rules and script as one generation.
+        // Both writers swap rules and script as one generation, so no flow reads a half-swapped pair.
         let mut script = self
             .script_router
             .write()
@@ -3219,11 +3219,14 @@ impl RouteShared {
     /// script a live flow would get, without the default outbound the reference leaves to the caller.
     /// A matched rule's webhook fires here too, as the reference's `PickRoute` fires it.
     fn routed_tag(&self, probe: &crate::router::Probe<'_>) -> Result<Option<String>, String> {
-        let script = self
-            .script_router
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(script) = script.as_deref() {
+        let script = {
+            let router = self
+                .script_router
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            router.as_ref().map(Arc::clone)
+        };
+        if let Some(script) = script {
             let Some(callbacks) = self.script.as_ref() else {
                 return Ok(None);
             };

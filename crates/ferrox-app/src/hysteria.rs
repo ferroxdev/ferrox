@@ -2479,7 +2479,11 @@ fn relay_datagrams(
             Err(_) => flow.stop.store(true, Ordering::Relaxed),
         }
         if forged {
-            inbound.udp.remove(&session);
+            if let Some(mut flow) = inbound.udp.remove(&session) {
+                if let Some(reader) = flow.reader.take() {
+                    retired.push(reader);
+                }
+            }
         }
     }
 }
@@ -2501,6 +2505,8 @@ struct Router<'a> {
     /// The route each client CID and initial DCID names, so an Initial's retransmit finds its lane in one probe instead of walking every route.
     by_client_cid: HashMap<Vec<u8>, Vec<u8>>,
     by_initial_dcid: HashMap<Vec<u8>, Vec<u8>>,
+    /// Readers whose association was reaped, kept so shutdown can join them before the listener closes.
+    retired: Vec<std::thread::JoinHandle<()>>,
 }
 
 /// A stateless reset token belongs to one connection, so the shared template is minted afresh before each accept; a failed mint refuses the connection rather than sharing one.
@@ -2744,6 +2750,7 @@ impl Router<'_> {
             serve,
             masq,
             local,
+            retired,
             ..
         } = self;
         let Some(inbound) = routes.get_mut(dcid) else {
@@ -2825,7 +2832,7 @@ impl Router<'_> {
                     );
                 });
             }
-            relay_datagrams(inbound, sock, &shared, &mut conn);
+            relay_datagrams(inbound, sock, &shared, &mut conn, retired);
         }
         true
     }
@@ -2852,9 +2859,11 @@ impl Router<'_> {
             by_initial_dcid,
             sock,
             udp_idle,
+            retired,
             ..
         } = self;
         let now = Instant::now();
+        retired.retain(|reader| !reader.is_finished());
         // One pass, one lock per route: the dead are dropped where they are found, the living take their turn of the wheel, and a datagram association idle past the timeout is told to stop so its reader ends within one poll.
         routes.retain(|key, inbound| {
             let Ok(mut conn) = inbound.conn.lock() else {
@@ -2869,10 +2878,12 @@ impl Router<'_> {
                     &inbound.initial_dcid,
                     &inbound.source_ids,
                 );
-                for flow in inbound.udp.values() {
+                for (_, mut flow) in inbound.udp.drain() {
                     flow.stop.store(true, Ordering::Relaxed);
+                    if let Some(reader) = flow.reader.take() {
+                        retired.push(reader);
+                    }
                 }
-                inbound.udp.clear();
                 return false;
             }
             conn.on_timeout();
@@ -2880,6 +2891,9 @@ impl Router<'_> {
             inbound.udp.retain(|_, flow| {
                 if now.duration_since(flow.last) > *udp_idle {
                     flow.stop.store(true, Ordering::Relaxed);
+                    if let Some(reader) = flow.reader.take() {
+                        retired.push(reader);
+                    }
                     false
                 } else {
                     true
@@ -3051,6 +3065,7 @@ pub(crate) fn serve_prepared(
         routes: HashMap::new(),
         by_client_cid: HashMap::new(),
         by_initial_dcid: HashMap::new(),
+        retired: Vec::new(),
     };
     let mut buf = Unfilled::<RECV_ROOM>::new();
     if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
@@ -3138,6 +3153,7 @@ pub(crate) fn serve_prepared(
             let _ = conn.close(true, 0, b"");
         }
     }
+    readers.extend(router.retired.drain(..));
     for reader in readers {
         let _ = reader.join();
     }
@@ -3890,6 +3906,7 @@ mod tests {
                 routes: by_scid,
                 by_client_cid: HashMap::new(),
                 by_initial_dcid: HashMap::new(),
+                retired: Vec::new(),
             };
             router.idle();
             stop.load(Ordering::Relaxed)
@@ -3928,6 +3945,7 @@ mod tests {
             routes: HashMap::new(),
             by_client_cid: HashMap::new(),
             by_initial_dcid: HashMap::new(),
+            retired: Vec::new(),
         };
         let mut template = server_template(&hysteria::Config::default());
         let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
@@ -4062,6 +4080,7 @@ mod tests {
             )]),
             by_client_cid: HashMap::from([(client, key.clone())]),
             by_initial_dcid: HashMap::from([(initial, key)]),
+            retired: Vec::new(),
         };
         router.idle();
         assert!(router.routes.is_empty());
