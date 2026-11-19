@@ -4379,17 +4379,18 @@ fn server_networks(inbound: &Json) -> Option<Vec<crate::router::Network>> {
     match canonical_protocol(protocol) {
         "shadowsocks" => {
             let (tcp, udp) = inbound_ss_networks(inbound);
-            let udp = udp
-                && !matches!(
-                    inbound_carrier(inbound),
-                    Carrier::Quic
-                        | Carrier::Kcp(_)
-                        | Carrier::Hysteria(_)
-                        | Carrier::Masque
-                        | Carrier::Xdrive { .. }
-                        | Carrier::Http
-                        | Carrier::Unknown { .. }
-                );
+            let carrier = inbound_carrier(inbound);
+            let served = !matches!(
+                carrier,
+                Carrier::Quic
+                    | Carrier::Kcp(_)
+                    | Carrier::Hysteria(_)
+                    | Carrier::Masque
+                    | Carrier::Xdrive { .. }
+                    | Carrier::Http
+                    | Carrier::Unknown { .. }
+            );
+            let udp = (udp && matches!(carrier, Carrier::Raw(_))) || (tcp && served);
             let mut networks = Vec::with_capacity(2);
             if tcp {
                 networks.push(crate::router::Network::Tcp);
@@ -45674,15 +45675,18 @@ mod tests {
     }
 
     #[test]
-    fn a_tcp_only_shadowsocks_inbound_proves_only_tcp() {
+    fn a_tcp_only_shadowsocks_inbound_proves_the_udp_its_mux_carries() {
         let inbound = crate::json::parse(
             r#"{"protocol":"shadowsocks","settings":{"network":"tcp","password":"p"}}"#,
         )
         .expect("parses");
         assert_eq!(
             server_networks(&inbound),
-            Some(vec![crate::router::Network::Tcp]),
-            "a tcp-only listener serves no udp route"
+            Some(vec![
+                crate::router::Network::Tcp,
+                crate::router::Network::Udp,
+            ]),
+            "the raw tcp listener still accepts a udp-bearing v1.mux.cool session"
         );
     }
 
