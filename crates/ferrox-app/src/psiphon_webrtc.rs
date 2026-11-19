@@ -2167,9 +2167,13 @@ impl Relay {
         &self.connection_id
     }
 
-    /// Relay one server packet and return the broker's next packet.
-    pub(crate) fn relay(&mut self, packet: &[u8]) -> Result<Vec<u8>, String> {
-        lock(&self.client).relay_packet(&self.connection_id, packet)
+    /// Relay one server packet, bounded by the handshake's absolute deadline.
+    pub(crate) fn relay_until(
+        &mut self,
+        packet: &[u8],
+        deadline: Instant,
+    ) -> Result<Vec<u8>, String> {
+        lock(&self.client).relay_packet_until(&self.connection_id, packet, deadline)
     }
 }
 

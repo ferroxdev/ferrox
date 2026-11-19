@@ -1934,7 +1934,7 @@ impl Session {
             return Err("psiphon ssh: establishment deadline expired before api".to_owned());
         }
         let api_timeout = api_timeout.unwrap_or(left).min(left);
-        let api_deadline = Instant::now() + api_timeout;
+        let api_deadline = (Instant::now() + api_timeout).min(deadline);
         output
             .set_deadline(api_deadline)
             .map_err(|error| format!("psiphon ssh api timeout: {error}"))?;
@@ -1954,6 +1954,7 @@ impl Session {
                 server.ssh_api,
                 &mut relay,
                 requests.as_deref(),
+                api_deadline,
             )?
         };
         output
@@ -4895,6 +4896,7 @@ fn handshake(
     ssh_api: bool,
     relay: &mut Option<Relay>,
     requests: Option<&dyn ServerRequests>,
+    deadline: Instant,
 ) -> Result<HandshakeState, String> {
     let encoding = if ssh_api {
         identity.api_encoding
@@ -4925,7 +4927,9 @@ fn handshake(
                 let want_reply = packet.body().get(at).copied().unwrap_or(0);
                 let payload = packet.body().get(at + 1..).unwrap_or(&[]);
                 let reply = match name {
-                    Some(b"psiphon-inproxy-relay") => relay_round_trip(relay, payload).map(Some),
+                    Some(b"psiphon-inproxy-relay") => {
+                        relay_round_trip(relay, payload, deadline).map(Some)
+                    }
                     Some(name) => match requests {
                         Some(requests) => requests.handle(name, payload).map(Some),
                         None => Err("psiphon ssh unexpected handshake request".to_owned()),
@@ -5177,12 +5181,16 @@ fn parse_handshake(body: &[u8]) -> HandshakeState {
     }
 }
 
-fn relay_round_trip(relay: &mut Option<Relay>, payload: &[u8]) -> Result<Vec<u8>, String> {
+fn relay_round_trip(
+    relay: &mut Option<Relay>,
+    payload: &[u8],
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
     let packet = crate::psiphon_broker::relay_request_packet(payload)?;
     let relay = relay
         .as_mut()
         .ok_or_else(|| "psiphon ssh: no in-proxy relay".to_owned())?;
-    let next = relay.relay(&packet)?;
+    let next = relay.relay_until(&packet, deadline)?;
     Ok(crate::psiphon_broker::relay_response(&next))
 }
 
