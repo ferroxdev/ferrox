@@ -31,6 +31,7 @@ const PASSWORD_LEN: usize = 32;
 const POLL: Duration = Duration::from_millis(100);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 const STREAM_QUEUE_LIMIT: usize = 64 * 1024;
+const QUEUE_CHUNKS: usize = 16;
 const SESSION_QUEUE_LIMIT: usize = 8 * 1024 * 1024;
 
 const DEFAULT_PADDING: &[u8] = b"stop=8
@@ -264,8 +265,14 @@ impl StreamState {
             self.budget.release(data.len());
             return;
         }
-        inner.queued += data.len();
-        inner.queue.push_back(data);
+        let state = &mut *inner;
+        state.queued += data.len();
+        // A frame keeps its own buffer until the stream holds QUEUE_CHUNKS of them; past that a small frame rides the tail, so a one-byte-frame peer cannot buy one allocation per byte.
+        if state.queue.len() < QUEUE_CHUNKS {
+            state.queue.push_back(data);
+        } else if let Some(tail) = state.queue.back_mut() {
+            tail.extend_from_slice(&data);
+        }
         drop(inner);
         self.wake.notify_all();
     }
@@ -1796,6 +1803,27 @@ mod tests {
                 .expect("ends"),
             0
         );
+    }
+
+    #[test]
+    fn a_stream_queue_keeps_its_slots_bounded() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::new(Shared::new(
+            Box::new(Sink(written)),
+            Padding::default_scheme(),
+            false,
+        ));
+        let stream = test_stream(&shared, 5);
+        for _ in 0..4096 {
+            stream.state.push(vec![0x7], &shared.alive);
+        }
+        let inner = stream
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(inner.queue.len() <= QUEUE_CHUNKS);
+        assert_eq!(inner.queued, 4096);
     }
 
     #[test]
