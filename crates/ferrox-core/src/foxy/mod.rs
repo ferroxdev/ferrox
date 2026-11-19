@@ -275,6 +275,19 @@ pub fn octet_in(bytes: &[u8], from: usize, needle: u8) -> Option<usize> {
         .map(|hit| from + at + hit)
 }
 
+/// The first `\r\n` in `bytes`, as the offset of its `\r`: the line ending every HTTP/1.1 head and chunked frame uses. A lone `\n` is skipped, so the answer is exactly `bytes.windows(2).position(|w| w == b"\r\n")` at eight octets a step.
+#[must_use]
+pub fn line_end(bytes: &[u8]) -> Option<usize> {
+    let mut from = 1;
+    while let Some(lf) = octet_in(bytes, from, b'\n') {
+        if bytes[lf - 1] == b'\r' {
+            return Some(lf - 1);
+        }
+        from = lf + 1;
+    }
+    None
+}
+
 pub fn connect_status(head: &[u8]) -> Result<u16, Failure> {
     let line_end = head_end(head).ok_or(Failure::Frame)?;
     let line = &head[..line_end];
@@ -1457,6 +1470,49 @@ mod tests {
                     .chain([len / 2, len / 2 + 1])
                     .chain(len.saturating_sub(9)..len),
             );
+        }
+    }
+
+    /// `line_end` is the line-ending scan the HTTP/1.1 head and chunked-frame readers reach; this sweep is its oracle, so every lone `\n`, every alignment and every start the byte walk finds or misses answers the same offset or the same `None`.
+    #[test]
+    fn the_swar_line_scan_is_the_windows_two_scan() {
+        fn sweep(len: usize, starts: impl Iterator<Item = usize>) {
+            const CR: u8 = b'\r';
+            const LF: u8 = b'\n';
+            let oracle = |buf: &[u8]| buf.windows(2).position(|w| w == b"\r\n");
+            for start in starts {
+                if start + 2 <= len {
+                    let mut v: Vec<u8> = (0..len)
+                        .map(|i| if i % 5 == 0 { LF } else { b'Z' })
+                        .collect();
+                    v[start] = CR;
+                    v[start + 1] = LF;
+                    assert_eq!(line_end(&v), oracle(&v), "len {len} at {start}");
+                }
+            }
+            let no_lf: Vec<u8> = vec![CR; len];
+            assert_eq!(line_end(&no_lf), oracle(&no_lf), "len {len} no LF");
+            let all_lf: Vec<u8> = vec![LF; len];
+            assert_eq!(line_end(&all_lf), oracle(&all_lf), "len {len} all LF");
+        }
+
+        const ALPHABET: [u8; 3] = *b"\r\nZ";
+        let mut small = [0u8; 8];
+        let oracle = |buf: &[u8]| buf.windows(2).position(|w| w == b"\r\n");
+        for len in 0..=8usize {
+            for code in 0..ALPHABET.len().pow(len as u32) {
+                let mut rest = code;
+                for slot in &mut small[..len] {
+                    *slot = ALPHABET[rest % ALPHABET.len()];
+                    rest /= ALPHABET.len();
+                }
+                let view = &small[..len];
+                assert_eq!(line_end(view), oracle(view), "exhaustive {view:?}");
+            }
+        }
+
+        for len in 0..=130usize {
+            sweep(len, 0..=len.saturating_sub(2));
         }
     }
 

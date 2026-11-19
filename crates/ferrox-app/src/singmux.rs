@@ -251,7 +251,21 @@ struct Window {
 struct WindowState {
     value: i64,
     closed: bool,
+    #[cfg(test)]
+    waiting: usize,
 }
+
+#[cfg(test)]
+fn note_wait(state: &mut WindowState, waiting: bool) {
+    if waiting {
+        state.waiting += 1;
+    } else {
+        state.waiting -= 1;
+    }
+}
+
+#[cfg(not(test))]
+fn note_wait(_state: &mut WindowState, _waiting: bool) {}
 
 impl Window {
     fn new(value: i64) -> Self {
@@ -259,6 +273,8 @@ impl Window {
             state: Mutex::new(WindowState {
                 value,
                 closed: false,
+                #[cfg(test)]
+                waiting: 0,
             }),
             wake: Condvar::new(),
         }
@@ -283,10 +299,12 @@ impl Window {
                 state.value -= taken;
                 return Some(usize::try_from(taken).unwrap_or(usize::MAX));
             }
+            note_wait(&mut state, true);
             state = match self.wake.wait(state) {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            note_wait(&mut state, false);
         }
     }
 
@@ -407,6 +425,13 @@ impl Queue {
         Some(msg)
     }
 
+    fn is_closed(&self) -> bool {
+        match self.state.lock() {
+            Ok(state) => state.closed,
+            Err(poisoned) => poisoned.into_inner().closed,
+        }
+    }
+
     fn close(&self) {
         let mut state = match self.state.lock() {
             Ok(state) => state,
@@ -456,6 +481,17 @@ impl Replies {
 enum Role {
     Client,
     Server,
+}
+
+fn defer_close(close: Arc<dyn Fn() + Send + Sync>) {
+    let callback = Arc::clone(&close);
+    if std::thread::Builder::new()
+        .name("singmux-close".to_owned())
+        .spawn(move || close())
+        .is_err()
+    {
+        callback();
+    }
 }
 
 struct Inner {
@@ -519,7 +555,7 @@ impl Inner {
             if role == Role::Client {
                 inner.write_raw(h2::MAGIC).ok()?;
             }
-            inner.write_settings();
+            inner.write_settings().ok()?;
         }
         let reader = Arc::clone(&inner);
         std::thread::spawn(move || reader.read_loop(read));
@@ -545,9 +581,9 @@ impl Inner {
         result
     }
 
-    fn write_settings(&self) {
+    fn write_settings(&self) -> io::Result<()> {
         if self.protocol != Protocol::H2Mux {
-            return;
+            return Ok(());
         }
         let mut settings = Vec::with_capacity(6 * 3);
         settings.extend_from_slice(&H2_SETTINGS_INITIAL.to_be_bytes());
@@ -561,7 +597,7 @@ impl Inner {
         frame.extend_from_slice(&settings);
         frame.extend_from_slice(&h2::frame_head(4, h2::T_WINDOW, 0, 0));
         frame.extend_from_slice(&((H2_WINDOW - 65_535) as u32).to_be_bytes());
-        let _ = self.write_raw(&frame);
+        self.write_raw(&frame)
     }
 
     fn open(&self, _target: &Destination, expect_status: bool) -> Option<Stream> {
@@ -824,7 +860,7 @@ impl Inner {
                 .is_some_and(|sender| sender.try_send(id).is_err());
             if failed {
                 drop(resets);
-                self.finish();
+                self.finish_deferred();
             }
             return;
         }
@@ -842,7 +878,7 @@ impl Inner {
             });
         if spawned.is_err() {
             drop(resets);
-            self.finish();
+            self.finish_deferred();
             return;
         }
         *resets = Some(sender.clone());
@@ -1010,6 +1046,12 @@ impl Inner {
             }
         }
         if data.is_empty() && !end {
+            if queue.is_closed() {
+                self.defer_credit(credit);
+                self.defer_reset(id, &reset_stream);
+                self.release(id);
+                return;
+            }
             self.credit(id, credit);
             return;
         }
@@ -1090,9 +1132,21 @@ impl Inner {
     }
 
     fn finish(&self) {
+        if self.teardown() {
+            (self.close)();
+        }
+    }
+
+    fn finish_deferred(&self) {
+        if self.teardown() {
+            defer_close(Arc::clone(&self.close));
+        }
+    }
+
+    fn teardown(&self) -> bool {
         self.dead.store(true, Ordering::Relaxed);
         if self.finished.swap(true, Ordering::Relaxed) {
-            return;
+            return false;
         }
         match self.resets.lock() {
             Ok(mut resets) => drop(resets.take()),
@@ -1116,12 +1170,15 @@ impl Inner {
             sink.window.close();
             sink.queue.close();
         }
-        (self.close)();
+        true
     }
 
     fn smux_loop(&self, mut read: Box<dyn Read + Send>) {
         let mut head = [0u8; SMUX_FRAME];
         loop {
+            if self.dead() {
+                return;
+            }
             if crate::proxy::read_exact(&mut *read, &mut head).is_err() {
                 return;
             }
@@ -1129,6 +1186,9 @@ impl Inner {
             let id = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
             let mut data = vec![0u8; len];
             if len > 0 && crate::proxy::read_exact(&mut *read, &mut data).is_err() {
+                return;
+            }
+            if self.dead() {
                 return;
             }
             match head[1] {
@@ -1150,6 +1210,9 @@ impl Inner {
     fn yamux_loop(&self, mut read: Box<dyn Read + Send>) {
         let mut head = [0u8; 12];
         loop {
+            if self.dead() {
+                return;
+            }
             if crate::proxy::read_exact(&mut *read, &mut head).is_err() {
                 return;
             }
@@ -1169,6 +1232,9 @@ impl Inner {
                 if len > 0 && crate::proxy::read_exact(&mut *read, &mut data).is_err() {
                     return;
                 }
+            }
+            if self.dead() {
+                return;
             }
             match kind {
                 YAMUX_DATA => {
@@ -1232,6 +1298,9 @@ impl Inner {
         }
         let mut continuation: Option<(u32, Vec<u8>)> = None;
         loop {
+            if self.dead() {
+                return;
+            }
             let Some((len, kind, flags, id)) = h2::read_head(&mut *read) else {
                 return;
             };
@@ -1240,6 +1309,9 @@ impl Inner {
             }
             let mut body = vec![0u8; len];
             if len > 0 && crate::proxy::read_exact(&mut *read, &mut body).is_err() {
+                return;
+            }
+            if self.dead() {
                 return;
             }
             match kind {
@@ -2109,6 +2181,43 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_close_callback_does_not_block_the_demux() {
+        let (client, _server) = pair();
+        let client_read = client.try_clone().expect("client read");
+        let client_write = client.try_clone().expect("client write");
+        let (entered, running) = channel();
+        let (release, blocked) = channel();
+        let blocked = Arc::new(Mutex::new(blocked));
+        let close: Arc<dyn Fn() + Send + Sync> = {
+            let blocked = Arc::clone(&blocked);
+            Arc::new(move || {
+                let _ = entered.send(());
+                if let Ok(blocked) = blocked.lock() {
+                    let _ = blocked.recv();
+                }
+            })
+        };
+        let session = Client::connect(
+            Protocol::Yamux,
+            false,
+            Box::new(client_read),
+            Box::new(client_write),
+            close,
+        )
+        .expect("client");
+        let started = std::time::Instant::now();
+        session.session.finish_deferred();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "deferred teardown returns without running the carrier close"
+        );
+        running
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the close worker runs the callback");
+        release.send(()).expect("releases the close callback");
+    }
+
+    #[test]
     fn a_dial_returns_before_the_server_status() {
         let (client, server) = pair();
         let server_read = server.try_clone().expect("server read");
@@ -2223,6 +2332,12 @@ mod tests {
         }
     }
 
+    fn window_waiters(session: &Inner) -> usize {
+        let window = &session.connection_window;
+        let state = window.state.lock().expect("window");
+        state.waiting
+    }
+
     #[test]
     fn a_failed_carrier_write_stops_the_next_writer() {
         let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
@@ -2250,6 +2365,14 @@ mod tests {
         waiting
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("waiter started");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while window_waiters(&session) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the credit waiter enters the window wait before the negative window"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert!(
             done.recv_timeout(std::time::Duration::from_millis(50))
                 .is_err(),
@@ -2303,12 +2426,14 @@ mod tests {
     }
 
     struct StoppingReader {
+        entered: Sender<()>,
         wake: Receiver<()>,
         done: Sender<()>,
     }
 
     impl Read for StoppingReader {
         fn read(&mut self, _out: &mut [u8]) -> io::Result<usize> {
+            let _ = self.entered.send(());
             let _ = self.wake.recv();
             let _ = self.done.send(());
             Ok(0)
@@ -2331,10 +2456,12 @@ mod tests {
     fn a_failed_carrier_write_wakes_the_reader() {
         let (wake, stopped) = channel();
         let (done, reader_done) = channel();
+        let (entered, reading) = channel();
         let session = Inner::start(
             Protocol::Smux,
             Role::Client,
             Box::new(StoppingReader {
+                entered,
                 wake: stopped,
                 done,
             }),
@@ -2344,6 +2471,11 @@ mod tests {
             }),
         )
         .expect("session");
+        assert_eq!(
+            reading.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "the reader is inside read before the write fails"
+        );
         assert!(!session.write_frame(&[1], &[]), "the write reports failure");
         assert_eq!(
             reader_done.recv_timeout(std::time::Duration::from_secs(1)),
@@ -2450,6 +2582,7 @@ mod tests {
 
     struct GateWriter {
         gate: Arc<(Mutex<bool>, Condvar)>,
+        seen: Arc<Mutex<Vec<u8>>>,
     }
 
     impl Write for GateWriter {
@@ -2459,6 +2592,8 @@ mod tests {
             while !*open {
                 open = wake.wait(open).expect("gate");
             }
+            drop(open);
+            self.seen.lock().expect("seen").extend_from_slice(data);
             Ok(data.len())
         }
 
@@ -2496,8 +2631,10 @@ mod tests {
     #[test]
     fn an_overfull_stream_resets_without_waiting_for_the_carrier() {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let (session, held) = held_session(Box::new(GateWriter {
             gate: Arc::clone(&gate),
+            seen: Arc::clone(&seen),
         }));
         let stream = session.attach(1);
         let mut writer = stream.writer();
@@ -2519,6 +2656,20 @@ mod tests {
             wake.notify_all();
         }
         worker.join().expect("worker");
+        let fin = smux_head(SMUX_FIN, 1, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !seen
+            .lock()
+            .expect("seen")
+            .windows(SMUX_FRAME)
+            .any(|frame| frame == fin)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the overfull stream sends its own Smux FIN after the gate opens"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(
             writer.write(b"x").is_err(),
             "the released stream refuses a retained writer"

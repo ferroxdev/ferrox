@@ -839,7 +839,7 @@ fn system_addresses(
 
 /// Resolve with an optional absolute deadline shared by every query attempt.
 #[allow(clippy::too_many_lines)]
-fn resolve_with_deadline(
+pub(crate) fn resolve_with_deadline(
     config: &Config,
     host: &str,
     port: u16,

@@ -1299,9 +1299,27 @@ impl Routing {
 
     /// Drop every rule carrying `tag`, the reference's `RemoveRule`; a tag no rule carries is not
     /// an error there, and the table is unchanged.
-    pub(crate) fn remove_rules(&mut self, tag: &str) {
+    pub(crate) fn remove_rules(
+        &mut self,
+        tag: &str,
+        proofs: &[ServerProof<'_>],
+    ) -> Result<(), String> {
+        let forced = |tag: &str| self.forced_tag(tag);
+        let always_picks = self.always_picks();
+        for proof in proofs {
+            Self::server_routes_over(
+                self.script.is_some(),
+                self.rules
+                    .iter()
+                    .filter(|rule| rule.tag.as_deref() != Some(tag)),
+                proof,
+                &forced,
+                &always_picks,
+            )?;
+        }
         self.rules.retain(|rule| rule.tag.as_deref() != Some(tag));
         self.refresh();
+        Ok(())
     }
 
     /// Recompute the three flags a front reads before it parses attributes or looks up a process.
@@ -1673,7 +1691,10 @@ impl Routing {
     pub(crate) fn source_refusal(&self, inbound: Option<&str>) -> Option<&'static str> {
         for network in [Network::Tcp, Network::Udp] {
             for rule in &self.rules {
-                if !rule.reachable(inbound, network) || !rule.local_os_matches() {
+                if rule.protocols.as_ref().is_some_and(Vec::is_empty)
+                    || !rule.reachable(inbound, network)
+                    || !rule.local_os_matches()
+                {
                     continue;
                 }
                 if rule

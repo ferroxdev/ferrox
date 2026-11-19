@@ -1411,31 +1411,6 @@ impl Inner {
             if batch.is_empty() {
                 continue;
             }
-            let lead = if std::mem::take(&mut first_batch) {
-                affinity_lead
-            } else {
-                Duration::ZERO
-            };
-            let lead = if lead.saturating_add(timeout) <= remaining {
-                lead
-            } else {
-                Duration::ZERO
-            };
-            let last_delay = lead.saturating_add(
-                self.settings
-                    .stagger
-                    .saturating_mul(u32::try_from(taken.saturating_sub(1)).unwrap_or(u32::MAX)),
-            );
-            let stagger = if last_delay.saturating_add(timeout) <= remaining {
-                self.settings.stagger
-            } else {
-                Duration::ZERO
-            };
-            let budget = if stagger.is_zero() {
-                remaining.min(timeout.saturating_add(lead))
-            } else {
-                last_delay.saturating_add(timeout).min(remaining)
-            };
             let session_id = self.session_id.clone();
             let authorizations = self.settings.authorizations.clone();
             let sponsor = self.settings.sponsor.clone();
@@ -1479,6 +1454,35 @@ impl Inner {
             } else {
                 None
             };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let lead = if std::mem::take(&mut first_batch) {
+                affinity_lead
+            } else {
+                Duration::ZERO
+            };
+            let lead = if lead.saturating_add(timeout) <= remaining {
+                lead
+            } else {
+                Duration::ZERO
+            };
+            let last_delay = lead.saturating_add(
+                self.settings
+                    .stagger
+                    .saturating_mul(u32::try_from(taken.saturating_sub(1)).unwrap_or(u32::MAX)),
+            );
+            let stagger = if last_delay.saturating_add(timeout) <= remaining {
+                self.settings.stagger
+            } else {
+                Duration::ZERO
+            };
+            let budget = if stagger.is_zero() {
+                remaining.min(timeout.saturating_add(lead))
+            } else {
+                last_delay.saturating_add(timeout).min(remaining)
+            };
+            if budget.is_zero() {
+                break;
+            }
             let inproxy_prefer = self.settings.inproxy_prefer_probability;
             let inproxy_only = !self.settings.protocols.is_empty()
                 && self
@@ -1499,6 +1503,7 @@ impl Inner {
                 Arc::clone(&self.requests) as Arc<dyn crate::psiphon_ssh::ServerRequests>;
             let cdn_scan_specs = self.settings.cdn_scan_specs.clone();
             let cdn_scan_state = Arc::clone(&self.settings.cdn_scan_state);
+            let batch_deadline = (Instant::now() + budget).min(deadline);
             let attempt = move |server: &Server| {
                 let lease = replay.begin(server, config_state);
                 let _scope = crate::psiphon_ssh::dial_seed_scope(lease.seed());
@@ -1554,6 +1559,12 @@ impl Inner {
                     server.port,
                     dsl_placeholder_ttl,
                 );
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    lease.failed();
+                    return Err("psiphon: dial budget expired before the attempt".to_owned());
+                }
+                let api_timeout = use_inproxy.then_some(inproxy_api_timeout);
                 let identity = Identity {
                     session_id: &session_id,
                     authorizations: &authorizations,
@@ -1576,14 +1587,14 @@ impl Inner {
                 match Session::connect(
                     &selected,
                     &identity,
-                    timeout,
+                    batch_deadline,
                     proxy.as_ref(),
                     &dns,
                     conduit.as_deref(),
                     keepalive,
                     &tls_shape,
                     limit_meek_buffers,
-                    use_inproxy.then_some(inproxy_api_timeout),
+                    api_timeout,
                     Some(Arc::clone(&requests)),
                     burst,
                 ) {
@@ -7061,14 +7072,17 @@ pub(crate) fn broker_offer(
             server.inproxy.as_ref().is_some_and(inproxy_uses_quic),
             media_secret,
         )?;
+        let nat_deadline = Instant::now()
+            + settings
+                .inproxy_discover_nat_timeout
+                .mul_f64(settings.latency.multiplier())
+                .min(Duration::from_secs(600))
+                .min(timeout);
         if coin(settings.inproxy_discover_nat) {
             if let Some(nat) = crate::psiphon_webrtc::discover_nat_type(
                 &inproxy_stun_servers_rfc5780(&settings, &tactics),
                 server.address,
-                settings
-                    .inproxy_discover_nat_timeout
-                    .mul_f64(settings.latency.multiplier())
-                    .min(Duration::from_secs(600)),
+                nat_deadline,
                 &settings.dns,
             ) {
                 client.set_nat_type(nat);

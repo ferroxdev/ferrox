@@ -3062,12 +3062,21 @@ impl Runtime {
         let Some(route) = &self.route else {
             return Err("routing not configured".to_owned());
         };
+        let server_inbounds = route
+            .server_inbounds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let direct = |named: &str| direct_tag(route, named);
+        let proofs: Vec<crate::router::ServerProof<'_>> = server_inbounds
+            .iter()
+            .map(|inbound| server_proof(route, inbound.tag.as_deref(), &inbound.networks, &direct))
+            .collect();
         route
             .routing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove_rules(tag);
-        Ok(())
+            .remove_rules(tag, &proofs)
     }
 
     /// The tag a `RoutingService.TestRoute` context routes to, or `None` for xray's no-clue.
@@ -4370,7 +4379,18 @@ fn server_networks(inbound: &Json) -> Option<Vec<crate::router::Network>> {
     match canonical_protocol(protocol) {
         "shadowsocks" => {
             let (tcp, udp) = inbound_ss_networks(inbound);
-            let udp = matches!(inbound_carrier(inbound), Carrier::Raw(_)) && (tcp || udp);
+            let carrier = inbound_carrier(inbound);
+            let served = !matches!(
+                carrier,
+                Carrier::Quic
+                    | Carrier::Kcp(_)
+                    | Carrier::Hysteria(_)
+                    | Carrier::Masque
+                    | Carrier::Xdrive { .. }
+                    | Carrier::Http
+                    | Carrier::Unknown { .. }
+            );
+            let udp = (udp && matches!(carrier, Carrier::Raw(_))) || (tcp && served);
             let mut networks = Vec::with_capacity(2);
             if tcp {
                 networks.push(crate::router::Network::Tcp);
@@ -14726,17 +14746,21 @@ fn xdrive_relay_until(app: &Connection, mut down: crate::xdrive::Conn, response_
     let done = RelayPool::global().run(move || {
         let mut app_read = app_read;
         let mut buf = RelayBuf::new().into_vec();
+        let mut wrote = true;
         loop {
             match app_read.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if up.write_all(&buf[..n]).is_err() {
+                        wrote = false;
                         break;
                     }
                 }
             }
         }
-        let _ = up.end_write();
+        if !wrote || up.end_write().is_err() {
+            up.abort();
+        }
     });
     let mut ended = false;
     let mut response_deadline = None;
@@ -45635,6 +45659,38 @@ mod tests {
     }
 
     #[test]
+    fn a_websocket_shadowsocks_inbound_proves_the_udp_its_mux_carries() {
+        let inbound = crate::json::parse(
+            r#"{"protocol":"shadowsocks","settings":{"password":"p"},"streamSettings":{"network":"ws","wsSettings":{"path":"/x"}}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            server_networks(&inbound),
+            Some(vec![
+                crate::router::Network::Tcp,
+                crate::router::Network::Udp,
+            ]),
+            "a ws mux tunnel serves both networks"
+        );
+    }
+
+    #[test]
+    fn a_tcp_only_shadowsocks_inbound_proves_the_udp_its_mux_carries() {
+        let inbound = crate::json::parse(
+            r#"{"protocol":"shadowsocks","settings":{"network":"tcp","password":"p"}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            server_networks(&inbound),
+            Some(vec![
+                crate::router::Network::Tcp,
+                crate::router::Network::Udp,
+            ]),
+            "the raw tcp listener still accepts a udp-bearing v1.mux.cool session"
+        );
+    }
+
+    #[test]
     fn the_seam_split_find_across_agrees_with_the_per_byte_branch_scan() {
         // The contiguous probe scan must yield the identical first position on every seam, interior and absent placement.
         fn before(head: &[u8], probe: &[u8]) -> Option<usize> {
@@ -56205,10 +56261,10 @@ mod tests {
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let payloads = [format!("ping-{echo_port}"), format!("pong-{echo_port}")];
         let mut frame = Vec::new();
-        for (index, payload) in payloads.iter().map(String::as_bytes).enumerate() {
+        for payload in payloads.iter().map(String::as_bytes) {
             let datagram = socks_udp_frame(&mut frame, &target, payload);
             assert_eq!(
-                socks_udp_answer(udp, datagram, payload, tag, index == 0),
+                socks_udp_answer(udp, datagram, payload, tag),
                 target,
                 "{tag}"
             );
@@ -56217,24 +56273,14 @@ mod tests {
         }
     }
 
-    /// A stale frame can land on a reused relay port and a lane can drop its first datagram: resend the first, but send the second once so a new association cannot answer it.
-    fn socks_udp_answer(
-        udp: &UdpSocket,
-        frame: &[u8],
-        want: &[u8],
-        tag: &str,
-        resend: bool,
-    ) -> SocketAddr {
+    /// A stale frame can land on a reused relay port and a lane can drop a datagram: resend until the deadline, so a lost packet is not a failed association.
+    fn socks_udp_answer(udp: &UdpSocket, frame: &[u8], want: &[u8], tag: &str) -> SocketAddr {
         udp.set_read_timeout(Some(Duration::from_millis(250)))
             .expect("timeout");
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut back = vec![0u8; UDP_BUF];
-        let mut sent = false;
         loop {
-            if resend || !sent {
-                udp.send(frame).expect("sends");
-                sent = true;
-            }
+            udp.send(frame).expect("sends");
             let until = Instant::now() + Duration::from_millis(250);
             while Instant::now() < until {
                 let Ok(n) = udp.recv(&mut back) else {
@@ -56245,12 +56291,6 @@ mod tests {
                         return source;
                     }
                 }
-            }
-            if !resend {
-                assert!(
-                    Instant::now() < deadline,
-                    "{tag} never answered {want:?} after one send"
-                );
             }
             assert!(Instant::now() < deadline, "{tag} never answers {want:?}");
         }

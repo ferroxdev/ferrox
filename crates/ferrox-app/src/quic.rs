@@ -4709,7 +4709,12 @@ impl Read for QuicStream {
         if self.stop.load(Ordering::Relaxed) {
             return Ok(0);
         }
-        let deadline = Instant::now() + STREAM_QUANTUM;
+        let quantum = if crate::proxy::relay_step_owns_poll() {
+            crate::budgets::RELAY_POLL
+        } else {
+            STREAM_QUANTUM
+        };
+        let deadline = Instant::now() + quantum;
         loop {
             match self.conn.lock() {
                 Ok(mut conn) => {
@@ -4744,7 +4749,8 @@ impl Read for QuicStream {
             if Instant::now() >= deadline {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
-            std::thread::sleep(STREAM_POLL);
+            let left = deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(STREAM_POLL.min(left));
         }
     }
 }

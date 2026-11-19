@@ -5256,6 +5256,24 @@ mod tests {
             let mut named = settings.clone();
             named.x_padding_placement = placement;
             named.x_padding_header = "Referer".to_owned();
+            let (target, padding, referer) = dial_head_parts(&named);
+            let mut wire = Vec::new();
+            send_dial_head_padded(
+                &mut wire,
+                "front.example",
+                &target,
+                &[],
+                &padding,
+                "",
+                &referer,
+            )
+            .expect("stages the dial");
+            assert!(
+                wire.windows(21)
+                    .any(|line| line == b"Host: front.example\r\n"),
+                "Host is terminated before the referer pad: {}",
+                String::from_utf8_lossy(&wire)
+            );
             for head in [
                 dial_head("front.example", &named, "session", None),
                 downlink_head("front.example", &named, "session"),

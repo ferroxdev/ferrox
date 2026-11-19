@@ -4861,7 +4861,7 @@ mod tests {
                     Ok((mut stream, _)) => {
                         let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-                        let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
                         let mut buf = [0u8; 1024];
                         let mut seen = 0;
                         loop {

@@ -2077,8 +2077,23 @@ fn read_origin<R: Read>(stream: &mut R, head: &[u8]) -> Option<hysteria::OriginR
             }
         }
     }
-    let method = head.split(|&byte| byte == b' ').next().unwrap_or_default();
-    hysteria::parse_origin_response(&raw, method)
+    let method = head
+        .split(|&byte| byte == b' ')
+        .next()
+        .and_then(|method| std::str::from_utf8(method).ok())
+        .unwrap_or("");
+    let parsed = hysteria::parse_origin_response(&raw, method);
+    if parsed.is_none() && raw.len() >= MASQ_BODY_CAP {
+        return Some(hysteria::OriginResponse {
+            status: 502,
+            headers: vec![(
+                "content-type".to_owned(),
+                "text/plain; charset=utf-8".to_owned(),
+            )],
+            body: b"502 origin response too large\n".to_vec(),
+        });
+    }
+    parsed
 }
 
 /// Bring one datagram association up: resolve the address the client named, connect a target socket of the matching family, and hand a reader thread the same socket so its replies return over the lane. `None` when the address is unresolvable or no socket can be raised, and the datagram is then dropped.
@@ -3030,6 +3045,25 @@ pub(crate) fn serve_prepared(
 mod tests {
     use super::*;
     use crate::quic::MAX_DATAGRAM;
+
+    #[test]
+    fn a_head_reply_keeps_its_client_method() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n";
+        let response = read_origin(&mut std::io::Cursor::new(raw), b"HEAD / HTTP/1.1\r\n")
+            .expect("a head reply");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn a_response_clipped_at_the_cap_reports_the_size_limit() {
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Length: 70000\r\n\r\n".to_vec();
+        raw.resize(MASQ_BODY_CAP, b'x');
+        let response = read_origin(&mut std::io::Cursor::new(raw), b"GET / HTTP/1.1\r\n")
+            .expect("a size-limit answer");
+        assert_eq!(response.status, 502);
+        assert_eq!(response.body, b"502 origin response too large\n");
+    }
 
     #[test]
     fn a_padded_auth_block_fits_the_handshakes_buffer() {
