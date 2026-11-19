@@ -90,10 +90,10 @@ Against the pinned references, xray-core and sing-box open the platform device a
 | --- | --- |
 | the device API, multi-queue, GSO and GRO | `tun-rs` 2.8.18 (`platform/linux/device.rs`, `platform/linux/offload.rs`) |
 | the TCP state machine and socket buffers | `smoltcp` 0.14 |
-| the stack tuning reference | `upstream/zeptun/src/stack/tcp.zig`, `src/engine.zig` |
+| the stack tuning reference | `upstream/sing-box/transport/device`, `upstream/xray-core/proxy/tun/tcp_lightweight.go` |
 | the native fallback | `docs/function/front-tun.md`, `crates/ferrox-app/src/tun.rs` |
 | the system NAT loop, accepted flow and relay | `crates/ferrox-app/src/tun_system.rs` |
-| the kernel-TCP stack shape | `upstream/zeptun/src/stack/system.zig`, `upstream/zeptun/src/flow/nat.zig` |
+| the kernel-TCP stack shape | `upstream/leaf/leaf/src/proxy/tun`, `upstream/sing-box/option/tun.go` |
 
 ## CI scope
 

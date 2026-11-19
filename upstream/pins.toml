@@ -140,16 +140,6 @@ test_enabled  = false
 ferrox_binary = ""
 note          = "the GPLv3 Windows GUI and its bundled console engine, read only by the live Windows comparison workflow; no source or binary is vendored"
 
-[sources.zeptun]
-repo          = "https://github.com/Noisemux/zeptun"
-rev           = "febd940b25f7f31ea2295cc8f20000a64609e394"
-topics        = "tun2socks, tun, fake-ip, offload"
-default_branch = "main"
-path          = "src"
-test_enabled  = false
-ferrox_binary = ""
-note          = "Zig tun2socks engine (MIT): TUN to TCP/UDP/ICMP via SOCKS5/direct/passthrough, fake-IP DNS, offloads, io_uring/epoll/kqueue/IOCP"
-
 [sources.slipstream]
 repo          = "https://github.com/EndPositive/slipstream"
 rev           = "e158a681f1cc5cb000a92274371e67237d2a6493"

@@ -182,7 +182,7 @@ Named rather than claimed, with the worst input worked out first:
 | the handshake numbers and dial convention | `upstream/xray-core/proxy/tun/tcp_lightweight.go` |
 | the stack the oracle runs, and the inherited-fd seam | `upstream/zeronet/crates/zero-tun` |
 | the device API and netstack shape the row trims | `upstream/sing-box/protocol/tun`, `upstream/sing-box/transport/device` |
-| the translate-onto-SOCKS idea, not its translator | `upstream/zeptun` |
+| the translate-onto-SOCKS idea, not its translator | `upstream/leaf/leaf/src/proxy/tun` |
 | the recorder that produced `expected.txt` | `scripts/tun-oracle/main.rs` |
 
 ## CI scope
