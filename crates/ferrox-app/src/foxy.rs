@@ -8552,15 +8552,16 @@ pub(crate) mod loopback {
         let at = Instant::now();
         let opened = Ip::open(&dial, None);
         crate::budgets::clear();
+        let took = at.elapsed();
+        assert!(
+            took < Duration::from_secs(5),
+            "the head budget expired the assignment, it took {took:?}"
+        );
         let (lane, assigned) = opened.expect("the status arrived");
         assert!(assigned.is_none(), "no address was assigned");
-        assert!(
-            at.elapsed() < Duration::from_secs(5),
-            "the head budget expired the assignment, it took {:?}",
-            at.elapsed()
-        );
         drop(lane);
-        join_edge_within(edge, Duration::from_secs(10));
+        // The pooled session outlives this lane, so the edge is left to its own hold rather than joined.
+        drop(edge);
     }
 
     /// The packet a datagram is built in is the lane's own buffer, and it stays that buffer: across a push and a drain the base pointer does not move and the capacity does not grow. A byte-level test passes with the copy and without it, so only the pointer can witness that the packet was not built in a buffer of its own.
@@ -9071,9 +9072,10 @@ pub(crate) mod loopback {
                     _ => {}
                 }
             }
-            // The assignment never comes, but the session stays open: a lane that stops reading on the first timeout is not what this edge is testing.
+            // The assignment never comes, and the pooled session outlives the lane, so the edge holds long enough that only the budget can end the wait: a lane that stops reading on the first timeout is not what this edge is testing.
+            let hold = Instant::now() + Duration::from_secs(6);
             let mut sink = [0u8; 256];
-            loop {
+            while Instant::now() < hold {
                 match tls.read(&mut sink) {
                     Ok(0) => return,
                     Ok(_) => {}
