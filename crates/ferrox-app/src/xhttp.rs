@@ -2433,6 +2433,7 @@ fn claim_session(session: &Session, sid: &str, owner: &Arc<crate::quic::Connecti
     }
     let token = Arc::downgrade(owner);
     *held = Some(token.clone());
+    drop(held);
     let id = sid.to_owned();
     owner.on_close(Box::new(move || end_session_of(&id, &token)));
     true
