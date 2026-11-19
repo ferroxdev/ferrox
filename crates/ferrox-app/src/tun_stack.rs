@@ -43,15 +43,15 @@ pub(crate) enum Mode {
     Hybrid,
 }
 
-/// Open the device and start the configured TCP stack.
-pub(crate) fn serve(spec: &Spec, out: &Outbound, mode: Mode) -> io::Result<()> {
+/// Open the device and start the configured TCP stack, returning the interface the platform gave it so a route can name it.
+pub(crate) fn serve(spec: &Spec, out: &Outbound, mode: Mode) -> io::Result<String> {
     match mode {
         Mode::Userspace => serve_userspace(spec, out),
         #[cfg(target_os = "linux")]
-        Mode::System => crate::tun_system::serve(spec, out, false),
+        Mode::System => crate::tun_system::serve(spec, out, false).map(|()| String::new()),
         #[cfg(target_os = "linux")]
         Mode::Hybrid => match crate::tun_system::serve(spec, out, true) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(String::new()),
             Err(error) => {
                 eprintln!(
                     "tun inbound: the hybrid stack is unavailable ({error}), using the userspace stack"
@@ -72,8 +72,9 @@ pub(crate) fn serve(spec: &Spec, out: &Outbound, mode: Mode) -> io::Result<()> {
     }
 }
 
-fn serve_userspace(spec: &Spec, out: &Outbound) -> io::Result<()> {
+fn serve_userspace(spec: &Spec, out: &Outbound) -> io::Result<String> {
     let (first, offload, queues) = open(spec)?;
+    let name = first.name().unwrap_or_default();
     let first = Arc::new(first);
     spawn_queue(Arc::clone(&first), spec, offload, out.clone());
     #[cfg(target_os = "linux")]
@@ -83,7 +84,7 @@ fn serve_userspace(spec: &Spec, out: &Outbound) -> io::Result<()> {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = queues;
-    Ok(())
+    Ok(name)
 }
 
 fn open(spec: &Spec) -> io::Result<(SyncDevice, bool, usize)> {

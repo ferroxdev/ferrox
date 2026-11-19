@@ -807,7 +807,13 @@ fn serve_inbounds_counted(
                                 continue;
                             }
                             inbounds += 1;
-                        } else if serve_tun_inbound(&spec, inbound, &out, address) {
+                        } else if serve_tun_inbound(
+                            &spec,
+                            inbound,
+                            &out,
+                            address,
+                            handler_stop.as_ref(),
+                        ) {
                             inbounds += 1;
                         }
                     }
@@ -17468,11 +17474,16 @@ fn tun_field<'a>(inbound: &'a Json, key: &str) -> Option<&'a Json> {
         .or_else(|| inbound.get(key))
 }
 
-/// The configured stack name, defaulting to `smoltcp`.
+/// The configured stack name, defaulting to the tree's own translator (`hev`).
 fn tun_stack(inbound: &Json) -> &str {
     tun_field(inbound, "stack")
         .and_then(Json::as_str)
-        .unwrap_or("smoltcp")
+        .unwrap_or("hev")
+}
+
+/// The stacks the tree's own handler serves: its `hev` spelling, the reference's `loopback`, and the alias names beside them.
+fn tun_native(stack: &str) -> bool {
+    matches!(stack, "hev" | "loopback" | "tun2socks" | "native")
 }
 
 /// Parse an optional unsigned integer, refusing a non-number.
@@ -17613,9 +17624,6 @@ fn tun_queues(inbound: &Json) -> Result<Option<usize>, String> {
 /// Reference options this build reads and accepts but does not apply: the routing table, firewall marks, namespace and the process/MAC filters.
 const TUN_NOT_APPLIED: &[&str] = &[
     "netns",
-    "dns_mode",
-    "dns_address",
-    "auto_route",
     "iproute2_table_index",
     "iproute2_rule_index",
     "auto_redirect",
@@ -17628,9 +17636,7 @@ const TUN_NOT_APPLIED: &[&str] = &[
     "exclude_mptcp",
     "loopback_address",
     "strict_route",
-    "route_address",
     "route_address_set",
-    "route_exclude_address",
     "route_exclude_address_set",
     "include_interface",
     "exclude_interface",
@@ -17647,10 +17653,6 @@ const TUN_NOT_APPLIED: &[&str] = &[
     "udp_filtering",
     "udp_nat_max",
     "platform",
-    "inet4_route_address",
-    "inet6_route_address",
-    "inet4_route_exclude_address",
-    "inet6_route_exclude_address",
 ];
 
 /// One line naming the options present in the config that this build does not apply, so a config from another TUN front runs here and says what it lost.
@@ -17675,6 +17677,47 @@ fn warn_unapplied_tun_options(inbound: &Json, native: bool) {
             "tun inbound: `udp_timeout` and `endpoint_independent_nat` apply to the `loopback` stack; this stack keeps its own datagram idle"
         );
     }
+}
+
+/// The CIDR prefixes a routing option names: `route_address` when it carries any, else both deprecated families.
+fn tun_prefixes(
+    inbound: &Json,
+    key: &str,
+    v4: &str,
+    v6: &str,
+) -> Result<Vec<(IpAddr, u8)>, String> {
+    let mut listed = tun_addresses(inbound, key)?;
+    if listed.is_empty() {
+        listed.extend(tun_addresses(inbound, v4)?);
+        listed.extend(tun_addresses(inbound, v6)?);
+    }
+    let mut prefixes = Vec::with_capacity(listed.len());
+    for text in listed {
+        if let (Some(address), prefix) = crate::tun::parse_address(Some(text), None)? {
+            prefixes.push((
+                address,
+                prefix.unwrap_or_else(|| crate::tun::default_prefix(address)),
+            ));
+        }
+    }
+    Ok(prefixes)
+}
+
+/// `dns_mode: hijack` names the resolver a hijacked query rides; `system` and the empty mode leave DNS to the device.
+fn tun_dns_hijack(inbound: &Json) -> Result<Option<IpAddr>, String> {
+    let hijack = tun_string(inbound, "dns_mode")?.is_some_and(|mode| mode == "hijack");
+    if !hijack {
+        return Ok(None);
+    }
+    let listed = tun_addresses(inbound, "dns_address")?;
+    let text = listed
+        .first()
+        .copied()
+        .ok_or_else(|| "`dns_mode` `hijack` needs a `dns_address`".to_owned())?;
+    let (address, _) = crate::tun::parse_address(Some(text), None)?;
+    address
+        .map(Some)
+        .ok_or_else(|| format!("`dns_address` `{text}` is not an address"))
 }
 
 /// Parse and validate the TUN spec without opening the device.
@@ -17707,6 +17750,21 @@ fn tun_spec(inbound: &Json) -> Result<crate::tun::Spec, String> {
     if let Some(on) = tun_bool(inbound, "gso")? {
         spec = spec.with_gso(on);
     }
+    let auto_route = tun_bool(inbound, "auto_route")?.unwrap_or(false);
+    let routes = tun_prefixes(
+        inbound,
+        "route_address",
+        "inet4_route_address",
+        "inet6_route_address",
+    )?;
+    let exclude = tun_prefixes(
+        inbound,
+        "route_exclude_address",
+        "inet4_route_exclude_address",
+        "inet6_route_exclude_address",
+    )?;
+    spec = spec.with_routes(auto_route, routes, exclude);
+    spec = spec.with_dns_hijack(tun_dns_hijack(inbound)?);
     spec.validate().map_err(|error| error.to_string())?;
     Ok(spec)
 }
@@ -17724,18 +17782,72 @@ fn tun_mode(stack: &str) -> crate::tun_stack::Mode {
     }
 }
 
+/// Install the `auto_route` guard for `interface` and hold it until the inbound stops, so the table goes back when the handler is removed.
+fn tun_routes(spec: &crate::tun::Spec, interface: &str, stop: Option<&Arc<Stop>>) {
+    if !spec.auto_route() {
+        if !spec.route_address().is_empty() || !spec.route_exclude().is_empty() {
+            eprintln!("tun inbound: `route_address` and `route_exclude_address` need `auto_route`");
+        }
+        return;
+    }
+    if interface.is_empty() {
+        eprintln!("tun inbound: `auto_route` needs a device the platform named");
+        return;
+    }
+    let v4 = spec
+        .addresses()
+        .iter()
+        .any(|(address, _)| address.is_ipv4());
+    let v6 = spec
+        .addresses()
+        .iter()
+        .any(|(address, _)| address.is_ipv6());
+    let plan = crate::tun_route::Plan::new(v4, v6, spec.route_address(), spec.route_exclude());
+    if plan.is_empty() {
+        return;
+    }
+    let guard = match crate::tun_route::Guard::install(interface, &plan) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("tun inbound: could not install the routes: {error}");
+            return;
+        }
+    };
+    match stop {
+        Some(stop) => {
+            let stop = Arc::clone(stop);
+            thread::spawn(move || {
+                while !stop.stopped() {
+                    thread::sleep(std::time::Duration::from_millis(200));
+                }
+                drop(guard);
+            });
+        }
+        // A run with no removable handler keeps its routes until the process ends.
+        None => std::mem::forget(guard),
+    }
+}
+
 /// Open the TUN device and spawn the packet handler. Returns true when the device opens.
 fn serve_tun_inbound(
     spec: &crate::tun::Spec,
     inbound: &Json,
     out: &Outbound,
     _address: &str,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let stack = tun_stack(inbound);
-    warn_unapplied_tun_options(inbound, stack == "loopback");
-    if stack != "loopback" {
+    warn_unapplied_tun_options(inbound, tun_native(stack));
+    if !tun_native(stack) {
         return match crate::tun_stack::serve(spec, out, tun_mode(stack)) {
-            Ok(()) => true,
+            Ok(interface) => {
+                if !interface.is_empty() {
+                    tun_routes(spec, &interface, stop);
+                } else if spec.auto_route() {
+                    eprintln!("tun inbound: the `{stack}` stack does not name its device, so `auto_route` is not applied");
+                }
+                true
+            }
             Err(error) => {
                 eprintln!("tun inbound: {error}");
                 false
@@ -17746,6 +17858,11 @@ fn serve_tun_inbound(
         eprintln!("tun inbound: {}", crate::tun::refusal_reason(spec));
         return false;
     };
+    let interface = devices
+        .first()
+        .map(|device| device.name().to_owned())
+        .unwrap_or_default();
+    tun_routes(spec, &interface, stop);
     let flows = crate::tun::Flows::default();
     let legs = crate::tun::Legs::default();
     let dial = Some(device_dial(out));
@@ -44051,6 +44168,31 @@ mod tests {
             spec(r#"{"endpoint_independent_nat":true,"gso":false}"#).expect("the NAT switches");
         assert!(nat.endpoint_independent_nat());
         assert!(!nat.gso());
+        let routed = spec(
+            r#"{"auto_route":true,"route_address":["192.0.2.0/25"],"route_exclude_address":["198.51.100.0/24"],"dns_mode":"hijack","dns_address":["192.0.2.53"]}"#,
+        )
+        .expect("the routing block");
+        assert!(routed.auto_route());
+        assert_eq!(
+            routed.route_address(),
+            &[("192.0.2.0".parse::<std::net::IpAddr>().unwrap(), 25)]
+        );
+        assert_eq!(
+            routed.route_exclude(),
+            &[("198.51.100.0".parse::<std::net::IpAddr>().unwrap(), 24)]
+        );
+        assert_eq!(
+            routed.dns_hijack(),
+            Some("192.0.2.53".parse::<std::net::IpAddr>().unwrap())
+        );
+        assert!(spec(r#"{"dns_mode":"system"}"#)
+            .expect("the system resolver")
+            .dns_hijack()
+            .is_none());
+        assert!(
+            spec(r#"{"dns_mode":"hijack"}"#).is_err(),
+            "hijack names a resolver"
+        );
         assert!(
             spec(
                 r#"{"interface_name":"tun0","mtu":1400,"address":["172.19.0.1/30","fdfe:dcba:9876::1/126"],"dns_mode":"hijack","dns_address":["192.0.2.53"],"auto_route":true,"iproute2_table_index":2022,"iproute2_rule_index":9000,"auto_redirect":true,"strict_route":true,"route_address":["192.0.2.0/25","192.0.2.128/25"],"route_exclude_address":["198.51.100.0/24"],"include_interface":["eth0"],"exclude_interface":["eth1"],"include_uid":[1000],"exclude_uid_range":["1000:2000"],"include_package":["com.example"],"include_mac_address":["00:11:22:33:44:55"],"udp_timeout":"5m","udp_mapping":"endpoint_independent","udp_filtering":"endpoint_independent","udp_nat_max":1024,"multi_queue":true,"platform":{"http_proxy":{"enabled":true}},"stack":"mixed","gso":true,"inet4_address":["172.19.0.1/30"],"inet4_route_address":["198.51.100.0/24"],"endpoint_independent_nat":true}"#
@@ -44068,6 +44210,12 @@ mod tests {
         assert_eq!(super::tun_mode("mixed"), Mode::Hybrid);
         assert_eq!(super::tun_mode("system"), Mode::System);
         assert_eq!(super::tun_mode("nonsense"), Mode::Userspace);
+        for native in ["hev", "loopback", "tun2socks", "native"] {
+            assert!(super::tun_native(native), "{native} is the in-tree handler");
+        }
+        assert!(!super::tun_native("smoltcp"));
+        assert!(!super::tun_native("mixed"));
+        assert_eq!(super::tun_stack(&crate::json::Json::Null), "hev");
     }
 
     #[cfg(target_os = "linux")]
