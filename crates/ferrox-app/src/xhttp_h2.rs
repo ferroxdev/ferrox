@@ -126,13 +126,8 @@ impl<'a> DataBatch<'a> {
     fn reserved_fits(&self, conn: &H2Conn) -> Option<bool> {
         let streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
         let mut fits = true;
-        for at in 0..self.used {
-            let id = u32::from_be_bytes([
-                self.heads[at][5],
-                self.heads[at][6],
-                self.heads[at][7],
-                self.heads[at][8],
-            ]);
+        for head in self.heads.iter().take(self.used) {
+            let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
             let state = streams.get(&id)?;
             let window = *state
                 .send_window
