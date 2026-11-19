@@ -463,11 +463,12 @@ credential_ancestors_trusted() {
   uid="$(id -u)"
   cur="$(dirname "$cur")"
   while :; do
+    owner="$(find "$cur" -maxdepth 0 \( -user 0 -o -user "$uid" \) -print -quit 2>/dev/null)"
+    [ -n "$owner" ] || return 1
     unsafe="$(find "$cur" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print -quit 2>/dev/null)"
     if [ -n "$unsafe" ]; then
       sticky="$(find "$cur" -maxdepth 0 -perm -1000 -print -quit 2>/dev/null)"
-      owner="$(find "$cur" -maxdepth 0 \( -user 0 -o -user "$uid" \) -print -quit 2>/dev/null)"
-      [ -n "$sticky" ] && [ -n "$owner" ] || return 1
+      [ -n "$sticky" ] || return 1
     fi
     [ "$cur" = / ] && return 0
     cur="$(dirname "$cur")"
@@ -1886,7 +1887,7 @@ proxy_restore_snapshot() {
 }
 
 proxy_lock() {
-  local dir pid i recover
+  local dir pid tmp recover
   if [ "${PROXY_LOCK_DEPTH:-0}" -gt 0 ]; then
     PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH + 1))
     return 0
@@ -1894,35 +1895,42 @@ proxy_lock() {
   dir="$(absolute_path "$STATE_DIR")/system-proxy.lock"
   ( umask 077; mkdir -p "$(dirname "$dir")" ) 2>/dev/null ||
     { say "system proxy: cannot create $STATE_DIR." >&2; return 1; }
-  for i in $(seq 1 300); do
-    if mkdir "$dir" 2>/dev/null; then
-      printf '%s\n' "$$" >"$dir/pid" 2>/dev/null ||
-        { rm -rf "$dir"; say "system proxy: cannot record the lock owner." >&2; return 1; }
+  for _ in $(seq 1 300); do
+    if [ -d "$dir" ]; then
+      pid="$(cat "$dir/pid" 2>/dev/null || true)"
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        sleep 0.1
+      else
+        rm -f "$dir/pid"
+        rmdir "$dir/recover" 2>/dev/null || true
+        rmdir "$dir" 2>/dev/null || true
+      fi
+      continue
+    fi
+    tmp="$dir.$$"
+    ( umask 077; printf '%s\n' "$$" >"$tmp" ) 2>/dev/null ||
+      { rm -f "$tmp"; say "system proxy: cannot record the lock owner." >&2; return 1; }
+    if ln "$tmp" "$dir" 2>/dev/null; then
+      rm -f "$tmp"
       PROXY_LOCK="$dir"
       PROXY_LOCK_DEPTH=1
       return 0
     fi
-    pid="$(cat "$dir/pid" 2>/dev/null || true)"
-    if [ -z "$pid" ] && [ "$i" -le 20 ]; then
-      sleep 0.1
-      continue
-    fi
+    rm -f "$tmp"
+    pid="$(cat "$dir" 2>/dev/null || true)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       sleep 0.1
       continue
     fi
-    recover="$dir/recover"
-    if mkdir "$recover" 2>/dev/null; then
-      for _ in $(seq 1 20); do
-        pid="$(cat "$dir/pid" 2>/dev/null || true)"
-        [ -n "$pid" ] && break
-        sleep 0.1
-      done
-      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        rmdir "$recover" 2>/dev/null || true
-      else
-        rm -rf "$dir"
+    recover="$dir.recover.$$"
+    rm -f "$recover"
+    if ln "$dir" "$recover" 2>/dev/null; then
+      pid="$(cat "$dir" 2>/dev/null || true)"
+      if [ "$dir" -ef "$recover" ] &&
+         { [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; }; then
+        rm -f "$dir"
       fi
+      rm -f "$recover"
     else
       sleep 0.1
     fi
@@ -2389,7 +2397,7 @@ foxy_lane_configured() {
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && exec 3>&- ; }
 
 wait_fronts() {
-  local front port i
+  local front port
   for front in ${FRONTS//,/ }; do
     case "$front" in
       socks) port="$SOCKS_PORT" ;;
@@ -2397,7 +2405,7 @@ wait_fronts() {
       mixed) port="$MIXED_PORT" ;;
       *) continue ;;
     esac
-    for i in $(seq 1 90); do
+    for _ in $(seq 1 90); do
       port_open "$port" && break
       lane_running || return 1
       sleep 1
