@@ -2003,7 +2003,7 @@ PY
 )" || from_config=""
     for port in $from_config; do ports="$ports$port "; from_lane=1; done
   fi
-  [ "$from_lane" = 1 ] || ports=" $SOCKS_PORT $HTTP_PORT $MIXED_PORT "
+  [ "$from_lane" = 1 ] || ports="$ports$SOCKS_PORT $HTTP_PORT $MIXED_PORT "
   printf '%s' "$ports"
 }
 
