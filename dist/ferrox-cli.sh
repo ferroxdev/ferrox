@@ -434,20 +434,44 @@ absolute_path() {
   case "$path" in /*) printf '%s\n' "$path" ;; *) printf '%s/%s\n' "$PWD" "$path" ;; esac
 }
 
-credentials_inside_repo() {
-  local real lex dir root
-  real="$(resolve_real "$CREDS")"
-  lex="$(absolute_path "$CREDS")"
-  dir="$(dirname "$lex")"
+repo_root_of_path() {
+  local path="$1" dir root
+  dir="$(dirname "$path")"
   while [ ! -d "$dir" ]; do
     [ "$dir" = / ] && return 1
     dir="$(dirname "$dir")"
   done
   root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
-  root="$(resolve_real "$root")"
-  case "$real" in "$root"/*) return 0 ;; esac
-  case "$lex" in "$root"/*) return 0 ;; esac
+  resolve_real "$root"
+}
+
+credentials_inside_repo() {
+  local real lex root
+  real="$(resolve_real "$CREDS")"
+  lex="$(absolute_path "$CREDS")"
+  if root="$(repo_root_of_path "$lex")"; then
+    case "$lex" in "$root"/*) return 0 ;; esac
+  fi
+  if [ "$real" != "$lex" ] && root="$(repo_root_of_path "$real")"; then
+    case "$real" in "$root"/*) return 0 ;; esac
+  fi
   return 1
+}
+
+credential_ancestors_trusted() {
+  local cur="$1" uid unsafe sticky owner
+  uid="$(id -u)"
+  cur="$(dirname "$cur")"
+  while :; do
+    unsafe="$(find "$cur" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print -quit 2>/dev/null)"
+    if [ -n "$unsafe" ]; then
+      sticky="$(find "$cur" -maxdepth 0 -perm -1000 -print -quit 2>/dev/null)"
+      owner="$(find "$cur" -maxdepth 0 \( -user 0 -o -user "$uid" \) -print -quit 2>/dev/null)"
+      [ -n "$sticky" ] && [ -n "$owner" ] || return 1
+    fi
+    [ "$cur" = / ] && return 0
+    cur="$(dirname "$cur")"
+  done
 }
 
 action_login() {
@@ -462,7 +486,7 @@ action_login() {
     printf 'password (hidden, not echoed): ' && read -rs pass && printf '\n'
   fi
   [ -n "$email" ] && [ -n "$pass" ] || die "an account is an email and a password"
-  local cred_dir tmp unsafe
+  local cred_dir save_dir tmp unsafe
   cred_dir="$(dirname "$CREDS")"
   [ -d "$CREDS" ] && die "$CREDS is a directory; FOXY_CREDENTIALS must name a file"
   mkdir -p "$CONF_DIR" || die "cannot create $CONF_DIR; the saved session was kept."
@@ -470,10 +494,13 @@ action_login() {
   if [ "$cred_dir" != "$CONF_DIR" ]; then
     ( umask 077; mkdir -p "$cred_dir" ) || die "cannot create $cred_dir; the saved session was kept."
   fi
-  [ -O "$cred_dir" ] || die "$cred_dir is not owned by you; choose an owner-only directory"
-  unsafe="$(find "$cred_dir" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print -quit 2>/dev/null)"
+  save_dir="$(resolve_real "$cred_dir")"
+  [ -O "$save_dir" ] || die "$cred_dir is not owned by you; choose an owner-only directory"
+  unsafe="$(find "$save_dir" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print -quit 2>/dev/null)"
   [ -z "$unsafe" ] || die "$cred_dir is writable by another user; choose an owner-only directory"
-  tmp="$(mktemp "$cred_dir/.ferrox-credentials.XXXXXX")" ||
+  credential_ancestors_trusted "$save_dir" ||
+    die "$cred_dir has an ancestor writable by another user; choose a private directory"
+  tmp="$(mktemp "$save_dir/.ferrox-credentials.XXXXXX")" ||
     die "cannot create a temporary credentials file in $cred_dir; the saved session was kept."
   (
     umask 077
@@ -484,7 +511,8 @@ action_login() {
   ) || { rm -f "$tmp"; die "cannot write $CREDS; the saved session was kept."; }
   chmod 600 "$tmp" || { rm -f "$tmp"; die "cannot set owner-only mode on $CREDS; the saved session was kept."; }
   [ -d "$CREDS" ] && { rm -f "$tmp"; die "$CREDS is a directory; FOXY_CREDENTIALS must name a file"; }
-  mv -f "$tmp" "$CREDS" || { rm -f "$tmp"; die "cannot replace $CREDS; the saved session was kept."; }
+  mv -f "$tmp" "$save_dir/$(basename "$CREDS")" ||
+    { rm -f "$tmp"; die "cannot replace $CREDS; the saved session was kept."; }
   # A login is the user asking for this account now: the grant the last one left is not the one to resume.
   rm -f "$TOKEN_FILE"
   if [ "${LOGIN_QUIET:-0}" != 1 ]; then
@@ -1590,6 +1618,19 @@ proxy_bypass_join() {
 }
 
 system_proxy_preflight() {
+  local platform rc=0
+  platform="$(uname -s 2>/dev/null || true)"
+  case "$platform" in
+    Darwin) ;;
+    *) _system_proxy_preflight; return $? ;;
+  esac
+  proxy_lock || return 1
+  _system_proxy_preflight || rc=$?
+  proxy_unlock
+  return "$rc"
+}
+
+_system_proxy_preflight() {
   local platform https="" all="" svc state
   platform="$(uname -s 2>/dev/null || true)"
   case "$platform" in
@@ -1845,15 +1886,18 @@ proxy_restore_snapshot() {
 }
 
 proxy_lock() {
-  local dir pid i
+  local dir pid i recover
   if [ "${PROXY_LOCK_DEPTH:-0}" -gt 0 ]; then
     PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH + 1))
     return 0
   fi
   dir="$(absolute_path "$STATE_DIR")/system-proxy.lock"
+  ( umask 077; mkdir -p "$(dirname "$dir")" ) 2>/dev/null ||
+    { say "system proxy: cannot create $STATE_DIR." >&2; return 1; }
   for i in $(seq 1 300); do
     if mkdir "$dir" 2>/dev/null; then
-      printf '%s\n' "$$" >"$dir/pid" 2>/dev/null || true
+      printf '%s\n' "$$" >"$dir/pid" 2>/dev/null ||
+        { rm -rf "$dir"; say "system proxy: cannot record the lock owner." >&2; return 1; }
       PROXY_LOCK="$dir"
       PROXY_LOCK_DEPTH=1
       return 0
@@ -1865,8 +1909,22 @@ proxy_lock() {
     fi
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       sleep 0.1
+      continue
+    fi
+    recover="$dir/recover"
+    if mkdir "$recover" 2>/dev/null; then
+      for _ in $(seq 1 20); do
+        pid="$(cat "$dir/pid" 2>/dev/null || true)"
+        [ -n "$pid" ] && break
+        sleep 0.1
+      done
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        rmdir "$recover" 2>/dev/null || true
+      else
+        rm -rf "$dir"
+      fi
     else
-      rm -rf "$dir"
+      sleep 0.1
     fi
   done
   say "system proxy: another ferrox-cli is changing the proxy; try again." >&2
