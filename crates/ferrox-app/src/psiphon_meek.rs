@@ -1280,7 +1280,7 @@ impl MeekHttp {
         // A stalled direct connect is one candidate; the proxy leg keeps its full handshake budget.
         let connect = timeout.min(MAX_CONNECT_ATTEMPT);
         let stream = match &self.proxy {
-            Some(proxy) => proxy.connect(address, Instant::now() + timeout)?,
+            Some(proxy) => proxy.connect(address, deadline)?,
             None => TcpStream::connect_timeout(&address, connect)
                 .map_err(|error| format!("psiphon meek connect {}: {error}", self.meek.dial))?,
         };
