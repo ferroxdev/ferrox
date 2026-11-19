@@ -79801,6 +79801,9 @@ end
         let direct = device_datagram(&out).expect("the UDP lane is a direct association");
         let direct = direct().expect("the association opens");
         let socket = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
         socket.connect(direct.relay).expect("connects");
         let mut frame = vec![0, 0, 0];
         push_socks_addr(&mut frame, &target_addr);
