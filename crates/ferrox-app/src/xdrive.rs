@@ -3635,6 +3635,35 @@ struct Target {
     path: String,
 }
 
+/// Every address a target resolves to, used to admit only the operator-named endpoint's own local address on a follow-up.
+fn target_ips(target: &Target) -> Vec<std::net::IpAddr> {
+    let bare = target.host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return vec![ip];
+    }
+    (bare, target.port)
+        .to_socket_addrs()
+        .map(|addresses| addresses.map(|address| address.ip()).collect())
+        .unwrap_or_default()
+}
+
+/// The address a followed href connects to: resolved once and checked against the local ranges before the dial, so a name cannot answer a public address to the check and a private one to the socket. A local address is admitted only when it is one the configured endpoint resolved to.
+fn pinned_peer(
+    target: &Target,
+    allowed_local: &[std::net::IpAddr],
+) -> Option<std::net::SocketAddr> {
+    let bare = target.host.trim_start_matches('[').trim_end_matches(']');
+    let allowed = |ip: std::net::IpAddr| !local_ip(ip) || allowed_local.contains(&ip);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return allowed(ip).then_some(std::net::SocketAddr::new(ip, target.port));
+    }
+    let addresses: Vec<_> = (bare, target.port).to_socket_addrs().ok()?.collect();
+    if addresses.iter().any(|address| !allowed(address.ip())) {
+        return None;
+    }
+    addresses.first().copied()
+}
+
 /// Whether a href's host is only reachable from this machine or its network: a store that answers a
 /// `localhost`/RFC 1918/ULA href would turn the proxy into a local port scanner, so those are refused.
 fn local_host(host: &str) -> bool {
@@ -3906,6 +3935,18 @@ impl Http {
         body: Option<&[u8]>,
         limit: Option<usize>,
     ) -> io::Result<(u16, Vec<u8>)> {
+        self.ask_at(method, url, headers, body, limit, None)
+    }
+
+    pub(crate) fn ask_at(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        limit: Option<usize>,
+        peer: Option<std::net::SocketAddr>,
+    ) -> io::Result<(u16, Vec<u8>)> {
         let target = Target::parse(url)
             .ok_or_else(|| carrier_error(format!("the service url {url} names no origin")))?;
         let head = request_head(
@@ -3916,15 +3957,20 @@ impl Http {
             body.map(<[u8]>::len),
         );
         let key = target.origin();
+        let peer = self.front.is_none().then_some(peer).flatten();
         let _hold = self.gate.hold();
         if target.secure && self.h3_enabled() {
             let head = std::str::from_utf8(&head)
                 .map_err(|_| carrier_error("the service head is not text"))?;
-            return self.ask_h3(&target, head, body, limit);
+            return self.ask_h3(&target, head, body, limit, peer);
         }
         let header_only = method.eq_ignore_ascii_case("HEAD");
         let _conns = self.conns.hold();
-        let pooled = self.borrow(&key);
+        let pooled = if peer.is_none() {
+            self.borrow(&key)
+        } else {
+            None
+        };
         if let Some(mut lane) = pooled {
             return match lane.exchange(&head, body, header_only, limit) {
                 Ok(answer) => {
@@ -3932,7 +3978,7 @@ impl Http {
                     Ok((answer.status, answer.body))
                 }
                 Err(first) => {
-                    let mut again = self.dial(&target)?;
+                    let mut again = self.dial(&target, peer)?;
                     let answer =
                         again
                             .exchange(&head, body, header_only, limit)
@@ -3946,9 +3992,12 @@ impl Http {
                 }
             };
         }
-        let mut lane = self.dial(&target)?;
+        let mut lane = self.dial(&target, peer)?;
         let answer = lane.exchange(&head, body, header_only, limit)?;
-        self.finish(&key, lane, &answer);
+        // A lane pinned to one address never returns to the origin-keyed pool: a later unpinned call would otherwise ride the pin.
+        if peer.is_none() {
+            self.finish(&key, lane, &answer);
+        }
         Ok((answer.status, answer.body))
     }
 
@@ -4057,20 +4106,23 @@ impl Http {
         head: &str,
         body: Option<&[u8]>,
         limit: Option<usize>,
+        peer: Option<std::net::SocketAddr>,
     ) -> io::Result<(u16, Vec<u8>)> {
         let (address, port) = self.endpoint(target);
         let cfg = self.tls_for(target)?;
         let key = target.origin();
-        let client = self.h3_client(&key, &address, port, &cfg)?;
+        let client = self.h3_client(&key, &address, port, &cfg, peer)?;
         let first = match client.ask(head, &target.authority(), body, limit) {
             Ok(answer) => return Ok(answer),
             Err(first) => first,
         };
-        self.h3
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&key);
-        let fresh = self.h3_client(&key, &address, port, &cfg)?;
+        if peer.is_none() {
+            self.h3
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&key);
+        }
+        let fresh = self.h3_client(&key, &address, port, &cfg, peer)?;
         fresh
             .ask(head, &target.authority(), body, limit)
             .map_err(|again| {
@@ -4086,30 +4138,40 @@ impl Http {
         address: &str,
         port: u16,
         cfg: &TlsConfig,
+        peer: Option<std::net::SocketAddr>,
     ) -> io::Result<Arc<H3Client>> {
-        if let Some(client) = self
-            .h3
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(key)
-            .cloned()
-        {
-            return Ok(client);
+        if peer.is_none() {
+            if let Some(client) = self
+                .h3
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(key)
+                .cloned()
+            {
+                return Ok(client);
+            }
         }
         let name = if cfg.server_name.is_empty() {
             address
         } else {
             cfg.server_name.as_str()
         };
-        let peer = (address, port)
-            .to_socket_addrs()
-            .map_err(|why| carrier_error(format!("resolve {address}:{port}: {why}")))?
-            .next()
-            .ok_or_else(|| carrier_error(format!("{address}:{port} resolves to nothing")))?;
+        let pinned = peer.is_some();
+        let peer = match peer {
+            Some(peer) => peer,
+            None => (address, port)
+                .to_socket_addrs()
+                .map_err(|why| carrier_error(format!("resolve {address}:{port}: {why}")))?
+                .next()
+                .ok_or_else(|| carrier_error(format!("{address}:{port} resolves to nothing")))?,
+        };
         let client = H3Client::connect_tuned(peer, name, cfg, self.quic.as_ref(), true)
             .ok_or_else(|| {
                 carrier_error(format!("h3 service lane cannot reach {address}:{port}"))
             })?;
+        if pinned {
+            return Ok(client);
+        }
         self.h3
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -4118,13 +4180,16 @@ impl Http {
     }
 
     /// Dial the fronting the outbound names, or the url's own origin, and put TLS on it when the url asks for that scheme.
-    fn dial(&self, target: &Target) -> io::Result<Lane> {
+    fn dial(&self, target: &Target, peer: Option<std::net::SocketAddr>) -> io::Result<Lane> {
         let (host, port) = self.endpoint(target);
-        let peer = (host.as_str(), port)
-            .to_socket_addrs()
-            .map_err(|why| carrier_error(format!("resolve {host}: {why}")))?
-            .next()
-            .ok_or_else(|| carrier_error(format!("{host} resolves to nothing")))?;
+        let peer = match peer {
+            Some(peer) => peer,
+            None => (host.as_str(), port)
+                .to_socket_addrs()
+                .map_err(|why| carrier_error(format!("resolve {host}: {why}")))?
+                .next()
+                .ok_or_else(|| carrier_error(format!("{host} resolves to nothing")))?,
+        };
         let stream = crate::conn::dial_tcp(&peer, SERVICE_TIMEOUT)
             .map_err(|why| carrier_error(format!("connect {peer}: {why}")))?;
         let _ = stream.set_read_timeout(Some(SERVICE_TIMEOUT));
@@ -4611,6 +4676,16 @@ impl Template {
     }
 
     fn do_op(&self, op: &Op, vars: &mut Vars, body: Option<&[u8]>) -> io::Result<(u16, Vec<u8>)> {
+        self.do_op_at(op, vars, body, None)
+    }
+
+    fn do_op_at(
+        &self,
+        op: &Op,
+        vars: &mut Vars,
+        body: Option<&[u8]>,
+        peer: Option<std::net::SocketAddr>,
+    ) -> io::Result<(u16, Vec<u8>)> {
         let method = if op.method.is_empty() {
             "GET"
         } else {
@@ -4642,7 +4717,7 @@ impl Template {
                 .collect();
             let answer = self
                 .http
-                .ask(method, &url, &sent, body, Some(MAX_SEGMENT_BYTES));
+                .ask_at(method, &url, &sent, body, Some(MAX_SEGMENT_BYTES), peer);
             let (status, payload) = match answer {
                 Ok(answer) => answer,
                 Err(why) => return Control::Again(format!("request failed: {why}")),
@@ -4667,6 +4742,18 @@ impl Template {
         if op.href_path.is_empty() {
             return self.do_op(op, vars, body);
         }
+        // Resolve the operator's endpoint before the store answers, so a name that turns local only for the follow-up cannot be admitted by the follow-up's own resolution.
+        let store_url = if op.presigned {
+            op.url.clone()
+        } else {
+            vars.sub(&op.url)
+        };
+        let store = Target::parse(&store_url);
+        let store_ips = if self.http.front.is_none() {
+            store.as_ref().map(target_ips).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let (status, payload) = self.do_op(op, vars, None)?;
         if !(200..300).contains(&status) {
             return Ok((status, payload));
@@ -4683,16 +4770,27 @@ impl Template {
             return Err(carrier_error("the store href names no origin"));
         };
         // The store's own endpoint may be loopback when the operator named it; a different local origin may not.
-        let here = Target::parse(&vars.sub(&op.url));
-        let same_endpoint = here.as_ref().is_some_and(|target| {
+        let same_endpoint = store.as_ref().is_some_and(|target| {
             target.host.eq_ignore_ascii_case(&follow_target.host)
                 && target.port == follow_target.port
         });
-        if !same_endpoint && local_host(&follow_target.host) {
-            return Err(carrier_error(
-                "the store href names this machine or its LAN, so it is not followed",
-            ));
-        }
+        let allowed_local = if same_endpoint { store_ips } else { Vec::new() };
+        let peer = if self.http.front.is_none() {
+            let Some(peer) = pinned_peer(&follow_target, &allowed_local) else {
+                return Err(carrier_error(
+                    "the store href names this machine or its LAN, so it is not followed",
+                ));
+            };
+            Some(peer)
+        } else {
+            // A fronted lane dials the front, so only a literal local href is refused; the name is never resolved here.
+            if !same_endpoint && local_host(&follow_target.host) {
+                return Err(carrier_error(
+                    "the store href names this machine or its LAN, so it is not followed",
+                ));
+            }
+            None
+        };
         let follow = Op {
             method: op.href_method.clone(),
             url: href.to_owned(),
@@ -4703,7 +4801,7 @@ impl Template {
             href_method: String::new(),
             presigned: true,
         };
-        self.do_op(&follow, vars, body)
+        self.do_op_at(&follow, vars, body, peer)
     }
 }
 

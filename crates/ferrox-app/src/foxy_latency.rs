@@ -55,7 +55,11 @@ pub(crate) fn readings(edges: &[Candidate]) -> Vec<Option<u64>> {
 /// The first address that answers, timed to the handshake; a name that does not resolve is a silence like any other.
 fn probe(host: &str, port: u16, budget: Duration) -> Option<u64> {
     let deadline = Instant::now() + budget;
-    for address in (host, port).to_socket_addrs().ok()? {
+    let addresses = (host, port).to_socket_addrs().ok()?;
+    if Instant::now() >= deadline {
+        return None;
+    }
+    for address in addresses {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return None;

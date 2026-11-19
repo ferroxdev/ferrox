@@ -3696,6 +3696,8 @@ struct Tunnel {
     udp_target: Option<(String, u16)>,
     udp_frame: Vec<u8>,
     udp_at: usize,
+    flow: Vec<u8>,
+    flow_at: usize,
 }
 
 fn sweep_due_timer(conn: &mut quiche::Connection) {
@@ -3739,6 +3741,8 @@ fn worker(
         udp_target: None,
         udp_frame: Vec::new(),
         udp_at: 0,
+        flow: Vec::new(),
+        flow_at: 0,
     };
     loop {
         if conn.is_closed() {
@@ -3767,6 +3771,9 @@ fn worker(
             }
             service(&mut conn, &shared, &spec, &mut tunnel);
             drain_udp(&mut conn, &mut tunnel);
+            if let Some(stream) = tunnel.stream {
+                flush_flow(&mut conn, &mut tunnel, stream);
+            }
         }
         'packets: while let Some(packet) = tunnel
             .unsent
@@ -3861,6 +3868,10 @@ fn service(
         loop {
             match conn.stream_recv(id, &mut room) {
                 Ok((0, _)) | Err(quiche::Error::Done) => break,
+                Err(quiche::Error::StreamReset(_)) => {
+                    cancel(conn, tunnel);
+                    return;
+                }
                 Ok((n, fin)) => {
                     tunnel.buf.extend_from_slice(&room[..n]);
                     if tunnel.buf.len() > CAPSULE_CAP {
@@ -4172,13 +4183,13 @@ fn accept(
     }
     let mut control = Vec::new();
     connectip::address_assign_encode(&assignments, &mut control);
-    if send_data(conn, stream, &control).is_err() {
+    if !queue_data(conn, tunnel, stream, &control) {
         cancel(conn, tunnel);
         return;
     }
     control.clear();
     connectip::route_advert_encode(&routes(&tunnel.addrs), &mut control);
-    if send_data(conn, stream, &control).is_err() {
+    if !queue_data(conn, tunnel, stream, &control) {
         cancel(conn, tunnel);
     }
 }
@@ -4297,7 +4308,7 @@ fn parse_capsules(conn: &mut quiche::Connection, tunnel: &mut Tunnel, mtu: usize
     };
     if let Some(stream) = tunnel.stream {
         for body in answers {
-            if send_data(conn, stream, &body).is_err() {
+            if !queue_data(conn, tunnel, stream, &body) {
                 return false;
             }
         }
@@ -4384,20 +4395,81 @@ fn drain_udp(conn: &mut quiche::Connection, tunnel: &mut Tunnel) {
             tunnel.udp_frame.extend_from_slice(&head[..length]);
             udp_capsule::datagram_encode(&payload, &mut tunnel.udp_frame);
         }
-        if !stream_frame(conn, stream, &tunnel.udp_frame, &mut tunnel.udp_at) {
-            return;
+        match stream_frame(conn, stream, &tunnel.udp_frame, &mut tunnel.udp_at) {
+            FrameSend::Sent => {}
+            FrameSend::Blocked => return,
+            FrameSend::Failed => {
+                cancel(conn, tunnel);
+                return;
+            }
         }
     }
 }
 
-fn stream_frame(conn: &mut quiche::Connection, stream: u64, frame: &[u8], at: &mut usize) -> bool {
+enum FrameSend {
+    Sent,
+    Blocked,
+    Failed,
+}
+
+fn stream_frame(
+    conn: &mut quiche::Connection,
+    stream: u64,
+    frame: &[u8],
+    at: &mut usize,
+) -> FrameSend {
     while *at < frame.len() {
         match conn.stream_send(stream, &frame[*at..], false) {
-            Ok(0) | Err(_) => return false,
+            Ok(0) | Err(quiche::Error::Done) => return FrameSend::Blocked,
             Ok(wrote) => *at += wrote,
+            Err(_) => return FrameSend::Failed,
         }
     }
+    FrameSend::Sent
+}
+
+/// Whether a frame still fits the queue a flow is allowed to hold unflushed.
+fn flow_fits(queued: usize, add: usize) -> bool {
+    queued.saturating_add(add) <= CAPSULE_CAP
+}
+
+/// Queues one DATA frame behind a send the stream has not taken whole, so a full send buffer never splits a control frame. A queue past the capsule bound refuses the answer rather than growing for the tunnel's life.
+fn queue_data(
+    conn: &mut quiche::Connection,
+    tunnel: &mut Tunnel,
+    stream: u64,
+    bytes: &[u8],
+) -> bool {
+    if tunnel.flow_at > 0 {
+        tunnel.flow.drain(..tunnel.flow_at);
+        tunnel.flow_at = 0;
+    }
+    let mut head = [0u8; 9];
+    let length = frames::h3_data_header(&mut head, bytes.len() as u64);
+    if !flow_fits(tunnel.flow.len(), length.saturating_add(bytes.len())) {
+        return false;
+    }
+    tunnel.flow.extend_from_slice(&head[..length]);
+    tunnel.flow.extend_from_slice(bytes);
+    flush_flow(conn, tunnel, stream);
     true
+}
+
+fn flush_flow(conn: &mut quiche::Connection, tunnel: &mut Tunnel, stream: u64) {
+    if tunnel.flow_at < tunnel.flow.len() {
+        match stream_frame(conn, stream, &tunnel.flow, &mut tunnel.flow_at) {
+            FrameSend::Sent | FrameSend::Blocked => {}
+            FrameSend::Failed => {
+                cancel(conn, tunnel);
+                return;
+            }
+        }
+        if tunnel.flow_at < tunnel.flow.len() {
+            return;
+        }
+    }
+    tunnel.flow.clear();
+    tunnel.flow_at = 0;
 }
 
 fn read_datagrams(
@@ -4506,6 +4578,8 @@ fn cancel(conn: &mut quiche::Connection, tunnel: &mut Tunnel) {
     tunnel.udp = None;
     tunnel.granted = None;
     tunnel.addrs.clear();
+    tunnel.flow.clear();
+    tunnel.flow_at = 0;
     tunnel.opened = false;
     tunnel.rejected = true;
 }
@@ -4591,6 +4665,13 @@ fn peer_key(addrs: &[IpAddr]) -> [u8; 32] {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn a_flow_queue_stops_at_the_capsule_bound() {
+        assert!(flow_fits(CAPSULE_CAP - 1, 1));
+        assert!(!flow_fits(CAPSULE_CAP, 1));
+        assert!(!flow_fits(usize::MAX, 1));
+    }
 
     #[test]
     fn a_masque_lane_without_params_runs_the_references_bbr() {
@@ -6583,6 +6664,8 @@ mod tests {
             udp_target: None,
             udp_frame: Vec::new(),
             udp_at: 0,
+            flow: Vec::new(),
+            flow_at: 0,
         }
     }
 

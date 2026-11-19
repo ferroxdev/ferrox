@@ -118,6 +118,9 @@ fn read_upgrade_head<R: Read>(read: &mut R, limit: usize) -> Option<(Vec<u8>, us
         if n == 0 {
             return None;
         }
+        if Instant::now() >= until {
+            return None;
+        }
         let from = base.saturating_sub(3);
         if let Some(at) = upgrade_head_end(&head[from..]).map(|hit| hit + from) {
             return Some((head, at));

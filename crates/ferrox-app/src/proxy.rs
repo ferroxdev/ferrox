@@ -27915,6 +27915,25 @@ fn probe_edge_exit(
         .account
         .as_ref()
         .map_or_else(|| foxy.pass.clone(), |account| account.current());
+    // A pinned edge is only trusted on a carrier that checks the pins; QUIC has no pin check, so a pinned probe takes H1, which does and owns its socket instead of sharing a pooled session's timeout.
+    if !foxy.pins.is_empty() {
+        let dial = crate::foxy::FoxyDial {
+            host: edge.host.clone(),
+            port: edge.port,
+            address: foxy.edge_address,
+            carrier: crate::foxy::Carrier::H1,
+            upstream: foxy.upstream.clone(),
+            roots: foxy.roots.clone(),
+            pins: foxy.pins.clone(),
+            pass,
+        };
+        let budget = budgets::carrier_probe();
+        let mut tunnel = crate::foxy::Tunnel::open(&dial, authority, None).ok()?;
+        let _ = tunnel.set_read_quantum(budget);
+        let seen = foxy_exit_country(&mut tunnel, foxy);
+        drop(tunnel);
+        return seen;
+    }
     let dial = crate::foxy::FoxyDial {
         host: edge.host.clone(),
         port: edge.port,
@@ -28060,7 +28079,9 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
             .map_or_else(|| foxy.pass.clone(), |account| account.current());
         for carrier in foxy.carrier.order() {
             // As on UDP: a silent carrier is left alone for the window, not probed per flow.
-            if foxy.carrier_unanswered(edge, carrier) {
+            if foxy.carrier_unanswered(edge, carrier)
+                || (carrier == crate::foxy::Carrier::H3 && !foxy.pins.is_empty())
+            {
                 continue;
             }
             let dial = crate::foxy::FoxyDial {
@@ -30686,7 +30707,9 @@ fn open_foxy_ip_tunnel(
             .map_or_else(|| foxy.pass.clone(), |account| account.current());
         for carrier in crate::foxy::Carrier::ip_order() {
             // As on TCP and CONNECT-UDP: a silent carrier is left alone for the window, not probed per packet.
-            if foxy.carrier_unanswered(edge, carrier) {
+            if foxy.carrier_unanswered(edge, carrier)
+                || (carrier == crate::foxy::Carrier::H3 && !foxy.pins.is_empty())
+            {
                 continue;
             }
             let dial = crate::foxy::FoxyDial {
@@ -30772,10 +30795,11 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                 continue;
             }
             if carrier == crate::foxy::Carrier::H3
-                && foxy
-                    .upstream
-                    .as_ref()
-                    .is_some_and(super::foxy::UpstreamProxy::http)
+                && (!foxy.pins.is_empty()
+                    || foxy
+                        .upstream
+                        .as_ref()
+                        .is_some_and(super::foxy::UpstreamProxy::http))
             {
                 continue;
             }

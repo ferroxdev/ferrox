@@ -13,16 +13,18 @@ const RECONNECT_MIN = 100;
 const RECONNECT_MAX = 5000;
 let reconnect = RECONNECT_MIN;
 let live = 0;
+let idle = 0;
+let busy = 0;
+let spawning = 0;
 
 function initFor(task) {
   const init = {};
   const extra = task.extra || {};
+  if (extra.cookies && Object.keys(extra.cookies).length) {
+    throw new Error("cookies cannot cross the browser dialer");
+  }
   if (extra.referrer) {
-    try {
-      const url = new URL(extra.referrer);
-      init.referrer = url.pathname + url.search + url.hash;
-      init.referrerPolicy = "unsafe-url";
-    } catch (_) {}
+    throw new Error("an external referrer cannot cross the browser dialer");
   }
   if (extra.headers) init.headers = extra.headers;
   return init;
@@ -100,7 +102,12 @@ async function run(ws, task) {
   }
 
   if (task.method === "GET" && task.streamResponse) {
-    const init = initFor(task);
+    let init;
+    try { init = initFor(task); } catch (_) {
+      try { ws.send("fail"); } catch (_) {}
+      ws.close();
+      return;
+    }
     const abort = new AbortController();
     let reader = null;
     let acknowledged = false;
@@ -135,7 +142,12 @@ async function run(ws, task) {
   }
 
   if (!task.streamResponse) {
-    const init = initFor(task);
+    let init;
+    try { init = initFor(task); } catch (_) {
+      try { ws.send("fail"); } catch (_) {}
+      ws.close();
+      return;
+    }
     init.method = task.method;
     const abort = new AbortController();
     init.signal = abort.signal;
@@ -163,13 +175,20 @@ function closed(ws) {
   if (ws.closed) return;
   ws.closed = true;
   live -= 1;
-  if (!ws.replaced) respawn();
+  if (ws.opened && !ws.consumed) idle -= 1;
+  if (ws.consumed) busy -= 1;
+  // Count every socket that can still become idle — opened, opening, or scheduled — against the idle target, so capacity freed by a closed task is filled without overfilling.
+  const want = Math.min(IDLE, LIVE_MAX - busy);
+  const potential = live - busy;
+  if (potential + spawning < want && live + spawning < LIVE_MAX) respawn();
 }
 
 function respawn() {
+  if (live + spawning >= LIVE_MAX) return;
   const wait = reconnect;
   reconnect = Math.min(reconnect * 2, RECONNECT_MAX);
-  setTimeout(connect, wait);
+  spawning += 1;
+  setTimeout(() => { spawning -= 1; connect(); }, wait);
 }
 
 function connect() {
@@ -183,14 +202,20 @@ function connect() {
   }
   live += 1;
   ws.closed = false;
+  ws.opened = false;
   ws.consumed = false;
-  ws.replaced = false;
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { reconnect = RECONNECT_MIN; };
+  ws.onopen = () => {
+    ws.opened = true;
+    if (!ws.consumed) idle += 1;
+    reconnect = RECONNECT_MIN;
+  };
   ws.onmessage = (event) => {
     if (ws.consumed) return;
+    if (ws.opened) idle -= 1;
     ws.consumed = true;
-    ws.replaced = connect();
+    busy += 1;
+    connect();
     let task;
     try {
       task = JSON.parse(event.data);
