@@ -4002,19 +4002,18 @@ impl Tls2 {
                 let mut staged = std::mem::take(&mut entry.capsule_buf);
                 let mut found = false;
                 // Every complete capsule already staged is drained before the socket is touched: a grant or a route in front of a datagram must not cost the datagram a wire read that may never come.
-                loop {
-                    let Some((used, capsule)) = connectip::capsule_split(&staged) else {
-                        break;
-                    };
+                let mut at = 0usize;
+                while let Some((used, capsule)) = connectip::capsule_split(&staged[at..]) {
+                    at += used;
                     if let connectip::Capsule::Datagram(packet) = capsule {
                         into.clear();
                         into.extend_from_slice(packet);
                         found = true;
-                    }
-                    staged.drain(..used);
-                    if found {
                         break;
                     }
+                }
+                if at > 0 {
+                    staged.drain(..at);
                 }
                 if let Some(entry) = inner.streams.get_mut(&own) {
                     entry.capsule_buf = staged;
@@ -8497,8 +8496,8 @@ pub(crate) mod loopback {
         let mut staged = Vec::new();
         connectip::route_advert_encode(
             &[connectip::Route {
-                first: [203, 0, 113, 0],
-                last: [203, 0, 113, 255],
+                first: [203, 0, 113, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                last: [203, 0, 113, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 version: 4,
                 protocol: 17,
             }],
