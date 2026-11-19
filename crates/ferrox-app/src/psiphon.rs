@@ -1411,31 +1411,6 @@ impl Inner {
             if batch.is_empty() {
                 continue;
             }
-            let lead = if std::mem::take(&mut first_batch) {
-                affinity_lead
-            } else {
-                Duration::ZERO
-            };
-            let lead = if lead.saturating_add(timeout) <= remaining {
-                lead
-            } else {
-                Duration::ZERO
-            };
-            let last_delay = lead.saturating_add(
-                self.settings
-                    .stagger
-                    .saturating_mul(u32::try_from(taken.saturating_sub(1)).unwrap_or(u32::MAX)),
-            );
-            let stagger = if last_delay.saturating_add(timeout) <= remaining {
-                self.settings.stagger
-            } else {
-                Duration::ZERO
-            };
-            let budget = if stagger.is_zero() {
-                remaining.min(timeout.saturating_add(lead))
-            } else {
-                last_delay.saturating_add(timeout).min(remaining)
-            };
             let session_id = self.session_id.clone();
             let authorizations = self.settings.authorizations.clone();
             let sponsor = self.settings.sponsor.clone();
@@ -1479,11 +1454,35 @@ impl Inner {
             } else {
                 None
             };
-            let budget = budget.min(deadline.saturating_duration_since(Instant::now()));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let lead = if std::mem::take(&mut first_batch) {
+                affinity_lead
+            } else {
+                Duration::ZERO
+            };
+            let lead = if lead.saturating_add(timeout) <= remaining {
+                lead
+            } else {
+                Duration::ZERO
+            };
+            let last_delay = lead.saturating_add(
+                self.settings
+                    .stagger
+                    .saturating_mul(u32::try_from(taken.saturating_sub(1)).unwrap_or(u32::MAX)),
+            );
+            let stagger = if last_delay.saturating_add(timeout) <= remaining {
+                self.settings.stagger
+            } else {
+                Duration::ZERO
+            };
+            let budget = if stagger.is_zero() {
+                remaining.min(timeout.saturating_add(lead))
+            } else {
+                last_delay.saturating_add(timeout).min(remaining)
+            };
             if budget.is_zero() {
                 break;
             }
-            let timeout = timeout.min(budget);
             let inproxy_prefer = self.settings.inproxy_prefer_probability;
             let inproxy_only = !self.settings.protocols.is_empty()
                 && self
@@ -1496,7 +1495,8 @@ impl Inner {
             let inproxy_api_timeout = self
                 .settings
                 .inproxy_api_timeout
-                .mul_f64(self.settings.latency.multiplier());
+                .mul_f64(self.settings.latency.multiplier())
+                .min(budget);
             let limiter = rate_limiter.clone();
             let rate_deadline = Instant::now() + budget;
             let force_remaining = Arc::clone(&inproxy_force_remaining);
@@ -1559,6 +1559,12 @@ impl Inner {
                     server.port,
                     dsl_placeholder_ttl,
                 );
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    lease.failed();
+                    return Err("psiphon: dial budget expired before the attempt".to_owned());
+                }
+                let timeout = timeout.min(left);
                 let identity = Identity {
                     session_id: &session_id,
                     authorizations: &authorizations,
