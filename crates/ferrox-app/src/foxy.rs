@@ -859,6 +859,7 @@ fn open_session(dial: &FoxyDial) -> Result<Arc<Session>, Failure> {
             streams: std::collections::HashMap::new(),
             frame: FrameState::default(),
             out: Vec::new(),
+            scratch: Vec::new(),
             gone: false,
             conn_pending: 0,
             park: None,
@@ -888,7 +889,7 @@ fn attach(
         stream,
         class,
     };
-    let mut block = std::mem::take(&mut inner.out);
+    let mut block = std::mem::take(&mut inner.scratch);
     block.clear();
     build(&mut block);
     let head = frames::H2Frame {
@@ -899,7 +900,7 @@ fn attach(
     }
     .header();
     let written = inner.tls.write_all_slices(&[&head[..], &block]);
-    inner.out = block;
+    inner.scratch = block;
     written.map_err(|_| Failure::Io)?;
     inner.tls.flush().map_err(|_| Failure::Io)?;
     inner
@@ -980,10 +981,10 @@ fn flush_credit(inner: &mut SessionInner, stream: u32) -> Result<(), Failure> {
     if stream_increment == 0 && conn_increment == 0 {
         return Ok(());
     }
-    let mut out = std::mem::take(&mut inner.out);
+    let mut out = std::mem::take(&mut inner.scratch);
     grant(stream, stream_increment, conn_increment, &mut out);
     let written = inner.tls.write_all(&out);
-    inner.out = out;
+    inner.scratch = out;
     written.map_err(|_| Failure::Io)
 }
 
@@ -1019,10 +1020,10 @@ fn credit_conn(inner: &mut SessionInner, len: usize) -> Result<(), Failure> {
     if conn_increment == 0 {
         return Ok(());
     }
-    let mut out = std::mem::take(&mut inner.out);
+    let mut out = std::mem::take(&mut inner.scratch);
     grant(0, 0, conn_increment, &mut out);
     let written = inner.tls.write_all(&out);
-    inner.out = out;
+    inner.scratch = out;
     written.map_err(|_| Failure::Io)
 }
 
@@ -1269,8 +1270,10 @@ struct SessionInner {
     streams: std::collections::HashMap<u32, Stream>,
     /// The frame in flight off the wire, and the stream it belongs to.
     frame: FrameState,
-    /// The frame this session writes, reused so a relay allocates nothing per frame.
+    /// The body of a frame off the wire: a frame that cannot go straight into its caller's buffer stages here, and a read that stops mid-body leaves the arrived bytes here for the next read to resume.
     out: Vec<u8>,
+    /// The frames this session writes outside a read — a CONNECT request and a credit grant — reused so a relay allocates nothing per frame, and kept apart from `out` so a write cannot overwrite a payload a paused read is still holding.
+    scratch: Vec<u8>,
     /// The session answered with a reset, a `GOAWAY`, or a broken frame: it can carry no flow further and is never lent again.
     gone: bool,
     /// The bytes the edge has sent into the connection's granted window that the session has taken but not yet granted back, over every stream: the connection's own credit is owed once, whatever stream the bytes arrived on.
@@ -3860,20 +3863,19 @@ impl Tls2 {
         let mut at = 0usize;
         let send_by = Instant::now() + HEADER_TIMEOUT;
         while at < request.len() {
-            let frame = {
-                let inner = self.inner()?;
-                let max = inner.max_frame;
-                foxy::flow::frame_size(request.len() - at, max)
-                    .min(stream_spend(&inner, self.stream))
-            };
+            // Selecting a frame and spending its credit is one decision: two lanes on one session each read the same last byte of connection credit, and a split between the look and the charge lets both spend it.
+            let mut inner = self.inner()?;
+            let max = inner.max_frame;
+            let frame = foxy::flow::frame_size(request.len() - at, max)
+                .min(stream_spend(&inner, self.stream));
             if frame == 0 {
+                drop(inner);
                 if Instant::now() >= send_by {
                     return Err(Failure::Stream);
                 }
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
             }
-            let mut inner = self.inner()?;
             charge_stream(&mut inner, self.stream, frame);
             let frame = frame as usize;
             let header = frames::H2Frame {
@@ -3901,7 +3903,7 @@ impl Tls2 {
         // The request rides the capsule stream inside DATA frames, the way a packet does: raw TLS bytes would desynchronise the edge's frame walk.
         self.send_capsules(&request)?;
 
-        let deadline = Instant::now() + HEADER_TIMEOUT;
+        let deadline = Instant::now() + crate::budgets::head_arrival();
         let mut assigned = None;
         while Instant::now() < deadline {
             let own = self.stream;
@@ -3968,7 +3970,20 @@ impl Tls2 {
             let read = self.with_frame(&mut [], |inner, frame, payload, _| {
                 stage_address(inner, frame, payload)
             });
-            read??;
+            match read {
+                Ok(staged) => {
+                    staged?;
+                }
+                // Another lane can leave a grain of read timeout on the shared socket; the frame's arrived bytes stay in `FrameState`, so the next turn of this loop resumes it under the same deadline rather than failing the open.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(assigned)
     }
@@ -3986,13 +4001,19 @@ impl Tls2 {
                 };
                 let mut staged = std::mem::take(&mut entry.capsule_buf);
                 let mut found = false;
-                if let Some((used, capsule)) = connectip::capsule_split(&staged) {
+                // Every complete capsule already staged is drained before the socket is touched: a grant or a route in front of a datagram must not cost the datagram a wire read that may never come.
+                let mut at = 0usize;
+                while let Some((used, capsule)) = connectip::capsule_split(&staged[at..]) {
+                    at += used;
                     if let connectip::Capsule::Datagram(packet) = capsule {
                         into.clear();
                         into.extend_from_slice(packet);
                         found = true;
+                        break;
                     }
-                    staged.drain(..used);
+                }
+                if at > 0 {
+                    staged.drain(..at);
                 }
                 if let Some(entry) = inner.streams.get_mut(&own) {
                     entry.capsule_buf = staged;
@@ -6065,7 +6086,7 @@ pub(crate) mod loopback {
                 panic!("an h2 lane");
             };
             let inner = lane.test_inner();
-            (inner.out.as_ptr(), inner.out.capacity())
+            (inner.scratch.as_ptr(), inner.scratch.capacity())
         };
         assert!(
             capacity >= frames::H2_HEADER,
@@ -6077,14 +6098,53 @@ pub(crate) mod loopback {
         };
         let inner = lane.test_inner();
         assert_eq!(
-            inner.out.as_ptr(),
+            inner.scratch.as_ptr(),
             base,
             "the second open moved the session's write scratch"
         );
         assert_eq!(
-            inner.out.capacity(),
+            inner.scratch.capacity(),
             capacity,
             "the second open grew the session's write scratch"
+        );
+    }
+
+    /// A grant is written through the session's write scratch, not through `out`: a read that stopped inside a frame leaves its arrived bytes in `out`, and a grant that cleared them would resume the frame at a corrupt offset.
+    #[test]
+    fn a_credit_grant_leaves_a_paused_frame_body_alone() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _edge = h2_session_edge(listener, server, std::sync::Arc::clone(&accepts));
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "one.test:80", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        let partial: Vec<u8> = (0..97u8).collect();
+        {
+            let mut inner = lane.test_inner();
+            inner.out.clear();
+            inner.out.extend_from_slice(&partial);
+            inner.frame.payload_at = partial.len();
+            inner
+                .streams
+                .get_mut(&lane.stream)
+                .expect("the lane's stream")
+                .pending_credit = CREDIT_FLOOR;
+        }
+        lane.flush_credit().expect("grants the held credit");
+        let inner = lane.test_inner();
+        assert_eq!(
+            inner.out.as_slice(),
+            partial.as_slice(),
+            "the grant cleared a frame body a read had paused inside"
+        );
+        assert_eq!(
+            inner.frame.payload_at,
+            partial.len(),
+            "the grant reset a paused read's cursor"
         );
     }
 
@@ -7448,7 +7508,7 @@ pub(crate) mod loopback {
         edge.join().expect("the edge finishes");
     }
 
-    /// A byte-level test cannot see a copy, so capacity is the witness: `out` is the write buffer and `carry` the read one, and a lane that stages a payload before handing it over has grown the buffer it staged in.
+    /// A byte-level test cannot see a copy, so capacity is the witness: `scratch` is the write buffer and `carry` the read one, and a lane that stages a payload before handing it over has grown the buffer it staged in.
     #[test]
     fn a_relayed_byte_is_copied_once_on_its_way_through_the_lane() {
         const BIG: usize = 40 * 1024;
@@ -7463,7 +7523,7 @@ pub(crate) mod loopback {
             panic!("an h2 lane");
         };
         let sent: Vec<u8> = (0..BIG).map(|i| (i % 251) as u8).collect();
-        let staged = lane.test_inner().out.capacity();
+        let staged = lane.test_inner().scratch.capacity();
         let mut wrote = 0usize;
         while wrote < sent.len() {
             match lane.write(&sent[wrote..]) {
@@ -7474,7 +7534,7 @@ pub(crate) mod loopback {
         }
         lane.flush().expect("flushes");
         assert_eq!(
-            lane.test_inner().out.capacity(),
+            lane.test_inner().scratch.capacity(),
             staged,
             "the payload went into the record, not into a staging buffer"
         );
@@ -8421,6 +8481,88 @@ pub(crate) mod loopback {
         edge.join().expect("joins");
     }
 
+    /// A route capsule staged in front of a packet does not cost that packet a wire read: every complete capsule already in the stream's buffer is drained before the socket is touched, so the packet behind a route is handed over even when the edge sends nothing more.
+    #[test]
+    fn a_staged_route_does_not_delay_the_packet_behind_it() {
+        let (roots, server) = minted(b"\x68\x32");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = ip_h2_quiet_edge(listener, server);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let (mut lane, assigned) = Ip::open(&dial, None).expect("opens");
+        assert_eq!(assigned.expect("an address").bytes(), &[198, 51, 100, 9]);
+        lane.set_read_quantum(Duration::from_millis(20))
+            .expect("bounds one read");
+        let mut staged = Vec::new();
+        connectip::route_advert_encode(
+            &[connectip::Route {
+                first: [203, 0, 113, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                last: [203, 0, 113, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                version: 4,
+                protocol: 17,
+            }],
+            &mut staged,
+        );
+        connectip::packet_encode(b"behind a route", &mut staged);
+        let Ip::H2(inner) = &mut lane else {
+            unreachable!("an h2 dial opens an h2 lane");
+        };
+        inner.test_stream(|stream| stream.capsule_buf.extend_from_slice(&staged));
+        let mut packet = Vec::new();
+        assert!(
+            lane.read(&mut packet).expect("reads"),
+            "a packet behind a staged route"
+        );
+        assert_eq!(packet.as_slice(), b"behind a route");
+        drop(lane);
+        join_edge_within(edge, Duration::from_secs(5));
+    }
+
+    /// An assignment slower than the socket's grain still opens the tunnel: a pooled session may carry another lane's short read timeout, and the first timeout is a pause the frame resumes from, not the open's answer.
+    #[test]
+    fn an_assignment_later_than_the_socket_timeout_still_opens() {
+        let (roots, server) = minted(b"\x68\x32");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = ip_h2_delayed_edge(listener, server, Duration::from_millis(80));
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let (mut first, assigned) = Ip::open(&dial, None).expect("opens");
+        assert!(assigned.is_some(), "the first tunnel owns an address");
+        first
+            .set_read_quantum(Duration::from_millis(1))
+            .expect("arms the session's grain");
+        let (second, assigned) =
+            Ip::open(&dial, None).expect("the second open outlasts a grain of read timeout");
+        assert!(assigned.is_some(), "the second tunnel owns an address");
+        drop(second);
+        drop(first);
+        join_edge_within(edge, Duration::from_secs(5));
+    }
+
+    /// An assignment the edge never sends costs the open its configured head budget, not the constant: the retry added for a shared socket's grain must not stretch a short budget back to twenty seconds.
+    #[test]
+    fn an_unanswered_assignment_costs_the_open_its_head_budget() {
+        let root = crate::json::parse(r#"{"budgets": {"headArrival": "300ms"}}"#).expect("parses");
+        crate::budgets::apply(&crate::config::budgets(&root).expect("a name the engine acts on"));
+        let (roots, server) = minted(b"\x68\x32");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = ip_h2_unassigned_edge(listener, server);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let at = Instant::now();
+        let opened = Ip::open(&dial, None);
+        crate::budgets::clear();
+        let took = at.elapsed();
+        assert!(
+            took < Duration::from_secs(5),
+            "the head budget expired the assignment, it took {took:?}"
+        );
+        let (lane, assigned) = opened.expect("the status arrived");
+        assert!(assigned.is_none(), "no address was assigned");
+        drop(lane);
+        join_edge_within(edge, Duration::from_secs(5));
+    }
+
     /// The packet a datagram is built in is the lane's own buffer, and it stays that buffer: across a push and a drain the base pointer does not move and the capacity does not grow. A byte-level test passes with the copy and without it, so only the pointer can witness that the packet was not built in a buffer of its own.
     #[test]
     fn the_packet_scratch_is_the_lanes_own_buffer_and_it_stays_there() {
@@ -8753,14 +8895,203 @@ pub(crate) mod loopback {
         })
     }
 
+    /// A CONNECT-IP edge that answers the open and assigns an address, then holds the socket without sending another frame: the lane's next packet must come from what it already staged.
+    fn ip_h2_quiet_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let socket = stream.try_clone().expect("clones");
+            stream
+                .set_read_timeout(Some(crate::budgets::handshake()))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            socket
+                .set_read_timeout(Some(crate::budgets::RELAY_QUANTUM))
+                .expect("times out");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let Some(frame) = frames::H2Frame::parse(&header) else {
+                    return;
+                };
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frames::h2_event(frame, &payload, 1) {
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::H2Event::Headers { .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut out);
+                        tls.write_all(&out).expect("answers");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            ip_h2_assign(&mut tls);
+            // The assignment is the last frame: a lane that waits on the socket for the packet it already has loses it.
+            std::thread::sleep(Duration::from_millis(250));
+        })
+    }
+
     /// The assignment a CONNECT-IP edge answers with: one address the tunnel owns, flushed so the lane's first read finds it.
     fn ip_h2_assign(tls: &mut ferrox_core::tls::RustlsServerProvider<Connection>) {
+        ip_h2_assign_on(tls, 1);
+    }
+
+    /// The same assignment on the stream that asked for it: a second tunnel on a pooled session owns its own address on its own stream.
+    fn ip_h2_assign_on(tls: &mut ferrox_core::tls::RustlsServerProvider<Connection>, stream: u32) {
         let mut capsule = Vec::new();
         connectip::address_assign_encode(&[ip_tunnel_grant()], &mut capsule);
         let mut frame = Vec::new();
-        h2_frame(frames::DATA, 0, 1, &capsule, &mut frame);
+        h2_frame(frames::DATA, 0, stream, &capsule, &mut frame);
         tls.write_all(&frame).expect("assigns an address");
         tls.flush().expect("flushes the assignment");
+    }
+
+    /// A CONNECT-IP edge that assigns on the first open at once and on the second only after a pause longer than the socket's grain: a lane that gives up on its first timeout never sees the second assignment.
+    fn ip_h2_delayed_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        delay: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let socket = stream.try_clone().expect("clones");
+            stream
+                .set_read_timeout(Some(crate::budgets::handshake()))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            socket
+                .set_read_timeout(Some(crate::budgets::RELAY_QUANTUM))
+                .expect("times out");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            let mut opened = 0usize;
+            while opened < 2 {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let Some(frame) = frames::H2Frame::parse(&header) else {
+                    return;
+                };
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frames::h2_event(frame, &payload, frame.stream) {
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::H2Event::Headers { .. } => {
+                        let stream = frame.stream;
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x4, stream, &[0x88], &mut out);
+                        tls.write_all(&out).expect("answers");
+                        if opened == 1 {
+                            std::thread::sleep(delay);
+                        }
+                        ip_h2_assign_on(&mut tls, stream);
+                        opened += 1;
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        })
+    }
+
+    /// A CONNECT-IP edge that answers the open and then withholds the assignment, holding the session open: the wait must end at the head budget that bounds every other open read.
+    fn ip_h2_unassigned_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let socket = stream.try_clone().expect("clones");
+            stream
+                .set_read_timeout(Some(crate::budgets::handshake()))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            socket
+                .set_read_timeout(Some(crate::budgets::RELAY_QUANTUM))
+                .expect("times out");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let Some(frame) = frames::H2Frame::parse(&header) else {
+                    return;
+                };
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frames::h2_event(frame, &payload, 1) {
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::H2Event::Headers { .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut out);
+                        tls.write_all(&out).expect("answers");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // The assignment never comes, and the pooled session outlives the lane, so the wait ends on the lane's own reset (or a backstop past the head budget): a lane that stops reading on the first timeout is not what this edge is testing.
+            let hold = Instant::now() + Duration::from_secs(6);
+            while Instant::now() < hold {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let Some(frame) = frames::H2Frame::parse(&header) else {
+                    return;
+                };
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if frame.stream == 1
+                    && (frame.kind == frames::RST_STREAM || frame.kind == frames::GOAWAY)
+                {
+                    return;
+                }
+            }
+        })
     }
 
     /// The one grant both CONNECT-IP edges answer with: the tunnel's own RFC 1918-ish address, request id one, `198.51.100.9/32`.
@@ -8867,11 +9198,11 @@ pub(crate) mod loopback {
             assert!(text.contains(field), "missing {field}");
         }
         // A byte-level echo cannot see a staging copy, so capacity is the witness on the write side: reset the pooled write buffer, write one datagram, and the buffer a stage would have grown must still be empty.
-        lane.test_inner().out = Vec::new();
+        lane.test_inner().scratch = Vec::new();
         lane.write_datagram(b"hello udp").expect("writes");
         lane.flush().expect("flushes");
         assert_eq!(
-            lane.test_inner().out.capacity(),
+            lane.test_inner().scratch.capacity(),
             0,
             "the datagram's payload went into the record, not into a staging buffer"
         );
