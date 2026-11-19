@@ -3641,6 +3641,9 @@ where
 {
     tls.get_ref()
         .inner()
+        .set_relay_write_timeout(Some(IO_TIMEOUT))?;
+    tls.get_ref()
+        .inner()
         .set_relay_read_timeout(Some(TLS_POLL))?;
     peer.set_read_timeout(Some(TLS_POLL))?;
     peer.set_write_timeout(Some(IO_TIMEOUT))?;
