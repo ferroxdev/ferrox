@@ -14747,9 +14747,7 @@ fn xdrive_relay_until(app: &Connection, mut down: crate::xdrive::Conn, response_
                 }
             }
         }
-        if wrote {
-            let _ = up.end_write();
-        } else {
+        if !wrote || up.end_write().is_err() {
             up.abort();
         }
     });

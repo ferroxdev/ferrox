@@ -1549,6 +1549,7 @@ fn seal_all(
 
 struct ServerUdp {
     window: shadowsocks2022::SlidingWindow,
+    seen: Instant,
     cipher: Option<Cipher>,
     user: Option<usize>,
     server_session: u64,
@@ -1748,6 +1749,7 @@ impl Datagrams {
             }
             let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
                 window: shadowsocks2022::SlidingWindow::new(),
+                seen: Instant::now(),
                 cipher: None,
                 user: None,
                 server_session: 0,
@@ -1757,6 +1759,7 @@ impl Datagrams {
             if !entry.window.check_and_add(packet_id) {
                 return None;
             }
+            entry.seen = Instant::now();
             let (target, used) = parse_addr_header(&body[11 + pad..])?;
             if body.len() < 11 + pad + used {
                 return None;
@@ -1783,6 +1786,7 @@ impl Datagrams {
             let len = authenticate_body(&cipher, &nonce, &mut packet[16..])?;
             let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
                 window: shadowsocks2022::SlidingWindow::new(),
+                seen: Instant::now(),
                 cipher: None,
                 user: None,
                 server_session: 0,
@@ -1792,6 +1796,7 @@ impl Datagrams {
             if !entry.window.check_and_add(packet_id) {
                 return None;
             }
+            entry.seen = Instant::now();
             let (target, total) = parse_body(&packet[16..16 + len], 11, 0)?;
             self.sessions
                 .get_mut(&session)?
@@ -1832,6 +1837,7 @@ impl Datagrams {
         let len = authenticate_body(&cipher, &nonce, &mut packet[32..])?;
         let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
             window: shadowsocks2022::SlidingWindow::new(),
+            seen: Instant::now(),
             cipher: None,
             user: None,
             server_session: 0,
@@ -1846,6 +1852,7 @@ impl Datagrams {
         if !entry.window.check_and_add(packet_id) {
             return None;
         }
+        entry.seen = Instant::now();
         if entry.user.is_none() {
             entry.user = Some(idx);
         }
@@ -1882,6 +1889,7 @@ impl Datagrams {
                 .entry(client_session)
                 .or_insert_with(|| ServerUdp {
                     window: shadowsocks2022::SlidingWindow::new(),
+                    seen: Instant::now(),
                     cipher: None,
                     user: None,
                     server_session: 0,
@@ -2413,9 +2421,10 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
         let live: HashSet<u64> = upstreams.keys().map(|(session, _)| *session).collect();
         clients_of.retain(|session, _| live.contains(session));
         users.retain(|session, _| live.contains(session));
-        datagrams
-            .sessions
-            .retain(|session, _| live.contains(session));
+        let replay_ttl = Duration::from_secs(SKEW * 2);
+        datagrams.sessions.retain(|session, entry| {
+            live.contains(session) || now.saturating_duration_since(entry.seen) < replay_ttl
+        });
     }
 }
 

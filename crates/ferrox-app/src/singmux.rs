@@ -849,13 +849,7 @@ impl Inner {
                 .is_some_and(|sender| sender.try_send(id).is_err());
             if failed {
                 drop(resets);
-                let inner = self.clone_handle();
-                let spawned = std::thread::Builder::new()
-                    .name("singmux-reset".to_owned())
-                    .spawn(move || inner.send_reset(id));
-                if spawned.is_err() {
-                    self.send_reset(id);
-                }
+                self.finish();
             }
             return;
         }
@@ -873,7 +867,7 @@ impl Inner {
             });
         if spawned.is_err() {
             drop(resets);
-            self.send_reset(id);
+            self.finish();
             return;
         }
         *resets = Some(sender.clone());

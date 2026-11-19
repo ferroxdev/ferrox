@@ -4744,7 +4744,8 @@ impl Read for QuicStream {
             if Instant::now() >= deadline {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
-            std::thread::sleep(STREAM_POLL);
+            let left = deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(STREAM_POLL.min(left));
         }
     }
 }

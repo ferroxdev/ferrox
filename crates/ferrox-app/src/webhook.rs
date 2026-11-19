@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +19,36 @@ const BUDGET: Duration = Duration::from_secs(5);
 
 /// One notifier's POST threads, capped because each is an OS thread held for up to [`BUDGET`].
 const MAX_IN_FLIGHT: usize = 32;
+
+static RESOLVERS: AtomicUsize = AtomicUsize::new(0);
+
+struct ResolverSlot;
+
+impl ResolverSlot {
+    fn acquire() -> Option<Self> {
+        let mut workers = RESOLVERS.load(Ordering::Relaxed);
+        loop {
+            if workers >= MAX_IN_FLIGHT {
+                return None;
+            }
+            match RESOLVERS.compare_exchange_weak(
+                workers,
+                workers + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(current) => workers = current,
+            }
+        }
+    }
+}
+
+impl Drop for ResolverSlot {
+    fn drop(&mut self) {
+        RESOLVERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// What a stage still has to spend, floored at a millisecond because `std` refuses a zero wait.
 fn left(deadline: Instant) -> Duration {
@@ -338,14 +369,20 @@ impl Webhook {
         let mut last = format!("{} resolved to no address", url.host);
         let host = url.host.clone();
         let port = url.port;
+        let slot = ResolverSlot::acquire()
+            .ok_or_else(|| "webhook resolution workers are saturated".to_owned())?;
         let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = sender.send(
-                (host.as_str(), port)
-                    .to_socket_addrs()
-                    .map(Iterator::collect::<Vec<_>>),
-            );
-        });
+        std::thread::Builder::new()
+            .name("webhook-dns".to_owned())
+            .spawn(move || {
+                let _slot = slot;
+                let _ = sender.send(
+                    (host.as_str(), port)
+                        .to_socket_addrs()
+                        .map(Iterator::collect::<Vec<_>>),
+                );
+            })
+            .map_err(|error| format!("cannot start webhook resolution: {error}"))?;
         let resolved = receiver
             .recv_timeout(left(deadline))
             .map_err(|_| format!("{} resolution ran past the webhook budget", url.host))?;
@@ -591,7 +628,16 @@ fn redirect_url(base: &HttpUrl, location: &str) -> Result<String, String> {
             base.authority, base.path, location
         ));
     }
-    if location.contains("://") {
+    let absolute = location.split_once("://").is_some_and(|(scheme, _)| {
+        scheme
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic())
+            && scheme
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    });
+    if absolute {
         return Ok(location.to_owned());
     }
     if location.starts_with("//") {

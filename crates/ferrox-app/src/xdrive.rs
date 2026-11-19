@@ -1047,14 +1047,11 @@ impl Pool {
     }
 
     /// Wait for every promised job, giving up if the lane ends underneath: a relay tearing down has no reader left to wait for.
-    fn wait_settled(&self, wake: &Wake) -> bool {
+    fn wait_settled(&self) -> bool {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         for _ in 0..DRAIN_TRIES {
             if queue.left == 0 {
                 return true;
-            }
-            if wake.stopped() {
-                return false;
             }
             census!("xdrive-drain", crate::census::NO_FD, Some(DRAIN_WAIT));
             let (guard, _timeout) = self
@@ -1409,7 +1406,7 @@ impl Writer {
         self.ticker.done.store(true, Ordering::Release);
         Clock::global().wakeup();
         self.uploads.shut();
-        if !self.uploads.wait_settled(&self.sink.wake) {
+        if !self.uploads.wait_settled() {
             self.uploads.abort();
             return Err(carrier_error(
                 "the store stopped answering the last segments".to_owned(),
