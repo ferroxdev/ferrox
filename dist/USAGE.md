@@ -11,13 +11,12 @@ Two things were built here, from the same release binary — a release package f
 | the Windows CLI | `ferrox-cli.exe` — the same commands natively; `--vpn` uses the Windows system proxy |
 | the Windows wrapper | `ferrox-cli.cmd` — forwards `cmd.exe` arguments to `ferrox-cli.exe` |
 | the Windows fallback | `ferrox-cli.sh` — Git Bash only, with Python 3 and curl on `PATH` |
-| the app | `dist/Ferrox.app` — the same CLI behind a double-click |
 
 In a source checkout `ferrox-cli.sh` uses the release binary when one exists, otherwise the dev binary the test build already produced, because a release link is minutes and a dev build is seconds. Set `FERROX_PROFILE=release` when you want the measured binary.
 
 On Windows the native launcher keeps config and account files under `%APPDATA%\ferrox` and pid/log/system-proxy state under `%LOCALAPPDATA%\ferrox`, owner-only through NTFS ACLs. Every `~/.config/ferrox` path on this page describes macOS and Linux.
 
-`ferrox-cli.sh`, this page and `README.md` are tracked so the release job can ship them; everything else under `dist/` — the bundle, its build script, any lane config — stays git-ignored, and so does every file that carries an account.
+`ferrox-cli.sh`, this page and `README.md` are tracked so the release job can ship them; everything else under `dist/` — any locally built bundle or lane config — stays git-ignored, and so does every file that carries an account.
 
 ## 1. The account
 
@@ -165,23 +164,18 @@ The vless converter writes `tcp`, `ws`, `grpc`, `httpupgrade` and `xhttp`, with 
 
 A config file can carry any inbound the binary serves — `vless`, `vmess`, `trojan`, `shadowsocks`, `hysteria`, `socks`, `http`, `mixed` — and any outbound — those plus `foxy`, `veepn`, `psiphon`, `http` and `freedom`.
 
-## 6. The app
+## 6. Build from a checkout
+
+The release package already carries `ferrox-app`; a checkout builds it:
 
 ```bash
-open dist/Ferrox.app
+cargo build --release -p ferrox-app
+./dist/ferrox-cli.sh version
 ```
 
-Double-clicking it opens a Terminal window with a menu: connect the Foxy or VeePN lane with the system proxy or ports-only, change the ports, another lane, status, the port map, the TUN explanation, stop. Closing the window stops the lane.
+The shell launcher builds a dev binary on first use when none exists; set `FERROX_PROFILE=release` to build or select the measured one.
 
-Drag `dist/Ferrox.app` to `/Applications` to keep it. It is ad-hoc signed, so the first launch may need right-click > Open.
-
-## 7. Rebuild
-
-```bash
-./dist/build-macos-app.sh        # binary + CLI + connect script into the bundle
-```
-
-## 8. When it does not work
+## 7. When it does not work
 
 | symptom | cause |
 | --- | --- |

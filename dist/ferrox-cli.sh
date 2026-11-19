@@ -49,11 +49,16 @@ resolve_bin() {
   done
   cargo_target="$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps 2>/dev/null | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -1)"
   cargo_target="${cargo_target:-$ROOT/target}"
-  case "${FERROX_PROFILE:-release}" in
-    release) profiles=(release debug) ;;
-    debug) profiles=(debug release) ;;
-    *) die "FERROX_PROFILE must be debug or release, not '$FERROX_PROFILE'" ;;
-  esac
+  if [ -n "${FERROX_PROFILE:-}" ]; then
+    case "$FERROX_PROFILE" in
+      release|debug) profiles=("$FERROX_PROFILE") ;;
+      *) die "FERROX_PROFILE must be debug or release, not '$FERROX_PROFILE'" ;;
+    esac
+  elif [ "${FERROX_RELEASE:-0}" = 1 ]; then
+    profiles=(release)
+  else
+    profiles=(release debug)
+  fi
   for dir in "${profiles[@]}"; do
     [ -x "$cargo_target/$dir/ferrox-app" ] && { BIN="$cargo_target/$dir/ferrox-app"; return 0; }
   done
@@ -417,9 +422,14 @@ resolve_real() {
 }
 
 credentials_inside_repo() {
-  local real root
-  root="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  local real dir root
   real="$(resolve_real "$CREDS")"
+  dir="$(dirname "$real")"
+  while [ ! -d "$dir" ]; do
+    [ "$dir" = / ] && return 1
+    dir="$(dirname "$dir")"
+  done
+  root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
   root="$(resolve_real "$root")"
   case "$real" in "$root"/*) return 0 ;; esac
   return 1
@@ -437,16 +447,23 @@ action_login() {
     printf 'password (hidden, not echoed): ' && read -rs pass && printf '\n'
   fi
   [ -n "$email" ] && [ -n "$pass" ] || die "an account is an email and a password"
-  mkdir -p "$CONF_DIR"
+  local cred_dir tmp
+  cred_dir="$(dirname "$CREDS")"
+  mkdir -p "$CONF_DIR" || die "cannot create $CONF_DIR; the saved session was kept."
   chmod 700 "$CONF_DIR" 2>/dev/null || true
+  if [ "$cred_dir" != "$CONF_DIR" ]; then
+    mkdir -p "$cred_dir" || die "cannot create $cred_dir; the saved session was kept."
+  fi
+  tmp="$CREDS.tmp.$$"
   (
     umask 077
     {
       printf "FOXY_EMAIL=%s\n" "$(shell_quote "$email")"
       printf "FOXY_PASS=%s\n" "$(shell_quote "$pass")"
-    } >"$CREDS"
-  )
-  chmod 600 "$CREDS"
+    } >"$tmp"
+  ) || { rm -f "$tmp"; die "cannot write $CREDS; the saved session was kept."; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; die "cannot set owner-only mode on $CREDS; the saved session was kept."; }
+  mv -f "$tmp" "$CREDS" || { rm -f "$tmp"; die "cannot replace $CREDS; the saved session was kept."; }
   # A login is the user asking for this account now: the grant the last one left is not the one to resume.
   rm -f "$TOKEN_FILE"
   if [ "${LOGIN_QUIET:-0}" != 1 ]; then
@@ -1919,7 +1936,7 @@ system_proxy_on() {
   done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
   [ "$any" = 1 ] || { system_proxy_off; say "no network service took the proxy" >&2; return 1; }
   printf '%s %s\n' "${want_socks:--}" "${want_http:--}" > "$PROXY_PORTS"
-  printf '%s\n' "$CONF_DIR" > "$PROXY_OWNER"
+  printf '%s\n' "$PID_FILE" > "$PROXY_OWNER"
   readback="$(scutil --proxy 2>/dev/null)" || readback=""
   bad=""
   proxy_readback_has "$readback" ProxyAutoConfigEnable 0 || bad="PAC"
@@ -1962,7 +1979,7 @@ proxy_field() {
 # The loopback ports a lane of this config dir can own: its marker, the inbounds
 # of its served config, and the three defaults a lane with neither still uses.
 proxy_owned_ports() {
-  local ports=" $SOCKS_PORT $HTTP_PORT $MIXED_PORT " first="" second="" file from_config port
+  local ports=" " first="" second="" file from_config port from_lane=0
   if [ -r "$PROXY_PORTS" ]; then
     read -r first second < "$PROXY_PORTS" || true
     for port in "$first" "$second"; do
@@ -1984,15 +2001,23 @@ for inbound in document.get("inbounds", []):
             print(port)
 PY
 )" || from_config=""
-    for port in $from_config; do ports="$ports$port "; done
+    for port in $from_config; do ports="$ports$port "; from_lane=1; done
   fi
+  [ "$from_lane" = 1 ] || ports=" $SOCKS_PORT $HTTP_PORT $MIXED_PORT "
   printf '%s' "$ports"
 }
 
 system_proxy_off() {
-  local svc kind get set line enabled server port owned failed=0 cleared=0 restored=0
-  local pac_on pac_url auto_on bypass
+  local svc kind get set line enabled server port owned owner_pidfile failed=0 cleared=0 restored=0
+  local pac_on pac_url auto_on bypass force="${1:-0}"
   owned="$(proxy_owned_ports)"
+  if [ "$force" != 1 ] && owner_pidfile="$(proxy_owner_pidfile)"; then
+    if lane_running_at "$owner_pidfile" &&
+       [ "$(resolve_real "$owner_pidfile")" != "$(resolve_real "$PID_FILE")" ]; then
+      say "system proxy: owned by the lane at $owner_pidfile; leaving it armed." >&2
+      return 0
+    fi
+  fi
   if ! command -v networksetup >/dev/null 2>&1; then
     rm -f "$PROXY_PORTS" "$PROXY_STATE" "$PROXY_OWNER"
     return 0
@@ -2118,19 +2143,26 @@ lane_pid_runs() {
   return 1
 }
 
-lane_running_in() {
-  local dir="$1" pidfile="$1/lane.pid" pid
+lane_running_at() {
+  local pidfile="$1" pid
   [ -f "$pidfile" ] || return 1
   pid="$(cat "$pidfile" 2>/dev/null || true)"
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
+proxy_owner_pidfile() {
+  local owner
+  owner="$(cat "$PROXY_OWNER" 2>/dev/null || true)"
+  [ -n "$owner" ] || return 1
+  [ -d "$owner" ] && owner="$owner/lane.pid"
+  printf '%s\n' "$owner"
+}
+
 reconcile_stale_proxy() {
   lane_running && return 0
-  local owner=""
-  if [ -r "$PROXY_OWNER" ]; then
-    owner="$(cat "$PROXY_OWNER" 2>/dev/null || true)"
-    [ -n "$owner" ] && lane_running_in "$owner" && return 0
+  local owner_pidfile
+  if owner_pidfile="$(proxy_owner_pidfile)" && lane_running_at "$owner_pidfile"; then
+    return 0
   fi
   # A marker left by a lane that is not alive is a dead arm: restore it before
   # anything else, whether or not the services still show the endpoint.
@@ -2553,7 +2585,7 @@ stop_all_lanes() {
   done
   INSTANCE=""
   apply_instance
-  system_proxy_off || rc=1
+  system_proxy_off 1 || rc=1
   rm -f "$LANES_FILE" "$PROXY_OWNER"
   CONF_DIR="$saved_conf"
   INSTANCE="$saved_instance"
@@ -3213,7 +3245,7 @@ require_bin() {
   # measured binary.
   if [ -f "$ROOT/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
     profile="${FERROX_PROFILE:-debug}"
-    [ "${FERROX_RELEASE:-0}" = 1 ] && profile=release
+    if [ -z "${FERROX_PROFILE:-}" ] && [ "${FERROX_RELEASE:-0}" = 1 ]; then profile=release; fi
     case "$profile" in
       release)
         say "building ferrox-app (release; minutes, not seconds)..."
