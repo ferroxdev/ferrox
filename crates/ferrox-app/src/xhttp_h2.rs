@@ -2277,7 +2277,9 @@ fn request_block(host: &str, settings: &XhttpSettings, scheme: &str) -> Vec<u8> 
             _ => {}
         }
     }
-    crate::h2::push_header(&mut out, "referer", &referer);
+    if !crate::xhttp::padding_is_referer(settings) {
+        crate::h2::push_header(&mut out, "referer", &referer);
+    }
     crate::h2::push_header(&mut out, "content-type", "application/octet-stream");
     out
 }
@@ -3920,10 +3922,12 @@ mod tests {
                 _ => {}
             }
         }
-        fields.push((
-            "referer".to_owned(),
-            crate::xhttp::referer_value(host, settings),
-        ));
+        if !crate::xhttp::padding_is_referer(settings) {
+            fields.push((
+                "referer".to_owned(),
+                crate::xhttp::referer_value(host, settings),
+            ));
+        }
         fields.push((
             "content-type".to_owned(),
             "application/octet-stream".to_owned(),
@@ -3981,6 +3985,26 @@ mod tests {
             staged_request_block("example.test", &settings, "https"),
             "queryInHeader carries the delimiter query_param reads"
         );
+    }
+
+    #[test]
+    fn referer_padding_header_keeps_a_single_referer_field() {
+        let mut settings = XhttpSettings::stream_one();
+        settings.x_padding_obfs = true;
+        settings.x_padding_method = crate::xhttp::PadMethod::RepeatX;
+        settings.x_padding_bytes = (8, 8);
+        settings.x_padding_header = "Referer".to_owned();
+        for placement in [
+            crate::xhttp::Placement::Header,
+            crate::xhttp::Placement::QueryInHeader,
+        ] {
+            settings.x_padding_placement = placement;
+            assert_eq!(
+                request_block("example.test", &settings, "https"),
+                staged_request_block("example.test", &settings, "https"),
+                "{placement:?} keeps the pad in the referer the hub reads"
+            );
+        }
     }
 
     #[test]

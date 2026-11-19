@@ -2364,6 +2364,10 @@ impl WarpOut {
             return Ok(Self::unbuilt(&spec));
         };
         let inner_identity = resolve_for_mode(&mut spec, &mut identity, test)?;
+        if test && spec.mode == Mode::Gool {
+            validate_gool(&identity, &spec)?;
+            return Ok(Self::unbuilt(&spec));
+        }
         let wireguard = if matches!(
             spec.mode,
             Mode::Masque | Mode::Gool | Mode::GoolClassic | Mode::Mim
@@ -2629,6 +2633,21 @@ fn build_wireguard(
 fn build_masque(identity: &Identity, spec: &WarpSpec) -> Result<crate::masque::MasqueOut, String> {
     let outbound = masque_outbound(identity, spec)?;
     crate::masque::MasqueOut::new(&outbound)
+}
+
+/// The test dial validates both halves without binding the forwarder `GoolOut::new` opens.
+fn validate_gool(identity: &Identity, spec: &WarpSpec) -> Result<(), String> {
+    if identity.masque.is_none() {
+        return Err("warp gool: the identity has no MASQUE key".to_owned());
+    }
+    let inner = spec.gool_identity_in(true)?;
+    let _ = build_masque(identity, spec)?;
+    let remote = spec.gool.peer.unwrap_or(inner.wireguard.endpoint);
+    let settings =
+        wireguard_settings_with_endpoint(&inner, spec, remote, spec.mtu.min(GOOL_INNER_MTU));
+    let config = crate::wireguard::DeviceConfig::from_json(&settings)?;
+    let _ = crate::wg::WireGuardOut::with_noise(config, spec.noize.wireguard())?;
+    Ok(())
 }
 
 /// `WireGuard` carried inside a MASQUE conversation.
