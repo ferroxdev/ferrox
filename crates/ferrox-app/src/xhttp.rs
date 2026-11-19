@@ -3539,6 +3539,7 @@ fn send_dial_head_padded<W: crate::proxy::FrameWrite>(
                 + target.len()
                 + BEFORE_HOST.len()
                 + host.len()
+                + 2
                 + if padding_is_referer {
                     0
                 } else {
@@ -6287,6 +6288,28 @@ mod tests {
         assert!(
             head.contains("?x_padding=XXXX\r\n"),
             "the dial wrote a run its own hub refuses: {head}"
+        );
+    }
+
+    /// A pad that is the `Referer` field itself follows a terminated `Host` line, not the host value.
+    #[test]
+    fn a_referer_pad_keeps_the_host_line_terminated() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = Sink(Arc::clone(&seen));
+        send_dial_head_padded(
+            &mut sink,
+            "front.example",
+            "/share",
+            &[],
+            "Referer: http://front.example/share?x_padding=XXXX\r\n",
+            "?x_padding=",
+            "",
+        )
+        .expect("head");
+        let head = String::from_utf8(seen.lock().expect("sink").clone()).expect("utf8");
+        assert!(
+            head.split("\r\n").any(|line| line == "Host: front.example"),
+            "the host line ends before the referer pad: {head}"
         );
     }
 

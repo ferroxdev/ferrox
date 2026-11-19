@@ -132,7 +132,7 @@ fn opened<T: Read + Write>(tunnel: &mut T, country: &str) -> Option<String> {
     let trace = through_tunnel(tunnel, TRACE_HOST, TRACE_PATH)?;
     let seen = crate::foxy::exit_country(trace.as_bytes())?;
     (seen.eq_ignore_ascii_case(country)
-        || country == "REC"
+        || country.eq_ignore_ascii_case("REC")
         || ((seen == "T1" || seen == "REC") && country.is_empty()))
     .then_some(seen)
 }
@@ -332,7 +332,11 @@ fn canceled(
         },
         until,
     )?;
-    std::thread::sleep(SETTLE);
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Ok(());
+    }
+    std::thread::sleep(SETTLE.min(left));
     let Some(settled) = settled(account, was, deadline) else {
         return Err("closed flow: the allowance did not settle before the clock".to_owned());
     };
@@ -343,6 +347,10 @@ fn canceled(
         PAYLOAD_LARGE.0
     );
     Ok(())
+}
+
+fn unsettled(carrier: Carrier) -> String {
+    format!("{carrier:?}: the allowance did not settle before the clock")
 }
 
 /// One carrier's charge with every other cost held still: an idle window, a head, a small payload and a large one, each read only after the counter has stopped moving.
@@ -357,16 +365,16 @@ fn brackets(
         .quota_remaining
         .ok_or("the plane names no allowance; without one there is nothing to charge")?;
     let Some(next) = settled(account, was, deadline) else {
-        return Err(format!(
-            "{carrier:?}: the allowance did not settle before the clock"
-        ));
+        return Err(unsettled(carrier));
     };
     was = next;
-    std::thread::sleep(IDLE);
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(unsettled(carrier));
+    }
+    std::thread::sleep(IDLE.min(left));
     let Some(idle) = settled(account, was, deadline) else {
-        return Err(format!(
-            "{carrier:?}: the allowance did not settle before the clock"
-        ));
+        return Err(unsettled(carrier));
     };
     let drained = was.saturating_sub(idle);
     println!(
@@ -393,9 +401,7 @@ fn brackets(
         until,
     )?;
     let Some(now) = settled(account, was, deadline) else {
-        return Err(format!(
-            "{carrier:?}: the allowance did not settle before the clock"
-        ));
+        return Err(unsettled(carrier));
     };
     let fixed = was.saturating_sub(now);
     println!(
@@ -425,9 +431,7 @@ fn brackets(
         }
         let bytes = bytes as u64;
         let Some(now) = settled(account, was, deadline) else {
-            return Err(format!(
-                "{carrier:?}: the allowance did not settle before the clock"
-            ));
+            return Err(unsettled(carrier));
         };
         let charged = was.saturating_sub(now);
         let (whole, fraction) = per_byte(charged, bytes);

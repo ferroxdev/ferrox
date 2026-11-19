@@ -2,6 +2,7 @@
 //! the `connect-ip` token, and the 101 answer turns the same bytes into the
 //! capsule stream the other carriers write.
 
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -171,18 +172,19 @@ fn capsules_ok(text: &str) -> bool {
 }
 
 /// The path of an absolute-form target, or the target itself.
-fn target_path(target: &str) -> &str {
+fn target_path(target: &str) -> Cow<'_, str> {
     let Some(at) = target.find("://") else {
-        return target;
+        return Cow::Borrowed(target);
     };
     let scheme = &target[..at];
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return target;
+        return Cow::Borrowed(target);
     }
     let rest = &target[at + 3..];
     match rest.find(['/', '?', '#']) {
-        Some(at) if rest.as_bytes()[at] == b'/' => &rest[at..],
-        _ => "/",
+        Some(at) if rest.as_bytes()[at] == b'/' => Cow::Borrowed(&rest[at..]),
+        Some(at) if rest.as_bytes()[at] == b'?' => Cow::Owned(format!("/{}", &rest[at..])),
+        _ => Cow::Borrowed("/"),
     }
 }
 
@@ -777,5 +779,6 @@ mod tests {
             "/.well-known/masque/ip/192.0.2.1/32/"
         );
         assert_eq!(target_path("Http://edge.example"), "/");
+        assert_eq!(target_path("Http://edge.example?x=1"), "/?x=1");
     }
 }

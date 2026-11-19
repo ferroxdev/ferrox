@@ -1210,6 +1210,19 @@ pub fn content_type(path: &str) -> &'static str {
     }
 }
 
+/// One `Content-Length` value, accepting a repeated list only when every element agrees.
+fn content_length(value: &str) -> Option<usize> {
+    let mut length = None;
+    for part in value.split(',') {
+        let parsed = part.trim().parse::<usize>().ok()?;
+        if length.is_some_and(|known| known != parsed) {
+            return None;
+        }
+        length = Some(parsed);
+    }
+    length
+}
+
 /// One origin HTTP/1.1 response reduced to what ferrox re-emits as HTTP/3: the status code, every header as it arrived (the caller drops the hop-by-hop ones), and the body with any chunked framing or content-length tail already removed. The whole response, read to the origin's close, is the input; a head that never reaches its blank line is not a response. `method` is the request method, so a HEAD reply and every status that forbids a body keep their declared length while carrying none.
 pub fn parse_origin_response(raw: &[u8], method: &str) -> Option<OriginResponse> {
     let mut rest = raw;
@@ -1247,7 +1260,11 @@ pub fn parse_origin_response(raw: &[u8], method: &str) -> Option<OriginResponse>
             {
                 chunked = true;
             } else if name.eq_ignore_ascii_case("content-length") {
-                length = value.trim().parse::<usize>().ok();
+                let parsed = content_length(&value)?;
+                if length.is_some_and(|known| known != parsed) {
+                    return None;
+                }
+                length = Some(parsed);
             }
             headers.push((name, value));
         }
@@ -2343,6 +2360,37 @@ mod tests {
             parse_origin_response(b"HTTP/1.1 200 OK\r\n", "GET").is_none(),
             "a head that never reaches its blank line is not a response"
         );
+        assert!(
+            parse_origin_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort", "GET")
+                .is_none(),
+            "a body shorter than its content-length is not the whole response"
+        );
+        let repeated =
+            parse_origin_response(b"HTTP/1.1 200 OK\r\nContent-Length: 3, 3\r\n\r\nabc", "GET")
+                .expect("matching repeated lengths are one length");
+        assert_eq!(repeated.body, b"abc");
+        assert!(
+            parse_origin_response(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 3, 4\r\n\r\nabcd",
+                "GET"
+            )
+            .is_none(),
+            "conflicting repeated lengths are not a response"
+        );
+        assert!(
+            parse_origin_response(b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\nabc", "GET")
+                .is_none(),
+            "an unparseable length is not a response"
+        );
+        let head = parse_origin_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n", "HEAD")
+            .expect("a HEAD reply has no body");
+        assert_eq!(head.body, Vec::<u8>::new());
+        let not_modified = parse_origin_response(
+            b"HTTP/1.1 304 Not Modified\r\nContent-Length: 9\r\n\r\n",
+            "GET",
+        )
+        .expect("a 304 has no body");
+        assert_eq!(not_modified.body, Vec::<u8>::new());
     }
 
     /// The doubling form `dechunk` grew through, kept as the byte oracle the one buffer has to equal.

@@ -1171,7 +1171,7 @@ struct Session {
     capsule_at: usize,
     frame: Vec<u8>,
     request: Option<u32>,
-    continuation: Option<(u32, Vec<u8>, u8)>,
+    continuation: Option<(u32, Vec<u8>, u8, bool)>,
     outgoing: Option<Receiver<Vec<u8>>>,
     queued: VecDeque<Vec<u8>>,
     queued_at: usize,
@@ -1211,6 +1211,13 @@ impl Session {
             half_closed: false,
             udp_quiet: None,
             end: false,
+        }
+    }
+
+    /// A trailer block ends the request body; decoding it keeps the HPACK table the next field block reads.
+    fn trailers(&mut self, block: &[u8]) {
+        if self.decoder.decode(block, &mut |_, _| {}).is_none() {
+            self.end = true;
         }
     }
 
@@ -1320,27 +1327,9 @@ impl Session {
             h2::T_PING if flags & h2::F_ACK == 0 => {
                 wire.send(h2::T_PING, h2::F_ACK, 0, body);
             }
-            h2::T_HEADERS => {
-                if let Some(active) = self.request {
-                    if id != active {
-                        wire.send(h2::T_RST, 0, id, &7u32.to_be_bytes());
-                    } else if flags & h2::F_END != 0 {
-                        self.half_close();
-                    }
-                    return;
-                }
-                let block = strip_padding(flags, body, true);
-                if flags & h2::F_END_HEADERS != 0 {
-                    self.request(wire, id, block);
-                    if flags & h2::F_END != 0 {
-                        self.half_close();
-                    }
-                } else {
-                    self.continuation = Some((id, block.to_vec(), flags));
-                }
-            }
+            h2::T_HEADERS => self.headers(wire, flags, id, body),
             h2::T_CONT => {
-                if let Some((stream, mut block, head_flags)) = self.continuation.take() {
+                if let Some((stream, mut block, head_flags, trailers)) = self.continuation.take() {
                     if stream != id {
                         self.end = true;
                         return;
@@ -1352,16 +1341,27 @@ impl Session {
                     }
                     block.extend_from_slice(data);
                     if flags & h2::F_END_HEADERS != 0 {
-                        self.request(wire, id, &block);
-                        if head_flags & h2::F_END != 0 {
+                        if trailers {
+                            self.trailers(&block);
+                        } else {
+                            self.request(wire, id, &block);
+                        }
+                        if Some(stream) == self.request && head_flags & h2::F_END != 0 {
                             self.half_close();
                         }
                     } else {
-                        self.continuation = Some((id, block, head_flags));
+                        self.continuation = Some((id, block, head_flags, trailers));
                     }
                 }
             }
             h2::T_DATA => {
+                if id == 0 {
+                    let mut goaway = [0u8; 8];
+                    goaway[4..].copy_from_slice(&1u32.to_be_bytes());
+                    wire.send(h2::T_GOAWAY, 0, 0, &goaway);
+                    self.end = true;
+                    return;
+                }
                 if Some(id) != self.request {
                     if let Ok(length) = u32::try_from(body.len()) {
                         if length != 0 {
@@ -1385,6 +1385,41 @@ impl Session {
             h2::T_RST if Some(id) == self.request => self.end = true,
             h2::T_GOAWAY => self.end = true,
             _ => {}
+        }
+    }
+
+    /// A field block after the request head is a trailer: decode it to keep HPACK state, and end the request when it closes.
+    fn headers(&mut self, wire: &mut Wire, flags: u8, id: u32, body: &[u8]) {
+        if let Some(active) = self.request {
+            if id != active {
+                let block = strip_padding(flags, body, true);
+                if flags & h2::F_END_HEADERS != 0 {
+                    self.trailers(block);
+                } else {
+                    self.continuation = Some((id, block.to_vec(), flags, true));
+                }
+                wire.send(h2::T_RST, 0, id, &7u32.to_be_bytes());
+                return;
+            }
+            let block = strip_padding(flags, body, true);
+            if flags & h2::F_END_HEADERS != 0 {
+                self.trailers(block);
+                if flags & h2::F_END != 0 {
+                    self.half_close();
+                }
+            } else {
+                self.continuation = Some((id, block.to_vec(), flags, true));
+            }
+            return;
+        }
+        let block = strip_padding(flags, body, true);
+        if flags & h2::F_END_HEADERS != 0 {
+            self.request(wire, id, block);
+            if flags & h2::F_END != 0 {
+                self.half_close();
+            }
+        } else {
+            self.continuation = Some((id, block.to_vec(), flags, false));
         }
     }
 
@@ -2469,10 +2504,31 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_stream_still_advances_the_hpack_table() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.request = Some(3);
+        let mut wire = Wire {
+            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            pending: Vec::new(),
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        let refused = h2::block_encode(&[("x-pad", "a")]);
+        session.on(&mut wire, h2::T_HEADERS, h2::F_END_HEADERS, 1, &refused);
+        assert_eq!(session.request, Some(3), "the active stream stays active");
+        assert!(!session.end);
+        session.on(&mut wire, h2::T_HEADERS, h2::F_END_HEADERS, 3, &[0xbe]);
+        assert!(
+            !session.end,
+            "the refused block left the hpack table out of step"
+        );
+    }
+
+    #[test]
     fn a_near_cap_block_is_rejected_without_growing() {
         let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
         let half = FRAME_CAP / 2 + 1;
-        session.continuation = Some((1, vec![0u8; half], 0));
+        session.continuation = Some((1, vec![0u8; half], 0, false));
         let body = vec![0u8; half];
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
