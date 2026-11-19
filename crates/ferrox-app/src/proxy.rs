@@ -36636,7 +36636,10 @@ pub(crate) fn find_across(head: &[u8], probe: &[u8], pattern: &[u8]) -> Option<u
 }
 
 /// Arm the poll quantum a head read needs: a budget cannot bound a blocking socket call, so the timeout is never longer than the caller's and the previous value goes back.
-fn with_head_poll<T>(stream: &mut Connection, run: impl FnOnce(&mut Connection) -> T) -> Option<T> {
+pub(crate) fn with_head_poll<T>(
+    stream: &mut Connection,
+    run: impl FnOnce(&mut Connection) -> T,
+) -> Option<T> {
     let previous = stream.read_timeout().ok().flatten();
     let poll = previous.map_or(RELAY_POLL, |armed| armed.min(RELAY_POLL));
     if stream.set_read_timeout(Some(poll)).is_err() {

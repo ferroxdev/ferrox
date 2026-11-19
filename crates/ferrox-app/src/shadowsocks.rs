@@ -1775,7 +1775,7 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
             }
         }
         let now = Instant::now();
-        sources.retain(|_, source| now.duration_since(source.last) < idle);
+        sources.retain(|_, source| now.duration_since(source.last) < source.idle);
     }
 }
 

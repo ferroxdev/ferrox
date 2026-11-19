@@ -688,7 +688,13 @@ pub(crate) fn tls_identity_from_settings(
         }
     };
     let certs = tls_cert_entries(settings)?;
-    let issuer = tls_issue_authority(settings);
+    let issuer = match tls_issue_authority(settings) {
+        Ok(issuer) => issuer,
+        Err(why) => {
+            eprintln!("tls: {why}; the inbound is refused");
+            return None;
+        }
+    };
     if certs.is_empty() && issuer.is_none() {
         return None;
     }
@@ -826,28 +832,35 @@ fn quic_owned_tls(settings: &Json) -> bool {
 /// the way xray warns and moves on, and a named file that cannot be read refuses the listener.
 /// The first `AUTHORITY_ISSUE` entry: its CA signs a leaf for an SNI no served certificate covers.
 /// One half of an `AUTHORITY_ISSUE` pair: a file when named, otherwise the inline PEM. A file that
-/// cannot be read skips its entry with the reason named, rather than silently serving no issuer.
-fn authority_pem(cert: &Json, file: &str, inline: &str, index: usize) -> Option<Vec<u8>> {
+/// cannot be read refuses the listener with the reason named, rather than silently serving no issuer.
+fn authority_pem(
+    cert: &Json,
+    file: &str,
+    inline: &str,
+    index: usize,
+) -> Result<Option<Vec<u8>>, String> {
     if let Some(path) = cert
         .get(file)
         .and_then(Json::as_str)
         .filter(|path| !path.is_empty())
     {
-        if let Some(pem) = read_cert_file(path) {
-            return Some(pem);
-        }
-        eprintln!("tls: skipping AUTHORITY_ISSUE entry {index}: {file} `{path}` cannot be read");
-        return None;
+        return read_cert_file(path)
+            .map(Some)
+            .ok_or_else(|| format!("AUTHORITY_ISSUE entry {index} cannot read {file} `{path}`"));
     }
-    if let Some(pem) = inline_pem(cert, inline) {
-        return Some(pem);
-    }
-    eprintln!("tls: skipping AUTHORITY_ISSUE entry {index}: no {inline} bytes or readable file");
-    None
+    Ok(inline_pem(cert, inline))
 }
 
-fn tls_issue_authority(settings: &Json) -> Option<Arc<ferrox_core::tls::CertIssuer>> {
-    let list = settings.get("tlsSettings")?.get("certificates")?.as_arr()?;
+fn tls_issue_authority(
+    settings: &Json,
+) -> Result<Option<Arc<ferrox_core::tls::CertIssuer>>, String> {
+    let Some(list) = settings
+        .get("tlsSettings")
+        .and_then(|tls| tls.get("certificates"))
+        .and_then(Json::as_arr)
+    else {
+        return Ok(None);
+    };
     for (index, cert) in list.iter().enumerate() {
         if !cert
             .get("usage")
@@ -863,10 +876,10 @@ fn tls_issue_authority(settings: &Json) -> Option<Arc<ferrox_core::tls::CertIssu
         };
         let certificate = named("certificateFile");
         let key = named("keyFile");
-        let Some(cert_pem) = authority_pem(cert, "certificateFile", "certificate", index) else {
+        let Some(cert_pem) = authority_pem(cert, "certificateFile", "certificate", index)? else {
             continue;
         };
-        let Some(key_pem) = authority_pem(cert, "keyFile", "key", index) else {
+        let Some(key_pem) = authority_pem(cert, "keyFile", "key", index)? else {
             continue;
         };
         let entry = match ferrox_core::tls::parse_pem_entry(&cert_pem, &key_pem) {
@@ -915,9 +928,9 @@ fn tls_issue_authority(settings: &Json) -> Option<Arc<ferrox_core::tls::CertIssu
             );
             continue;
         }
-        return Some(Arc::new(issuer));
+        return Ok(Some(Arc::new(issuer)));
     }
-    None
+    Ok(None)
 }
 
 fn tls_cert_entries(settings: &Json) -> Option<Vec<ferrox_core::tls::CertEntry>> {

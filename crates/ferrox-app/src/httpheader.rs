@@ -473,6 +473,40 @@ mod tests {
     }
 
     #[test]
+    fn an_interim_head_is_not_the_camouflage_answer() {
+        struct Sink(Vec<u8>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::proxy::FrameWrite for Sink {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                for part in parts {
+                    self.0.extend_from_slice(part);
+                }
+                true
+            }
+        }
+        let response = b"HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\nHTTP/1.1 200 OK\r\n\r\nping";
+        let (mut reader, _write) = connect_split(
+            std::io::Cursor::new(response.to_vec()),
+            Sink(Vec::new()),
+            "oracle.example",
+            "/camouflage",
+            &[],
+        )
+        .expect("accepts the final response");
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf).expect("reads the payload");
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[test]
     fn a_configured_response_is_the_one_the_carrier_sends() {
         let head = b"GET /camouflage HTTP/1.1\r\nHost: h\r\n\r\n";
         let response = b"HTTP/1.1 204 No Content\r\nX-Camo: 1\r\n\r\n";

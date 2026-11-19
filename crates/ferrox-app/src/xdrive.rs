@@ -910,11 +910,13 @@ impl Wake {
 
     /// Shorten the next wait: the peer's write means an object the reader would otherwise learn of only when its backoff expires.
     fn ring(&self) {
+        let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.rung.store(true, Ordering::Release);
         self.cv.notify_one();
     }
 
     fn halt(&self) {
+        let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.stopped.store(true, Ordering::Release);
         self.cv.notify_all();
     }
@@ -930,14 +932,14 @@ impl Wake {
 
     /// Wait out `longest`, or until rung, or until halted; a flag set while nobody waited is read here, so a wake is never lost between two polls.
     fn wait(&self, longest: Duration) -> Woke {
+        census!("xdrive-wait", crate::census::NO_FD, Some(longest));
+        let guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         if self.stopped() {
             return Woke::Stopped;
         }
         if self.rung.swap(false, Ordering::AcqRel) {
             return Woke::Rung;
         }
-        census!("xdrive-wait", crate::census::NO_FD, Some(longest));
-        let guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         let (guard, timed_out) = self
             .cv
             .wait_timeout(guard, longest)

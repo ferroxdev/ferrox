@@ -2968,16 +2968,12 @@ impl IpMatcher {
             .collect()
     }
 
-    pub(crate) fn set_reverse(&mut self, reverse: bool) {
-        for (_, current) in &mut self.sets {
-            *current = reverse;
-        }
-    }
-
-    pub(crate) fn flip_reverse(&mut self) {
-        for (_, current) in &mut self.sets {
-            *current = !*current;
-        }
+    /// Match with a Lua userdata's reverse override or pending flip, without cloning the parsed sets.
+    pub(crate) fn matches_override(&self, ip: IpAddr, reverse: Option<bool>, flip: bool) -> bool {
+        self.sets.iter().any(|(set, own)| {
+            let reverse = reverse.unwrap_or(if flip { !*own } else { *own });
+            set.matches(ip, reverse)
+        })
     }
 }
 

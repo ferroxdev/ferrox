@@ -1688,7 +1688,7 @@ fn grpc_signed(pairs: &mut Vec<(&str, Json)>, key: &'static str, value: i32) {
 }
 
 /// A nonpositive timeout or window is xray's absent default, and a later occurrence still replaces
-/// an earlier positive one.
+/// an earlier positive one; a negative idle timeout takes the positive health interval.
 fn grpc_positive(pairs: &mut Vec<(&str, Json)>, key: &'static str, value: i32) {
     if value > 0 {
         grpc_pair(pairs, key, Json::Num(f64::from(value)));
@@ -2864,6 +2864,9 @@ fn metrics_settings(bytes: &[u8]) -> Result<Json, String> {
     }
     if !listen.is_empty() {
         pairs.push(("listen", Json::Str(listen)));
+    }
+    if pairs.is_empty() {
+        return Err("xray.app.metrics.Config: neither a tag nor a listen address".to_owned());
     }
     Ok(object(pairs))
 }

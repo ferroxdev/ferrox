@@ -2015,9 +2015,6 @@ impl Datagrams {
             }
             let session = u64::from_be_bytes(body[..8].try_into().ok()?);
             let packet_id = u64::from_be_bytes(body[8..16].try_into().ok()?);
-            if !peer_check(&mut self.peers, session, packet_id, now) {
-                return None;
-            }
             let body = &body[16..];
             if body[0] != 1 {
                 return None;
@@ -2032,14 +2029,19 @@ impl Datagrams {
             if body.len() < 19 + pad {
                 return None;
             }
+            if replayed(&self.peers, session, packet_id) {
+                return None;
+            }
             let (target, used) = parse_addr_header(&body[19 + pad..])?;
             if body.len() < 19 + pad + used {
                 return None;
             }
+            if !peer_check(&mut self.peers, session, packet_id, now) {
+                return None;
+            }
             Some((target, &packet[24 + 16 + 19 + pad + used..24 + len]))
         } else {
-            let key_len = method.key_len();
-            if psk.len() != key_len || packet.len() < 16 + TAG_LEN {
+            if psk.len() != method.key_len() || packet.len() < 16 + TAG_LEN {
                 return None;
             }
             let mut enc = [0u8; BLOCK_LEN];
@@ -2047,22 +2049,17 @@ impl Datagrams {
             let raw = shadowsocks2022::block_decrypt(psk, &enc)?;
             let session = u64::from_be_bytes(raw[..8].try_into().ok()?);
             let packet_id = u64::from_be_bytes(raw[8..].try_into().ok()?);
-            if !peer_check(&mut self.peers, session, packet_id, now) {
-                return None;
-            }
-            if self
-                .peers
-                .get(&session)
-                .is_none_or(|peer| peer.cipher.is_none())
-            {
-                let sub = shadowsocks2022::session_subkey(psk, &raw[..8])?;
-                let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
-                self.peers.get_mut(&session)?.cipher = Some(cipher);
-            }
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
-            let cipher = self.peers.get(&session)?.cipher.as_ref()?;
-            let len = cipher.open_with_nonce(&nonce, &mut packet[16..])?;
+            let (len, derived) = open_peer_body(
+                &self.peers,
+                session,
+                psk,
+                method,
+                &raw[..8],
+                &nonce,
+                &mut packet[16..],
+            )?;
             if len > packet.len() - 16 {
                 return None;
             }
@@ -2080,13 +2077,51 @@ impl Datagrams {
             if body.len() < 19 + pad {
                 return None;
             }
+            if replayed(&self.peers, session, packet_id) {
+                return None;
+            }
             let (target, used) = parse_addr_header(&body[19 + pad..])?;
             if body.len() < 19 + pad + used {
                 return None;
             }
+            if !peer_check(&mut self.peers, session, packet_id, now) {
+                return None;
+            }
+            if let Some(cipher) = derived {
+                if self
+                    .peers
+                    .get(&session)
+                    .is_none_or(|peer| peer.cipher.is_none())
+                {
+                    self.peers.get_mut(&session)?.cipher = Some(cipher);
+                }
+            }
             Some((target, &packet[16 + 19 + pad + used..16 + len]))
         }
     }
+}
+
+fn open_peer_body(
+    peers: &HashMap<u64, PeerServer>,
+    session: u64,
+    psk: &[u8],
+    method: Method,
+    salt: &[u8],
+    nonce: &[u8; 12],
+    body: &mut [u8],
+) -> Option<(usize, Option<Cipher>)> {
+    if let Some(cipher) = peers.get(&session).and_then(|peer| peer.cipher.as_ref()) {
+        return Some((cipher.open_with_nonce(nonce, body)?, None));
+    }
+    let sub = shadowsocks2022::session_subkey(psk, salt)?;
+    let cipher = Cipher::from_subkey(method, &sub[..method.key_len()])?;
+    Some((cipher.open_with_nonce(nonce, body)?, Some(cipher)))
+}
+
+fn replayed(peers: &HashMap<u64, PeerServer>, session: u64, packet_id: u64) -> bool {
+    peers
+        .get(&session)
+        .is_some_and(|peer| !peer.window.check(packet_id))
 }
 
 fn peer_check(
@@ -2096,10 +2131,13 @@ fn peer_check(
     now: u64,
 ) -> bool {
     if let Some(peer) = peers.get_mut(&session) {
+        if !peer.window.check_and_add(packet_id) {
+            return false;
+        }
         peer.last_seen = now;
-        return peer.window.check_and_add(packet_id);
+        return true;
     }
-    peers.retain(|_, peer: &mut PeerServer| now.wrapping_sub(peer.last_seen) < 60);
+    peers.retain(|_, peer: &mut PeerServer| now.wrapping_sub(peer.last_seen) < SKEW * 2 + 1);
     if peers.len() >= 8 {
         return false;
     }
