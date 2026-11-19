@@ -21,6 +21,17 @@ use std::time::{Duration, Instant};
 
 use ferrox_core::realm::{self, Config, Family, Metadata, PacketType};
 
+fn napping(duration: Duration, stopped: impl Fn() -> bool) {
+    let deadline = Instant::now() + duration;
+    while !stopped() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(50)));
+    }
+}
+
 /// The realm rendezvous over hand-written HTTP/1.1. One request is one closed exchange, so the
 /// caller never holds a pooled HTTP connection beside the QUIC peer it punches for.
 #[derive(Clone)]
@@ -900,7 +911,9 @@ pub(crate) fn serve_registration(
         let Some(base) =
             stun_discover_via_state(&state, &sock, &config.stun_servers, config.family)
         else {
-            std::thread::sleep(backoff.min(Duration::from_secs(30)));
+            napping(backoff.min(Duration::from_secs(30)), || {
+                stop.load(std::sync::atomic::Ordering::Relaxed)
+            });
             backoff = (backoff * 2).min(Duration::from_secs(30));
             continue;
         };
@@ -922,7 +935,9 @@ pub(crate) fn serve_registration(
         }
         let shared_locals = std::sync::Arc::new(std::sync::Mutex::new(locals.clone()));
         let Some((session, ttl)) = client.register(&config.id, &locals) else {
-            std::thread::sleep(backoff.min(Duration::from_secs(30)));
+            napping(backoff.min(Duration::from_secs(30)), || {
+                stop.load(std::sync::atomic::Ordering::Relaxed)
+            });
             backoff = (backoff * 2).min(Duration::from_secs(30));
             continue;
         };
@@ -963,7 +978,9 @@ pub(crate) fn serve_registration(
         }
         let Some(mut stream) = events_client.open_events(&config.id, &session) else {
             session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            std::thread::sleep(backoff.min(Duration::from_secs(30)));
+            napping(backoff.min(Duration::from_secs(30)), || {
+                stop.load(std::sync::atomic::Ordering::Relaxed)
+            });
             backoff = (backoff * 2).min(Duration::from_secs(30));
             continue;
         };
@@ -992,7 +1009,9 @@ pub(crate) fn serve_registration(
         }
         // The stream ended: re-register with the same backoff a refused register pays.
         session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        std::thread::sleep(backoff.min(Duration::from_secs(30)));
+        napping(backoff.min(Duration::from_secs(30)), || {
+            stop.load(std::sync::atomic::Ordering::Relaxed)
+        });
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
@@ -1032,7 +1051,10 @@ fn heartbeat_loop(
         {
             return;
         }
-        std::thread::sleep(interval);
+        napping(interval, || {
+            stop.load(std::sync::atomic::Ordering::Relaxed)
+                || session_stop.load(std::sync::atomic::Ordering::Relaxed)
+        });
         if stop.load(std::sync::atomic::Ordering::Relaxed)
             || session_stop.load(std::sync::atomic::Ordering::Relaxed)
         {

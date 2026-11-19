@@ -550,16 +550,14 @@ fn inbound_is_xhttp_h3(inbound: &Json) -> bool {
 fn stop_covers_inbound(inbound: &Json, protocol: &str) -> bool {
     let carrier = inbound_carrier(inbound);
     match protocol {
-        "vless" | "trojan" | "vmess" => {
-            !matches!(carrier, Carrier::Xdrive { .. } | Carrier::Hysteria(_))
-        }
+        "vless" | "trojan" | "vmess" => !matches!(carrier, Carrier::Xdrive { .. }),
         "shadowsocks" => match carrier {
             Carrier::Raw(_) => {
                 let (tcp, udp) = inbound_ss_networks(inbound);
                 tcp || udp
             }
-            Carrier::Kcp(_) => true,
-            Carrier::Xdrive { .. } | Carrier::Hysteria(_) | Carrier::Quic => false,
+            Carrier::Kcp(_) | Carrier::Hysteria(_) => true,
+            Carrier::Xdrive { .. } | Carrier::Quic => false,
             Carrier::Xhttp { .. } if inbound_is_xhttp_h3(inbound) => true,
             _ => inbound_ss_networks(inbound).0,
         },
@@ -1060,6 +1058,7 @@ enum Reservation {
 fn preflight_tcp(
     target: &crate::conn::Target,
     address: &str,
+    transparent: bool,
 ) -> Result<Option<Reservation>, String> {
     #[cfg(any(unix, windows))]
     if let crate::conn::Target::Unix(path) = target {
@@ -1067,19 +1066,42 @@ fn preflight_tcp(
             .map_err(|error| format!("cannot listen on {address}: {error}"))?;
         return Ok(None);
     }
-    let listener = crate::conn::Listener::bind(target)
-        .map_err(|error| format!("cannot listen on {address}: {error}"))?;
+    let listener = if transparent {
+        crate::conn::Listener::bind_transparent(target)
+    } else {
+        crate::conn::Listener::bind(target)
+    }
+    .map_err(|error| format!("cannot listen on {address}: {error}"))?;
     Ok(Some(Reservation::Tcp(listener)))
 }
 
 /// Bind every socket a dynamic inbound would open before serving any of them, so a port already
 /// taken refuses the whole add and nothing is left behind.
+fn dokodemo_transparent_mode(inbound: &Json) -> Option<crate::sockopt::Tproxy> {
+    let settings = inbound.get("settings");
+    let follow = settings
+        .and_then(|settings| settings.get("followRedirect"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    let receive = settings
+        .and_then(|settings| settings.get("receiveOriginalDestination"))
+        .and_then(Json::as_bool)
+        .unwrap_or(follow);
+    let mode = crate::sockopt::inbound_tproxy(inbound.get("streamSettings")).ok()?;
+    match dokodemo_transparent(receive, mode) {
+        Some(crate::sockopt::Tproxy::Tproxy) if !crate::transparent::TPROXY => {
+            crate::transparent::REDIRECT.then_some(crate::sockopt::Tproxy::Redirect)
+        }
+        Some(crate::sockopt::Tproxy::Redirect) if !crate::transparent::REDIRECT => None,
+        mode => mode,
+    }
+}
+
 fn preflight_inbound(inbound: &Json, protocol: &str, addresses: &[String]) -> Result<(), String> {
     let (tcp, udp) = inbound_sockets(inbound, protocol);
-    // A transparent door binds its datagram socket with options plain `UdpSocket::bind` cannot set.
-    let transparent_door = protocol == "dokodemo-door"
-        && crate::sockopt::inbound_tproxy(inbound.get("streamSettings"))
-            .is_ok_and(|mode| mode != crate::sockopt::Tproxy::Off);
+    // A transparent door binds its sockets with options plain `bind` cannot set.
+    let transparent_door =
+        protocol == "dokodemo-door" && dokodemo_transparent_mode(inbound).is_some();
     let mut held = Vec::new();
     for address in addresses {
         if address.is_empty() {
@@ -1087,7 +1109,7 @@ fn preflight_inbound(inbound: &Json, protocol: &str, addresses: &[String]) -> Re
         }
         if tcp {
             let target = parse_target(address).map_err(|error| format!("{address}: {error}"))?;
-            if let Some(reservation) = preflight_tcp(&target, address)? {
+            if let Some(reservation) = preflight_tcp(&target, address, transparent_door)? {
                 held.push(reservation);
             }
         }
@@ -1336,7 +1358,7 @@ fn serve_vless_inbound(
             let serve: crate::hysteria::Serve = Arc::new(move |flow| {
                 serve_vless_hysteria(flow.with_meter(meter.clone()), &users, freedom);
             });
-            serve_hysteria_thread(&owned, &config, &identity, &masq, &serve)
+            serve_hysteria_thread(&owned, &config, &identity, &masq, &serve, stop)
         }
         "tls" => serve_vless_tls_inbound(address, inbound, &users, &carrier, freedom, path, stop),
         "reality" => {
@@ -1399,6 +1421,7 @@ fn serve_hysteria_thread(
     identity: &ferrox_core::tls::TlsServerConfig,
     masq: &ferrox_core::hysteria::Masquerade,
     serve: &crate::hysteria::Serve,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let Some(prepared) = crate::hysteria::prepare(
         address,
@@ -1415,6 +1438,8 @@ fn serve_hysteria_thread(
     let realm = config.realm.clone();
     let masq = masq.clone();
     let serve = Arc::clone(serve);
+    let worker_stop = stop.cloned();
+    let cancel = stop.map(|stop| stop.shared());
     thread::spawn(move || {
         crate::hysteria::serve_prepared(
             prepared,
@@ -1424,7 +1449,11 @@ fn serve_hysteria_thread(
             udp_idle,
             quic.as_ref(),
             realm.as_deref(),
+            cancel,
         );
+        if let Some(stop) = worker_stop {
+            stop.mark_closed();
+        }
     });
     true
 }
@@ -16270,7 +16299,7 @@ fn serve_trojan_transport_inbound(
         serve_trojan_hysteria(flow.with_meter(meter.clone()), &key, freedom);
     });
     Some(serve_hysteria_thread(
-        &owned, &config, &identity, &masq, &serve,
+        &owned, &config, &identity, &masq, &serve, stop,
     ))
 }
 
@@ -16532,7 +16561,7 @@ fn serve_vmess_inbound_users(
             serve_vmess_quic_inbound(address, inbound, users, freedom, address, stop.as_ref())
         }
         Carrier::Hysteria(config) => {
-            serve_vmess_hysteria_inbound(address, inbound, &config, users, freedom)
+            serve_vmess_hysteria_inbound(address, inbound, &config, users, freedom, stop)
         }
         carrier if sec == "reality" => {
             if !carrier.tcp_stream() {
@@ -16630,6 +16659,7 @@ fn serve_vmess_hysteria_inbound(
     config: &ferrox_core::hysteria::Config,
     users: &crate::vmess::UsersRef,
     freedom: bool,
+    stop: Option<Arc<Stop>>,
 ) -> bool {
     if config.version != 2 {
         eprintln!(
@@ -16663,6 +16693,8 @@ fn serve_vmess_hysteria_inbound(
     let serve: crate::hysteria::Serve = Arc::new(move |flow| {
         serve_vmess_hysteria(flow.with_meter(meter.clone()), &hysteria_users, freedom);
     });
+    let worker_stop = stop.clone();
+    let cancel = stop.as_ref().map(|stop| stop.shared());
     thread::spawn(move || {
         crate::hysteria::serve_prepared(
             prepared,
@@ -16672,7 +16704,11 @@ fn serve_vmess_hysteria_inbound(
             std::time::Duration::from_secs(config.udp_idle),
             config.quic.as_ref(),
             config.realm.as_deref(),
+            cancel,
         );
+        if let Some(stop) = worker_stop {
+            stop.mark_closed();
+        }
     });
     true
 }
@@ -17521,7 +17557,7 @@ fn serve_ss_relay_front(
     if let Carrier::Hysteria(config) = carrier {
         let tcp = inbound_ss_networks(inbound).0;
         return Some(usize::from(serve_ss_hysteria_front(
-            config, address, inbound, accounts, tcp, freedom,
+            config, address, inbound, accounts, tcp, freedom, stop,
         )));
     }
     if !matches!(carrier, Carrier::Raw(_)) {
@@ -17571,6 +17607,7 @@ fn serve_ss_hysteria_front(
     accounts: &Arc<crate::shadowsocks::SsAccounts>,
     tcp: bool,
     freedom: bool,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     if !tcp {
         return false;
@@ -17598,7 +17635,7 @@ fn serve_ss_hysteria_front(
     let serve: crate::hysteria::Serve = Arc::new(move |flow| {
         serve_ss_hysteria(flow.with_meter(meter.clone()), &accounts, freedom);
     });
-    serve_hysteria_thread(&owned, &config, &identity, &masq, &serve)
+    serve_hysteria_thread(&owned, &config, &identity, &masq, &serve, stop)
 }
 
 fn serve_ss_xhttp_h3(
@@ -72756,7 +72793,7 @@ mod tests {
         };
         let users = crate::vmess::Users::single([0x62u8; 16]);
         assert!(!serve_vmess_hysteria_inbound(
-            &address, &inbound, &config, &users, true
+            &address, &inbound, &config, &users, true, None
         ));
         drop(held);
     }

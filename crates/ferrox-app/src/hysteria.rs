@@ -3003,9 +3003,10 @@ pub(crate) fn serve_loop(
     let Some(prepared) = prepare(address, identity, cc, obfs_password, quic) else {
         return;
     };
-    serve_prepared(prepared, auths, masq, serve, udp_idle, quic, realm);
+    serve_prepared(prepared, auths, masq, serve, udp_idle, quic, realm, None);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_prepared(
     prepared: Prepared,
     auths: &[String],
@@ -3014,6 +3015,7 @@ pub(crate) fn serve_prepared(
     udp_idle: Duration,
     quic: Option<&hysteria::QuicParams>,
     realm: Option<&ferrox_core::realm::Config>,
+    stop: Option<Arc<AtomicBool>>,
 ) {
     let Prepared {
         sock,
@@ -3022,12 +3024,14 @@ pub(crate) fn serve_prepared(
     } = prepared;
     let sock = Arc::new(sock);
     let realm_state = realm.map(|_| crate::hysteria_realm::RealmState::new());
+    let realm_stop = Arc::new(AtomicBool::new(false));
+    let mut realm_worker = None;
     if let Some((cfg, state)) = realm.cloned().zip(realm_state.clone()) {
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&realm_stop);
         let sock_for_realm = Arc::clone(&sock);
-        std::thread::spawn(move || {
+        realm_worker = Some(std::thread::spawn(move || {
             crate::hysteria_realm::serve_registration(sock_for_realm, &cfg, state, stop);
-        });
+        }));
     }
     let mut router = Router {
         sock: Arc::clone(&sock),
@@ -3045,12 +3049,22 @@ pub(crate) fn serve_prepared(
     };
     let mut buf = Unfilled::<RECV_ROOM>::new();
     if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
+        realm_stop.store(true, Ordering::SeqCst);
+        if let Some(worker) = realm_worker.take() {
+            let _ = worker.join();
+        }
         return;
     }
     #[cfg(target_os = "linux")]
     let mut batch = crate::quic::Batch::new();
     let mut idle_at = Instant::now();
     loop {
+        if stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::SeqCst))
+        {
+            break;
+        }
         #[cfg(target_os = "linux")]
         match crate::quic::recv_batch(&router.sock, &mut batch) {
             crate::quic::Drain::Read => {
@@ -3078,7 +3092,7 @@ pub(crate) fn serve_prepared(
             }
             crate::quic::Drain::Unbatchable => {}
             // A socket that coalesces must not be read one segment wide.
-            crate::quic::Drain::Unreadable => return,
+            crate::quic::Drain::Unreadable => break,
         }
         match router.sock.recv_from(buf.as_mut()) {
             Ok((n, from)) => {
@@ -3103,8 +3117,12 @@ pub(crate) fn serve_prepared(
             {
                 router.idle();
             }
-            Err(_) => return,
+            Err(_) => break,
         }
+    }
+    realm_stop.store(true, Ordering::SeqCst);
+    if let Some(worker) = realm_worker {
+        let _ = worker.join();
     }
 }
 

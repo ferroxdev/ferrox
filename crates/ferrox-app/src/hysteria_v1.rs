@@ -391,12 +391,12 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, owner: Option<IpAddr>) {
     let mut packet = 0u16;
     let mut stream: Option<Flow> = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
-        let Some((dest, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
-            continue;
-        };
         if owner.is_some_and(|owner| owner.to_canonical() != src.ip().to_canonical()) {
             continue;
         }
+        let Some((dest, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
+            continue;
+        };
         let Ok(mut client) = lane.client.lock() else {
             break;
         };
