@@ -1660,6 +1660,7 @@ struct Inner {
     writer: Mutex<PacketWriter>,
     channels: Mutex<HashMap<u32, Arc<ChannelState>>>,
     deferred_close: Mutex<Vec<u32>>,
+    close_wake: Condvar,
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
     channel_window: u32,
     next_channel: AtomicU32,
@@ -2078,6 +2079,7 @@ impl Session {
             writer: Mutex::new(output),
             channels: Mutex::new(HashMap::new()),
             deferred_close: Mutex::new(Vec::new()),
+            close_wake: Condvar::new(),
             pool,
             channel_window: server.channel_window,
             next_channel: AtomicU32::new(1),
@@ -2108,6 +2110,14 @@ impl Session {
             .name("psiphon-ssh".to_owned())
             .spawn(move || read_loop(read_inner, input))
             .map_err(|error| format!("psiphon ssh reader: {error}"))?;
+        let close_inner = Arc::downgrade(&inner);
+        if let Err(error) = std::thread::Builder::new()
+            .name("psiphon-ssh-close".to_owned())
+            .spawn(move || close_flusher(&close_inner))
+        {
+            inner.close();
+            return Err(format!("psiphon ssh close flusher: {error}"));
+        }
         if let Some(keepalive) = keepalive {
             let keepalive_inner = Arc::downgrade(&inner);
             if let Err(error) = std::thread::Builder::new()
@@ -2540,6 +2550,31 @@ impl Drop for Session {
     }
 }
 
+/// Emit queued close frames off the closing thread, so local closure never waits on the transport.
+fn close_flusher(inner: &Weak<Inner>) {
+    loop {
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        let mut pending = lock(&inner.deferred_close);
+        while pending.is_empty() {
+            if inner.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let (guard, _) = inner
+                .close_wake
+                .wait_timeout(pending, Duration::from_secs(1))
+                .unwrap_or_else(PoisonError::into_inner);
+            pending = guard;
+        }
+        drop(pending);
+        let mut writer = lock(&inner.writer);
+        if !inner.flush_deferred_close(&mut writer, None) {
+            return;
+        }
+    }
+}
+
 /// Refresh NAT and tunnel liveness with a jittered `keepalive@openssh.com`,
 /// closing the session when the server misses the reply deadline.
 fn ssh_keepalive(inner: &Weak<Inner>, config: KeepAlive) {
@@ -2697,6 +2732,7 @@ impl Inner {
         let remote = state.remote.swap(NO_CHANNEL, Ordering::AcqRel);
         if remote != NO_CHANNEL && !self.closed.load(Ordering::Acquire) {
             lock(&self.deferred_close).push(remote);
+            self.close_wake.notify_one();
         }
     }
 
@@ -5912,6 +5948,7 @@ fn test_channel_with_window(payloads: &[&[u8]], window: u32) -> Channel {
         writer: Mutex::new(PacketWriter::new(writer, None, None, None)),
         channels: Mutex::new(HashMap::new()),
         deferred_close: Mutex::new(Vec::new()),
+        close_wake: Condvar::new(),
         pool: Arc::clone(&pool),
         channel_window: DEFAULT_CHANNEL_WINDOW,
         next_channel: AtomicU32::new(1),
@@ -6316,6 +6353,7 @@ mod tests {
             )),
             channels: Mutex::new(HashMap::new()),
             deferred_close: Mutex::new(Vec::new()),
+            close_wake: Condvar::new(),
             pool: Arc::clone(&pool),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(1),
@@ -6409,6 +6447,7 @@ mod tests {
             )),
             channels: Mutex::new(HashMap::new()),
             deferred_close: Mutex::new(Vec::new()),
+            close_wake: Condvar::new(),
             pool: Arc::clone(&pool),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(1),
@@ -6484,6 +6523,7 @@ mod tests {
             writer: Mutex::new(PacketWriter::new(writer, None, None, None)),
             channels: Mutex::new(HashMap::new()),
             deferred_close: Mutex::new(Vec::new()),
+            close_wake: Condvar::new(),
             pool: Arc::clone(&pool),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),
@@ -6587,6 +6627,7 @@ mod tests {
             )),
             channels: Mutex::new(HashMap::new()),
             deferred_close: Mutex::new(Vec::new()),
+            close_wake: Condvar::new(),
             pool: Arc::clone(&pool),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),
@@ -6686,6 +6727,7 @@ mod tests {
             )),
             channels: Mutex::new(HashMap::new()),
             deferred_close: Mutex::new(Vec::new()),
+            close_wake: Condvar::new(),
             pool: Arc::new(Mutex::new(Vec::new())),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(1),
@@ -6741,6 +6783,7 @@ mod tests {
             )),
             channels: Mutex::new(HashMap::new()),
             deferred_close: Mutex::new(Vec::new()),
+            close_wake: Condvar::new(),
             pool: Arc::clone(&pool),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),
@@ -6789,6 +6832,7 @@ mod tests {
         lock(&inner.channels).insert(1, Arc::clone(&state));
         let mut channel = test_channel(Arc::clone(&inner), state);
         channel.close();
+        inner.flush_deferred_close(&mut lock(&inner.writer), None);
         let mut head = [0u8; 4];
         wire.read_exact(&mut head).expect("packet length");
         let mut packet = vec![0u8; usize::try_from(u32::from_be_bytes(head)).expect("length")];
@@ -6829,6 +6873,7 @@ mod tests {
             )),
             channels: Mutex::new(HashMap::new()),
             deferred_close: Mutex::new(Vec::new()),
+            close_wake: Condvar::new(),
             pool: Arc::clone(&pool),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),
