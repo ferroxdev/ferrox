@@ -2097,7 +2097,7 @@ fn informational_head(head: &[u8]) -> bool {
     let Some(line) = head.split(|byte| *byte == b'\n').next() else {
         return false;
     };
-    line.split(|byte| byte.is_ascii_whitespace())
+    line.split(u8::is_ascii_whitespace)
         .nth(1)
         .and_then(|code| std::str::from_utf8(code).ok())
         .and_then(|code| code.parse::<u16>().ok())
