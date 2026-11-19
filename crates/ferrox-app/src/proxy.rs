@@ -79746,7 +79746,7 @@ end
         for asked in &tcp {
             let (picked, tag) = plan.lane(asked, crate::router::Network::Tcp, None, None);
             assert!(matches!(&*picked, Outbound::Freedom(_)), "{asked:?}");
-            assert_eq!(tag, None, "TCP never takes the datagram lane");
+            assert_eq!(tag.as_deref(), Some("foxy"), "TCP stays on the first lane");
         }
         let udp = [
             Destination::Address("192.0.2.10:53".parse().expect("v4")),
@@ -79842,7 +79842,11 @@ end
             None,
         );
         assert!(matches!(&*picked, Outbound::Freedom(_)));
-        assert_eq!(tag, None, "an unmatched datagram keeps the default lane");
+        assert_eq!(
+            tag.as_deref(),
+            Some("foxy"),
+            "an unmatched datagram keeps the default lane"
+        );
     }
 
     /// A server inbound never evaluates a rule, so a rule the API adds for one must agree with its
