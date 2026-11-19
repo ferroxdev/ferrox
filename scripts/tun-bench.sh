@@ -28,7 +28,6 @@ GAPS="$OUT_DIR/gaps.md"
 
 FERROX=${FERROX:-}
 BENCH=${BENCH:-}
-ZEPTUN=${ZEPTUN:-}
 HEV=${HEV:-}
 HEV_SERVER=${HEV_SERVER:-}
 SINGBOX=${SINGBOX:-}
@@ -42,7 +41,7 @@ MTU=${MTU:-1500}
 SETTLE=${SETTLE:-3}
 CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-$((DURATION + 20))}
 PROBE_SECONDS=${PROBE_SECONDS:-1}
-ENGINES=${ENGINES:-"ferrox ferrox-native zeptun-userspace zeptun-hybrid hev-socks5-tunnel singbox-system singbox-gvisor"}
+ENGINES=${ENGINES:-"hev-socks5-tunnel ferrox ferrox-native singbox-system singbox-gvisor"}
 RSS_START=0
 SCENARIOS=${SCENARIOS:-"tcp-up-1 tcp-up-10 tcp-down-1 tcp-down-10 rr rr-8x1k udp-100k"}
 
@@ -146,13 +145,10 @@ services() {
     bg_server "$BENCH" tcp-server --listen "$SERVER_ADDR:5201"
     bg_server "$BENCH" tcp-server --listen "$SERVER_ADDR:5203"
     bg_server "$BENCH" udp-server --listen "$SERVER_ADDR:5202" --echo
-    if [ -n "$HEV_SERVER" ]; then
-        printf "main:\n  workers: %s\n  port: %s\n  listen-address: '%s'\n" \
-            "$(nproc)" "$SOCKS_PORT" "$VETH_SERVER" > "$OUT_DIR/socks5.yml"
-        bg_server "$HEV_SERVER" "$OUT_DIR/socks5.yml"
-    else
-        bg_server "$BENCH" socks5-server --listen "$VETH_SERVER:$SOCKS_PORT"
-    fi
+    [ -n "$HEV_SERVER" ] || die "HEV_SERVER is required: it is the far side's SOCKS5 server"
+    printf "main:\n  workers: %s\n  port: %s\n  listen-address: '%s'\n" \
+        "$(nproc)" "$SOCKS_PORT" "$VETH_SERVER" > "$OUT_DIR/socks5.yml"
+    bg_server "$HEV_SERVER" "$OUT_DIR/socks5.yml"
     wait_port 5201 || die "the TCP target never listened"
     wait_port 5203 || die "the RR target never listened"
     wait_port 5202 || die "the UDP target never listened"
@@ -174,19 +170,6 @@ start_ferrox() {
     wait_up fx0 || return 1
     install_routes fx0
     TUN_NAME=fx0
-}
-
-start_zeptun() {
-    mode=$1
-    [ -n "$ZEPTUN" ] || return 1
-    "$ZEPTUN" run --tun zep0 --mtu "$MTU" --queues "$QUEUES" --stack "$mode" \
-        --socks5 "$VETH_SERVER:$SOCKS_PORT" --auto-route --log-level warn \
-        > "$OUT_DIR/zeptun-$mode.log" 2>&1 &
-    ENGINE_PIDS=$!
-    wait_dev zep0 || { note "zeptun-$mode did not create zep0"; cat "$OUT_DIR/zeptun-$mode.log" >&2; return 1; }
-    wait_up zep0 || return 1
-    install_routes zep0
-    TUN_NAME=zep0
 }
 
 start_hev() {
@@ -243,9 +226,6 @@ start_engine() {
         ferrox-userspace) start_ferrox userspace ;;
         ferrox-system) start_ferrox system ;;
         ferrox-hybrid) start_ferrox hybrid ;;
-        zeptun-userspace) start_zeptun userspace ;;
-        zeptun-hybrid) start_zeptun hybrid ;;
-        zeptun-system) start_zeptun system ;;
         hev|hev-socks5-tunnel) start_hev ;;
         singbox-system|sing-tun-system) start_singbox system ;;
         singbox-gvisor|sing-tun-gvisor) start_singbox gvisor ;;
@@ -474,7 +454,6 @@ while [ "$rep" -le "$REPEAT" ]; do
         slot=$((slot + 1))
         case "$engine" in
             ferrox|ferrox-*) [ -n "$FERROX" ] || continue ;;
-            zeptun-*) [ -n "$ZEPTUN" ] || continue ;;
             hev|hev-socks5-tunnel) [ -n "$HEV" ] || continue ;;
             singbox-*|sing-tun-*) [ -n "$SINGBOX" ] || continue ;;
             tun2socks) [ -n "$TUN2SOCKS" ] || continue ;;
