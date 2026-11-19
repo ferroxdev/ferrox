@@ -73905,6 +73905,7 @@ mod tests {
         hysteria_udp_echo_once();
     }
 
+    #[allow(clippy::too_many_lines)]
     fn hysteria_udp_echo_once() {
         use ferrox_core::foxy::frames as h3;
         let echo_port = udp_echo_loop();
