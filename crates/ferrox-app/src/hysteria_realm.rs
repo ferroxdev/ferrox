@@ -91,14 +91,14 @@ impl Client {
     /// server name is the authority host and the roots are the platform anchors, verified unless the
     /// rendezvous itself names `http` — the scheme already chose which one travels.
     fn open(&self) -> Option<DynStream> {
-        self.open_with_timeout(Some(Duration::from_secs(5)), |_| {})
+        self.open_with_timeout(Some(Duration::from_secs(5)), |_| true)
             .map(|(stream, _)| stream)
     }
 
     fn open_with_timeout(
         &self,
         read_timeout: Option<Duration>,
-        on_connect: impl FnOnce(TcpStream),
+        on_connect: impl FnOnce(TcpStream) -> bool,
     ) -> Option<(DynStream, TcpStream)> {
         let address: SocketAddr = format!("{}:{}", self.host, self.port)
             .to_socket_addrs()
@@ -106,7 +106,9 @@ impl Client {
             .next()?;
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).ok()?;
         let interrupt = stream.try_clone().ok()?;
-        on_connect(stream.try_clone().ok()?);
+        if !on_connect(stream.try_clone().ok()?) {
+            return None;
+        }
         let _ = stream.set_read_timeout(read_timeout);
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
         if !self.is_https() {
@@ -224,7 +226,7 @@ impl Client {
         id: &str,
         session: &str,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        on_connect: impl FnOnce(TcpStream),
+        on_connect: impl FnOnce(TcpStream) -> bool,
     ) -> Option<EventStream> {
         let (mut stream, _) = self.open_with_timeout(Some(Duration::from_secs(60)), on_connect)?;
         let host_header = self.host_header();
@@ -712,6 +714,7 @@ pub(crate) fn dial_peer(socket: &UdpSocket, config: &Config) -> Option<SocketAdd
 /// senders.
 #[allow(clippy::type_complexity)]
 pub(crate) struct RealmState {
+    events_stopped: std::sync::atomic::AtomicBool,
     events: std::sync::Mutex<Option<TcpStream>>,
     stun: std::sync::Mutex<
         std::collections::HashMap<
@@ -732,17 +735,27 @@ impl RealmState {
     #[must_use]
     pub(crate) fn new() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
+            events_stopped: std::sync::atomic::AtomicBool::new(false),
             events: std::sync::Mutex::new(None),
             stun: std::sync::Mutex::new(std::collections::HashMap::new()),
             punch: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
-    /// Remember the events socket a stop must interrupt.
-    pub(crate) fn watch_events(&self, stream: TcpStream) {
+    /// Remember the events socket a stop must interrupt, refusing one that arrives after cancellation.
+    pub(crate) fn watch_events(&self, stream: TcpStream) -> bool {
         if let Ok(mut slot) = self.events.lock() {
+            if self
+                .events_stopped
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return false;
+            }
             *slot = Some(stream);
+            return true;
         }
+        false
     }
 
     /// Forget the events socket once its stream ends.
@@ -754,6 +767,8 @@ impl RealmState {
 
     /// Shut the events socket so a blocked read returns.
     pub(crate) fn interrupt_events(&self) {
+        self.events_stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut slot) = self.events.lock() {
             if let Some(stream) = slot.take() {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
