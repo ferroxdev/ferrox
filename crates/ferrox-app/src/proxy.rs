@@ -1008,7 +1008,6 @@ fn inbound_sockets(inbound: &Json, protocol: &str) -> (bool, bool) {
             let (tcp, udp) = inbound_ss_networks(inbound);
             match inbound_carrier(inbound) {
                 Carrier::Kcp(_) | Carrier::Hysteria(_) => (false, tcp),
-                Carrier::Quic | Carrier::Xdrive { .. } => (tcp, false),
                 // A stream carrier keeps serving tcp when the optional datagram front cannot bind.
                 Carrier::Raw(_) => (tcp, udp && !tcp),
                 _ => (tcp, false),
@@ -1020,11 +1019,11 @@ fn inbound_sockets(inbound: &Json, protocol: &str) -> (bool, bool) {
             _ if inbound_is_xhttp_h3(inbound) => (false, true),
             _ => (true, false),
         },
-        "tun" => (false, false),
         _ => (false, false),
     }
 }
 
+#[allow(dead_code)]
 enum Reservation {
     Tcp(crate::conn::Listener),
     Udp(UdpSocket),
@@ -10463,9 +10462,7 @@ fn serve_vless_quic_inbound(
             decryption.as_deref(),
         );
     });
-    let stop = stop
-        .map(|stop| stop.shared())
-        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let stop = stop.map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
     thread::spawn(move || {
         crate::quic::serve_loop(
             crate::quic::Datagram::plain(sock),
@@ -16242,9 +16239,7 @@ fn serve_trojan_quic_inbound(
     let serve: crate::quic::Serve = Arc::new(move |stream| {
         serve_trojan_quic(stream.with_meter(meter.clone()), &key, freedom);
     });
-    let stop = stop
-        .map(|stop| stop.shared())
-        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let stop = stop.map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
     thread::spawn(move || {
         crate::quic::serve_loop(
             crate::quic::Datagram::plain(sock),
@@ -16648,9 +16643,7 @@ fn serve_vmess_quic_inbound(
     let serve: crate::quic::Serve = Arc::new(move |stream| {
         serve_vmess_quic(stream.with_meter(meter.clone()), &users, freedom);
     });
-    let stop = stop
-        .map(|stop| stop.shared())
-        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let stop = stop.map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
     thread::spawn(move || {
         crate::quic::serve_loop(
             crate::quic::Datagram::plain(sock),
