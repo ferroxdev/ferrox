@@ -2665,18 +2665,6 @@ start_lane() {
     say "lane: cannot record $reg_dir in $LANES_FILE." >&2
     return 1
   fi
-  # stop_lane reads the old meta to name the process it must kill, so keep the
-  # new lane's settings aside until that process is gone.
-  new_cfg="$CFG"; new_fronts="$FRONTS"
-  if lane_running; then
-    say "a lane${INSTANCE:+ '$INSTANCE'} is already running (pid $(lane_pid)); stopping it first."
-    stop_lane 0
-  fi
-  CFG="$new_cfg"; FRONTS="$new_fronts"
-  if ! write_lane_meta; then
-    proxy_unlock
-    return 1
-  fi
   if [ "$OUTBOUND" != config ]; then
     CFG_STAGE="$(dirname "$final_cfg")/.$(basename "$final_cfg").stage.$$"
     rm -f "$CFG_STAGE"
@@ -2689,6 +2677,21 @@ start_lane() {
       return 1
     fi
     CFG="$final_cfg"
+  fi
+  # stop_lane reads the old meta to name the process it must kill, so keep the
+  # new lane's settings aside until that process is gone.
+  new_cfg="$CFG"; new_fronts="$FRONTS"
+  if lane_running; then
+    say "a lane${INSTANCE:+ '$INSTANCE'} is already running (pid $(lane_pid)); stopping it first."
+    stop_lane 0
+  fi
+  CFG="$new_cfg"; FRONTS="$new_fronts"
+  if ! write_lane_meta; then
+    [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"
+    proxy_unlock
+    return 1
+  fi
+  if [ "$OUTBOUND" != config ]; then
     if ! mv -f "$CFG_STAGE" "$final_cfg"; then
       rm -f "$CFG_STAGE"; CFG_STAGE=""
       proxy_unlock
