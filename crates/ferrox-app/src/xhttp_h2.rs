@@ -130,10 +130,7 @@ impl<'a> DataBatch<'a> {
             if conn.client_read.is_some() {
                 drop(credit);
                 let pumped = conn.pump_read(
-                    || match self.reserved_fits(conn) {
-                        Some(false) => false,
-                        _ => true,
-                    },
+                    || !matches!(self.reserved_fits(conn), Some(false)),
                     crate::proxy::relay_step_owns_poll(),
                 );
                 gate = conn
@@ -193,7 +190,7 @@ impl<'a> DataBatch<'a> {
             .heads
             .iter()
             .take(self.used)
-            .map(|head| u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]])))
+            .map(|head| u64::from(u32::from_be_bytes([0, head[0], head[1], head[2]])))
             .sum();
         if total == 0 {
             return;
@@ -207,7 +204,7 @@ impl<'a> DataBatch<'a> {
         }
         let streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
         for head in self.heads.iter().take(self.used) {
-            let len = i64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]));
+            let len = i64::from(u32::from_be_bytes([0, head[0], head[1], head[2]]));
             let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
             if let Some(state) = streams.get(&id) {
                 let mut window = state
