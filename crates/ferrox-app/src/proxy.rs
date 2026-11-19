@@ -17327,6 +17327,7 @@ fn inbound_ss_destinations(inbound: &Json, method: &str) -> Vec<(Vec<u8>, Socket
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_ss_kcp_listener(
     address: &str,
     inbound: &Json,
