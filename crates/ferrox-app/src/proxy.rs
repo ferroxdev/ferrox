@@ -73905,7 +73905,6 @@ mod tests {
         hysteria_udp_echo_once();
     }
 
-    #[allow(clippy::too_many_lines)]
     fn hysteria_udp_echo_once() {
         use ferrox_core::foxy::frames as h3;
         let echo_port = udp_echo_loop();
@@ -73978,17 +73977,28 @@ mod tests {
         while let Ok((written, info)) = conn.send(&mut out) {
             sock.send_to(&out[..written], info.to).expect("pumps");
         }
+        hysteria_udp_echo_frames(&mut conn, &sock, &mut out, local, &address, horizon);
+    }
+
+    fn hysteria_udp_echo_frames(
+        conn: &mut quiche::Connection,
+        sock: &crate::quic::Datagram,
+        out: &mut [u8],
+        local: SocketAddr,
+        address: &str,
+        horizon: std::time::Instant,
+    ) {
         // Read until the echo returns over the lane, driving the connection so the reply's packets are delivered; then repeat with a header-only frame that carries no payload.
         sock.set_read_timeout(Some(Duration::from_millis(200)))
             .expect("timeout");
         let mut echoed = false;
         loop {
             assert!(std::time::Instant::now() < horizon, "echo never returns");
-            if let Ok((n, from)) = sock.recv_from(&mut out) {
+            if let Ok((n, from)) = sock.recv_from(out) {
                 let info = quiche::RecvInfo { from, to: local };
                 let _ = conn.recv(&mut out[..n], info);
             }
-            while let Ok((written, info)) = conn.send(&mut out) {
+            while let Ok((written, info)) = conn.send(out) {
                 let _ = sock.send_to(&out[..written], info.to);
             }
             if let Ok(data) = conn.dgram_recv_buf() {
@@ -74004,13 +74014,13 @@ mod tests {
                         packet: 2,
                         frag: 0,
                         frags: 1,
-                        address: &address,
+                        address,
                         payload: b"",
                     };
                     let mut wire = Vec::new();
                     ferrox_core::hysteria::encode_udp_unchecked(&empty, &mut wire);
                     conn.dgram_send(&wire).expect("sends");
-                    while let Ok((written, info)) = conn.send(&mut out) {
+                    while let Ok((written, info)) = conn.send(out) {
                         sock.send_to(&out[..written], info.to).expect("pumps");
                     }
                 } else if echoed && got.payload.is_empty() {

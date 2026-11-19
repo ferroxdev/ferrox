@@ -2222,6 +2222,9 @@ fn udp_reader(
             }
             Err(_) => break,
         };
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let Ok(mut conn) = shared.lock() else {
             break;
         };
@@ -3125,9 +3128,6 @@ pub(crate) fn serve_prepared(
     }
     let mut readers = Vec::new();
     for inbound in router.routes.values_mut() {
-        if inbound.udp.is_empty() {
-            continue;
-        }
         for (_, mut flow) in inbound.udp.drain() {
             flow.stop.store(true, Ordering::Relaxed);
             if let Some(reader) = flow.reader.take() {

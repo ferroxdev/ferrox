@@ -91,17 +91,22 @@ impl Client {
     /// server name is the authority host and the roots are the platform anchors, verified unless the
     /// rendezvous itself names `http` — the scheme already chose which one travels.
     fn open(&self) -> Option<DynStream> {
-        self.open_with_timeout(Some(Duration::from_secs(5)))
+        self.open_with_timeout(Some(Duration::from_secs(5)), |_| {})
             .map(|(stream, _)| stream)
     }
 
-    fn open_with_timeout(&self, read_timeout: Option<Duration>) -> Option<(DynStream, TcpStream)> {
+    fn open_with_timeout(
+        &self,
+        read_timeout: Option<Duration>,
+        on_connect: impl FnOnce(TcpStream),
+    ) -> Option<(DynStream, TcpStream)> {
         let address: SocketAddr = format!("{}:{}", self.host, self.port)
             .to_socket_addrs()
             .ok()?
             .next()?;
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).ok()?;
         let interrupt = stream.try_clone().ok()?;
+        on_connect(stream.try_clone().ok()?);
         let _ = stream.set_read_timeout(read_timeout);
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
         if !self.is_https() {
@@ -219,8 +224,9 @@ impl Client {
         id: &str,
         session: &str,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        on_connect: impl FnOnce(TcpStream),
     ) -> Option<EventStream> {
-        let (mut stream, interrupt) = self.open_with_timeout(Some(Duration::from_secs(60)))?;
+        let (mut stream, _) = self.open_with_timeout(Some(Duration::from_secs(60)), on_connect)?;
         let host_header = self.host_header();
         let path = join_path(id, "events");
         let mut request = Vec::with_capacity(128);
@@ -265,7 +271,6 @@ impl Client {
             event: String::new(),
             data: String::new(),
             stop,
-            interrupt,
         })
     }
 }
@@ -367,7 +372,6 @@ pub(crate) struct EventStream {
     event: String,
     data: String,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    interrupt: TcpStream,
 }
 
 impl EventStream {
@@ -414,11 +418,6 @@ impl EventStream {
                 }
             }
         }
-    }
-
-    /// A clone of the events socket a caller can shut down.
-    pub(crate) fn interrupt_handle(&self) -> Option<TcpStream> {
-        self.interrupt.try_clone().ok()
     }
 }
 
@@ -1020,9 +1019,13 @@ pub(crate) fn serve_registration(
             let _ = events_client.deregister(&config.id, &session);
             return;
         }
-        let Some(mut stream) =
-            events_client.open_events(&config.id, &session, std::sync::Arc::clone(&stop))
-        else {
+        let Some(mut stream) = events_client.open_events(
+            &config.id,
+            &session,
+            std::sync::Arc::clone(&stop),
+            |handle| state.watch_events(handle),
+        ) else {
+            state.clear_events();
             session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
             napping(backoff.min(Duration::from_secs(30)), || {
                 stop.load(std::sync::atomic::Ordering::Relaxed)
@@ -1030,9 +1033,6 @@ pub(crate) fn serve_registration(
             backoff = (backoff * 2).min(Duration::from_secs(30));
             continue;
         };
-        if let Some(handle) = stream.interrupt_handle() {
-            state.watch_events(handle);
-        }
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             state.clear_events();
             session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
