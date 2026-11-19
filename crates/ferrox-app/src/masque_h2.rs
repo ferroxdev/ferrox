@@ -1327,33 +1327,7 @@ impl Session {
             h2::T_PING if flags & h2::F_ACK == 0 => {
                 wire.send(h2::T_PING, h2::F_ACK, 0, body);
             }
-            h2::T_HEADERS => {
-                if let Some(active) = self.request {
-                    if id != active {
-                        wire.send(h2::T_RST, 0, id, &7u32.to_be_bytes());
-                        return;
-                    }
-                    let block = strip_padding(flags, body, true);
-                    if flags & h2::F_END_HEADERS != 0 {
-                        self.trailers(block);
-                        if flags & h2::F_END != 0 {
-                            self.half_close();
-                        }
-                    } else {
-                        self.continuation = Some((id, block.to_vec(), flags, true));
-                    }
-                    return;
-                }
-                let block = strip_padding(flags, body, true);
-                if flags & h2::F_END_HEADERS != 0 {
-                    self.request(wire, id, block);
-                    if flags & h2::F_END != 0 {
-                        self.half_close();
-                    }
-                } else {
-                    self.continuation = Some((id, block.to_vec(), flags, false));
-                }
-            }
+            h2::T_HEADERS => self.headers(wire, flags, id, body),
             h2::T_CONT => {
                 if let Some((stream, mut block, head_flags, trailers)) = self.continuation.take() {
                     if stream != id {
@@ -1411,6 +1385,35 @@ impl Session {
             h2::T_RST if Some(id) == self.request => self.end = true,
             h2::T_GOAWAY => self.end = true,
             _ => {}
+        }
+    }
+
+    /// A field block after the request head is a trailer: decode it to keep HPACK state, and end the request when it closes.
+    fn headers(&mut self, wire: &mut Wire, flags: u8, id: u32, body: &[u8]) {
+        if let Some(active) = self.request {
+            if id != active {
+                wire.send(h2::T_RST, 0, id, &7u32.to_be_bytes());
+                return;
+            }
+            let block = strip_padding(flags, body, true);
+            if flags & h2::F_END_HEADERS != 0 {
+                self.trailers(block);
+                if flags & h2::F_END != 0 {
+                    self.half_close();
+                }
+            } else {
+                self.continuation = Some((id, block.to_vec(), flags, true));
+            }
+            return;
+        }
+        let block = strip_padding(flags, body, true);
+        if flags & h2::F_END_HEADERS != 0 {
+            self.request(wire, id, block);
+            if flags & h2::F_END != 0 {
+                self.half_close();
+            }
+        } else {
+            self.continuation = Some((id, block.to_vec(), flags, false));
         }
     }
 
@@ -2498,7 +2501,7 @@ mod tests {
     fn a_near_cap_block_is_rejected_without_growing() {
         let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
         let half = FRAME_CAP / 2 + 1;
-        session.continuation = Some((1, vec![0u8; half], 0));
+        session.continuation = Some((1, vec![0u8; half], 0, false));
         let body = vec![0u8; half];
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),

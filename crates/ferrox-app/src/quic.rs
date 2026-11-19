@@ -5184,6 +5184,31 @@ impl Routing {
             unverified: 0,
         }
     }
+
+    fn retire(&mut self, (closed, closed_unverified, verified): (usize, usize, usize)) {
+        self.lanes = self.lanes.saturating_sub(closed);
+        self.unverified = self
+            .unverified
+            .saturating_sub(closed_unverified)
+            .saturating_sub(verified);
+    }
+}
+
+/// One connection's close is counted once, while every key it owns leaves the table with it.
+fn note_closed(
+    state: &ServerConn,
+    key: &[u8],
+    scratch: &mut Scratch,
+    closed: &mut usize,
+    unverified: &mut usize,
+) {
+    if !state.gone.swap(true, Ordering::Relaxed) {
+        *closed += 1;
+        if !state.established.load(Ordering::Relaxed) {
+            *unverified += 1;
+        }
+    }
+    scratch.closed.push(key.to_vec());
 }
 
 /// One packet to its connection, or to a new connection when it knocks with an Initial.
@@ -5343,7 +5368,7 @@ fn reap(
     let mut closed_unverified = 0usize;
     let mut verified_lanes = 0usize;
     // A state is keyed once per connection id, so the stamp keeps one connection's questions asked once.
-    for (key, state) in routes.conns.iter() {
+    for (key, state) in &routes.conns {
         if state.visit.load(Ordering::Relaxed) == epoch {
             // A closed connection still owes every key it routes: they leave together.
             if state.gone.load(Ordering::Relaxed) {
@@ -5356,26 +5381,26 @@ fn reap(
             continue;
         };
         if conn.is_closed() {
-            if !state.gone.swap(true, Ordering::Relaxed) {
-                closed_lanes += 1;
-                if !state.established.load(Ordering::Relaxed) {
-                    closed_unverified += 1;
-                }
-            }
-            scratch.closed.push(key.clone());
+            note_closed(
+                state,
+                key,
+                scratch,
+                &mut closed_lanes,
+                &mut closed_unverified,
+            );
             continue;
         }
         if conn.timeout().is_some_and(|left| left.is_zero()) {
             conn.on_timeout();
             flush_egress(&mut conn, sock);
             if conn.is_closed() {
-                if !state.gone.swap(true, Ordering::Relaxed) {
-                    closed_lanes += 1;
-                    if !state.established.load(Ordering::Relaxed) {
-                        closed_unverified += 1;
-                    }
-                }
-                scratch.closed.push(key.clone());
+                note_closed(
+                    state,
+                    key,
+                    scratch,
+                    &mut closed_lanes,
+                    &mut closed_unverified,
+                );
                 continue;
             }
         }
@@ -5419,11 +5444,7 @@ fn reap(
         }
     }
     scratch.deadline = deadline;
-    routes.lanes = routes.lanes.saturating_sub(closed_lanes);
-    routes.unverified = routes
-        .unverified
-        .saturating_sub(closed_unverified)
-        .saturating_sub(verified_lanes);
+    routes.retire((closed_lanes, closed_unverified, verified_lanes));
     for (key, state) in scratch.learned.drain(..) {
         routes.conns.entry(key).or_insert(state);
     }
