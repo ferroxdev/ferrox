@@ -140,14 +140,12 @@ fn serve(mut stream: TcpStream) {
             buf.fill(0x5a);
             while stream.write_all(&buf).is_ok() {}
         }
-        ECHO => {
-            loop {
-                let Ok(n) = stream.read(&mut buf) else { return };
-                if n == 0 || stream.write_all(&buf[..n]).is_err() {
-                    return;
-                }
+        ECHO => loop {
+            let Ok(n) = stream.read(&mut buf) else { return };
+            if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                return;
             }
-        }
+        },
         RR => {
             let size = size.clamp(1, 16384) as usize;
             loop {
@@ -181,7 +179,9 @@ fn tcp_client(args: &Args) {
     for _ in 0..streams.max(1) {
         let bytes = Arc::clone(&bytes);
         let failed = Arc::clone(&failed);
-        handles.push(thread::spawn(move || stream_run(endpoint, reverse, deadline, &bytes, &failed)));
+        handles.push(thread::spawn(move || {
+            stream_run(endpoint, reverse, deadline, &bytes, &failed)
+        }));
     }
     for handle in handles {
         let _ = handle.join();
@@ -201,9 +201,7 @@ fn tcp_client(args: &Args) {
     );
     println!(
         "{} streams {:.3} Gbit/s over {:.2} s",
-        streams,
-        gbps,
-        elapsed
+        streams, gbps, elapsed
     );
 }
 
@@ -327,9 +325,9 @@ fn udp_server(listen: SocketAddr, echo: bool) -> ! {
 }
 
 fn widen(socket: &UdpSocket) {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     let _ = socket;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(socket);
         for option in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
@@ -358,7 +356,9 @@ fn stamp(buf: &mut [u8], sequence: u64) {
 }
 
 fn intact(buf: &[u8]) -> bool {
-    if buf.len() < 12 || u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize != buf.len() {
+    if buf.len() < 12
+        || u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize != buf.len()
+    {
         return false;
     }
     let sequence = u64::from_le_bytes(buf[0..8].try_into().unwrap());
@@ -388,8 +388,9 @@ fn udp_client(args: &Args) {
     let deadline = start + Duration::from_secs(seconds);
     let total = pps * seconds;
     let per_tick = (pps / 1000).max(1);
+    const BATCH: usize = 64;
     let mut segments = if gso { (64_000 / size).max(1) } else { 1 };
-    let mut payload = vec![0u8; size * segments];
+    let mut payload = vec![0u8; size * BATCH.max(segments)];
     let mut received = 0u64;
     let mut corrupt = 0u64;
     let mut sent = 0u64;
@@ -399,29 +400,32 @@ fn udp_client(args: &Args) {
         // Pace off the clock rather than a fixed tick, so a tick the scheduler delays is made up
         // instead of shrinking the offered load.
         let owed = ((pps as f64 * start.elapsed().as_secs_f64()) as u64).min(total);
-        let mut step_owed = owed.saturating_sub(sent);
-        if step_owed == 0 && sent < total {
-            step_owed = per_tick;
+        let mut want = owed.saturating_sub(sent);
+        if want == 0 && sent < total {
+            want = per_tick;
         }
-        for _ in 0..step_owed {
-            stamp(&mut payload[..size], sequence);
+        while want > 0 {
+            let chunk = want.min(BATCH as u64) as usize;
             let step = if segments > 1 {
-                socket.send(&payload)
+                stamp(&mut payload[..size], sequence);
+                socket.send(&payload[..size * segments]).map(|_| 1)
             } else {
-                socket.send(&payload[..size])
+                Ok(send_batch(&socket, &mut payload, size, sequence, chunk))
             };
-            if step.is_err() && segments > 1 {
-                // A kernel that refuses the segment option: the batch went nowhere, so drop back to
-                // single datagrams rather than reporting an engine that moved no bytes.
-                segments = 1;
-                payload.truncate(size);
-                continue;
+            match step {
+                Ok(0) => break,
+                Ok(n) => {
+                    sent += n as u64;
+                    sequence += n as u64;
+                    want -= n as u64;
+                }
+                Err(_) if segments > 1 => {
+                    // A kernel that refuses the segment option: the batch went nowhere, so drop
+                    // back to single datagrams rather than reporting an engine that moved nothing.
+                    segments = 1;
+                }
+                Err(_) => break,
             }
-            if step.is_err() {
-                break;
-            }
-            sent += 1;
-            sequence += 1;
         }
         drain(&socket, &mut rbuf, &mut received, &mut corrupt);
         thread::sleep(Duration::from_micros(200));
@@ -443,6 +447,63 @@ fn udp_client(args: &Args) {
         ),
     );
     println!("{received} of {sent} echoed, {measured:.0} pps");
+}
+
+/// Stamps and sends one batch, returning how many left. A single `sendmmsg(2)` per batch is what
+/// keeps a 100k pps offer inside one thread instead of paying one syscall a datagram.
+fn send_batch(
+    socket: &UdpSocket,
+    payload: &mut [u8],
+    size: usize,
+    sequence: u64,
+    count: usize,
+) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(socket);
+        let count = count.min(payload.len() / size).max(1);
+        let mut iov = Vec::with_capacity(count);
+        for index in 0..count {
+            let start = index * size;
+            stamp(&mut payload[start..start + size], sequence + index as u64);
+            iov.push(libc::iovec {
+                iov_base: payload[start..].as_mut_ptr() as *mut libc::c_void,
+                iov_len: size,
+            });
+        }
+        let mut msgs: Vec<libc::mmsghdr> = (0..count)
+            .map(|index| libc::mmsghdr {
+                msg_hdr: libc::msghdr {
+                    msg_name: std::ptr::null_mut(),
+                    msg_namelen: 0,
+                    msg_iov: unsafe { iov.as_mut_ptr().add(index) },
+                    msg_iovlen: 1,
+                    msg_control: std::ptr::null_mut(),
+                    msg_controllen: 0,
+                    msg_flags: 0,
+                },
+                msg_len: 0,
+            })
+            .collect();
+        let moved = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), count as libc::c_uint, 0) };
+        if moved < 0 {
+            return 0;
+        }
+        return moved as usize;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut moved = 0;
+        for index in 0..count {
+            let start = index * size;
+            stamp(&mut payload[start..start + size], sequence + index as u64);
+            if socket.send(&payload[start..start + size]).is_err() {
+                break;
+            }
+            moved += 1;
+        }
+        moved
+    }
 }
 
 fn drain(socket: &UdpSocket, buf: &mut [u8], received: &mut u64, corrupt: &mut u64) {
