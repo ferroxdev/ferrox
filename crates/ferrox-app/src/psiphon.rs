@@ -1495,8 +1495,7 @@ impl Inner {
             let inproxy_api_timeout = self
                 .settings
                 .inproxy_api_timeout
-                .mul_f64(self.settings.latency.multiplier())
-                .min(budget);
+                .mul_f64(self.settings.latency.multiplier());
             let limiter = rate_limiter.clone();
             let rate_deadline = Instant::now() + budget;
             let force_remaining = Arc::clone(&inproxy_force_remaining);
@@ -1565,6 +1564,7 @@ impl Inner {
                     return Err("psiphon: dial budget expired before the attempt".to_owned());
                 }
                 let timeout = timeout.min(left);
+                let api_timeout = use_inproxy.then_some(inproxy_api_timeout.min(left));
                 let identity = Identity {
                     session_id: &session_id,
                     authorizations: &authorizations,
@@ -1594,7 +1594,7 @@ impl Inner {
                     keepalive,
                     &tls_shape,
                     limit_meek_buffers,
-                    use_inproxy.then_some(inproxy_api_timeout),
+                    api_timeout,
                     Some(Arc::clone(&requests)),
                     burst,
                 ) {

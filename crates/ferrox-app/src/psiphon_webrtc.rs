@@ -1852,6 +1852,7 @@ impl Conduit {
         address: IpAddr,
         destination: &Destination,
         identity: &Identity<'_>,
+        allowance: Duration,
     ) -> Result<(InproxyStream, Relay), String> {
         if !self.routes.iter().any(|route| !route.fronts.is_empty()) {
             return Err("psiphon conduit: no broker front".to_owned());
@@ -1886,12 +1887,18 @@ impl Conduit {
                 destination.protocol
             ));
         }
+        let deadline = Instant::now()
+            + self
+                .timeout
+                .min(self.offer_timeout.saturating_add(self.await_ready_timeout))
+                .min(allowance);
         let mut metrics = Metrics::from_identity(identity);
-        if weighted(self.discover_nat, random_unit()) {
+        let nat_left = deadline.saturating_duration_since(Instant::now());
+        if !nat_left.is_zero() && weighted(self.discover_nat, random_unit()) {
             if let Some(nat) = discover_nat_type(
                 &self.rfc5780_stun_servers,
                 address,
-                self.discover_nat_timeout,
+                self.discover_nat_timeout.min(nat_left),
                 &self.dns_config,
             ) {
                 *lock(&self.nat_type) = Some(nat);
@@ -1900,10 +1907,6 @@ impl Conduit {
         if let Some(nat) = *lock(&self.nat_type) {
             metrics.set_nat_type(nat);
         }
-        let deadline = Instant::now()
-            + self
-                .timeout
-                .min(self.offer_timeout.saturating_add(self.await_ready_timeout));
         let personal = !self.personal.is_empty();
         let failover = if personal {
             self.no_match_failover_personal

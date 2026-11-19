@@ -1744,7 +1744,8 @@ impl Session {
     ) -> Result<Self, String> {
         let (stream, mut relay, protocol, relay_protocol) =
             if let (Some(conduit), Some(destination)) = (conduit, server.inproxy.as_ref()) {
-                let (stream, relay) = conduit.open(server.address, destination, identity)?;
+                let (stream, relay) =
+                    conduit.open(server.address, destination, identity, timeout)?;
                 let base = destination.base_protocol();
                 let data = |stream: WebRtcStream| -> Result<Stream, String> {
                     Ok(match base {
