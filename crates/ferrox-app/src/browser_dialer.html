@@ -14,6 +14,7 @@ const RECONNECT_MAX = 5000;
 let reconnect = RECONNECT_MIN;
 let live = 0;
 let idle = 0;
+let spawning = 0;
 
 function initFor(task) {
   const init = {};
@@ -100,7 +101,12 @@ async function run(ws, task) {
   }
 
   if (task.method === "GET" && task.streamResponse) {
-    const init = initFor(task);
+    let init;
+    try { init = initFor(task); } catch (_) {
+      try { ws.send("fail"); } catch (_) {}
+      ws.close();
+      return;
+    }
     const abort = new AbortController();
     let reader = null;
     let acknowledged = false;
@@ -135,7 +141,12 @@ async function run(ws, task) {
   }
 
   if (!task.streamResponse) {
-    const init = initFor(task);
+    let init;
+    try { init = initFor(task); } catch (_) {
+      try { ws.send("fail"); } catch (_) {}
+      ws.close();
+      return;
+    }
     init.method = task.method;
     const abort = new AbortController();
     init.signal = abort.signal;
@@ -164,13 +175,16 @@ function closed(ws) {
   ws.closed = true;
   live -= 1;
   if (ws.opened && !ws.consumed) idle -= 1;
-  if (idle < IDLE && live < LIVE_MAX) respawn();
+  // A consumed socket already scheduled its replacement; only an idle socket, or one the live cap left unreplaced, is replenished here.
+  if (idle < IDLE && live < LIVE_MAX && (!ws.consumed || !ws.replaced)) respawn();
 }
 
 function respawn() {
+  if (live + spawning >= LIVE_MAX) return;
   const wait = reconnect;
   reconnect = Math.min(reconnect * 2, RECONNECT_MAX);
-  setTimeout(connect, wait);
+  spawning += 1;
+  setTimeout(() => { spawning -= 1; connect(); }, wait);
 }
 
 function connect() {

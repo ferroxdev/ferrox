@@ -918,6 +918,20 @@ impl Endpoint {
         endpoint
     }
 
+    /// A challenge page's origin: the caller's dial, TLS settings and pins under the page's own authority, with the fronted `Host` cleared so the request names the origin that issued the challenge.
+    #[must_use]
+    pub(crate) fn challenged(&self, host: &str) -> Self {
+        let mut endpoint = self.clone();
+        endpoint.base = String::new();
+        endpoint.host_header = None;
+        if !host.eq_ignore_ascii_case(&self.host) {
+            endpoint.port = 443;
+        }
+        endpoint.host = host.to_owned();
+        endpoint.address = self.address.or_else(|| edge_peer(host, endpoint.port));
+        endpoint
+    }
+
     fn tls(&self) -> TlsConfig {
         TlsConfig {
             server_name: self
@@ -1232,19 +1246,8 @@ pub(crate) fn h2_ask(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Reply, String> {
-    // One call, one connection: the exchange the reference makes, and nothing kept for the next call to trust.
-    let mut connection = H2Connection::connect(endpoint)?;
-    let mut retried = false;
-    loop {
-        match connection.request(endpoint, method, path, headers, body) {
-            Ok(reply) => return Ok(reply),
-            Err(why) if retried => return Err(why),
-            Err(_) => {
-                connection = H2Connection::connect(endpoint)?;
-                retried = true;
-            }
-        }
-    }
+    // One call, one connection: the exchange the reference makes, and nothing kept for the next call to trust. A request that reached the peer is never replayed, because a POST cannot be sent twice safely.
+    H2Connection::connect(endpoint)?.request(endpoint, method, path, headers, body)
 }
 
 /// One request and its answer over HTTP/1.1, headers exactly as the caller wrote them: the exchange every plane of this app makes, cookie jar or none.

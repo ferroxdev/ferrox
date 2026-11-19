@@ -884,11 +884,6 @@ fn attach(
     }
     inner.next_stream += 2;
     let peer_initial = inner.peer_initial;
-    let mut lane = Tls2 {
-        session: Arc::clone(session),
-        stream,
-        class,
-    };
     let mut block = std::mem::take(&mut inner.scratch);
     block.clear();
     build(&mut block);
@@ -907,6 +902,12 @@ fn attach(
         .streams
         .insert(stream, Stream::new(i64::from(peer_initial) as u32));
     drop(inner);
+    // Built after the session lock is released: a failed open drops this lane, and its cleanup locks the session again.
+    let mut lane = Tls2 {
+        session: Arc::clone(session),
+        stream,
+        class,
+    };
     let status = match lane.await_status() {
         Ok(status) => status,
         Err(failure) => {
@@ -3900,24 +3901,22 @@ impl Tls2 {
                     return Err(Failure::Stream);
                 }
                 // A zero initial window is a valid setting, so the grant that opens this lane can only arrive as a frame: read and apply it here, because no other reader exists on this dedicated tunnel yet.
-                let _ = inner.tls.get_ref().set_read_timeout(Some(left));
+                let previous = inner.tls.get_ref().read_timeout().ok().flatten();
+                let wait = left.min(inner.quantum).max(Duration::from_millis(1));
+                let _ = inner.tls.get_ref().set_read_timeout(Some(wait));
                 let read = Self::with_frame_locked(
                     &mut inner,
                     self.stream,
                     &mut [],
                     |inner, frame, payload, _| {
-                        if let frames::H2Routed::Data {
-                            stream,
-                            payload,
-                            end,
-                            wire,
-                        } = frames::h2_routed(frame, payload)
-                        {
-                            stage_foreign(inner, PoolClass::Ip, stream, payload, end, wire)?;
+                        stage_address(inner, frame, payload).map_err(|_| Failure::Io)?;
+                        if inner.gone {
+                            return Err(Failure::Stream);
                         }
                         Ok::<(), Failure>(())
                     },
                 );
+                let _ = inner.tls.get_ref().set_read_timeout(previous);
                 match read {
                     Ok(Ok(())) => {}
                     Ok(Err(failure)) => return Err(failure),

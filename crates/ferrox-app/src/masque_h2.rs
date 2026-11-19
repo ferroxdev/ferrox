@@ -1171,6 +1171,7 @@ struct Session {
     capsule_at: usize,
     frame: Vec<u8>,
     request: Option<u32>,
+    last_stream: u32,
     continuation: Option<(u32, Vec<u8>, u8, bool)>,
     outgoing: Option<Receiver<Vec<u8>>>,
     queued: VecDeque<Vec<u8>>,
@@ -1197,6 +1198,7 @@ impl Session {
             capsule_at: 0,
             frame: Vec::new(),
             request: None,
+            last_stream: 0,
             continuation: None,
             outgoing: None,
             queued: VecDeque::new(),
@@ -1357,7 +1359,7 @@ impl Session {
             h2::T_DATA => {
                 if id == 0 {
                     let mut goaway = [0u8; 8];
-                    goaway[..4].copy_from_slice(&self.request.unwrap_or(0).to_be_bytes());
+                    goaway[..4].copy_from_slice(&self.last_stream.to_be_bytes());
                     goaway[4..].copy_from_slice(&1u32.to_be_bytes());
                     wire.send(h2::T_GOAWAY, 0, 0, &goaway);
                     self.end = true;
@@ -1391,6 +1393,7 @@ impl Session {
 
     /// A field block after the request head is a trailer: decode it to keep HPACK state, and end the request when it closes.
     fn headers(&mut self, wire: &mut Wire, flags: u8, id: u32, body: &[u8]) {
+        self.last_stream = self.last_stream.max(id);
         if let Some(active) = self.request {
             if id != active {
                 let block = strip_padding(flags, body, true);
@@ -1436,6 +1439,7 @@ impl Session {
     }
 
     fn request(&mut self, wire: &mut Wire, id: u32, block: &[u8]) {
+        self.last_stream = self.last_stream.max(id);
         let mut fields = Vec::new();
         let mut expanded = 0usize;
         let mut overflow = false;

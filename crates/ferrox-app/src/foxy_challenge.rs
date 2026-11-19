@@ -261,10 +261,7 @@ fn solve_reply(
                 .filter(|origin| trusted_origin(origin, &endpoint.host))
                 .unwrap_or_else(|| format!("https://{}", endpoint.host));
             let host = origin.strip_prefix("https://").unwrap_or(&origin);
-            let challenged = Endpoint {
-                base: String::new(),
-                ..endpoint.with_host(host)
-            };
+            let challenged = endpoint.challenged(host);
             match solve_page(&challenged, jar, &page, solver_page(agent)) {
                 Ok(()) => return Ok(()),
                 Err(other) => last = other,
@@ -274,7 +271,7 @@ fn solve_reply(
     asked.push(endpoint.clone());
     for host in FALLBACKS {
         if host != endpoint.host {
-            asked.push(endpoint.with_host(host));
+            asked.push(endpoint.challenged(host));
         }
     }
     for host in &asked {

@@ -3983,7 +3983,10 @@ impl Http {
         }
         let mut lane = self.dial(&target, peer)?;
         let answer = lane.exchange(&head, body, header_only, limit)?;
-        self.finish(&key, lane, &answer);
+        // A lane pinned to one address never returns to the origin-keyed pool: a later unpinned call would otherwise ride the pin.
+        if peer.is_none() {
+            self.finish(&key, lane, &answer);
+        }
         Ok((answer.status, answer.body))
     }
 

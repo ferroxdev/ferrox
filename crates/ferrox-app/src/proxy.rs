@@ -27911,14 +27911,29 @@ fn probe_edge_exit(
     edge: &ferrox_core::foxy::Candidate,
     authority: &str,
 ) -> Option<String> {
-    // A pinned edge is only trusted on a carrier that checks the pins; QUIC has no pin check, so it cannot carry the probe pass.
-    if !foxy.pins.is_empty() {
-        return None;
-    }
     let pass = foxy
         .account
         .as_ref()
         .map_or_else(|| foxy.pass.clone(), |account| account.current());
+    // A pinned edge is only trusted on a carrier that checks the pins; QUIC has no pin check, so a pinned probe takes H2, which does.
+    if !foxy.pins.is_empty() {
+        let dial = crate::foxy::FoxyDial {
+            host: edge.host.clone(),
+            port: edge.port,
+            address: foxy.edge_address,
+            carrier: crate::foxy::Carrier::H2,
+            upstream: foxy.upstream.clone(),
+            roots: foxy.roots.clone(),
+            pins: foxy.pins.clone(),
+            pass,
+        };
+        let budget = budgets::carrier_probe();
+        let mut tunnel = crate::foxy::Tunnel::open(&dial, authority, None).ok()?;
+        let _ = tunnel.set_read_quantum(budget);
+        let seen = foxy_exit_country(&mut tunnel, foxy);
+        drop(tunnel);
+        return seen;
+    }
     let dial = crate::foxy::FoxyDial {
         host: edge.host.clone(),
         port: edge.port,
