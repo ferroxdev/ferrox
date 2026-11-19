@@ -2698,12 +2698,6 @@ impl Inner {
         if remote != NO_CHANNEL && !self.closed.load(Ordering::Acquire) {
             lock(&self.deferred_close).push(remote);
         }
-        let mut writer = match self.writer.try_lock() {
-            Ok(writer) => writer,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
-        self.flush_deferred_close(&mut writer, None);
     }
 
     fn relay_round_trip(&self, payload: &[u8]) -> Result<Vec<u8>, String> {

@@ -1549,10 +1549,11 @@ fn drive(
                 }
                 if let Some(shaping) = &shaping {
                     if !wrote {
-                        let decoy = lock(shaping).decoy(MAX_DATAGRAM);
-                        if let Some(message) = decoy {
-                            if let Err(error) = webrtc.send(&message) {
-                                backlog.push_back(Err(error));
+                        if let Some(mut shaping) = try_lock(shaping) {
+                            if let Some(message) = shaping.decoy(MAX_DATAGRAM) {
+                                if let Err(error) = webrtc.send(&message) {
+                                    backlog.push_back(Err(error));
+                                }
                             }
                         }
                     }
@@ -1630,6 +1631,15 @@ fn unframe(mut data: Vec<u8>, done: &mut bool) -> Result<Option<Vec<u8>>, String
 /// Lock, recovering the data after a panic.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Try to lock without waiting; a producer shaping a batch keeps the driver draining.
+fn try_lock<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match mutex.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
 }
 
 /// Lock without waiting past the offer deadline.
