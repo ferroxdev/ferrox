@@ -92,33 +92,80 @@ impl<'a> DataBatch<'a> {
         if self.used == 0 {
             return true;
         }
-        // The credit lock holds a SETTINGS update away from the window check and the write, so a batch reserved before a reduced initial window waits instead of overrunning it.
-        let mut credit = conn
-            .send_conn
+        let deadline = std::time::Instant::now() + crate::budgets::relay_stall();
+        let mut gate = conn
+            .batch_gate
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         loop {
+            let mut credit = conn
+                .send_conn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             if conn.dead.load(Ordering::SeqCst) {
                 return false;
             }
             match self.reserved_fits(conn) {
-                None => return false,
-                Some(true) => break,
+                Some(true) => {
+                    drop(credit);
+                    let Ok(mut write) = conn.write.lock() else {
+                        return false;
+                    };
+                    return self.flush_locked(conn, &mut **write);
+                }
                 Some(false) => {}
+                None => {
+                    drop(credit);
+                    self.refund_reserved(conn);
+                    return false;
+                }
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                drop(credit);
+                self.refund_reserved(conn);
+                return false;
+            }
+            drop(gate);
+            if conn.client_read.is_some() {
+                drop(credit);
+                let pumped = conn.pump_read(
+                    || match self.reserved_fits(conn) {
+                        Some(false) => false,
+                        _ => true,
+                    },
+                    crate::proxy::relay_step_owns_poll(),
+                );
+                gate = conn
+                    .batch_gate
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if matches!(pumped, Pumped::Dead) {
+                    self.refund_reserved(conn);
+                    return false;
+                }
+                if matches!(pumped, Pumped::Yield) && self.reserved_fits(conn) != Some(true) {
+                    self.refund_reserved(conn);
+                    return false;
+                }
+                continue;
             }
             let (guard, waited) = conn
                 .wake
-                .wait_timeout(credit, crate::budgets::relay_stall())
+                .wait_timeout(credit, left)
                 .unwrap_or_else(PoisonError::into_inner);
             credit = guard;
-            if waited.timed_out() {
+            let timed_out = waited.timed_out();
+            drop(credit);
+            gate = conn
+                .batch_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if timed_out {
+                self.refund_reserved(conn);
                 return false;
             }
         }
-        let Ok(mut write) = conn.write.lock() else {
-            return false;
-        };
-        self.flush_locked(conn, &mut **write)
     }
 
     /// Whether every reserved frame still fits the stream window it was taken from: `None` when a
@@ -138,6 +185,39 @@ impl<'a> DataBatch<'a> {
             }
         }
         Some(fits)
+    }
+
+    /// Return the credit a batch that will never be written took from the connection and its stream.
+    fn refund_reserved(&self, conn: &H2Conn) {
+        let total: u64 = self
+            .heads
+            .iter()
+            .take(self.used)
+            .map(|head| u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]])))
+            .sum();
+        if total == 0 {
+            return;
+        }
+        {
+            let mut credit = conn
+                .send_conn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *credit = credit.saturating_add(total).min((1 << 31) - 1);
+        }
+        let streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        for head in self.heads.iter().take(self.used) {
+            let len = i64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]));
+            let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+            if let Some(state) = streams.get(&id) {
+                let mut window = state
+                    .send_window
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                *window = window.saturating_add(len).min(i64::from(u32::MAX >> 1));
+            }
+        }
+        conn.wake.notify_all();
     }
 
     /// The same bytes into a write half the caller already holds: a lane takes the lock without
@@ -477,6 +557,8 @@ pub(crate) struct H2Conn {
     session_of: Mutex<HashMap<u32, String>>,
     upload_of: Mutex<HashMap<u32, String>>,
     send_conn: Mutex<u64>,
+    /// Held across a reserved batch write so a SETTINGS window change cannot land before it.
+    batch_gate: Mutex<()>,
     wake: Condvar,
     decoder: Mutex<Decoder>,
     max_frame: Mutex<usize>,
@@ -1011,13 +1093,13 @@ impl H2Conn {
             .unwrap_or_else(PoisonError::into_inner);
         let mut batch = DataBatch::new();
         while !payload.is_empty() {
+            if batch.full() && !batch.flush(self) {
+                return false;
+            }
             let fit = payload.len().min(max);
             let Some(chunk) = self.credit(&state, fit as u64, &mut batch) else {
                 return false;
             };
-            if batch.full() && !batch.flush(self) {
-                return false;
-            }
             batch.add(stream, &payload[..chunk]);
             payload = &payload[chunk..];
         }
@@ -1047,13 +1129,13 @@ impl H2Conn {
             let mut index = 0;
             let mut offset = 0;
             while need > 0 {
+                if batch.full() && !batch.flush(self) {
+                    return false;
+                }
                 let want = need.min(max);
                 let Some(chunk) = self.credit(&state, want as u64, &mut batch) else {
                     return false;
                 };
-                if batch.full() && !batch.flush(self) {
-                    return false;
-                }
                 let mut parts: [&[u8]; 4] = [&[]; 4];
                 let mut used = 0;
                 let mut left = chunk;
@@ -1102,13 +1184,19 @@ impl H2Conn {
         if total == 0 {
             return Some(true);
         }
+        let Ok(_gate) = self.batch_gate.try_lock() else {
+            return None;
+        };
         let Ok(mut write) = self.write.try_lock() else {
             return None;
         };
-        let Ok(mut conn) = self.send_conn.try_lock() else {
-            return None;
-        };
         {
+            let Ok(mut conn) = self.send_conn.try_lock() else {
+                return None;
+            };
+            if self.dead.load(Ordering::SeqCst) || state.gone() {
+                return Some(false);
+            }
             let Ok(mut window) = state.send_window.try_lock() else {
                 return None;
             };
@@ -1707,7 +1795,11 @@ impl H2Conn {
                     .clamp(16_384, 16_777_215);
             } else if id == S_WINDOW {
                 let value = u64::from(value.min((1 << 31) - 1));
-                // A sender holds the connection window while it decides to wait; taking it here closes that gap.
+                // A sender holds the batch gate across its write and the connection window while it decides to wait.
+                let _gate = self
+                    .batch_gate
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
                 let conn = self
                     .send_conn
                     .lock()
@@ -2105,6 +2197,7 @@ impl H2Client {
             session_of: Mutex::new(HashMap::new()),
             upload_of: Mutex::new(HashMap::new()),
             send_conn: Mutex::new(65_535),
+            batch_gate: Mutex::new(()),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
             max_frame: Mutex::new(16_384),
@@ -3077,6 +3170,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     session_of: Mutex::new(HashMap::new()),
                     upload_of: Mutex::new(HashMap::new()),
                     send_conn: Mutex::new(65_535),
+                    batch_gate: Mutex::new(()),
                     wake: Condvar::new(),
                     decoder: Mutex::new(Decoder::default()),
                     max_frame: Mutex::new(16_384),
@@ -4262,6 +4356,28 @@ mod tests {
         );
     }
 
+    /// A batch whose stream retired before its write returns the connection credit it had taken.
+    #[test]
+    fn a_retired_stream_returns_its_unwritten_reservation() {
+        let (conn, _, _) = bare_conn();
+        let reserved = b"reserved".len() as u64;
+        *conn
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = 65_535 - reserved;
+        let mut batch = DataBatch::new();
+        batch.add(7, b"reserved");
+        assert!(!batch.flush(&conn), "a batch with no stream is not written");
+        assert_eq!(
+            *conn
+                .send_conn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            65_535,
+            "the unwritten reservation is returned"
+        );
+    }
+
     #[test]
     fn a_frame_window_is_the_readers_own_allocation() {
         let (conn, _, _) = bare_conn();
@@ -5376,6 +5492,7 @@ mod tests {
             session_of: Mutex::new(HashMap::new()),
             upload_of: Mutex::new(HashMap::new()),
             send_conn: Mutex::new(65_535),
+            batch_gate: Mutex::new(()),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
             max_frame: Mutex::new(16_384),
@@ -5881,6 +5998,7 @@ mod tests {
             session_of: Mutex::new(HashMap::new()),
             upload_of: Mutex::new(HashMap::new()),
             send_conn: Mutex::new(65_535),
+            batch_gate: Mutex::new(()),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
             max_frame: Mutex::new(16_384),
