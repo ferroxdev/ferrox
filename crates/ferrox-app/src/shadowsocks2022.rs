@@ -2029,6 +2029,13 @@ impl Datagrams {
             if body.len() < 19 + pad {
                 return None;
             }
+            if self
+                .peers
+                .get(&session)
+                .is_some_and(|peer| !peer.window.check(packet_id))
+            {
+                return None;
+            }
             let (target, used) = parse_addr_header(&body[19 + pad..])?;
             if body.len() < 19 + pad + used {
                 return None;
@@ -2072,6 +2079,13 @@ impl Datagrams {
             }
             let pad = usize::from(u16::from_be_bytes([body[17], body[18]]));
             if body.len() < 19 + pad {
+                return None;
+            }
+            if self
+                .peers
+                .get(&session)
+                .is_some_and(|peer| !peer.window.check(packet_id))
+            {
                 return None;
             }
             let (target, used) = parse_addr_header(&body[19 + pad..])?;

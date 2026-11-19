@@ -1549,11 +1549,11 @@ fn drive(
                 }
                 if let Some(shaping) = &shaping {
                     if !wrote {
-                        if let Some(mut shaping) = try_lock(shaping) {
-                            if let Some(message) = shaping.decoy(MAX_DATAGRAM) {
-                                if let Err(error) = webrtc.send(&message) {
-                                    backlog.push_back(Err(error));
-                                }
+                        let decoy =
+                            try_lock(shaping).and_then(|mut shaping| shaping.decoy(MAX_DATAGRAM));
+                        if let Some(message) = decoy {
+                            if let Err(error) = webrtc.send(&message) {
+                                backlog.push_back(Err(error));
                             }
                         }
                     }
