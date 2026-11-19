@@ -183,8 +183,8 @@ jobs:
         shell: bash
         run: |
           curl -fsSL --retry 3 -o GeoLite2-Country.mmdb \
-            https://github.com/mojolabs-id/GeoLite2-Database/releases/download/2026.11.01/GeoLite2-Country.mmdb
-          test -s GeoLite2-Country.mmdb
+            https://github.com/mojolabs-id/GeoLite2-Database/releases/download/2026.11.01/GeoLite2-Country.mmdb \
+            || echo "::warning::optional country database unavailable"
       - name: the handout
         shell: bash
         env:
@@ -348,7 +348,7 @@ jobs:
             gh release create "$VERSION" --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" \
               --notes-file RELEASE-BODY.md
           fi
-          gh release upload "$VERSION" GeoLite2-Country.mmdb --clobber
+          [ -s GeoLite2-Country.mmdb ] && gh release upload "$VERSION" GeoLite2-Country.mmdb --clobber
           gh release view "$VERSION" --json tagName,assets \
             --jq '.tagName + ": " + ([.assets[].name] | join(", "))'
 
@@ -369,7 +369,6 @@ jobs:
           mkdir -p packages
           gh release download "$VERSION" --dir packages --clobber
           cd packages
-          rm -f SHA256SUMS
           shopt -s nullglob
           assets=(./*.tar.gz ./*.zip ./*.mmdb)
           [ "${#assets[@]}" -gt 0 ] || { echo "no packages to checksum"; exit 0; }
