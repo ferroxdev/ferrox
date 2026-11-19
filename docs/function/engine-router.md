@@ -57,7 +57,7 @@ A flow has a network, a destination (a name stays a name; only a lane that carri
 
 A server inbound in this tree dials direct whatever the rules say. Rather than ignore the table per flow, startup walks the rules in order over the networks the inbound serves (its tag, the current OS, and a rule set's own network selector) and requires every rule still able to decide a flow to target a freedom outbound that dials itself, with no `dialerProxy` or `detour` — including a rule naming a fact the server flow does not carry, which is checked by its target rather than skipped. For a balancer, every candidate, its `fallbackTag` and an active forced target must pass the same test; when no fallback or forced target covers a strategy with no pick, the default is held to it too. Once a direct rule matches every flow of a network for the inbound, later rules cannot decide that network and are not checked; a network no rule covers must fall to a direct default. Anything else refuses the config with the tag named.
 
-A `tun` flow has no source or local address the rules could read. If any rule that could reach the tun tag names `source`, `sourcePort`, `localIP`, `localPort` or a rule set with a source selector, the config is refused naming that selector instead of letting the rule silently never match. A `process` rule is not refused: a tun flow carries no source address to look an owner up by, so the rule is carried and never holds. A routing script can still answer a tun flow by its destination, so a tun inbound is not refused for naming one.
+A `tun` flow has no source or local address the rules could read. If any rule that could reach the tun tag names `source`, `sourcePort`, `localIP`, `localPort` or a rule set with a source selector, the config is refused naming that selector instead of letting the rule silently never match. A `process` rule is not refused: a tun flow carries no source address to look an owner up by, so the rule is carried and never holds. A routing script can still answer a tun flow by its destination, so a tun inbound is not refused for naming one. A catch-all UDP rule still fixes the tun's datagram lane: `device_datagram` reads the association from the live table before the handler opens its lane and resolves it again at the open, so it skips the front's loopback association when that lane is a static SOCKS outbound and a rule the management API changed before the first datagram is the one dialled; a destination-dependent rule keeps the split path.
 
 A server inbound cannot evaluate a routing script, so a scripted config that would serve one is refused at startup naming the script; the reference's server path would otherwise route a dial it must keep direct.
 
@@ -69,6 +69,7 @@ A scripted config splits every SOCKS UDP association, because the script decides
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| syscalls-per-flow | UNBLESSED | scripts/count-ops.sh |
 | flow-decision-allocations | 0 | ferrox-app-router::tests::a_flow_without_a_domain_matcher_allocates_nothing |
 | host-lowercase-buffers-lowercase | 0 | ferrox-app-router::tests::a_lowercase_host_matches_without_a_buffer |
 | host-lowercase-buffers-mixed-case | 1 | ferrox-app-router::tests::a_mixed_case_host_takes_one_lowercase_buffer |
@@ -95,7 +96,7 @@ What was not removed: the compressed archive is still read into one buffer befor
 
 ## Time
 
-No duration is claimed here. Benchmarks are CI-only in this tree, and the pinned routing references have no per-flow durations that a local run could compare without the tunnel this machine sits behind. The operation-count gate (`scripts/count-ops.sh`) needs valgrind, which does not exist for macOS/aarch64, so on this host the figure is `UNBLESSED` and the gate is the `ops.yml` artefact in CI. The allocation and lookup counts above are the parts a test here can see exactly.
+No duration is claimed here. Benchmarks are CI-only in this tree, and the pinned routing references have no per-flow durations that a local run could compare without the tunnel this machine sits behind. The operation-count gate (`scripts/count-ops.sh`) needs valgrind, which does not exist for macOS/aarch64, so on this host the figure is `UNBLESSED` and the gate is the `ops.yml` artefact in CI. The allocation and lookup counts above are the parts a test here can see exactly. The syscall row is `UNBLESSED` for the same reason rather than zero: the decision itself reads the table in process, but a flow's socket syscalls belong to the lane the rule picked, and the filter that would slice the decision from that dial is the same CI artefact, so no local run may quote a number here.
 
 ## Pins
 

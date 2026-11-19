@@ -130,6 +130,9 @@ EXCLUDE_DOMAINS=""
 EXCLUDE_PORTS=""
 UPSTREAM=""
 WANT_WARP=0
+UDP_VIA=""
+BUILT_UDP_OUTBOUND=""
+BUILT_UDP_TAG=""
 WARP_STARTED=0
 WARP_CFG=""
 WARP_PID_FILE=""
@@ -156,6 +159,7 @@ PSIPHON_PASS=""
 PSIPHON_POOL=""
 PSIPHON_WORKERS=""
 PSIPHON_AGGRESSIVE=""
+PSIPHON_AGGRESSIVE_SET=0
 PSIPHON_FEATURES=""
 PSIPHON_LATENCY=""
 PSIPHON_CDN_PROFILE=""
@@ -274,6 +278,7 @@ so no password is asked again and FxA sends no new-sign-in mail.
 
   ferrox-cli up --foxy --vpn                    # asks once, then connects
   ferrox-cli up --foxy --vpn                    # second run: resumes, no sign-in
+  ferrox-cli up --foxy --vpn --udp-via warp     # TCP on foxy, UDP on WARP
   ferrox-cli locations --foxy                   # countries and cities to pin
   ferrox-cli locations --ping                   # the same list, nearest exit first
   ferrox-cli locations --veepn                  # VeePN region ids, no account
@@ -328,6 +333,12 @@ foxy options (email + password is the whole setup; there is no server to name)
   --warp                 chain through WARP first: register once, race WireGuard
                          against MASQUE, and egress the account plane and the
                          carrier through it (a region block sees a WARP exit)
+  --udp-via LANE         split egress: TCP stays on foxy, datagrams take a second
+                         outbound in the same config. LANE is foxy (default),
+                         warp, psiphon, psiphon-cdn, direct or block. warp is a
+                         registering WARP lane (or the --warp hop when both are
+                         named); psiphon rides its udpgw; direct is unencrypted;
+                         block drops UDP.
   --exclude-domains LIST domain suffixes that leave the tunnel and dial directly
                          (comma-separated; example.com also covers its subdomains)
   --exclude-ports LIST   destination ports that leave the tunnel and dial directly
@@ -856,11 +867,11 @@ PY
 
 # One JSON writer for every outbound: python3 already carries this tree's scripts.
 write_config() {
-  local outbound="$1" rc=0
-  python3 - "$CFG" "$outbound" "$FRONTS" "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" <<'PY'
+  local outbound="$1" udp="${2:-}" tag="${3:-}" rc=0
+  python3 - "$CFG" "$outbound" "$udp" "$tag" "$FRONTS" "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" <<'PY'
 import json, sys
 
-cfg, outbound, fronts, socks, http, mixed = sys.argv[1:7]
+cfg, outbound, udp, tag, fronts, socks, http, mixed = sys.argv[1:9]
 ports = {"socks": int(socks), "http": int(http), "mixed": int(mixed)}
 wanted = [f.strip() for f in fronts.split(",") if f.strip()]
 for front in wanted:
@@ -870,6 +881,13 @@ doc = {
     "inbounds": [{"protocol": f, "listen": "127.0.0.1", "port": ports[f]} for f in wanted],
     "outbounds": [json.loads(outbound)],
 }
+if udp:
+    lane = json.loads(udp)
+    lane["tag"] = tag
+    doc["outbounds"].append(lane)
+    doc["routing"] = {
+        "rules": [{"type": "field", "network": "udp", "outboundTag": tag}]
+    }
 with open(cfg, "w") as handle:
     json.dump(doc, handle, indent=2)
 PY
@@ -1331,6 +1349,46 @@ if exchange_key:
     settings["exchangeObfuscationKey"] = exchange_key
 print(json.dumps({"protocol": "psiphon", "settings": settings}))
 PY
+}
+
+# The lane UDP rides when it is not the foxy carrier: a second outbound in the
+# same config, so the routing rule `network: udp` sends datagrams there while
+# TCP stays on the first outbound.
+udp_outbound() {
+  case "$UDP_VIA" in
+    warp)
+      if [ "$WANT_WARP" = 1 ] && warp_hop_running; then
+        local port
+        port="$(cat "$WARP_PORT_FILE" 2>/dev/null || true)"
+        [ -n "$port" ] || return 1
+        python3 - "$port" <<'PY'
+import json, sys
+port = int(sys.argv[1])
+print(json.dumps({
+    "protocol": "socks",
+    "settings": {"servers": [{"address": "127.0.0.1", "port": port}]},
+}))
+PY
+      else
+        local identity
+        identity="$(resolve_real "$CONF_DIR/warp-identity.json")"
+        python3 - "$identity" <<'PY'
+import json, sys
+print(json.dumps({
+    "protocol": "warp",
+    "settings": {"identityFile": sys.argv[1], "register": True, "mode": "auto"},
+}))
+PY
+      fi ;;
+    psiphon|psiphon-cdn)
+      local state listen
+      state="$(resolve_real "${PSIPHON_DIR:-$CONF_DIR/psiphon-udp${INSTANCE:+-$INSTANCE}}")"
+      listen="${PSIPHON_LISTEN:-127.0.0.1:0}"
+      PSIPHON_DIR="$state" PSIPHON_LISTEN="$listen" psiphon_outbound ;;
+    direct) printf '%s' '{"protocol": "freedom"}' ;;
+    block) printf '%s' '{"protocol": "blackhole"}' ;;
+    *) return 1 ;;
+  esac
 }
 
 # A vless:// or vmess:// share link, or --vmess HOST:PORT, -> xray json.
@@ -2518,6 +2576,8 @@ build_outbound() {
 }
 
 build_config() {
+  BUILT_UDP_OUTBOUND=""
+  BUILT_UDP_TAG=""
   case "$OUTBOUND" in
     foxy)
       read_credentials
@@ -2541,6 +2601,16 @@ build_config() {
       fi
       BUILT_OUTBOUND="$(build_outbound foxy)" || exit 1
       save_lane_location
+      if [ -n "$UDP_VIA" ] && [ "$UDP_VIA" != foxy ]; then
+        BUILT_UDP_OUTBOUND="$(udp_outbound 2>&1)" || die "$BUILT_UDP_OUTBOUND"
+        BUILT_UDP_TAG="udp-$UDP_VIA"
+        case "$UDP_VIA" in
+          warp) say "udp: WARP is a second lane in this config; TCP stays on foxy." ;;
+          psiphon|psiphon-cdn) say "udp: Psiphon's udpgw is a second lane in this config; TCP stays on foxy." ;;
+          direct) say "udp: direct egress (unencrypted) for datagrams; TCP stays on foxy." ;;
+          block) say "udp: dropped at the lane; TCP stays on foxy." ;;
+        esac
+      fi
       ;;
     vless)
       case "$VLESS" in
@@ -2669,7 +2739,7 @@ start_lane() {
     CFG_STAGE="$(dirname "$final_cfg")/.$(basename "$final_cfg").stage.$$"
     rm -f "$CFG_STAGE"
     CFG="$CFG_STAGE"
-    if ! write_config "$BUILT_OUTBOUND"; then
+    if ! write_config "$BUILT_OUTBOUND" "$BUILT_UDP_OUTBOUND" "$BUILT_UDP_TAG"; then
       rm -f "$CFG_STAGE"; CFG_STAGE=""
       CFG="$final_cfg"
       proxy_unlock
@@ -3471,8 +3541,8 @@ while [ $# -gt 0 ]; do
     --psiphon-pass) need_value --psiphon-pass "a password" "$#" "${2:-}"; PSIPHON_PASS="$2"; shift 2 ;;
     --psiphon-pool) need_value --psiphon-pool "a tunnel count" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*) die "--psiphon-pool wants a number, got '$2'; nothing was started." ;; esac; PSIPHON_POOL="$2"; shift 2 ;;
     --psiphon-workers) need_value --psiphon-workers "a worker count" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*) die "--psiphon-workers wants a number, got '$2'; nothing was started." ;; esac; PSIPHON_WORKERS="$2"; shift 2 ;;
-    --psiphon-aggressive) PSIPHON_AGGRESSIVE=1; shift ;;
-    --psiphon-no-aggressive) PSIPHON_AGGRESSIVE=0; shift ;;
+    --psiphon-aggressive) PSIPHON_AGGRESSIVE=1; PSIPHON_AGGRESSIVE_SET=1; shift ;;
+    --psiphon-no-aggressive) PSIPHON_AGGRESSIVE=0; PSIPHON_AGGRESSIVE_SET=1; shift ;;
     --psiphon-conduit-mode)
       need_value --psiphon-conduit-mode "auto, private or public" "$#" "${2:-}"
       case "$2" in
@@ -3489,7 +3559,7 @@ while [ $# -gt 0 ]; do
     --psiphon-feature) need_value --psiphon-feature "client features" "$#" "${2:-}"; PSIPHON_FEATURES="$2"; shift 2 ;;
     --psiphon-latency) need_value --psiphon-latency "a multiplier of at least 1" "$#" "${2:-}"; PSIPHON_LATENCY="$2"; shift 2 ;;
     --psiphon-disable-timeouts) PSIPHON_DISABLE_TIMEOUTS=1; shift ;;
-    --psiphon-cdn|--psiphon-fronted) OUTBOUND=psiphon; PSIPHON_CDN_PROFILE=fronted; PSIPHON_AGGRESSIVE=1; PSIPHON_SHAPE=cdn; shift ;;
+    --psiphon-cdn|--psiphon-fronted) OUTBOUND=psiphon; PSIPHON_CDN_PROFILE=fronted; PSIPHON_AGGRESSIVE=1; PSIPHON_AGGRESSIVE_SET=1; PSIPHON_SHAPE=cdn; shift ;;
     --psiphon-cdn-profile) need_value --psiphon-cdn-profile "fronted, legacy, android or off" "$#" "${2:-}"; case "$2" in fronted|legacy|android|off) PSIPHON_CDN_PROFILE="$2" ;; *) die "--psiphon-cdn-profile wants fronted, legacy, android or off, got '$2'; nothing was started." ;; esac; shift 2 ;;
     --psiphon-cdn-ip) need_value --psiphon-cdn-ip "CDN edge addresses" "$#" "${2:-}"; PSIPHON_CDN_IPS="$2"; shift 2 ;;
     --psiphon-cdn-sni) need_value --psiphon-cdn-sni "CDN edge names" "$#" "${2:-}"; PSIPHON_CDN_SNI="$2"; shift 2 ;;
@@ -3538,6 +3608,12 @@ while [ $# -gt 0 ]; do
       FXA_USER_AGENT="$2"; shift 2 ;;
     --upstream) need_value --upstream "an http:// or socks5:// URL" "$#" "${2:-}"; UPSTREAM="$2"; shift 2 ;;
     --warp) WANT_WARP=1; shift ;;
+    --udp-via)
+      need_value --udp-via "foxy, warp, psiphon, psiphon-cdn, direct or block" "$#" "${2:-}"
+      case "$2" in
+        foxy|warp|psiphon|psiphon-cdn|direct|block) UDP_VIA="$2" ;;
+        *) die "--udp-via wants foxy, warp, psiphon, psiphon-cdn, direct or block, got '$2'; nothing was started." ;;
+      esac; shift 2 ;;
     --exclude-domains) need_value --exclude-domains "comma-separated domain suffixes" "$#" "${2:-}"; EXCLUDE_DOMAINS="$2"; shift 2 ;;
     --exclude-ports) need_value --exclude-ports "comma-separated ports" "$#" "${2:-}"; EXCLUDE_PORTS="$2"; shift 2 ;;
     --fronts) need_value --fronts "a comma-separated front list" "$#" "${2:-}"; FRONTS="$2"; FRONTS_SET=1; shift 2 ;;
@@ -3586,6 +3662,16 @@ if [ -n "$FXA_USER_AGENT" ] && [ "$OUTBOUND" != foxy ]; then
 fi
 if [ "$WANT_WARP" = 1 ] && [ "$OUTBOUND" != foxy ]; then
   die "--warp chains the foxy lane through WARP (up --foxy --warp); nothing was started."
+fi
+case "$UDP_VIA" in
+  ""|foxy) ;;
+  warp|psiphon|psiphon-cdn|direct|block)
+    [ "$OUTBOUND" = foxy ] || die "--udp-via splits the foxy lane (up --foxy --udp-via ...); nothing was started." ;;
+esac
+if [ "$UDP_VIA" = psiphon-cdn ]; then
+  [ -z "$PSIPHON_CDN_PROFILE" ] && PSIPHON_CDN_PROFILE=fronted
+  [ "$PSIPHON_AGGRESSIVE_SET" = 0 ] && PSIPHON_AGGRESSIVE=1
+  [ -z "$PSIPHON_SHAPE" ] && PSIPHON_SHAPE=cdn
 fi
 
 if [ "$ALL" = 1 ]; then

@@ -11,7 +11,10 @@ the log does hold. `locations --ping` is given a fake catalogue: the rows must
 order by latency, keep a silent edge as `no answer`, pin REC, and leave the
 readings out of the offline copy. The split
 lists must reach the lane normalized, and a port outside 1-65535 must be refused
-before the lane config is written. A lane that binds its front but carries no
+before the lane config is written. `--udp-via` must add exactly two outbounds,
+foxy first and the named lane second, plus exactly one catch-all `network: udp`
+rule, leave a plain foxy lane with no second outbound, and refuse a lane that is
+not foxy. A lane that binds its front but carries no
 flow must be stopped by `up` itself, with its pid file, config and proxy marker
 removed and its port free again. An attempt cut short by an interrupt must leave
 nothing either: the lane child, its pid file, its config and the proxy marker
@@ -855,6 +858,141 @@ def check_splits(state: pathlib.Path) -> int:
         return 1
     print(
         "check-cli-lane: split lists reach the lane normalized, and a bad port is refused"
+    )
+    return 0
+
+
+def check_udp_split(state: pathlib.Path) -> int:
+    env = env_for(state)
+    env["FERROX_BIN"] = str(snapshot_binary(state))
+    snapshot = state / "lane-snapshot.json"
+
+    def lane(*extra: str) -> dict:
+        snapshot.unlink(missing_ok=True)
+        subprocess.run(
+            [*up_argv(free_port()), *extra],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+        if not snapshot.exists():
+            raise AssertionError(f"no config was written for {' '.join(extra)}")
+        return json.loads(snapshot.read_text(encoding="utf-8"))
+
+    def tagged(document: dict, tag: str) -> dict:
+        matches = [
+            outbound
+            for outbound in document.get("outbounds", [])
+            if outbound.get("tag") == tag
+        ]
+        if len(matches) != 1:
+            raise AssertionError(
+                f"expected one outbound tagged {tag}: {document.get('outbounds')!r}"
+            )
+        return matches[0]
+
+    def split(document: dict, tag: str) -> dict:
+        outbounds = document.get("outbounds", [])
+        if len(outbounds) != 2:
+            raise AssertionError(f"expected exactly two outbounds: {outbounds!r}")
+        if outbounds[0].get("protocol") != "foxy" or outbounds[1].get("tag") != tag:
+            raise AssertionError(f"the split is not foxy plus {tag}: {outbounds!r}")
+        expected = {
+            "rules": [{"type": "field", "network": "udp", "outboundTag": tag}]
+        }
+        if document.get("routing") != expected:
+            raise AssertionError(
+                f"expected exactly the catch-all UDP rule: {document.get('routing')!r}"
+            )
+        return tagged(document, tag)
+
+    try:
+        plain = lane()
+        if len(plain.get("outbounds", [])) != 1 or "routing" in plain:
+            raise AssertionError(f"a plain foxy lane was split: {plain!r}")
+
+        warp = lane("--udp-via", "warp")
+        lane_warp = split(warp, "udp-warp")
+        if lane_warp.get("protocol") != "warp" or not lane_warp.get(
+            "settings", {}
+        ).get("register"):
+            raise AssertionError(f"the UDP lane is not a registering warp: {lane_warp!r}")
+        if not lane_warp["settings"].get("identityFile", "").endswith(
+            "warp-identity.json"
+        ):
+            raise AssertionError(
+                f"the UDP warp lane has no identity file: {lane_warp!r}"
+            )
+
+        psiphon = lane("--udp-via", "psiphon-cdn")
+        lane_psiphon = split(psiphon, "udp-psiphon-cdn")
+        settings = lane_psiphon.get("settings", {})
+        if lane_psiphon.get("protocol") != "psiphon":
+            raise AssertionError(f"the UDP lane is not psiphon: {lane_psiphon!r}")
+        if settings.get("cdnProfile") != "fronted" or settings.get(
+            "aggressiveEstablishment"
+        ) is not True:
+            raise AssertionError(
+                f"psiphon-cdn did not request fronted + aggressive: {settings!r}"
+            )
+        if settings.get("protocolSelection") != "cdn_fronting":
+            raise AssertionError(f"psiphon-cdn did not request CDN: {settings!r}")
+        if settings.get("listen") != "127.0.0.1:0":
+            raise AssertionError(
+                f"a split psiphon lane took a fixed local port: {settings!r}"
+            )
+
+        direct = lane("--udp-via", "direct")
+        if split(direct, "udp-direct").get("protocol") != "freedom":
+            raise AssertionError("udp-via direct is not a freedom outbound")
+
+        block = lane("--udp-via", "block")
+        if split(block, "udp-block").get("protocol") != "blackhole":
+            raise AssertionError("udp-via block is not a blackhole outbound")
+
+        same = lane("--udp-via", "foxy")
+        if len(same.get("outbounds", [])) != 1 or "routing" in same:
+            raise AssertionError(f"udp-via foxy emitted a second lane: {same!r}")
+    except AssertionError as why:
+        print(f"check-cli-lane: {why}", file=sys.stderr)
+        return 1
+
+    refused = subprocess.run(
+        [str(CLI), "up", "--veepn", "--udp-via", "warp"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env,
+    )
+    spoken = refused.stdout + refused.stderr
+    if refused.returncode == 0 or "--udp-via splits the foxy lane" not in spoken:
+        print(
+            f"check-cli-lane: --udp-via outside foxy was not refused:\n{spoken}",
+            file=sys.stderr,
+        )
+        return 1
+    all_lanes = subprocess.run(
+        [str(CLI), "up", "--foxy", "--udp-via", "turbo"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env,
+    )
+    spoken = all_lanes.stdout + all_lanes.stderr
+    if all_lanes.returncode == 0 or "--udp-via wants" not in spoken:
+        print(
+            f"check-cli-lane: an unknown --udp-via value was not refused:\n{spoken}",
+            file=sys.stderr,
+        )
+        return 1
+    snapshot.unlink(missing_ok=True)
+    print(
+        "check-cli-lane: --udp-via emits a second tagged outbound and a UDP rule,"
+        " leaves plain foxy untouched, and refuses outside foxy"
     )
     return 0
 
@@ -3357,6 +3495,7 @@ CHECKS = (
     ("status", check_status),
     ("locations", check_locations),
     ("splits", check_splits),
+    ("udp split", check_udp_split),
     ("failed lane", check_failed_lane_is_closed),
     ("interrupted attempt", check_interrupted_attempt_leaves_nothing),
     ("warp ladder", check_warp_ladder),
