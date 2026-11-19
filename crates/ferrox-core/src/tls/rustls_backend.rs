@@ -2100,9 +2100,9 @@ pub(crate) fn sni_matches(names: &[String], sni: &str) -> bool {
         .any(|name| name.eq_ignore_ascii_case(sni) || name.eq_ignore_ascii_case(&wildcard))
 }
 
-/// The names a served certificate answers: its DNS SANs and subject common name. An issuer-backed
-/// resolver serves only DNS SANs, since a verifier does not fall back to the Common Name, so a leaf
-/// with none reaches the issuer for every host instead of shadowing it with an unusable name.
+/// The names a served certificate answers: its DNS SANs and, when it has none, its subject common
+/// name. An issuer-backed resolver keeps the Common Name only for a leaf with no SANs, so a CN-only
+/// static identity a client pins still answers and a SAN-bearing leaf never falls back to it.
 pub(crate) fn certificate_names(leaf: &[u8], issuer: bool) -> Vec<String> {
     let Ok(cert) = boring::x509::X509::from_der(leaf) else {
         return Vec::new();
@@ -2115,7 +2115,7 @@ pub(crate) fn certificate_names(leaf: &[u8], issuer: bool) -> Vec<String> {
             }
         }
     }
-    if issuer {
+    if issuer && !names.is_empty() {
         return names;
     }
     for entry in cert
@@ -3014,7 +3014,7 @@ mod tests {
     }
 
     #[test]
-    fn an_issued_leaf_does_not_shadow_the_issuer_with_a_common_name_alone() {
+    fn an_issued_leaf_keeps_a_common_name_only_identity_reachable() {
         let key = rcgen::KeyPair::generate().expect("key");
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
         params
@@ -3026,9 +3026,10 @@ mod tests {
             vec!["cn.test".to_owned()],
             "a static-only server still answers the Common Name"
         );
-        assert!(
-            certificate_names(cert.der().as_ref(), true).is_empty(),
-            "an issuer-backed server sends the host to the issuer instead"
+        assert_eq!(
+            certificate_names(cert.der().as_ref(), true),
+            vec!["cn.test".to_owned()],
+            "an issuer-backed server keeps the pinned static identity reachable"
         );
     }
 
