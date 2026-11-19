@@ -454,6 +454,35 @@ fn dump_prints_the_config_the_reference_would_merge() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `-dump` takes the format the flags name, not only the file's suffix, so a JSONC stream in a
+/// `.json` file strips its comments before the merge.
+#[test]
+fn dump_honors_the_named_format() {
+    let text = r#"{
+        // the named format, not the suffix, decides
+        "outbounds":[{"tag":"named","protocol":"blackhole"}]
+    }"#;
+    let path = std::env::temp_dir().join(format!(
+        "ferrox-test-dump-format-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(&path, text).expect("write config");
+    let named = path.to_string_lossy().into_owned();
+    let output = run(&["-dump", "-format", "jsonc", "-c", &named]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "`-dump` ignored the named format: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(r#""tag":"named""#),
+        "`-dump` dropped the parsed config: {stdout}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
 /// A file whose name contains `tail` appends its new outbounds instead of prepending them.
 #[test]
 fn a_config_file_named_tail_appends_its_outbounds() {

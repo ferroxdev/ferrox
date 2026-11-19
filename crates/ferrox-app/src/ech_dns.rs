@@ -314,7 +314,7 @@ fn parse_answer(packet: &[u8], id: Option<u16>, name: &str) -> Result<Answer, St
     let mut redirected = HashSet::new();
     for (owner, kind, _, start, _) in &records {
         let mut at = *start;
-        if *kind == DNS_HTTPS && take_u16(packet, &mut at)? == 0 {
+        if *kind == DNS_HTTPS && matches!(take_u16(packet, &mut at), Ok(0)) {
             redirected.insert(owner.to_ascii_lowercase());
         }
     }
