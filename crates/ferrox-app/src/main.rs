@@ -813,7 +813,7 @@ fn serve_from_flags(args: &[String]) -> ! {
         read_conf_dir(&dir, format.as_deref(), &mut configs);
     }
     if dump {
-        dump_config(&configs);
+        dump_config(&configs, format.as_deref());
     }
     if configs.len() > 1 {
         serve_files(&configs, format.as_deref());
@@ -917,7 +917,7 @@ fn serve_files(files: &[String], format: Option<&str>) -> ! {
 /// xray's `-dump`: the merged config on stdout, without building or serving it. A file format the
 /// reference has no decoder for is skipped, and a merge error is its status 23 with the reason on
 /// stdout.
-fn dump_config(configs: &[String]) -> ! {
+fn dump_config(configs: &[String], named: Option<&str>) -> ! {
     let files = if configs.is_empty() {
         vec![discover_config()]
     } else {
@@ -926,22 +926,12 @@ fn dump_config(configs: &[String]) -> ! {
     let mut merged = crate::json::Json::Obj(Vec::new());
     let mut first = true;
     for file in &files {
-        let extension = if file == "stdin" || file == "stdin:" {
-            None
-        } else {
-            std::path::Path::new(file)
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                .map(str::to_ascii_lowercase)
+        let format = source_format(named, file);
+        let strip = match format {
+            SourceFormat::Json => false,
+            SourceFormat::Jsonc => true,
+            SourceFormat::Protobuf => continue,
         };
-        match extension.as_deref() {
-            Some(format @ ("yaml" | "yml" | "toml")) => {
-                dump_fail(&format!("config format `{format}` is not carried; json is"));
-            }
-            Some("json" | "jsonc") => {}
-            None if file == "stdin" || file == "stdin:" => {}
-            _ => continue,
-        }
         let bytes = if file == "stdin" || file == "stdin:" {
             let mut bytes = Vec::new();
             if let Err(error) = std::io::stdin().read_to_end(&mut bytes) {
@@ -954,7 +944,7 @@ fn dump_config(configs: &[String]) -> ! {
         };
         let body = std::str::from_utf8(&bytes)
             .unwrap_or_else(|error| dump_fail(&format!("bad config {file}: {error}")));
-        let body = if extension.as_deref() == Some("jsonc") {
+        let body = if strip {
             crate::json::strip_jsonc(body)
         } else {
             std::borrow::Cow::Borrowed(body)

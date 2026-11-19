@@ -1,5 +1,5 @@
 use crate::sockopt::SocketOptions;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -311,6 +311,7 @@ fn parse_answer(packet: &[u8], id: Option<u16>, name: &str) -> Result<Answer, St
         records.push((owner, kind, ttl, at, end));
         at = end;
     }
+    let redirected = redirected_owners(packet, &records);
     let mut names = vec![name.to_ascii_lowercase()];
     let mut alias_ttl = u32::MAX;
     loop {
@@ -351,7 +352,12 @@ fn parse_answer(packet: &[u8], id: Option<u16>, name: &str) -> Result<Answer, St
         }
     }
     for (owner, kind, ttl, start, end) in &records {
-        if *kind == DNS_HTTPS && names.iter().any(|seen| seen.eq_ignore_ascii_case(owner)) {
+        if *kind == DNS_HTTPS
+            && names.iter().any(|seen| seen.eq_ignore_ascii_case(owner))
+            && !redirected
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(owner))
+        {
             if let Some(ech) = svcb_ech(packet, *start, *end)? {
                 return Ok(Answer::Found(ech, (*ttl).min(alias_ttl), names.len() - 1));
             }
@@ -361,6 +367,20 @@ fn parse_answer(packet: &[u8], id: Option<u16>, name: &str) -> Result<Answer, St
         return Ok(Answer::Alias(alias, alias_ttl));
     }
     Err(format!("ech: no ECH config in the HTTPS record for {name}"))
+}
+
+fn redirected_owners(
+    packet: &[u8],
+    records: &[(String, u16, u32, usize, usize)],
+) -> HashSet<String> {
+    let mut owners = HashSet::new();
+    for (owner, kind, _, start, _) in records {
+        let mut at = *start;
+        if *kind == DNS_HTTPS && matches!(take_u16(packet, &mut at), Ok(0)) {
+            owners.insert(owner.to_ascii_lowercase());
+        }
+    }
+    owners
 }
 
 fn svcb_ech(packet: &[u8], start: usize, end: usize) -> Result<Option<Vec<u8>>, String> {
@@ -492,6 +512,55 @@ mod tests {
         let (ech, ttl) = parse_response(&packet, Some(0), "example.com").unwrap();
         assert_eq!(ech, [1, 2, 3, 4]);
         assert_eq!(ttl, 300);
+    }
+
+    fn name(packet: &mut Vec<u8>, value: &str) {
+        if value.is_empty() {
+            packet.push(0);
+            return;
+        }
+        for label in value.split('.') {
+            packet.push(label.len() as u8);
+            packet.extend_from_slice(label.as_bytes());
+        }
+        packet.push(0);
+    }
+
+    fn record(packet: &mut Vec<u8>, priority: u16, target: &str, ech: Option<&[u8]>) {
+        packet.extend_from_slice(&[0xc0, 0x0c]);
+        packet.extend_from_slice(&DNS_HTTPS.to_be_bytes());
+        packet.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        packet.extend_from_slice(&300u32.to_be_bytes());
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&priority.to_be_bytes());
+        name(&mut rdata, target);
+        if let Some(ech) = ech {
+            rdata.extend_from_slice(&ECH_PARAM.to_be_bytes());
+            rdata.extend_from_slice(&(ech.len() as u16).to_be_bytes());
+            rdata.extend_from_slice(ech);
+        }
+        packet.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        packet.extend_from_slice(&rdata);
+    }
+
+    #[test]
+    fn an_alias_mode_owner_does_not_supply_ech() {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&0u16.to_be_bytes());
+        packet.extend_from_slice(&0x8180u16.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&2u16.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes());
+        name(&mut packet, "example.com");
+        packet.extend_from_slice(&DNS_HTTPS.to_be_bytes());
+        packet.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        record(&mut packet, 0, "alias.test", None);
+        record(&mut packet, 1, "", Some(&[1, 2, 3, 4]));
+        assert!(matches!(
+            parse_answer(&packet, Some(0), "example.com"),
+            Ok(Answer::Alias(alias, _)) if alias == "alias.test"
+        ));
     }
 
     #[test]
