@@ -217,6 +217,15 @@ impl Stream {
         }
     }
 
+    /// Set or clear only the write timeout.
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.set_write_timeout(timeout),
+            Self::Fragment(stream) => stream.set_write_timeout(timeout),
+            _ => self.set_timeout(timeout),
+        }
+    }
+
     fn shutdown(&self) -> io::Result<()> {
         match self {
             Self::Tcp(socket) => socket.shutdown(Shutdown::Both),
