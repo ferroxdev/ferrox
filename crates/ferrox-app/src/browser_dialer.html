@@ -14,6 +14,7 @@ const RECONNECT_MAX = 5000;
 let reconnect = RECONNECT_MIN;
 let live = 0;
 let idle = 0;
+let busy = 0;
 let spawning = 0;
 
 function initFor(task) {
@@ -175,8 +176,11 @@ function closed(ws) {
   ws.closed = true;
   live -= 1;
   if (ws.opened && !ws.consumed) idle -= 1;
-  // A consumed socket already scheduled its replacement; only an idle socket, or one the live cap left unreplaced, is replenished here.
-  if (idle < IDLE && live < LIVE_MAX && (!ws.consumed || !ws.replaced)) respawn();
+  if (ws.consumed) busy -= 1;
+  // Count every socket that can still become idle — opened, opening, or scheduled — against the idle target, so capacity freed by a closed task is filled without overfilling.
+  const want = Math.min(IDLE, LIVE_MAX - busy);
+  const potential = live - busy;
+  if (potential + spawning < want && live + spawning < LIVE_MAX) respawn();
 }
 
 function respawn() {
@@ -200,7 +204,6 @@ function connect() {
   ws.closed = false;
   ws.opened = false;
   ws.consumed = false;
-  ws.replaced = false;
   ws.binaryType = "arraybuffer";
   ws.onopen = () => {
     ws.opened = true;
@@ -211,7 +214,8 @@ function connect() {
     if (ws.consumed) return;
     if (ws.opened) idle -= 1;
     ws.consumed = true;
-    ws.replaced = connect();
+    busy += 1;
+    connect();
     let task;
     try {
       task = JSON.parse(event.data);

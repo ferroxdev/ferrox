@@ -3868,6 +3868,10 @@ fn service(
         loop {
             match conn.stream_recv(id, &mut room) {
                 Ok((0, _)) | Err(quiche::Error::Done) => break,
+                Err(quiche::Error::StreamReset(_)) => {
+                    cancel(conn, tunnel);
+                    return;
+                }
                 Ok((n, fin)) => {
                     tunnel.buf.extend_from_slice(&room[..n]);
                     if tunnel.buf.len() > CAPSULE_CAP {
@@ -4436,6 +4440,10 @@ fn queue_data(
     stream: u64,
     bytes: &[u8],
 ) -> bool {
+    if tunnel.flow_at > 0 {
+        tunnel.flow.drain(..tunnel.flow_at);
+        tunnel.flow_at = 0;
+    }
     let mut head = [0u8; 9];
     let length = frames::h3_data_header(&mut head, bytes.len() as u64);
     if !flow_fits(tunnel.flow.len(), length.saturating_add(bytes.len())) {

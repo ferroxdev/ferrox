@@ -3892,6 +3892,15 @@ impl Tls2 {
         while at < request.len() {
             // Selecting a frame and spending its credit is one decision: two lanes on one session each read the same last byte of connection credit, and a split between the look and the charge lets both spend it.
             let mut inner = self.inner()?;
+            // A reset, ended or vanished stream can never take this request: waiting for credit on it is waiting for a grant that cannot arrive.
+            if inner.gone
+                || inner
+                    .streams
+                    .get(&self.stream)
+                    .is_none_or(|entry| entry.reset.is_some() || entry.sent_end)
+            {
+                return Err(Failure::Stream);
+            }
             let max = inner.max_frame;
             let frame = foxy::flow::frame_size(request.len() - at, max)
                 .min(stream_spend(&inner, self.stream));

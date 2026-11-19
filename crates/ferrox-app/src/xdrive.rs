@@ -3635,22 +3635,33 @@ struct Target {
     path: String,
 }
 
-/// The address a followed href connects to: resolved once and checked against the local ranges before the dial, so a name cannot answer a public address to the check and a private one to the socket.
-fn pinned_peer(target: &Target, allow_local: bool) -> Option<std::net::SocketAddr> {
+/// Every address a target resolves to, used to admit only the operator-named endpoint's own local address on a follow-up.
+fn target_ips(target: &Target) -> Vec<std::net::IpAddr> {
     let bare = target.host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return (!local_ip(ip) || allow_local)
-            .then_some(std::net::SocketAddr::new(ip, target.port));
+        return vec![ip];
     }
-    let mut addresses = (bare, target.port).to_socket_addrs().ok()?;
-    let chosen = addresses.next()?;
-    if !allow_local && local_ip(chosen.ip()) {
+    (bare, target.port)
+        .to_socket_addrs()
+        .map(|addresses| addresses.map(|address| address.ip()).collect())
+        .unwrap_or_default()
+}
+
+/// The address a followed href connects to: resolved once and checked against the local ranges before the dial, so a name cannot answer a public address to the check and a private one to the socket. A local address is admitted only when it is one the configured endpoint resolved to.
+fn pinned_peer(
+    target: &Target,
+    allowed_local: &[std::net::IpAddr],
+) -> Option<std::net::SocketAddr> {
+    let bare = target.host.trim_start_matches('[').trim_end_matches(']');
+    let allowed = |ip: std::net::IpAddr| !local_ip(ip) || allowed_local.contains(&ip);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return allowed(ip).then_some(std::net::SocketAddr::new(ip, target.port));
+    }
+    let addresses: Vec<_> = (bare, target.port).to_socket_addrs().ok()?.collect();
+    if addresses.iter().any(|address| !allowed(address.ip())) {
         return None;
     }
-    if !allow_local && addresses.any(|address| local_ip(address.ip())) {
-        return None;
-    }
-    Some(chosen)
+    addresses.first().copied()
 }
 
 /// Whether a href's host is only reachable from this machine or its network: a store that answers a
@@ -4731,6 +4742,14 @@ impl Template {
         if op.href_path.is_empty() {
             return self.do_op(op, vars, body);
         }
+        // Resolve the operator's endpoint before the store answers, so a name that turns local only for the follow-up cannot be admitted by the follow-up's own resolution.
+        let store_url = if op.presigned {
+            op.url.clone()
+        } else {
+            vars.sub(&op.url)
+        };
+        let store = Target::parse(&store_url);
+        let store_ips = store.as_ref().map(target_ips).unwrap_or_default();
         let (status, payload) = self.do_op(op, vars, None)?;
         if !(200..300).contains(&status) {
             return Ok((status, payload));
@@ -4747,13 +4766,13 @@ impl Template {
             return Err(carrier_error("the store href names no origin"));
         };
         // The store's own endpoint may be loopback when the operator named it; a different local origin may not.
-        let here = Target::parse(&vars.sub(&op.url));
-        let same_endpoint = here.as_ref().is_some_and(|target| {
+        let same_endpoint = store.as_ref().is_some_and(|target| {
             target.host.eq_ignore_ascii_case(&follow_target.host)
                 && target.port == follow_target.port
         });
+        let allowed_local = if same_endpoint { store_ips } else { Vec::new() };
         let peer = if self.http.front.is_none() {
-            let Some(peer) = pinned_peer(&follow_target, same_endpoint) else {
+            let Some(peer) = pinned_peer(&follow_target, &allowed_local) else {
                 return Err(carrier_error(
                     "the store href names this machine or its LAN, so it is not followed",
                 ));

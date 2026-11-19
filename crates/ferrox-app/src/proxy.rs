@@ -27915,13 +27915,13 @@ fn probe_edge_exit(
         .account
         .as_ref()
         .map_or_else(|| foxy.pass.clone(), |account| account.current());
-    // A pinned edge is only trusted on a carrier that checks the pins; QUIC has no pin check, so a pinned probe takes H2, which does.
+    // A pinned edge is only trusted on a carrier that checks the pins; QUIC has no pin check, so a pinned probe takes H1, which does and owns its socket instead of sharing a pooled session's timeout.
     if !foxy.pins.is_empty() {
         let dial = crate::foxy::FoxyDial {
             host: edge.host.clone(),
             port: edge.port,
             address: foxy.edge_address,
-            carrier: crate::foxy::Carrier::H2,
+            carrier: crate::foxy::Carrier::H1,
             upstream: foxy.upstream.clone(),
             roots: foxy.roots.clone(),
             pins: foxy.pins.clone(),
