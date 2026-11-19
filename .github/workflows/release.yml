@@ -78,6 +78,9 @@ jobs:
             [ -n "$DECLARED" ] || { echo "::error::cannot read the workspace version from Cargo.toml"; exit 1; }
             valid_version "v$DECLARED" || { echo "::error::Cargo.toml declares a non-vX.Y.Z version: $DECLARED"; exit 1; }
             echo "version=v$DECLARED" >> "$GITHUB_OUTPUT"
+            if EXISTING="$(git rev-parse --verify --quiet "v$DECLARED^{commit}")"; then
+              echo "ref=$EXISTING" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
   build:
