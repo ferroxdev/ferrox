@@ -3413,13 +3413,35 @@ const TLS_BUFFER: usize = 64 * 1024;
 /// does not pay the peer poll per TLS record while an interactive write still lands.
 const TLS_DRAIN: usize = 1024 * 1024;
 
+/// Re-arm only the read timeout on the TLS transport, leaving its write bound alone.
+trait RelayTimeout {
+    fn set_relay_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl RelayTimeout for Stream {
+    fn set_relay_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
+
+impl RelayTimeout for DeadlineIo {
+    fn set_relay_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.io.set_read_timeout(timeout)
+    }
+}
+
+impl<S: RelayTimeout> RelayTimeout for crate::psiphon_fragment::TlsHelloFragmentor<S> {
+    fn set_relay_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner().set_relay_read_timeout(timeout)
+    }
+}
+
 /// A transport that re-arms its socket timeout from a shared deadline before every read and
 /// write, so a blocking TLS step cannot outlive the handshake.
 struct DeadlineIo {
     io: Stream,
     deadline: Instant,
     active: Arc<AtomicBool>,
-    cleared: bool,
 }
 
 impl DeadlineIo {
@@ -3428,16 +3450,11 @@ impl DeadlineIo {
             io,
             deadline,
             active,
-            cleared: false,
         }
     }
 
     fn arm(&mut self) -> io::Result<()> {
         if !self.active.load(Ordering::Acquire) {
-            if !self.cleared {
-                self.io.set_timeout(None)?;
-                self.cleared = true;
-            }
             return Ok(());
         }
         let left = self.deadline.saturating_duration_since(Instant::now());
@@ -3563,11 +3580,17 @@ fn tls_tunnel(
     Ok(Stream::Tcp(local))
 }
 
-fn relay_tls(
-    mut tls: ClientSession<crate::psiphon_fragment::TlsHelloFragmentor<Stream>>,
+fn relay_tls<S>(
+    mut tls: ClientSession<crate::psiphon_fragment::TlsHelloFragmentor<S>>,
     mut peer: TcpStream,
-) -> io::Result<()> {
-    tls.get_ref().inner().set_read_timeout(Some(TLS_POLL))?;
+) -> io::Result<()>
+where
+    S: Read + Write + RelayTimeout + ferrox_core::tls::RecordAlignment,
+    crate::psiphon_fragment::TlsHelloFragmentor<S>: ferrox_core::tls::RecordAlignment,
+{
+    tls.get_ref()
+        .inner()
+        .set_relay_read_timeout(Some(TLS_POLL))?;
     peer.set_read_timeout(Some(TLS_POLL))?;
     peer.set_write_timeout(Some(IO_TIMEOUT))?;
     peer.set_nodelay(true)?;

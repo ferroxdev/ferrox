@@ -2263,7 +2263,8 @@ impl Inner {
     /// The direct half of split tunnel: the reference's untunneled dial, proxy included.
     fn direct(&self, host: &str, port: u16) -> Result<TcpStream, String> {
         if let Some(proxy) = self.settings.proxy.as_ref() {
-            let stream = proxy.connect_host(host, port, self.settings.dial_timeout())?;
+            let deadline = Instant::now() + self.settings.dial_timeout();
+            let stream = proxy.connect_host(host, port, deadline)?;
             let _ = stream.set_read_timeout(None);
             let _ = stream.set_write_timeout(None);
             return Ok(stream);
