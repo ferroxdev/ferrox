@@ -549,7 +549,7 @@ fn connect_one(
     timeout: Duration,
 ) -> Result<TcpStream, String> {
     match proxy {
-        Some(proxy) => proxy.connect(address, timeout),
+        Some(proxy) => proxy.connect(address, Instant::now() + timeout),
         None => TcpStream::connect_timeout(&address, timeout)
             .map_err(|error| format!("psiphon light: connect {address}: {error}")),
     }

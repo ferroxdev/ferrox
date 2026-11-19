@@ -655,6 +655,7 @@ impl Client {
         connection_id: &[u8],
         packet: &[u8],
     ) -> Result<Vec<u8>, String> {
+        self.transport.set_deadline(None);
         self.transport.set_timeout(self.relay_timeout);
         self.relay_packet_reply(connection_id, packet)
     }

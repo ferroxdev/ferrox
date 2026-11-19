@@ -13,7 +13,7 @@ use std::io::{self, IoSlice, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
 use std::time::{Duration, Instant};
 use x25519_dalek::{x25519, X25519_BASEPOINT_BYTES};
 
@@ -1323,9 +1323,9 @@ impl Proxy {
     pub(crate) fn connect(
         &self,
         target: SocketAddr,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<TcpStream, String> {
-        self.connect_host(&target.ip().to_string(), target.port(), timeout)
+        self.connect_host(&target.ip().to_string(), target.port(), deadline)
     }
 
     /// Dial any host through the hop; SOCKS5 keeps a domain name for the proxy to resolve.
@@ -1333,7 +1333,7 @@ impl Proxy {
         &self,
         host: &str,
         port: u16,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<TcpStream, String> {
         if host.is_empty()
             || host.bytes().any(|byte| {
@@ -1346,18 +1346,25 @@ impl Proxy {
             return Err("psiphon: upstream proxy host name is not valid".to_owned());
         }
         let mut last = String::new();
-        for address in crate::psiphon_dns::resolve_with(&self.dns, &self.host, self.port)
-            .map_err(|error| format!("psiphon: upstream proxy resolve {}: {error}", self.host))?
+        for address in crate::psiphon_dns::resolve_with_deadline(
+            &self.dns,
+            &self.host,
+            self.port,
+            Some(deadline),
+        )
+        .map_err(|error| format!("psiphon: upstream proxy resolve {}: {error}", self.host))?
         {
-            match TcpStream::connect_timeout(&address, timeout) {
-                Ok(stream) => {
-                    let _ = stream.set_read_timeout(Some(timeout));
-                    let _ = stream.set_write_timeout(Some(timeout));
-                    let mut stream = stream;
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err("psiphon: upstream proxy deadline expired".to_owned());
+            }
+            match TcpStream::connect_timeout(&address, left) {
+                Ok(mut stream) => {
+                    arm_tcp(&stream, deadline)?;
                     if self.http {
-                        self.connect_http(&mut stream, host, port)?;
+                        self.connect_http(&mut stream, host, port, deadline)?;
                     } else {
-                        self.connect_socks(&mut stream, host, port)?;
+                        self.connect_socks(&mut stream, host, port, deadline)?;
                     }
                     return Ok(stream);
                 }
@@ -1370,7 +1377,13 @@ impl Proxy {
         ))
     }
 
-    fn connect_http(&self, stream: &mut TcpStream, host: &str, port: u16) -> Result<(), String> {
+    fn connect_http(
+        &self,
+        stream: &mut TcpStream,
+        host: &str,
+        port: u16,
+        deadline: Instant,
+    ) -> Result<(), String> {
         let authority = authority_host(host, port);
         let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
         if !self.user.is_empty() || !self.pass.is_empty() {
@@ -1381,11 +1394,13 @@ impl Proxy {
             request.push_str("\r\n");
         }
         request.push_str("\r\n");
+        arm_tcp(stream, deadline)?;
         stream
             .write_all(request.as_bytes())
             .map_err(|error| format!("psiphon: upstream proxy write: {error}"))?;
         let mut head = Vec::with_capacity(128);
         loop {
+            arm_tcp(stream, deadline)?;
             let mut byte = [0u8; 1];
             stream
                 .read_exact(&mut byte)
@@ -1412,13 +1427,21 @@ impl Proxy {
         Ok(())
     }
 
-    fn connect_socks(&self, stream: &mut TcpStream, host: &str, port: u16) -> Result<(), String> {
+    fn connect_socks(
+        &self,
+        stream: &mut TcpStream,
+        host: &str,
+        port: u16,
+        deadline: Instant,
+    ) -> Result<(), String> {
         let auth = !self.user.is_empty() || !self.pass.is_empty();
         let greeting: &[u8] = if auth { &[5, 2, 0, 2] } else { &[5, 1, 0] };
+        arm_tcp(stream, deadline)?;
         stream
             .write_all(greeting)
             .map_err(|error| format!("psiphon: upstream proxy greeting: {error}"))?;
         let mut method = [0u8; 2];
+        arm_tcp(stream, deadline)?;
         stream
             .read_exact(&mut method)
             .map_err(|error| format!("psiphon: upstream proxy greeting: {error}"))?;
@@ -1436,10 +1459,12 @@ impl Proxy {
                 request.extend_from_slice(user);
                 request.push(u8::try_from(pass.len()).unwrap_or(u8::MAX));
                 request.extend_from_slice(pass);
+                arm_tcp(stream, deadline)?;
                 stream
                     .write_all(&request)
                     .map_err(|error| format!("psiphon: upstream proxy auth: {error}"))?;
                 let mut reply = [0u8; 2];
+                arm_tcp(stream, deadline)?;
                 stream
                     .read_exact(&mut reply)
                     .map_err(|error| format!("psiphon: upstream proxy auth: {error}"))?;
@@ -1469,10 +1494,12 @@ impl Proxy {
             }
         }
         request.extend_from_slice(&port.to_be_bytes());
+        arm_tcp(stream, deadline)?;
         stream
             .write_all(&request)
             .map_err(|error| format!("psiphon: upstream proxy request: {error}"))?;
         let mut head = [0u8; 4];
+        arm_tcp(stream, deadline)?;
         stream
             .read_exact(&mut head)
             .map_err(|error| format!("psiphon: upstream proxy reply: {error}"))?;
@@ -1490,6 +1517,7 @@ impl Proxy {
             4 => 16,
             3 => {
                 let mut length = [0u8; 1];
+                arm_tcp(stream, deadline)?;
                 stream
                     .read_exact(&mut length)
                     .map_err(|error| format!("psiphon: upstream proxy reply: {error}"))?;
@@ -1497,11 +1525,23 @@ impl Proxy {
             }
             _ => return Err("psiphon: upstream proxy named no address".to_owned()),
         };
+        arm_tcp(stream, deadline)?;
         stream
             .read_exact(&mut bound[..skip + 2])
             .map_err(|error| format!("psiphon: upstream proxy reply: {error}"))?;
         Ok(())
     }
+}
+
+fn arm_tcp(stream: &TcpStream, deadline: Instant) -> Result<(), String> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err("psiphon: upstream proxy deadline expired".to_owned());
+    }
+    stream
+        .set_read_timeout(Some(left))
+        .and_then(|()| stream.set_write_timeout(Some(left)))
+        .map_err(|error| format!("psiphon: upstream proxy socket: {error}"))
 }
 
 fn authority_host(host: &str, port: u16) -> String {
@@ -2249,7 +2289,7 @@ impl Session {
         put_u32(&mut payload, channel_window);
         put_u32(&mut payload, CHANNEL_PACKET);
         payload.extend_from_slice(extra);
-        if let Err(why) = self.inner.send(&payload) {
+        if let Err(why) = self.inner.send_until(&payload, deadline) {
             lock(&self.inner.channels).remove(&local);
             self.inner.close();
             return Err(why);
@@ -2477,19 +2517,35 @@ fn ssh_keepalive(inner: &Weak<Inner>, config: KeepAlive) {
 
 impl Inner {
     fn send(&self, payload: &[u8]) -> Result<(), String> {
-        let mut writer = lock(&self.writer);
-        writer
-            .send(payload)
+        self.send_until(payload, None)
+    }
+
+    fn send_until(&self, payload: &[u8], deadline: Option<Instant>) -> Result<(), String> {
+        let mut writer = match deadline {
+            Some(deadline) => lock_until(&self.writer, deadline)?,
+            None => lock(&self.writer),
+        };
+        with_writer_deadline(&mut writer, deadline, |writer| writer.send(payload))
             .map_err(|error| format!("psiphon ssh write: {error}"))
     }
 
-    fn send_channel_data(&self, state: &ChannelState, data: &[u8]) -> Result<(), String> {
-        let mut writer = lock(&self.writer);
+    fn send_channel_data(
+        &self,
+        state: &ChannelState,
+        data: &[u8],
+        deadline: Option<Instant>,
+    ) -> Result<(), String> {
+        let mut writer = match deadline {
+            Some(deadline) => lock_until(&self.writer, deadline)?,
+            None => lock(&self.writer),
+        };
         let remote = state.remote.load(Ordering::Acquire);
         if remote == NO_CHANNEL {
             return Err("psiphon channel closed".to_owned());
         }
-        let result = writer.send_channel_data(remote, data);
+        let result = with_writer_deadline(&mut writer, deadline, |writer| {
+            writer.send_channel_data(remote, data)
+        });
         if result.is_err() {
             self.close();
         }
@@ -2500,13 +2556,19 @@ impl Inner {
         &self,
         state: &ChannelState,
         data: &mut [u8],
+        deadline: Option<Instant>,
     ) -> Result<(), String> {
-        let mut writer = lock(&self.writer);
+        let mut writer = match deadline {
+            Some(deadline) => lock_until(&self.writer, deadline)?,
+            None => lock(&self.writer),
+        };
         let remote = state.remote.load(Ordering::Acquire);
         if remote == NO_CHANNEL {
             return Err("psiphon channel closed".to_owned());
         }
-        let result = writer.send_channel_data_in_place(remote, data);
+        let result = with_writer_deadline(&mut writer, deadline, |writer| {
+            writer.send_channel_data_in_place(remote, data)
+        });
         if result.is_err() {
             self.close();
         }
@@ -3114,7 +3176,7 @@ impl Channel {
         let started = self.session.burst_started();
         let take = self.take_window(buf.len())?;
         self.session
-            .send_channel_data_in_place(&self.state, &mut buf[..take])
+            .send_channel_data_in_place(&self.state, &mut buf[..take], self.deadline)
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
         self.session
             .record_up(started, u64::try_from(take).unwrap_or(0));
@@ -3132,7 +3194,7 @@ impl Write for Channel {
         let started = self.session.burst_started();
         let take = self.take_window(buf.len())?;
         self.session
-            .send_channel_data(&self.state, &buf[..take])
+            .send_channel_data(&self.state, &buf[..take], self.deadline)
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
         self.session
             .record_up(started, u64::try_from(take).unwrap_or(0));
@@ -3153,6 +3215,41 @@ fn liveness_timeout() -> io::Error {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Lock without waiting past the establishment deadline.
+fn lock_until<T>(mutex: &Mutex<T>, deadline: Instant) -> Result<MutexGuard<'_, T>, String> {
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err("psiphon ssh: establishment deadline expired".to_owned());
+                }
+                std::thread::sleep(left.min(Duration::from_millis(2)));
+            }
+        }
+    }
+}
+
+/// Hold the writer's deadline for one packet, then restore what was there.
+fn with_writer_deadline<T>(
+    writer: &mut PacketWriter,
+    deadline: Option<Instant>,
+    send: impl FnOnce(&mut PacketWriter) -> io::Result<T>,
+) -> io::Result<T> {
+    let previous = writer.deadline;
+    if let Some(deadline) = deadline {
+        writer.set_deadline(deadline)?;
+    }
+    let result = send(writer);
+    if deadline.is_some() {
+        writer.deadline = previous;
+        let _ = arm_deadline(&writer.io, previous);
+    }
+    result
 }
 
 pub(crate) fn tls_passthrough_key(server: &Server) -> &str {
@@ -3213,11 +3310,15 @@ fn direct_stream(
     let tls = server.tls && server.meek.is_none() && !server.ss;
     let socket = match &server.meek {
         Some(meek) => crate::psiphon_meek::connect(meek, timeout, proxy, dns, limit_meek_buffers)?,
-        None => direct_socket(address, server, timeout, proxy)?,
+        None => direct_socket(address, server, deadline, proxy)?,
     };
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err("psiphon ssh: establishment deadline expired".to_owned());
+    }
     socket
-        .set_read_timeout(Some(timeout))
-        .and_then(|()| socket.set_write_timeout(Some(timeout)))
+        .set_read_timeout(Some(left))
+        .and_then(|()| socket.set_write_timeout(Some(left)))
         .and_then(|()| socket.set_nodelay(true))
         .map_err(|error| format!("psiphon ssh socket: {error}"))?;
     let protocol = if server.ss {
@@ -3286,15 +3387,20 @@ fn direct_stream(
 fn direct_socket(
     address: SocketAddr,
     server: &Server,
-    timeout: Duration,
+    deadline: Instant,
     proxy: Option<&Proxy>,
 ) -> Result<TcpStream, String> {
-    match proxy {
-        Some(proxy) => proxy
-            .connect(address, timeout)
-            .map_err(|error| format!("psiphon ssh proxy {}: {error}", proxy.display())),
-        None => TcpStream::connect_timeout(&address, timeout)
-            .map_err(|error| format!("psiphon ssh {}: {error}", server.host)),
+    if let Some(proxy) = proxy {
+        proxy
+            .connect(address, deadline)
+            .map_err(|error| format!("psiphon ssh proxy {}: {error}", proxy.display()))
+    } else {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return Err("psiphon ssh: establishment deadline expired".to_owned());
+        }
+        TcpStream::connect_timeout(&address, timeout)
+            .map_err(|error| format!("psiphon ssh {}: {error}", server.host))
     }
 }
 
@@ -3305,6 +3411,100 @@ const TLS_BUFFER: usize = 64 * 1024;
 /// Decrypted bytes moved before the upload side is polled once, so a full download
 /// does not pay the peer poll per TLS record while an interactive write still lands.
 const TLS_DRAIN: usize = 1024 * 1024;
+
+/// Re-arm only the read timeout on the TLS transport, leaving its write bound alone.
+trait RelayTimeout {
+    fn set_relay_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl RelayTimeout for Stream {
+    fn set_relay_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
+
+impl RelayTimeout for DeadlineIo {
+    fn set_relay_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.io.set_read_timeout(timeout)
+    }
+}
+
+impl<S: RelayTimeout> RelayTimeout for crate::psiphon_fragment::TlsHelloFragmentor<S> {
+    fn set_relay_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner().set_relay_read_timeout(timeout)
+    }
+}
+
+/// A transport that re-arms its socket timeout from a shared deadline before every read and
+/// write, so a blocking TLS step cannot outlive the handshake.
+struct DeadlineIo {
+    io: Stream,
+    deadline: Instant,
+    active: Arc<AtomicBool>,
+}
+
+impl DeadlineIo {
+    fn new(io: Stream, deadline: Instant, active: Arc<AtomicBool>) -> Self {
+        Self {
+            io,
+            deadline,
+            active,
+        }
+    }
+
+    fn arm(&mut self) -> io::Result<()> {
+        if !self.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "psiphon tls: establishment deadline expired",
+            ));
+        }
+        self.io.set_timeout(Some(left))
+    }
+}
+
+impl io::Read for DeadlineIo {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.arm()?;
+        self.io.read(buffer)
+    }
+}
+
+impl io::Write for DeadlineIo {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.arm()?;
+        self.io.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.io.flush()
+    }
+}
+
+impl ferrox_core::tls::RecordAlignment for DeadlineIo {
+    fn engage_record_alignment(&mut self) {
+        ferrox_core::tls::RecordAlignment::engage_record_alignment(&mut self.io);
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        ferrox_core::tls::RecordAlignment::disarm_record_alignment(&mut self.io);
+    }
+
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> io::Result<()> {
+        if self.active.load(Ordering::Acquire) {
+            for part in parts {
+                self.write_all(part)?;
+            }
+            Ok(())
+        } else {
+            ferrox_core::tls::RecordAlignment::write_all_slices(&mut self.io, parts)
+        }
+    }
+}
 
 /// Wrap a stream in TLS and expose the decrypted bytes as a loopback TCP socket, so the SSH
 /// framing below keeps one transport shape. The reference dials TLS-OSSH this way and then adds
@@ -3340,12 +3540,15 @@ fn tls_tunnel(
         obfuscated_ticket: shape.obfuscated_ticket(protocol, obfuscated_key)?,
         ..TlsConfig::default()
     };
+    let active = Arc::new(AtomicBool::new(true));
+    let stream = DeadlineIo::new(stream, deadline, Arc::clone(&active));
     let stream = crate::psiphon_fragment::TlsHelloFragmentor::new(stream, fragment);
     let mut tls = ferrox_core::tls::connect(&config, stream)
         .map_err(|error| format!("psiphon tls {name}: {error}"))?;
     tls.set_handshake_deadline(deadline);
     tls.handshake()
         .map_err(|error| format!("psiphon tls handshake {name}: {error}"))?;
+    active.store(false, Ordering::Release);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| format!("psiphon tls listener: {error}"))?;
     let address = listener
@@ -3376,11 +3579,17 @@ fn tls_tunnel(
     Ok(Stream::Tcp(local))
 }
 
-fn relay_tls(
-    mut tls: ClientSession<crate::psiphon_fragment::TlsHelloFragmentor<Stream>>,
+fn relay_tls<S>(
+    mut tls: ClientSession<crate::psiphon_fragment::TlsHelloFragmentor<S>>,
     mut peer: TcpStream,
-) -> io::Result<()> {
-    tls.get_ref().inner().set_read_timeout(Some(TLS_POLL))?;
+) -> io::Result<()>
+where
+    S: Read + Write + RelayTimeout + ferrox_core::tls::RecordAlignment,
+    crate::psiphon_fragment::TlsHelloFragmentor<S>: ferrox_core::tls::RecordAlignment,
+{
+    tls.get_ref()
+        .inner()
+        .set_relay_read_timeout(Some(TLS_POLL))?;
     peer.set_read_timeout(Some(TLS_POLL))?;
     peer.set_write_timeout(Some(IO_TIMEOUT))?;
     peer.set_nodelay(true)?;

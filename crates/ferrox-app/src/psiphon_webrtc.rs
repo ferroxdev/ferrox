@@ -2195,7 +2195,11 @@ impl Relay {
         packet: &[u8],
         deadline: Instant,
     ) -> Result<Vec<u8>, String> {
-        lock(&self.client).relay_packet_until(&self.connection_id, packet, deadline)
+        lock_until(&self.client, deadline)?.relay_packet_until(
+            &self.connection_id,
+            packet,
+            deadline,
+        )
     }
 }
 
