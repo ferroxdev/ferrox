@@ -1894,7 +1894,7 @@ impl Handler {
             let direct_due = self
                 .datagram_retry
                 .is_none_or(|at| std::time::Instant::now() >= at);
-            if self.datagram.is_some() && direct_due {
+            if self.datagram.as_ref().is_some_and(Datagram::ready) && direct_due {
                 self.open_datagram_lane();
             } else if let Ok(association) = Association::open(&self.associate) {
                 self.association = Some(association);
@@ -1979,7 +1979,7 @@ impl Handler {
         let (tx, rx) = mpsc::channel();
         self.opening = Some(rx);
         budgets::spawn(move || {
-            let _ = tx.send(open());
+            let _ = tx.send(open.open());
         });
     }
 
@@ -4666,12 +4666,12 @@ mod tests {
             relay.set_nonblocking(true).unwrap();
             let (ctl, ctl_peer) = UnixStream::pair().unwrap();
             let (a, peer) = peer_with_deadline().unwrap();
-            let open: Datagram = Arc::new(move || {
+            let open = Datagram::always(Arc::new(move || {
                 Some(crate::proxy::DirectDatagram {
                     relay: relay_addr,
                     control: Connection::from(ctl.try_clone().unwrap()),
                 })
-            });
+            }));
             let relay_fn: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
             let handler = Handler::on(
                 Device::from_handle(a, DEFAULT_MTU),
@@ -4750,13 +4750,13 @@ mod tests {
         let (ctl, ctl_peer) = UnixStream::pair().unwrap();
         let opens = Arc::new(AtomicU32::new(0));
         let seen = Arc::clone(&opens);
-        let open: Datagram = Arc::new(move || {
+        let open = Datagram::always(Arc::new(move || {
             seen.fetch_add(1, Relaxed);
             Some(crate::proxy::DirectDatagram {
                 relay: relay_addr,
                 control: Connection::from(ctl.try_clone().unwrap()),
             })
-        });
+        }));
         let relay_fn: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::on(
             Device::from_handle(a, DEFAULT_MTU),
@@ -4975,13 +4975,13 @@ mod tests {
         });
         let (control, _hold) = UnixStream::pair().unwrap();
         let slot = Arc::new(std::sync::Mutex::new(Some(Connection::from(control))));
-        let open: Datagram = Arc::new(move || {
+        let open = Datagram::always(Arc::new(move || {
             let control = slot.lock().unwrap().take()?;
             Some(crate::proxy::DirectDatagram {
                 relay: relay_address,
                 control,
             })
-        });
+        }));
         let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let associate: Associate = Arc::new(|_conn| {
             unreachable!("a direct datagram lane must not open the front association")
@@ -5046,10 +5046,10 @@ mod tests {
         let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
         let attempts = Arc::new(AtomicU32::new(0));
         let seen = Arc::clone(&attempts);
-        let open: Datagram = Arc::new(move || {
+        let open = Datagram::always(Arc::new(move || {
             seen.fetch_add(1, Relaxed);
             None
-        });
+        }));
         let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
         let mut handler = Handler::on(
             Device::from_handle(a, DEFAULT_MTU),

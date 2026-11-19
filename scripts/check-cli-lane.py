@@ -11,9 +11,10 @@ the log does hold. `locations --ping` is given a fake catalogue: the rows must
 order by latency, keep a silent edge as `no answer`, pin REC, and leave the
 readings out of the offline copy. The split
 lists must reach the lane normalized, and a port outside 1-65535 must be refused
-before the lane config is written. `--udp-via` must add exactly one tagged
-datagram outbound and one `network: udp` rule, leave a plain foxy lane with no
-second outbound, and refuse a lane that is not foxy. A lane that binds its front but carries no
+before the lane config is written. `--udp-via` must add exactly two outbounds,
+foxy first and the named lane second, plus exactly one catch-all `network: udp`
+rule, leave a plain foxy lane with no second outbound, and refuse a lane that is
+not foxy. A lane that binds its front but carries no
 flow must be stopped by `up` itself, with its pid file, config and proxy marker
 removed and its port free again. An attempt cut short by an interrupt must leave
 nothing either: the lane child, its pid file, its config and the proxy marker
@@ -881,18 +882,31 @@ def check_udp_split(state: pathlib.Path) -> int:
         return json.loads(snapshot.read_text(encoding="utf-8"))
 
     def tagged(document: dict, tag: str) -> dict:
-        for outbound in document.get("outbounds", []):
-            if outbound.get("tag") == tag:
-                return outbound
-        raise AssertionError(f"no outbound tagged {tag}: {document.get('outbounds')!r}")
+        matches = [
+            outbound
+            for outbound in document.get("outbounds", [])
+            if outbound.get("tag") == tag
+        ]
+        if len(matches) != 1:
+            raise AssertionError(
+                f"expected one outbound tagged {tag}: {document.get('outbounds')!r}"
+            )
+        return matches[0]
 
-    def rule(document: dict, tag: str) -> None:
-        rules = document.get("routing", {}).get("rules", [])
-        if not any(
-            item.get("network") == "udp" and item.get("outboundTag") == tag
-            for item in rules
-        ):
-            raise AssertionError(f"no UDP rule to {tag}: {rules!r}")
+    def split(document: dict, tag: str) -> dict:
+        outbounds = document.get("outbounds", [])
+        if len(outbounds) != 2:
+            raise AssertionError(f"expected exactly two outbounds: {outbounds!r}")
+        if outbounds[0].get("protocol") != "foxy" or outbounds[1].get("tag") != tag:
+            raise AssertionError(f"the split is not foxy plus {tag}: {outbounds!r}")
+        expected = {
+            "rules": [{"type": "field", "network": "udp", "outboundTag": tag}]
+        }
+        if document.get("routing") != expected:
+            raise AssertionError(
+                f"expected exactly the catch-all UDP rule: {document.get('routing')!r}"
+            )
+        return tagged(document, tag)
 
     try:
         plain = lane()
@@ -900,9 +914,7 @@ def check_udp_split(state: pathlib.Path) -> int:
             raise AssertionError(f"a plain foxy lane was split: {plain!r}")
 
         warp = lane("--udp-via", "warp")
-        if warp["outbounds"][0].get("protocol") != "foxy":
-            raise AssertionError("the first outbound stopped being foxy")
-        lane_warp = tagged(warp, "udp-warp")
+        lane_warp = split(warp, "udp-warp")
         if lane_warp.get("protocol") != "warp" or not lane_warp.get(
             "settings", {}
         ).get("register"):
@@ -913,10 +925,9 @@ def check_udp_split(state: pathlib.Path) -> int:
             raise AssertionError(
                 f"the UDP warp lane has no identity file: {lane_warp!r}"
             )
-        rule(warp, "udp-warp")
 
         psiphon = lane("--udp-via", "psiphon-cdn")
-        lane_psiphon = tagged(psiphon, "udp-psiphon-cdn")
+        lane_psiphon = split(psiphon, "udp-psiphon-cdn")
         settings = lane_psiphon.get("settings", {})
         if lane_psiphon.get("protocol") != "psiphon":
             raise AssertionError(f"the UDP lane is not psiphon: {lane_psiphon!r}")
@@ -932,17 +943,14 @@ def check_udp_split(state: pathlib.Path) -> int:
             raise AssertionError(
                 f"a split psiphon lane took a fixed local port: {settings!r}"
             )
-        rule(psiphon, "udp-psiphon-cdn")
 
         direct = lane("--udp-via", "direct")
-        if tagged(direct, "udp-direct").get("protocol") != "freedom":
+        if split(direct, "udp-direct").get("protocol") != "freedom":
             raise AssertionError("udp-via direct is not a freedom outbound")
-        rule(direct, "udp-direct")
 
         block = lane("--udp-via", "block")
-        if tagged(block, "udp-block").get("protocol") != "blackhole":
+        if split(block, "udp-block").get("protocol") != "blackhole":
             raise AssertionError("udp-via block is not a blackhole outbound")
-        rule(block, "udp-block")
 
         same = lane("--udp-via", "foxy")
         if len(same.get("outbounds", [])) != 1 or "routing" in same:

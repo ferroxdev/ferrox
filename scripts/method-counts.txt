@@ -897,6 +897,7 @@ http-proxy hop-relay-splice-pipes 2 ferrox-app-proxy::tests::a_plain_http_hop_re
 
 # --- Routing rules and geosite/geoip -----------------------------------------
 engine-router ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-router syscalls-per-flow UNBLESSED scripts/count-ops.sh
 engine-router flow-decision-allocations 0 ferrox-app-router::tests::a_flow_without_a_domain_matcher_allocates_nothing
 engine-router host-lowercase-buffers-lowercase 0 ferrox-app-router::tests::a_lowercase_host_matches_without_a_buffer
 engine-router host-lowercase-buffers-mixed-case 1 ferrox-app-router::tests::a_mixed_case_host_takes_one_lowercase_buffer
