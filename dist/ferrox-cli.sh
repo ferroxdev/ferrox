@@ -76,6 +76,8 @@ else
 fi
 LANES_FILE="$STATE_DIR/lanes"
 PROXY_OWNER="$STATE_DIR/system-proxy.owner"
+PROXY_LOCK=""
+PROXY_LOCK_DEPTH=0
 CREDS="${FOXY_CREDENTIALS:-$CONF_DIR/credentials}"
 CFG="$CONF_DIR/lane.json"
 # The signed-in session FxA handed back, so a launch after the first signs in
@@ -421,10 +423,22 @@ resolve_real() {
   printf '%s/%s\n' "${dir%/}" "$base"
 }
 
+absolute_path() {
+  local path="$1" dir base
+  dir="$(dirname "$path")"
+  base="$(basename "$path")"
+  if dir="$(cd -P "$dir" 2>/dev/null && pwd)"; then
+    printf '%s/%s\n' "${dir%/}" "$base"
+    return 0
+  fi
+  case "$path" in /*) printf '%s\n' "$path" ;; *) printf '%s/%s\n' "$PWD" "$path" ;; esac
+}
+
 credentials_inside_repo() {
-  local real dir root
+  local real lex dir root
   real="$(resolve_real "$CREDS")"
-  dir="$(dirname "$real")"
+  lex="$(absolute_path "$CREDS")"
+  dir="$(dirname "$lex")"
   while [ ! -d "$dir" ]; do
     [ "$dir" = / ] && return 1
     dir="$(dirname "$dir")"
@@ -432,6 +446,7 @@ credentials_inside_repo() {
   root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
   root="$(resolve_real "$root")"
   case "$real" in "$root"/*) return 0 ;; esac
+  case "$lex" in "$root"/*) return 0 ;; esac
   return 1
 }
 
@@ -447,14 +462,17 @@ action_login() {
     printf 'password (hidden, not echoed): ' && read -rs pass && printf '\n'
   fi
   [ -n "$email" ] && [ -n "$pass" ] || die "an account is an email and a password"
-  local cred_dir tmp
+  local cred_dir tmp unsafe
   cred_dir="$(dirname "$CREDS")"
   [ -d "$CREDS" ] && die "$CREDS is a directory; FOXY_CREDENTIALS must name a file"
   mkdir -p "$CONF_DIR" || die "cannot create $CONF_DIR; the saved session was kept."
   chmod 700 "$CONF_DIR" 2>/dev/null || true
   if [ "$cred_dir" != "$CONF_DIR" ]; then
-    mkdir -p "$cred_dir" || die "cannot create $cred_dir; the saved session was kept."
+    ( umask 077; mkdir -p "$cred_dir" ) || die "cannot create $cred_dir; the saved session was kept."
   fi
+  [ -O "$cred_dir" ] || die "$cred_dir is not owned by you; choose an owner-only directory"
+  unsafe="$(find "$cred_dir" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print -quit 2>/dev/null)"
+  [ -z "$unsafe" ] || die "$cred_dir is writable by another user; choose an owner-only directory"
   tmp="$(mktemp "$cred_dir/.ferrox-credentials.XXXXXX")" ||
     die "cannot create a temporary credentials file in $cred_dir; the saved session was kept."
   (
@@ -1826,7 +1844,53 @@ proxy_restore_snapshot() {
   return 2
 }
 
+proxy_lock() {
+  local dir pid i
+  if [ "${PROXY_LOCK_DEPTH:-0}" -gt 0 ]; then
+    PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH + 1))
+    return 0
+  fi
+  dir="$(absolute_path "$STATE_DIR")/system-proxy.lock"
+  for i in $(seq 1 300); do
+    if mkdir "$dir" 2>/dev/null; then
+      printf '%s\n' "$$" >"$dir/pid" 2>/dev/null || true
+      PROXY_LOCK="$dir"
+      PROXY_LOCK_DEPTH=1
+      return 0
+    fi
+    pid="$(cat "$dir/pid" 2>/dev/null || true)"
+    if [ -z "$pid" ] && [ "$i" -le 20 ]; then
+      sleep 0.1
+      continue
+    fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      sleep 0.1
+    else
+      rm -rf "$dir"
+    fi
+  done
+  say "system proxy: another ferrox-cli is changing the proxy; try again." >&2
+  return 1
+}
+
+proxy_unlock() {
+  [ "${PROXY_LOCK_DEPTH:-0}" -gt 0 ] || return 0
+  PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH - 1))
+  if [ "$PROXY_LOCK_DEPTH" -eq 0 ] && [ -n "$PROXY_LOCK" ]; then
+    rm -rf "$PROXY_LOCK"
+    PROXY_LOCK=""
+  fi
+}
+
 system_proxy_on() {
+  local rc=0
+  proxy_lock || return 1
+  _system_proxy_on || rc=$?
+  proxy_unlock
+  return "$rc"
+}
+
+_system_proxy_on() {
   command -v networksetup >/dev/null 2>&1 || { say "system proxy: no networksetup; nothing was armed." >&2; return 1; }
   command -v scutil >/dev/null 2>&1 || { say "system proxy: no scutil to read the proxy back; nothing was armed." >&2; return 1; }
   local owner_pidfile
@@ -1945,7 +2009,7 @@ system_proxy_on() {
   done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
   [ "$any" = 1 ] || { system_proxy_off; say "no network service took the proxy" >&2; return 1; }
   printf '%s %s\n' "${want_socks:--}" "${want_http:--}" > "$PROXY_PORTS"
-  printf '%s\n' "$PID_FILE" > "$PROXY_OWNER"
+  printf '%s\n' "$(absolute_path "$PID_FILE")" > "$PROXY_OWNER"
   readback="$(scutil --proxy 2>/dev/null)" || readback=""
   bad=""
   proxy_readback_has "$readback" ProxyAutoConfigEnable 0 || bad="PAC"
@@ -2017,6 +2081,14 @@ PY
 }
 
 system_proxy_off() {
+  local rc=0
+  proxy_lock || return 1
+  _system_proxy_off "${1:-0}" || rc=$?
+  proxy_unlock
+  return "$rc"
+}
+
+_system_proxy_off() {
   local svc kind get set line enabled server port owned owner_pidfile failed=0 cleared=0 restored=0
   local pac_on pac_url auto_on bypass force="${1:-0}"
   owned="$(proxy_owned_ports)"
