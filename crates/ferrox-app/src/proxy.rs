@@ -17656,6 +17656,7 @@ fn serve_ss_tls_front(
     )))
 }
 
+#[allow(clippy::too_many_lines)]
 fn serve_shadowsocks_inbound(
     address: &str,
     inbound: &Json,
@@ -17752,31 +17753,40 @@ fn serve_shadowsocks_inbound(
     }
     if let (Some(accounts), Some(clients)) = (udp_accounts, udp_front) {
         served += 1;
-        let udp_stop = stop.cloned();
-        let udp_cancel = stop.map(|stop| stop.shared());
-        thread::spawn(move || {
-            if accounts.is_2022 {
-                crate::shadowsocks2022::serve_udp_on(
-                    &clients,
-                    &accounts.password,
-                    &accounts.method,
-                    freedom,
-                    udp_cancel.as_deref(),
-                );
-            } else {
-                crate::shadowsocks::serve_udp_on(
-                    &clients,
-                    &accounts.users,
-                    freedom,
-                    udp_cancel.as_deref(),
-                );
-            }
-            if let Some(stop) = udp_stop {
-                stop.mark_closed();
-            }
-        });
+        serve_ss_udp_front(accounts, clients, freedom, stop);
     }
     served
+}
+
+fn serve_ss_udp_front(
+    accounts: Arc<crate::shadowsocks::SsAccounts>,
+    clients: UdpSocket,
+    freedom: bool,
+    stop: Option<&Arc<Stop>>,
+) {
+    let udp_stop = stop.cloned();
+    let udp_cancel = stop.map(|stop| stop.shared());
+    thread::spawn(move || {
+        if accounts.is_2022 {
+            crate::shadowsocks2022::serve_udp_on(
+                &clients,
+                &accounts.password,
+                &accounts.method,
+                freedom,
+                udp_cancel.as_deref(),
+            );
+        } else {
+            crate::shadowsocks::serve_udp_on(
+                &clients,
+                &accounts.users,
+                freedom,
+                udp_cancel.as_deref(),
+            );
+        }
+        if let Some(stop) = udp_stop {
+            stop.mark_closed();
+        }
+    });
 }
 
 /// The inbound's own key, preferring `settings`.
