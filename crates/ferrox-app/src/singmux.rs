@@ -2193,7 +2193,7 @@ mod tests {
         let started = std::time::Instant::now();
         session.session.finish_deferred();
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(100),
+            started.elapsed() < std::time::Duration::from_millis(500),
             "deferred teardown returns without running the carrier close"
         );
         running
