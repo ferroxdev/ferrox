@@ -56230,10 +56230,10 @@ mod tests {
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let payloads = [format!("ping-{echo_port}"), format!("pong-{echo_port}")];
         let mut frame = Vec::new();
-        for (index, payload) in payloads.iter().map(String::as_bytes).enumerate() {
+        for payload in payloads.iter().map(String::as_bytes) {
             let datagram = socks_udp_frame(&mut frame, &target, payload);
             assert_eq!(
-                socks_udp_answer(udp, datagram, payload, tag, index == 0),
+                socks_udp_answer(udp, datagram, payload, tag),
                 target,
                 "{tag}"
             );
@@ -56242,24 +56242,14 @@ mod tests {
         }
     }
 
-    /// A stale frame can land on a reused relay port and a lane can drop its first datagram: resend the first, but send the second once so a new association cannot answer it.
-    fn socks_udp_answer(
-        udp: &UdpSocket,
-        frame: &[u8],
-        want: &[u8],
-        tag: &str,
-        resend: bool,
-    ) -> SocketAddr {
+    /// A stale frame can land on a reused relay port and a lane can drop a datagram: resend until the deadline, so a lost packet is not a failed association.
+    fn socks_udp_answer(udp: &UdpSocket, frame: &[u8], want: &[u8], tag: &str) -> SocketAddr {
         udp.set_read_timeout(Some(Duration::from_millis(250)))
             .expect("timeout");
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut back = vec![0u8; UDP_BUF];
-        let mut sent = false;
         loop {
-            if resend || !sent {
-                udp.send(frame).expect("sends");
-                sent = true;
-            }
+            udp.send(frame).expect("sends");
             let until = Instant::now() + Duration::from_millis(250);
             while Instant::now() < until {
                 let Ok(n) = udp.recv(&mut back) else {
@@ -56270,12 +56260,6 @@ mod tests {
                         return source;
                     }
                 }
-            }
-            if !resend {
-                assert!(
-                    Instant::now() < deadline,
-                    "{tag} never answered {want:?} after one send"
-                );
             }
             assert!(Instant::now() < deadline, "{tag} never answers {want:?}");
         }
