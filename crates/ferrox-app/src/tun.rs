@@ -971,12 +971,6 @@ impl Device {
         unsafe { libc::poll(&raw mut row, 1, 0) > 0 && (row.revents & libc::POLLIN) != 0 }
     }
 
-    /// Wintun has no descriptor to poll, so a queued packet is served on the next read rather than by asking the device.
-    #[cfg(not(unix))]
-    fn readable_now(&self) -> bool {
-        false
-    }
-
     fn write_packet(&mut self, packet: &[u8]) -> io::Result<bool> {
         write_framed(&mut self.handle, self.framing, None, packet)
     }
