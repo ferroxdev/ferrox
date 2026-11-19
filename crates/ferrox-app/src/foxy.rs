@@ -1110,10 +1110,10 @@ fn reset_stream(inner: &mut SessionInner, stream: u32) {
 }
 
 /// Ends one stream without touching the session: an edge's `RST_STREAM` names a flow, so only that flow's readers stop; a `GOAWAY` is the session's and still sets `gone`.
-fn end_stream(inner: &mut SessionInner, stream: u32) {
+fn end_stream(inner: &mut SessionInner, stream: u32, code: u32) {
     if let Some(entry) = inner.streams.get_mut(&stream) {
         entry.fin = true;
-        entry.reset = true;
+        entry.reset = Some(code);
     }
 }
 
@@ -1301,8 +1301,8 @@ struct Stream {
     staged: u32,
     /// The peer ended this stream: nothing more will arrive on it.
     fin: bool,
-    /// The edge reset this stream before its status arrived: an opening read stops on it rather than waiting for a frame that will never come.
-    reset: bool,
+    /// The edge reset this stream, with its `RST_STREAM` code: an opening read stops on it rather than waiting for a frame that will never come.
+    reset: Option<u32>,
     /// This flow has closed its half of the stream.
     sent_end: bool,
     /// The IP packet under construction, reused so a datagram allocates nothing: an IP header, a UDP header and the payload, written once and handed to the frame. A packet per datagram took a buffer that grew three times on its way to the wire.
@@ -1323,7 +1323,7 @@ impl Stream {
             pending_credit: 0,
             staged: 0,
             fin: false,
-            reset: false,
+            reset: None,
             sent_end: false,
             packet: Vec::new(),
         }
@@ -1843,7 +1843,12 @@ impl Tls2 {
                 return Ok(status);
             }
             // A reset or a session the edge took away ends the open before the read: no frame will arrive for it, and waiting under the session lock would hold every sibling lane for the whole head budget. `fin` is not the signal, because a HEADERS may carry `END_STREAM` before its CONTINUATION frames.
-            if inner.gone || inner.streams.get(&own).is_some_and(|entry| entry.reset) {
+            if inner.gone
+                || inner
+                    .streams
+                    .get(&own)
+                    .is_some_and(|entry| entry.reset.is_some())
+            {
                 return Err(Failure::Stream);
             }
             let status =
@@ -1867,8 +1872,8 @@ impl Tls2 {
                             }
                             take_status(inner, own)
                         }
-                        frames::H2Routed::Reset { stream, .. } => {
-                            end_stream(inner, stream);
+                        frames::H2Routed::Reset { stream, code } => {
+                            end_stream(inner, stream, code);
                             if stream == own {
                                 Err(Failure::Stream)
                             } else {
@@ -2062,8 +2067,8 @@ fn stage_datagram(
             }
             Ok(0)
         }
-        frames::H2Routed::Reset { stream, .. } => {
-            end_stream(inner, stream);
+        frames::H2Routed::Reset { stream, code } => {
+            end_stream(inner, stream, code);
             Ok(0)
         }
         frames::H2Routed::GoAway { .. } => {
@@ -2098,8 +2103,8 @@ fn stage_address(
             }
             Ok(())
         }
-        frames::H2Routed::Reset { stream, .. } => {
-            end_stream(inner, stream);
+        frames::H2Routed::Reset { stream, code } => {
+            end_stream(inner, stream, code);
             Ok(())
         }
         frames::H2Routed::GoAway { .. } => {
@@ -2166,8 +2171,8 @@ fn route_packet(
             }
             Ok(false)
         }
-        frames::H2Routed::Reset { stream, .. } => {
-            end_stream(inner, stream);
+        frames::H2Routed::Reset { stream, code } => {
+            end_stream(inner, stream, code);
             Ok(false)
         }
         frames::H2Routed::GoAway { .. } => {
@@ -2316,13 +2321,13 @@ impl Read for Tls2 {
                             }
                             Ok(0)
                         }
-                        frames::H2Routed::Reset { stream, .. } => {
-                            end_stream(inner, stream);
+                        frames::H2Routed::Reset { stream, code } => {
+                            end_stream(inner, stream, code);
                             Ok(0)
                         }
                         frames::H2Routed::GoAway { .. } => {
                             inner.gone = true;
-                            end_stream(inner, own);
+                            end_stream(inner, own, 8);
                             Ok(0)
                         }
                         _ => Ok(0),
