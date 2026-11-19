@@ -46,6 +46,10 @@ on:
         description: country code to pin the dial at
         required: false
         default: US
+      ref:
+        description: commit or branch to test (empty means the dispatched ref)
+        required: false
+        default: ""
 
 # One account, so every relay and the allowance probe take turns: a second
 # client downloading while a transfer is bracketed is charged to the bracket.
@@ -110,6 +114,8 @@ jobs:
       SOCKS_PORT: 10808
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - name: Check secrets present
         id: secrets
         env:
@@ -229,6 +235,7 @@ jobs:
           # still to come: a slow carrier gets the room its first flow needs, and a dead
           # one cannot starve the rest. The job fails at the end if any leg did.
           FAILED=""
+          printf 'carrier cpu_ms peak_rss_kib\n' > foxy-resources.tsv
           legs=4
           leg=0
           reserve=45
@@ -255,6 +262,10 @@ jobs:
               stop_lane
               FAILED="$FAILED $carrier(listen)"
               continue
+            fi
+            cpu0=""
+            if [ -r "/proc/$LANE_PID/stat" ]; then
+              cpu0="$(awk '{print $14+$15}' "/proc/$LANE_PID/stat")"
             fi
             # The first flow is the measurement: one trace attempt, timed, and its
             # curl exit taken at face value. A retry here would hide a stalling
@@ -331,6 +342,12 @@ jobs:
             else
               echo "carrier $carrier FAILED: curl_exit=$code bytes=$got" >&2
               FAILED="$FAILED $carrier"
+            fi
+            if [ -n "$cpu0" ] && [ -r "/proc/$LANE_PID/status" ]; then
+              cpu1="$(awk '{print $14+$15}' "/proc/$LANE_PID/stat")"
+              hwm="$(awk '/VmHWM/{print $2}' "/proc/$LANE_PID/status")"
+              hz="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+              echo "$carrier $(( (cpu1 - cpu0) * 1000 / hz )) ${hwm:-0}" >> foxy-resources.tsv
             fi
             stop_lane
           done
@@ -893,6 +910,14 @@ jobs:
             echo "| leg | bytes | seconds | MiB/s | vs this runner's own egress | proxy open | tls through the lane | first byte | transfer tail |"
             echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
             echo "$table"
+            if [ -f foxy-resources.tsv ]; then
+              echo
+              echo "### Lane CPU and peak RSS, live (${{ matrix.os }})"
+              echo
+              echo "| carrier | CPU ms | peak RSS KiB |"
+              echo "| --- | --- | --- |"
+              tail -n +2 foxy-resources.tsv | awk '{printf "| %s | %s | %s |\n", $1, $2, $3}'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   result:
