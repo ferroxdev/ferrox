@@ -3154,7 +3154,7 @@ pub(crate) fn serve_prepared(
             let _ = conn.close(true, 0, b"");
         }
     }
-    readers.extend(router.retired.drain(..));
+    readers.append(&mut router.retired);
     for reader in readers {
         let _ = reader.join();
     }
