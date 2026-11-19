@@ -927,7 +927,7 @@ impl Endpoint {
         if !host.eq_ignore_ascii_case(&self.host) {
             endpoint.port = 443;
         }
-        endpoint.host = host.to_owned();
+        host.clone_into(&mut endpoint.host);
         endpoint.address = self.address.or_else(|| edge_peer(host, endpoint.port));
         endpoint
     }

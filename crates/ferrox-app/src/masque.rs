@@ -4416,9 +4416,8 @@ fn stream_frame(
 ) -> FrameSend {
     while *at < frame.len() {
         match conn.stream_send(stream, &frame[*at..], false) {
-            Ok(0) => return FrameSend::Blocked,
+            Ok(0) | Err(quiche::Error::Done) => return FrameSend::Blocked,
             Ok(wrote) => *at += wrote,
-            Err(quiche::Error::Done) => return FrameSend::Blocked,
             Err(_) => return FrameSend::Failed,
         }
     }
