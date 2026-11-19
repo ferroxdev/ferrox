@@ -509,7 +509,7 @@ pub(crate) fn serve(
     spec: &crate::tun::Spec,
     out: &crate::proxy::Outbound,
     hybrid: bool,
-) -> io::Result<()> {
+) -> io::Result<String> {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
@@ -536,7 +536,8 @@ pub(crate) fn serve(
         );
     }
     let device = Arc::new(tun_stack::build(spec, false, false)?.0);
-    let listener = std::net::TcpListener::bind(listener_address(local, &device.name()?)?)?;
+    let name = device.name()?;
+    let listener = std::net::TcpListener::bind(listener_address(local, &name)?)?;
     listener.set_nonblocking(true)?;
     let listener_port = listener.local_addr()?.port();
     if spec.queues() > 1 {
@@ -600,7 +601,7 @@ pub(crate) fn serve(
 
     let mtu = spec.mtu();
     thread::spawn(move || tun_stack::recv_loop(device, packets, reused, mtu, 0, wake_write));
-    Ok(())
+    Ok(name)
 }
 
 #[cfg(target_os = "linux")]

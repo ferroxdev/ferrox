@@ -2061,8 +2061,8 @@ impl Handler {
         } else {
             Some((ip.destination, udp.destination_port))
         };
-        // An endpoint-independent mapping keys on the client source alone; the frame still names each datagram's destination, and the reply's source comes back off that frame.
-        let (key, pinned) = if self.endpoint_independent_nat {
+        // An endpoint-independent mapping keys on the client source alone; the frame still names each datagram's destination, and the reply's source comes back off that frame. A hijacked query keeps its own key, because its answer names the address the device asked rather than the last frame the shared socket sent.
+        let (key, pinned) = if self.endpoint_independent_nat && render.is_none() {
             (
                 UdpKey {
                     source: ip.source,
@@ -5265,6 +5265,66 @@ mod tests {
             (ip.source, ip.destination),
             ([198, 51, 100, 7], SCRIPT_CLIENT),
             "the answer keeps the address the device asked"
+        );
+    }
+
+    /// Endpoint-independent NAT does not fold hijacked queries together: each asked address keeps a leg, so an answer names the address its own query asked.
+    #[cfg(unix)]
+    #[test]
+    fn a_hijacked_query_keeps_its_own_leg_under_endpoint_independent_nat() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+        let spec = Spec::new(None, None)
+            .with_endpoint_independent_nat(true)
+            .with_dns_hijack(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 53))));
+        let mut handler = Handler::on(
+            Device::from_handle(a, DEFAULT_MTU),
+            relay,
+            echo_associate(frames.clone()),
+            None,
+            None,
+            Flows::default(),
+            Legs::default(),
+            &spec,
+        );
+        let asked = [
+            ([198, 51, 100, 7], &b"one"[..]),
+            ([203, 0, 113, 9], &b"two"[..]),
+        ];
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        for (destination, payload) in asked {
+            let query = datagram(SCRIPT_CLIENT, destination, 51500, 53, payload);
+            peer.write_all(&query).unwrap();
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+        }
+        assert_eq!(
+            handler.legs.len(),
+            2,
+            "each asked address keeps its own leg"
+        );
+        wait_for_frames(&frames, 2);
+        let on_wire = frames.lock().unwrap().clone();
+        for (destination, payload) in asked {
+            let mut want = vec![0u8, 0, 0, 1, 203, 0, 113, 53, 0, 53];
+            want.extend_from_slice(payload);
+            assert!(
+                on_wire.iter().any(|frame| frame == &want),
+                "the query to {destination:?} rides the resolver"
+            );
+        }
+        let mut sources = Vec::new();
+        for _ in 0..asked.len() {
+            let n = next_datagram(&mut peer, &mut buf);
+            let (ip, _) = ipv4_head(&buf[..n]).unwrap();
+            sources.push(ip.source);
+        }
+        sources.sort_unstable();
+        assert_eq!(
+            sources,
+            vec![[198, 51, 100, 7], [203, 0, 113, 9]],
+            "each answer keeps the address its own query asked"
         );
     }
 

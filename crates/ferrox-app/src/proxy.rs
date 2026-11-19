@@ -2609,6 +2609,20 @@ impl Outbound {
         }
     }
 
+    /// Every edge a dial from this host can reach first: the static outbound's own server, or every tag a route plan could pick, hostnames resolved now. A destination the tree dials directly has no edge and is named by the caller.
+    pub(crate) fn edges(&self) -> Vec<SocketAddr> {
+        let mut edges = Vec::new();
+        match self {
+            Self::Route(plan) => plan.edges(&mut edges),
+            other => {
+                if let Some(edge) = other.edge() {
+                    edges.push(edge);
+                }
+            }
+        }
+        edges
+    }
+
     fn resolved_lane_with_protocol(
         &self,
         asked: &Destination,
@@ -3438,6 +3452,31 @@ impl RoutePlan {
         match self.shared.tagged.get(tag) {
             Some(out) => Picked::Static(out),
             None => Picked::Static(&self.shared.closed),
+        }
+    }
+
+    /// Every edge a plan can pick, deduplicated: the default, the tagged table and anything the management API added.
+    fn edges(&self, edges: &mut Vec<SocketAddr>) {
+        let mut push = |outbound: &Outbound| {
+            if let Some(edge) = outbound.edge() {
+                if !edges.contains(&edge) {
+                    edges.push(edge);
+                }
+            }
+        };
+        push(&self.shared.default);
+        for outbound in self.shared.tagged.values() {
+            push(outbound);
+        }
+        if self.shared.changed.load(Ordering::Relaxed) {
+            let dynamic = self
+                .shared
+                .dynamic
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for outbound in dynamic.added.values() {
+                push(outbound);
+            }
         }
     }
 
@@ -17703,9 +17742,17 @@ fn tun_prefixes(
     Ok(prefixes)
 }
 
-/// `dns_mode: hijack` names the resolver a hijacked query rides; `system` and the empty mode leave DNS to the device.
+/// `dns_mode: hijack` names the resolver a hijacked query rides; `system`, `none`, `forward` and the empty mode leave DNS to the device, and a word outside that set is refused rather than read as a silent forward.
 fn tun_dns_hijack(inbound: &Json) -> Result<Option<IpAddr>, String> {
-    let hijack = tun_string(inbound, "dns_mode")?.is_some_and(|mode| mode == "hijack");
+    let hijack = match tun_string(inbound, "dns_mode")? {
+        None | Some("" | "system" | "none" | "forward") => false,
+        Some("hijack") => true,
+        Some(other) => {
+            return Err(format!(
+                "`dns_mode` `{other}` is not `hijack`, `system`, `none` or `forward`"
+            ));
+        }
+    };
     if !hijack {
         return Ok(None);
     }
@@ -17783,7 +17830,7 @@ fn tun_mode(stack: &str) -> crate::tun_stack::Mode {
 }
 
 /// Install the `auto_route` guard for `interface` and hold it until the inbound stops, so the table goes back when the handler is removed.
-fn tun_routes(spec: &crate::tun::Spec, interface: &str, stop: Option<&Arc<Stop>>) {
+fn tun_routes(spec: &crate::tun::Spec, interface: &str, out: &Outbound, stop: Option<&Arc<Stop>>) {
     if !spec.auto_route() {
         if !spec.route_address().is_empty() || !spec.route_exclude().is_empty() {
             eprintln!("tun inbound: `route_address` and `route_exclude_address` need `auto_route`");
@@ -17802,7 +17849,22 @@ fn tun_routes(spec: &crate::tun::Spec, interface: &str, stop: Option<&Arc<Stop>>
         .addresses()
         .iter()
         .any(|(address, _)| address.is_ipv6());
-    let plan = crate::tun_route::Plan::new(v4, v6, spec.route_address(), spec.route_exclude());
+    // The proxy's own edge must not enter the device it just captured: pin each one where it already routes, the way the reference keeps its outbound off the tunnel.
+    let mut keep = spec.route_exclude().to_vec();
+    let edges = out.edges();
+    if edges.is_empty() {
+        eprintln!(
+            "tun inbound: `auto_route` captured the default route and this outbound dials destinations directly; bind its interface or exclude the servers it reaches"
+        );
+    }
+    for edge in edges {
+        let host = edge.ip();
+        let bits = if host.is_ipv4() { 32 } else { 128 };
+        if !keep.contains(&(host, bits)) {
+            keep.push((host, bits));
+        }
+    }
+    let plan = crate::tun_route::Plan::new(v4, v6, spec.route_address(), &keep);
     if plan.is_empty() {
         return;
     }
@@ -17839,10 +17901,15 @@ fn serve_tun_inbound(
     let stack = tun_stack(inbound);
     warn_unapplied_tun_options(inbound, tun_native(stack));
     if !tun_native(stack) {
+        if spec.dns_hijack().is_some() {
+            eprintln!(
+                "tun inbound: the `{stack}` stack does not hijack DNS, so `dns_mode` is not applied"
+            );
+        }
         return match crate::tun_stack::serve(spec, out, tun_mode(stack)) {
             Ok(interface) => {
                 if !interface.is_empty() {
-                    tun_routes(spec, &interface, stop);
+                    tun_routes(spec, &interface, out, stop);
                 } else if spec.auto_route() {
                     eprintln!("tun inbound: the `{stack}` stack does not name its device, so `auto_route` is not applied");
                 }
@@ -17862,7 +17929,7 @@ fn serve_tun_inbound(
         .first()
         .map(|device| device.name().to_owned())
         .unwrap_or_default();
-    tun_routes(spec, &interface, stop);
+    tun_routes(spec, &interface, out, stop);
     let flows = crate::tun::Flows::default();
     let legs = crate::tun::Legs::default();
     let dial = Some(device_dial(out));
@@ -44192,6 +44259,10 @@ mod tests {
         assert!(
             spec(r#"{"dns_mode":"hijack"}"#).is_err(),
             "hijack names a resolver"
+        );
+        assert!(
+            spec(r#"{"dns_mode":"hijak"}"#).is_err(),
+            "a mode outside the set is refused, not forwarded"
         );
         assert!(
             spec(

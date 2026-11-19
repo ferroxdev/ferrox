@@ -48,10 +48,10 @@ pub(crate) fn serve(spec: &Spec, out: &Outbound, mode: Mode) -> io::Result<Strin
     match mode {
         Mode::Userspace => serve_userspace(spec, out),
         #[cfg(target_os = "linux")]
-        Mode::System => crate::tun_system::serve(spec, out, false).map(|()| String::new()),
+        Mode::System => crate::tun_system::serve(spec, out, false),
         #[cfg(target_os = "linux")]
         Mode::Hybrid => match crate::tun_system::serve(spec, out, true) {
-            Ok(()) => Ok(String::new()),
+            Ok(name) => Ok(name),
             Err(error) => {
                 eprintln!(
                     "tun inbound: the hybrid stack is unavailable ({error}), using the userspace stack"

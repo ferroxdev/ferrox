@@ -26,27 +26,33 @@ impl Plan {
             routes: Vec::new(),
             keep: keep.to_vec(),
         };
+        let kept = |address: IpAddr, prefix: u8| {
+            keep.iter().any(|(outer, outer_prefix)| {
+                same_family(*outer, address) && covers(*outer, *outer_prefix, address, prefix)
+            })
+        };
         if v4 {
-            plan.routes
-                .push((IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 1));
-            plan.routes
-                .push((IpAddr::V4(std::net::Ipv4Addr::new(128, 0, 0, 0)), 1));
+            for half in [
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                IpAddr::V4(std::net::Ipv4Addr::new(128, 0, 0, 0)),
+            ] {
+                if !kept(half, 1) {
+                    plan.routes.push((half, 1));
+                }
+            }
         }
         if v6 {
-            plan.routes
-                .push((IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 1));
-            plan.routes.push((
+            for half in [
+                IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
                 IpAddr::V6(std::net::Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0)),
-                1,
-            ));
+            ] {
+                if !kept(half, 1) {
+                    plan.routes.push((half, 1));
+                }
+            }
         }
         for (address, prefix) in routes {
-            if plan.routes.contains(&(*address, *prefix))
-                || keep.iter().any(|(outer, outer_prefix)| {
-                    same_family(*outer, *address)
-                        && covers(*outer, *outer_prefix, *address, *prefix)
-                })
-            {
+            if plan.routes.contains(&(*address, *prefix)) || kept(*address, *prefix) {
                 continue;
             }
             plan.routes.push((*address, *prefix));
@@ -138,7 +144,7 @@ fn same_family(outer: IpAddr, inner: IpAddr) -> bool {
 
 /// Whether `outer/prefix` contains `inner/inner_prefix`, by masked bits alone.
 fn covers(outer: IpAddr, prefix: u8, inner: IpAddr, inner_prefix: u8) -> bool {
-    if prefix >= inner_prefix {
+    if prefix > inner_prefix {
         return false;
     }
     match (outer, inner) {
@@ -198,6 +204,32 @@ mod tests {
         assert!(!plan
             .routes()
             .contains(&(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16)));
+    }
+
+    #[test]
+    fn a_kept_default_route_skips_the_family_halves() {
+        let keep = [
+            (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+        ];
+        let plan = Plan::new(true, true, &[], &keep);
+        assert!(plan.routes().is_empty(), "{:?}", plan.routes());
+    }
+
+    #[test]
+    fn an_equal_prefix_is_contained() {
+        let route = (IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16);
+        let plan = Plan::new(true, false, &[route], &[route]);
+        assert!(!plan.routes().contains(&route));
+        let host = (IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 32);
+        let plan = Plan::new(true, false, &[host], &[host]);
+        assert!(!plan.routes().contains(&host));
+        let v6 = (
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            128,
+        );
+        let plan = Plan::new(false, true, &[v6], &[v6]);
+        assert!(!plan.routes().contains(&v6));
     }
 
     #[test]
