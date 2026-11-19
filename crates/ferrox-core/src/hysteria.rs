@@ -1257,7 +1257,7 @@ pub fn parse_origin_response(raw: &[u8]) -> Option<OriginResponse> {
         });
     }
     if let Some(want) = length {
-        body = body.get(..want).unwrap_or(body);
+        body = body.get(..want)?;
     }
     Some(OriginResponse {
         status,
@@ -2290,6 +2290,10 @@ mod tests {
         assert!(
             parse_origin_response(b"HTTP/1.1 200 OK\r\n").is_none(),
             "a head that never reaches its blank line is not a response"
+        );
+        assert!(
+            parse_origin_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort").is_none(),
+            "a body shorter than its content-length is not the whole response"
         );
     }
 

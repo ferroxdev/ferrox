@@ -233,6 +233,10 @@ impl TokenFile {
         }
         let mut text = String::new();
         json::write(&Json::Obj(pairs), &mut text);
+        if text.len() > TOKEN_FILE_CAP {
+            eprintln!("foxy: the session is too large to store");
+            return false;
+        }
         // A lane beside this one may read the file at any moment: a rename shows it the old grant or the new one, never half of either.
         let mut opened = None;
         for _ in 0..8 {
@@ -2249,6 +2253,8 @@ impl Account {
         if base.valid_at(epoch()) && (!forced || base.access_token != stale.access_token) {
             return Ok(self.adopt(base));
         }
+        // The refused grant is the one this lane attempted, so cleanup names it rather than a stale in-memory pair.
+        *self.auth.lock().map_err(|_| Denied::Token)? = base.clone();
         let now = epoch();
         let fresh = match token(&self.fxa, &self.jar, None, Some(&base.refresh_token), now) {
             Ok(fresh) => fresh,
@@ -3704,6 +3710,11 @@ mod loopback {
             "an oversized file is not a session"
         );
         let _ = std::fs::remove_file(&path);
+        assert!(
+            !tokens.save(None, Some(&"x".repeat(TOKEN_FILE_CAP))),
+            "a session too large to load is not written"
+        );
+        assert!(!path.exists(), "the refused session leaves no file");
     }
 
     /// A temp name is created fresh, so a link planted at the predictable old name is never followed or truncated.

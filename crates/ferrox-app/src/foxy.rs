@@ -3403,15 +3403,25 @@ pub(crate) fn exit_country(head: &[u8]) -> Option<String> {
             .chars()
             .take_while(char::is_ascii_alphanumeric)
             .collect();
-        if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
+        if is_exit_marker(&code) {
             return Some(code);
         }
     }
     let key = "\"countryCode\":\"";
     let at = text.find(key)? + key.len();
-    text.get(at..at + 2)
-        .filter(|code| code.chars().all(|c| c.is_ascii_uppercase()))
-        .map(str::to_owned)
+    let code: String = text
+        .get(at..)?
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect();
+    is_exit_marker(&code).then_some(code)
+}
+
+/// A country code, or the `T1`/`REC` markers an exit probe uses for a restricted edge.
+fn is_exit_marker(code: &str) -> bool {
+    code == "T1"
+        || code == "REC"
+        || (code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()))
 }
 
 fn io(failure: Failure) -> std::io::Error {
@@ -4377,6 +4387,8 @@ mod tests {
         );
         assert_eq!(exit_country(b"nothing here"), None);
         assert_eq!(exit_country(b"loc=DEU"), None);
+        assert_eq!(exit_country(b"loc=T1\n"), Some("T1".to_owned()));
+        assert_eq!(exit_country(b"loc=REC\n"), Some("REC".to_owned()));
     }
 }
 

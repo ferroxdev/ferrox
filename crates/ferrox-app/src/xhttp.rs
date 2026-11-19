@@ -3522,7 +3522,7 @@ fn send_dial_head_padded<W: crate::proxy::FrameWrite>(
 ) -> Option<()> {
     const BEFORE_PATH: &str = "POST ";
     const BEFORE_HOST: &str = " HTTP/1.1\r\nHost: ";
-    const BEFORE_REFERER: &str = "\r\nReferer: http://";
+    const BEFORE_REFERER: &str = "Referer: http://";
     // The reference dialer disables keep-alives (dialer.go:272), and a chunked request whose first chunk waits on the 200 hangs a peer that drains the body before it flushes.
     const TAIL: &str = "Transfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
     let referer = target.split_once('?').map_or(target, |(path, _)| path);
@@ -3539,6 +3539,7 @@ fn send_dial_head_padded<W: crate::proxy::FrameWrite>(
                 + target.len()
                 + BEFORE_HOST.len()
                 + host.len()
+                + 2
                 + if padding_is_referer {
                     0
                 } else {
@@ -3556,6 +3557,7 @@ fn send_dial_head_padded<W: crate::proxy::FrameWrite>(
         head.extend_from_slice(target.as_bytes());
         head.extend_from_slice(BEFORE_HOST.as_bytes());
         head.extend_from_slice(host.as_bytes());
+        head.extend_from_slice(b"\r\n");
         if !padding_is_referer {
             head.extend_from_slice(BEFORE_REFERER.as_bytes());
             head.extend_from_slice(host.as_bytes());
@@ -6268,6 +6270,30 @@ mod tests {
         assert!(
             head.contains("?x_padding=XXXX\r\n"),
             "the dial wrote a run its own hub refuses: {head}"
+        );
+    }
+
+    /// A pad that is the `Referer` field itself follows a terminated `Host` line, not the host value.
+    #[test]
+    fn a_referer_pad_keeps_the_host_line_terminated() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = Sink(Arc::clone(&seen));
+        send_dial_head_padded(
+            &mut sink,
+            "front.example",
+            "/share",
+            &[],
+            "Referer: http://front.example/share?x_padding=XXXX\r\n",
+            "?x_padding=",
+            "",
+        )
+        .expect("head");
+        let head = String::from_utf8(seen.lock().expect("sink").clone()).expect("utf8");
+        assert!(
+            head.contains(
+                "Host: front.example\r\nReferer: http://front.example/share?x_padding=XXXX\r\n"
+            ),
+            "the host line ends before the referer pad: {head}"
         );
     }
 

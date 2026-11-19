@@ -904,6 +904,13 @@ impl<R: Read> GrpcReader<R> {
             return Ok(None);
         }
         self.pending = None;
+        // A body that completes after the handshake clock cannot be the request that spends it: refuse before `dispatch` writes a status.
+        if self
+            .handshake
+            .is_some_and(|until| std::time::Instant::now() >= until)
+        {
+            return Ok(None);
+        }
         Ok(if kind == T_DATA {
             self.finish_data(id, flags, from, len)
         } else {
@@ -5296,6 +5303,14 @@ mod tests {
         let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, 0);
         let shared = Arc::clone(&writer.shared);
         writer.upload_done();
+        {
+            let peer = peer.lock().unwrap();
+            assert_eq!(
+                peer.writes.concat(),
+                frame(T_DATA, F_END, 1, &[]),
+                "the end marker is written before any credit is granted"
+            );
+        }
         {
             let mut send = shared.send.lock().unwrap();
             send.conn = u64::MAX;

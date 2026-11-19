@@ -86,6 +86,7 @@ impl QuicServer {
 /// How many flows one lane lends before it is handed back for a fresh dial: reuse without a bound is the leak the lane was first closed for, and a stream id only comes back if the edge grants it.
 pub(crate) const MAX_FLOWS_ON_LANE: u64 = 64;
 const MAX_SERVER_CONNECTIONS: usize = 1024;
+const MAX_UNVERIFIED_CONNECTIONS: usize = MAX_SERVER_CONNECTIONS / 4;
 
 struct PooledState {
     /// One handle per flow, shared by every burst it arrives in: a hand-off takes a refcount, not a `dup`.
@@ -181,6 +182,7 @@ impl PooledStream {
             prefaced: Arc::new(AtomicBool::new(true)),
             activity: Arc::clone(&self.activity),
             stop: Arc::new(AtomicBool::new(false)),
+            stalled: Arc::new(AtomicBool::new(false)),
             owner: None,
         }
     }
@@ -4145,6 +4147,7 @@ fn pump(
                     break;
                 }
                 if n > 0 && (&*up).write_all(&chunk[..n]).is_err() {
+                    stop_stream(shared, sock, id);
                     fail_session(table, id);
                     break;
                 }
@@ -4683,6 +4686,8 @@ pub(crate) struct QuicStream {
     activity: Arc<Activity>,
     /// Set by the serving driver when it stops: a worker parked in a read or write leaves instead of holding the socket past the loop.
     stop: Arc<AtomicBool>,
+    /// A partial frame spent its send deadline: the next `write_all` retry fails instead of starting a second wait.
+    stalled: Arc<AtomicBool>,
     /// The serving connection's identity, absent on a client-side handle whose sessions no listener owns.
     owner: Option<Arc<ConnectionToken>>,
 }
@@ -4752,6 +4757,9 @@ impl Write for QuicStream {
         if self.stop.load(Ordering::Relaxed) {
             return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         }
+        if self.stalled.load(Ordering::Relaxed) {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        }
         // The lock covers one send each: a flow-control wait must not hold it, or ACKs stop arriving.
         let deadline = Instant::now() + SEND_WAIT;
         let mut rest = buf;
@@ -4761,6 +4769,7 @@ impl Write for QuicStream {
                     if Instant::now() >= deadline {
                         let sent = buf.len() - rest.len();
                         if sent > 0 {
+                            self.stalled.store(true, Ordering::Relaxed);
                             return Ok(sent);
                         }
                         return Err(std::io::Error::other("quic stream send timed out"));
@@ -4820,6 +4829,7 @@ impl QuicStream {
             prefaced: Arc::new(AtomicBool::new(true)),
             activity: Arc::new(Activity::new()),
             stop: Arc::new(AtomicBool::new(false)),
+            stalled: Arc::new(AtomicBool::new(false)),
             owner: None,
         }
     }
@@ -4961,6 +4971,7 @@ struct ServerConn {
     conn: Arc<Mutex<quiche::Connection>>,
     seen: Mutex<HashSet<u64>>,
     visit: AtomicU64,
+    established: AtomicBool,
     gone: AtomicBool,
     prefaced: Arc<AtomicBool>,
     /// The serving loop's stop, so every stream on this connection leaves with the driver.
@@ -5052,7 +5063,7 @@ pub(crate) fn serve_loop(
     };
     let sock = Arc::new(sock);
     let live = Arc::new(AtomicUsize::new(0));
-    let mut conns: HashMap<Vec<u8>, Arc<ServerConn>> = HashMap::new();
+    let mut routes = Routing::new();
     let mut scratch = Scratch {
         buf: [0u8; MAX_DATAGRAM],
         out: [0u8; MAX_DATAGRAM],
@@ -5086,15 +5097,15 @@ pub(crate) fn serve_loop(
                     &sock,
                     local,
                     config,
-                    &mut conns,
+                    &mut routes,
                     &mut batch,
                     &mut scratch.out,
                 );
-                reap(serve, &sock, &mut conns, &mut scratch, &live);
+                reap(serve, &sock, &mut routes, &mut scratch, &live);
                 continue;
             }
             Drain::Empty => {
-                reap(serve, &sock, &mut conns, &mut scratch, &live);
+                reap(serve, &sock, &mut routes, &mut scratch, &live);
                 continue;
             }
             Drain::Unbatchable => {}
@@ -5104,7 +5115,7 @@ pub(crate) fn serve_loop(
         match sock.recv_from(&mut scratch.buf) {
             Ok((n, from)) => {
                 let Scratch { buf, out, .. } = &mut scratch;
-                route(&sock, local, config, &mut conns, &mut buf[..n], out, from);
+                route(&sock, local, config, &mut routes, &mut buf[..n], out, from);
             }
             Err(e)
                 if matches!(
@@ -5113,9 +5124,9 @@ pub(crate) fn serve_loop(
                 ) => {}
             Err(_) => return,
         }
-        reap(serve, &sock, &mut conns, &mut scratch, &live);
+        reap(serve, &sock, &mut routes, &mut scratch, &live);
     }
-    for state in conns.values() {
+    for state in routes.conns.values() {
         state.stop.store(true, Ordering::SeqCst);
         if let Ok(mut conn) = state.conn.lock() {
             let _ = conn.close(false, 0, b"");
@@ -5158,12 +5169,29 @@ fn packet_key(buf: &[u8]) -> Option<&[u8]> {
     buf.get(6..6 + dcid_len)
 }
 
+/// The routing table plus the one count per admitted connection, so an Initial does not scan its aliases.
+struct Routing {
+    conns: HashMap<Vec<u8>, Arc<ServerConn>>,
+    lanes: usize,
+    unverified: usize,
+}
+
+impl Routing {
+    fn new() -> Self {
+        Self {
+            conns: HashMap::new(),
+            lanes: 0,
+            unverified: 0,
+        }
+    }
+}
+
 /// One packet to its connection, or to a new connection when it knocks with an Initial.
 fn route(
     sock: &Datagram,
     local: SocketAddr,
     config: &Arc<Mutex<quiche::Config>>,
-    conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
+    routes: &mut Routing,
     buf: &mut [u8],
     out: &mut [u8],
     from: SocketAddr,
@@ -5171,14 +5199,17 @@ fn route(
     let Some(key) = packet_key(buf) else {
         return;
     };
-    if let Some(state) = conns.get(key).cloned() {
+    if let Some(state) = routes.conns.get(key).cloned() {
         let Ok(mut conn) = state.conn.lock() else {
             return;
         };
         let info = quiche::RecvInfo { from, to: local };
         let _ = conn.recv(buf, info);
         flush_egress(&mut conn, sock);
-        learn_ids(conns, &state, &conn);
+        learn_ids(&mut routes.conns, &state, &conn);
+        if conn.is_established() && !state.established.swap(true, Ordering::Relaxed) {
+            routes.unverified = routes.unverified.saturating_sub(1);
+        }
         return;
     }
     // A short header names an established lane or nothing: only a long header can open one.
@@ -5197,14 +5228,8 @@ fn route(
         }
         return;
     }
-    // Every routing key names the same connection, so count distinct lanes before opening another.
-    if conns
-        .values()
-        .map(Arc::as_ptr)
-        .collect::<std::collections::HashSet<_>>()
-        .len()
-        >= MAX_SERVER_CONNECTIONS
-    {
+    // A verified handshake keeps a reserved share of the table: unverified Initials cannot take every slot.
+    if routes.lanes >= MAX_SERVER_CONNECTIONS || routes.unverified >= MAX_UNVERIFIED_CONNECTIONS {
         return;
     }
     // Server SCIDs are the parse length, so short-header DCIDs read exactly, not into payload.
@@ -5226,20 +5251,26 @@ fn route(
     }
     issue_spare_scids_len(&mut conn, sock, out, quiche::MAX_CONN_ID_LEN);
     flush_egress(&mut conn, sock);
+    let established = conn.is_established();
     let state = Arc::new(ServerConn {
         conn: Arc::new(Mutex::new(conn)),
         seen: Mutex::new(HashSet::new()),
         visit: AtomicU64::new(0),
+        established: AtomicBool::new(established),
         gone: AtomicBool::new(false),
         prefaced: Arc::new(AtomicBool::new(false)),
         stop: Arc::new(AtomicBool::new(false)),
         owner: ConnectionToken::new(),
     });
     if let Ok(guard) = state.conn.lock() {
-        learn_ids(conns, &state, &guard);
+        learn_ids(&mut routes.conns, &state, &guard);
     }
-    conns.insert(scid.to_vec(), Arc::clone(&state));
-    conns.insert(header.dcid.as_ref().to_vec(), state);
+    routes.conns.insert(scid.to_vec(), Arc::clone(&state));
+    routes.conns.insert(header.dcid.as_ref().to_vec(), state);
+    routes.lanes += 1;
+    if !established {
+        routes.unverified += 1;
+    }
 }
 
 /// A whole receive batch, one lock per run of datagrams for the same lane. A burst for one lane is what a data frame is, so the common batch pays one lock, one `learn_ids` pass per run and one egress sweep for the run, not one of each per packet. A lane's run keeps the kernel's order; a run for another lane starts its own.
@@ -5248,7 +5279,7 @@ fn route_batch(
     sock: &Datagram,
     local: SocketAddr,
     config: &Arc<Mutex<quiche::Config>>,
-    conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
+    routes: &mut Routing,
     batch: &mut Batch,
     out: &mut [u8],
 ) {
@@ -5258,13 +5289,13 @@ fn route_batch(
             at += 1;
             continue;
         };
-        let Some(state) = conns.get(key).cloned() else {
+        let Some(state) = routes.conns.get(key).cloned() else {
             // A lane the table does not hold: one datagram through the path that may accept or negotiate.
             let Some((bytes, from)) = batch.at(at) else {
                 at += 1;
                 continue;
             };
-            route(sock, local, config, conns, bytes, out, from);
+            route(sock, local, config, routes, bytes, out, from);
             at += 1;
             continue;
         };
@@ -5284,8 +5315,11 @@ fn route_batch(
                 let _ = conn.recv(bytes, info);
             }
             // The peer cannot use an id before this run's flush carries it, so the run learns once after every packet.
-            learn_ids(conns, &state, &conn);
+            learn_ids(&mut routes.conns, &state, &conn);
             flush_egress(&mut conn, sock);
+            if conn.is_established() && !state.established.swap(true, Ordering::Relaxed) {
+                routes.unverified = routes.unverified.saturating_sub(1);
+            }
         }
         at = end;
     }
@@ -5295,7 +5329,7 @@ fn route_batch(
 fn reap(
     serve: &Serve,
     sock: &Arc<Datagram>,
-    conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
+    routes: &mut Routing,
     scratch: &mut Scratch,
     live: &Arc<AtomicUsize>,
 ) {
@@ -5305,8 +5339,11 @@ fn reap(
     scratch.epoch = scratch.epoch.wrapping_add(1);
     let epoch = scratch.epoch;
     let mut deadline = None;
+    let mut closed_lanes = 0usize;
+    let mut closed_unverified = 0usize;
+    let mut verified_lanes = 0usize;
     // A state is keyed once per connection id, so the stamp keeps one connection's questions asked once.
-    for (key, state) in conns.iter() {
+    for (key, state) in routes.conns.iter() {
         if state.visit.load(Ordering::Relaxed) == epoch {
             // A closed connection still owes every key it routes: they leave together.
             if state.gone.load(Ordering::Relaxed) {
@@ -5319,7 +5356,12 @@ fn reap(
             continue;
         };
         if conn.is_closed() {
-            state.gone.store(true, Ordering::Relaxed);
+            if !state.gone.swap(true, Ordering::Relaxed) {
+                closed_lanes += 1;
+                if !state.established.load(Ordering::Relaxed) {
+                    closed_unverified += 1;
+                }
+            }
             scratch.closed.push(key.clone());
             continue;
         }
@@ -5327,7 +5369,12 @@ fn reap(
             conn.on_timeout();
             flush_egress(&mut conn, sock);
             if conn.is_closed() {
-                state.gone.store(true, Ordering::Relaxed);
+                if !state.gone.swap(true, Ordering::Relaxed) {
+                    closed_lanes += 1;
+                    if !state.established.load(Ordering::Relaxed) {
+                        closed_unverified += 1;
+                    }
+                }
                 scratch.closed.push(key.clone());
                 continue;
             }
@@ -5337,11 +5384,14 @@ fn reap(
         }
         // New source IDs first: a packet carrying one must route on the next datagram.
         for id in conn.source_ids() {
-            if !conns.contains_key(id.as_ref()) {
+            if !routes.conns.contains_key(id.as_ref()) {
                 scratch
                     .learned
                     .push((id.as_ref().to_vec(), Arc::clone(state)));
             }
+        }
+        if conn.is_established() && !state.established.swap(true, Ordering::Relaxed) {
+            verified_lanes += 1;
         }
         if !conn.is_established() {
             continue;
@@ -5369,11 +5419,16 @@ fn reap(
         }
     }
     scratch.deadline = deadline;
+    routes.lanes = routes.lanes.saturating_sub(closed_lanes);
+    routes.unverified = routes
+        .unverified
+        .saturating_sub(closed_unverified)
+        .saturating_sub(verified_lanes);
     for (key, state) in scratch.learned.drain(..) {
-        conns.entry(key).or_insert(state);
+        routes.conns.entry(key).or_insert(state);
     }
     for key in scratch.closed.drain(..) {
-        conns.remove(&key);
+        routes.conns.remove(&key);
     }
     for (conn, stream, prefaced, stop, owner) in scratch.fresh.drain(..) {
         let session = QuicStream {
@@ -5386,6 +5441,7 @@ fn reap(
             prefaced: Arc::clone(&prefaced),
             activity: Arc::new(Activity::new()),
             stop,
+            stalled: Arc::new(AtomicBool::new(false)),
             owner: Some(owner),
         };
         let serve = Arc::clone(serve);
@@ -7612,6 +7668,7 @@ mod tests {
             prefaced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             owner: None,
         };
         let started = Instant::now();
@@ -7661,6 +7718,7 @@ mod tests {
             prefaced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             owner: None,
         };
         let started = Instant::now();
@@ -7691,6 +7749,7 @@ mod tests {
             prefaced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             owner: None,
         };
         let moved = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));

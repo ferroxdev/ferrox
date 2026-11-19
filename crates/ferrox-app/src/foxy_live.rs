@@ -132,7 +132,7 @@ fn opened<T: Read + Write>(tunnel: &mut T, country: &str) -> Option<String> {
     let trace = through_tunnel(tunnel, TRACE_HOST, TRACE_PATH)?;
     let seen = crate::foxy::exit_country(trace.as_bytes())?;
     (seen.eq_ignore_ascii_case(country)
-        || country == "REC"
+        || country.eq_ignore_ascii_case("REC")
         || ((seen == "T1" || seen == "REC") && country.is_empty()))
     .then_some(seen)
 }
@@ -332,7 +332,11 @@ fn canceled(
         },
         until,
     )?;
-    std::thread::sleep(SETTLE);
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Ok(());
+    }
+    std::thread::sleep(SETTLE.min(left));
     let Some(settled) = settled(account, was, deadline) else {
         return Err("closed flow: the allowance did not settle before the clock".to_owned());
     };
@@ -362,7 +366,13 @@ fn brackets(
         ));
     };
     was = next;
-    std::thread::sleep(IDLE);
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(format!(
+            "{carrier:?}: the allowance did not settle before the clock"
+        ));
+    }
+    std::thread::sleep(IDLE.min(left));
     let Some(idle) = settled(account, was, deadline) else {
         return Err(format!(
             "{carrier:?}: the allowance did not settle before the clock"

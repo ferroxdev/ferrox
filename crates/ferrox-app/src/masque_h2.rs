@@ -1171,7 +1171,7 @@ struct Session {
     capsule_at: usize,
     frame: Vec<u8>,
     request: Option<u32>,
-    continuation: Option<(u32, Vec<u8>, u8)>,
+    continuation: Option<(u32, Vec<u8>, u8, bool)>,
     outgoing: Option<Receiver<Vec<u8>>>,
     queued: VecDeque<Vec<u8>>,
     queued_at: usize,
@@ -1211,6 +1211,13 @@ impl Session {
             half_closed: false,
             udp_quiet: None,
             end: false,
+        }
+    }
+
+    /// A trailer block ends the request body; decoding it keeps the HPACK table the next field block reads.
+    fn trailers(&mut self, block: &[u8]) {
+        if self.decoder.decode(block, &mut |_, _| {}).is_none() {
+            self.end = true;
         }
     }
 
@@ -1324,8 +1331,16 @@ impl Session {
                 if let Some(active) = self.request {
                     if id != active {
                         wire.send(h2::T_RST, 0, id, &7u32.to_be_bytes());
-                    } else if flags & h2::F_END != 0 {
-                        self.half_close();
+                        return;
+                    }
+                    let block = strip_padding(flags, body, true);
+                    if flags & h2::F_END_HEADERS != 0 {
+                        self.trailers(block);
+                        if flags & h2::F_END != 0 {
+                            self.half_close();
+                        }
+                    } else {
+                        self.continuation = Some((id, block.to_vec(), flags, true));
                     }
                     return;
                 }
@@ -1336,11 +1351,11 @@ impl Session {
                         self.half_close();
                     }
                 } else {
-                    self.continuation = Some((id, block.to_vec(), flags));
+                    self.continuation = Some((id, block.to_vec(), flags, false));
                 }
             }
             h2::T_CONT => {
-                if let Some((stream, mut block, head_flags)) = self.continuation.take() {
+                if let Some((stream, mut block, head_flags, trailers)) = self.continuation.take() {
                     if stream != id {
                         self.end = true;
                         return;
@@ -1352,16 +1367,27 @@ impl Session {
                     }
                     block.extend_from_slice(data);
                     if flags & h2::F_END_HEADERS != 0 {
-                        self.request(wire, id, &block);
+                        if trailers {
+                            self.trailers(&block);
+                        } else {
+                            self.request(wire, id, &block);
+                        }
                         if head_flags & h2::F_END != 0 {
                             self.half_close();
                         }
                     } else {
-                        self.continuation = Some((id, block, head_flags));
+                        self.continuation = Some((id, block, head_flags, trailers));
                     }
                 }
             }
             h2::T_DATA => {
+                if id == 0 {
+                    let mut goaway = [0u8; 8];
+                    goaway[4..].copy_from_slice(&1u32.to_be_bytes());
+                    wire.send(h2::T_GOAWAY, 0, 0, &goaway);
+                    self.end = true;
+                    return;
+                }
                 if Some(id) != self.request {
                     if let Ok(length) = u32::try_from(body.len()) {
                         if length != 0 {

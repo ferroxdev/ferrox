@@ -4297,7 +4297,9 @@ fn parse_capsules(conn: &mut quiche::Connection, tunnel: &mut Tunnel, mtu: usize
     };
     if let Some(stream) = tunnel.stream {
         for body in answers {
-            send_data(conn, stream, &body).ok();
+            if send_data(conn, stream, &body).is_err() {
+                return false;
+            }
         }
     }
     true

@@ -558,6 +558,32 @@ impl ToTunnel {
             Self::Bounded(sender) => sender.send(packet),
         }
     }
+
+    /// A bounded lane's reply reader must leave when its owner stops, even while the queue is full.
+    fn send_or_stop(
+        &self,
+        mut packet: Vec<u8>,
+        stop: &AtomicBool,
+    ) -> Result<(), mpsc::SendError<Vec<u8>>> {
+        match self {
+            Self::Unbounded(sender) => sender.send(packet),
+            Self::Bounded(sender) => loop {
+                match sender.try_send(packet) {
+                    Ok(()) => return Ok(()),
+                    Err(mpsc::TrySendError::Full(again)) => {
+                        if stop.load(Ordering::Relaxed) {
+                            return Err(mpsc::SendError(again));
+                        }
+                        packet = again;
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(mpsc::TrySendError::Disconnected(again)) => {
+                        return Err(mpsc::SendError(again));
+                    }
+                }
+            },
+        }
+    }
 }
 
 impl From<Sender<Vec<u8>>> for ToTunnel {
@@ -3012,7 +3038,7 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
                         continue;
                     }
                     reader_activity.store(elapsed_ms(started), Ordering::Relaxed);
-                    if tunnel.send(packet).is_err() {
+                    if tunnel.send_or_stop(packet, &reader_stop).is_err() {
                         break;
                     }
                 }

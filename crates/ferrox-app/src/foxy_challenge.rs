@@ -747,9 +747,16 @@ fn ask_human(image: &[u8], extension: &str) -> Option<String> {
         return None;
     }
     drop(file);
-    println!("the edge asks for a captcha: open {}", path.display());
-    print!("captcha characters: ");
-    if std::io::stdout().flush().is_err() {
+    let mut prompt = std::io::stdout();
+    if writeln!(
+        prompt,
+        "the edge asks for a captcha: open {}",
+        path.display()
+    )
+    .is_err()
+        || write!(prompt, "captcha characters: ").is_err()
+        || prompt.flush().is_err()
+    {
         let _ = std::fs::remove_file(&path);
         return None;
     }
