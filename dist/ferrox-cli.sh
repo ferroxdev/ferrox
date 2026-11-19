@@ -79,6 +79,7 @@ PROXY_OWNER="$STATE_DIR/system-proxy.owner"
 PROXY_LOCK_DEPTH=0
 PROXY_LOCK_PID=""
 PROXY_LOCK_READY=""
+PROXY_LOCK_RELEASE=""
 CREDS="${FOXY_CREDENTIALS:-$CONF_DIR/credentials}"
 CFG="$CONF_DIR/lane.json"
 # The signed-in session FxA handed back, so a launch after the first signs in
@@ -554,7 +555,8 @@ same_stored_account() {
 }
 
 action_logout() {
-  stop_all_lanes
+  stop_all_lanes ||
+    die "logout: the lanes or system proxy could not be stopped; the saved account was kept."
   rm -f "$TOKEN_FILE" "$CREDS" "$CONF_DIR"/lane*.json
   say "signed out: every lane is stopped, and the stored session, the saved account and the lane configs are gone."
   say "the remembered exit stays in $LOCATION_FILE; 'ferrox-cli login' signs in again."
@@ -1888,7 +1890,7 @@ proxy_restore_snapshot() {
 }
 
 proxy_lock() {
-  local dir ready
+  local dir ready release
   if [ "${PROXY_LOCK_DEPTH:-0}" -gt 0 ]; then
     PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH + 1))
     return 0
@@ -1899,19 +1901,54 @@ proxy_lock() {
   ( umask 077; mkdir -p "$dir" ) 2>/dev/null ||
     { say "system proxy: cannot create $STATE_DIR." >&2; return 1; }
   ready="$dir/ready.$$"
-  rm -f "$ready"
+  release="$dir/release.$$"
+  rm -f "$ready" "$release"
   python3 -c '
-import fcntl, os, signal, sys, time
-lock = open(sys.argv[1], "a+")
-fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+import os, signal, sys, time
+try:
+    import fcntl
+    def acquire(lock):
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+except ImportError:
+    import msvcrt
+    def acquire(lock):
+        while True:
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError:
+                time.sleep(0.1)
+lock = open(sys.argv[1], "a+b")
+if os.name == "nt":
+    lock.seek(0, os.SEEK_END)
+    if lock.tell() == 0:
+        lock.write(b"\0")
+        lock.flush()
+    lock.seek(0)
+def parent_alive(pid):
+    if os.name != "nt":
+        return os.getppid() == pid
+    import ctypes
+    handle = ctypes.windll.kernel32.OpenProcess(0x101000, False, pid)
+    if not handle:
+        return False
+    try:
+        return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == 0x102
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+    sig = getattr(signal, name, None)
+    if sig is not None:
+        signal.signal(sig, signal.SIG_IGN)
+parent = os.getppid()
+acquire(lock)
+if not parent_alive(parent):
+    sys.exit(0)
 with open(sys.argv[2], "w") as ready:
     ready.write("locked\n")
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
-parent = os.getppid()
-while parent != 1 and os.getppid() == parent:
+while parent_alive(parent) and not os.path.exists(sys.argv[3]):
     time.sleep(0.1)
-' "$dir/lock" "$ready" &
+' "$dir/lock" "$ready" "$release" &
   PROXY_LOCK_PID=$!
   for _ in $(seq 1 300); do
     [ -s "$ready" ] && break
@@ -1919,14 +1956,16 @@ while parent != 1 and os.getppid() == parent:
     sleep 0.1
   done
   if [ ! -s "$ready" ]; then
-    kill "$PROXY_LOCK_PID" 2>/dev/null || true
+    : >"$release"
+    kill -KILL "$PROXY_LOCK_PID" 2>/dev/null || true
     wait "$PROXY_LOCK_PID" 2>/dev/null || true
-    rm -f "$ready"
+    rm -f "$ready" "$release"
     PROXY_LOCK_PID=""
     say "system proxy: the lock owner did not start." >&2
     return 1
   fi
   PROXY_LOCK_READY="$ready"
+  PROXY_LOCK_RELEASE="$release"
   PROXY_LOCK_DEPTH=1
   return 0
 }
@@ -1935,11 +1974,12 @@ proxy_unlock() {
   [ "${PROXY_LOCK_DEPTH:-0}" -gt 0 ] || return 0
   PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH - 1))
   if [ "$PROXY_LOCK_DEPTH" -eq 0 ] && [ -n "$PROXY_LOCK_PID" ]; then
-    kill "$PROXY_LOCK_PID" 2>/dev/null || true
+    : >"$PROXY_LOCK_RELEASE"
     wait "$PROXY_LOCK_PID" 2>/dev/null || true
-    rm -f "$PROXY_LOCK_READY"
+    rm -f "$PROXY_LOCK_READY" "$PROXY_LOCK_RELEASE"
     PROXY_LOCK_PID=""
     PROXY_LOCK_READY=""
+    PROXY_LOCK_RELEASE=""
   fi
 }
 
@@ -2948,7 +2988,7 @@ action_up() {
   choose_carrier
   for _ in 1 2; do
     trap 'interrupt_before_lane; exit 130' INT TERM
-    start_lane
+    start_lane || exit 1
     # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
     trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
     if [ -n "$FRONTS" ] && ! wait_fronts; then
@@ -2996,7 +3036,7 @@ action_serve() {
   choose_carrier
   for _ in 1 2; do
     trap 'interrupt_before_lane; exit 130' INT TERM
-    start_lane
+    start_lane || exit 1
     # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.
     trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
     if [ -n "$FRONTS" ] && ! wait_fronts; then
