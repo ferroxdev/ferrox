@@ -5103,10 +5103,11 @@ struct ServerConn {
 /// One serving connection's identity: a session bound to it ends when the last stream drops it.
 #[derive(Default)]
 pub(crate) struct ConnectionToken {
-    close: Mutex<ConnectionCloses>,
+    closes: Mutex<ConnectionCloses>,
+    closed: AtomicBool,
 }
 
-/// What ends with one serving connection, run once when its token drops.
+/// What ends with one serving connection, run once when its token closes or drops.
 type ConnectionCloses = Vec<Box<dyn FnOnce() + Send>>;
 
 impl ConnectionToken {
@@ -5116,24 +5117,37 @@ impl ConnectionToken {
 
     /// Records what ends with this connection: a session id's record cannot outlive its transport.
     pub(crate) fn on_close(&self, close: Box<dyn FnOnce() + Send>) {
-        self.close
+        let mut closes = self
+            .closes
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(close);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) {
+            drop(closes);
+            close();
+            return;
+        }
+        closes.push(close);
+    }
+
+    /// Ends the sessions a shutdown must not wait for, before the last stream drops the token.
+    pub(crate) fn close(&self) {
+        let closes = {
+            let mut closes = self
+                .closes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.closed.store(true, Ordering::Release);
+            std::mem::take(&mut *closes)
+        };
+        for close in closes {
+            close();
+        }
     }
 }
 
 impl Drop for ConnectionToken {
     fn drop(&mut self) {
-        let close = std::mem::take(
-            &mut *self
-                .close
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        for close in close {
-            close();
-        }
+        self.close();
     }
 }
 
@@ -5252,6 +5266,7 @@ pub(crate) fn serve_loop(
             let _ = conn.close(false, 0, b"");
             flush_egress(&mut conn, sock.as_ref());
         }
+        state.owner.close();
     }
     let drain_deadline = Instant::now() + Duration::from_secs(5);
     while live.load(Ordering::SeqCst) != 0 && Instant::now() < drain_deadline {
@@ -5261,9 +5276,14 @@ pub(crate) fn serve_loop(
     if left != 0 {
         eprintln!("quic: {left} stream handlers still running at shutdown");
     }
-    // A stream handler holds a socket clone; the port is not free until the last one drops it.
-    while Arc::strong_count(&sock) > 1 {
+    // A stream handler holds a socket clone; wait a bounded time for the last one to drop it.
+    let release_deadline = Instant::now() + Duration::from_secs(5);
+    while Arc::strong_count(&sock) > 1 && Instant::now() < release_deadline {
         std::thread::sleep(Duration::from_millis(1));
+    }
+    let held = Arc::strong_count(&sock).saturating_sub(1);
+    if held != 0 {
+        eprintln!("quic: {held} socket references still held at shutdown");
     }
 }
 

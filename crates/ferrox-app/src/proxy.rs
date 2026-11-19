@@ -780,16 +780,17 @@ fn serve_inbounds_counted(
                             "socks" => Role::Socks { out, accounts },
                             _ => Role::Mixed { out, accounts },
                         };
-                        spawn_role_stopped(
+                        if spawn_role_stopped(
                             address,
                             inbound_role(inbound, role),
                             inbound_tag(inbound),
                             handler_stop.clone(),
-                        );
-                        if let Some(stop) = recorded_stop {
-                            handler_stops.push((Arc::clone(stop), address.clone()));
+                        ) {
+                            if let Some(stop) = recorded_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            }
+                            inbounds += 1;
                         }
-                        inbounds += 1;
                     }
                     "dokodemo-door" => {
                         if let Some(out) = routed(inbound, true) {
@@ -1222,18 +1223,19 @@ fn spawn_role_stopped(
     role: Role,
     tag: Option<String>,
     stop: Option<std::sync::Arc<Stop>>,
-) {
+) -> bool {
     let listener = match bind_listener(address, &role) {
         Ok(listener) => listener,
         Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
             bind_failed();
             eprintln!("cannot listen on {address}: {error}");
-            return;
+            return false;
         }
         Err(error) => exit(&format!("cannot listen on {address}: {error}")),
     };
     let address = address.to_owned();
     thread::spawn(move || accept_listener(listener, &address, &role, tag.as_deref(), stop));
+    true
 }
 
 fn try_spawn_role_stopped(
@@ -1360,8 +1362,7 @@ fn serve_vless_inbound(
                     decryption,
                 },
             );
-            spawn_role_stopped(&owned, role, inbound_tag(inbound), stop.cloned());
-            true
+            spawn_role_stopped(&owned, role, inbound_tag(inbound), stop.cloned())
         }
     }
 }
@@ -10792,8 +10793,7 @@ fn serve_vless_tls_inbound(
             decryption,
         },
     );
-    spawn_role_stopped(&owned, role, inbound_tag(inbound), stop.cloned());
-    true
+    spawn_role_stopped(&owned, role, inbound_tag(inbound), stop.cloned())
 }
 
 fn serve_vless_reality_inbound(
@@ -10856,8 +10856,7 @@ fn serve_vless_reality_inbound(
             decryption,
         },
     );
-    spawn_role_stopped(&owned, role, inbound_tag(inbound), stop.cloned());
-    true
+    spawn_role_stopped(&owned, role, inbound_tag(inbound), stop.cloned())
 }
 
 fn serve_session_ws<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'static>(
@@ -16127,8 +16126,7 @@ fn serve_trojan_inbound(
                 ),
                 inbound_tag(inbound),
                 stop.cloned(),
-            );
-            true
+            )
         }
         // A listener that declares tls answers the session its config names; an identity it cannot load is refused, never served as plaintext.
         carrier if sec == "tls" => {
@@ -16171,26 +16169,22 @@ fn serve_trojan_inbound(
                 ),
                 inbound_tag(inbound),
                 stop.cloned(),
-            );
-            true
+            )
         }
-        carrier => {
-            spawn_role_stopped(
-                address,
-                inbound_role(
-                    inbound,
-                    Role::Trojan {
-                        keys: key,
-                        carrier,
-                        freedom,
-                        account,
-                    },
-                ),
-                inbound_tag(inbound),
-                stop.cloned(),
-            );
-            true
-        }
+        carrier => spawn_role_stopped(
+            address,
+            inbound_role(
+                inbound,
+                Role::Trojan {
+                    keys: key,
+                    carrier,
+                    freedom,
+                    account,
+                },
+            ),
+            inbound_tag(inbound),
+            stop.cloned(),
+        ),
     }
 }
 
@@ -16525,8 +16519,7 @@ fn serve_vmess_inbound_users(
                 ),
                 inbound_tag(inbound),
                 stop,
-            );
-            true
+            )
         }
         carrier if sec == "tls" => {
             let Some(server) = inbound_tls_identity(inbound) else {
@@ -16570,26 +16563,22 @@ fn serve_vmess_inbound_users(
                 ),
                 inbound_tag(inbound),
                 stop,
-            );
-            true
+            )
         }
-        other => {
-            spawn_role_stopped(
-                address,
-                inbound_role(
-                    inbound,
-                    Role::Vmess {
-                        users: std::sync::Arc::clone(users),
-                        carrier: other,
-                        freedom,
-                        account,
-                    },
-                ),
-                inbound_tag(inbound),
-                stop,
-            );
-            true
-        }
+        other => spawn_role_stopped(
+            address,
+            inbound_role(
+                inbound,
+                Role::Vmess {
+                    users: std::sync::Arc::clone(users),
+                    carrier: other,
+                    freedom,
+                    account,
+                },
+            ),
+            inbound_tag(inbound),
+            stop,
+        ),
     }
 }
 
@@ -17046,8 +17035,7 @@ fn serve_dokodemo(
                 }
             }
         } else {
-            spawn_role_stopped(address, role, inbound_tag(inbound), stop.cloned());
-            tcp_armed = true;
+            tcp_armed = spawn_role_stopped(address, role, inbound_tag(inbound), stop.cloned());
         }
         if tcp_armed {
             armed += 1;
@@ -17615,7 +17603,7 @@ fn serve_ss_tls_front(
             ));
         }
     }
-    spawn_role_stopped(
+    Some(spawn_role_stopped(
         address,
         inbound_role(
             inbound,
@@ -17628,8 +17616,7 @@ fn serve_ss_tls_front(
         ),
         inbound_tag(inbound),
         stop.cloned(),
-    );
-    None
+    ))
 }
 
 fn serve_shadowsocks_inbound(
@@ -17707,7 +17694,7 @@ fn serve_shadowsocks_inbound(
                 eprintln!("shadowsocks security `{security}` on {address}: refused, not served");
             }
             other => {
-                spawn_role_stopped(
+                served = spawn_role_stopped(
                     address,
                     inbound_role(
                         inbound,
@@ -17721,7 +17708,6 @@ fn serve_shadowsocks_inbound(
                     inbound_tag(inbound),
                     stop.cloned(),
                 );
-                served = true;
             }
         }
     }
