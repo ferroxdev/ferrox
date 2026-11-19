@@ -6783,9 +6783,11 @@ mod tests {
         let (sent, got) = std::sync::mpsc::channel();
         let sender = Arc::clone(&conn);
         let running = crate::budgets::spawn(move || {
+            // Starts after the old observer gave up, so only a loaded-runner budget passes.
+            std::thread::sleep(Duration::from_secs(4));
             let _ = sent.send(sender.send_data(1, b"ping"));
         });
-        let verdict = got.recv_timeout(Duration::from_secs(3));
+        let verdict = got.recv_timeout(Duration::from_secs(30));
         conn.dead.store(true, Ordering::SeqCst);
         conn.wake.notify_all();
         running.join().expect("sender thread");
