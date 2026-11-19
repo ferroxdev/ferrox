@@ -3006,7 +3006,7 @@ pub(crate) fn serve_loop(
     serve_prepared(prepared, auths, masq, serve, udp_idle, quic, realm, None);
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn serve_prepared(
     prepared: Prepared,
     auths: &[String],
@@ -3015,7 +3015,7 @@ pub(crate) fn serve_prepared(
     udp_idle: Duration,
     quic: Option<&hysteria::QuicParams>,
     realm: Option<&ferrox_core::realm::Config>,
-    stop: Option<Arc<AtomicBool>>,
+    stop: Option<&Arc<AtomicBool>>,
 ) {
     let Prepared {
         sock,
@@ -3059,10 +3059,7 @@ pub(crate) fn serve_prepared(
     let mut batch = crate::quic::Batch::new();
     let mut idle_at = Instant::now();
     loop {
-        if stop
-            .as_ref()
-            .is_some_and(|stop| stop.load(Ordering::SeqCst))
-        {
+        if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
             break;
         }
         #[cfg(target_os = "linux")]

@@ -1449,7 +1449,7 @@ fn serve_hysteria_thread(
             udp_idle,
             quic.as_ref(),
             realm.as_deref(),
-            cancel,
+            cancel.as_ref(),
         );
         if let Some(stop) = worker_stop {
             stop.mark_closed();
@@ -16561,7 +16561,7 @@ fn serve_vmess_inbound_users(
             serve_vmess_quic_inbound(address, inbound, users, freedom, address, stop.as_ref())
         }
         Carrier::Hysteria(config) => {
-            serve_vmess_hysteria_inbound(address, inbound, &config, users, freedom, stop)
+            serve_vmess_hysteria_inbound(address, inbound, &config, users, freedom, stop.as_ref())
         }
         carrier if sec == "reality" => {
             if !carrier.tcp_stream() {
@@ -16659,7 +16659,7 @@ fn serve_vmess_hysteria_inbound(
     config: &ferrox_core::hysteria::Config,
     users: &crate::vmess::UsersRef,
     freedom: bool,
-    stop: Option<Arc<Stop>>,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     if config.version != 2 {
         eprintln!(
@@ -16704,7 +16704,7 @@ fn serve_vmess_hysteria_inbound(
             std::time::Duration::from_secs(config.udp_idle),
             config.quic.as_ref(),
             config.realm.as_deref(),
-            cancel,
+            cancel.as_ref(),
         );
         if let Some(stop) = worker_stop {
             stop.mark_closed();
