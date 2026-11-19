@@ -5207,7 +5207,7 @@ pub(crate) fn serve_loop(
             })
             .max(Duration::from_millis(1));
         if !sock.refresh_read_timeout(wait) {
-            return;
+            break;
         }
         // A serving lane takes the queue in a batch where the platform has one: a burst of a dozen packets is one read, one lock per lane and one reap, not one of each per packet.
         #[cfg(target_os = "linux")]
@@ -5230,7 +5230,7 @@ pub(crate) fn serve_loop(
             }
             Drain::Unbatchable => {}
             // A socket that coalesces must not be read one segment wide.
-            Drain::Unreadable => return,
+            Drain::Unreadable => break,
         }
         match sock.recv_from(&mut scratch.buf) {
             Ok((n, from)) => {
@@ -5242,7 +5242,7 @@ pub(crate) fn serve_loop(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
-            Err(_) => return,
+            Err(_) => break,
         }
         reap(serve, &sock, &mut routes, &mut scratch, &live);
     }

@@ -2933,17 +2933,19 @@ impl RouteShared {
             return Ok(());
         };
         let next_script = next.script_shared();
+        // Script flows hold the router read guard while they run and route through callbacks, so
+        // taking the write guard first makes the rules and the script swap as one generation.
+        let mut script = self
+            .script_router
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut current = self
             .routing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         next.adopt_balancer_state(&mut current);
         *current = next;
-        drop(current);
-        *self
-            .script_router
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = next_script;
+        *script = next_script;
         Ok(())
     }
 
@@ -3166,8 +3168,7 @@ impl RouteShared {
         let script = self
             .script_router
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(script) = script.as_deref() {
             let Some(callbacks) = self.script.as_ref() else {
                 return Ok(None);
@@ -3780,8 +3781,7 @@ impl RoutePlan {
             .shared
             .script_router
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(script) = script.as_deref() {
             let Some(callbacks) = self.shared.script.as_ref() else {
                 return self.default_lane();
