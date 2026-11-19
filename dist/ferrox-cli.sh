@@ -991,6 +991,7 @@ write_lane_meta() {
     {
       printf 'config=%s\n' "$(resolve_real "$CFG")"
       printf 'fronts=%s\n' "$FRONTS"
+      printf 'generated=%s\n' "$([ "$OUTBOUND" = config ] && echo 0 || echo 1)"
     } >"$META_FILE"
   )
 }
@@ -998,10 +999,12 @@ write_lane_meta() {
 load_lane_meta() {
   [ -f "$META_FILE" ] || return 1
   local line
+  GENERATED=0
   while IFS= read -r line; do
     case "$line" in
       config=*) CFG="${line#config=}" ;;
       fronts=*) FRONTS="${line#fronts=}"; FRONTS_SET=1 ;;
+      generated=*) GENERATED="${line#generated=}" ;;
     esac
   done <"$META_FILE"
 }
@@ -2603,24 +2606,33 @@ choose_carrier() {
 }
 
 start_lane() {
-  local new_cfg new_fronts old_exit lane_pid reg_dir status=0
+  local new_cfg new_fronts old_exit lane_pid reg_dir status=0 start_epoch
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
-  require_bin
+  start_epoch="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)"
+  WARP_SELECTED=0
   # Validate first: an invocation that cannot start must not stop a healthy lane,
   # and a bad link must not send the user to a build before saying what is wrong.
   old_exit="$(trap -p EXIT)"
   trap 'status=$?; [ "$WARP_STARTED" = 1 ] && stop_warp_hop; exit $status' EXIT
   build_config
   if [ -n "$old_exit" ]; then eval "$old_exit"; else trap - EXIT; fi
+  require_bin
   proxy_lock || return 1
+  if [ "$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)" != "$start_epoch" ]; then
+    [ "$OUTBOUND" = config ] || rm -f "$CFG"
+    [ "$WARP_STARTED" = 1 ] && stop_warp_hop
+    proxy_unlock
+    say "a concurrent down or logout cancelled this start; try again." >&2
+    return 1
+  fi
   if [ "$OUTBOUND" != config ] && ! write_config "$BUILT_OUTBOUND"; then
     proxy_unlock
     say "cannot write $CFG" >&2
     return 1
   fi
   save_lane_location
-  if [ "$WARP_STARTED" = 1 ] && ! warp_hop_running; then
+  if [ "$WARP_SELECTED" = 1 ] && ! warp_hop_running; then
     proxy_unlock
     say "the warp hop was stopped by a concurrent down; try again." >&2
     return 1
@@ -2717,8 +2729,10 @@ warp_hop_running() {
 
 start_warp_hop() {
   WARP_STARTED=0
+  WARP_SELECTED=0
   if warp_hop_running; then
     UPSTREAM="socks5://127.0.0.1:$(cat "$WARP_PORT_FILE")"
+    WARP_SELECTED=1
     say "warp hop already up (pid $(cat "$WARP_PID_FILE")); the lane chains through it."
     return 0
   fi
@@ -2756,6 +2770,7 @@ PY
     return 1
   fi
   UPSTREAM="socks5://127.0.0.1:$port"
+  WARP_SELECTED=1
   say "warp hop up (pid $pid) on 127.0.0.1:$port; the account plane and the carrier egress through it."
 }
 
@@ -2771,10 +2786,17 @@ stop_warp_hop() {
 }
 
 forget_lane_config() {
-  case "$CFG" in
-    "$CONF_DIR"/lane*.json) rm -f "$CFG" ;;
-  esac
+  if [ "${GENERATED:-0}" = 1 ] || [ ! -f "$META_FILE" ]; then
+    case "$CFG" in "$CONF_DIR"/lane*.json) rm -f "$CFG" ;; esac
+  fi
   rm -f "$META_FILE"
+}
+
+bump_stop_epoch() {
+  local n
+  n="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || echo 0)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s\n' "$((n + 1))" >"$STATE_DIR/stop-epoch"
 }
 
 # The account is shared, so signing out ends every lane; each owns its pid and config.
@@ -2784,6 +2806,11 @@ stop_all_lanes() {
   local -a forget=()
   local pending="$STATE_DIR/logout.pending" pending_tmp
   proxy_lock || return 1
+  if ! bump_stop_epoch; then
+    proxy_unlock
+    say "cannot record the stop generation; nothing was stopped." >&2
+    return 1
+  fi
   if [ -r "$pending" ]; then
     while IFS= read -r dir; do
       [ -n "$dir" ] && forget+=("$(resolve_real "$dir")")
@@ -2792,15 +2819,33 @@ stop_all_lanes() {
   if [ -r "$LANES_FILE" ]; then
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue
-      dir="$(resolve_real "$dir")"
-      for pidfile in "$dir"/lane*.json "$dir"/lane.meta "$dir"/lane-*.meta; do
-        [ -f "$pidfile" ] && forget+=("$pidfile")
+      CONF_DIR="$(resolve_real "$dir")"
+      for pidfile in "$CONF_DIR"/lane*.pid; do
+        [ -f "$pidfile" ] || continue
+        base="${pidfile##*/}"; base="${base#lane}"; base="${base%.pid}"
+        INSTANCE="${base#-}"
+        apply_instance
+        GENERATED=0
+        load_lane_meta || true
+        if [ "$GENERATED" = 1 ] || [ ! -f "$META_FILE" ]; then
+          case "$CFG" in "$CONF_DIR"/lane*.json) forget+=("$CFG") ;; esac
+        fi
+        forget+=("$META_FILE")
       done
     done < "$LANES_FILE"
   fi
-  dir="$(resolve_real "$saved_conf")"
-  for pidfile in "$dir"/lane*.json "$dir"/lane.meta "$dir"/lane-*.meta; do
-    [ -f "$pidfile" ] && forget+=("$pidfile")
+  CONF_DIR="$(resolve_real "$saved_conf")"
+  for pidfile in "$CONF_DIR"/lane*.pid; do
+    [ -f "$pidfile" ] || continue
+    base="${pidfile##*/}"; base="${base#lane}"; base="${base%.pid}"
+    INSTANCE="${base#-}"
+    apply_instance
+    GENERATED=0
+    load_lane_meta || true
+    if [ "$GENERATED" = 1 ] || [ ! -f "$META_FILE" ]; then
+      case "$CFG" in "$CONF_DIR"/lane*.json) forget+=("$CFG") ;; esac
+    fi
+    forget+=("$META_FILE")
   done
   if [ "${#forget[@]}" -gt 0 ]; then
     pending_tmp="$pending.$$"
@@ -2861,6 +2906,7 @@ stop_all_lanes() {
       rm -f "$pending"
     fi
   fi
+  bump_stop_epoch || rc=1
   proxy_unlock
   CONF_DIR="$saved_conf"
   INSTANCE="$saved_instance"
