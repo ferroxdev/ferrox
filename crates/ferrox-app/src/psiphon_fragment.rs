@@ -159,6 +159,7 @@ pub(crate) struct FragmentStream {
     config: Arc<Fragmentor>,
     state: Arc<Mutex<State>>,
     deadline: Arc<Mutex<Option<Instant>>>,
+    write_timeout: Arc<Mutex<Option<Duration>>>,
 }
 
 impl FragmentStream {
@@ -172,6 +173,7 @@ impl FragmentStream {
                 fragmented: 0,
             })),
             deadline: Arc::new(Mutex::new(None)),
+            write_timeout: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -181,6 +183,13 @@ impl FragmentStream {
             .deadline
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
+        if deadline.is_none() {
+            let timeout = *self
+                .write_timeout
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = self.socket.set_write_timeout(timeout);
+        }
     }
 
     /// Clone the socket and its remaining fragment plan.
@@ -190,6 +199,7 @@ impl FragmentStream {
             config: Arc::clone(&self.config),
             state: Arc::clone(&self.state),
             deadline: Arc::clone(&self.deadline),
+            write_timeout: Arc::clone(&self.write_timeout),
         })
     }
 
@@ -203,9 +213,21 @@ impl FragmentStream {
         self.socket.set_read_timeout(timeout)
     }
 
-    /// Forward the write timeout to the socket.
+    /// Keep the relay timeout beside the establishment deadline, which overrides it while set.
     pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.socket.set_write_timeout(timeout)
+        *self
+            .write_timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
+        if self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+        {
+            return self.socket.set_write_timeout(timeout);
+        }
+        Ok(())
     }
 
     /// Forward the shutdown to the socket.
@@ -281,6 +303,24 @@ impl Write for FragmentStream {
                 .config
                 .write_size((buffer.len() - written).min(remaining));
             let end = written + size;
+            if let Some(deadline) = *self
+                .deadline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return if written > 0 {
+                        Ok(written)
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "psiphon fragmentor: establishment deadline expired",
+                        ))
+                    };
+                }
+                self.socket.set_write_timeout(Some(left))?;
+            }
             match self.socket.write(&buffer[written..end]) {
                 Ok(0) => {
                     return Err(io::Error::new(

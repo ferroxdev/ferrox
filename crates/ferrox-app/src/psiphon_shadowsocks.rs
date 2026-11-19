@@ -338,6 +338,11 @@ impl Stream<TcpStream> {
         self.io.set_read_timeout(timeout)
     }
 
+    /// Forward the write timeout to the underlying stream.
+    pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.io.set_write_timeout(timeout)
+    }
+
     /// Shut down the underlying stream.
     pub(crate) fn shutdown(&self) -> io::Result<()> {
         self.io.shutdown(Shutdown::Both)
@@ -373,6 +378,11 @@ impl Stream<crate::psiphon_fragment::FragmentStream> {
     /// Forward the read timeout to the underlying stream.
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.io.set_read_timeout(timeout)
+    }
+
+    /// Forward the write timeout to the underlying stream.
+    pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.io.set_write_timeout(timeout)
     }
 
     /// Forward the fragment loop's absolute deadline.
@@ -411,6 +421,10 @@ impl Stream<crate::psiphon_webrtc::WebRtcStream> {
         self.io.set_read_timeout(timeout);
     }
 
+    pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) {
+        self.io.set_write_timeout(timeout);
+    }
+
     pub(crate) fn shutdown(&self) {
         self.io.shutdown();
     }
@@ -439,6 +453,10 @@ impl Stream<crate::psiphon_quic::QuicStream> {
 
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) {
         self.io.set_read_timeout(timeout);
+    }
+
+    pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) {
+        self.io.set_write_timeout(timeout);
     }
 
     pub(crate) fn shutdown(&self) {

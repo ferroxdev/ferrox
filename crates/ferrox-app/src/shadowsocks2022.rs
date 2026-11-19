@@ -2015,9 +2015,6 @@ impl Datagrams {
             }
             let session = u64::from_be_bytes(body[..8].try_into().ok()?);
             let packet_id = u64::from_be_bytes(body[8..16].try_into().ok()?);
-            if !peer_check(&mut self.peers, session, packet_id, now) {
-                return None;
-            }
             let body = &body[16..];
             if body[0] != 1 {
                 return None;
@@ -2036,6 +2033,9 @@ impl Datagrams {
             if body.len() < 19 + pad + used {
                 return None;
             }
+            if !peer_check(&mut self.peers, session, packet_id, now) {
+                return None;
+            }
             Some((target, &packet[24 + 16 + 19 + pad + used..24 + len]))
         } else {
             let key_len = method.key_len();
@@ -2047,21 +2047,10 @@ impl Datagrams {
             let raw = shadowsocks2022::block_decrypt(psk, &enc)?;
             let session = u64::from_be_bytes(raw[..8].try_into().ok()?);
             let packet_id = u64::from_be_bytes(raw[8..].try_into().ok()?);
-            if !peer_check(&mut self.peers, session, packet_id, now) {
-                return None;
-            }
-            if self
-                .peers
-                .get(&session)
-                .is_none_or(|peer| peer.cipher.is_none())
-            {
-                let sub = shadowsocks2022::session_subkey(psk, &raw[..8])?;
-                let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
-                self.peers.get_mut(&session)?.cipher = Some(cipher);
-            }
+            let sub = shadowsocks2022::session_subkey(psk, &raw[..8])?;
+            let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
-            let cipher = self.peers.get(&session)?.cipher.as_ref()?;
             let len = cipher.open_with_nonce(&nonce, &mut packet[16..])?;
             if len > packet.len() - 16 {
                 return None;
@@ -2084,6 +2073,16 @@ impl Datagrams {
             if body.len() < 19 + pad + used {
                 return None;
             }
+            if !peer_check(&mut self.peers, session, packet_id, now) {
+                return None;
+            }
+            if self
+                .peers
+                .get(&session)
+                .is_none_or(|peer| peer.cipher.is_none())
+            {
+                self.peers.get_mut(&session)?.cipher = Some(cipher);
+            }
             Some((target, &packet[16 + 19 + pad + used..16 + len]))
         }
     }
@@ -2099,7 +2098,7 @@ fn peer_check(
         peer.last_seen = now;
         return peer.window.check_and_add(packet_id);
     }
-    peers.retain(|_, peer: &mut PeerServer| now.wrapping_sub(peer.last_seen) < 60);
+    peers.retain(|_, peer: &mut PeerServer| now.wrapping_sub(peer.last_seen) < SKEW * 2 + 1);
     if peers.len() >= 8 {
         return false;
     }

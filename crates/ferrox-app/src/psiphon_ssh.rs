@@ -222,7 +222,24 @@ impl Stream {
         match self {
             Self::Tcp(socket) => socket.set_write_timeout(timeout),
             Self::Fragment(stream) => stream.set_write_timeout(timeout),
-            _ => self.set_timeout(timeout),
+            Self::Quic(stream) => {
+                stream.set_write_timeout(timeout);
+                Ok(())
+            }
+            Self::QuicShadowsocks(stream) => {
+                stream.set_write_timeout(timeout);
+                Ok(())
+            }
+            Self::Shadowsocks(stream) => stream.set_write_timeout(timeout),
+            Self::ShadowsocksFragment(stream) => stream.set_write_timeout(timeout),
+            Self::WebRtcShadowsocks(stream) => {
+                stream.set_write_timeout(timeout);
+                Ok(())
+            }
+            Self::WebRtc(stream) => {
+                stream.set_write_timeout(timeout);
+                Ok(())
+            }
         }
     }
 
@@ -2636,7 +2653,14 @@ impl Inner {
 
     /// End a channel: its remote id is retired and its close frame sent under one writer lock.
     fn close_channel(&self, state: &ChannelState) {
-        let mut writer = lock(&self.writer);
+        let mut writer = match self.writer.try_lock() {
+            Ok(writer) => writer,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                state.remote.store(NO_CHANNEL, Ordering::Release);
+                return;
+            }
+        };
         let remote = state.remote.swap(NO_CHANNEL, Ordering::AcqRel);
         let failed = remote != NO_CHANNEL
             && !self.closed.load(Ordering::Acquire)

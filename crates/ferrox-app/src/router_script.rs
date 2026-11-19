@@ -690,14 +690,8 @@ struct IpMatcherUser {
 }
 
 impl IpMatcherUser {
-    fn matcher(&self) -> IpMatcher {
-        let mut matcher = self.matcher.clone();
-        if let Some(reverse) = self.reverse {
-            matcher.set_reverse(reverse);
-        } else if self.flip {
-            matcher.flip_reverse();
-        }
-        matcher
+    fn matches(&self, ip: std::net::IpAddr) -> bool {
+        self.matcher.matches_override(ip, self.reverse, self.flip)
     }
 }
 
@@ -708,34 +702,31 @@ impl UserData for IpMatcherUser {
                 return Ok(false);
             };
             let ip = ip.borrow::<IpUser>()?;
-            Ok(this.matcher().matches(ip.0))
+            Ok(this.matches(ip.0))
         });
         methods.add_method("AnyMatch", |_, this, ips: Option<AnyUserData>| {
             let Some(ips) = ips else {
                 return Ok(false);
             };
             let ips = ips.borrow::<IpList>()?;
-            let matcher = this.matcher();
-            Ok(ips.items.iter().any(|ip| matcher.matches(*ip)))
+            Ok(ips.items.iter().any(|ip| this.matches(*ip)))
         });
         methods.add_method("Matches", |_, this, ips: Option<AnyUserData>| {
             let Some(ips) = ips else {
                 return Ok(false);
             };
             let ips = ips.borrow::<IpList>()?;
-            let matcher = this.matcher();
-            Ok(!ips.items.is_empty() && ips.items.iter().all(|ip| matcher.matches(*ip)))
+            Ok(!ips.items.is_empty() && ips.items.iter().all(|ip| this.matches(*ip)))
         });
         methods.add_method("FilterIPs", |lua, this, ips: Option<AnyUserData>| {
             let ips = match ips {
                 Some(ips) => ips.borrow::<IpList>()?.items.clone(),
                 None => Arc::new(Vec::<IpAddr>::new()),
             };
-            let matcher = this.matcher();
             let mut kept = Vec::new();
             let mut unmatched = Vec::new();
             for ip in ips.iter() {
-                if matcher.matches(*ip) {
+                if this.matches(*ip) {
                     kept.push(*ip);
                 } else {
                     unmatched.push(*ip);

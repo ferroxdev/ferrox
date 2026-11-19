@@ -353,6 +353,7 @@ struct State {
     write_closed: bool,
     close_requested: bool,
     timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
 }
 
 impl State {
@@ -844,6 +845,7 @@ impl QuicStream {
                 write_closed: false,
                 close_requested: false,
                 timeout: Some(timeout),
+                write_timeout: Some(timeout),
             }),
             readable: Condvar::new(),
             writable: Condvar::new(),
@@ -857,7 +859,12 @@ impl QuicStream {
     }
 
     pub(crate) fn set_timeout(&self, timeout: Option<Duration>) {
-        self.set_read_timeout(timeout);
+        let mut state = lock(&self.shared.state);
+        state.timeout = timeout;
+        state.write_timeout = timeout;
+        drop(state);
+        self.shared.readable.notify_all();
+        self.shared.writable.notify_all();
     }
 
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) {
@@ -865,6 +872,13 @@ impl QuicStream {
         state.timeout = timeout;
         drop(state);
         self.shared.readable.notify_all();
+    }
+
+    pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) {
+        let mut state = lock(&self.shared.state);
+        state.write_timeout = timeout;
+        drop(state);
+        self.shared.writable.notify_all();
     }
 
     pub(crate) fn shutdown(&self) {
@@ -950,7 +964,7 @@ impl Write for QuicStream {
         if let Some(error) = state.error.clone() {
             return Err(io::Error::new(ErrorKind::BrokenPipe, error));
         }
-        let deadline = state.timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = state.write_timeout.map(|timeout| Instant::now() + timeout);
         while state.send_bytes > 0 && state.send_bytes + buf.len() > MAX_SEND_QUEUE {
             let (next, expired) = wait_writable(&self.shared, state, deadline);
             state = next;
@@ -992,7 +1006,7 @@ impl Write for QuicStream {
         if let Some(error) = state.error.clone() {
             return Err(io::Error::new(ErrorKind::BrokenPipe, error));
         }
-        let deadline = state.timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = state.write_timeout.map(|timeout| Instant::now() + timeout);
         while state.send_bytes > 0 && state.send_bytes + total > MAX_SEND_QUEUE {
             let (next, expired) = wait_writable(&self.shared, state, deadline);
             state = next;
@@ -3868,6 +3882,7 @@ mod tests {
                 write_closed: false,
                 close_requested: false,
                 timeout: None,
+                write_timeout: None,
             }),
             readable: Condvar::new(),
             writable: Condvar::new(),

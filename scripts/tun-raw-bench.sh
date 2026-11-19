@@ -19,6 +19,7 @@ CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-$((DURATION + 20))}
 REPEAT=${REPEAT:-2}
 STATUS=0
 GAPS="$OUT_DIR/gaps.md"
+FAILED_SCENARIO=""
 : > "$GAPS"
 QUEUES=${QUEUES:-4}
 VARIANTS=${VARIANTS:-"ferrox-raw-plain ferrox-raw-gso ferrox-raw-mq ferrox-raw-gso-mq tun-rs-sync-normal tun-rs-sync-gso tun-rs-sync-gso-concurrent"}
@@ -207,6 +208,7 @@ run_variant() {
     rep=$2
     slot=$3
     echo "round $rep variant $variant"
+    FAILED_SCENARIO="start"
     rc=0
     start_variant "$variant" || rc=$?
     if [ "$rc" -eq 2 ]; then
@@ -225,6 +227,7 @@ run_variant() {
 
     sample_start "$OUT_DIR/$variant-$rep.samples"
     if ! timeout "$CLIENT_TIMEOUT" iperf3 -c 10.0.2.1 -p 5201 -t "$DURATION" -J > "$OUT_DIR/$variant-$rep-tcp.json" 2> /dev/null; then
+        FAILED_SCENARIO="tcp"
         echo "  $variant: tcp iperf3 failed" >&2
         stop_variant
         return 1
@@ -244,11 +247,12 @@ if not math.isfinite(bits) or bits <= 0:
     raise SystemExit(1)
 print("%.3f" % (bits / 1e9))
 PY
-) || { echo "  $variant: tcp measurement failed" >&2; stop_variant; return 1; }
+) || { FAILED_SCENARIO="tcp measurement"; echo "  $variant: tcp measurement failed" >&2; stop_variant; return 1; }
     emit "$variant" "tcp-${rep}" "$tcp" "Gbit/s" "$1" "$2" "$slot"
 
     sample_start "$OUT_DIR/$variant-$rep-udp.samples"
     if ! timeout "$CLIENT_TIMEOUT" iperf3 -c 10.0.2.1 -p 5201 -u -b 1G -t "$DURATION" -J > "$OUT_DIR/$variant-$rep-udp.json" 2> /dev/null; then
+        FAILED_SCENARIO="udp"
         echo "  $variant: udp iperf3 failed" >&2
         stop_variant
         return 1
@@ -278,11 +282,12 @@ if isinstance(lost, (int, float)):
 else:
     print("%.3f" % (bits / 1e9))
 PY
-) || { echo "  $variant: udp measurement failed" >&2; stop_variant; return 1; }
+) || { FAILED_SCENARIO="udp measurement"; echo "  $variant: udp measurement failed" >&2; stop_variant; return 1; }
     set -- $udp
     emit "$variant" "udp-${rep}" "$1" "Gbit/s" "$udp_cpu" "$udp_rss" "$slot" "${2:-}"
 
     if ! timeout 10 ping -c 100 -i 0.01 -W 1 -q 10.0.2.1 > "$OUT_DIR/$variant-$rep-ping.log" 2>&1; then
+        FAILED_SCENARIO="ping"
         echo "  $variant: ping failed" >&2
         stop_variant
         return 1
@@ -300,7 +305,7 @@ if not math.isfinite(rtt) or rtt <= 0:
     raise SystemExit(1)
 print("%.3f" % rtt)
 PY
-) || { echo "  $variant: ping measurement failed" >&2; stop_variant; return 1; }
+) || { FAILED_SCENARIO="ping measurement"; echo "  $variant: ping measurement failed" >&2; stop_variant; return 1; }
     emit "$variant" "ping-${rep}" "$rtt" "ms" "0" "0" "$slot"
 
     stop_variant
@@ -354,7 +359,7 @@ while [ "$rep" -le "$REPEAT" ]; do
         if ! run_variant "$variant" "$rep" "$slot"; then
             case "$variant" in
                 ferrox-raw*) STATUS=1 ;;
-                *) printf -- '- `%s` did not hold its devices\n' "$variant" >> "$GAPS" ;;
+                *) printf -- '- `%s` failed round %s (%s)\n' "$variant" "$rep" "$FAILED_SCENARIO" >> "$GAPS" ;;
             esac
         fi
     done

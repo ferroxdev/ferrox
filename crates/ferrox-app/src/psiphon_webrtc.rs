@@ -1275,6 +1275,11 @@ impl WebRtcStream {
         *lock(&self.read_timeout) = timeout;
     }
 
+    /// Set or clear only the write timeout, leaving the read deadline in place.
+    pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) {
+        *lock(&self.write_timeout) = timeout;
+    }
+
     /// End the driver and every clone of this stream.
     pub(crate) fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
@@ -1365,12 +1370,13 @@ impl WebRtcStream {
         if total == 0 {
             return Ok(0);
         }
+        let deadline = (*lock(&self.write_timeout)).map(|timeout| Instant::now() + timeout);
         if self.media {
             let mut packet = Vec::with_capacity(total);
             for buf in bufs {
                 packet.extend_from_slice(buf);
             }
-            self.send(packet)?;
+            self.send_until(packet, deadline)?;
             return Ok(total);
         }
         if let Some(shaping) = &self.shaping {
@@ -1380,7 +1386,7 @@ impl WebRtcStream {
                         let mut shaping = lock(shaping);
                         shaping.frame(chunk, MAX_DATAGRAM)
                     };
-                    self.send(message)?;
+                    self.send_until(message, deadline)?;
                 }
             }
             return Ok(total);
@@ -1396,7 +1402,7 @@ impl WebRtcStream {
             let mut at = 0;
             while at < buf.len() {
                 if message.len() - header_len >= STREAM_MESSAGE {
-                    self.send(std::mem::take(&mut message))?;
+                    self.send_until(std::mem::take(&mut message), deadline)?;
                     message.reserve(STREAM_MESSAGE + 2);
                     header_len = 0;
                 }
@@ -1407,19 +1413,22 @@ impl WebRtcStream {
             }
         }
         if message.len() > header_len {
-            self.send(message)?;
+            self.send_until(message, deadline)?;
         }
         Ok(total)
     }
 
     /// Queue one framed message, respecting the current write timeout.
     fn send(&self, message: Vec<u8>) -> io::Result<()> {
+        let deadline = (*lock(&self.write_timeout)).map(|timeout| Instant::now() + timeout);
+        self.send_until(message, deadline)
+    }
+
+    /// Queue one framed message against a deadline fixed before the first of a batch.
+    fn send_until(&self, mut message: Vec<u8>, deadline: Option<Instant>) -> io::Result<()> {
         if let Some(error) = lock(&self.failure).as_ref().cloned() {
             return Err(io::Error::new(ErrorKind::ConnectionAborted, error));
         }
-        let timeout = *lock(&self.write_timeout);
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        let mut message = message;
         loop {
             match self.out.try_send(message) {
                 Ok(()) => return Ok(()),
