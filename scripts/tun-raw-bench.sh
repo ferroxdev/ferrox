@@ -18,6 +18,8 @@ DURATION=${DURATION:-5}
 CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-$((DURATION + 20))}
 REPEAT=${REPEAT:-2}
 STATUS=0
+GAPS="$OUT_DIR/gaps.md"
+: > "$GAPS"
 QUEUES=${QUEUES:-4}
 VARIANTS=${VARIANTS:-"ferrox-raw-plain ferrox-raw-gso ferrox-raw-mq ferrox-raw-gso-mq tun-rs-sync-normal tun-rs-sync-gso tun-rs-sync-gso-concurrent"}
 
@@ -209,6 +211,11 @@ run_variant() {
     start_variant "$variant" || rc=$?
     if [ "$rc" -eq 2 ]; then
         stop_variant
+        # A comparator with no command is unmeasured, not green: past a missing TUN_RS_DIR the cell is named, while a ferrox variant that lost its command still fails the gate.
+        case "$variant" in
+            ferrox-raw*) return 1 ;;
+        esac
+        printf -- '- `%s` had no command to run\n' "$variant" >> "$GAPS"
         return 0
     fi
     if [ "$rc" -ne 0 ]; then
@@ -343,7 +350,13 @@ while [ "$rep" -le "$REPEAT" ]; do
     slot=0
     for variant in $(order_for_round "$rep"); do
         slot=$((slot + 1))
-        run_variant "$variant" "$rep" "$slot" || STATUS=1
+        # A baseline variant that cannot hold its two devices is a hole in the comparison, not this tree's regression: the cell is named and the gate still fails on our own variants.
+        if ! run_variant "$variant" "$rep" "$slot"; then
+            case "$variant" in
+                ferrox-raw*) STATUS=1 ;;
+                *) printf -- '- `%s` did not hold its devices\n' "$variant" >> "$GAPS" ;;
+            esac
+        fi
     done
     rep=$((rep + 1))
 done
@@ -378,4 +391,7 @@ for (engine, scenario), group in groups.items():
 open(sys.argv[2], "w").write("\n".join(lines) + "\n")
 print("\n".join(lines))
 PY
+if [ -s "$GAPS" ]; then
+    { printf '\nNot measured:\n\n'; cat "$GAPS"; } >> "$OUT_DIR/summary.md"
+fi
 exit "$STATUS"

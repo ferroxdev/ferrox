@@ -405,3 +405,8 @@ ferrox_core::mux::decode 610304 mux::tests::the_decode_probe_costs_the_frame_wal
 # 44015809956.
 ferrox_core::mux::Outgoing::encode_into 876544 mux::tests::the_frame_probe_costs_the_metadata_and_payload_write_and_nothing_else
 ferrox_core::mux::Outgoing::encode_header_into 507904 mux::tests::the_header_probe_costs_the_metadata_write_and_nothing_else
+# The tun render had no blessed row: this is the first, 691 for the v4 and v6
+# gso renders in ops.yml run 44345699821 that named the number as UNBLESSED.
+# Not a before/after pair -- the pseudo-header scratch buffer and the vector
+# kernel's setup on a four-octet address had already gone when it was taken.
+ferrox_app::tun::render_tcp_headers_ip 691 tun::tests::a_gso_frame_carries_the_folded_pseudo_sum
