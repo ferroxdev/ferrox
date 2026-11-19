@@ -31,6 +31,10 @@ const SETTINGS_ENABLE_CONNECT: u16 = 0x8;
 const FRAME_CAP: usize = 1 << 20;
 const FRAME_HEAD: usize = 9;
 const QUEUED_CAP: usize = 64;
+/// h2's default `SETTINGS_MAX_FRAME_SIZE`: a DATA body past it is a connection error for a peer that keeps the default.
+const MAX_FRAME_BODY: usize = 16 * 1024;
+/// The capsules one downlink DATA frame carries, half the frame limit so one capsule's overshoot still fits.
+const BATCH_BODY: usize = MAX_FRAME_BODY / 2;
 const CREDIT_BATCH: usize = 64 * 1024;
 const DEFAULT_WINDOW: i64 = 65_535;
 const H2_CONNECTIONS: usize = 256;
@@ -1114,7 +1118,10 @@ impl Client {
             return;
         }
         let length = i64::try_from(capsule.len()).unwrap_or(i64::MAX);
-        if self.queued.is_empty() && length <= self.send_window.min(self.connection_window) {
+        if self.queued.is_empty()
+            && capsule.len() <= MAX_FRAME_BODY
+            && length <= self.send_window.min(self.connection_window)
+        {
             if self.wire.send(h2::T_DATA, 0, self.stream, capsule) {
                 self.send_window -= length;
                 self.connection_window -= length;
@@ -1140,7 +1147,9 @@ impl Client {
                 self.frame = frame;
                 return;
             }
-            let take = (answer.len() - start).min(usize::try_from(room).unwrap_or(usize::MAX));
+            let take = (answer.len() - start)
+                .min(usize::try_from(room).unwrap_or(usize::MAX))
+                .min(MAX_FRAME_BODY);
             // A queued body leaves in one write: its head and the credited slice share a frame.
             frame.clear();
             frame.resize(FRAME_HEAD, 0);
@@ -1627,14 +1636,78 @@ impl Session {
         }
     }
 
-    /// Sends a built DATA frame in one write when it fits the window, otherwise queues its body.
+    /// Gathers the queued packets into DATA frames, one per batch and never past the peer's frame limit.
+    fn gather(&mut self, wire: &mut Wire, frame: &mut Vec<u8>) -> bool {
+        let mut origin_closed = false;
+        let mut pulled = 0;
+        let Some(id) = self.request else {
+            return false;
+        };
+        frame.clear();
+        frame.resize(FRAME_HEAD, 0);
+        while pulled < QUEUED_CAP {
+            // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
+            if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
+                break;
+            }
+            let packet = if let Some(udp) = &self.udp {
+                udp.try_recv()
+            } else {
+                match self
+                    .outgoing
+                    .as_ref()
+                    .map(std::sync::mpsc::Receiver::try_recv)
+                {
+                    Some(Ok(packet)) => Some(packet),
+                    Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                        origin_closed = true;
+                        None
+                    }
+                    _ => None,
+                }
+            };
+            let Some(packet) = packet else {
+                break;
+            };
+            if self.warp {
+                bare_datagram(&packet, frame);
+            } else {
+                datagram(&packet, frame);
+            }
+            pulled += 1;
+            if frame.len() - FRAME_HEAD >= BATCH_BODY {
+                self.frame_body(wire, frame, id);
+                frame.clear();
+                frame.resize(FRAME_HEAD, 0);
+            }
+        }
+        if frame.len() > FRAME_HEAD {
+            self.frame_body(wire, frame, id);
+        }
+        if pulled > 0 {
+            self.udp_quiet = Some(Instant::now());
+        }
+        origin_closed
+    }
+
+    /// Heads a built body with its length and hands it to `send`.
+    fn frame_body(&mut self, wire: &mut Wire, frame: &mut [u8], id: u32) {
+        let body = frame.len() - FRAME_HEAD;
+        frame[..FRAME_HEAD].copy_from_slice(&h2::frame_head(body, h2::T_DATA, 0, id));
+        self.send(wire, frame);
+    }
+
+    /// Sends a built DATA frame in one write when it fits the window and the frame limit, otherwise queues its body.
     fn send(&mut self, wire: &mut Wire, frame: &[u8]) {
         if self.end || wire.closed || self.request.is_none() {
             return;
         }
         let body = &frame[FRAME_HEAD..];
         let length = i64::try_from(body.len()).unwrap_or(i64::MAX);
-        if self.queued.is_empty() && length <= self.send_window.min(self.connection_window) {
+        if self.queued.is_empty()
+            && body.len() <= MAX_FRAME_BODY
+            && length <= self.send_window.min(self.connection_window)
+        {
             if wire.send_frame(frame) {
                 self.send_window -= length;
                 self.connection_window -= length;
@@ -1703,49 +1776,12 @@ impl Session {
                 self.queued_at = 0;
             }
         }
-        let mut origin_closed = false;
         // CONNECT-IP keeps its grant and sender alive, so waiting for `outgoing` to disconnect is a wait it never reaches; both datagram modes drain on a quiet window instead.
         let drainable = self.warp || self.udp.is_some();
         if self.half_closed && drainable && self.udp_quiet.is_none() {
             self.udp_quiet = Some(Instant::now());
         }
-        for _ in 0..QUEUED_CAP {
-            // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
-            if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
-                break;
-            }
-            let packet = if let Some(udp) = &self.udp {
-                udp.try_recv()
-            } else {
-                match self
-                    .outgoing
-                    .as_ref()
-                    .map(std::sync::mpsc::Receiver::try_recv)
-                {
-                    Some(Ok(packet)) => Some(packet),
-                    Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                        origin_closed = true;
-                        None
-                    }
-                    _ => None,
-                }
-            };
-            let Some(packet) = packet else {
-                break;
-            };
-            self.udp_quiet = Some(Instant::now());
-            let Some(id) = self.request else {
-                break;
-            };
-            data_frame(&mut frame, id, |out| {
-                if self.warp {
-                    bare_datagram(&packet, out);
-                } else {
-                    datagram(&packet, out);
-                }
-            });
-            self.send(wire, &frame);
-        }
+        let origin_closed = self.gather(wire, &mut frame);
         self.frame = frame;
         let udp_drained = self.half_closed
             && drainable
@@ -2061,7 +2097,7 @@ mod tests {
         session.connection_window = 0;
         let (sender, outgoing) = mpsc::sync_channel(masque::QUEUE);
         session.outgoing = Some(outgoing);
-        for _ in 0..=QUEUED_CAP {
+        for _ in 0..QUEUED_CAP {
             sender.send(udp_packet(53)).expect("a packet");
         }
         let mut wire = Wire {
@@ -2073,8 +2109,22 @@ mod tests {
         session.flush(&mut wire);
         assert_eq!(
             session.queued.len(),
-            QUEUED_CAP,
-            "a stalled window keeps at most {QUEUED_CAP} capsules"
+            1,
+            "a stalled window queues the burst as one frame"
+        );
+        let queued: usize = session.queued.iter().map(Vec::len).sum();
+        assert!(
+            session.queued.len() <= QUEUED_CAP && queued <= QUEUED_CAP * BATCH_BODY,
+            "a stalled window keeps at most {QUEUED_CAP} frames of {BATCH_BODY} bytes"
+        );
+        assert!(
+            session
+                .outgoing
+                .as_ref()
+                .expect("receiver")
+                .try_recv()
+                .is_err(),
+            "the whole burst left the channel"
         );
         assert!(
             !session.end,
@@ -2127,6 +2177,89 @@ mod tests {
             &h2::frame_head(bytes.len() - FRAME_HEAD, h2::T_DATA, 0, 1)
         );
         assert_eq!(bytes[FRAME_HEAD], 0, "the capsule leads with its type");
+    }
+
+    /// A burst leaves as one DATA frame: the peer reads one head per burst instead of one per datagram.
+    #[test]
+    fn a_burst_leaves_as_one_data_frame() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.request = Some(1);
+        let (sender, outgoing) = mpsc::sync_channel(masque::QUEUE);
+        session.outgoing = Some(outgoing);
+        let mut expected = Vec::new();
+        for _ in 0..4 {
+            sender.send(udp_packet(53)).expect("a packet");
+            datagram(&udp_packet(53), &mut expected);
+        }
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut wire = Wire {
+            stream: Box::new(Recorder {
+                out: Arc::clone(&out),
+                writes: Arc::clone(&writes),
+            }),
+            pending: Vec::new(),
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        session.flush(&mut wire);
+        assert_eq!(writes.load(Ordering::Relaxed), 1, "the burst is one write");
+        let bytes = out.lock().expect("a recorder");
+        assert_eq!(
+            &bytes[..FRAME_HEAD],
+            &h2::frame_head(expected.len(), h2::T_DATA, 0, 1)
+        );
+        assert_eq!(
+            &bytes[FRAME_HEAD..],
+            expected.as_slice(),
+            "one frame carries every capsule"
+        );
+    }
+
+    /// A burst past a batch leaves several frames, and no body passes h2's default frame limit.
+    #[test]
+    fn a_burst_keeps_every_body_inside_the_frame_limit() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.request = Some(1);
+        session.send_window = 1 << 20;
+        session.connection_window = 1 << 20;
+        let (sender, outgoing) = mpsc::sync_channel(masque::QUEUE);
+        session.outgoing = Some(outgoing);
+        let packet = vec![7u8; 1400];
+        for _ in 0..QUEUED_CAP {
+            sender.send(packet.clone()).expect("a packet");
+        }
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut wire = Wire {
+            stream: Box::new(Recorder {
+                out: Arc::clone(&out),
+                writes: Arc::clone(&writes),
+            }),
+            pending: Vec::new(),
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        session.flush(&mut wire);
+        let bytes = out.lock().expect("a recorder");
+        let mut at = 0;
+        let mut frames = 0;
+        let mut body = Vec::new();
+        while at < bytes.len() {
+            let head = &bytes[at..at + FRAME_HEAD];
+            let length =
+                usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
+            assert!(
+                length <= MAX_FRAME_BODY,
+                "a body stays inside the peer's frame limit"
+            );
+            body.extend_from_slice(&bytes[at + FRAME_HEAD..at + FRAME_HEAD + length]);
+            at += FRAME_HEAD + length;
+            frames += 1;
+        }
+        assert!(frames > 1, "a burst past a batch leaves a second frame");
+        assert_eq!(body.len(), QUEUED_CAP * (packet.len() + 4));
+        assert!(session.queued.is_empty(), "the burst left on the frames");
     }
 
     #[test]
