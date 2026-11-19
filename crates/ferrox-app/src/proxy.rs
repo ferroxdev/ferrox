@@ -16693,7 +16693,7 @@ fn serve_vmess_hysteria_inbound(
     let serve: crate::hysteria::Serve = Arc::new(move |flow| {
         serve_vmess_hysteria(flow.with_meter(meter.clone()), &hysteria_users, freedom);
     });
-    let worker_stop = stop.clone();
+    let worker_stop = stop.cloned();
     let cancel = stop.as_ref().map(|stop| stop.shared());
     thread::spawn(move || {
         crate::hysteria::serve_prepared(
