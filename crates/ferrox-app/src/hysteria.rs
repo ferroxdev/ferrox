@@ -2065,24 +2065,43 @@ fn is_hop_by_hop(name: &str) -> bool {
 }
 
 /// Reads an origin's whole HTTP/1.1 reply to its close, then reduces it to status, headers, and body; the buffered bytes stop at the cover's cap so a runaway origin never exhausts memory.
-/// Whether the head names its own body length, so a probe timeout cannot mean the body continues past the cap.
+/// Whether the final response head names its own body length, so a probe timeout cannot mean the body continues past the cap.
 fn origin_frames_its_body(raw: &[u8]) -> bool {
-    let head_end = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .unwrap_or(raw.len());
-    raw[..head_end].split(|byte| *byte == b'\n').any(|line| {
-        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+    let mut rest = raw;
+    loop {
+        let Some(end) = rest.windows(4).position(|window| window == b"\r\n\r\n") else {
             return false;
         };
-        let name = &line[..colon];
-        let value = &line[colon + 1..];
-        name.eq_ignore_ascii_case(b"content-length")
-            || (name.eq_ignore_ascii_case(b"transfer-encoding")
-                && value
-                    .windows(7)
-                    .any(|window| window.eq_ignore_ascii_case(b"chunked")))
-    })
+        let head = &rest[..end];
+        if informational_head(head) {
+            rest = &rest[end + 4..];
+            continue;
+        }
+        return head.split(|byte| *byte == b'\n').any(|line| {
+            let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+                return false;
+            };
+            let name = &line[..colon];
+            let value = &line[colon + 1..];
+            name.eq_ignore_ascii_case(b"content-length")
+                || (name.eq_ignore_ascii_case(b"transfer-encoding")
+                    && value
+                        .windows(7)
+                        .any(|window| window.eq_ignore_ascii_case(b"chunked")))
+        });
+    }
+}
+
+/// A `1xx` head carries no body, so the next block is the final response.
+fn informational_head(head: &[u8]) -> bool {
+    let Some(line) = head.split(|byte| *byte == b'\n').next() else {
+        return false;
+    };
+    line.split(|byte| byte.is_ascii_whitespace())
+        .nth(1)
+        .and_then(|code| std::str::from_utf8(code).ok())
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| (100..200).contains(&code))
 }
 
 fn read_origin<R: Read>(stream: &mut R, head: &[u8]) -> Option<hysteria::OriginResponse> {
@@ -3124,6 +3143,14 @@ mod tests {
             .expect("a size-limit answer");
         assert_eq!(response.status, 502);
         assert_eq!(response.body, b"502 origin response too large\n");
+    }
+
+    #[test]
+    fn an_informational_head_does_not_hide_the_final_framing() {
+        let raw = b"HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        assert!(origin_frames_its_body(raw));
+        let close = b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\n\r\n";
+        assert!(!origin_frames_its_body(close));
     }
 
     #[test]

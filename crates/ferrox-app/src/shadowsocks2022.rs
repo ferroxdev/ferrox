@@ -112,6 +112,9 @@ fn read_request(stream: &mut dyn Read, recv: &mut Cipher) -> Option<(Request, Ve
         let (target, used) = parse_addr_header(&variable)?;
         (Request::Target(target), used, false)
     };
+    if now_secs().abs_diff(stamp) > SKEW {
+        return None;
+    }
     if variable.len() < used + 2 {
         return None;
     }
