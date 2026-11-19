@@ -2102,8 +2102,15 @@ impl Conduit {
             }
         }
         let media = webrtc.media.is_some();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err((
+                "psiphon conduit: offer retry window expired".to_owned(),
+                false,
+            ));
+        }
         let stream = webrtc
-            .into_stream(self.timeout)
+            .into_stream(self.timeout.min(remaining))
             .map_err(|error| (error, false))?;
         let stream = if media && !unreliable {
             let handshake_remaining = deadline.saturating_duration_since(Instant::now());
