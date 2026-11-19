@@ -34,15 +34,7 @@ jobs:
       - name: plan the scope
         id: scope
         shell: bash
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          EVENT: ${{ github.event_name }}
-        run: |
-          if [[ "$EVENT" == pull_request ]]; then
-            python3 scripts/ci-scope.py scope --base "$BASE"
-          else
-            python3 scripts/ci-scope.py scope --wide
-          fi
+        run: python3 scripts/ci-scope.py scope --wide
 
   suites:
     name: upstream suites (those in scope)
@@ -74,15 +66,7 @@ jobs:
           key: upstream-go-${{ runner.os }}-${{ hashFiles('upstream/pins.toml') }}
       - name: plan the scope, so each suite is read from the same plan
         shell: bash
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          EVENT: ${{ github.event_name }}
-        run: |
-          if [[ "$EVENT" == pull_request ]]; then
-            python3 scripts/ci-scope.py scope --base "$BASE" > /dev/null
-          else
-            python3 scripts/ci-scope.py scope --wide > /dev/null
-          fi
+        run: python3 scripts/ci-scope.py scope --wide > /dev/null
       - name: upstream suites by test_enabled bit
         run: ./scripts/run-upstream-suite.sh
 
@@ -118,15 +102,7 @@ jobs:
           key: upstream-go-${{ runner.os }}-${{ hashFiles('upstream/pins.toml') }}
       - name: plan the scope, so the map runs on the same plan as the gate
         shell: bash
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          EVENT: ${{ github.event_name }}
-        run: |
-          if [[ "$EVENT" == pull_request ]]; then
-            python3 scripts/ci-scope.py scope --base "$BASE" > /dev/null
-          else
-            python3 scripts/ci-scope.py scope --wide > /dev/null
-          fi
+        run: python3 scripts/ci-scope.py scope --wide > /dev/null
       - name: map every scenario family against Ferrox
         run: ./scripts/run-xray-scenario-map.sh
       - name: publish the map

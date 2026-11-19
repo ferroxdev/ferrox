@@ -12,8 +12,8 @@ name: release
 # Nothing here dials a connection: the job compiles, smoke-runs the binary's
 # own version line, and packages. Whether a lane carries bytes is gated by
 # foxy-relay.yml, veepn-relay.yml and the parity matrix, never by a release
-# build. The release opens first and each platform attaches its package as its
-# own build finishes, so one queued or failed runner never holds the others.
+# build. The release opens first, each platform builds without a write token,
+# and one publish job attaches whatever the matrix produced.
 
 on:
   push:
@@ -27,10 +27,11 @@ on:
         default: ""
 
 concurrency:
-  group: release
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
   queue: max
 
+# Only the jobs that create or write the release take a write token.
 permissions:
   contents: read
 
@@ -46,7 +47,7 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.v.outputs.version }}
-      ref: ${{ steps.v.outputs.ref }}
+      commit: ${{ steps.v.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,26 +64,28 @@ jobs:
           valid_version() {
             printf '%s' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
           }
-          echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          tag_commit() {
+            git rev-parse --verify "refs/tags/$1^{commit}" 2>/dev/null
+          }
           if [ "$EVENT" = push ]; then
             valid_version "$REF_NAME" || { echo "::error::the pushed tag must be vX.Y.Z, got: $REF_NAME"; exit 1; }
-            echo "version=$REF_NAME" >> "$GITHUB_OUTPUT"
+            version="$REF_NAME"
+            commit="$(git rev-parse HEAD)"
           elif [ -n "$WANT" ]; then
             valid_version "$WANT" || { echo "::error::the tag input must name an existing vX.Y.Z tag, got: $WANT"; exit 1; }
-            SHA="$(git rev-parse --verify --quiet "$WANT^{commit}")" || { echo "::error::the tag input names no tag here: $WANT"; exit 1; }
-            echo "version=$WANT" >> "$GITHUB_OUTPUT"
-            echo "ref=$SHA" >> "$GITHUB_OUTPUT"
+            commit="$(tag_commit "$WANT")" || { echo "::error::the tag input names no tag: $WANT"; exit 1; }
+            version="$WANT"
           else
             # Nothing typed: the version this workspace declares is the version
             # to ship, so pressing the button once is the whole interaction.
             DECLARED="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
             [ -n "$DECLARED" ] || { echo "::error::cannot read the workspace version from Cargo.toml"; exit 1; }
             valid_version "v$DECLARED" || { echo "::error::Cargo.toml declares a non-vX.Y.Z version: $DECLARED"; exit 1; }
-            echo "version=v$DECLARED" >> "$GITHUB_OUTPUT"
-            if EXISTING="$(git rev-parse --verify --quiet "v$DECLARED^{commit}")"; then
-              echo "ref=$EXISTING" >> "$GITHUB_OUTPUT"
-            fi
+            version="v$DECLARED"
+            commit="$(tag_commit "$version")" || commit="$(git rev-parse HEAD)"
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
   build:
     name: ${{ matrix.target }}
@@ -110,7 +113,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.plan.outputs.ref }}
+          ref: ${{ needs.plan.outputs.commit }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -127,8 +130,9 @@ jobs:
         env:
           # The same crypto cfgs ci.yml arms and .cargo/config.toml documents:
           # aarch64 consults them, x86_64 consults neither, so every package
-          # holds the runtime-dispatching build the local gates measured.
-          RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8 ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-C target-feature=+crt-static' || '' }}
+          # holds the runtime-dispatching build the local gates measured. The
+          # Windows package also carries the MSVC runtime it links.
+          RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8 ${{ contains(matrix.target, 'windows') && '-C target-feature=+crt-static' || '' }}
         run: cargo build --locked --release -p ferrox-app -p ferrox-cli --target "${{ matrix.target }}"
       - name: prove the binaries run
         shell: bash
@@ -182,13 +186,39 @@ jobs:
           name: pkg-${{ matrix.target }}
           path: ferrox-*
           if-no-files-found: error
-      - name: attach this platform as soon as it builds
+
+  publish:
+    name: attach ${{ needs.plan.outputs.version }}
+    needs: [plan, start, build]
+    if: always() && needs.start.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: release-publish-${{ needs.plan.outputs.version }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: pkg-*
+          path: packages
+          merge-multiple: true
+      - name: attach every package that built
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.plan.outputs.version }}
-        run: gh release upload "$VERSION" ferrox-* --clobber
+        run: |
+          shopt -s nullglob
+          files=(packages/ferrox-*)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::warning::no build artefacts to attach"
+            exit 0
+          fi
+          gh release upload "$VERSION" "${files[@]}" --clobber
 
   start:
     name: open ${{ needs.plan.outputs.version }}
@@ -202,7 +232,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.plan.outputs.version }}
-          REF: ${{ needs.plan.outputs.ref }}
+          COMMIT: ${{ needs.plan.outputs.commit }}
           BODY: |-
             ## Ferrox VERSION_PLACEHOLDER
 
@@ -339,7 +369,7 @@ jobs:
 
             `README.md` in each package is the quickstart; `USAGE.md` is the full manual. `GeoLite2-Country.mmdb` is a separate optional asset for configs that ask the binary for country data; it is not unpacked by the lane packages. Its checksum is in the same `SHA256SUMS`.
         run: |
-          printf "%s\n\nBuilt by \`release.yml\` from commit \`%s\`.\n" "$BODY" "${REF::8}" \
+          printf "%s\n\nBuilt by \`release.yml\` from commit \`%s\`.\n" "$BODY" "${COMMIT::8}" \
             | sed "s/VERSION_PLACEHOLDER/${VERSION#v}/g" >RELEASE-BODY.md
           head -5 RELEASE-BODY.md
       - name: open the release
@@ -349,15 +379,15 @@ jobs:
           # This job holds no checkout, so the repo has to be named for gh.
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.plan.outputs.version }}
-          REF: ${{ needs.plan.outputs.ref }}
+          COMMIT: ${{ needs.plan.outputs.commit }}
           EVENT: ${{ github.event_name }}
         run: |
           if gh release view "$VERSION" >/dev/null 2>&1; then
             gh release edit "$VERSION" --notes-file RELEASE-BODY.md
           elif [ "$EVENT" = workflow_dispatch ]; then
             # A dispatched release of a version with no tag yet: cut the tag at
-            # the commit that dispatched it, before any build is waited on.
-            gh release create "$VERSION" --target "$REF" \
+            # the commit the plan resolved, before any build is waited on.
+            gh release create "$VERSION" --target "$COMMIT" \
               --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" --notes-file RELEASE-BODY.md
           else
             gh release create "$VERSION" --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" \
@@ -395,7 +425,7 @@ jobs:
 
   checksums:
     name: the checksums
-    needs: [plan, start, database, build]
+    needs: [plan, start, database, publish]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -439,7 +469,7 @@ jobs:
 
   result:
     name: result
-    needs: [plan, start, database, build, checksums]
+    needs: [plan, start, database, build, publish, checksums]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

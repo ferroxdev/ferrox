@@ -54,29 +54,29 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: offline comparison (no network, link stays masked)
         run: |
-          VLESS_LINK="$(jq -r '.inputs.vless_link // ""' "$GITHUB_EVENT_PATH")"
-          echo "::add-mask::$VLESS_LINK"
-          if [ -n "$VLESS_LINK" ]; then
-            cargo run --locked --release -p ferrox-bench -- --config "$VLESS_LINK"
+          link="$(python3 -c 'import json, os; print(json.load(open(os.environ["GITHUB_EVENT_PATH"])).get("inputs", {}).get("vless_link", ""))')"
+          echo "::add-mask::$link"
+          if [ -n "$link" ]; then
+            cargo run --locked --release -p ferrox-bench -- --config "$link"
           else
-            echo "no vless_link input (push run): exercising parser against the brief link shape only"
+            echo "no vless_link input: exercising parser against the brief link shape only"
             cargo test --locked --release -p ferrox-core vless
           fi
       - name: app check (offline, no network)
         run: |
-          VLESS_LINK="$(jq -r '.inputs.vless_link // ""' "$GITHUB_EVENT_PATH")"
-          echo "::add-mask::$VLESS_LINK"
-          if [ -n "$VLESS_LINK" ]; then
-            cargo run --locked --release -p ferrox-app -- check "$VLESS_LINK"
+          link="$(python3 -c 'import json, os; print(json.load(open(os.environ["GITHUB_EVENT_PATH"])).get("inputs", {}).get("vless_link", ""))')"
+          echo "::add-mask::$link"
+          if [ -n "$link" ]; then
+            cargo run --locked --release -p ferrox-app -- check "$link"
           fi
       - name: live reachability (TCP connect only, sends nothing)
         if: inputs.live == 'true'
         run: |
-          VLESS_LINK="$(jq -r '.inputs.vless_link // ""' "$GITHUB_EVENT_PATH")"
-          echo "::add-mask::$VLESS_LINK"
+          link="$(python3 -c 'import json, os; print(json.load(open(os.environ["GITHUB_EVENT_PATH"])).get("inputs", {}).get("vless_link", ""))')"
+          echo "::add-mask::$link"
           # `run` serves and never returns: this leg asks for the dial and its exit
           # code, which is what "reachability" means here.
-          cargo run --locked --release -p ferrox-app -- check "$VLESS_LINK"
+          cargo run --locked --release -p ferrox-app -- check "$link"
       - name: publish the table
         if: always()
         run: |

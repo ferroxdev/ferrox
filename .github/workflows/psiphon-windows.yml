@@ -416,7 +416,7 @@ jobs:
           fetch_mb socks 10808 psiphon-socks.bin "native socks" || FAILED="$FAILED native(socks)"
           trace_front http 10819 "native http" || FAILED="$FAILED native(http trace)"
           fetch_mb http 10819 psiphon-http.bin "native http" || FAILED="$FAILED native(http)"
-          fetch_mb socks 10808 psiphon-socks-warm.bin "native socks warmup" || FAILED="$FAILED native(socks warmup)"
+          fetch_mb socks 10808 psiphon-socks-warm.bin "native socks warmup" || FAILED="$FAILED native(socks warm)"
           # A cold first fetch and a slow-start connection make an early leg
           # read lower than the lane carries. One warm-up fetch warms both
           # sides of the tunnel before the measured pair, so the measured
@@ -426,7 +426,7 @@ jobs:
             echo "native light FAILED: the ten-megabyte legs did not use the light proxy" >&2
             FAILED="$FAILED native(light)"
           fi
-          # The CPU window matches the reference's three ten-megabyte legs; the mixed leg
+          # The CPU window matches the reference's four ten-megabyte legs; the mixed leg
           # still gates, but it is extra work and stays outside the ratio.
           sample_native "native done" "$NATIVE_LANE"
           trace_front mixed 10809 "native mixed" || FAILED="$FAILED native(mixed trace)"
@@ -508,7 +508,7 @@ jobs:
               echo "::warning::the shipped engine's HTTP proxy carried no trace in 120s"
               REF_FAILED="$REF_FAILED http(unbound)"
             fi
-            fetch_mb socks 10808 reference-socks-warm.bin "reference socks warmup" || REF_FAILED="$REF_FAILED socks(warmup)"
+            fetch_mb socks 10808 reference-socks-warm.bin "reference socks warmup" || REF_FAILED="$REF_FAILED socks(warm)"
             # Same warm-up as the native lane, so both measured legs carry
             # steady-state traffic.
             fetch_mb socks 10808 reference-socks-warm2.bin "reference socks warm" || REF_FAILED="$REF_FAILED socks(warm)"
@@ -691,9 +691,9 @@ jobs:
           else:
               print("| RSS KiB after the legs | n/a | n/a | n/a |")
           if cpu_native is not None and cpu_reference is not None and cpu_native > 0:
-              print(f"| CPU s for 30 MB | {cpu_native:.2f} | {cpu_reference:.2f} | {cpu_reference / cpu_native:.2f}x |")
+              print(f"| CPU s for 40 MB | {cpu_native:.2f} | {cpu_reference:.2f} | {cpu_reference / cpu_native:.2f}x |")
           else:
-              print("| CPU s for 30 MB | n/a | n/a | n/a |")
+              print("| CPU s for 40 MB | n/a | n/a | n/a |")
           PY
           echo "Raw legs (label bytes seconds bytes/s):"
           cat psiphon-legs.tsv 2>/dev/null || true

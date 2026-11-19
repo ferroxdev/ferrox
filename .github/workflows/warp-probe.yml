@@ -94,8 +94,10 @@ jobs:
                       sid = event.stream_id
                       print("==== REQUEST ====", flush=True)
                       for name, value in self.heads[sid]:
-                          shown = "<redacted>" if name == b"authorization" else value
-                          print(f"{name}: {shown}", flush=True)
+                          if name.lower() in (b"authorization", b"proxy-authorization", b"cookie"):
+                              print(f"{name.decode()}: <redacted {len(value)} bytes>", flush=True)
+                          else:
+                              print(f"{name}: {value}", flush=True)
                       body = self.bodies[sid]
                       print(f"body: {body.decode('utf-8', 'replace')}", flush=True)
                       heads = dict(self.heads[sid])
