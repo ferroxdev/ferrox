@@ -9,7 +9,7 @@
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::psiphon_ssh::dial_random;
 
@@ -158,6 +158,7 @@ pub(crate) struct FragmentStream {
     socket: TcpStream,
     config: Arc<Fragmentor>,
     state: Arc<Mutex<State>>,
+    deadline: Arc<Mutex<Option<Instant>>>,
 }
 
 impl FragmentStream {
@@ -170,7 +171,16 @@ impl FragmentStream {
                 bytes_to_fragment: -1,
                 fragmented: 0,
             })),
+            deadline: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The absolute write deadline the fragment loop checks between pauses and writes.
+    pub(crate) fn set_deadline(&self, deadline: Option<Instant>) {
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
     }
 
     /// Clone the socket and its remaining fragment plan.
@@ -179,6 +189,7 @@ impl FragmentStream {
             socket: self.socket.try_clone()?,
             config: Arc::clone(&self.config),
             state: Arc::clone(&self.state),
+            deadline: Arc::clone(&self.deadline),
         })
     }
 
@@ -201,6 +212,13 @@ impl FragmentStream {
     pub(crate) fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.socket.shutdown(how)
     }
+
+    fn expired(&self) -> bool {
+        self.deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
 }
 
 impl ferrox_core::tls::RecordAlignment for FragmentStream {}
@@ -215,6 +233,12 @@ impl Read for FragmentStream {
 impl Write for FragmentStream {
     /// Write the planned leading bytes in fragments, then the rest ordinarily.
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.expired() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "psiphon fragmentor: establishment deadline expired",
+            ));
+        }
         let mut state = self
             .state
             .lock()
@@ -232,7 +256,27 @@ impl Write for FragmentStream {
             if remaining == 0 {
                 break;
             }
+            if self.expired() {
+                return if written > 0 {
+                    Ok(written)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "psiphon fragmentor: establishment deadline expired",
+                    ))
+                };
+            }
             std::thread::sleep(self.config.delay());
+            if self.expired() {
+                return if written > 0 {
+                    Ok(written)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "psiphon fragmentor: establishment deadline expired",
+                    ))
+                };
+            }
             let size = self
                 .config
                 .write_size((buffer.len() - written).min(remaining));
@@ -698,5 +742,29 @@ mod tests {
     fn a_hello_without_sni_is_refused() {
         let record = client_hello(None);
         assert!(split_client_hello(&record).is_err());
+    }
+    #[test]
+    /// An expired establishment deadline stops the fragment loop before it pauses or writes.
+    fn an_expired_fragment_write_returns_before_the_socket() {
+        let (client, _server) = pair();
+        let config = Fragmentor::new(
+            1.0,
+            Vec::new(),
+            1024,
+            1024,
+            1,
+            16,
+            Duration::ZERO,
+            Duration::from_millis(10),
+            false,
+        );
+        let mut stream = FragmentStream::new(client, config);
+        stream.set_deadline(Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a past deadline"),
+        ));
+        let error = stream.write(b"ping").expect_err("an expired write");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }

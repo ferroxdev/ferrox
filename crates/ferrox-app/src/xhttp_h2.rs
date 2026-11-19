@@ -6869,7 +6869,9 @@ mod tests {
         let running = crate::budgets::spawn(move || {
             // Starts after the old observer gave up, so only a loaded-runner budget passes.
             std::thread::sleep(Duration::from_secs(4));
-            let _ = sent.send(sender.send_data(1, b"ping"));
+            let began = std::time::Instant::now();
+            let sent_ok = sender.send_data(1, b"ping");
+            let _ = sent.send((sent_ok, began.elapsed()));
         });
         // Both windows are zero and the stream is live, so false is the relay-stall timeout.
         let verdict = got.recv_timeout(Duration::from_secs(30));
@@ -6877,7 +6879,12 @@ mod tests {
         conn.wake.notify_all();
         running.join().expect("sender thread");
         crate::budgets::clear();
-        assert_eq!(verdict, Ok(false), "a sender with no credit returned");
+        let (sent_ok, took) = verdict.expect("the sender returned");
+        assert!(!sent_ok, "a sender with no credit returned");
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_secs(10),
+            "the sender waited {took:?}, not the configured 500 ms stall"
+        );
     }
 
     /// A request that ended its own body still has a response to send: waiting for credit must not

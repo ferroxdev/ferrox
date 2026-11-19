@@ -2065,15 +2065,69 @@ fn is_hop_by_hop(name: &str) -> bool {
 }
 
 /// Reads an origin's whole HTTP/1.1 reply to its close, then reduces it to status, headers, and body; the buffered bytes stop at the cover's cap so a runaway origin never exhausts memory.
+/// Whether the final response head names its own body length, so a probe timeout cannot mean the body continues past the cap.
+fn origin_frames_its_body(raw: &[u8]) -> bool {
+    let mut rest = raw;
+    loop {
+        let Some(end) = rest.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let head = &rest[..end];
+        if informational_head(head) {
+            rest = &rest[end + 4..];
+            continue;
+        }
+        return head.split(|byte| *byte == b'\n').any(|line| {
+            let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+                return false;
+            };
+            let name = &line[..colon];
+            let value = &line[colon + 1..];
+            name.eq_ignore_ascii_case(b"content-length")
+                || (name.eq_ignore_ascii_case(b"transfer-encoding")
+                    && value
+                        .windows(7)
+                        .any(|window| window.eq_ignore_ascii_case(b"chunked")))
+        });
+    }
+}
+
+/// A `1xx` head carries no body, so the next block is the final response.
+fn informational_head(head: &[u8]) -> bool {
+    let Some(line) = head.split(|byte| *byte == b'\n').next() else {
+        return false;
+    };
+    line.split(u8::is_ascii_whitespace)
+        .nth(1)
+        .and_then(|code| std::str::from_utf8(code).ok())
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| (100..200).contains(&code))
+}
+
 fn read_origin<R: Read>(stream: &mut R, head: &[u8]) -> Option<hysteria::OriginResponse> {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 8 * 1024];
+    let mut clipped = false;
+    let mut probe_failed = false;
     loop {
         match stream.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                if raw.len() + n > MASQ_BODY_CAP {
+                    clipped = true;
+                    break;
+                }
                 raw.extend_from_slice(&chunk[..n]);
-                if raw.len() >= MASQ_BODY_CAP {
+                if raw.len() == MASQ_BODY_CAP {
+                    let mut extra = [0u8; 1];
+                    (clipped, probe_failed) = loop {
+                        match stream.read(&mut extra) {
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                            Ok(0) => break (false, false),
+                            Ok(_) => break (true, false),
+                            Err(_) => break (false, true),
+                        }
+                    };
                     break;
                 }
             }
@@ -2085,7 +2139,8 @@ fn read_origin<R: Read>(stream: &mut R, head: &[u8]) -> Option<hysteria::OriginR
         .and_then(|method| std::str::from_utf8(method).ok())
         .unwrap_or("");
     let parsed = hysteria::parse_origin_response(&raw, method);
-    if parsed.is_none() && raw.len() >= MASQ_BODY_CAP {
+    let indeterminate_close = probe_failed && !origin_frames_its_body(&raw);
+    if clipped || indeterminate_close || (parsed.is_none() && raw.len() >= MASQ_BODY_CAP) {
         return Some(hysteria::OriginResponse {
             status: 502,
             headers: vec![(
@@ -3076,6 +3131,63 @@ mod tests {
         raw.resize(MASQ_BODY_CAP, b'x');
         let response = read_origin(&mut std::io::Cursor::new(raw), b"GET / HTTP/1.1\r\n")
             .expect("a size-limit answer");
+        assert_eq!(response.status, 502);
+        assert_eq!(response.body, b"502 origin response too large\n");
+    }
+
+    #[test]
+    fn a_close_delimited_response_past_the_cap_is_not_accepted_as_complete() {
+        let mut raw = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        raw.resize(MASQ_BODY_CAP + 1, b'x');
+        let response = read_origin(&mut std::io::Cursor::new(raw), b"GET / HTTP/1.1\r\n")
+            .expect("a size-limit answer");
+        assert_eq!(response.status, 502);
+        assert_eq!(response.body, b"502 origin response too large\n");
+    }
+
+    #[test]
+    fn an_informational_head_does_not_hide_the_final_framing() {
+        let raw = b"HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        assert!(origin_frames_its_body(raw));
+        let close = b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\n\r\n";
+        assert!(!origin_frames_its_body(close));
+    }
+
+    #[test]
+    fn a_complete_close_delimited_response_at_the_cap_is_accepted() {
+        let mut raw = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        raw.resize(MASQ_BODY_CAP, b'x');
+        let response = read_origin(&mut std::io::Cursor::new(raw), b"GET / HTTP/1.1\r\n")
+            .expect("a complete response");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body.len(), MASQ_BODY_CAP - 19);
+    }
+
+    #[test]
+    fn an_indeterminate_probe_on_a_close_delimited_response_reports_the_size_limit() {
+        struct StallsAtCap {
+            raw: Vec<u8>,
+            at: usize,
+        }
+        impl Read for StallsAtCap {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.at == self.raw.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "probe timed out",
+                    ));
+                }
+                let len = buf.len().min(self.raw.len() - self.at);
+                buf[..len].copy_from_slice(&self.raw[self.at..self.at + len]);
+                self.at += len;
+                Ok(len)
+            }
+        }
+        let mut raw = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        raw.resize(MASQ_BODY_CAP, b'x');
+        let mut stream = StallsAtCap { raw, at: 0 };
+        let response =
+            read_origin(&mut stream, b"GET / HTTP/1.1\r\n").expect("a size-limit answer");
         assert_eq!(response.status, 502);
         assert_eq!(response.body, b"502 origin response too large\n");
     }

@@ -5543,9 +5543,15 @@ pub(crate) mod loopback {
 
     /// Reads exactly `buf` the way a real edge server must: a socket timeout answers `WouldBlock` on macOS under scheduler load and means "nothing yet", not a closed lane, so it is retried until the budget or a genuine close — aborting on the timeout would tear the lane down mid-echo while nothing is wrong.
     fn read_exact_poll<S: Read>(io: &mut S, buf: &mut [u8]) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        read_exact_until(io, buf, std::time::Instant::now() + Duration::from_secs(60))
+    }
+
+    fn read_exact_until<S: Read>(io: &mut S, buf: &mut [u8], deadline: std::time::Instant) -> bool {
         let mut at = 0usize;
         while at < buf.len() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
             match io.read(&mut buf[at..]) {
                 Ok(0) => return false,
                 Ok(read) => at += read,
@@ -5555,12 +5561,7 @@ pub(crate) mod loopback {
                         std::io::ErrorKind::WouldBlock
                             | std::io::ErrorKind::TimedOut
                             | std::io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    if std::time::Instant::now() >= deadline {
-                        return false;
-                    }
-                }
+                    ) => {}
                 Err(_) => return false,
             }
         }
@@ -9075,18 +9076,18 @@ pub(crate) mod loopback {
             let hold = Instant::now() + Duration::from_secs(6);
             while Instant::now() < hold {
                 let mut header = [0u8; frames::H2_HEADER];
-                if !read_exact_poll(&mut tls, &mut header) {
+                if !read_exact_until(&mut tls, &mut header, hold) {
                     return;
                 }
                 let Some(frame) = frames::H2Frame::parse(&header) else {
                     return;
                 };
                 let mut payload = vec![0u8; frame.length as usize];
-                if !read_exact_poll(&mut tls, &mut payload) {
+                if !read_exact_until(&mut tls, &mut payload, hold) {
                     return;
                 }
-                if frame.stream == 1
-                    && (frame.kind == frames::RST_STREAM || frame.kind == frames::GOAWAY)
+                if frame.kind == frames::GOAWAY
+                    || (frame.stream == 1 && frame.kind == frames::RST_STREAM)
                 {
                     return;
                 }

@@ -5,7 +5,7 @@ use ferrox_core::shadowsocks::{Cipher, MasterKey, Method, LENGTH_LEN, MAX_CHUNK,
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const METHOD: Method = Method::Chacha20Poly1305;
 const SALT_LEN: usize = 32;
@@ -373,6 +373,11 @@ impl Stream<crate::psiphon_fragment::FragmentStream> {
     /// Forward the read timeout to the underlying stream.
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.io.set_read_timeout(timeout)
+    }
+
+    /// Forward the fragment loop's absolute deadline.
+    pub(crate) fn set_deadline(&self, deadline: Option<Instant>) {
+        self.io.set_deadline(deadline);
     }
 
     /// Shut down the underlying stream.

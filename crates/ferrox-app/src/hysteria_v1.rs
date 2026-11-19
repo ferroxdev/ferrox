@@ -680,13 +680,41 @@ struct UdpLane {
     resolving: usize,
 }
 
-struct Resolving(Arc<Mutex<UdpLane>>);
+struct Resolving {
+    lane: Arc<Mutex<UdpLane>>,
+    released: bool,
+}
+
+impl Resolving {
+    fn new(lane: Arc<Mutex<UdpLane>>) -> Self {
+        Self {
+            lane,
+            released: false,
+        }
+    }
+
+    /// Release this resolver's slot once; the guard's drop then has nothing left to give back.
+    fn release(&mut self) {
+        if !self.released {
+            self.released = true;
+            if let Ok(mut lane) = self.lane.lock() {
+                lane.resolving = lane.resolving.saturating_sub(1);
+            }
+        }
+    }
+
+    /// The same release while the caller already holds the lane lock.
+    fn release_in(&mut self, lane: &mut UdpLane) {
+        if !self.released {
+            self.released = true;
+            lane.resolving = lane.resolving.saturating_sub(1);
+        }
+    }
+}
 
 impl Drop for Resolving {
     fn drop(&mut self) {
-        if let Ok(mut lane) = self.0.lock() {
-            lane.resolving = lane.resolving.saturating_sub(1);
-        }
+        self.release();
     }
 }
 
@@ -1087,7 +1115,7 @@ fn resolve_pending(
     port: u16,
     token: u64,
 ) {
-    let _resolving = Resolving(Arc::clone(&lane));
+    let mut resolving = Resolving::new(Arc::clone(&lane));
     let peer = crate::proxy::resolve_bounded(&host, port, UDP_RESOLVE_BUDGET, |host, port| {
         (host, port)
             .to_socket_addrs()
@@ -1100,6 +1128,8 @@ fn resolve_pending(
                 lane.pending.remove(&session);
             }
         }
+        resolving.release();
+        resume_lane(&lane);
         return;
     };
     let Some(mut flow) = open_udp(&shared, &sock, session, peer) else {
@@ -1108,6 +1138,8 @@ fn resolve_pending(
                 lane.pending.remove(&session);
             }
         }
+        resolving.release();
+        resume_lane(&lane);
         return;
     };
     let Ok(mut guard) = lane.lock() else {
@@ -1118,10 +1150,16 @@ fn resolve_pending(
         || !guard.sessions.contains(&session)
     {
         flow.stop.store(true, Ordering::Relaxed);
+        drop(guard);
+        resolving.release();
+        resume_lane(&lane);
         return;
     }
     let Some(pending) = guard.pending.remove(&session) else {
         flow.stop.store(true, Ordering::Relaxed);
+        drop(guard);
+        resolving.release();
+        resume_lane(&lane);
         return;
     };
     let first = (pending.host.clone(), pending.port);
@@ -1132,7 +1170,6 @@ fn resolve_pending(
         flow.used.insert(key.clone(), now);
     }
     flow.used.insert(first.clone(), now);
-    let room = MAX_PENDING_RESOLVERS.saturating_sub(guard.resolving.saturating_sub(1));
     for (key, packets) in pending.packets {
         if key == first {
             for payload in packets {
@@ -1145,6 +1182,8 @@ fn resolve_pending(
         }
     }
     guard.flows.insert(session, flow);
+    resolving.release_in(&mut guard);
+    let room = MAX_PENDING_RESOLVERS.saturating_sub(guard.resolving);
     let spawns = guard.start_waiting(room);
     guard.resolving += spawns.len();
     drop(guard);
@@ -1156,9 +1195,26 @@ fn resolve_pending(
     }
 }
 
+/// A resolver that ends without installing its flow still releases a slot: start the queued work that slot can now carry.
+fn resume_lane(lane: &Arc<Mutex<UdpLane>>) {
+    let Ok(mut guard) = lane.lock() else {
+        return;
+    };
+    let room = MAX_PENDING_RESOLVERS.saturating_sub(guard.resolving);
+    let spawn = guard.start_waiting(room);
+    guard.resolving += spawn.len();
+    drop(guard);
+    for (session, host, port) in spawn {
+        std::thread::spawn({
+            let lane = Arc::clone(lane);
+            move || resolve_dest(lane, session, host, port)
+        });
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn resolve_dest(handle: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u16) {
-    let _resolving = Resolving(Arc::clone(&handle));
+    let mut resolving = Resolving::new(Arc::clone(&handle));
     let key = (host.clone(), port);
     let peer = crate::proxy::resolve_bounded(&host, port, UDP_RESOLVE_BUDGET, |host, port| {
         (host, port)
@@ -1169,11 +1225,7 @@ fn resolve_dest(handle: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u
     let Ok(mut lane) = handle.lock() else {
         return;
     };
-    let room = MAX_PENDING_RESOLVERS.saturating_sub(lane.resolving.saturating_sub(1));
-    {
-        let Some(flow) = lane.flows.get_mut(&session) else {
-            return;
-        };
+    if let Some(flow) = lane.flows.get_mut(&session) {
         flow.resolving.remove(&key);
         if let Some(peer) = peer {
             flow.dests.insert(key.clone(), peer);
@@ -1191,6 +1243,8 @@ fn resolve_dest(handle: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u
             flow.used.remove(&key);
         }
     }
+    resolving.release_in(&mut lane);
+    let room = MAX_PENDING_RESOLVERS.saturating_sub(lane.resolving);
     let spawn = lane.start_waiting(room);
     lane.resolving += spawn.len();
     drop(lane);

@@ -668,6 +668,7 @@ impl Client {
         deadline: Instant,
     ) -> Result<Vec<u8>, String> {
         let cap = Instant::now() + self.relay_timeout;
+        self.transport.set_timeout(self.relay_timeout);
         self.transport.set_deadline(Some(deadline.min(cap)));
         self.relay_packet_reply(connection_id, packet)
     }
