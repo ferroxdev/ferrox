@@ -79894,6 +79894,9 @@ end
             .expect_err("the default tag was removed, so it no longer dials direct");
         assert!(error.contains("direct"), "{error}");
 
+        shared
+            .add_outbound("direct", freedom())
+            .expect("restores the default as freedom");
         shared.remove_outbound("alt");
         shared
             .add_outbound("alt", freedom())
