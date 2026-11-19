@@ -13392,6 +13392,7 @@ pub(crate) fn resolve_outbound_with(
     port: u16,
 ) -> Option<SocketAddr> {
     if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+        crate::tun_route::pin_dialled(ip);
         return Some(SocketAddr::new(ip, port));
     }
     let (address, port) = match options {
@@ -13401,7 +13402,11 @@ pub(crate) fn resolve_outbound_with(
         },
         None => (std::borrow::Cow::Borrowed(address), port),
     };
-    resolve_name(address.as_ref(), port, true)
+    let resolved = resolve_name(address.as_ref(), port, true);
+    if let Some(server) = resolved {
+        crate::tun_route::pin_dialled(server.ip());
+    }
+    resolved
 }
 
 fn browser_host<'a>(

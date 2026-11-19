@@ -4,13 +4,30 @@
 //! stops.
 
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use route_manager::{Route, RouteManager};
 
+/// The capture in force, shared with the dial path so an address resolved after the routes landed is pinned before it is dialled.
+fn capture() -> &'static Mutex<Option<Weak<Guard>>> {
+    static CAPTURE: OnceLock<Mutex<Option<Weak<Guard>>>> = OnceLock::new();
+    CAPTURE.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn pin_dialled(address: IpAddr) {
+    let guard = capture()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().and_then(Weak::upgrade));
+    if let Some(guard) = guard {
+        guard.pin(address);
+    }
+}
+
 /// What one open device captures: the half-default of each family it carries,
 /// the prefixes the config names, and the prefixes it must not capture.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
     routes: Vec<(IpAddr, u8)>,
     keep: Vec<(IpAddr, u8)>,
@@ -77,17 +94,30 @@ impl Plan {
 
 /// The routes one device holds; dropping the guard puts the table back.
 pub(crate) struct Guard {
-    manager: RouteManager,
-    added: Vec<Route>,
+    manager: Mutex<RouteManager>,
+    added: Mutex<Vec<Route>>,
+    pinned: Mutex<Vec<(IpAddr, u8)>>,
+    plan: Plan,
+    default_v4: Option<Route>,
+    default_v6: Option<Route>,
 }
 
 impl Guard {
     /// Pin every kept prefix where it already resolves, then capture the plan's
     /// prefixes on `interface`. A prefix whose current route cannot be found is
     /// named and left to the half-defaults, which is the same table the
-    /// reference leaves it in.
-    pub(crate) fn install(interface: &str, plan: &Plan) -> io::Result<Self> {
+    /// reference leaves it in. The family defaults are read before the capture
+    /// so a later dial can pin a fresh address to the route that carried it.
+    pub(crate) fn install(interface: &str, plan: &Plan) -> io::Result<Arc<Self>> {
         let mut manager = RouteManager::new()?;
+        let default_v4 = manager
+            .find_route(&IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            .ok()
+            .flatten();
+        let default_v6 = manager
+            .find_route(&IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+            .ok()
+            .flatten();
         let mut added: Vec<Route> = Vec::with_capacity(plan.routes.len() + plan.keep.len());
         for (destination, prefix) in plan.keep() {
             match manager.find_route(destination) {
@@ -126,14 +156,91 @@ impl Guard {
                 ),
             }
         }
-        Ok(Self { manager, added })
+        let guard = Arc::new(Self {
+            manager: Mutex::new(manager),
+            added: Mutex::new(added),
+            pinned: Mutex::new(Vec::new()),
+            plan: plan.clone(),
+            default_v4,
+            default_v6,
+        });
+        if let Ok(mut slot) = capture().lock() {
+            *slot = Some(Arc::downgrade(&guard));
+        }
+        Ok(guard)
+    }
+
+    /// Keep one dialled address on the route that carried the default, so a name
+    /// resolved after the capture cannot send the proxy's own connection back
+    /// into the device.
+    fn pin(&self, address: IpAddr) {
+        let bits = if address.is_ipv4() { 32 } else { 128 };
+        let covered = |(outer, prefix): &(IpAddr, u8)| {
+            same_family(*outer, address) && covers(*outer, *prefix, address, bits)
+        };
+        if self.plan.keep().iter().any(covered) || self.plan.routes().iter().any(covered) {
+            return;
+        }
+        let base = if address.is_ipv4() {
+            self.default_v4.as_ref()
+        } else {
+            self.default_v6.as_ref()
+        };
+        let Ok(mut pinned) = self.pinned.lock() else {
+            return;
+        };
+        if pinned.contains(&(address, bits)) {
+            return;
+        }
+        pinned.push((address, bits));
+        drop(pinned);
+        let Some(base) = base else {
+            eprintln!("tun inbound: no default route to pin {address} to");
+            return;
+        };
+        let mut route = Route::new(address, bits);
+        if let Some(gateway) = base.gateway() {
+            route = route.with_gateway(gateway);
+        }
+        if let Some(name) = base.if_name() {
+            route = route.with_if_name(name.to_owned());
+        } else if let Some(index) = base.if_index() {
+            route = route.with_if_index(index);
+        }
+        let Ok(mut manager) = self.manager.lock() else {
+            return;
+        };
+        match manager.add(&route) {
+            Ok(()) => {
+                if let Ok(mut added) = self.added.lock() {
+                    added.push(route);
+                }
+            }
+            Err(error) => {
+                eprintln!("tun inbound: could not pin the outbound edge {address}: {error}");
+            }
+        }
     }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        for route in self.added.drain(..).rev() {
-            let _ = self.manager.delete(&route);
+        if let Ok(mut slot) = capture().lock() {
+            if slot
+                .as_ref()
+                .is_some_and(|weak| std::ptr::eq(weak.as_ptr(), self))
+            {
+                *slot = None;
+            }
+        }
+        let Ok(mut added) = self.added.lock() else {
+            return;
+        };
+        let Ok(mut manager) = self.manager.lock() else {
+            return;
+        };
+        for route in added.drain(..).rev() {
+            let _ = manager.delete(&route);
         }
     }
 }
