@@ -751,7 +751,11 @@ mod tests {
             false,
         );
         let mut stream = FragmentStream::new(client, config);
-        stream.set_deadline(Some(Instant::now() - Duration::from_secs(1)));
+        stream.set_deadline(Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a past deadline"),
+        ));
         let error = stream.write(b"ping").expect_err("an expired write");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
