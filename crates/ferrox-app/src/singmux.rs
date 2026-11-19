@@ -483,23 +483,38 @@ enum Role {
     Server,
 }
 
-static CLOSE_QUEUE: OnceLock<Option<SyncSender<Arc<dyn Fn() + Send + Sync>>>> = OnceLock::new();
+static CLOSE_QUEUE: Mutex<Option<Sender<Arc<dyn Fn() + Send + Sync>>>> = Mutex::new(None);
 
 fn defer_close(close: Arc<dyn Fn() + Send + Sync>) {
-    let sender = CLOSE_QUEUE.get_or_init(|| {
-        let (sender, pending) = sync_channel(MAX_STREAMS);
-        std::thread::Builder::new()
+    let mut queue = match CLOSE_QUEUE.lock() {
+        Ok(queue) => queue,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if queue.is_none() {
+        let (sender, pending) = channel();
+        let spawned = std::thread::Builder::new()
             .name("singmux-close".to_owned())
             .spawn(move || {
                 while let Ok(close) = pending.recv() {
-                    close();
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(close));
                 }
-            })
-            .ok()
-            .map(|_| sender)
-    });
-    if let Some(sender) = sender {
-        let _ = sender.try_send(close);
+            });
+        if spawned.is_err() {
+            drop(queue);
+            close();
+            return;
+        }
+        *queue = Some(sender);
+    }
+    if let Some(sender) = queue.as_ref() {
+        match sender.send(close) {
+            Ok(()) => return,
+            Err(close) => {
+                *queue = None;
+                drop(queue);
+                defer_close(close);
+            }
+        }
     }
 }
 
@@ -1185,6 +1200,9 @@ impl Inner {
     fn smux_loop(&self, mut read: Box<dyn Read + Send>) {
         let mut head = [0u8; SMUX_FRAME];
         loop {
+            if self.dead() {
+                return;
+            }
             if crate::proxy::read_exact(&mut *read, &mut head).is_err() {
                 return;
             }
@@ -1192,6 +1210,9 @@ impl Inner {
             let id = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
             let mut data = vec![0u8; len];
             if len > 0 && crate::proxy::read_exact(&mut *read, &mut data).is_err() {
+                return;
+            }
+            if self.dead() {
                 return;
             }
             match head[1] {
@@ -1213,6 +1234,9 @@ impl Inner {
     fn yamux_loop(&self, mut read: Box<dyn Read + Send>) {
         let mut head = [0u8; 12];
         loop {
+            if self.dead() {
+                return;
+            }
             if crate::proxy::read_exact(&mut *read, &mut head).is_err() {
                 return;
             }
@@ -1232,6 +1256,9 @@ impl Inner {
                 if len > 0 && crate::proxy::read_exact(&mut *read, &mut data).is_err() {
                     return;
                 }
+            }
+            if self.dead() {
+                return;
             }
             match kind {
                 YAMUX_DATA => {
@@ -1295,6 +1322,9 @@ impl Inner {
         }
         let mut continuation: Option<(u32, Vec<u8>)> = None;
         loop {
+            if self.dead() {
+                return;
+            }
             let Some((len, kind, flags, id)) = h2::read_head(&mut *read) else {
                 return;
             };
@@ -1303,6 +1333,9 @@ impl Inner {
             }
             let mut body = vec![0u8; len];
             if len > 0 && crate::proxy::read_exact(&mut *read, &mut body).is_err() {
+                return;
+            }
+            if self.dead() {
                 return;
             }
             match kind {
@@ -2178,10 +2211,16 @@ mod tests {
         let client_write = client.try_clone().expect("client write");
         let (entered, running) = channel();
         let (release, blocked) = channel();
-        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            let _ = entered.send(());
-            let _ = blocked.recv();
-        });
+        let blocked = Arc::new(Mutex::new(blocked));
+        let close: Arc<dyn Fn() + Send + Sync> = {
+            let blocked = Arc::clone(&blocked);
+            Arc::new(move || {
+                let _ = entered.send(());
+                if let Ok(blocked) = blocked.lock() {
+                    let _ = blocked.recv();
+                }
+            })
+        };
         let session = Client::connect(
             Protocol::Yamux,
             false,
