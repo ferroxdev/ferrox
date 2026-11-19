@@ -177,6 +177,8 @@ graph TD
 | carrier-alpn-allocations-per-dial | 0 | ferrox-app-foxy::tests::a_carriers_alpn_list_is_shared_rather_than_built_per_dial |
 <!-- counts:end -->
 
+A status that carries `END_STREAM` now ends its stream on the spot: a bodyless CONNECT reads EOF instead of waiting for a DATA frame the edge will never send (`a_status_with_end_stream_reads_eof`). A reset that arrives before the status ends the open before the session lock takes another wire read (`a_reset_before_status_ends_the_open`), while a socket timeout during that wait is retried to the head budget rather than discarding a pooled session the next flow could ride. A refused warm open, a failed CONNECT-IP address request and a dropped CONNECT-IP lane all end their stream through `end_lane`, so a refused stream no longer rides a shared session (`a_rejected_warm_open_leaves_the_session`).
+
 `tcp-connections-asked-of-an-untrusted-edge 1` is the retry rule seen from the edge's side. The counter is the server's own accept loop, so it sees connections, not intent: one, and the failure names the certificate rather than the moment. The same rule stops the `auto` walk at the first refusal, so a pinned edge with no trusted chain costs one handshake per address instead of one per address per carrier. The front's answer stays `0x01 general failure` (`a_refusal_becomes_the_socks_reply_that_says_so`); what changed is that an actionable message ("this device does not trust the edge's certificate") survives to the caller.
 
 Deliberately left alone: `FoxyOut::remember_unanswered` still caches only `Io | Stream | Frame` as a carrier that died; an untrusted chain does not mark that carrier dead. Trust is per edge, not per carrier, so installing the missing root earns a real dial on the next flow.

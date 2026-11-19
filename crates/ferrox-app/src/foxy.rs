@@ -906,8 +906,17 @@ fn attach(
         .streams
         .insert(stream, Stream::new(i64::from(peer_initial) as u32));
     drop(inner);
-    let status = lane.await_status()?;
-    opened(status)?;
+    let status = match lane.await_status() {
+        Ok(status) => status,
+        Err(failure) => {
+            end_lane(&mut lane);
+            return Err(failure);
+        }
+    };
+    if let Err(failure) = opened(status) {
+        end_lane(&mut lane);
+        return Err(failure);
+    }
     Ok(lane)
 }
 
@@ -1104,6 +1113,7 @@ fn reset_stream(inner: &mut SessionInner, stream: u32) {
 fn end_stream(inner: &mut SessionInner, stream: u32) {
     if let Some(entry) = inner.streams.get_mut(&stream) {
         entry.fin = true;
+        entry.reset = true;
     }
 }
 
@@ -1291,6 +1301,8 @@ struct Stream {
     staged: u32,
     /// The peer ended this stream: nothing more will arrive on it.
     fin: bool,
+    /// The edge reset this stream before its status arrived: an opening read stops on it rather than waiting for a frame that will never come.
+    reset: bool,
     /// This flow has closed its half of the stream.
     sent_end: bool,
     /// The IP packet under construction, reused so a datagram allocates nothing: an IP header, a UDP header and the payload, written once and handed to the frame. A packet per datagram took a buffer that grew three times on its way to the wire.
@@ -1311,6 +1323,7 @@ impl Stream {
             pending_credit: 0,
             staged: 0,
             fin: false,
+            reset: false,
             sent_end: false,
             packet: Vec::new(),
         }
@@ -1653,10 +1666,11 @@ impl Tls2 {
             frames::H2Routed::Headers {
                 stream,
                 block,
+                end,
                 end_headers,
-                ..
             } => {
                 let over = if let Some(entry) = inner.streams.get_mut(&stream) {
+                    entry.fin |= end;
                     if entry.head_end {
                         false
                     } else {
@@ -1828,6 +1842,10 @@ impl Tls2 {
             if let Some(status) = take_status(&mut inner, own)? {
                 return Ok(status);
             }
+            // A reset or a session the edge took away ends the open before the read: no frame will arrive for it, and waiting under the session lock would hold every sibling lane for the whole head budget. `fin` is not the signal, because a HEADERS may carry `END_STREAM` before its CONTINUATION frames.
+            if inner.gone || inner.streams.get(&own).is_some_and(|entry| entry.reset) {
+                return Err(Failure::Stream);
+            }
             let status =
                 Self::with_frame_locked(&mut inner, own, &mut [], |inner, frame, payload, _| {
                     match frames::h2_routed(frame, payload) {
@@ -1864,7 +1882,21 @@ impl Tls2 {
                         _ => take_status(inner, own),
                     }
                 });
-            let status = status.map_err(|_| Failure::Stream)??;
+            // A socket timeout is a quantum, not the open's answer: a session lent warm may still carry the poll its last flow armed, so a status slower than that poll is read again until the head budget itself expires.
+            let status = match status {
+                Ok(status) => status.map_err(|_| Failure::Stream)?,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(_) => return Err(Failure::Stream),
+            };
             if let Some(status) = status {
                 return Ok(status);
             }
@@ -3796,7 +3828,13 @@ pub(crate) fn open_ip_h2(
     let mut lane = open_stream(dial, PoolClass::Ip, |block| {
         connectip::connect_ip(&edge, "*", 0, &dial.pass.token, block);
     })?;
-    let assigned = lane.address_assign()?;
+    let assigned = match lane.address_assign() {
+        Ok(assigned) => assigned,
+        Err(failure) => {
+            end_lane(&mut lane);
+            return Err(failure);
+        }
+    };
     Ok((lane, assigned))
 }
 
@@ -4131,6 +4169,15 @@ impl Drop for Tunnel {
             Self::H2(lane) => end_lane(lane),
             Self::H3(lane) if !lane.closed && !lane.fin => lane.quic.cancel(),
             Self::H3(_) | Self::H1(_) => {}
+        }
+    }
+}
+
+impl Drop for Ip {
+    /// A CONNECT-IP tunnel that ends returns its stream to the pooled session, or resets it when it did not end cleanly: an h2 stream left open keeps the edge fetching into a window nobody drains.
+    fn drop(&mut self) {
+        if let Self::H2(lane) = self {
+            end_lane(lane);
         }
     }
 }
@@ -5522,7 +5569,7 @@ pub(crate) mod loopback {
                     frames::H2Event::Headers { block, .. } => {
                         let _ = seen.send(block.to_vec());
                         let mut out = Vec::new();
-                        h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut out);
+                        h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut out);
                         tls.write_all(&out).ok();
                     }
                     frames::H2Event::Data { payload, .. } => {
@@ -5532,6 +5579,108 @@ pub(crate) mod loopback {
                     }
                     _ => {}
                 }
+            }
+        })
+    }
+
+    /// An h2 edge that answers the first CONNECT with the given HEADERS flags, or resets the opening stream before any status: the open's answer is the whole script.
+    fn single_head_h2_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        flags: u8,
+        reset: bool,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if frame.kind != frames::HEADERS {
+                    continue;
+                }
+                let mut out = Vec::new();
+                if reset {
+                    h2_frame(
+                        frames::RST_STREAM,
+                        0,
+                        frame.stream,
+                        &8u32.to_be_bytes(),
+                        &mut out,
+                    );
+                } else {
+                    h2_frame(frames::HEADERS, flags, frame.stream, &[0x88], &mut out);
+                }
+                tls.write_all(&out).expect("answers");
+                tls.flush().expect("flushes");
+                std::thread::sleep(Duration::from_millis(250));
+                return;
+            }
+        })
+    }
+
+    /// An h2 edge that answers each CONNECT with the next indexed status in `statuses`, then stays open: a warm session's second answer is the script.
+    fn statuses_h2_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        statuses: Vec<u8>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut answers = statuses.into_iter();
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if frame.kind != frames::HEADERS {
+                    continue;
+                }
+                let Some(status) = answers.next() else {
+                    std::thread::sleep(Duration::from_millis(250));
+                    return;
+                };
+                let mut out = Vec::new();
+                h2_frame(
+                    frames::HEADERS,
+                    0x4,
+                    frame.stream,
+                    &[0x80 | status],
+                    &mut out,
+                );
+                tls.write_all(&out).expect("answers");
+                tls.flush().expect("flushes");
             }
         })
     }
@@ -5552,6 +5701,71 @@ pub(crate) mod loopback {
         hpack::hpack_connect("example.com:443", "the-pass", &mut want);
         assert_eq!(block, want, "the edge reads the same block the lane wrote");
         round_trip(&mut tunnel);
+    }
+
+    /// A status that carries `END_STREAM` opened a tunnel with no body: the first read answers EOF instead of waiting for a frame the edge will never send.
+    #[test]
+    fn a_status_with_end_stream_reads_eof() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = single_head_h2_edge(listener, server, 0x5, false);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let mut end = [0u8; 1];
+        assert_eq!(
+            tunnel.read(&mut end).expect("reads the end"),
+            0,
+            "END_STREAM on the status was dropped"
+        );
+        edge.join().expect("joins");
+    }
+
+    /// A warm open the edge refuses leaves no stream on the session it was tried on: the next flow sees the session it had, not the entry the refusal inserted.
+    #[test]
+    fn a_rejected_warm_open_leaves_the_session() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = statuses_h2_edge(listener, server, vec![8, 13]);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let first = Tunnel::open(&dial, "one.test:80", None).expect("opens");
+        let second = Tunnel::open(&dial, "two.test:80", None);
+        assert!(
+            matches!(second, Err(Failure::Rejected(404))),
+            "the edge's refusal was not the open's answer"
+        );
+        let Tunnel::H2(lane) = &first else {
+            panic!("an h2 lane");
+        };
+        assert_eq!(
+            lane.test_inner().streams.len(),
+            1,
+            "a refused warm open left its stream on the session"
+        );
+        drop(first);
+        edge.join().expect("joins");
+    }
+
+    /// A reset that arrives before the status ends the open at once: no frame will answer the stream, so waiting under the session lock would stall every sibling for the head budget.
+    #[test]
+    fn a_reset_before_status_ends_the_open() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = single_head_h2_edge(listener, server, 0, true);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let started = Instant::now();
+        let opened = Tunnel::open(&dial, "example.com:443", None);
+        assert!(
+            matches!(opened, Err(Failure::Stream)),
+            "a reset opening stream opened"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the reset open waited for the head budget"
+        );
+        edge.join().expect("joins");
     }
 
     #[test]
@@ -6360,7 +6574,7 @@ pub(crate) mod loopback {
                 }
             }
             let mut status = Vec::new();
-            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut status);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut status);
             tls.write_all(&status).expect("answers 200");
             let body: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
             std::thread::sleep(Duration::from_millis(200));
@@ -6638,7 +6852,7 @@ pub(crate) mod loopback {
                 }
             }
             let mut status = Vec::new();
-            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut status);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut status);
             tls.write_all(&status).expect("answers 200");
             let _ = close_rx.recv();
         });
@@ -6708,7 +6922,7 @@ pub(crate) mod loopback {
                 }
             }
             let mut status = Vec::new();
-            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut status);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut status);
             tls.write_all(&status).expect("answers 200");
             let _ = hold_rx.recv();
         });
@@ -6762,7 +6976,7 @@ pub(crate) mod loopback {
                     return;
                 }
                 h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut opening);
-                h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut opening);
+                h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut opening);
             } else {
                 let mut request = Vec::new();
                 let mut byte = [0u8; 1];
@@ -6960,7 +7174,7 @@ pub(crate) mod loopback {
                 }
             }
             let mut status = Vec::new();
-            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut status);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut status);
             tls.write_all(&status).expect("answers 200");
             let body = vec![0xA5u8; CHUNK];
             for _ in 0..256 {
@@ -7064,7 +7278,7 @@ pub(crate) mod loopback {
                 }
             }
             let mut status = Vec::new();
-            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut status);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut status);
             tls.write_all(&status).expect("answers 200");
             // The edge reads the credit it granted and gives none of it back, then hangs up on the lane that still has a chunk to send.
             let mut credit = 0usize;
@@ -8372,7 +8586,7 @@ pub(crate) mod loopback {
                 }
             }
             let mut out = Vec::new();
-            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut out);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut out);
             tls.write_all(&out).expect("answers");
             out.clear();
             if assign {
@@ -8501,7 +8715,7 @@ pub(crate) mod loopback {
                     frames::H2Event::Headers { block, .. } => {
                         seen.send(block.to_vec()).expect("reports the block");
                         let mut out = Vec::new();
-                        h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut out);
+                        h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut out);
                         tls.write_all(&out).expect("answers");
                         break;
                     }
@@ -8844,7 +9058,7 @@ pub(crate) mod loopback {
                     frames::H2Event::Headers { block, .. } => {
                         seen.send(block.to_vec()).expect("reports the block");
                         let mut out = Vec::new();
-                        h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut out);
+                        h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut out);
                         tls.write_all(&out).expect("answers");
                         break;
                     }
@@ -8926,7 +9140,7 @@ pub(crate) mod loopback {
                     }
                     frames::HEADERS => {
                         let mut out = Vec::new();
-                        h2_frame(frames::HEADERS, 0x5, frame.stream, &[0x88], &mut out);
+                        h2_frame(frames::HEADERS, 0x4, frame.stream, &[0x88], &mut out);
                         tls.write_all(&out).expect("answers");
                         opened.push(frame.stream);
                     }
@@ -8987,11 +9201,11 @@ pub(crate) mod loopback {
                         answered += 1;
                         if answered == 2 {
                             let mut foreign = Vec::new();
-                            h2_frame(frames::HEADERS, 0x5, 7, &[0x88], &mut foreign);
+                            h2_frame(frames::HEADERS, 0x4, 7, &[0x88], &mut foreign);
                             tls.write_all(&foreign).expect("answers elsewhere");
                         }
                         let mut out = Vec::new();
-                        h2_frame(frames::HEADERS, 0x5, frame.stream, &[0x88], &mut out);
+                        h2_frame(frames::HEADERS, 0x4, frame.stream, &[0x88], &mut out);
                         tls.write_all(&out).expect("answers");
                         tls.flush().expect("flushes");
                         if answered == 2 {
@@ -9048,7 +9262,7 @@ pub(crate) mod loopback {
                             masque::datagram_encode(b"early", &mut early);
                             h2_frame(frames::DATA, 0, opened[0], &early, &mut out);
                         }
-                        h2_frame(frames::HEADERS, 0x5, frame.stream, &[0x88], &mut out);
+                        h2_frame(frames::HEADERS, 0x4, frame.stream, &[0x88], &mut out);
                         tls.write_all(&out).expect("answers");
                         opened.push(frame.stream);
                     }
@@ -9677,7 +9891,7 @@ pub(crate) mod loopback {
             let _ = tls.read(&mut sink);
             // an indexed `:status` of 200, which is one byte
             let mut out = Vec::new();
-            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut out);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut out);
             tls.write_all(&out).expect("answers");
             std::thread::sleep(Duration::from_millis(100));
         });
