@@ -1418,12 +1418,6 @@ impl WebRtcStream {
         Ok(total)
     }
 
-    /// Queue one framed message, respecting the current write timeout.
-    fn send(&self, message: Vec<u8>) -> io::Result<()> {
-        let deadline = (*lock(&self.write_timeout)).map(|timeout| Instant::now() + timeout);
-        self.send_until(message, deadline)
-    }
-
     /// Queue one framed message against a deadline fixed before the first of a batch.
     fn send_until(&self, mut message: Vec<u8>, deadline: Option<Instant>) -> io::Result<()> {
         if let Some(error) = lock(&self.failure).as_ref().cloned() {
