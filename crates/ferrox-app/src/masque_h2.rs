@@ -1629,6 +1629,60 @@ impl Session {
         }
     }
 
+    /// Gathers the queued packets into one DATA frame within peer credit, up to a read's worth of capsules.
+    fn gather(&mut self, wire: &mut Wire, frame: &mut Vec<u8>) -> bool {
+        let mut origin_closed = false;
+        let mut pulled = 0;
+        let Some(id) = self.request else {
+            return false;
+        };
+        while pulled < QUEUED_CAP {
+            // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
+            if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
+                break;
+            }
+            let packet = if let Some(udp) = &self.udp {
+                udp.try_recv()
+            } else {
+                match self
+                    .outgoing
+                    .as_ref()
+                    .map(std::sync::mpsc::Receiver::try_recv)
+                {
+                    Some(Ok(packet)) => Some(packet),
+                    Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                        origin_closed = true;
+                        None
+                    }
+                    _ => None,
+                }
+            };
+            let Some(packet) = packet else {
+                break;
+            };
+            self.udp_quiet = Some(Instant::now());
+            if pulled == 0 {
+                frame.clear();
+                frame.resize(FRAME_HEAD, 0);
+            }
+            if self.warp {
+                bare_datagram(&packet, frame);
+            } else {
+                datagram(&packet, frame);
+            }
+            pulled += 1;
+            if frame.len() - FRAME_HEAD >= BATCH_BODY {
+                break;
+            }
+        }
+        if pulled > 0 {
+            let body = frame.len() - FRAME_HEAD;
+            frame[..FRAME_HEAD].copy_from_slice(&h2::frame_head(body, h2::T_DATA, 0, id));
+            self.send(wire, frame);
+        }
+        origin_closed
+    }
+
     /// Sends a built DATA frame in one write when it fits the window, otherwise queues its body.
     fn send(&mut self, wire: &mut Wire, frame: &[u8]) {
         if self.end || wire.closed || self.request.is_none() {
@@ -1705,59 +1759,12 @@ impl Session {
                 self.queued_at = 0;
             }
         }
-        let mut origin_closed = false;
         // CONNECT-IP keeps its grant and sender alive, so waiting for `outgoing` to disconnect is a wait it never reaches; both datagram modes drain on a quiet window instead.
         let drainable = self.warp || self.udp.is_some();
         if self.half_closed && drainable && self.udp_quiet.is_none() {
             self.udp_quiet = Some(Instant::now());
         }
-        let mut pulled = 0;
-        if let Some(id) = self.request {
-            while pulled < QUEUED_CAP {
-                // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
-                if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
-                    break;
-                }
-                let packet = if let Some(udp) = &self.udp {
-                    udp.try_recv()
-                } else {
-                    match self
-                        .outgoing
-                        .as_ref()
-                        .map(std::sync::mpsc::Receiver::try_recv)
-                    {
-                        Some(Ok(packet)) => Some(packet),
-                        Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                            origin_closed = true;
-                            None
-                        }
-                        _ => None,
-                    }
-                };
-                let Some(packet) = packet else {
-                    break;
-                };
-                self.udp_quiet = Some(Instant::now());
-                if pulled == 0 {
-                    frame.clear();
-                    frame.resize(FRAME_HEAD, 0);
-                }
-                if self.warp {
-                    bare_datagram(&packet, &mut frame);
-                } else {
-                    datagram(&packet, &mut frame);
-                }
-                pulled += 1;
-                if frame.len() - FRAME_HEAD >= BATCH_BODY {
-                    break;
-                }
-            }
-            if pulled > 0 {
-                let body = frame.len() - FRAME_HEAD;
-                frame[..FRAME_HEAD].copy_from_slice(&h2::frame_head(body, h2::T_DATA, 0, id));
-                self.send(wire, &frame);
-            }
-        }
+        let origin_closed = self.gather(wire, &mut frame);
         self.frame = frame;
         let udp_drained = self.half_closed
             && drainable
