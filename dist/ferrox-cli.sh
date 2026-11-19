@@ -490,7 +490,8 @@ action_login() {
     printf 'password (hidden, not echoed): ' && read -rs pass && printf '\n'
   fi
   [ -n "$email" ] && [ -n "$pass" ] || die "an account is an email and a password"
-  local cred_dir save_dir tmp unsafe
+  local cred_dir save_dir tmp unsafe login_epoch="${LOGIN_GUARD_EPOCH:-}"
+  [ -n "$login_epoch" ] || login_epoch="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)"
   cred_dir="$(dirname "$CREDS")"
   [ -d "$CREDS" ] && die "$CREDS is a directory; FOXY_CREDENTIALS must name a file"
   mkdir -p "$CONF_DIR" || die "cannot create $CONF_DIR; the saved session was kept."
@@ -515,10 +516,16 @@ action_login() {
   ) || { rm -f "$tmp"; die "cannot write $CREDS; the saved session was kept."; }
   chmod 600 "$tmp" || { rm -f "$tmp"; die "cannot set owner-only mode on $CREDS; the saved session was kept."; }
   [ -d "$CREDS" ] && { rm -f "$tmp"; die "$CREDS is a directory; FOXY_CREDENTIALS must name a file"; }
+  proxy_lock || { rm -f "$tmp"; die "login: the system proxy lock was unavailable; the saved session was kept."; }
+  if [ "$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)" != "$login_epoch" ]; then
+    rm -f "$tmp"; proxy_unlock
+    die "login: a concurrent down or logout cancelled this sign-in."
+  fi
   mv -f "$tmp" "$save_dir/$(basename "$CREDS")" ||
-    { rm -f "$tmp"; die "cannot replace $CREDS; the saved session was kept."; }
+    { rm -f "$tmp"; proxy_unlock; die "cannot replace $CREDS; the saved session was kept."; }
   # A login is the user asking for this account now: the grant the last one left is not the one to resume.
   rm -f "$TOKEN_FILE"
+  proxy_unlock
   if [ "${LOGIN_QUIET:-0}" != 1 ]; then
     say "account saved to $CREDS: owner-only, outside the repository, read by every future up."
     say "the next up --foxy signs in once and keeps the session in $TOKEN_FILE."
@@ -558,8 +565,8 @@ same_stored_account() {
 action_logout() {
   stop_all_lanes ||
     die "logout: the lanes or system proxy could not be stopped; the saved account was kept."
-  rm -f "$TOKEN_FILE" "$CREDS" "$CONF_DIR"/lane*.json
-  say "signed out: every lane is stopped, and the stored session, the saved account and the lane configs are gone."
+  rm -f "$TOKEN_FILE" "$CREDS"
+  say "signed out: every lane is stopped, and the stored session, the saved account and generated lane configs are gone."
   say "the remembered exit stays in $LOCATION_FILE; 'ferrox-cli login' signs in again."
 }
 
@@ -998,15 +1005,22 @@ write_lane_meta() {
 
 load_lane_meta() {
   [ -f "$META_FILE" ] || return 1
-  local line
+  local line default_cfg="$CFG" generated_set=0
   GENERATED=0
   while IFS= read -r line; do
     case "$line" in
       config=*) CFG="${line#config=}" ;;
       fronts=*) FRONTS="${line#fronts=}"; FRONTS_SET=1 ;;
-      generated=*) GENERATED="${line#generated=}" ;;
+      generated=*) GENERATED="${line#generated=}"; generated_set=1 ;;
     esac
   done <"$META_FILE"
+  if [ "$generated_set" -eq 0 ]; then
+    if [ "$(resolve_real "$CFG")" = "$(resolve_real "$default_cfg")" ]; then
+      GENERATED=1
+    else
+      GENERATED=0
+    fi
+  fi
 }
 
 foxy_outbound() {
@@ -2606,37 +2620,59 @@ choose_carrier() {
 }
 
 start_lane() {
-  local new_cfg new_fronts old_exit lane_pid reg_dir status=0 start_epoch
+  local new_cfg new_fronts old_exit lane_pid reg_dir status=0 start_epoch final_cfg warp_port
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
   start_epoch="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)"
+  LOGIN_GUARD_EPOCH="$start_epoch"
   WARP_SELECTED=0
+  final_cfg="$CFG"; CFG_STAGE=""
+  if [ "$OUTBOUND" != config ]; then
+    CFG_STAGE="$(dirname "$final_cfg")/.$(basename "$final_cfg").stage.$$"
+    rm -f "$CFG_STAGE"
+    CFG="$CFG_STAGE"
+  fi
   # Validate first: an invocation that cannot start must not stop a healthy lane,
   # and a bad link must not send the user to a build before saying what is wrong.
   old_exit="$(trap -p EXIT)"
-  trap 'status=$?; [ "$WARP_STARTED" = 1 ] && stop_warp_hop; exit $status' EXIT
+  trap 'status=$?; [ "$WARP_STARTED" = 1 ] && stop_warp_hop; [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"; exit $status' EXIT
   build_config
-  if [ -n "$old_exit" ]; then eval "$old_exit"; else trap - EXIT; fi
   require_bin
-  proxy_lock || return 1
+  if [ -n "$old_exit" ]; then eval "$old_exit"; else trap - EXIT; fi
+  proxy_lock || {
+    [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"
+    [ "$OUTBOUND" = config ] || CFG="$final_cfg"
+    return 1
+  }
   if [ "$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)" != "$start_epoch" ]; then
-    [ "$OUTBOUND" = config ] || rm -f "$CFG"
+    [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"
     [ "$WARP_STARTED" = 1 ] && stop_warp_hop
+    [ "$OUTBOUND" = config ] || CFG="$final_cfg"
     proxy_unlock
     say "a concurrent down or logout cancelled this start; try again." >&2
     return 1
   fi
-  if [ "$OUTBOUND" != config ] && ! write_config "$BUILT_OUTBOUND"; then
-    proxy_unlock
-    say "cannot write $CFG" >&2
-    return 1
+  if [ "$WARP_SELECTED" = 1 ]; then
+    warp_port="$(cat "$WARP_PORT_FILE" 2>/dev/null || true)"
+    if ! warp_hop_running || [ "$UPSTREAM" != "socks5://127.0.0.1:$warp_port" ]; then
+      [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"
+      [ "$OUTBOUND" = config ] || CFG="$final_cfg"
+      proxy_unlock
+      say "the warp hop was stopped by a concurrent down; try again." >&2
+      return 1
+    fi
+  fi
+  if [ "$OUTBOUND" != config ]; then
+    if ! mv -f "$CFG_STAGE" "$final_cfg"; then
+      rm -f "$CFG_STAGE"
+      [ "$OUTBOUND" = config ] || CFG="$final_cfg"
+      proxy_unlock
+      say "cannot publish $final_cfg" >&2
+      return 1
+    fi
+    CFG="$final_cfg"
   fi
   save_lane_location
-  if [ "$WARP_SELECTED" = 1 ] && ! warp_hop_running; then
-    proxy_unlock
-    say "the warp hop was stopped by a concurrent down; try again." >&2
-    return 1
-  fi
   reg_dir="$(resolve_real "$CONF_DIR")"
   if ! { touch "$LANES_FILE" &&
          { grep -Fxq "$reg_dir" "$LANES_FILE" || printf '%s\n' "$reg_dir" >> "$LANES_FILE"; }; }; then
@@ -2786,8 +2822,10 @@ stop_warp_hop() {
 }
 
 forget_lane_config() {
-  if [ "${GENERATED:-0}" = 1 ] || [ ! -f "$META_FILE" ]; then
-    case "$CFG" in "$CONF_DIR"/lane*.json) rm -f "$CFG" ;; esac
+  local default_cfg="${META_FILE%.meta}.json"
+  if [ "${GENERATED:-0}" = 1 ] ||
+     { [ ! -f "$META_FILE" ] && [ "$(resolve_real "$CFG")" = "$(resolve_real "$default_cfg")" ]; }; then
+    rm -f "$CFG"
   fi
   rm -f "$META_FILE"
 }
@@ -2827,9 +2865,20 @@ stop_all_lanes() {
         apply_instance
         GENERATED=0
         load_lane_meta || true
-        if [ "$GENERATED" = 1 ] || [ ! -f "$META_FILE" ]; then
-          case "$CFG" in "$CONF_DIR"/lane*.json) forget+=("$CFG") ;; esac
+        if [ "$GENERATED" = 1 ] ||
+           { [ ! -f "$META_FILE" ] && [ "$CFG" = "$CONF_DIR/lane$([ -n "$INSTANCE" ] && echo "-$INSTANCE").json" ]; }; then
+          forget+=("$CFG")
         fi
+        forget+=("$META_FILE")
+      done
+      for pidfile in "$CONF_DIR"/lane.meta "$CONF_DIR"/lane-*.meta; do
+        [ -f "$pidfile" ] || continue
+        base="${pidfile##*/}"; base="${base#lane}"; base="${base%.meta}"
+        INSTANCE="${base#-}"
+        apply_instance
+        GENERATED=0
+        load_lane_meta || true
+        [ "$GENERATED" = 1 ] && forget+=("$CFG")
         forget+=("$META_FILE")
       done
     done < "$LANES_FILE"
@@ -2842,9 +2891,20 @@ stop_all_lanes() {
     apply_instance
     GENERATED=0
     load_lane_meta || true
-    if [ "$GENERATED" = 1 ] || [ ! -f "$META_FILE" ]; then
-      case "$CFG" in "$CONF_DIR"/lane*.json) forget+=("$CFG") ;; esac
+    if [ "$GENERATED" = 1 ] ||
+       { [ ! -f "$META_FILE" ] && [ "$CFG" = "$CONF_DIR/lane$([ -n "$INSTANCE" ] && echo "-$INSTANCE").json" ]; }; then
+      forget+=("$CFG")
     fi
+    forget+=("$META_FILE")
+  done
+  for pidfile in "$CONF_DIR"/lane.meta "$CONF_DIR"/lane-*.meta; do
+    [ -f "$pidfile" ] || continue
+    base="${pidfile##*/}"; base="${base#lane}"; base="${base%.meta}"
+    INSTANCE="${base#-}"
+    apply_instance
+    GENERATED=0
+    load_lane_meta || true
+    [ "$GENERATED" = 1 ] && forget+=("$CFG")
     forget+=("$META_FILE")
   done
   if [ "${#forget[@]}" -gt 0 ]; then
