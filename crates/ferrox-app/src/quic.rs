@@ -5179,6 +5179,7 @@ struct Scratch {
     fresh: Vec<FreshStream>,
     learned: Vec<(Vec<u8>, Arc<ServerConn>)>,
     closed: Vec<Vec<u8>>,
+    retired_owners: Vec<Arc<ConnectionToken>>,
     /// The stamp one reap writes on every state it visits, so a second key for that state is a load, not a scan.
     epoch: u64,
     /// The earliest timer a live connection wants, carried from the reap that read it to the wait it gates.
@@ -5352,6 +5353,7 @@ fn note_closed(state: &ServerConn, key: &[u8], scratch: &mut Scratch, retired: &
         if !state.established.load(Ordering::Relaxed) {
             retired.unverified += 1;
         }
+        scratch.retired_owners.push(Arc::clone(&state.owner));
     }
     scratch.closed.push(key.to_vec());
 }
@@ -5506,6 +5508,7 @@ fn reap(
     scratch.fresh.clear();
     scratch.learned.clear();
     scratch.closed.clear();
+    scratch.retired_owners.clear();
     scratch.epoch = scratch.epoch.wrapping_add(1);
     let epoch = scratch.epoch;
     let mut deadline = None;
@@ -5581,6 +5584,9 @@ fn reap(
     }
     for key in scratch.closed.drain(..) {
         routes.conns.remove(&key);
+    }
+    for owner in scratch.retired_owners.drain(..) {
+        owner.close();
     }
     for (conn, stream, prefaced, stop, owner) in scratch.fresh.drain(..) {
         let session = QuicStream {

@@ -1155,7 +1155,12 @@ pub(crate) fn verify_endpoint(
 
 /// Open the server's UDP socket and spawn its reader and stack. Returns the
 /// port the OS bound, or a refusal the startup names.
-pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Result<u16, String> {
+pub(crate) fn serve_inbound(
+    inbound: &Json,
+    out: &Outbound,
+    address: &str,
+    stop: Option<&Arc<crate::proxy::Stop>>,
+) -> Result<u16, String> {
     let settings = inbound
         .get("settings")
         .ok_or("wireguard inbound has no settings")?;
@@ -1181,6 +1186,8 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     let io_recycle = recycle.clone();
     let io_config = config.clone();
     let io_packets = packets_tx.clone();
+    let io_stop = stop.map(crate::proxy::Stop::shared);
+    let io_closed = stop.cloned();
     std::thread::spawn(move || {
         io(
             io_config,
@@ -1188,11 +1195,14 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
             from_tunnel,
             io_packets,
             None,
-            None,
+            io_stop,
             io_recycle,
             recycled,
             crate::noize::WireGuardNoize::off(),
         );
+        if let Some(stop) = io_closed {
+            stop.mark_closed();
+        }
     });
     let stack_config = config;
     let stack_tunnel = to_tunnel;

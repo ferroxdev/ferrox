@@ -4780,9 +4780,13 @@ mod tests {
         );
         let wireguard_inbound = crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#))
             .expect("a wireguard inbound");
-        let wireguard_port =
-            crate::wg::serve_inbound(&wireguard_inbound, &freedom_outbound(None), "127.0.0.1:0")
-                .expect("the wireguard server serves");
+        let wireguard_port = crate::wg::serve_inbound(
+            &wireguard_inbound,
+            &freedom_outbound(None),
+            "127.0.0.1:0",
+            None,
+        )
+        .expect("the wireguard server serves");
 
         let masque_inbound = crate::json::parse(
             r#"{"settings":{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]},"streamSettings":{"network":"masque","security":"none"}}"#,
@@ -4793,6 +4797,7 @@ mod tests {
             &masque_inbound,
             &freedom_outbound(Some(&redirect)),
             "127.0.0.1:0",
+            None,
         )
         .expect("the masque server serves");
 
@@ -4901,6 +4906,7 @@ mod tests {
             &outer_inbound,
             &freedom_outbound(Some(&redirect)),
             "127.0.0.1:0",
+            None,
         )
         .expect("the outer masque server serves");
 
@@ -5086,7 +5092,7 @@ mod tests {
         let inner_inbound = crate::json::parse(&format!(r#"{{"settings":{inner_settings}}}"#))
             .expect("an inner wireguard inbound");
         let inner_port =
-            crate::wg::serve_inbound(&inner_inbound, &freedom_outbound(None), "127.0.0.1:0")
+            crate::wg::serve_inbound(&inner_inbound, &freedom_outbound(None), "127.0.0.1:0", None)
                 .expect("the inner wireguard server serves");
         crate::proxy::echo_trace("wiw: inner inbound");
 
@@ -5102,6 +5108,7 @@ mod tests {
             &outer_inbound,
             &freedom_outbound(Some(&redirect)),
             "127.0.0.1:0",
+            None,
         )
         .expect("the outer wireguard server serves");
         crate::proxy::echo_trace("wiw: outer inbound");

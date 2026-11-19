@@ -639,6 +639,11 @@ fn serve_inbounds_counted(
                     .map(|(_, raw)| raw.clone())
             });
             let mut handler_stops: Vec<(Arc<Stop>, String)> = Vec::new();
+            let vmess_cached_before = protocol != "vmess"
+                || match (route, handler_tag.as_deref()) {
+                    (Some(shared), Some(tag)) => shared.has_vmess_users(tag),
+                    _ => true,
+                };
             let vmess_users = (protocol == "vmess").then(|| {
                 let make = || inbound_vmess_users(inbound);
                 let users = match (route, handler_tag.as_deref()) {
@@ -892,8 +897,18 @@ fn serve_inbounds_counted(
                             }
                             continue;
                         };
-                        match crate::wg::serve_inbound(inbound, &out, address) {
-                            Ok(_) => inbounds += 1,
+                        match crate::wg::serve_inbound(
+                            inbound,
+                            &out,
+                            address,
+                            handler_stop.as_ref(),
+                        ) {
+                            Ok(_) => {
+                                inbounds += 1;
+                                if let Some(stop) = &handler_stop {
+                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                }
+                            }
                             Err(reason) => eprintln!("wireguard inbound {address}: {reason}"),
                         }
                     }
@@ -941,6 +956,11 @@ fn serve_inbounds_counted(
                     }
                 }
                 inbounds = before;
+                if !vmess_cached_before {
+                    if let (Some(shared), Some(tag)) = (route, handler_tag.as_deref()) {
+                        shared.forget_vmess_users(tag);
+                    }
+                }
                 continue;
             }
             if !prove && inbounds > before {
@@ -3120,6 +3140,13 @@ impl RouteShared {
             &|named| portal_tag(self, named),
             &|named| portal_domain(self, named),
         ));
+    }
+
+    fn has_vmess_users(&self, tag: &str) -> bool {
+        self.vmess_users
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(tag)
     }
 
     fn forget_vmess_users(&self, tag: &str) {
