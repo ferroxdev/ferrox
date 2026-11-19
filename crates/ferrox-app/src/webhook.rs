@@ -343,7 +343,7 @@ impl Webhook {
             let _ = sender.send(
                 (host.as_str(), port)
                     .to_socket_addrs()
-                    .map(|addresses| addresses.collect::<Vec<_>>()),
+                    .map(Iterator::collect::<Vec<_>>),
             );
         });
         let resolved = receiver
