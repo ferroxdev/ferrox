@@ -97,6 +97,7 @@ impl<'a> DataBatch<'a> {
             .batch_gate
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let mut pump = true;
         loop {
             let mut credit = conn
                 .send_conn
@@ -127,7 +128,7 @@ impl<'a> DataBatch<'a> {
                 return false;
             }
             drop(gate);
-            if conn.client_read.is_some() {
+            if conn.client_read.is_some() && pump {
                 drop(credit);
                 let pumped = conn.pump_read(
                     || !matches!(self.reserved_fits(conn), Some(false)),
@@ -137,13 +138,13 @@ impl<'a> DataBatch<'a> {
                     .batch_gate
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                if matches!(pumped, Pumped::Dead) {
-                    self.refund_reserved(conn);
-                    return false;
-                }
-                if matches!(pumped, Pumped::Yield) && self.reserved_fits(conn) != Some(true) {
-                    self.refund_reserved(conn);
-                    return false;
+                match pumped {
+                    Pumped::Dead => {
+                        self.refund_reserved(conn);
+                        return false;
+                    }
+                    Pumped::Yield => pump = false,
+                    Pumped::Alive => pump = true,
                 }
                 continue;
             }
@@ -158,6 +159,7 @@ impl<'a> DataBatch<'a> {
                 .batch_gate
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            pump = true;
             if timed_out {
                 self.refund_reserved(conn);
                 return false;
