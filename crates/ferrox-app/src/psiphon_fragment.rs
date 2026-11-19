@@ -257,17 +257,25 @@ impl Write for FragmentStream {
                 break;
             }
             if self.expired() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "psiphon fragmentor: establishment deadline expired",
-                ));
+                return if written > 0 {
+                    Ok(written)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "psiphon fragmentor: establishment deadline expired",
+                    ))
+                };
             }
             std::thread::sleep(self.config.delay());
             if self.expired() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "psiphon fragmentor: establishment deadline expired",
-                ));
+                return if written > 0 {
+                    Ok(written)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "psiphon fragmentor: establishment deadline expired",
+                    ))
+                };
             }
             let size = self
                 .config

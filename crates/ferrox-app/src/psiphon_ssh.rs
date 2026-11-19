@@ -4382,6 +4382,7 @@ fn write_vectored_all(
 ) -> io::Result<()> {
     while !slices.is_empty() {
         arm_deadline(io, deadline)?;
+        io.set_write_deadline(deadline);
         let written = match io.write_vectored(slices) {
             Ok(written) => written,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,

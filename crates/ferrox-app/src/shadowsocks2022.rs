@@ -100,6 +100,9 @@ fn read_request(stream: &mut dyn Read, recv: &mut Cipher) -> Option<(Request, Ve
         return None;
     }
     recv.open_in_place(&mut variable)?;
+    if now_secs().abs_diff(stamp) > SKEW {
+        return None;
+    }
     variable.truncate(var_len);
     let (target, used, mux) = if let Some(used) = mux_header_len(&variable) {
         (Request::Mux, used, true)
