@@ -1077,6 +1077,9 @@ pub(crate) fn pump_relay_carried<R, W>(
     let Ok(plain_write) = plain.try_clone() else {
         return;
     };
+    let Ok(plain_eof) = plain.try_clone() else {
+        return;
+    };
     let mut plain_read = plain_read;
     let mut plain_write = plain_write;
     let _ = plain_read.set_read_timeout(Some(RELAY_POLL));
@@ -1092,6 +1095,7 @@ pub(crate) fn pump_relay_carried<R, W>(
         Box::new(move || {
             uplink_step(
                 &mut plain_read,
+                &plain_eof,
                 &mut buf,
                 &mut send,
                 &mut writer,
@@ -1121,6 +1125,7 @@ pub(crate) fn pump_relay_carried<R, W>(
 /// lane back when the socket has nothing yet rather than waiting inside the read.
 fn uplink_step(
     plain_read: &mut Connection,
+    plain_eof: &Connection,
     buf: &mut [u8],
     send: &mut Uplink,
     writer: &mut dyn Write,
@@ -1132,7 +1137,10 @@ fn uplink_step(
         Uplink::Stream(_) => plain_read.read(&mut buf[SEAL_HEAD..SEAL_HEAD + READ_CHUNK]),
     };
     match read {
-        Ok(0) => crate::proxy::lane_pool::Next::Done,
+        Ok(0) => {
+            let _ = plain_eof.shutdown(Shutdown::Write);
+            crate::proxy::lane_pool::Next::Done
+        }
         Ok(n) if seal_all(send, buf, n, writer).is_ok() => {
             flow.mark_progress();
             crate::proxy::lane_pool::Next::More

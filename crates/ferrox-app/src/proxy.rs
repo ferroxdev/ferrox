@@ -565,6 +565,9 @@ fn serve_inbounds_counted(
     test: bool,
     fallible: bool,
 ) -> usize {
+    if fallible {
+        FALLIBLE_BIND.with(|fallible| fallible.set(true));
+    }
     let routed =
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
     let mut inbounds = 0;
@@ -595,6 +598,12 @@ fn serve_inbounds_counted(
                 refuse_inbound(protocol, label, inbound);
                 continue;
             }
+            if fallible {
+                if let Err(reason) = preflight_inbound(inbound, protocol, &addresses) {
+                    eprintln!("inbound `{protocol}` in {label}: {reason}");
+                    continue;
+                }
+            }
             if prove {
                 if let Some(shared) = route {
                     prove_server_route(shared, inbound, label);
@@ -623,12 +632,16 @@ fn serve_inbounds_counted(
                 users
             });
             let before = inbounds;
+            let mut armed_addresses: Vec<String> = Vec::new();
+            let mut bind_failure = false;
             let h3_stop = if inbound_is_xhttp_h3(inbound) {
                 handler_stop.as_ref()
             } else {
                 None
             };
             for address in bind {
+                BIND_FAILED.with(|failed| failed.set(false));
+                let was = inbounds;
                 match protocol {
                     "vless" => {
                         if serve_vless_inbound(
@@ -728,11 +741,19 @@ fn serve_inbounds_counted(
                             eprintln!(
                                 "inbound `{protocol}` in {label} names no outbound to carry it"
                             );
+                            if fallible {
+                                bind_failed();
+                                break;
+                            }
                             continue;
                         };
                         // A front with no tcp carrier has no chain to arm, so the inbound is refused rather than served unmasked.
                         if crate::config::has_tcp_mask(inbound.get("streamSettings")) {
                             eprintln!("inbound `{protocol}` in {label} asks for a finalmask tcp chain it cannot arm");
+                            if fallible {
+                                bind_failed();
+                                break;
+                            }
                             continue;
                         }
                         let accounts = Arc::new(if protocol == "http" {
@@ -745,7 +766,12 @@ fn serve_inbounds_counted(
                             "socks" => Role::Socks { out, accounts },
                             _ => Role::Mixed { out, accounts },
                         };
-                        spawn_role(address, inbound_role(inbound, role), inbound_tag(inbound));
+                        spawn_role_stopped(
+                            address,
+                            inbound_role(inbound, role),
+                            inbound_tag(inbound),
+                            handler_stop.clone(),
+                        );
                         inbounds += 1;
                     }
                     "dokodemo-door" => {
@@ -764,10 +790,16 @@ fn serve_inbounds_counted(
                                     handler_stops.push((Arc::clone(stop), address.clone()));
                                 }
                             }
+                        } else if fallible {
+                            bind_failed();
+                            break;
                         }
                     }
                     "hc" => {
-                        if serve_hc_inbound(address, inbound) {
+                        if serve_hc_inbound(address, inbound, handler_stop.clone()) {
+                            if let Some(stop) = &handler_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            }
                             inbounds += 1;
                         }
                     }
@@ -787,15 +819,27 @@ fn serve_inbounds_counted(
                     "tun" => {
                         // A tun flow has no source or local address, so a reaching rule that names one is refused here.
                         if refuse_source(route, inbound, label, "tun", prove) {
+                            if fallible {
+                                bind_failed();
+                                break;
+                            }
                             continue;
                         }
                         let Some(out) = routed(inbound, false) else {
+                            if fallible {
+                                bind_failed();
+                                break;
+                            }
                             continue;
                         };
                         let spec = match tun_spec(inbound) {
                             Ok(spec) => spec,
                             Err(error) => {
                                 eprintln!("tun inbound: {error}");
+                                if fallible {
+                                    bind_failed();
+                                    break;
+                                }
                                 continue;
                             }
                         };
@@ -804,6 +848,10 @@ fn serve_inbounds_counted(
                             #[cfg(not(target_os = "linux"))]
                             if tun_stack(inbound) == "system" {
                                 eprintln!("tun inbound: the system tun stack is Linux-only");
+                                if fallible {
+                                    bind_failed();
+                                    break;
+                                }
                                 continue;
                             }
                             inbounds += 1;
@@ -813,9 +861,17 @@ fn serve_inbounds_counted(
                     }
                     "wireguard" => {
                         if refuse_source(route, inbound, label, "tunnel", prove) {
+                            if fallible {
+                                bind_failed();
+                                break;
+                            }
                             continue;
                         }
                         let Some(out) = routed(inbound, false) else {
+                            if fallible {
+                                bind_failed();
+                                break;
+                            }
                             continue;
                         };
                         match crate::wg::serve_inbound(inbound, &out, address) {
@@ -825,9 +881,17 @@ fn serve_inbounds_counted(
                     }
                     "masque" => {
                         if refuse_source(route, inbound, label, "MASQUE", prove) {
+                            if fallible {
+                                bind_failed();
+                                break;
+                            }
                             continue;
                         }
                         let Some(out) = routed(inbound, false) else {
+                            if fallible {
+                                bind_failed();
+                                break;
+                            }
                             continue;
                         };
                         match crate::masque::serve_inbound(inbound, &out, address) {
@@ -837,6 +901,23 @@ fn serve_inbounds_counted(
                     }
                     _ => eprintln!("unsupported inbound protocol `{protocol}` in {label}"),
                 }
+                if inbounds > was {
+                    armed_addresses.push(address.clone());
+                }
+                if fallible && (BIND_FAILED.with(std::cell::Cell::get) || inbounds == was) {
+                    bind_failure = true;
+                    break;
+                }
+            }
+            if bind_failure {
+                if let Some(stop) = &handler_stop {
+                    stop.stop();
+                    for address in &armed_addresses {
+                        wake_listener(stop, address);
+                    }
+                }
+                inbounds = before;
+                continue;
             }
             if !prove && inbounds > before {
                 if let Some(networks) = server_networks(inbound) {
@@ -866,6 +947,7 @@ fn serve_inbounds_counted(
             }
         }
     }
+    FALLIBLE_BIND.with(|fallible| fallible.set(false));
     inbounds
 }
 
@@ -911,6 +993,72 @@ fn serve_addresses(inbound: &Json, protocol: &str) -> Option<Vec<String>> {
     }
     let addresses = inbound_addresses(inbound);
     (!addresses.is_empty()).then_some(addresses)
+}
+
+/// The sockets an inbound opens, as `(tcp, udp)`, for the dynamic path's all-or-nothing bind.
+fn inbound_sockets(inbound: &Json, protocol: &str) -> (bool, bool) {
+    match protocol {
+        "socks" | "http" | "mixed" | "anytls" | "hc" | "blackhole" => (true, false),
+        "hysteria" | "tuic" | "wireguard" | "masque" => (false, true),
+        "dokodemo-door" => (
+            dokodemo_has(&dokodemo_networks(inbound), "tcp"),
+            dokodemo_has(&dokodemo_networks(inbound), "udp"),
+        ),
+        "shadowsocks" => {
+            let (tcp, udp) = inbound_ss_networks(inbound);
+            match inbound_carrier(inbound) {
+                Carrier::Kcp(_) | Carrier::Hysteria(_) => (false, tcp),
+                Carrier::Quic | Carrier::Xdrive { .. } => (tcp, false),
+                // A stream carrier keeps serving tcp when the optional datagram front cannot bind.
+                Carrier::Raw(_) => (tcp, udp && !tcp),
+                _ => (tcp, false),
+            }
+        }
+        "vless" | "trojan" | "vmess" => match inbound_carrier(inbound) {
+            Carrier::Kcp(_) | Carrier::Hysteria(_) | Carrier::Quic => (false, true),
+            Carrier::Xdrive { .. } => (false, false),
+            _ if inbound_is_xhttp_h3(inbound) => (false, true),
+            _ => (true, false),
+        },
+        "tun" => (false, false),
+        _ => (false, false),
+    }
+}
+
+enum Reservation {
+    Tcp(crate::conn::Listener),
+    Udp(UdpSocket),
+}
+
+/// Bind every socket a dynamic inbound would open before serving any of them, so a port already
+/// taken refuses the whole add and nothing is left behind.
+fn preflight_inbound(inbound: &Json, protocol: &str, addresses: &[String]) -> Result<(), String> {
+    let (tcp, udp) = inbound_sockets(inbound, protocol);
+    // A transparent door binds its datagram socket with options plain `UdpSocket::bind` cannot set.
+    let transparent_door = protocol == "dokodemo-door"
+        && crate::sockopt::inbound_tproxy(inbound.get("streamSettings"))
+            .ok()
+            .flatten()
+            .is_some();
+    let mut held = Vec::new();
+    for address in addresses {
+        if address.is_empty() {
+            continue;
+        }
+        if tcp {
+            let target = parse_target(address).map_err(|error| format!("{address}: {error}"))?;
+            let listener = crate::conn::Listener::bind(&target)
+                .map_err(|error| format!("cannot listen on {address}: {error}"))?;
+            held.push(Reservation::Tcp(listener));
+        }
+        if udp && !transparent_door {
+            let socket = UdpSocket::bind(address)
+                .map_err(|error| format!("cannot bind {address}: {error}"))?;
+            held.push(Reservation::Udp(socket));
+        }
+    }
+    drop(held);
+    Ok(())
 }
 
 /// A device inbound is refused with the reason the device layer computes from the config; any other unserved inbound is refused by name.
@@ -959,6 +1107,17 @@ const SERVED_INBOUNDS: [&str; 16] = [
 /// Whether this protocol is an inbound this binary serves.
 fn inbound_served(protocol: &str) -> bool {
     SERVED_INBOUNDS.contains(&protocol)
+}
+
+thread_local! {
+    /// A management add owns the dynamic listener path: a bind failure is reported to the caller
+    /// instead of ending the process.
+    static FALLIBLE_BIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BIND_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn bind_failed() {
+    BIND_FAILED.with(|failed| failed.set(true));
 }
 
 /// A listener's stop flag: removal sets it and dials the address, so a blocked accept wakes, sees
@@ -1044,18 +1203,21 @@ pub(crate) fn wake_listener(stop: &Stop, address: &str) {
     }
 }
 
-fn spawn_role(address: &str, role: Role, tag: Option<String>) {
-    spawn_role_stopped(address, role, tag, None);
-}
-
 fn spawn_role_stopped(
     address: &str,
     role: Role,
     tag: Option<String>,
     stop: Option<std::sync::Arc<Stop>>,
 ) {
-    let listener = bind_listener(address, &role)
-        .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
+    let listener = match bind_listener(address, &role) {
+        Ok(listener) => listener,
+        Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
+            bind_failed();
+            eprintln!("cannot listen on {address}: {error}");
+            return;
+        }
+        Err(error) => exit(&format!("cannot listen on {address}: {error}")),
+    };
     let address = address.to_owned();
     thread::spawn(move || accept_listener(listener, &address, &role, tag.as_deref(), stop));
 }
@@ -1094,7 +1256,7 @@ fn serve_vless_inbound(
     let sec = stream_security(inbound);
     // QUIC arrives on UDP with its own handshake, so it never reaches the TCP accept loop.
     if matches!(carrier, Carrier::Quic) {
-        return serve_vless_quic_inbound(address, inbound, &users, freedom, path);
+        return serve_vless_quic_inbound(address, inbound, &users, freedom, path, stop);
     }
     if let Carrier::Unknown { network } = &carrier {
         eprintln!("unsupported network `{network}` in {path}: refused, not served");
@@ -1136,7 +1298,9 @@ fn serve_vless_inbound(
             serve_hysteria_thread(&owned, &config, &identity, &masq, &serve)
         }
         "tls" => serve_vless_tls_inbound(address, inbound, &users, &carrier, freedom, path, stop),
-        "reality" => serve_vless_reality_inbound(address, inbound, &users, &carrier, freedom, path),
+        "reality" => {
+            serve_vless_reality_inbound(address, inbound, &users, &carrier, freedom, path, stop)
+        }
         _ if !vless_security_supported(sec) => {
             eprintln!("unsupported vless security `{sec}` in {path}: serves raw TCP only");
             false
@@ -1182,7 +1346,7 @@ fn serve_vless_inbound(
                     decryption,
                 },
             );
-            spawn_role_stopped(&owned, role, inbound_tag(inbound), None);
+            spawn_role_stopped(&owned, role, inbound_tag(inbound), stop.cloned());
             true
         }
     }
@@ -2724,7 +2888,7 @@ pub(crate) struct RouteShared {
     vmess_users: Mutex<HashMap<String, crate::vmess::UsersRef>>,
     observatory: Option<Arc<crate::observatory::Observatory>>,
     /// The script router, kept outside the routing lock: a script callback re-enters the table.
-    script_router: Option<Arc<crate::router_script::ScriptRouter>>,
+    script_router: RwLock<Option<Arc<crate::router_script::ScriptRouter>>>,
     script: Option<crate::router_script::ScriptCallbacks>,
     default: Outbound,
     default_tag: Option<String>,
@@ -2748,26 +2912,24 @@ pub(crate) struct RouteShared {
 
 impl RouteShared {
     /// Rebuild the rule table from the config after a geodata download, keeping the balancer state
-    /// a reparse cannot recreate. A script owns its own matchers and reads the files per call.
+    /// a reparse cannot recreate. The script's matchers are rebuilt from the same files.
     pub(crate) fn reload_routing(&self, root: &Json) -> Result<(), String> {
-        if self
-            .routing
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .carries_script()
-        {
-            return Ok(());
-        }
         let Some(mut next) = crate::router::Routing::parse_in(root, crate::router::asset_dirs())?
         else {
             return Ok(());
         };
+        let next_script = next.script_shared();
         let mut current = self
             .routing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         next.adopt_balancer_state(&mut current);
         *current = next;
+        drop(current);
+        *self
+            .script_router
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next_script;
         Ok(())
     }
 
@@ -2987,7 +3149,12 @@ impl RouteShared {
     /// script a live flow would get, without the default outbound the reference leaves to the caller.
     /// A matched rule's webhook fires here too, as the reference's `PickRoute` fires it.
     fn routed_tag(&self, probe: &crate::router::Probe<'_>) -> Result<Option<String>, String> {
-        if let Some(script) = self.script_router.as_deref() {
+        let script = self
+            .script_router
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(script) = script.as_deref() {
             let Some(callbacks) = self.script.as_ref() else {
                 return Ok(None);
             };
@@ -3595,7 +3762,13 @@ impl RoutePlan {
             attrs: facts.attrs,
             process: facts.process,
         };
-        if let Some(script) = self.shared.script_router.as_deref() {
+        let script = self
+            .shared
+            .script_router
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(script) = script.as_deref() {
             let Some(callbacks) = self.shared.script.as_ref() else {
                 return self.default_lane();
             };
@@ -4461,7 +4634,7 @@ fn route_shared_with_api(
         server_inbounds: Mutex::new(server_inbounds),
         vmess_users: Mutex::new(HashMap::new()),
         observatory,
-        script_router,
+        script_router: RwLock::new(script_router),
         script,
         default,
         default_tag,
@@ -10261,6 +10434,7 @@ fn serve_vless_quic_inbound(
     users: &VlessUsers,
     freedom: bool,
     path: &str,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let Some(identity) = quic_inbound_identity(inbound) else {
         eprintln!("quic inbound in {path} needs security tls with a certificate: serves nothing");
@@ -10291,12 +10465,15 @@ fn serve_vless_quic_inbound(
             decryption.as_deref(),
         );
     });
+    let stop = stop
+        .map(|stop| stop.shared())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     thread::spawn(move || {
         crate::quic::serve_loop(
             crate::quic::Datagram::plain(sock),
             &Arc::new(Mutex::new(config)),
             &serve,
-            &Arc::new(AtomicBool::new(false)),
+            &stop,
         );
     });
     true
@@ -10598,7 +10775,7 @@ fn serve_vless_tls_inbound(
             decryption,
         },
     );
-    spawn_role_stopped(&owned, role, inbound_tag(inbound), None);
+    spawn_role_stopped(&owned, role, inbound_tag(inbound), stop.cloned());
     true
 }
 
@@ -10609,6 +10786,7 @@ fn serve_vless_reality_inbound(
     carrier: &Carrier,
     freedom: bool,
     path: &str,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let Some(server) = inbound_reality_config(inbound) else {
         eprintln!("unreadable vless reality settings in {path}: serves nothing");
@@ -10661,7 +10839,7 @@ fn serve_vless_reality_inbound(
             decryption,
         },
     );
-    spawn_role_stopped(&owned, role, inbound_tag(inbound), None);
+    spawn_role_stopped(&owned, role, inbound_tag(inbound), stop.cloned());
     true
 }
 
@@ -15607,18 +15785,26 @@ fn serve_blackhole_inbound(
             inbound_tag(inbound).as_deref().unwrap_or("<untagged>")
         )),
     };
+    let target = match parse_target(address) {
+        Ok(target) => target,
+        Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
+            bind_failed();
+            eprintln!("cannot resolve {address}: {error}");
+            return false;
+        }
+        Err(error) => exit(&format!("cannot resolve {address}: {error}")),
+    };
+    let listener = match Listener::bind(&target) {
+        Ok(listener) => listener,
+        Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
+            bind_failed();
+            eprintln!("cannot listen on {address}: {error}");
+            return false;
+        }
+        Err(error) => exit(&format!("cannot listen on {address}: {error}")),
+    };
     let address = address.to_owned();
     thread::spawn(move || {
-        if stop.as_ref().is_some_and(|stop| stop.stopped()) {
-            if let Some(stop) = stop {
-                stop.mark_closed();
-            }
-            return;
-        }
-        let target = parse_target(&address)
-            .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
-        let listener = Listener::bind(&target)
-            .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
         if stop.as_ref().is_some_and(|stop| stop.stopped()) {
             drop(listener);
             if let Some(stop) = stop {
@@ -15645,7 +15831,7 @@ fn serve_blackhole_inbound(
 
 /// Leaf's healthcheck door: one exact request line and, for `POST`, one exact body answer a
 /// fixed `200` body. A mismatch closes without an answer.
-fn serve_hc_inbound(address: &str, inbound: &Json) -> bool {
+fn serve_hc_inbound(address: &str, inbound: &Json, stop: Option<Arc<Stop>>) -> bool {
     let Some(settings) = inbound.get("settings") else {
         eprintln!("inbound `hc` names no settings");
         return false;
@@ -15667,17 +15853,38 @@ fn serve_hc_inbound(address: &str, inbound: &Json) -> bool {
         }
     };
     let handler = std::sync::Arc::new(HcHandler::new(path, request, response));
+    let target = match parse_target(address) {
+        Ok(target) => target,
+        Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
+            bind_failed();
+            eprintln!("cannot resolve {address}: {error}");
+            return false;
+        }
+        Err(error) => exit(&format!("cannot resolve {address}: {error}")),
+    };
+    let listener = match Listener::bind(&target) {
+        Ok(listener) => listener,
+        Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
+            bind_failed();
+            eprintln!("cannot listen on {address}: {error}");
+            return false;
+        }
+        Err(error) => exit(&format!("cannot listen on {address}: {error}")),
+    };
     let address = address.to_owned();
     thread::spawn(move || {
-        let target = parse_target(&address)
-            .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
-        let listener = Listener::bind(&target)
-            .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
         for stream in listener.incoming() {
+            if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+                break;
+            }
             let Ok(stream) = stream else { continue };
             no_delay(&stream);
             let handler = std::sync::Arc::clone(&handler);
             thread::spawn(move || handler.serve(stream));
+        }
+        drop(listener);
+        if let Some(stop) = stop {
+            stop.mark_closed();
         }
     });
     true
@@ -15809,7 +16016,7 @@ fn serve_trojan_inbound(
         return false;
     }
     if let Some(served) =
-        serve_trojan_transport_inbound(address, inbound, Arc::clone(&key), &carrier, freedom)
+        serve_trojan_transport_inbound(address, inbound, Arc::clone(&key), &carrier, freedom, stop)
     {
         return served;
     }
@@ -15890,7 +16097,7 @@ fn serve_trojan_inbound(
                 eprintln!("{error} on {address}: inbound refused");
                 return false;
             }
-            spawn_role(
+            spawn_role_stopped(
                 address,
                 inbound_role(
                     inbound,
@@ -15904,6 +16111,7 @@ fn serve_trojan_inbound(
                     },
                 ),
                 inbound_tag(inbound),
+                stop.cloned(),
             );
             true
         }
@@ -15933,7 +16141,7 @@ fn serve_trojan_inbound(
                     );
                 }
             }
-            spawn_role(
+            spawn_role_stopped(
                 address,
                 inbound_role(
                     inbound,
@@ -15947,11 +16155,12 @@ fn serve_trojan_inbound(
                     },
                 ),
                 inbound_tag(inbound),
+                stop.cloned(),
             );
             true
         }
         carrier => {
-            spawn_role(
+            spawn_role_stopped(
                 address,
                 inbound_role(
                     inbound,
@@ -15963,6 +16172,7 @@ fn serve_trojan_inbound(
                     },
                 ),
                 inbound_tag(inbound),
+                stop.cloned(),
             );
             true
         }
@@ -15975,9 +16185,12 @@ fn serve_trojan_transport_inbound(
     key: Arc<[[u8; 56]]>,
     carrier: &Carrier,
     freedom: bool,
+    stop: Option<&Arc<Stop>>,
 ) -> Option<bool> {
     if matches!(carrier, Carrier::Quic) {
-        return Some(serve_trojan_quic_inbound(address, inbound, key, freedom));
+        return Some(serve_trojan_quic_inbound(
+            address, inbound, key, freedom, stop,
+        ));
     }
     let Carrier::Hysteria(config) = carrier else {
         return None;
@@ -16015,6 +16228,7 @@ fn serve_trojan_quic_inbound(
     inbound: &Json,
     key: Arc<[[u8; 56]]>,
     freedom: bool,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let Some(identity) = quic_inbound_identity(inbound) else {
         eprintln!("trojan quic inbound needs security tls with a certificate: serves nothing");
@@ -16032,12 +16246,15 @@ fn serve_trojan_quic_inbound(
     let serve: crate::quic::Serve = Arc::new(move |stream| {
         serve_trojan_quic(stream.with_meter(meter.clone()), &key, freedom);
     });
+    let stop = stop
+        .map(|stop| stop.shared())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     thread::spawn(move || {
         crate::quic::serve_loop(
             crate::quic::Datagram::plain(sock),
             &Arc::new(Mutex::new(config)),
             &serve,
-            &Arc::new(AtomicBool::new(false)),
+            &stop,
         );
     });
     true
@@ -16256,7 +16473,9 @@ fn serve_vmess_inbound_users(
             serve_xdrive_loop(&settings, address, accept);
             true
         }
-        Carrier::Quic => serve_vmess_quic_inbound(address, inbound, users, freedom, address),
+        Carrier::Quic => {
+            serve_vmess_quic_inbound(address, inbound, users, freedom, address, stop.as_ref())
+        }
         Carrier::Hysteria(config) => {
             serve_vmess_hysteria_inbound(address, inbound, &config, users, freedom)
         }
@@ -16414,6 +16633,7 @@ fn serve_vmess_quic_inbound(
     users: &crate::vmess::UsersRef,
     freedom: bool,
     path: &str,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let Some(identity) = quic_inbound_identity(inbound) else {
         eprintln!("quic inbound in {path} needs security tls with a certificate: serves nothing");
@@ -16432,12 +16652,15 @@ fn serve_vmess_quic_inbound(
     let serve: crate::quic::Serve = Arc::new(move |stream| {
         serve_vmess_quic(stream.with_meter(meter.clone()), &users, freedom);
     });
+    let stop = stop
+        .map(|stop| stop.shared())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     thread::spawn(move || {
         crate::quic::serve_loop(
             crate::quic::Datagram::plain(sock),
             &Arc::new(Mutex::new(config)),
             &serve,
-            &Arc::new(AtomicBool::new(false)),
+            &stop,
         );
     });
     true
@@ -16795,6 +17018,7 @@ fn serve_dokodemo(
             match try_spawn_role_stopped(address, role, inbound_tag(inbound), stop.cloned()) {
                 Ok(()) => tcp_armed = true,
                 Err(error) => {
+                    bind_failed();
                     eprintln!("dokodemo-door tcp: cannot listen on {address} in {label}: {error}");
                 }
             }
@@ -16811,6 +17035,7 @@ fn serve_dokodemo(
         let mut listen = None;
         let socket = if transparent.is_some() {
             let Ok(crate::conn::Target::Ip(bound)) = parse_target(address) else {
+                bind_failed();
                 eprintln!("dokodemo-door udp: {address} names no IP in {label}");
                 return (armed, dokodemo_has(&networks, "tcp"));
             };
@@ -16830,12 +17055,14 @@ fn serve_dokodemo(
             {
                 eprintln!("dokodemo-door udp: a transparent listener is unavailable in {label}; the rewrite target carries the flow");
                 let Ok(socket) = UdpSocket::bind(address) else {
+                    bind_failed();
                     eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
                     return (armed, dokodemo_has(&networks, "tcp"));
                 };
                 (socket, false)
             }
             Err(_) => {
+                bind_failed();
                 eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
                 return (armed, dokodemo_has(&networks, "tcp"));
             }
@@ -16843,6 +17070,7 @@ fn serve_dokodemo(
         let door = out.clone();
         if transparent_udp {
             let Some(listen) = socket.local_addr().ok().or(listen) else {
+                bind_failed();
                 eprintln!("dokodemo-door udp: cannot read the bound address in {label}");
                 return (armed, dokodemo_has(&networks, "tcp"));
             };
@@ -16854,6 +17082,7 @@ fn serve_dokodemo(
                 Some(rewrite.resolved(socket.local_addr().ok(), &port_map))
             };
             let Some(dest) = dest else {
+                bind_failed();
                 eprintln!(
                     "dokodemo-door udp: followRedirect needs a rewrite address in {label}; no UDP flow is served"
                 );
@@ -17149,18 +17378,27 @@ fn serve_ss_relay_inbound(
         UdpFront::Bound(clients) => Some(clients),
     };
     let udp_served = udp_front.is_some();
-    let tcp_address = address.to_owned();
     if tcp {
+        let Ok(target) = parse_target(address) else {
+            if FALLIBLE_BIND.with(std::cell::Cell::get) {
+                bind_failed();
+            }
+            return RelayFront::Refused;
+        };
+        let listener = match Listener::bind(&target) {
+            Ok(listener) => listener,
+            Err(error) => {
+                if FALLIBLE_BIND.with(std::cell::Cell::get) {
+                    bind_failed();
+                }
+                eprintln!("shadowsocks relay tcp on {address}: {error}");
+                return RelayFront::Refused;
+            }
+        };
         let method = method.to_owned();
         let psk = psk.clone();
         let relay_dests = relay_dests.clone();
         thread::spawn(move || {
-            let Ok(target) = parse_target(&tcp_address) else {
-                return;
-            };
-            let Ok(listener) = Listener::bind(&target) else {
-                return;
-            };
             for stream in listener.incoming().flatten() {
                 crate::shadowsocks2022::serve_relay(stream, &method, &psk, &relay_dests);
             }
@@ -17329,7 +17567,7 @@ fn serve_ss_tls_front(
             ));
         }
     }
-    spawn_role(
+    spawn_role_stopped(
         address,
         inbound_role(
             inbound,
@@ -17341,6 +17579,7 @@ fn serve_ss_tls_front(
             },
         ),
         inbound_tag(inbound),
+        stop.cloned(),
     );
     None
 }
@@ -17419,7 +17658,7 @@ fn serve_shadowsocks_inbound(
                 eprintln!("shadowsocks security `{security}` on {address}: refused, not served");
             }
             other => {
-                spawn_role(
+                spawn_role_stopped(
                     address,
                     inbound_role(
                         inbound,
@@ -17431,6 +17670,7 @@ fn serve_shadowsocks_inbound(
                         },
                     ),
                     inbound_tag(inbound),
+                    stop.cloned(),
                 );
                 served = true;
             }
@@ -29526,7 +29766,7 @@ fn serve_udp_lane_with(
         Outbound::Hysteria(hy) => {
             let dial = hy.dial();
             if dial.config.version == 1 {
-                crate::hysteria_v1::serve_udp(relay, &dial);
+                crate::hysteria_v1::serve_udp(relay, &dial, control_peer(associate));
             } else {
                 crate::hysteria::serve_udp(relay, &dial);
             }
@@ -74412,7 +74652,7 @@ mod tests {
             },
             roots: Some(roots.into()),
         };
-        thread::spawn(move || crate::hysteria_v1::serve_udp(&relay, &dial));
+        thread::spawn(move || crate::hysteria_v1::serve_udp(&relay, &dial, None));
         let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
         client
             .set_read_timeout(Some(QUIC_TEST_TIMEOUT))

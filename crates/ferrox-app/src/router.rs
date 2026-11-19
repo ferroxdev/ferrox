@@ -1208,12 +1208,6 @@ impl Routing {
         }))
     }
 
-    /// Whether a script owns the decisions, so a geodata reload must leave the parsed table alone:
-    /// the script's own `xray.geodata` matchers read the files on every call.
-    pub(crate) fn carries_script(&self) -> bool {
-        self.script.is_some()
-    }
-
     /// Move the runtime state a reparse cannot rebuild — a balancer's forced tag, weights and
     /// rotation — onto the freshly parsed table, matched by tag.
     pub(crate) fn adopt_balancer_state(&mut self, old: &mut Self) {
