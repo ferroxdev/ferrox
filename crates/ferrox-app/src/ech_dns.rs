@@ -311,13 +311,7 @@ fn parse_answer(packet: &[u8], id: Option<u16>, name: &str) -> Result<Answer, St
         records.push((owner, kind, ttl, at, end));
         at = end;
     }
-    let mut redirected = HashSet::new();
-    for (owner, kind, _, start, _) in &records {
-        let mut at = *start;
-        if *kind == DNS_HTTPS && matches!(take_u16(packet, &mut at), Ok(0)) {
-            redirected.insert(owner.to_ascii_lowercase());
-        }
-    }
+    let redirected = redirected_owners(packet, &records);
     let mut names = vec![name.to_ascii_lowercase()];
     let mut alias_ttl = u32::MAX;
     loop {
@@ -373,6 +367,20 @@ fn parse_answer(packet: &[u8], id: Option<u16>, name: &str) -> Result<Answer, St
         return Ok(Answer::Alias(alias, alias_ttl));
     }
     Err(format!("ech: no ECH config in the HTTPS record for {name}"))
+}
+
+fn redirected_owners(
+    packet: &[u8],
+    records: &[(String, u16, u32, usize, usize)],
+) -> HashSet<String> {
+    let mut owners = HashSet::new();
+    for (owner, kind, _, start, _) in records {
+        let mut at = *start;
+        if *kind == DNS_HTTPS && matches!(take_u16(packet, &mut at), Ok(0)) {
+            owners.insert(owner.to_ascii_lowercase());
+        }
+    }
+    owners
 }
 
 fn svcb_ech(packet: &[u8], start: usize, end: usize) -> Result<Option<Vec<u8>>, String> {
@@ -550,7 +558,7 @@ mod tests {
         record(&mut packet, 0, "alias.test", None);
         record(&mut packet, 1, "", Some(&[1, 2, 3, 4]));
         assert!(matches!(
-            parse_response(&packet, Some(0), "example.com"),
+            parse_answer(&packet, Some(0), "example.com"),
             Ok(Answer::Alias(alias, _)) if alias == "alias.test"
         ));
     }
