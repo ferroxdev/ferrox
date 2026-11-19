@@ -80,6 +80,7 @@ PROXY_LOCK_DEPTH=0
 PROXY_LOCK_PID=""
 PROXY_LOCK_READY=""
 PROXY_LOCK_RELEASE=""
+PROXY_LOCK_ACQUIRING=0
 CREDS="${FOXY_CREDENTIALS:-$CONF_DIR/credentials}"
 CFG="$CONF_DIR/lane.json"
 # The signed-in session FxA handed back, so a launch after the first signs in
@@ -1890,9 +1891,20 @@ proxy_restore_snapshot() {
 }
 
 proxy_lock() {
-  local dir ready release
+  local dir ready release old_int old_term old_hup
   if [ "${PROXY_LOCK_DEPTH:-0}" -gt 0 ]; then
     PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH + 1))
+    if [ "${PROXY_LOCK_ACQUIRING:-0}" = 1 ]; then
+      for _ in $(seq 1 300); do
+        [ -s "$PROXY_LOCK_READY" ] && break
+        kill -0 "$PROXY_LOCK_PID" 2>/dev/null || break
+        sleep 0.1
+      done
+      if [ ! -s "$PROXY_LOCK_READY" ]; then
+        PROXY_LOCK_DEPTH=$((PROXY_LOCK_DEPTH - 1))
+        return 1
+      fi
+    fi
     return 0
   fi
   command -v python3 >/dev/null 2>&1 ||
@@ -1903,6 +1915,12 @@ proxy_lock() {
   ready="$dir/ready.$$"
   release="$dir/release.$$"
   rm -f "$ready" "$release"
+  old_int="$(trap -p INT)"; old_term="$(trap -p TERM)"; old_hup="$(trap -p HUP)"
+  trap '' INT TERM HUP
+  PROXY_LOCK_DEPTH=1
+  PROXY_LOCK_ACQUIRING=1
+  PROXY_LOCK_READY="$ready"
+  PROXY_LOCK_RELEASE="$release"
   python3 -c '
 import os, signal, sys, time
 try:
@@ -1940,7 +1958,7 @@ for name in ("SIGTERM", "SIGINT", "SIGHUP"):
     sig = getattr(signal, name, None)
     if sig is not None:
         signal.signal(sig, signal.SIG_IGN)
-parent = os.getppid()
+parent = int(sys.argv[4])
 acquire(lock)
 if not parent_alive(parent):
     sys.exit(0)
@@ -1948,8 +1966,11 @@ with open(sys.argv[2], "w") as ready:
     ready.write("locked\n")
 while parent_alive(parent) and not os.path.exists(sys.argv[3]):
     time.sleep(0.1)
-' "$dir/lock" "$ready" "$release" &
+ ' "$dir/lock" "$ready" "$release" "$$" &
   PROXY_LOCK_PID=$!
+  if [ -n "$old_int" ]; then eval "$old_int"; else trap - INT; fi
+  if [ -n "$old_term" ]; then eval "$old_term"; else trap - TERM; fi
+  if [ -n "$old_hup" ]; then eval "$old_hup"; else trap - HUP; fi
   for _ in $(seq 1 300); do
     [ -s "$ready" ] && break
     kill -0 "$PROXY_LOCK_PID" 2>/dev/null || break
@@ -1961,12 +1982,12 @@ while parent_alive(parent) and not os.path.exists(sys.argv[3]):
     wait "$PROXY_LOCK_PID" 2>/dev/null || true
     rm -f "$ready" "$release"
     PROXY_LOCK_PID=""
+    PROXY_LOCK_DEPTH=0
+    PROXY_LOCK_ACQUIRING=0
     say "system proxy: the lock owner did not start." >&2
     return 1
   fi
-  PROXY_LOCK_READY="$ready"
-  PROXY_LOCK_RELEASE="$release"
-  PROXY_LOCK_DEPTH=1
+  PROXY_LOCK_ACQUIRING=0
   return 0
 }
 
@@ -2730,6 +2751,7 @@ forget_lane_config() {
 # The registry makes a lane armed under a moved FERROX_CONF_DIR visible here.
 stop_all_lanes() {
   local saved_conf="$CONF_DIR" saved_instance="$INSTANCE" dir pidfile base rc=0
+  local -a forget=()
   proxy_lock || return 1
   if [ -r "$LANES_FILE" ]; then
     while IFS= read -r dir; do
@@ -2743,7 +2765,8 @@ stop_all_lanes() {
         INSTANCE="${base#-}"
         apply_instance
         stop_lane 0 || rc=1
-        forget_lane_config
+        case "$CFG" in "$CONF_DIR"/lane*.json) forget+=("$CFG") ;; esac
+        forget+=("$META_FILE")
       done
       for pidfile in "$CONF_DIR"/warp-hop*.pid; do
         [ -f "$pidfile" ] || continue
@@ -2763,7 +2786,8 @@ stop_all_lanes() {
     INSTANCE="${base#-}"
     apply_instance
     stop_lane 0 || rc=1
-    forget_lane_config
+    case "$CFG" in "$CONF_DIR"/lane*.json) forget+=("$CFG") ;; esac
+    forget+=("$META_FILE")
   done
   for pidfile in "$CONF_DIR"/warp-hop*.pid; do
     [ -f "$pidfile" ] || continue
@@ -2775,6 +2799,9 @@ stop_all_lanes() {
   INSTANCE=""
   apply_instance
   system_proxy_off 1 || rc=1
+  if [ "$rc" -eq 0 ] && [ "${#forget[@]}" -gt 0 ]; then
+    rm -f "${forget[@]}"
+  fi
   proxy_unlock
   CONF_DIR="$saved_conf"
   INSTANCE="$saved_instance"
@@ -2988,7 +3015,10 @@ action_up() {
   choose_carrier
   for _ in 1 2; do
     trap 'interrupt_before_lane; exit 130' INT TERM
-    start_lane || exit 1
+    if ! start_lane; then
+      [ "$WARP_STARTED" = 1 ] && stop_warp_hop
+      exit 1
+    fi
     # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
     trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
     if [ -n "$FRONTS" ] && ! wait_fronts; then
@@ -3036,7 +3066,10 @@ action_serve() {
   choose_carrier
   for _ in 1 2; do
     trap 'interrupt_before_lane; exit 130' INT TERM
-    start_lane || exit 1
+    if ! start_lane; then
+      [ "$WARP_STARTED" = 1 ] && stop_warp_hop
+      exit 1
+    fi
     # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.
     trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
     if [ -n "$FRONTS" ] && ! wait_fronts; then
