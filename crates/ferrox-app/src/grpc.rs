@@ -21,6 +21,16 @@ const POST_END_BURST: usize = 16;
 /// The bodies one credit pays for, half the window the preface advertises: a peer that has sent this much is owed a credit, and one that has not still has the other half to send into, so no grant is ever the thing a stalled writer waits for.
 const CREDIT_AT: u32 = WINDOW / 2;
 
+/// The credit threshold for the window this lane advertises: half of it, but at least one byte, because a zero-sized window would never owe a grant.
+fn credit_at(initial_window_size: u32) -> u32 {
+    let window = if initial_window_size == 0 {
+        WINDOW
+    } else {
+        initial_window_size.min(WINDOW)
+    };
+    (window / 2).max(1)
+}
+
 /// The two `WINDOW_UPDATE` frames a credit grants differ only by stream id, so their eighteen header bytes are constant and each call fills the two increment slots left zero here: the pair leaves in one write.
 const CREDIT_PAIR: [u8; 26] = {
     let mut out = [0u8; 26];
@@ -292,6 +302,8 @@ pub(crate) struct GrpcReader<R: Read = Connection> {
     /// Bodies read since the last credit, and the stream they belong to: a credit pays for a window's worth of frames, not for one.
     owed: u32,
     owed_id: u32,
+    /// Half the receive window this lane advertised, floored above zero so a tiny window can still make progress.
+    credit_at: u32,
     /// The clock this head must be decoded by, armed only while the preface, the request headers and the opening request arrive: past it a silence is an error rather than a wait, so a peer that stops speaking releases the thread.
     handshake: Option<std::time::Instant>,
     eof: bool,
@@ -428,7 +440,7 @@ impl<R: Read> GrpcReader<R> {
         }
         self.owed_id = id;
         self.owed += len as u32;
-        if self.owed >= CREDIT_AT {
+        if self.owed >= self.credit_at {
             self.grant();
         }
     }
@@ -1066,8 +1078,8 @@ impl<R: Read> GrpcReader<R> {
     }
 
     fn end(&mut self) -> std::io::Result<Option<(usize, usize)>> {
-        // The status may ride the `HEADERS` trailer after a `DATA` that carried `END_STREAM`; pump first so a later trailer is judged, not read as a clean end.
-        if self.remote_end && self.poll {
+        // A status already recorded is the answer, even while a poll would otherwise wait for the next control frame.
+        if !self.grpc_status_bad && self.grpc_status.is_none() && self.remote_end && self.poll {
             self.pump_after_end()?;
         }
         if self.grpc_status_bad {
@@ -1272,7 +1284,12 @@ impl GrpcWriter {
     pub(crate) fn send(&self, data: &[u8]) -> bool {
         let max = self.max_frame();
         // Four frames of the 16 KiB the peer advertises are one byte over the default 65_535-byte stream window, so the fourth waits for a credit; a body one byte under the frame fits all four.
-        let payload = message_payload(max.saturating_sub(1)).max(1);
+        let cap = if self.shared.muxed {
+            usize::try_from(self.hunk_cap()).unwrap_or(usize::MAX)
+        } else {
+            usize::MAX
+        };
+        let payload = message_payload(max.saturating_sub(1).min(cap)).max(1);
         if self.multi {
             return self.send_multi(data, payload);
         }
@@ -2411,7 +2428,15 @@ fn mux_stream(
     let window = conn.peer_window();
     let read = mux_shared(Box::new(NullSink), max, window);
     let write = mux_shared(Box::new(MuxSink { out }), max, window);
-    let mut reader = new_reader(BodyFrames::new(body, sid), read, true, "", "", sid);
+    let mut reader = new_reader(
+        BodyFrames::new(body, sid),
+        read,
+        true,
+        "",
+        "",
+        sid,
+        CREDIT_AT,
+    );
     reader.answered = true;
     reader.stream = sid;
     reader.method = method;
@@ -3111,6 +3136,7 @@ fn new_reader<R: Read>(
     path: &str,
     multi_path: &str,
     stream: u32,
+    credit_at: u32,
 ) -> GrpcReader<R> {
     GrpcReader {
         read,
@@ -3139,6 +3165,7 @@ fn new_reader<R: Read>(
         pending: None,
         owed: 0,
         owed_id: 0,
+        credit_at,
         handshake: None,
         eof: false,
         remote_end: false,
@@ -3196,6 +3223,7 @@ pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
         &settings.path,
         &settings.multi_path,
         0,
+        credit_at(settings.initial_window_size),
     );
     // The clock the preface was read under covers the request headers too, and ends where the head ends: past it the pump is a give-up rather than a wait, and a reader handed to a caller is unarmed again.
     reader.set_handshake_budget(Some(until));
@@ -3300,6 +3328,7 @@ pub(crate) fn connect_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>
         &settings.path,
         &settings.multi_path,
         1,
+        credit_at(settings.initial_window_size),
     );
     if settings.multi_mode {
         reader.method = Method::MultiHunk;

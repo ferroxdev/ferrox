@@ -1079,6 +1079,10 @@ fn stage_foreign(
             if spent > u64::from(CARRY_MAX) {
                 overflow = true;
             } else {
+                if entry.at > 0 {
+                    entry.carry.drain(..entry.at);
+                    entry.at = 0;
+                }
                 entry.carry.extend_from_slice(payload);
                 entry.staged = entry.staged.saturating_add(bytes);
             }
@@ -1139,7 +1143,12 @@ fn apply_settings(inner: &mut SessionInner, payload: &[u8]) {
 
 /// One UDP payload out as one DATAGRAM capsule, split over DATA frames when needed: the capsule stream is byte-oriented and the reader reassembles. The frame header and the capsule header ride a fixed buffer and the payload keeps the caller's bytes, so the whole datagram is never staged before the record takes it.
 fn write_capsule(inner: &mut SessionInner, stream: u32, payload: &[u8]) -> std::io::Result<()> {
-    if inner.gone || inner.streams.get(&stream).is_none_or(|s| s.fin) {
+    if inner.gone
+        || inner
+            .streams
+            .get(&stream)
+            .is_none_or(|s| s.sent_end || s.reset.is_some())
+    {
         return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
     }
     let mut prefix = [0u8; 10];
@@ -1795,7 +1804,12 @@ impl Tls2 {
         };
         let peer_initial = inner.peer_initial;
         let stream = self.stream;
-        if inner.gone || inner.streams.get(&stream).is_none_or(|s| s.fin) {
+        if inner.gone
+            || inner
+                .streams
+                .get(&stream)
+                .is_none_or(|s| s.sent_end || s.reset.is_some())
+        {
             return (
                 false,
                 Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
@@ -2224,12 +2238,12 @@ fn open_h2_with_raw(
 impl Write for Tls2 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut inner = self.inner().map_err(io)?;
-        let fin = inner.gone
+        let closed = inner.gone
             || inner
                 .streams
                 .get(&self.stream)
-                .is_none_or(|stream| stream.fin);
-        if fin {
+                .is_none_or(|stream| stream.sent_end || stream.reset.is_some());
+        if closed {
             return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         }
         let max = inner.max_frame;
@@ -2307,8 +2321,8 @@ impl Read for Tls2 {
                                 }
                                 let got = inner.frame.delivered as usize;
                                 if got > 0 {
-                                    // The frame's own length: the whole DATA payload is what the window counts.
-                                    credit(inner, stream, frame.length as usize).map_err(io)?;
+                                    // The bytes this call handed over, not the frame's whole length: a frame cut across reads credits each part as it lands.
+                                    credit(inner, stream, got).map_err(io)?;
                                 }
                                 return Ok(got);
                             }
@@ -2499,6 +2513,10 @@ impl H3 {
         quic: Quic,
         head_wait: Duration,
     ) -> Result<Self, Failure> {
+        // QUIC has no pin check yet, so a pinned dial never sends its account pass over it.
+        if !dial.pins.is_empty() {
+            return Err(Failure::Stream);
+        }
         let mut lane = Self {
             quic,
             head: vec![0u8; H3_PEEK],
@@ -3118,11 +3136,19 @@ impl H3 {
         loop {
             let (took_head, took_body) = self
                 .with_conn(|conn| {
-                    let n = conn.stream_send(stream, head, false).ok()?;
+                    let n = match conn.stream_send(stream, head, false) {
+                        Ok(n) => n,
+                        Err(quiche::Error::Done) => 0,
+                        Err(_) => return None,
+                    };
                     if n < head.len() || payload.is_empty() {
                         return Some((n, 0));
                     }
-                    let m = conn.stream_send(stream, payload, false).ok()?;
+                    let m = match conn.stream_send(stream, payload, false) {
+                        Ok(m) => m,
+                        Err(quiche::Error::Done) => 0,
+                        Err(_) => return None,
+                    };
                     Some((n, m))
                 })
                 .ok_or(Failure::Io)?
@@ -3869,11 +3895,41 @@ impl Tls2 {
             let frame = foxy::flow::frame_size(request.len() - at, max)
                 .min(stream_spend(&inner, self.stream));
             if frame == 0 {
-                drop(inner);
-                if Instant::now() >= send_by {
+                let left = send_by.saturating_duration_since(Instant::now());
+                if left.is_zero() {
                     return Err(Failure::Stream);
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                // A zero initial window is a valid setting, so the grant that opens this lane can only arrive as a frame: read and apply it here, because no other reader exists on this dedicated tunnel yet.
+                let _ = inner.tls.get_ref().set_read_timeout(Some(left));
+                let read = Self::with_frame_locked(
+                    &mut inner,
+                    self.stream,
+                    &mut [],
+                    |inner, frame, payload, _| {
+                        if let frames::H2Routed::Data {
+                            stream,
+                            payload,
+                            end,
+                            wire,
+                        } = frames::h2_routed(frame, payload)
+                        {
+                            stage_foreign(inner, PoolClass::Ip, stream, payload, end, wire)?;
+                        }
+                        Ok::<(), Failure>(())
+                    },
+                );
+                match read {
+                    Ok(Ok(())) => {}
+                    Ok(Err(failure)) => return Err(failure),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => return Err(Failure::Io),
+                }
                 continue;
             }
             charge_stream(&mut inner, self.stream, frame);
@@ -4198,31 +4254,20 @@ fn end_lane(lane: &mut Tls2) {
     }
 }
 
+impl Drop for Tls2 {
+    /// Ends the stream wherever its lane is dropped: a CONNECT-IP lane owns this handle directly, and a session that outlives it would otherwise keep fetching into a window nobody drains, charged to the account.
+    fn drop(&mut self) {
+        end_lane(self);
+    }
+}
+
 impl Drop for Tunnel {
-    /// Ends a lane no settle handed back — a client gone before its grant, a failed write — because an h2 stream left open keeps the edge fetching into a window nobody drains, charged to the account, and an h3 stream half-open is still being filled.
+    /// Ends a lane no settle handed back — a client gone before its grant, a failed write — because an h3 stream half-open is still being filled; an h2 stream is ended by its own `Tls2`.
     fn drop(&mut self) {
-        match self {
-            Self::H2(lane) => end_lane(lane),
-            Self::H3(lane) if !lane.closed && !lane.fin => lane.quic.cancel(),
-            Self::H3(_) | Self::H1(_) => {}
-        }
-    }
-}
-
-impl Drop for Ip {
-    /// A CONNECT-IP tunnel that ends returns its stream to the pooled session, or resets it when it did not end cleanly: an h2 stream left open keeps the edge fetching into a window nobody drains.
-    fn drop(&mut self) {
-        if let Self::H2(lane) = self {
-            end_lane(lane);
-        }
-    }
-}
-
-impl Drop for Datagram {
-    /// A UDP flow that ends returns its stream to the pooled session, or resets it when it did not end cleanly: dropping only the handle used to close an exclusive session, and now it would leave the stream and its window on a session another flow rides.
-    fn drop(&mut self) {
-        if let Self::H2(lane) = self {
-            end_lane(lane);
+        if let Self::H3(lane) = self {
+            if !lane.closed && !lane.fin {
+                lane.quic.cancel();
+            }
         }
     }
 }

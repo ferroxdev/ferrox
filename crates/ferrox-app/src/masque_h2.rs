@@ -1357,6 +1357,7 @@ impl Session {
             h2::T_DATA => {
                 if id == 0 {
                     let mut goaway = [0u8; 8];
+                    goaway[..4].copy_from_slice(&self.request.unwrap_or(0).to_be_bytes());
                     goaway[4..].copy_from_slice(&1u32.to_be_bytes());
                     wire.send(h2::T_GOAWAY, 0, 0, &goaway);
                     self.end = true;

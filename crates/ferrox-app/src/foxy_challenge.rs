@@ -260,11 +260,14 @@ fn solve_reply(
             let origin = origin_of(&page)
                 .filter(|origin| trusted_origin(origin, &endpoint.host))
                 .unwrap_or_else(|| format!("https://{}", endpoint.host));
-            if let Some(challenged) = Endpoint::parse(&origin, endpoint.roots.clone()) {
-                match solve_page(&challenged, jar, &page, solver_page(agent)) {
-                    Ok(()) => return Ok(()),
-                    Err(other) => last = other,
-                }
+            let host = origin.strip_prefix("https://").unwrap_or(&origin);
+            let challenged = Endpoint {
+                base: String::new(),
+                ..endpoint.with_host(host)
+            };
+            match solve_page(&challenged, jar, &page, solver_page(agent)) {
+                Ok(()) => return Ok(()),
+                Err(other) => last = other,
             }
         }
     }

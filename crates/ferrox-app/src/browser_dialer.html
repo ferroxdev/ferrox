@@ -13,16 +13,16 @@ const RECONNECT_MIN = 100;
 const RECONNECT_MAX = 5000;
 let reconnect = RECONNECT_MIN;
 let live = 0;
+let idle = 0;
 
 function initFor(task) {
   const init = {};
   const extra = task.extra || {};
+  if (extra.cookies && Object.keys(extra.cookies).length) {
+    throw new Error("cookies cannot cross the browser dialer");
+  }
   if (extra.referrer) {
-    try {
-      const url = new URL(extra.referrer);
-      init.referrer = url.pathname + url.search + url.hash;
-      init.referrerPolicy = "unsafe-url";
-    } catch (_) {}
+    throw new Error("an external referrer cannot cross the browser dialer");
   }
   if (extra.headers) init.headers = extra.headers;
   return init;
@@ -163,7 +163,8 @@ function closed(ws) {
   if (ws.closed) return;
   ws.closed = true;
   live -= 1;
-  if (!ws.replaced) respawn();
+  if (ws.opened && !ws.consumed) idle -= 1;
+  if (idle < IDLE && live < LIVE_MAX) respawn();
 }
 
 function respawn() {
@@ -183,12 +184,18 @@ function connect() {
   }
   live += 1;
   ws.closed = false;
+  ws.opened = false;
   ws.consumed = false;
   ws.replaced = false;
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { reconnect = RECONNECT_MIN; };
+  ws.onopen = () => {
+    ws.opened = true;
+    if (!ws.consumed) idle += 1;
+    reconnect = RECONNECT_MIN;
+  };
   ws.onmessage = (event) => {
     if (ws.consumed) return;
+    if (ws.opened) idle -= 1;
     ws.consumed = true;
     ws.replaced = connect();
     let task;

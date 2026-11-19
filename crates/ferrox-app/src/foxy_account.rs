@@ -1184,6 +1184,13 @@ impl H2Connection {
                         0
                     };
                     let end = frame.len().saturating_sub(padding);
+                    let add = end.saturating_sub(at);
+                    if reply.body.len().saturating_add(add) > MAX_BODY {
+                        return Err(format!(
+                            "reading {} {path}: body above {MAX_BODY} bytes",
+                            endpoint.host
+                        ));
+                    }
                     reply
                         .body
                         .extend_from_slice(frame.get(at..end).unwrap_or_default());

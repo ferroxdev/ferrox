@@ -3696,6 +3696,8 @@ struct Tunnel {
     udp_target: Option<(String, u16)>,
     udp_frame: Vec<u8>,
     udp_at: usize,
+    flow: Vec<u8>,
+    flow_at: usize,
 }
 
 fn sweep_due_timer(conn: &mut quiche::Connection) {
@@ -3739,6 +3741,8 @@ fn worker(
         udp_target: None,
         udp_frame: Vec::new(),
         udp_at: 0,
+        flow: Vec::new(),
+        flow_at: 0,
     };
     loop {
         if conn.is_closed() {
@@ -3767,6 +3771,9 @@ fn worker(
             }
             service(&mut conn, &shared, &spec, &mut tunnel);
             drain_udp(&mut conn, &mut tunnel);
+            if let Some(stream) = tunnel.stream {
+                flush_flow(&mut conn, &mut tunnel, stream);
+            }
         }
         'packets: while let Some(packet) = tunnel
             .unsent
@@ -4172,15 +4179,10 @@ fn accept(
     }
     let mut control = Vec::new();
     connectip::address_assign_encode(&assignments, &mut control);
-    if send_data(conn, stream, &control).is_err() {
-        cancel(conn, tunnel);
-        return;
-    }
+    queue_data(conn, tunnel, stream, &control);
     control.clear();
     connectip::route_advert_encode(&routes(&tunnel.addrs), &mut control);
-    if send_data(conn, stream, &control).is_err() {
-        cancel(conn, tunnel);
-    }
+    queue_data(conn, tunnel, stream, &control);
 }
 
 /// One address per family from the pool, or `None` when it has none left.
@@ -4297,9 +4299,7 @@ fn parse_capsules(conn: &mut quiche::Connection, tunnel: &mut Tunnel, mtu: usize
     };
     if let Some(stream) = tunnel.stream {
         for body in answers {
-            if send_data(conn, stream, &body).is_err() {
-                return false;
-            }
+            queue_data(conn, tunnel, stream, &body);
         }
     }
     true
@@ -4398,6 +4398,25 @@ fn stream_frame(conn: &mut quiche::Connection, stream: u64, frame: &[u8], at: &m
         }
     }
     true
+}
+
+/// Queues one DATA frame behind a send the stream has not taken whole, so a full send buffer never splits a control frame.
+fn queue_data(conn: &mut quiche::Connection, tunnel: &mut Tunnel, stream: u64, bytes: &[u8]) {
+    let mut head = [0u8; 9];
+    let length = frames::h3_data_header(&mut head, bytes.len() as u64);
+    tunnel.flow.extend_from_slice(&head[..length]);
+    tunnel.flow.extend_from_slice(bytes);
+    flush_flow(conn, tunnel, stream);
+}
+
+fn flush_flow(conn: &mut quiche::Connection, tunnel: &mut Tunnel, stream: u64) {
+    if tunnel.flow_at < tunnel.flow.len()
+        && !stream_frame(conn, stream, &tunnel.flow, &mut tunnel.flow_at)
+    {
+        return;
+    }
+    tunnel.flow.clear();
+    tunnel.flow_at = 0;
 }
 
 fn read_datagrams(
@@ -6583,6 +6602,8 @@ mod tests {
             udp_target: None,
             udp_frame: Vec::new(),
             udp_at: 0,
+            flow: Vec::new(),
+            flow_at: 0,
         }
     }
 
