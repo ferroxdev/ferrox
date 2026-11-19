@@ -71,6 +71,8 @@ struct Shared {
     stream: Mutex<Box<dyn crate::proxy::FrameWrite + Send>>,
     send: Mutex<SendWindow>,
     wake: Condvar,
+    keepalive_gate: Mutex<()>,
+    keepalive_wake: Condvar,
     max_frame: Mutex<usize>,
     init: Mutex<u64>,
     ended: AtomicBool,
@@ -362,6 +364,7 @@ impl<R: Read> GrpcReader<R> {
             .is_ok_and(|mut stream| write_frame(&mut **stream, kind, flags, id, body));
         if !sent {
             self.shared.dead.store(true, Ordering::SeqCst);
+            wake_keepalive(&self.shared);
         }
         sent
     }
@@ -454,6 +457,7 @@ impl<R: Read> GrpcReader<R> {
         };
         if !stream.write_slices(&[out]) {
             self.shared.dead.store(true, Ordering::SeqCst);
+            wake_keepalive(&self.shared);
         }
     }
 
@@ -1665,6 +1669,7 @@ impl GrpcWriter {
         if self.trailers {
             self.shared.ended.store(true, Ordering::SeqCst);
             self.shared.wake.notify_all();
+            wake_keepalive(&self.shared);
             if !self.send_trailer() {
                 self.shared.ended.store(false, Ordering::SeqCst);
                 return;
@@ -1703,6 +1708,7 @@ impl GrpcWriter {
             .unwrap_or_else(PoisonError::into_inner);
         let ended = self.shared.ended.swap(true, Ordering::SeqCst);
         self.shared.wake.notify_all();
+        wake_keepalive(&self.shared);
         if ended {
             return;
         }
@@ -2391,6 +2397,8 @@ fn mux_shared(write: Box<dyn FrameWrite + Send>, max: usize, window: u64) -> Arc
             unlimited: true,
         }),
         wake: Condvar::new(),
+        keepalive_gate: Mutex::new(()),
+        keepalive_wake: Condvar::new(),
         max_frame: Mutex::new(max),
         init: Mutex::new(window),
         ended: AtomicBool::new(false),
@@ -3099,6 +3107,8 @@ fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
             unlimited: false,
         }),
         wake: Condvar::new(),
+        keepalive_gate: Mutex::new(()),
+        keepalive_wake: Condvar::new(),
         max_frame: Mutex::new(16_384),
         init: Mutex::new(65_535),
         ended: AtomicBool::new(false),
@@ -3409,7 +3419,7 @@ fn start_keepalive(shared: Arc<Shared>, settings: &GrpcSettings) {
 fn keepalive_wait(shared: &Shared, duration: Duration) -> bool {
     let deadline = Instant::now() + duration;
     let mut gate = shared
-        .upload_gate
+        .keepalive_gate
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
@@ -3421,11 +3431,19 @@ fn keepalive_wait(shared: &Shared, duration: Duration) -> bool {
             return true;
         }
         let (next, _) = shared
-            .wake
+            .keepalive_wake
             .wait_timeout(gate, left)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         gate = next;
     }
+}
+
+fn wake_keepalive(shared: &Shared) {
+    let _gate = shared
+        .keepalive_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    shared.keepalive_wake.notify_all();
 }
 
 /// Records the failed health check, wakes the lanes, and closes the socket a blocked read sits on.
@@ -3435,6 +3453,7 @@ fn keepalive_stop(shared: &Shared) {
         stream.shutdown_both();
     }
     shared.wake.notify_all();
+    wake_keepalive(shared);
 }
 
 impl crate::proxy::CarrierSink for GrpcWriter {
@@ -3488,6 +3507,7 @@ pub(crate) fn mark_reader_dead<R: Read>(reader: &mut GrpcReader<R>) {
     }
     reader.shared.dead.store(true, Ordering::SeqCst);
     reader.shared.wake.notify_all();
+    wake_keepalive(&reader.shared);
 }
 
 pub(crate) fn request_ended<R: Read>(reader: &GrpcReader<R>) -> bool {
@@ -5895,6 +5915,8 @@ mod tests {
                             unlimited: false,
                         }),
                         wake: Condvar::new(),
+                        keepalive_gate: Mutex::new(()),
+                        keepalive_wake: Condvar::new(),
                         max_frame: Mutex::new(max),
                         init: Mutex::new(u64::from(WINDOW)),
                         ended: AtomicBool::new(false),
