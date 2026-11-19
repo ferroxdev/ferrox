@@ -804,15 +804,15 @@ unix unix-mode-staging-litter 0 ferrox-app-conn::tests::a_unix_mode_staging_leav
 front-tun-smoltcp ops-retired-instructions 32598 scripts/count-ops.sh
 front-tun-smoltcp syscalls-per-tun-packet UNBLESSED no syscall checker yet
 front-tun-smoltcp user-space-copies-per-tun-packet UNBLESSED no copy checker yet
-front-tun-smoltcp time-tcp-down-1 ferrox=13.392Gbit/s,hev=16.669Gbit/s,ratio=0.80 tun-bench.yml
-front-tun-smoltcp time-tcp-down-10 ferrox=19.778Gbit/s,hev=44.010Gbit/s,ratio=0.45 tun-bench.yml
-front-tun-smoltcp time-tcp-up-1 ferrox=17.395Gbit/s,hev=22.832Gbit/s,ratio=0.76 tun-bench.yml
-front-tun-smoltcp time-tcp-up-10 ferrox=20.417Gbit/s,hev=38.620Gbit/s,ratio=0.53 tun-bench.yml
-front-tun-smoltcp time-rr ferrox=8544tps,hev=16513tps,ratio=0.52 tun-bench.yml
-front-tun-smoltcp time-rr-8x1k ferrox=58519tps,hev=91060tps,ratio=0.64 tun-bench.yml
-front-tun-smoltcp time-udp-100k ferrox=99240pps,hev=99301pps,ratio=1.00 tun-bench.yml
-front-tun-smoltcp cpu-cores-at-tcp-down-10 ferrox=2.96cores,hev=2.09cores tun-bench.yml
-front-tun-smoltcp rss-mb-at-ten-flows ferrox=74.0MB,hev=2.5MB tun-bench.yml
+front-tun-smoltcp time-tcp-down-1 ferrox=13.767Gbit/s,hev=16.039Gbit/s,ratio=0.86 tun-bench.yml
+front-tun-smoltcp time-tcp-down-10 ferrox=20.363Gbit/s,hev=43.298Gbit/s,ratio=0.47 tun-bench.yml
+front-tun-smoltcp time-tcp-up-1 ferrox=17.848Gbit/s,hev=23.474Gbit/s,ratio=0.76 tun-bench.yml
+front-tun-smoltcp time-tcp-up-10 ferrox=21.132Gbit/s,hev=40.103Gbit/s,ratio=0.53 tun-bench.yml
+front-tun-smoltcp time-rr ferrox=8591tps,hev=17785tps,ratio=0.48 tun-bench.yml
+front-tun-smoltcp time-rr-8x1k ferrox=61292tps,hev=93763tps,ratio=0.65 tun-bench.yml
+front-tun-smoltcp time-udp-100k ferrox=99268pps,hev=99301pps,ratio=1.00 tun-bench.yml
+front-tun-smoltcp cpu-cores-at-tcp-down-10 ferrox=2.98cores,hev=2.06cores tun-bench.yml
+front-tun-smoltcp rss-mb-at-ten-flows ferrox=75.2MB,hev=2.5MB tun-bench.yml
 front-tun-smoltcp writes-after-a-refused-packet 2 ferrox-app-tun-stack::tests::a_refused_packet_is_dropped_and_the_next_still_goes_out
 front-tun ops-retired-instructions 691 scripts/count-ops.sh
 front-tun syscalls-per-tun-packet UNBLESSED no syscall checker yet
@@ -840,16 +840,16 @@ front-tun response-payload-copies-per-read 0 ferrox-app-tun::tests::a_response_i
 front-tun flows-served-off-the-queue-that-opened-them 1 ferrox-app-tun::tests::a_flow_opened_on_one_queue_is_served_from_another
 front-tun direct-lane-flows-without-a-pair 1 ferrox-app-tun::tests::a_direct_lane_carries_the_flow_without_the_pair
 front-tun direct-datagram-lanes-without-the-association 1 ferrox-app-tun::tests::a_direct_datagram_lane_frames_the_relay_without_the_association
-front-tun time-tcp-up-1 ferrox=26.981Gbit/s,hev=22.832Gbit/s,ratio=1.18 tun-bench.yml
-front-tun time-tcp-up-10 ferrox=41.398Gbit/s,hev=38.620Gbit/s,ratio=1.07 tun-bench.yml
-front-tun time-tcp-down-1 ferrox=26.708Gbit/s,hev=16.669Gbit/s,ratio=1.60 tun-bench.yml
-front-tun time-tcp-down-10 ferrox=41.583Gbit/s,hev=44.010Gbit/s,ratio=0.94 tun-bench.yml
-front-tun time-rr ferrox=25338tps,hev=16513tps,ratio=1.53 tun-bench.yml
-front-tun time-rr-8x1k ferrox=97327tps,hev=91060tps,ratio=1.07 tun-bench.yml
-front-tun time-udp-100k ferrox=99294pps,hev=99301pps,ratio=1.00 tun-bench.yml
-front-tun cpu-cores-at-tcp-down-10 ferrox=1.82cores,hev=2.09cores tun-bench.yml
-front-tun rss-mb-at-tcp-down-10 ferrox=15.5MB,hev=2.5MB tun-bench.yml
-front-tun rss-above-start-mb-at-tcp-down-10 ferrox=0.9MB,hev=0.7MB tun-bench.yml
+front-tun time-tcp-up-1 ferrox=26.737Gbit/s,hev=23.474Gbit/s,ratio=1.14 tun-bench.yml
+front-tun time-tcp-up-10 ferrox=43.763Gbit/s,hev=40.103Gbit/s,ratio=1.09 tun-bench.yml
+front-tun time-tcp-down-1 ferrox=26.873Gbit/s,hev=16.039Gbit/s,ratio=1.68 tun-bench.yml
+front-tun time-tcp-down-10 ferrox=48.259Gbit/s,hev=43.298Gbit/s,ratio=1.11 tun-bench.yml
+front-tun time-rr ferrox=25801tps,hev=17785tps,ratio=1.45 tun-bench.yml
+front-tun time-rr-8x1k ferrox=95637tps,hev=93763tps,ratio=1.02 tun-bench.yml
+front-tun time-udp-100k ferrox=99296pps,hev=99301pps,ratio=1.00 tun-bench.yml
+front-tun cpu-cores-at-tcp-down-10 ferrox=1.79cores,hev=2.06cores tun-bench.yml
+front-tun rss-mb-at-tcp-down-10 ferrox=15.2MB,hev=2.5MB tun-bench.yml
+front-tun rss-above-start-mb-at-tcp-down-10 ferrox=1.0MB,hev=0.7MB tun-bench.yml
 
 # --- finalmask post-TLS TCP mask chain --------------------------------------
 finalmask sudoku-ops-retired-instructions UNBLESSED scripts/count-ops.sh
