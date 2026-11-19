@@ -1916,7 +1916,10 @@ proxy_lock() {
   release="$dir/release.$$"
   rm -f "$ready" "$release"
   old_int="$(trap -p INT)"; old_term="$(trap -p TERM)"; old_hup="$(trap -p HUP)"
-  trap '' INT TERM HUP
+  PROXY_LOCK_SIGNAL=""
+  trap 'PROXY_LOCK_SIGNAL=INT' INT
+  trap 'PROXY_LOCK_SIGNAL=TERM' TERM
+  trap 'PROXY_LOCK_SIGNAL=HUP' HUP
   PROXY_LOCK_DEPTH=1
   PROXY_LOCK_ACQUIRING=1
   PROXY_LOCK_READY="$ready"
@@ -1971,6 +1974,10 @@ while parent_alive(parent) and not os.path.exists(sys.argv[3]):
   if [ -n "$old_int" ]; then eval "$old_int"; else trap - INT; fi
   if [ -n "$old_term" ]; then eval "$old_term"; else trap - TERM; fi
   if [ -n "$old_hup" ]; then eval "$old_hup"; else trap - HUP; fi
+  if [ -n "$PROXY_LOCK_SIGNAL" ]; then
+    kill -s "$PROXY_LOCK_SIGNAL" "$$"
+    PROXY_LOCK_SIGNAL=""
+  fi
   for _ in $(seq 1 300); do
     [ -s "$ready" ] && break
     kill -0 "$PROXY_LOCK_PID" 2>/dev/null || break
@@ -2597,12 +2604,15 @@ choose_carrier() {
 }
 
 start_lane() {
-  local new_cfg new_fronts
+  local new_cfg new_fronts old_exit
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
   # Validate first: an invocation that cannot start must not stop a healthy lane,
   # and a bad link must not send the user to a build before saying what is wrong.
+  old_exit="$(trap -p EXIT)"
+  trap '[ "$WARP_STARTED" = 1 ] && stop_warp_hop' EXIT
   build_config
+  if [ -n "$old_exit" ]; then eval "$old_exit"; else trap - EXIT; fi
   require_bin
   proxy_lock || return 1
   if ! { touch "$LANES_FILE" &&
@@ -2611,7 +2621,6 @@ start_lane() {
     say "lane: cannot record $CONF_DIR in $LANES_FILE." >&2
     return 1
   fi
-  proxy_unlock
   # stop_lane reads the old meta to name the process it must kill, so keep the
   # new lane's settings aside until that process is gone.
   new_cfg="$CFG"; new_fronts="$FRONTS"
@@ -2620,13 +2629,20 @@ start_lane() {
     stop_lane 0
   fi
   CFG="$new_cfg"; FRONTS="$new_fronts"
-  write_lane_meta
+  if ! write_lane_meta; then
+    proxy_unlock
+    return 1
+  fi
   if [ "$DEBUG" = 1 ]; then
     FOXY_DEBUG=1 "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
   else
     "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
   fi
-  echo "$!" > "$PID_FILE"
+  if ! echo "$!" > "$PID_FILE"; then
+    proxy_unlock
+    return 1
+  fi
+  proxy_unlock
 }
 
 supervise_lane() {
@@ -2752,7 +2768,13 @@ forget_lane_config() {
 stop_all_lanes() {
   local saved_conf="$CONF_DIR" saved_instance="$INSTANCE" dir pidfile base rc=0
   local -a forget=()
+  local pending="$STATE_DIR/logout.pending"
   proxy_lock || return 1
+  if [ -r "$pending" ]; then
+    while IFS= read -r dir; do
+      [ -n "$dir" ] && forget+=("$dir")
+    done <"$pending"
+  fi
   if [ -r "$LANES_FILE" ]; then
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue
@@ -2799,8 +2821,11 @@ stop_all_lanes() {
   INSTANCE=""
   apply_instance
   system_proxy_off 1 || rc=1
-  if [ "$rc" -eq 0 ] && [ "${#forget[@]}" -gt 0 ]; then
-    rm -f "${forget[@]}"
+  if [ "$rc" -eq 0 ]; then
+    if [ "${#forget[@]}" -gt 0 ]; then rm -f "${forget[@]}"; fi
+    rm -f "$pending"
+  elif [ "${#forget[@]}" -gt 0 ]; then
+    printf '%s\n' "${forget[@]}" >"$pending"
   fi
   proxy_unlock
   CONF_DIR="$saved_conf"
