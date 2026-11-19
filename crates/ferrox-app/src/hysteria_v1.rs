@@ -607,6 +607,55 @@ fn touch(last: &Arc<Mutex<Instant>>) {
     }
 }
 
+impl UdpFlow {
+    fn track(&mut self, key: &(String, u16)) -> bool {
+        let now = Instant::now();
+        if !self.used.contains_key(key) {
+            while self.used.len() >= MAX_UDP_ASSOCIATIONS {
+                let mut victim = None;
+                let mut oldest = now;
+                for (other, at) in &self.used {
+                    if other == key
+                        || self.resolving.contains(other)
+                        || self.waiting.contains_key(other)
+                    {
+                        continue;
+                    }
+                    if *at <= oldest {
+                        oldest = *at;
+                        victim = Some(other.clone());
+                    }
+                }
+                let Some(victim) = victim else {
+                    break;
+                };
+                self.used.remove(&victim);
+                self.dests.remove(&victim);
+                self.defrags.remove(&victim);
+            }
+            if self.used.len() >= MAX_UDP_ASSOCIATIONS {
+                return false;
+            }
+        }
+        self.used.insert(key.clone(), now);
+        true
+    }
+
+    fn start_waiting(&mut self, room: usize) -> Vec<(String, u16)> {
+        let keys: Vec<_> = self
+            .waiting
+            .keys()
+            .filter(|key| !self.resolving.contains(*key))
+            .take(room)
+            .cloned()
+            .collect();
+        for key in &keys {
+            self.resolving.insert(key.clone());
+        }
+        keys
+    }
+}
+
 #[derive(Default)]
 struct UdpLane {
     sessions: HashSet<u32>,
