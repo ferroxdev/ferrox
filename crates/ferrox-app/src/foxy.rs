@@ -907,6 +907,7 @@ fn attach(
         session: Arc::clone(session),
         stream,
         class,
+        ended: false,
     };
     let status = match lane.await_status() {
         Ok(status) => status,
@@ -1249,6 +1250,8 @@ pub(crate) struct Tls2 {
     stream: u32,
     /// What this session carries: a TCP stream stages raw bytes in `carry`, while a capsule stream stages into `capsule_buf`.
     class: PoolClass,
+    /// Whether this lane has already handed its stream back or reset it, so a second drop is a no-op.
+    ended: bool,
 }
 
 /// One HTTP/2 session to the edge: the socket, the connection's own credit, and the streams that ride it.
@@ -1764,6 +1767,7 @@ impl Tls2 {
 
     /// Hands this stream back to its session: the id is spent, the bytes staged on it are dropped, and the session stays open for the next flow.
     fn release(&mut self) {
+        self.ended = true;
         let Ok(mut inner) = self.inner() else {
             return;
         };
@@ -1772,6 +1776,7 @@ impl Tls2 {
 
     /// Resets a flow that ended before its stream did: an edge left unreset keeps fetching the response into a window nobody drains, charged to the account, and its stream entry would ride the session for the rest of the pool's life.
     fn cancel(&mut self) {
+        self.ended = true;
         let Ok(mut inner) = self.inner() else {
             return;
         };
@@ -4254,6 +4259,9 @@ impl Tunnel {
 
 /// Ends an h2 lane that no `settle` handed back: a reusable stream is returned to the session, and one that did not end cleanly is reset and removed.
 fn end_lane(lane: &mut Tls2) {
+    if lane.ended {
+        return;
+    }
     if lane.reusable() {
         lane.release();
     } else {
