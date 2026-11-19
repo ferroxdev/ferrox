@@ -179,12 +179,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: fetch the optional country database
-        shell: bash
-        run: |
-          curl -fsSL --retry 3 -o GeoLite2-Country.mmdb \
-            https://github.com/mojolabs-id/GeoLite2-Database/releases/download/2026.11.01/GeoLite2-Country.mmdb \
-            || echo "::warning::optional country database unavailable"
       - name: the handout
         shell: bash
         env:
@@ -348,13 +342,37 @@ jobs:
             gh release create "$VERSION" --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" \
               --notes-file RELEASE-BODY.md
           fi
-          [ -s GeoLite2-Country.mmdb ] && gh release upload "$VERSION" GeoLite2-Country.mmdb --clobber
           gh release view "$VERSION" --json tagName,assets \
             --jq '.tagName + ": " + ([.assets[].name] | join(", "))'
 
+  database:
+    name: the optional country database
+    needs: [plan, start]
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: fetch and attach the optional country database
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          tmp="$(mktemp)"
+          if curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 \
+              -o "$tmp" \
+              https://github.com/mojolabs-id/GeoLite2-Database/releases/download/2026.11.01/GeoLite2-Country.mmdb; then
+            mv "$tmp" GeoLite2-Country.mmdb
+            gh release upload "$VERSION" GeoLite2-Country.mmdb --clobber
+          else
+            rm -f "$tmp"
+            echo "::warning::optional country database unavailable"
+          fi
+
   checksums:
     name: the checksums
-    needs: [plan, start, build]
+    needs: [plan, start, database, build]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -396,7 +414,7 @@ jobs:
 
   result:
     name: result
-    needs: [plan, start, build, checksums]
+    needs: [plan, start, database, build, checksums]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
