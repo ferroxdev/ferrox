@@ -26578,7 +26578,7 @@ fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + 
     read: R,
     write: W,
     raw: Connection,
-    path: &str,
+    paths: &[String],
     key: &[[u8; 56]],
     freedom: bool,
     response: Option<&[u8]>,

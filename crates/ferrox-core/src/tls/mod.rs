@@ -691,7 +691,7 @@ pub enum ServerKeyKind {
 }
 
 /// The lane an `AUTHORITY_ISSUE` identity cannot serve, if the listener selects one: ECH,
-/// the shaped TLS 1.2 engine, and the BoringSSL legacy lane each read only static identities.
+/// the shaped TLS 1.2 engine, and the `BoringSSL` legacy lane each read only static identities.
 #[must_use]
 pub fn issuer_lane_error(cfg: &TlsServerConfig) -> Option<&'static str> {
     cfg.issuer.as_ref()?;

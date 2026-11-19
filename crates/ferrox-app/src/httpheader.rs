@@ -259,7 +259,7 @@ mod tests {
         let (_reader, writer) = accept_split(
             std::io::Cursor::new(head),
             Vec::new(),
-            "/camouflage",
+            &["/camouflage".to_owned()],
             Some(response),
         )
         .expect("answers");
@@ -273,9 +273,13 @@ mod tests {
         const TAIL: &[u8] = b"ping";
         let mut wire = Vec::from(HEAD);
         wire.extend_from_slice(TAIL);
-        let (reader, _write) =
-            accept_split(std::io::Cursor::new(wire), Vec::new(), "/camouflage", None)
-                .expect("answers");
+        let (reader, _write) = accept_split(
+            std::io::Cursor::new(wire),
+            Vec::new(),
+            &["/camouflage".to_owned()],
+            None,
+        )
+        .expect("answers");
         assert_eq!(reader.at, HEAD.len(), "the cursor sits past the head");
         assert_eq!(
             reader.prefix.len(),

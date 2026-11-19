@@ -468,7 +468,7 @@ pub(crate) fn serve_ws(
     password: &str,
     method: &str,
     identities: &[(String, u32)],
-    paths: &[String],
+    path: &str,
     freedom: bool,
 ) {
     let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
@@ -512,7 +512,7 @@ pub(crate) fn serve_grpc(
     password: &str,
     method: &str,
     identities: &[(String, u32)],
-    paths: &[String],
+    path: &str,
     freedom: bool,
 ) {
     serve_grpc_with(
