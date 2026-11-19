@@ -4111,7 +4111,8 @@ fn read_identification(reader: &mut PacketReader, banner: &mut Vec<u8>) -> Resul
     let mut raw = [0u8; 512];
     banner.clear();
     loop {
-        arm_deadline(&reader.io, reader.deadline)?;
+        arm_deadline(&reader.io, reader.deadline)
+            .map_err(|error| format!("psiphon ssh banner: {error}"))?;
         let read = match reader.io.read(&mut chunk) {
             Ok(0) => return Err("psiphon ssh closed before its banner".to_owned()),
             Ok(read) => read,
