@@ -563,6 +563,7 @@ def snapshot_binary(state: pathlib.Path) -> pathlib.Path:
     binary = state / "fake-carrier-lane"
     binary.write_text(
         """#!/bin/sh
+python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$3" > "$FERROX_CONF_DIR/lane-mode"
 cp "$3" "$FERROX_CONF_DIR/lane-snapshot.json"
 """,
         encoding="utf-8",
@@ -585,6 +586,12 @@ def check_picker(state: pathlib.Path) -> int:
             print(
                 f"check-cli-lane: {label}: the lane was handed "
                 f"{chosen_carrier(state)!r}:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        if os.name != "nt" and (state / "lane-mode").read_text(encoding="utf-8").strip() != "0o600":
+            print(
+                f"check-cli-lane: {label}: the generated config is not owner-only",
                 file=sys.stderr,
             )
             return 1
