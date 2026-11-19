@@ -1001,7 +1001,7 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut network = String::new();
     let mut transports: Vec<(String, Option<Vec<u8>>)> = Vec::new();
     let mut security_type = String::new();
-    let mut security: Option<(&'static str, Json)> = None;
+    let mut security_entries: Vec<(String, Vec<u8>)> = Vec::new();
     let mut sockopt = None;
     let mut udp_masks = Vec::new();
     let mut tcp_masks = Vec::new();
@@ -1012,12 +1012,7 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
             (3, 2) => security_type = account_text(&mut reader)?,
             (4, 2) => {
                 let (name, value) = typed_message(reader.bytes()?)?;
-                // The named type's settings decide, as the reference's walk does; every other entry is read and dropped.
-                if name == security_type {
-                    security = Some(security_settings(&name, value)?);
-                } else {
-                    security_settings_exists(&name)?;
-                }
+                security_entries.push((name, value.to_vec()));
             }
             (5, 2) => network = account_text(&mut reader)?,
             (6, 2) => sockopt = socket_settings(reader.bytes()?)?,
@@ -1026,6 +1021,14 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
             (11, 2) => tcp_masks.push(mask_stage(reader.bytes()?, false)?),
             (12, 2) => quic_policy = Some(quic_params(reader.bytes()?)?),
             _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut security: Option<(&'static str, Json)> = None;
+    for (name, value) in security_entries {
+        if name == security_type {
+            security = Some(security_settings(&name, &value)?);
+        } else {
+            security_settings_exists(&name)?;
         }
     }
     let explicit = !network.is_empty();
@@ -2355,6 +2358,15 @@ fn tls_certificate(bytes: &[u8]) -> Result<Json, String> {
     if pairs.len() < 2 && !authority_verify {
         return Err(
             "xray.transport.internet.tls.Certificate: no certificate bytes or paths".to_owned(),
+        );
+    }
+    let has_key = pairs
+        .iter()
+        .any(|(key, _)| matches!(*key, "key" | "keyFile"));
+    if usage != "verify" && !has_key {
+        return Err(
+            "xray.transport.internet.tls.Certificate: no private key for a signing identity"
+                .to_owned(),
         );
     }
     if usage != "encipherment" {

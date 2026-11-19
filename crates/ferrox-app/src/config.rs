@@ -286,20 +286,20 @@ impl<'a> FallbackGroups<'a> {
     /// named one, then a group's `""` rows fill its other maps, then the unnamed group's rows
     /// fill the same-alpn map of every named group where a path is missing.
     fn inherit(&mut self) {
-        let Some(default) = self.groups.iter().position(|g| g.name.is_empty()) else {
-            return;
-        };
-        let alpns: Vec<&'a str> = self.groups[default]
-            .alpns
-            .iter()
-            .map(|map| map.alpn)
-            .collect();
-        for (at, group) in self.groups.iter_mut().enumerate() {
-            if at == default {
-                continue;
-            }
-            for alpn in &alpns {
-                alpn_map(group, alpn);
+        let default = self.groups.iter().position(|g| g.name.is_empty());
+        if let Some(default) = default {
+            let alpns: Vec<&'a str> = self.groups[default]
+                .alpns
+                .iter()
+                .map(|map| map.alpn)
+                .collect();
+            for (at, group) in self.groups.iter_mut().enumerate() {
+                if at == default {
+                    continue;
+                }
+                for alpn in &alpns {
+                    alpn_map(group, alpn);
+                }
             }
         }
         for group in &mut self.groups {
@@ -318,6 +318,9 @@ impl<'a> FallbackGroups<'a> {
                 fill(&mut map.cells, &shared);
             }
         }
+        let Some(default) = default else {
+            return;
+        };
         let shared: Vec<(&'a str, Vec<(&'a str, &'a Fallback)>)> = self.groups[default]
             .alpns
             .iter()
@@ -1990,19 +1993,20 @@ pub(crate) fn accept_proxy_protocol(settings: Option<&Json>) -> bool {
         return false;
     };
     let network = settings.get("network").and_then(Json::as_str).unwrap_or("");
-    let carrier = match network {
-        "ws" | "websocket" => "wsSettings",
-        "httpupgrade" => "httpupgradeSettings",
-        "grpc" => "grpcSettings",
-        "" | "raw" | "tcp" => "tcpSettings",
-        _ => "",
+    let block = match network {
+        "ws" | "websocket" => settings.get("wsSettings"),
+        "httpupgrade" => settings.get("httpupgradeSettings"),
+        "grpc" => settings.get("grpcSettings"),
+        "" | "raw" | "tcp" => match settings.get("rawSettings") {
+            Some(raw) if !matches!(raw, Json::Null) => Some(raw),
+            _ => settings.get("tcpSettings"),
+        },
+        _ => None,
     };
-    let per_carrier = !carrier.is_empty()
-        && settings
-            .get(carrier)
-            .and_then(|s| s.get("acceptProxyProtocol"))
-            .and_then(Json::as_bool)
-            .unwrap_or(false);
+    let per_carrier = block
+        .and_then(|s| s.get("acceptProxyProtocol"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
     let sockopt = settings
         .get("sockopt")
         .and_then(|s| s.get("acceptProxyProtocol"))
@@ -3428,7 +3432,7 @@ fn hysteria_realm(
         .and_then(Json::as_str)
         .map(str::to_owned)
         .or(scheme_from_url)
-        .unwrap_or_else(|| "http".to_owned());
+        .unwrap_or_else(|| "https".to_owned());
     if scheme != "http" && scheme != "https" {
         return Err("realm scheme must be http or https".to_owned());
     }

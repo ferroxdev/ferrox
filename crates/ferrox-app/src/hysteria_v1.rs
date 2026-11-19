@@ -28,6 +28,14 @@ const UDP_POLL: Duration = Duration::from_secs(1);
 
 const UDP_TARGET_BUF: usize = wire::MAX_UDP_PAYLOAD;
 
+const UDP_RESOLVE_BUDGET: Duration = Duration::from_secs(5);
+
+const MAX_PENDING_DATAGRAMS: usize = 64;
+
+const MAX_UDP_ASSOCIATIONS: usize = 256;
+
+const MAX_PENDING_RESOLVERS: usize = 32;
+
 /// A TCP flow after the server has acknowledged its request: the callback dials the target and writes the response.
 pub(crate) type Serve = Arc<dyn Fn(Flow, String, u16) + Send + Sync>;
 
@@ -477,7 +485,7 @@ fn open_udp_flow(session: &Session, host: &str, port: u16) -> Option<(Flow, u32)
     let head = read_until(session, FIRST_FLOW_STREAM, |head| {
         wire::decode_server_response(head).is_ok()
     })?;
-    let (response, _) = wire::decode_server_response(&head).ok()?;
+    let (response, used) = wire::decode_server_response(&head).ok()?;
     if !response.ok {
         return None;
     }
@@ -488,7 +496,7 @@ fn open_udp_flow(session: &Session, host: &str, port: u16) -> Option<(Flow, u32)
             Arc::clone(&session.sock),
             session.local,
             FIRST_FLOW_STREAM,
-            Vec::new(),
+            head.get(used..).unwrap_or_default().to_vec(),
             true,
             false,
         )
@@ -576,9 +584,20 @@ fn server_config(
 
 struct UdpFlow {
     target: Arc<UdpSocket>,
-    defrag: Defrag,
+    dests: HashMap<(String, u16), SocketAddr>,
+    waiting: HashMap<(String, u16), Vec<Vec<u8>>>,
+    resolving: HashSet<(String, u16)>,
+    defrags: HashMap<(String, u16), Defrag>,
     last: Arc<Mutex<Instant>>,
     stop: Arc<AtomicBool>,
+}
+
+struct PendingUdp {
+    token: u64,
+    host: String,
+    port: u16,
+    defrags: HashMap<(String, u16), Defrag>,
+    packets: HashMap<(String, u16), Vec<Vec<u8>>>,
 }
 
 fn touch(last: &Arc<Mutex<Instant>>) {
@@ -591,6 +610,19 @@ fn touch(last: &Arc<Mutex<Instant>>) {
 struct UdpLane {
     sessions: HashSet<u32>,
     flows: HashMap<u32, UdpFlow>,
+    pending: HashMap<u32, PendingUdp>,
+    next_token: u64,
+    resolving: usize,
+}
+
+struct Resolving(Arc<Mutex<UdpLane>>);
+
+impl Drop for Resolving {
+    fn drop(&mut self) {
+        if let Ok(mut lane) = self.0.lock() {
+            lane.resolving = lane.resolving.saturating_sub(1);
+        }
+    }
 }
 
 struct Inbound {
@@ -679,7 +711,10 @@ fn open_udp(
     });
     Some(UdpFlow {
         target,
-        defrag: Defrag::new(),
+        dests: HashMap::new(),
+        waiting: HashMap::new(),
+        resolving: HashSet::new(),
+        defrags: HashMap::new(),
         last,
         stop,
     })
@@ -813,6 +848,7 @@ fn serve_udp_stream(mut flow: Flow, next_udp: u32, lane: &Arc<Mutex<UdpLane>>) {
     }
     if let Ok(mut lane) = lane.lock() {
         lane.sessions.remove(&next_udp);
+        lane.pending.remove(&next_udp);
         if let Some(flow) = lane.flows.remove(&next_udp) {
             flow.stop.store(true, Ordering::Relaxed);
         }
@@ -820,6 +856,7 @@ fn serve_udp_stream(mut flow: Flow, next_udp: u32, lane: &Arc<Mutex<UdpLane>>) {
     flow.close();
 }
 
+#[allow(clippy::too_many_lines)]
 fn relay_datagrams(
     routes: &mut HashMap<Vec<u8>, Inbound>,
     sock: &Arc<crate::quic::Datagram>,
@@ -837,7 +874,8 @@ fn relay_datagrams(
         if !inbound.authed {
             continue;
         }
-        let Ok(mut lane) = inbound.udp.lock() else {
+        let lane_handle = Arc::clone(&inbound.udp);
+        let Ok(mut lane) = lane_handle.lock() else {
             return;
         };
         let session = message.session;
@@ -845,37 +883,245 @@ fn relay_datagrams(
             let _ = conn.close(false, 0, b"");
             return;
         }
-        let Some(peer) = (message.host, message.port)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut it| it.next())
-        else {
-            continue;
-        };
-        let flow = match lane.flows.entry(session) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                let Some(opened) = open_udp(shared, sock, session, peer) else {
+        if lane.flows.contains_key(&session) {
+            let host = message.host.to_owned();
+            let port = message.port;
+            let key = (host.clone(), port);
+            let literal = host
+                .parse::<IpAddr>()
+                .ok()
+                .map(|ip| SocketAddr::new(ip, port));
+            let can_spawn = lane.resolving < MAX_PENDING_RESOLVERS;
+            let mut assembled = Vec::new();
+            let forged;
+            let mut spawn = None;
+            {
+                let Some(flow) = lane.flows.get_mut(&session) else {
                     continue;
                 };
-                vacant.insert(opened)
+                if !flow.defrags.contains_key(&key)
+                    && flow.defrags.len()
+                        + flow.dests.len()
+                        + flow.waiting.len()
+                        + flow.resolving.len()
+                        >= MAX_UDP_ASSOCIATIONS
+                {
+                    continue;
+                }
+                let whole = flow
+                    .defrags
+                    .entry(key.clone())
+                    .or_insert_with(Defrag::new)
+                    .feed(&message, &mut assembled);
+                touch(&flow.last);
+                forged = whole.is_err();
+                match whole {
+                    Ok(Some(message)) => {
+                        let peer = flow.dests.get(&key).copied().or(literal);
+                        if let Some(peer) = peer {
+                            flow.dests.insert(key.clone(), peer);
+                            let _ = flow
+                                .target
+                                .send_to(message.payload, target_addr(&flow.target, peer));
+                        } else {
+                            let queued: usize = flow.waiting.values().map(Vec::len).sum::<usize>();
+                            if queued < MAX_PENDING_DATAGRAMS {
+                                flow.waiting
+                                    .entry(key.clone())
+                                    .or_default()
+                                    .push(message.payload.to_vec());
+                                if can_spawn && flow.resolving.insert(key.clone()) {
+                                    spawn = Some(key.clone());
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => flow.stop.store(true, Ordering::Relaxed),
+                }
+            }
+            if forged {
+                lane.flows.remove(&session);
+            }
+            if let Some((host, port)) = spawn {
+                lane.resolving += 1;
+                std::thread::spawn({
+                    let lane = Arc::clone(&lane_handle);
+                    move || resolve_dest(lane, session, host, port)
+                });
+            }
+            continue;
+        }
+        let UdpLane {
+            flows,
+            pending,
+            next_token,
+            resolving,
+            ..
+        } = &mut *lane;
+        let at_cap = flows.len() + pending.len() >= MAX_UDP_ASSOCIATIONS;
+        let can_spawn = *resolving < MAX_PENDING_RESOLVERS;
+        let token = *next_token;
+        let pending = match pending.entry(session) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                if at_cap || !can_spawn {
+                    continue;
+                }
+                let host = message.host.to_owned();
+                let port = message.port;
+                let key = (host.clone(), port);
+                *next_token = next_token.wrapping_add(1);
+                *resolving += 1;
+                let inserted = vacant.insert(PendingUdp {
+                    token,
+                    host: host.clone(),
+                    port,
+                    defrags: HashMap::from([(key.clone(), Defrag::new())]),
+                    packets: HashMap::from([(key, Vec::new())]),
+                });
+                std::thread::spawn({
+                    let lane = Arc::clone(&lane_handle);
+                    let shared = Arc::clone(shared);
+                    let sock = Arc::clone(sock);
+                    move || resolve_pending(lane, shared, sock, session, host, port, token)
+                });
+                inserted
             }
         };
+        let key = (message.host.to_owned(), message.port);
+        if !pending.defrags.contains_key(&key) {
+            if pending.defrags.len() >= MAX_UDP_ASSOCIATIONS {
+                continue;
+            }
+            pending.defrags.insert(key.clone(), Defrag::new());
+            pending.packets.insert(key.clone(), Vec::new());
+        }
+        let queued: usize = pending.packets.values().map(Vec::len).sum();
+        let Some(defrag) = pending.defrags.get_mut(&key) else {
+            continue;
+        };
         let mut assembled = Vec::new();
-        let whole = flow.defrag.feed(&message, &mut assembled);
-        touch(&flow.last);
-        let forged = whole.is_err();
+        let whole = defrag.feed(&message, &mut assembled);
         match whole {
-            Ok(Some(message)) => {
+            Ok(Some(message)) if queued < MAX_PENDING_DATAGRAMS => {
+                if let Some(packets) = pending.packets.get_mut(&key) {
+                    packets.push(message.payload.to_vec());
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                lane.pending.remove(&session);
+            }
+        }
+    }
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+fn resolve_pending(
+    lane: Arc<Mutex<UdpLane>>,
+    shared: Arc<Mutex<quiche::Connection>>,
+    sock: Arc<crate::quic::Datagram>,
+    session: u32,
+    host: String,
+    port: u16,
+    token: u64,
+) {
+    let _resolving = Resolving(Arc::clone(&lane));
+    let peer = crate::proxy::resolve_bounded(&host, port, UDP_RESOLVE_BUDGET, |host, port| {
+        (host, port)
+            .to_socket_addrs()
+            .map(std::iter::Iterator::collect)
+    })
+    .and_then(|addrs| addrs.into_iter().next());
+    let Some(peer) = peer else {
+        if let Ok(mut lane) = lane.lock() {
+            if lane.pending.get(&session).is_some_and(|p| p.token == token) {
+                lane.pending.remove(&session);
+            }
+        }
+        return;
+    };
+    let Some(mut flow) = open_udp(&shared, &sock, session, peer) else {
+        if let Ok(mut lane) = lane.lock() {
+            if lane.pending.get(&session).is_some_and(|p| p.token == token) {
+                lane.pending.remove(&session);
+            }
+        }
+        return;
+    };
+    let Ok(mut guard) = lane.lock() else {
+        flow.stop.store(true, Ordering::Relaxed);
+        return;
+    };
+    if guard.pending.get(&session).is_none_or(|p| p.token != token)
+        || !guard.sessions.contains(&session)
+    {
+        flow.stop.store(true, Ordering::Relaxed);
+        return;
+    }
+    let Some(pending) = guard.pending.remove(&session) else {
+        flow.stop.store(true, Ordering::Relaxed);
+        return;
+    };
+    let first = (pending.host.clone(), pending.port);
+    flow.dests.insert(first.clone(), peer);
+    flow.defrags = pending.defrags;
+    let room = MAX_PENDING_RESOLVERS.saturating_sub(guard.resolving);
+    let mut spawns = Vec::new();
+    for (key, packets) in pending.packets {
+        if key == first {
+            for payload in packets {
                 let _ = flow
                     .target
-                    .send_to(message.payload, target_addr(&flow.target, peer));
+                    .send_to(&payload, target_addr(&flow.target, peer));
             }
-            Ok(None) => {}
-            Err(_) => flow.stop.store(true, Ordering::Relaxed),
+        } else {
+            if spawns.len() < room {
+                flow.resolving.insert(key.clone());
+                spawns.push(key.clone());
+            }
+            flow.waiting.insert(key, packets);
         }
-        if forged {
-            lane.flows.remove(&session);
+    }
+    guard.resolving += spawns.len();
+    guard.flows.insert(session, flow);
+    drop(guard);
+    for (host, port) in spawns {
+        std::thread::spawn({
+            let lane = Arc::clone(&lane);
+            move || resolve_dest(lane, session, host, port)
+        });
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn resolve_dest(lane: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u16) {
+    let _resolving = Resolving(Arc::clone(&lane));
+    let key = (host.clone(), port);
+    let peer = crate::proxy::resolve_bounded(&host, port, UDP_RESOLVE_BUDGET, |host, port| {
+        (host, port)
+            .to_socket_addrs()
+            .map(std::iter::Iterator::collect)
+    })
+    .and_then(|addrs| addrs.into_iter().next());
+    let Ok(mut lane) = lane.lock() else {
+        return;
+    };
+    let Some(flow) = lane.flows.get_mut(&session) else {
+        return;
+    };
+    flow.resolving.remove(&key);
+    let Some(peer) = peer else {
+        flow.waiting.remove(&key);
+        return;
+    };
+    flow.dests.insert(key.clone(), peer);
+    if let Some(packets) = flow.waiting.remove(&key) {
+        for payload in packets {
+            let _ = flow
+                .target
+                .send_to(&payload, target_addr(&flow.target, peer));
         }
     }
 }
@@ -1090,6 +1336,7 @@ impl Router<'_> {
                         flow.stop.store(true, Ordering::Relaxed);
                     }
                     lane.flows.clear();
+                    lane.pending.clear();
                     lane.sessions.clear();
                 }
                 return false;
@@ -1397,7 +1644,10 @@ mod tests {
                 1,
                 UdpFlow {
                     target: Arc::new(target),
-                    defrag: Defrag::new(),
+                    dests: HashMap::new(),
+                    waiting: HashMap::new(),
+                    resolving: HashSet::new(),
+                    defrags: HashMap::new(),
                     last: Arc::new(Mutex::new(
                         Instant::now()
                             .checked_sub(Duration::from_secs(6))

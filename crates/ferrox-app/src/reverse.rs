@@ -5,7 +5,7 @@
 //! `Control` message. The portal keeps a picker of live sessions, the bridge keeps a
 //! monitor that opens another session when the live ones carry more than sixteen flows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -93,6 +93,9 @@ impl Control {
                 }
                 (_, 5) => at = at.checked_add(4)?,
                 _ => return None,
+            }
+            if at > bytes.len() {
+                return None;
             }
         }
         Some(Self { state, random })
@@ -253,6 +256,7 @@ pub(crate) struct Session {
     done: AtomicBool,
     draining: AtomicBool,
     control: Mutex<Option<u16>>,
+    ends: Mutex<(VecDeque<u16>, bool)>,
     portal: Weak<Portal>,
 }
 
@@ -280,6 +284,7 @@ impl Session {
             done: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             control: Mutex::new(None),
+            ends: Mutex::new((VecDeque::new(), false)),
             portal: Arc::downgrade(portal),
         });
         let reader = session.clone().read_loop(reader);
@@ -319,10 +324,10 @@ impl Session {
                                     };
                                     let source = frame.target.and_then(source_addr);
                                     if sender.try_send((payload.to_vec(), source)).is_err() {
-                                        worker.end(frame.id);
+                                        worker.end_async(frame.id);
                                     }
                                 }
-                                ferrox_core::mux::Status::End => worker.end(frame.id),
+                                ferrox_core::mux::Status::End => worker.end_async(frame.id),
                                 ferrox_core::mux::Status::New
                                 | ferrox_core::mux::Status::KeepAlive => {}
                             }
@@ -516,6 +521,58 @@ impl Session {
         }
     }
 
+    /// End a flow without making the reader wait for the writer lock; the id returns to the pool
+    /// only after the End frame is written, so a new flow cannot reuse it first.
+    fn end_async(self: &Arc<Self>, id: u16) {
+        let cancelled = self
+            .slots
+            .lock()
+            .ok()
+            .and_then(|mut slots| slots.remove(&id))
+            .map(|slot| slot.cancelled);
+        let Some(cancelled) = cancelled else {
+            return;
+        };
+        cancelled.store(true, Ordering::Relaxed);
+        self.active.fetch_sub(1, Ordering::Relaxed);
+        let Ok(mut ends) = self.ends.lock() else {
+            return;
+        };
+        ends.0.push_back(id);
+        if ends.1 {
+            return;
+        }
+        ends.1 = true;
+        drop(ends);
+        let worker = Arc::clone(self);
+        std::thread::spawn(move || worker.flush_ends());
+    }
+
+    /// Writes the queued End frames on one worker, so a stalled tunnel cannot turn every closed flow into a thread.
+    fn flush_ends(self: Arc<Self>) {
+        loop {
+            let id = {
+                let Ok(mut ends) = self.ends.lock() else {
+                    return;
+                };
+                if let Some(id) = ends.0.pop_front() {
+                    id
+                } else {
+                    ends.1 = false;
+                    return;
+                }
+            };
+            let end = ferrox_core::mux::Outgoing::bare(id, ferrox_core::mux::Status::End, 0);
+            let mut scratch = Vec::with_capacity(16);
+            let _ = self.write_frame_to(&mut scratch, &end, None);
+            if !self.done.load(Ordering::Relaxed) {
+                if let Ok(mut ids) = self.ids.lock() {
+                    ids.give_back();
+                }
+            }
+        }
+    }
+
     fn write_frame_to(
         &self,
         scratch: &mut Vec<u8>,
@@ -627,16 +684,42 @@ impl Portal {
 
     /// The least-loaded live session, skipping a draining one until nothing else is left; the
     /// reference's own two passes.
+    #[cfg(test)]
     pub(crate) fn pick(&self) -> Option<Arc<Session>> {
+        self.pick_excluding(&[])
+    }
+
+    fn pick_excluding(&self, tried: &[Arc<Session>]) -> Option<Arc<Session>> {
         let mut list = self.sessions.lock().ok()?;
         list.retain(|session| !session.done());
         let least = |skip_draining: bool| {
             list.iter()
-                .filter(|session| !session.done() && (!skip_draining || !session.draining()))
+                .filter(|session| {
+                    !session.done()
+                        && (!skip_draining || !session.draining())
+                        && !tried.iter().any(|seen| Arc::ptr_eq(seen, session))
+                })
                 .min_by_key(|session| session.active_connections())
                 .cloned()
         };
         least(true).or_else(|| least(false))
+    }
+
+    /// Open a flow on a session that still accepts it, retrying when a picked session begins
+    /// draining between the pick and the open.
+    pub(crate) fn open(
+        &self,
+        target: ferrox_core::mux::Target<'_>,
+        cap: u32,
+    ) -> Option<(Arc<Session>, u16, Flow)> {
+        let mut tried: Vec<Arc<Session>> = Vec::new();
+        loop {
+            let session = self.pick_excluding(&tried)?;
+            if let Some((id, flow)) = session.open(target, cap) {
+                return Some((session, id, flow));
+            }
+            tried.push(session);
+        }
     }
 }
 

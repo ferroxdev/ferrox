@@ -392,10 +392,12 @@ fn sniff_http(
         return None;
     }
     let mut attrs = attrs;
+    let want_attrs = attrs.is_some();
     if let Some(attrs) = attrs.as_deref_mut() {
         attrs.clear();
     }
     let mut host = None;
+    let mut complete = false;
     let mut at = end + 1;
     while at < bytes.len() {
         let Some(line_end) = ferrox_core::foxy::octet_in(bytes, at, b'\n') else {
@@ -404,6 +406,7 @@ fn sniff_http(
         let line = &bytes[at..line_end];
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
+            complete = true;
             break;
         }
         if let Some(colon) = ferrox_core::foxy::octet_in(line, 0, b':') {
@@ -422,6 +425,9 @@ fn sniff_http(
             }
         }
         at = line_end + 1;
+    }
+    if want_attrs && !complete {
+        return None;
     }
     if let Some(attrs) = attrs {
         let mut parts = first.split(|byte| *byte == b' ');

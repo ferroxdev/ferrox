@@ -337,26 +337,19 @@ impl Api {
     }
 
     /// Bind the configured listen address and answer accepted connections from a bounded set of workers.
-    pub(crate) fn serve_listen(self: &Arc<Self>) {
+    pub(crate) fn serve_listen(self: &Arc<Self>) -> Result<(), String> {
         let Some(address) = self.config.listen.clone() else {
-            return;
+            return Ok(());
         };
         let targets = if address.starts_with("unix:") {
-            match crate::conn::parse_target(&address) {
-                Ok(target) => vec![target],
-                Err(error) => {
-                    eprintln!("commander: cannot resolve {address}: {error}");
-                    return;
-                }
-            }
+            vec![crate::conn::parse_target(&address)
+                .map_err(|error| format!("cannot resolve {address}: {error}"))?]
         } else {
-            match address.to_socket_addrs() {
-                Ok(addrs) => addrs.map(crate::conn::Target::Ip).collect(),
-                Err(error) => {
-                    eprintln!("commander: cannot resolve {address}: {error}");
-                    return;
-                }
-            }
+            address
+                .to_socket_addrs()
+                .map_err(|error| format!("cannot resolve {address}: {error}"))?
+                .map(crate::conn::Target::Ip)
+                .collect()
         };
         let mut last = None;
         let mut listener = None;
@@ -374,8 +367,7 @@ impl Api {
                 || "address resolved to nothing".to_owned(),
                 |e| e.to_string(),
             );
-            eprintln!("commander: cannot listen on {address}: {error}");
-            return;
+            return Err(format!("cannot listen on {address}: {error}"));
         };
         let api = Arc::clone(self);
         thread::spawn(move || {
@@ -398,6 +390,7 @@ impl Api {
                 }
             }
         });
+        Ok(())
     }
 
     /// One HTTP/2 connection's worth of calls under the configured idle bound.

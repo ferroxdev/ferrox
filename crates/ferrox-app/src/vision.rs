@@ -808,7 +808,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 return 0;
             }
             if self.have[dot..dot + 16] != self.uuid {
-                // the uuid is a window, not a gate: a raw-target proxy passes everything through, exactly as the staged path did
+                // the uuid is a window, not a gate: an unframed peer stays on the session, never the raw clone a direct command would peel
                 self.session.disarm_record_alignment();
                 self.read.padding = false;
                 return 0;

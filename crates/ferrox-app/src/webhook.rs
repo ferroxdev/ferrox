@@ -70,8 +70,15 @@ pub(crate) struct Webhook {
 
 #[derive(Debug)]
 struct Seen {
-    emails: HashMap<String, Instant>,
+    emails: HashMap<String, (Instant, u64)>,
     swept: Instant,
+    next: u64,
+}
+
+enum Mark {
+    Ignore,
+    Duplicate,
+    Token(u64),
 }
 
 #[derive(Debug)]
@@ -137,6 +144,7 @@ pub(crate) fn parse(field: &Json) -> Result<Option<Arc<Webhook>>, String> {
         seen: Mutex::new(Seen {
             emails: HashMap::new(),
             swept: Instant::now(),
+            next: 0,
         }),
         in_flight: Mutex::new(InFlight {
             active: 0,
@@ -167,10 +175,14 @@ impl Webhook {
         if !self.acquire() {
             return;
         }
-        if self.is_duplicate(event.email.unwrap_or("")) {
-            self.release();
-            return;
-        }
+        let token = match self.mark(event.email.unwrap_or("")) {
+            Mark::Duplicate => {
+                self.release();
+                return;
+            }
+            Mark::Ignore => None,
+            Mark::Token(token) => Some(token),
+        };
         let body = event_body(event);
         let webhook = Arc::clone(self);
         if let Err(error) = std::thread::Builder::new()
@@ -181,6 +193,9 @@ impl Webhook {
             })
         {
             self.release();
+            if let Some(token) = token {
+                self.unmark(token);
+            }
             eprintln!("webhook: cannot start the POST: {error}");
         }
     }
@@ -216,9 +231,14 @@ impl Webhook {
     }
 
     /// Whether this email already fired inside the window, which also records the send.
+    #[cfg(test)]
     fn is_duplicate(&self, email: &str) -> bool {
+        matches!(self.mark(email), Mark::Duplicate)
+    }
+
+    fn mark(&self, email: &str) -> Mark {
         if self.deduplication == 0 || email.is_empty() {
-            return false;
+            return Mark::Ignore;
         }
         let ttl = Duration::from_secs(u64::from(self.deduplication));
         let now = Instant::now();
@@ -227,18 +247,31 @@ impl Webhook {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if now.duration_since(seen.swept) >= ttl {
-            seen.emails.retain(|_, at| now.duration_since(*at) < ttl);
+            seen.emails
+                .retain(|_, (at, _)| now.duration_since(*at) < ttl);
             seen.swept = now;
         }
         if seen
             .emails
             .get(email)
-            .is_some_and(|at| now.duration_since(*at) < ttl)
+            .is_some_and(|(at, _)| now.duration_since(*at) < ttl)
         {
-            return true;
+            return Mark::Duplicate;
         }
-        seen.emails.insert(email.to_owned(), now);
-        false
+        let token = seen.next;
+        seen.next = seen.next.wrapping_add(1);
+        seen.emails.insert(email.to_owned(), (now, token));
+        Mark::Token(token)
+    }
+
+    /// Drop the deduplication mark when the send thread could not start, so a later event is
+    /// not dropped for a POST that never began.
+    fn unmark(&self, token: u64) {
+        let mut seen = self
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        seen.emails.retain(|_, (_, seen)| *seen != token);
     }
 
     /// The sending thread's body: one failure reports itself and ends the thread.
@@ -260,7 +293,7 @@ impl Webhook {
     }
 
     /// The POST over TCP, from the URL it parses to the status line it reads, inside the one
-    /// budget. Host name resolution is the stage `std` cannot bound, so it sits outside the deadline.
+    /// budget, including name resolution.
     fn send(&self, body: &str) -> Result<(), String> {
         let deadline = Instant::now() + BUDGET;
         let mut url = HttpUrl::parse(&self.url)?;

@@ -375,7 +375,8 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
                 Arc::clone(&portals),
             ),
             test,
-        );
+        )
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     }
     if !test {
         if let Some(geodata) = geodata {
@@ -395,6 +396,7 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         api.as_deref(),
         seed,
         test,
+        false,
     );
     if inbounds == 0 {
         match refused.as_deref().unwrap_or(&[]).first() {
@@ -450,12 +452,13 @@ fn wire_api(
     observatory: Option<Arc<crate::observatory::Observatory>>,
     runtime: Runtime,
     test: bool,
-) {
+) -> Result<(), String> {
     api.set_observatory(observatory);
     api.set_runtime(Arc::new(runtime));
     if !test {
-        api.serve_listen();
+        api.serve_listen()?;
     }
+    Ok(())
 }
 
 /// One inbound's lane: a route plan when the config carries rules, else the single configured outbound.
@@ -544,7 +547,11 @@ fn inbound_is_xhttp_h3(inbound: &Json) -> bool {
     names.as_slice() == ["h3"]
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 fn serve_inbounds_counted(
     label: &str,
     root: &Json,
@@ -556,6 +563,7 @@ fn serve_inbounds_counted(
     api: Option<&crate::commander::Api>,
     seed: Option<&crate::xray_pb::Seed>,
     test: bool,
+    fallible: bool,
 ) -> usize {
     let routed =
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
@@ -748,6 +756,7 @@ fn serve_inbounds_counted(
                                 &out,
                                 label,
                                 handler_stop.as_ref(),
+                                fallible,
                             );
                             inbounds += armed;
                             if tcp && !dokodemo_has(&dokodemo_networks(inbound), "udp") {
@@ -889,6 +898,7 @@ fn serve_inbounds(
         portals,
         api.map(std::sync::Arc::as_ref),
         seed,
+        false,
         false,
     )
 }
@@ -1044,8 +1054,22 @@ fn spawn_role_stopped(
     tag: Option<String>,
     stop: Option<std::sync::Arc<Stop>>,
 ) {
+    let listener = bind_listener(address, &role)
+        .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
     let address = address.to_owned();
-    thread::spawn(move || accept_loop(&address, &role, tag.as_deref(), stop));
+    thread::spawn(move || accept_listener(listener, &address, &role, tag.as_deref(), stop));
+}
+
+fn try_spawn_role_stopped(
+    address: &str,
+    role: Role,
+    tag: Option<String>,
+    stop: Option<std::sync::Arc<Stop>>,
+) -> std::io::Result<()> {
+    let listener = bind_listener(address, &role)?;
+    let address = address.to_owned();
+    thread::spawn(move || accept_listener(listener, &address, &role, tag.as_deref(), stop));
+    Ok(())
 }
 
 /// The role a listener serves, wrapped when its config says the first bytes are a PROXY header.
@@ -3272,6 +3296,7 @@ pub(crate) fn serve_dynamic_inbounds(
         Some(api),
         Some(seed),
         false,
+        true,
     )
 }
 
@@ -5587,6 +5612,13 @@ impl PooledFlow {
         }
     }
 
+    fn end_upload(&self) {
+        match self {
+            Self::Cool(flow) => flow.end_upload(),
+            Self::Sing(flow) => flow.end_upload(),
+        }
+    }
+
     fn close(self) {
         match self {
             Self::Cool(flow) => flow.close(),
@@ -5656,14 +5688,21 @@ enum Udp443 {
     Skip,
 }
 
-fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::sync::Arc<Stop>>) {
-    let target = parse_target(address)
-        .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
-    let listener = match role.transparent() {
+fn bind_listener(address: &str, role: &Role) -> std::io::Result<Listener> {
+    let target = parse_target(address)?;
+    match role.transparent() {
         Some(_) => Listener::bind_transparent(&target),
         None => Listener::bind(&target),
     }
-    .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
+}
+
+fn accept_listener(
+    listener: Listener,
+    address: &str,
+    role: &Role,
+    tag: Option<&str>,
+    stop: Option<std::sync::Arc<Stop>>,
+) {
     let sniffing = crate::sniff::for_listener(listener.local_addr().ok(), address);
     for stream in listener.incoming() {
         if stop.as_ref().is_some_and(|stop| stop.stopped()) {
@@ -8732,7 +8771,12 @@ fn resolve_worker(receiver: &Mutex<Receiver<ResolveJob>>) {
 }
 
 /// `None` is no answer (timeout, resolver error, or a saturated pool); `Some(empty)` is an answer.
-fn resolve_bounded<F>(host: &str, port: u16, budget: Duration, lookup: F) -> Option<Vec<SocketAddr>>
+pub(crate) fn resolve_bounded<F>(
+    host: &str,
+    port: u16,
+    budget: Duration,
+    lookup: F,
+) -> Option<Vec<SocketAddr>>
 where
     F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
 {
@@ -16522,6 +16566,7 @@ fn serve_dokodemo(
     out: &Outbound,
     label: &str,
     stop: Option<&Arc<Stop>>,
+    fallible: bool,
 ) -> (usize, bool) {
     let follow_redirect = inbound
         .get("settings")
@@ -16587,30 +16632,39 @@ fn serve_dokodemo(
             "dokodemo-door in {label}: followRedirect has no rewrite address and no original-destination lookup; each tcp flow closes without a destination"
         );
     }
+    let mut tcp_armed = false;
     if dokodemo_has(&networks, "tcp") {
-        spawn_role_stopped(
-            address,
-            inbound_role(
-                inbound,
-                Role::Dokodemo {
-                    out: out.clone(),
-                    dest: rewrite.clone(),
-                    port_map: port_map.clone(),
-                    follow_redirect,
-                    receive_original_destination,
-                    transparent,
-                    mask,
-                    listen,
-                    account: Box::new(InboundAccount {
-                        email: String::new(),
-                        level: user_level,
-                    }),
-                },
-            ),
-            inbound_tag(inbound),
-            stop.cloned(),
+        let role = inbound_role(
+            inbound,
+            Role::Dokodemo {
+                out: out.clone(),
+                dest: rewrite.clone(),
+                port_map: port_map.clone(),
+                follow_redirect,
+                receive_original_destination,
+                transparent,
+                mask,
+                listen,
+                account: Box::new(InboundAccount {
+                    email: String::new(),
+                    level: user_level,
+                }),
+            },
         );
-        armed += 1;
+        if fallible {
+            match try_spawn_role_stopped(address, role, inbound_tag(inbound), stop.cloned()) {
+                Ok(()) => tcp_armed = true,
+                Err(error) => {
+                    eprintln!("dokodemo-door tcp: cannot listen on {address} in {label}: {error}");
+                }
+            }
+        } else {
+            spawn_role_stopped(address, role, inbound_tag(inbound), stop.cloned());
+            tcp_armed = true;
+        }
+        if tcp_armed {
+            armed += 1;
+        }
     }
     if dokodemo_has(&networks, "udp") {
         // The door's own socket is bound before the inbound is armed: a port nobody holds answers a datagram with a refusal.
@@ -16669,7 +16723,7 @@ fn serve_dokodemo(
         }
         armed += 1;
     }
-    (armed, dokodemo_has(&networks, "tcp"))
+    (armed, tcp_armed)
 }
 
 fn dokodemo_original_destination(
@@ -20363,8 +20417,9 @@ fn relay_pool_flow(client: &Connection, mut flow: PooledFlow) {
             }
         }
     }
-    flow.close();
+    flow.end_upload();
     join(&done);
+    flow.close();
 }
 
 /// Replies one downlink hands the app socket at a time: a batch of `Keep` payloads leaves as one
@@ -26781,15 +26836,13 @@ fn mux_destination(
 /// A flow the rules routed to a portal: it rides one mux session the bridge opened, and the
 /// portal never sees a socket for it.
 fn serve_reverse_tcp(client: &Connection, portal: &crate::reverse::Portal, asked: &Destination) {
-    let Some(session) = portal.pick() else {
+    let target = mux_destination(asked, ferrox_core::mux::Network::Tcp);
+    let Some((session, id, flow)) = portal.open(target, ferrox_core::mux::DEFAULT_CAP as u32)
+    else {
         eprintln!(
             "reverse: portal `{}` has no live session, so the flow is closed",
             portal.tag()
         );
-        return;
-    };
-    let target = mux_destination(asked, ferrox_core::mux::Network::Tcp);
-    let Some((id, flow)) = session.open(target, ferrox_core::mux::DEFAULT_CAP as u32) else {
         return;
     };
     let (Ok(mut down), Ok(mut up)) = (client.try_clone(), client.try_clone()) else {
@@ -29275,13 +29328,6 @@ fn serve_socks_udp_portal(relay: &UdpSocket, portal: &crate::reverse::Portal) {
             let lane = match lanes.entry(dest) {
                 std::collections::hash_map::Entry::Occupied(lane) => lane.into_mut(),
                 std::collections::hash_map::Entry::Vacant(lane) => {
-                    let Some(session) = portal.pick() else {
-                        eprintln!(
-                            "reverse: portal `{}` has no live session, so the datagram is dropped",
-                            portal.tag()
-                        );
-                        continue;
-                    };
                     let target = ferrox_core::mux::Target {
                         network: ferrox_core::mux::Network::Udp,
                         port: dest.port(),
@@ -29290,8 +29336,13 @@ fn serve_socks_udp_portal(relay: &UdpSocket, portal: &crate::reverse::Portal) {
                             std::net::IpAddr::V6(ip) => ferrox_core::addr::Addr::V6(ip.octets()),
                         },
                     };
-                    let opened = session.open(target, ferrox_core::mux::DEFAULT_CAP as u32);
-                    let Some((id, flow)) = opened else {
+                    let Some((session, id, flow)) =
+                        portal.open(target, ferrox_core::mux::DEFAULT_CAP as u32)
+                    else {
+                        eprintln!(
+                            "reverse: portal `{}` has no live session, so the datagram is dropped",
+                            portal.tag()
+                        );
                         continue;
                     };
                     let Ok(output) = relay.try_clone() else {
@@ -46559,7 +46610,11 @@ mod tests {
         let serving = {
             let address = address.clone();
             let stop = std::sync::Arc::clone(&stop);
-            thread::spawn(move || accept_loop(&address, &role, None, Some(stop)))
+            let role = role.clone();
+            thread::spawn(move || {
+                let listener = bind_listener(&address, &role).expect("binds the carried listener");
+                accept_listener(listener, &address, &role, None, Some(stop));
+            })
         };
         let clients: Vec<_> = (0..8)
             .map(|_| {
@@ -75394,7 +75449,7 @@ mod tests {
             .and_then(Json::as_arr)
             .expect("inbounds")[0];
         assert_eq!(
-            serve_dokodemo("127.0.0.1:0", inbound, &freedom(), "test", None).0,
+            serve_dokodemo("127.0.0.1:0", inbound, &freedom(), "test", None, false).0,
             0,
             "a bad entry is the Build's refusal"
         );

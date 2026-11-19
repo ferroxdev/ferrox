@@ -6,7 +6,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Config {
@@ -161,10 +161,18 @@ fn answer(mut stream: TcpStream) {
         return;
     }
     let mut request = [0u8; 4096];
-    let read = match stream.read(&mut request) {
-        Ok(0) | Err(_) => return,
-        Ok(read) => read,
-    };
+    let mut read = 0;
+    let deadline = Instant::now() + METRICS_IDLE;
+    while read < request.len() && !request[..read].windows(4).any(|end| end == b"\r\n\r\n") {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return;
+        }
+        match stream.read(&mut request[read..]) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => read += n,
+        }
+    }
     let head = String::from_utf8_lossy(&request[..read]);
     let path = head
         .lines()
