@@ -415,6 +415,11 @@ impl EventStream {
             }
         }
     }
+
+    /// A clone of the events socket a caller can shut down.
+    pub(crate) fn interrupt_handle(&self) -> Option<TcpStream> {
+        self.interrupt.try_clone().ok()
+    }
 }
 
 /// `/v1/{id}` or `/v1/{id}/{sub}`, with the slot escaped as a single name — the caller's id has
