@@ -5185,27 +5185,28 @@ impl Routing {
         }
     }
 
-    fn retire(&mut self, (closed, closed_unverified, verified): (usize, usize, usize)) {
-        self.lanes = self.lanes.saturating_sub(closed);
+    fn retire(&mut self, retired: Retired) {
+        self.lanes = self.lanes.saturating_sub(retired.lanes);
         self.unverified = self
             .unverified
-            .saturating_sub(closed_unverified)
-            .saturating_sub(verified);
+            .saturating_sub(retired.unverified)
+            .saturating_sub(retired.verified);
     }
 }
 
+#[derive(Default)]
+struct Retired {
+    lanes: usize,
+    unverified: usize,
+    verified: usize,
+}
+
 /// One connection's close is counted once, while every key it owns leaves the table with it.
-fn note_closed(
-    state: &ServerConn,
-    key: &[u8],
-    scratch: &mut Scratch,
-    closed: &mut usize,
-    unverified: &mut usize,
-) {
+fn note_closed(state: &ServerConn, key: &[u8], scratch: &mut Scratch, retired: &mut Retired) {
     if !state.gone.swap(true, Ordering::Relaxed) {
-        *closed += 1;
+        retired.lanes += 1;
         if !state.established.load(Ordering::Relaxed) {
-            *unverified += 1;
+            retired.unverified += 1;
         }
     }
     scratch.closed.push(key.to_vec());
@@ -5364,9 +5365,7 @@ fn reap(
     scratch.epoch = scratch.epoch.wrapping_add(1);
     let epoch = scratch.epoch;
     let mut deadline = None;
-    let mut closed_lanes = 0usize;
-    let mut closed_unverified = 0usize;
-    let mut verified_lanes = 0usize;
+    let mut retired = Retired::default();
     // A state is keyed once per connection id, so the stamp keeps one connection's questions asked once.
     for (key, state) in &routes.conns {
         if state.visit.load(Ordering::Relaxed) == epoch {
@@ -5381,26 +5380,14 @@ fn reap(
             continue;
         };
         if conn.is_closed() {
-            note_closed(
-                state,
-                key,
-                scratch,
-                &mut closed_lanes,
-                &mut closed_unverified,
-            );
+            note_closed(state, key, scratch, &mut retired);
             continue;
         }
         if conn.timeout().is_some_and(|left| left.is_zero()) {
             conn.on_timeout();
             flush_egress(&mut conn, sock);
             if conn.is_closed() {
-                note_closed(
-                    state,
-                    key,
-                    scratch,
-                    &mut closed_lanes,
-                    &mut closed_unverified,
-                );
+                note_closed(state, key, scratch, &mut retired);
                 continue;
             }
         }
@@ -5416,7 +5403,7 @@ fn reap(
             }
         }
         if conn.is_established() && !state.established.swap(true, Ordering::Relaxed) {
-            verified_lanes += 1;
+            retired.verified += 1;
         }
         if !conn.is_established() {
             continue;
@@ -5444,7 +5431,7 @@ fn reap(
         }
     }
     scratch.deadline = deadline;
-    routes.retire((closed_lanes, closed_unverified, verified_lanes));
+    routes.retire(retired);
     for (key, state) in scratch.learned.drain(..) {
         routes.conns.entry(key).or_insert(state);
     }
