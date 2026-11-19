@@ -3896,6 +3896,30 @@ mod tests {
             name.make_ascii_lowercase();
             fields.push((name, value.to_owned()));
         });
+        if settings.x_padding_obfs {
+            let pad = crate::xhttp::referer_pad_value(settings);
+            match settings.x_padding_placement {
+                crate::xhttp::Placement::Header if !settings.x_padding_header.is_empty() => {
+                    fields.push((settings.x_padding_header.to_ascii_lowercase(), pad));
+                }
+                crate::xhttp::Placement::Cookie if !settings.x_padding_key.is_empty() => {
+                    fields.push((
+                        "cookie".to_owned(),
+                        format!("{}={pad}", settings.x_padding_key),
+                    ));
+                }
+                crate::xhttp::Placement::QueryInHeader
+                    if !settings.x_padding_header.is_empty()
+                        && !settings.x_padding_key.is_empty() =>
+                {
+                    fields.push((
+                        settings.x_padding_header.to_ascii_lowercase(),
+                        format!("?{}={pad}", settings.x_padding_key),
+                    ));
+                }
+                _ => {}
+            }
+        }
         fields.push((
             "referer".to_owned(),
             crate::xhttp::referer_value(host, settings),
@@ -3952,11 +3976,10 @@ mod tests {
         settings.x_padding_placement = crate::xhttp::Placement::QueryInHeader;
         settings.x_padding_method = crate::xhttp::PadMethod::RepeatX;
         settings.x_padding_bytes = (8, 8);
-        let block = request_block("example.test", &settings, "https");
-        let text = String::from_utf8_lossy(&block);
-        assert!(
-            text.contains("?x_padding=XXXXXXXX"),
-            "queryInHeader carries the delimiter query_param reads: {text:?}"
+        assert_eq!(
+            request_block("example.test", &settings, "https"),
+            staged_request_block("example.test", &settings, "https"),
+            "queryInHeader carries the delimiter query_param reads"
         );
     }
 

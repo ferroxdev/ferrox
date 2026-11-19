@@ -1045,16 +1045,8 @@ where
     let discard = || {
         let headers = registration_headers(Some(&bearer));
         let headers = borrow_headers(&headers);
-        match call("DELETE", &path, &headers, &[]) {
-            Ok(reply) if (200..300).contains(&reply.status) => {}
-            Ok(reply) => eprintln!(
-                "warp: could not delete the failed device registration: {}",
-                reply.status
-            ),
-            Err(error) => eprintln!(
-                "warp: could not delete the failed device registration: {}",
-                error.reason
-            ),
+        if let Err(reason) = cleanup_reply(call("DELETE", &path, &headers, &[])) {
+            eprintln!("warp: could not delete the failed device registration: {reason}");
         }
     };
     let mut masque = None;
@@ -1123,6 +1115,14 @@ where
         },
         masque,
     })
+}
+
+fn cleanup_reply(reply: Result<Reply, RegisterError>) -> Result<(), String> {
+    match reply {
+        Ok(reply) if (200..300).contains(&reply.status) => Ok(()),
+        Ok(reply) => Err(reply.status.to_string()),
+        Err(error) => Err(error.reason),
+    }
 }
 
 /// Read a device back from the API, so an identity Cloudflare no longer knows
