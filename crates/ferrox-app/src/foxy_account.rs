@@ -799,6 +799,8 @@ pub(crate) struct Endpoint {
     pub(crate) base: String,
     pub(crate) address: Option<SocketAddr>,
     pub(crate) roots: ferrox_core::tls::Anchors,
+    /// The name and port a fronted dial actually dials, kept when a challenge changes the authority the request names.
+    pub(crate) dial: Option<(String, u16)>,
     /// The hop every dial to this origin chains through; the TLS name stays the origin's.
     pub(crate) upstream: Option<crate::foxy::UpstreamProxy>,
     /// The shaped hello the HTTP/2 dials ride; `None` keeps the plane's own.
@@ -841,6 +843,7 @@ impl Endpoint {
             // An origin that already is an address is read here, once, so an ask does not build the name and ask the resolver what it means.
             address: edge_peer(host, port),
             roots,
+            dial: None,
             upstream: None,
             h2_fingerprint: None,
             no_resumption: false,
@@ -869,6 +872,7 @@ impl Endpoint {
         dial.clone_into(&mut self.host);
         self.port = port;
         self.address = edge_peer(dial, port);
+        self.dial = Some((dial.to_owned(), port));
         self.host_header = Some(host_header.to_owned());
         // Omitted SNI still has to name the certificate: `VerifyServerName` when the config gives one, the fronted Host otherwise, and the dialed name last.
         self.server_name = Some(if disable_sni {
@@ -1004,21 +1008,31 @@ impl Endpoint {
         self.connect_with(&self.tls_h2())
     }
 
+    /// The host and port the socket dials: the edge a fronted dial named, even after a challenge changed the authority the request names.
+    fn dial_edge(&self) -> (String, u16) {
+        match (self.address, &self.dial) {
+            (Some(address), _) => (address.ip().to_string(), address.port()),
+            (None, Some((host, port))) => (host.clone(), *port),
+            (None, None) => (self.host.clone(), self.port),
+        }
+    }
+
     fn connect_with(
         &self,
         cfg: &TlsConfig,
     ) -> Result<ferrox_core::tls::ClientSession<Connection>, String> {
+        let edge = self.dial_edge();
         let stream = if let Some(proxy) = &self.upstream {
-            crate::foxy::tcp_via(proxy, &self.host, self.port)
-                .map_err(|why| format!("connect {} via the hop: {why:?}", self.host))?
+            crate::foxy::tcp_via(proxy, &edge.0, edge.1)
+                .map_err(|why| format!("connect {} via the hop: {why:?}", edge.0))?
         } else {
             let peer = match self.address {
                 Some(address) => address,
-                None => format!("{}:{}", self.host, self.port)
+                None => format!("{}:{}", edge.0, edge.1)
                     .to_socket_addrs()
-                    .map_err(|why| format!("resolve {}: {why}", self.host))?
+                    .map_err(|why| format!("resolve {}: {why}", edge.0))?
                     .next()
-                    .ok_or_else(|| format!("{} resolves to nothing", self.host))?,
+                    .ok_or_else(|| format!("{} resolves to nothing", edge.0))?,
             };
             crate::conn::dial_tcp(&peer, IO_TIMEOUT)
                 .map_err(|why| format!("connect {peer}: {why}"))?
@@ -2078,7 +2092,31 @@ mod tests {
         assert_eq!(challenged.host, "oauth.accounts.firefox.com");
         assert_eq!(challenged.port, 443);
         assert_eq!(challenged.address, None);
+        assert_eq!(
+            challenged.dial_edge(),
+            ("oauth.accounts.firefox.com".to_owned(), 443)
+        );
         assert!(challenged.host_header.is_none());
+    }
+
+    #[test]
+    fn a_challenge_under_a_hostname_fronting_keeps_the_edge_it_dials() {
+        let endpoint = Endpoint::parse("https://vpn.mozilla.org", Vec::new().into())
+            .expect("parses")
+            .with_fronting(
+                "vpn.mozilla.org",
+                "edge.example",
+                8443,
+                false,
+                None,
+                Vec::new(),
+            )
+            .expect("fronted");
+        let challenged = endpoint.challenged("oauth.accounts.firefox.com");
+        assert_eq!(challenged.host, "oauth.accounts.firefox.com");
+        assert_eq!(challenged.port, 443);
+        assert_eq!(challenged.address, None);
+        assert_eq!(challenged.dial_edge(), ("edge.example".to_owned(), 8443));
     }
 
     #[test]

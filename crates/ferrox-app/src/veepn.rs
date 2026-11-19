@@ -133,6 +133,7 @@ impl VeepnOut {
                 base: String::new(),
                 address: None,
                 roots: Arc::clone(&roots),
+                dial: None,
                 upstream: None,
                 h2_fingerprint: None,
                 no_resumption: false,
