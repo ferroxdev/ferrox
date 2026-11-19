@@ -2313,21 +2313,21 @@ mod tests {
             .is_none(),
             "a body shorter than its content-length is not a response"
         );
-        assert!(
+        assert_eq!(
             parse_origin_response(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n", "HEAD")
                 .expect("a head reply carries no body")
-                .body
-                .is_empty(),
+                .body,
+            Vec::<u8>::new(),
             "HEAD keeps its declared length and carries no body"
         );
-        assert!(
+        assert_eq!(
             parse_origin_response(
                 b"HTTP/1.1 304 Not Modified\r\nContent-Length: 11\r\n\r\n",
                 "GET"
             )
             .expect("a 304 carries no body")
-            .body
-            .is_empty(),
+            .body,
+            Vec::<u8>::new(),
             "304 keeps its declared length and carries no body"
         );
         assert_eq!(
