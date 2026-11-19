@@ -2029,11 +2029,7 @@ impl Datagrams {
             if body.len() < 19 + pad {
                 return None;
             }
-            if self
-                .peers
-                .get(&session)
-                .is_some_and(|peer| !peer.window.check(packet_id))
-            {
+            if replayed(&self.peers, session, packet_id) {
                 return None;
             }
             let (target, used) = parse_addr_header(&body[19 + pad..])?;
@@ -2081,11 +2077,7 @@ impl Datagrams {
             if body.len() < 19 + pad {
                 return None;
             }
-            if self
-                .peers
-                .get(&session)
-                .is_some_and(|peer| !peer.window.check(packet_id))
-            {
+            if replayed(&self.peers, session, packet_id) {
                 return None;
             }
             let (target, used) = parse_addr_header(&body[19 + pad..])?;
@@ -2124,6 +2116,12 @@ fn open_peer_body(
     let sub = shadowsocks2022::session_subkey(psk, salt)?;
     let cipher = Cipher::from_subkey(method, &sub[..method.key_len()])?;
     Some((cipher.open_with_nonce(nonce, body)?, Some(cipher)))
+}
+
+fn replayed(peers: &HashMap<u64, PeerServer>, session: u64, packet_id: u64) -> bool {
+    peers
+        .get(&session)
+        .is_some_and(|peer| !peer.window.check(packet_id))
 }
 
 fn peer_check(
