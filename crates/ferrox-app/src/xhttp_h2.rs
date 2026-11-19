@@ -89,10 +89,60 @@ impl<'a> DataBatch<'a> {
     }
 
     fn flush(&mut self, conn: &H2Conn) -> bool {
+        if self.used == 0 {
+            return true;
+        }
+        // The credit lock holds a SETTINGS update away from the window check and the write, so a batch reserved before a reduced initial window waits instead of overrunning it.
+        let mut credit = conn
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if conn.dead.load(Ordering::SeqCst) {
+                return false;
+            }
+            match self.reserved_fits(conn) {
+                None => return false,
+                Some(true) => break,
+                Some(false) => {}
+            }
+            let (guard, waited) = conn
+                .wake
+                .wait_timeout(credit, crate::budgets::relay_stall())
+                .unwrap_or_else(PoisonError::into_inner);
+            credit = guard;
+            if waited.timed_out() {
+                return false;
+            }
+        }
         let Ok(mut write) = conn.write.lock() else {
             return false;
         };
         self.flush_locked(conn, &mut **write)
+    }
+
+    /// Whether every reserved frame still fits the stream window it was taken from: `None` when a
+    /// stream retired under the batch, `Some(false)` while a reduced window is short of its share.
+    fn reserved_fits(&self, conn: &H2Conn) -> Option<bool> {
+        let streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut fits = true;
+        for at in 0..self.used {
+            let id = u32::from_be_bytes([
+                self.heads[at][5],
+                self.heads[at][6],
+                self.heads[at][7],
+                self.heads[at][8],
+            ]);
+            let state = streams.get(&id)?;
+            let window = *state
+                .send_window
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if window < 0 {
+                fits = false;
+            }
+        }
+        Some(fits)
     }
 
     /// The same bytes into a write half the caller already holds: a lane takes the lock without
@@ -1060,10 +1110,11 @@ impl H2Conn {
         let Ok(mut write) = self.write.try_lock() else {
             return None;
         };
+        let Ok(mut conn) = self.send_conn.try_lock() else {
+            return None;
+        };
         {
-            let (Ok(mut conn), Ok(mut window)) =
-                (self.send_conn.try_lock(), state.send_window.try_lock())
-            else {
+            let Ok(mut window) = state.send_window.try_lock() else {
                 return None;
             };
             let total_signed = i64::try_from(total).unwrap_or(i64::MAX);
@@ -4169,6 +4220,51 @@ mod tests {
         assert_eq!(reader.read(&mut rest).unwrap(), 48);
         assert!(rest.iter().copied().eq(16u8..64), "the tail of the frame");
         assert!(reader.cur.is_empty(), "the spent frame is released");
+    }
+
+    /// A SETTINGS update that takes a stream window negative holds the batch reserved before it:
+    /// the same reservation clears once credit brings the window back to zero.
+    #[test]
+    fn a_reduced_window_holds_a_reserved_batch() {
+        let (conn, _, _) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                credit: VecDeque::new(),
+                queued_bytes: 0,
+                ended: false,
+                finished: false,
+                request_ended: false,
+                stopped: false,
+                abandoned: false,
+                status: None,
+                dead: false,
+                pending_credit: 0,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(-1),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        let mut batch = DataBatch::new();
+        batch.add(1, b"reserved");
+        assert_eq!(
+            batch.reserved_fits(&conn),
+            Some(false),
+            "a negative window holds the reservation"
+        );
+        *state
+            .send_window
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = 0;
+        assert_eq!(
+            batch.reserved_fits(&conn),
+            Some(true),
+            "the reservation fits again once the window is back at zero"
+        );
     }
 
     #[test]
