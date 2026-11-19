@@ -186,7 +186,7 @@ fn try_carrier(
         .map_err(|failure| failure.to_string())?;
     let answer = through_tunnel(&mut tunnel, PROBE_HOST, PROBE_PATH)
         .ok_or_else(|| "no answer through the tunnel".to_owned())?;
-    let response = ferrox_core::hysteria::parse_origin_response(answer.as_bytes())
+    let response = ferrox_core::hysteria::parse_origin_response(answer.as_bytes(), "GET")
         .ok_or_else(|| "the probe did not answer a full response".to_owned())?;
     if response.status != 200 {
         return Err("the probe did not answer 200".to_owned());

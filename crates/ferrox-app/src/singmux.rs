@@ -483,6 +483,17 @@ enum Role {
     Server,
 }
 
+fn defer_close(close: Arc<dyn Fn() + Send + Sync>) {
+    let callback = Arc::clone(&close);
+    if std::thread::Builder::new()
+        .name("singmux-close".to_owned())
+        .spawn(move || close())
+        .is_err()
+    {
+        callback();
+    }
+}
+
 struct Inner {
     protocol: Protocol,
     role: Role,
@@ -849,7 +860,7 @@ impl Inner {
                 .is_some_and(|sender| sender.try_send(id).is_err());
             if failed {
                 drop(resets);
-                self.finish();
+                self.finish_deferred();
             }
             return;
         }
@@ -867,7 +878,7 @@ impl Inner {
             });
         if spawned.is_err() {
             drop(resets);
-            self.finish();
+            self.finish_deferred();
             return;
         }
         *resets = Some(sender.clone());
@@ -1121,9 +1132,21 @@ impl Inner {
     }
 
     fn finish(&self) {
+        if self.teardown() {
+            (self.close)();
+        }
+    }
+
+    fn finish_deferred(&self) {
+        if self.teardown() {
+            defer_close(Arc::clone(&self.close));
+        }
+    }
+
+    fn teardown(&self) -> bool {
         self.dead.store(true, Ordering::Relaxed);
         if self.finished.swap(true, Ordering::Relaxed) {
-            return;
+            return false;
         }
         match self.resets.lock() {
             Ok(mut resets) => drop(resets.take()),
@@ -1147,12 +1170,15 @@ impl Inner {
             sink.window.close();
             sink.queue.close();
         }
-        (self.close)();
+        true
     }
 
     fn smux_loop(&self, mut read: Box<dyn Read + Send>) {
         let mut head = [0u8; SMUX_FRAME];
         loop {
+            if self.dead() {
+                return;
+            }
             if crate::proxy::read_exact(&mut *read, &mut head).is_err() {
                 return;
             }
@@ -1160,6 +1186,9 @@ impl Inner {
             let id = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
             let mut data = vec![0u8; len];
             if len > 0 && crate::proxy::read_exact(&mut *read, &mut data).is_err() {
+                return;
+            }
+            if self.dead() {
                 return;
             }
             match head[1] {
@@ -1181,6 +1210,9 @@ impl Inner {
     fn yamux_loop(&self, mut read: Box<dyn Read + Send>) {
         let mut head = [0u8; 12];
         loop {
+            if self.dead() {
+                return;
+            }
             if crate::proxy::read_exact(&mut *read, &mut head).is_err() {
                 return;
             }
@@ -1200,6 +1232,9 @@ impl Inner {
                 if len > 0 && crate::proxy::read_exact(&mut *read, &mut data).is_err() {
                     return;
                 }
+            }
+            if self.dead() {
+                return;
             }
             match kind {
                 YAMUX_DATA => {
@@ -1263,6 +1298,9 @@ impl Inner {
         }
         let mut continuation: Option<(u32, Vec<u8>)> = None;
         loop {
+            if self.dead() {
+                return;
+            }
             let Some((len, kind, flags, id)) = h2::read_head(&mut *read) else {
                 return;
             };
@@ -1271,6 +1309,9 @@ impl Inner {
             }
             let mut body = vec![0u8; len];
             if len > 0 && crate::proxy::read_exact(&mut *read, &mut body).is_err() {
+                return;
+            }
+            if self.dead() {
                 return;
             }
             match kind {
@@ -2137,6 +2178,43 @@ mod tests {
         flow.close();
         close();
         worker.join().expect("worker");
+    }
+
+    #[test]
+    fn a_deferred_close_callback_does_not_block_the_demux() {
+        let (client, _server) = pair();
+        let client_read = client.try_clone().expect("client read");
+        let client_write = client.try_clone().expect("client write");
+        let (entered, running) = channel();
+        let (release, blocked) = channel();
+        let blocked = Arc::new(Mutex::new(blocked));
+        let close: Arc<dyn Fn() + Send + Sync> = {
+            let blocked = Arc::clone(&blocked);
+            Arc::new(move || {
+                let _ = entered.send(());
+                if let Ok(blocked) = blocked.lock() {
+                    let _ = blocked.recv();
+                }
+            })
+        };
+        let session = Client::connect(
+            Protocol::Yamux,
+            false,
+            Box::new(client_read),
+            Box::new(client_write),
+            close,
+        )
+        .expect("client");
+        let started = std::time::Instant::now();
+        session.session.finish_deferred();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "deferred teardown returns without running the carrier close"
+        );
+        running
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the close worker runs the callback");
+        release.send(()).expect("releases the close callback");
     }
 
     #[test]

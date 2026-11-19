@@ -3522,7 +3522,7 @@ fn send_dial_head_padded<W: crate::proxy::FrameWrite>(
 ) -> Option<()> {
     const BEFORE_PATH: &str = "POST ";
     const BEFORE_HOST: &str = " HTTP/1.1\r\nHost: ";
-    const BEFORE_REFERER: &str = "\r\nReferer: http://";
+    const BEFORE_REFERER: &str = "Referer: http://";
     // The reference dialer disables keep-alives (dialer.go:272), and a chunked request whose first chunk waits on the 200 hangs a peer that drains the body before it flushes.
     const TAIL: &str = "Transfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
     let referer = target.split_once('?').map_or(target, |(path, _)| path);
@@ -3556,6 +3556,7 @@ fn send_dial_head_padded<W: crate::proxy::FrameWrite>(
         head.extend_from_slice(target.as_bytes());
         head.extend_from_slice(BEFORE_HOST.as_bytes());
         head.extend_from_slice(host.as_bytes());
+        head.extend_from_slice(b"\r\n");
         if !padding_is_referer {
             head.extend_from_slice(BEFORE_REFERER.as_bytes());
             head.extend_from_slice(host.as_bytes());
@@ -5254,6 +5255,24 @@ mod tests {
             let mut named = settings.clone();
             named.x_padding_placement = placement;
             named.x_padding_header = "Referer".to_owned();
+            let (target, padding, referer) = dial_head_parts(&named);
+            let mut wire = Vec::new();
+            send_dial_head_padded(
+                &mut wire,
+                "front.example",
+                &target,
+                &[],
+                &padding,
+                "",
+                &referer,
+            )
+            .expect("stages the dial");
+            assert!(
+                wire.windows(21)
+                    .any(|line| line == b"Host: front.example\r\n"),
+                "Host is terminated before the referer pad: {}",
+                String::from_utf8_lossy(&wire)
+            );
             for head in [
                 dial_head("front.example", &named, "session", None),
                 downlink_head("front.example", &named, "session"),

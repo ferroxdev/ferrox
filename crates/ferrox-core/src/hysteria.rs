@@ -1210,60 +1210,78 @@ pub fn content_type(path: &str) -> &'static str {
     }
 }
 
-/// One origin HTTP/1.1 response reduced to what ferrox re-emits as HTTP/3: the status code, every header as it arrived (the caller drops the hop-by-hop ones), and the body with any chunked framing or content-length tail already removed. The whole response, read to the origin's close, is the input; a head that never reaches its blank line is not a response.
-pub fn parse_origin_response(raw: &[u8]) -> Option<OriginResponse> {
-    let end = head_end(raw)?;
-    let mut body = &raw[end + 4..];
-    let mut lines = raw[..end].split(|&byte| byte == b'\n');
-    let status = lines
-        .next()?
-        .split(|&byte| byte == b' ')
-        .nth(1)
-        .and_then(|code| std::str::from_utf8(code).ok())
-        .and_then(|code| code.parse::<u16>().ok())?;
-    let mut headers = Vec::new();
-    let mut chunked = false;
-    let mut length = None;
-    for line in lines {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() {
+/// One origin HTTP/1.1 response reduced to what ferrox re-emits as HTTP/3: the status code, every header as it arrived (the caller drops the hop-by-hop ones), and the body with any chunked framing or content-length tail already removed. The whole response, read to the origin's close, is the input; a head that never reaches its blank line is not a response. `method` is the request method, so a HEAD reply and every status that forbids a body keep their declared length while carrying none.
+pub fn parse_origin_response(raw: &[u8], method: &str) -> Option<OriginResponse> {
+    let mut rest = raw;
+    loop {
+        let end = head_end(rest)?;
+        let body = &rest[end + 4..];
+        let mut lines = rest[..end].split(|&byte| byte == b'\n');
+        let status = lines
+            .next()?
+            .split(|&byte| byte == b' ')
+            .nth(1)
+            .and_then(|code| std::str::from_utf8(code).ok())
+            .and_then(|code| code.parse::<u16>().ok())?;
+        let mut headers = Vec::new();
+        let mut chunked = false;
+        let mut length = None;
+        for line in lines {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.splitn(2, |&byte| byte == b':');
+            let name = parts.next()?;
+            let value = match parts.next() {
+                Some(value) => value.strip_prefix(b" ").unwrap_or(value),
+                None => continue,
+            };
+            let name = String::from_utf8_lossy(name).into_owned();
+            let value = String::from_utf8_lossy(value).into_owned();
+            if name.eq_ignore_ascii_case("transfer-encoding")
+                && value
+                    .as_bytes()
+                    .windows(7)
+                    .any(|window| window.eq_ignore_ascii_case(b"chunked"))
+            {
+                chunked = true;
+            } else if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse::<usize>().ok();
+            }
+            headers.push((name, value));
+        }
+        if (100..200).contains(&status) && status != 101 {
+            rest = body;
             continue;
         }
-        let mut parts = line.splitn(2, |&byte| byte == b':');
-        let name = parts.next()?;
-        let value = match parts.next() {
-            Some(value) => value.strip_prefix(b" ").unwrap_or(value),
-            None => continue,
-        };
-        let name = String::from_utf8_lossy(name).into_owned();
-        let value = String::from_utf8_lossy(value).into_owned();
-        if name.eq_ignore_ascii_case("transfer-encoding")
-            && value
-                .as_bytes()
-                .windows(7)
-                .any(|window| window.eq_ignore_ascii_case(b"chunked"))
-        {
-            chunked = true;
-        } else if name.eq_ignore_ascii_case("content-length") {
-            length = value.trim().parse::<usize>().ok();
+        if method == "HEAD" || status == 101 || status == 204 || status == 304 {
+            return Some(OriginResponse {
+                status,
+                headers,
+                body: Vec::new(),
+            });
         }
-        headers.push((name, value));
-    }
-    if chunked {
+        if chunked {
+            return Some(OriginResponse {
+                status,
+                headers,
+                body: dechunk(body)?,
+            });
+        }
+        if let Some(want) = length {
+            return Some(OriginResponse {
+                status,
+                headers,
+                body: body.get(..want)?.to_vec(),
+            });
+        }
         return Some(OriginResponse {
             status,
             headers,
-            body: dechunk(body)?,
+            body: body.to_vec(),
         });
     }
-    if let Some(want) = length {
-        body = body.get(..want).unwrap_or(body);
-    }
-    Some(OriginResponse {
-        status,
-        headers,
-        body: body.to_vec(),
-    })
 }
 
 /// The parts ferrox re-emits from a reverse-proxied origin: kept apart from the HTTP/3 encoder so a chunked body is proven de-framed without a socket in the test.
@@ -2280,15 +2298,49 @@ mod tests {
     #[test]
     fn a_chunked_origin_body_defragments_to_its_bytes() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-        let response = parse_origin_response(raw).expect("a chunked response");
+        let response = parse_origin_response(raw, "GET").expect("a chunked response");
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"hello world");
         let plain = b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nabctrailing";
-        let response = parse_origin_response(plain).expect("a lengthed response");
+        let response = parse_origin_response(plain, "GET").expect("a lengthed response");
         assert_eq!(response.status, 404);
         assert_eq!(response.body, b"abc", "content-length bounds the body");
         assert!(
-            parse_origin_response(b"HTTP/1.1 200 OK\r\n").is_none(),
+            parse_origin_response(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n192.0.2.1",
+                "GET"
+            )
+            .is_none(),
+            "a body shorter than its content-length is not a response"
+        );
+        assert_eq!(
+            parse_origin_response(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n", "HEAD")
+                .expect("a head reply carries no body")
+                .body,
+            Vec::<u8>::new(),
+            "HEAD keeps its declared length and carries no body"
+        );
+        assert_eq!(
+            parse_origin_response(
+                b"HTTP/1.1 304 Not Modified\r\nContent-Length: 11\r\n\r\n",
+                "GET"
+            )
+            .expect("a 304 carries no body")
+            .body,
+            Vec::<u8>::new(),
+            "304 keeps its declared length and carries no body"
+        );
+        assert_eq!(
+            parse_origin_response(
+                b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                "GET"
+            )
+            .expect("the final response follows the interim one")
+            .status,
+            200
+        );
+        assert!(
+            parse_origin_response(b"HTTP/1.1 200 OK\r\n", "GET").is_none(),
             "a head that never reaches its blank line is not a response"
         );
     }
@@ -2378,7 +2430,7 @@ mod tests {
             let raw = format!(
                 "HTTP/1.1 200 OK\r\nTransfer-Encoding: {value}\r\nContent-Length: 5\r\n\r\nhello"
             );
-            let response = parse_origin_response(raw.as_bytes());
+            let response = parse_origin_response(raw.as_bytes(), "GET");
             if value.to_ascii_lowercase().contains("chunked") {
                 assert!(
                     response.is_none(),
