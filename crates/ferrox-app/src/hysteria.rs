@@ -3052,7 +3052,7 @@ mod tests {
         let response = read_origin(&mut std::io::Cursor::new(raw), b"HEAD / HTTP/1.1\r\n")
             .expect("a head reply");
         assert_eq!(response.status, 200);
-        assert!(response.body.is_empty());
+        assert_eq!(response.body, Vec::<u8>::new());
     }
 
     #[test]
