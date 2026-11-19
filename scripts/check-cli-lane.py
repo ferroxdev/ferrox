@@ -3498,7 +3498,7 @@ def check_warp_ladder(state: pathlib.Path) -> int:
 def check_stale_warp_pid(state: pathlib.Path) -> int:
     for stale in ("warp-hop.pid", "warp-hop.port", "warp-hop.json", "lane.pid"):
         (state / stale).unlink(missing_ok=True)
-    sleeper = subprocess.Popen(["sleep", "30"])
+    sleeper = subprocess.Popen(["sleep", "300"])
     try:
         (state / "warp-hop.pid").write_text(f"{sleeper.pid}\n", encoding="utf-8")
         (state / "warp-hop.port").write_text("9\n", encoding="utf-8")
