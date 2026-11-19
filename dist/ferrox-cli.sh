@@ -578,10 +578,12 @@ same_stored_account() {
 }
 
 action_logout() {
-  stop_all_lanes ||
-    die "logout: the lanes or system proxy could not be stopped; the saved account was kept."
   proxy_lock ||
     die "logout: the account lock was unavailable; the saved account was kept."
+  if ! stop_all_lanes; then
+    proxy_unlock
+    die "logout: the lanes or system proxy could not be stopped; the saved account was kept."
+  fi
   rm -f "$TOKEN_FILE" "$CREDS"
   proxy_unlock
   say "signed out: every lane is stopped, and the stored session, the saved account and generated lane configs are gone."
@@ -868,10 +870,16 @@ PY
 # One JSON writer for every outbound: python3 already carries this tree's scripts.
 write_config() {
   local outbound="$1" udp="${2:-}" tag="${3:-}" rc=0
-  python3 - "$CFG" "$outbound" "$udp" "$tag" "$FRONTS" "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" <<'PY'
-import json, sys
+  ( umask 077
+    python3 - "$CFG" "$FRONTS" "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" "$tag" \
+      3< <(printf '%s' "$outbound") 4< <(printf '%s' "$udp") <<'PY'
+import json, os, sys
 
-cfg, outbound, udp, tag, fronts, socks, http, mixed = sys.argv[1:9]
+cfg, fronts, socks, http, mixed, tag = sys.argv[1:7]
+with os.fdopen(3) as handle:
+    outbound = handle.read()
+with os.fdopen(4) as handle:
+    udp = handle.read()
 ports = {"socks": int(socks), "http": int(http), "mixed": int(mixed)}
 wanted = [f.strip() for f in fronts.split(",") if f.strip()]
 for front in wanted:
@@ -891,7 +899,7 @@ if udp:
 with open(cfg, "w") as handle:
     json.dump(doc, handle, indent=2)
 PY
-  rc=$?
+  ) || rc=$?
   [ "$rc" -eq 0 ] || return "$rc"
   chmod 600 "$CFG"
 }
@@ -2855,7 +2863,8 @@ start_warp_hop() {
   local port pid
   port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" || return 1
   [ -n "$port" ] || return 1
-  python3 - "$WARP_CFG" "$port" "$CONF_DIR/warp-identity.json" <<'PY'
+  ( umask 077
+    python3 - "$WARP_CFG" "$port" "$CONF_DIR/warp-identity.json" <<'PY'
 import json, sys
 cfg, port, identity = sys.argv[1:4]
 doc = {
@@ -2866,6 +2875,7 @@ doc = {
 with open(cfg, "w") as handle:
     json.dump(doc, handle, indent=2)
 PY
+  ) || return 1
   chmod 600 "$WARP_CFG"
   say "warp hop: registering once and racing WireGuard against MASQUE..."
   "$BIN" run -c "$WARP_CFG" >"$WARP_LOG" 2>&1 &
@@ -3317,6 +3327,7 @@ action_up() {
 }
 
 action_serve() {
+  reconcile_stale_proxy || die "the stale system proxy could not be cleared; run ferrox-cli down."
   if [ "$WANT_VPN" = 1 ] && ! system_proxy_preflight; then exit 1; fi
   choose_carrier
   for _ in 1 2; do
