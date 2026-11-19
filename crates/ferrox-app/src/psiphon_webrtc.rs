@@ -994,6 +994,7 @@ fn is_bogon_v4(ip: Ipv4Addr) -> bool {
 type InputChannel = Arc<Mutex<Receiver<Result<Vec<u8>, String>>>>;
 
 /// The sender-side traffic-shaping state: random padding counts and decoy messages.
+#[derive(Clone)]
 struct Shaping {
     parameters: TrafficShapingParameters,
     state: u64,
@@ -1380,14 +1381,14 @@ impl WebRtcStream {
             return Ok(total);
         }
         if let Some(shaping) = &self.shaping {
+            let mut shaping = lock(shaping);
             let mut queued = 0;
             for buf in bufs {
                 for chunk in buf.chunks(STREAM_MESSAGE) {
-                    let message = {
-                        let mut shaping = lock(shaping);
-                        shaping.frame(chunk, MAX_DATAGRAM)
-                    };
+                    let saved = shaping.clone();
+                    let message = shaping.frame(chunk, MAX_DATAGRAM);
                     if let Err(error) = self.send_until(message, deadline) {
+                        *shaping = saved;
                         return if queued > 0 { Ok(queued) } else { Err(error) };
                     }
                     queued += chunk.len();

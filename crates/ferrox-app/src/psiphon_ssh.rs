@@ -2590,7 +2590,7 @@ impl Inner {
             Some(deadline) => lock_until(&self.writer, deadline)?,
             None => lock(&self.writer),
         };
-        if !self.flush_deferred_close(&mut writer) {
+        if !self.flush_deferred_close(&mut writer, deadline) {
             return Err("psiphon ssh write: session closed".to_owned());
         }
         with_writer_deadline(&mut writer, deadline, |writer| writer.send(payload))
@@ -2598,7 +2598,7 @@ impl Inner {
     }
 
     /// Send every close frame a contended writer deferred, before the caller's own payload.
-    fn flush_deferred_close(&self, writer: &mut PacketWriter) -> bool {
+    fn flush_deferred_close(&self, writer: &mut PacketWriter, caller: Option<Instant>) -> bool {
         let pending = {
             let mut deferred = lock(&self.deferred_close);
             std::mem::take(&mut *deferred)
@@ -2606,16 +2606,14 @@ impl Inner {
         if pending.is_empty() {
             return true;
         }
-        let result = with_writer_deadline(
-            writer,
-            Some(Instant::now() + CLOSE_FRAME_TIMEOUT),
-            |writer| {
-                for remote in pending {
-                    writer.send(&channel_close(remote))?;
-                }
-                Ok(())
-            },
-        );
+        let close = Instant::now() + CLOSE_FRAME_TIMEOUT;
+        let deadline = caller.map_or(close, |deadline| deadline.min(close));
+        let result = with_writer_deadline(writer, Some(deadline), |writer| {
+            for remote in pending {
+                writer.send(&channel_close(remote))?;
+            }
+            Ok(())
+        });
         if result.is_err() {
             // A half-written close packet leaves the sequence advanced; the stream is unusable.
             self.close();
@@ -2634,7 +2632,7 @@ impl Inner {
             Some(deadline) => lock_until(&self.writer, deadline)?,
             None => lock(&self.writer),
         };
-        if !self.flush_deferred_close(&mut writer) {
+        if !self.flush_deferred_close(&mut writer, deadline) {
             return Err("psiphon channel closed".to_owned());
         }
         let remote = state.remote.load(Ordering::Acquire);
@@ -2660,7 +2658,7 @@ impl Inner {
             Some(deadline) => lock_until(&self.writer, deadline)?,
             None => lock(&self.writer),
         };
-        if !self.flush_deferred_close(&mut writer) {
+        if !self.flush_deferred_close(&mut writer, deadline) {
             return Err("psiphon channel closed".to_owned());
         }
         let remote = state.remote.load(Ordering::Acquire);
@@ -2679,7 +2677,7 @@ impl Inner {
     /// A per-channel frame leaves only while the channel still names a remote id, read under the writer lock.
     fn send_framed(&self, state: &ChannelState, payload: &mut [u8]) -> bool {
         let mut writer = lock(&self.writer);
-        if !self.flush_deferred_close(&mut writer) {
+        if !self.flush_deferred_close(&mut writer, None) {
             return false;
         }
         let remote = state.remote.load(Ordering::Acquire);
@@ -2705,7 +2703,7 @@ impl Inner {
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => return,
         };
-        self.flush_deferred_close(&mut writer);
+        self.flush_deferred_close(&mut writer, None);
     }
 
     fn relay_round_trip(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
@@ -3352,7 +3350,7 @@ fn with_writer_deadline<T>(
     if deadline.is_some() {
         if previous.is_some() {
             writer.deadline = previous;
-            let _ = arm_deadline(&writer.io, previous);
+            let _ = arm_write_deadline(&writer.io, previous);
         } else {
             let _ = writer.clear_deadline();
         }
@@ -4108,6 +4106,21 @@ fn arm_deadline(io: &Stream, deadline: Option<Instant>) -> io::Result<()> {
     io.set_timeout(Some(left))
 }
 
+/// A write deadline belongs to the socket's write half; arming it must not shorten a concurrent read.
+fn arm_write_deadline(io: &Stream, deadline: Option<Instant>) -> io::Result<()> {
+    let Some(deadline) = deadline else {
+        return io.set_write_timeout(None);
+    };
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "psiphon ssh: establishment deadline expired",
+        ));
+    }
+    io.set_write_timeout(Some(left))
+}
+
 impl PacketWriter {
     /// Wrap a socket with optional obfuscation and packet crypto.
     fn new(
@@ -4219,12 +4232,12 @@ impl PacketWriter {
 
     fn set_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         self.deadline = Some(deadline);
-        arm_deadline(&self.io, self.deadline)
+        arm_write_deadline(&self.io, self.deadline)
     }
 
     fn clear_deadline(&mut self) -> io::Result<()> {
         self.deadline = None;
-        self.io.set_timeout(None)
+        self.io.set_write_timeout(None)
     }
 
     fn begin_packet(&mut self, packet_len: usize, padding: usize) {
