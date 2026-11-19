@@ -490,8 +490,12 @@ action_login() {
     printf 'password (hidden, not echoed): ' && read -rs pass && printf '\n'
   fi
   [ -n "$email" ] && [ -n "$pass" ] || die "an account is an email and a password"
-  local cred_dir save_dir tmp unsafe login_epoch="${LOGIN_GUARD_EPOCH:-}"
-  [ -n "$login_epoch" ] || login_epoch="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)"
+  local cred_dir save_dir tmp unsafe login_epoch
+  if [ "${LOGIN_GUARD_SET:-0}" = 1 ]; then
+    login_epoch="$LOGIN_GUARD_EPOCH"
+  else
+    login_epoch="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)"
+  fi
   cred_dir="$(dirname "$CREDS")"
   [ -d "$CREDS" ] && die "$CREDS is a directory; FOXY_CREDENTIALS must name a file"
   mkdir -p "$CONF_DIR" || die "cannot create $CONF_DIR; the saved session was kept."
@@ -565,7 +569,10 @@ same_stored_account() {
 action_logout() {
   stop_all_lanes ||
     die "logout: the lanes or system proxy could not be stopped; the saved account was kept."
+  proxy_lock ||
+    die "logout: the account lock was unavailable; the saved account was kept."
   rm -f "$TOKEN_FILE" "$CREDS"
+  proxy_unlock
   say "signed out: every lane is stopped, and the stored session, the saved account and generated lane configs are gone."
   say "the remembered exit stays in $LOCATION_FILE; 'ferrox-cli login' signs in again."
 }
@@ -994,33 +1001,29 @@ adopt_lane_ports() {
 # The running lane's config path and fronts, so a later status or ports reads
 # the addresses it actually serves instead of the defaults.
 write_lane_meta() {
+  local tmp="$META_FILE.$$" rc=0
   ( umask 077
     {
       printf 'config=%s\n' "$(resolve_real "$CFG")"
       printf 'fronts=%s\n' "$FRONTS"
       printf 'generated=%s\n' "$([ "$OUTBOUND" = config ] && echo 0 || echo 1)"
-    } >"$META_FILE"
-  )
+    } >"$tmp"
+  ) || rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$tmp"; return "$rc"; fi
+  mv -f "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
 }
 
 load_lane_meta() {
   [ -f "$META_FILE" ] || return 1
-  local line default_cfg="$CFG" generated_set=0
+  local line
   GENERATED=0
   while IFS= read -r line; do
     case "$line" in
       config=*) CFG="${line#config=}" ;;
       fronts=*) FRONTS="${line#fronts=}"; FRONTS_SET=1 ;;
-      generated=*) GENERATED="${line#generated=}"; generated_set=1 ;;
+      generated=*) GENERATED="${line#generated=}" ;;
     esac
   done <"$META_FILE"
-  if [ "$generated_set" -eq 0 ]; then
-    if [ "$(resolve_real "$CFG")" = "$(resolve_real "$default_cfg")" ]; then
-      GENERATED=1
-    else
-      GENERATED=0
-    fi
-  fi
 }
 
 foxy_outbound() {
@@ -2592,7 +2595,6 @@ EOF
       exit 2
       ;;
   esac
-  write_config "$BUILT_OUTBOUND" || die "cannot write $CFG"
 }
 
 # The carrier is a choice, not a default: h2 is the rung auto opens on and h3 is
@@ -2624,18 +2626,13 @@ start_lane() {
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
   start_epoch="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)"
-  LOGIN_GUARD_EPOCH="$start_epoch"
+  LOGIN_GUARD_SET=1; LOGIN_GUARD_EPOCH="$start_epoch"
   WARP_SELECTED=0
   final_cfg="$CFG"; CFG_STAGE=""
-  if [ "$OUTBOUND" != config ]; then
-    CFG_STAGE="$(dirname "$final_cfg")/.$(basename "$final_cfg").stage.$$"
-    rm -f "$CFG_STAGE"
-    CFG="$CFG_STAGE"
-  fi
   # Validate first: an invocation that cannot start must not stop a healthy lane,
   # and a bad link must not send the user to a build before saying what is wrong.
   old_exit="$(trap -p EXIT)"
-  trap 'status=$?; [ "$WARP_STARTED" = 1 ] && stop_warp_hop; [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"; exit $status' EXIT
+  trap 'status=$?; [ "$WARP_STARTED" = 1 ] && stop_owned_warp; exit $status' EXIT
   build_config
   require_bin
   if [ -n "$old_exit" ]; then eval "$old_exit"; else trap - EXIT; fi
@@ -2645,8 +2642,7 @@ start_lane() {
     return 1
   }
   if [ "$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)" != "$start_epoch" ]; then
-    [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"
-    [ "$WARP_STARTED" = 1 ] && stop_warp_hop
+    [ "$WARP_STARTED" = 1 ] && stop_owned_warp
     [ "$OUTBOUND" = config ] || CFG="$final_cfg"
     proxy_unlock
     say "a concurrent down or logout cancelled this start; try again." >&2
@@ -2655,22 +2651,11 @@ start_lane() {
   if [ "$WARP_SELECTED" = 1 ]; then
     warp_port="$(cat "$WARP_PORT_FILE" 2>/dev/null || true)"
     if ! warp_hop_running || [ "$UPSTREAM" != "socks5://127.0.0.1:$warp_port" ]; then
-      [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"
       [ "$OUTBOUND" = config ] || CFG="$final_cfg"
       proxy_unlock
       say "the warp hop was stopped by a concurrent down; try again." >&2
       return 1
     fi
-  fi
-  if [ "$OUTBOUND" != config ]; then
-    if ! mv -f "$CFG_STAGE" "$final_cfg"; then
-      rm -f "$CFG_STAGE"
-      [ "$OUTBOUND" = config ] || CFG="$final_cfg"
-      proxy_unlock
-      say "cannot publish $final_cfg" >&2
-      return 1
-    fi
-    CFG="$final_cfg"
   fi
   save_lane_location
   reg_dir="$(resolve_real "$CONF_DIR")"
@@ -2691,6 +2676,26 @@ start_lane() {
   if ! write_lane_meta; then
     proxy_unlock
     return 1
+  fi
+  if [ "$OUTBOUND" != config ]; then
+    CFG_STAGE="$(dirname "$final_cfg")/.$(basename "$final_cfg").stage.$$"
+    rm -f "$CFG_STAGE"
+    CFG="$CFG_STAGE"
+    if ! write_config "$BUILT_OUTBOUND"; then
+      rm -f "$CFG_STAGE"; CFG_STAGE=""
+      CFG="$final_cfg"
+      proxy_unlock
+      say "cannot write $final_cfg" >&2
+      return 1
+    fi
+    CFG="$final_cfg"
+    if ! mv -f "$CFG_STAGE" "$final_cfg"; then
+      rm -f "$CFG_STAGE"; CFG_STAGE=""
+      proxy_unlock
+      say "cannot publish $final_cfg" >&2
+      return 1
+    fi
+    CFG_STAGE=""
   fi
   if [ "$DEBUG" = 1 ]; then
     FOXY_DEBUG=1 "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
@@ -2766,6 +2771,7 @@ warp_hop_running() {
 start_warp_hop() {
   WARP_STARTED=0
   WARP_SELECTED=0
+  WARP_OWN_PID=""
   if warp_hop_running; then
     UPSTREAM="socks5://127.0.0.1:$(cat "$WARP_PORT_FILE")"
     WARP_SELECTED=1
@@ -2792,6 +2798,7 @@ PY
   "$BIN" run -c "$WARP_CFG" >"$WARP_LOG" 2>&1 &
   pid=$!
   WARP_STARTED=1
+  WARP_OWN_PID="$pid"
   echo "$pid" > "$WARP_PID_FILE"
   echo "$port" > "$WARP_PORT_FILE"
   for _ in $(seq 1 120); do
@@ -2802,7 +2809,7 @@ PY
   if ! port_open "$port"; then
     say "the warp hop did not open; last lines of $WARP_LOG:"
     tail -n 20 "$WARP_LOG" 2>/dev/null || true
-    stop_warp_hop
+    stop_owned_warp
     return 1
   fi
   UPSTREAM="socks5://127.0.0.1:$port"
@@ -2821,12 +2828,22 @@ stop_warp_hop() {
   rm -f "$WARP_PID_FILE" "$WARP_PORT_FILE" "$WARP_CFG"
 }
 
-forget_lane_config() {
-  local default_cfg="${META_FILE%.meta}.json"
-  if [ "${GENERATED:-0}" = 1 ] ||
-     { [ ! -f "$META_FILE" ] && [ "$(resolve_real "$CFG")" = "$(resolve_real "$default_cfg")" ]; }; then
-    rm -f "$CFG"
+stop_owned_warp() {
+  local pid="${WARP_OWN_PID:-}"
+  [ -n "$pid" ] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
   fi
+  if [ "$(cat "$WARP_PID_FILE" 2>/dev/null || true)" = "$pid" ]; then
+    rm -f "$WARP_PID_FILE" "$WARP_PORT_FILE" "$WARP_CFG"
+  fi
+  WARP_OWN_PID=""; WARP_STARTED=0
+}
+
+forget_lane_config() {
+  [ "${GENERATED:-0}" = 1 ] && rm -f "$CFG"
   rm -f "$META_FILE"
 }
 
@@ -2865,10 +2882,7 @@ stop_all_lanes() {
         apply_instance
         GENERATED=0
         load_lane_meta || true
-        if [ "$GENERATED" = 1 ] ||
-           { [ ! -f "$META_FILE" ] && [ "$CFG" = "$CONF_DIR/lane$([ -n "$INSTANCE" ] && echo "-$INSTANCE").json" ]; }; then
-          forget+=("$CFG")
-        fi
+        [ "$GENERATED" = 1 ] && forget+=("$CFG")
         forget+=("$META_FILE")
       done
       for pidfile in "$CONF_DIR"/lane.meta "$CONF_DIR"/lane-*.meta; do
@@ -2881,6 +2895,9 @@ stop_all_lanes() {
         [ "$GENERATED" = 1 ] && forget+=("$CFG")
         forget+=("$META_FILE")
       done
+      for staged in "$CONF_DIR"/.lane*.json.stage.*; do
+        [ -e "$staged" ] && forget+=("$staged")
+      done
     done < "$LANES_FILE"
   fi
   CONF_DIR="$(resolve_real "$saved_conf")"
@@ -2891,10 +2908,7 @@ stop_all_lanes() {
     apply_instance
     GENERATED=0
     load_lane_meta || true
-    if [ "$GENERATED" = 1 ] ||
-       { [ ! -f "$META_FILE" ] && [ "$CFG" = "$CONF_DIR/lane$([ -n "$INSTANCE" ] && echo "-$INSTANCE").json" ]; }; then
-      forget+=("$CFG")
-    fi
+    [ "$GENERATED" = 1 ] && forget+=("$CFG")
     forget+=("$META_FILE")
   done
   for pidfile in "$CONF_DIR"/lane.meta "$CONF_DIR"/lane-*.meta; do
@@ -2906,6 +2920,9 @@ stop_all_lanes() {
     load_lane_meta || true
     [ "$GENERATED" = 1 ] && forget+=("$CFG")
     forget+=("$META_FILE")
+  done
+  for staged in "$CONF_DIR"/.lane*.json.stage.*; do
+    [ -e "$staged" ] && forget+=("$staged")
   done
   if [ "${#forget[@]}" -gt 0 ]; then
     pending_tmp="$pending.$$"
@@ -3170,7 +3187,7 @@ warp_ladder() {
 # An interruption before the lane exists can still leave the warp hop this
 # attempt started; stop only that, never a lane that was already running.
 interrupt_before_lane() {
-  [ "$WARP_STARTED" = 1 ] && stop_warp_hop
+  [ "$WARP_STARTED" = 1 ] && stop_owned_warp
   say "interrupted: the attempt was stopped; the log stays at $LOG."
 }
 
@@ -3181,7 +3198,7 @@ action_up() {
   for _ in 1 2; do
     trap 'interrupt_before_lane; exit 130' INT TERM
     if ! start_lane; then
-      [ "$WARP_STARTED" = 1 ] && stop_warp_hop
+      [ "$WARP_STARTED" = 1 ] && stop_owned_warp
       exit 1
     fi
     # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
@@ -3232,7 +3249,7 @@ action_serve() {
   for _ in 1 2; do
     trap 'interrupt_before_lane; exit 130' INT TERM
     if ! start_lane; then
-      [ "$WARP_STARTED" = 1 ] && stop_warp_hop
+      [ "$WARP_STARTED" = 1 ] && stop_owned_warp
       exit 1
     fi
     # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.

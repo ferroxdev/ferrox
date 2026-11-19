@@ -2768,6 +2768,10 @@ def check_instance_lifecycle(state: pathlib.Path) -> int:
         ),
         encoding="utf-8",
     )
+    (state / "lane-two.meta").write_text(
+        f"config={state / 'lane-two.json'}\nfronts=socks\ngenerated=1\n",
+        encoding="utf-8",
+    )
     env = env_for(state)
     env["FERROX_BIN"] = str(lane)
     try:
@@ -2814,6 +2818,29 @@ def check_instance_lifecycle(state: pathlib.Path) -> int:
                 file=sys.stderr,
             )
             return 1
+        for name, legacy in (("lane-backup", False), ("lane-legacy", True)):
+            (state / f"{name}.json").write_text(
+                '{"inbounds": [], "outbounds": []}\n', encoding="utf-8"
+            )
+            if legacy:
+                (state / f"{name}.meta").write_text(
+                    f"config={state / f'{name}.json'}\nfronts=\n", encoding="utf-8"
+                )
+            unknown = subprocess.run(
+                [str(CLI), "down", "--instance", name],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=WATCH,
+                env=env,
+            )
+            output += unknown.stdout + unknown.stderr
+            if unknown.returncode != 0 or not (state / f"{name}.json").exists():
+                print(
+                    f"check-cli-lane: down --instance deleted an unknown-owner config:\n{output}",
+                    file=sys.stderr,
+                )
+                return 1
     finally:
         for lane in (unnamed, named):
             if lane.poll() is None:
