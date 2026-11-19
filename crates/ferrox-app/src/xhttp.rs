@@ -4480,8 +4480,6 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// Reads are driven with a fixed CHUNK buffer, the way `relay_ordered` drives them, so the count is the reader's and not `read_to_end`'s buffer growth; `reads` is the counter that says so.
-    #[test]
     /// A steady read room is zeroed when the allocation grows, not once per fill: the same pointer and capacity answer a second read.
     #[test]
     fn a_second_fill_keeps_the_framing_buffers_allocation() {
@@ -4526,6 +4524,8 @@ mod tests {
         assert_eq!(reader.reads, 2, "one read per fill");
     }
 
+    /// Reads are driven with a fixed CHUNK buffer, the way `relay_ordered` drives them, so the count is the reader's and not `read_to_end`'s buffer growth; `reads` is the counter that says so.
+    #[test]
     fn a_chunk_costs_two_reads_not_three() {
         for count in [1usize, 2, 4, 8, 16] {
             let chunks: Vec<usize> = std::iter::repeat_n(CHUNK, count).collect();
