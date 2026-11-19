@@ -36827,7 +36827,7 @@ pub(crate) trait FrameWrite: Write + Send {
     fn clear_write_timeout(&mut self) {}
 
     /// Closes both directions of the transport, so a reader blocked beside this writer ends.
-    fn shutdown(&mut self) {}
+    fn shutdown_both(&mut self) {}
 }
 
 impl FrameWrite for Connection {
@@ -36852,7 +36852,7 @@ impl FrameWrite for Connection {
         let _ = self.set_write_timeout(None);
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown_both(&mut self) {
         let _ = Connection::shutdown(self, std::net::Shutdown::Both);
     }
 }

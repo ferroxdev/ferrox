@@ -3084,6 +3084,10 @@ impl crate::proxy::FrameWrite for Tail {
     fn arm_write(&mut self, timeout: Duration) {
         self.inner.arm_write(timeout);
     }
+
+    fn shutdown_both(&mut self) {
+        self.inner.shutdown_both();
+    }
 }
 
 fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
@@ -3428,7 +3432,7 @@ fn keepalive_wait(shared: &Shared, duration: Duration) -> bool {
 fn keepalive_stop(shared: &Shared) {
     shared.dead.store(true, Ordering::SeqCst);
     if let Ok(mut stream) = shared.stream.lock() {
-        stream.shutdown();
+        stream.shutdown_both();
     }
     shared.wake.notify_all();
 }
