@@ -201,12 +201,17 @@ jobs:
 
             Unpack the package for your platform. The engine and launcher are side by side; no cargo, repository, or config is needed.
 
-            ### What is new in this build
+            ### What this build carries
 
-            - **`--warp`**: chain any lane through a one-tap Cloudflare WARP registration (WireGuard, with the MASQUE dialect as its peer). No account and no client binary: `ferrox-cli up --foxy --warp`.
-            - **Foxy sign-in over WARP**: on the Foxy lane `--warp` is applied before the account plane, so the Firefox sign-in and the carrier catalogue see a WARP exit instead of a region block. An explicit `--upstream` still wins.
-            - **VMess share links**: `ferrox-cli up --vmess 'vmess://...'` reads the v2rayN base64-JSON form and the standard URI form, with the carrier, TLS, REALITY, ALPN, fingerprint and pin fields mapped the same way as VLESS. `--vmess HOST:PORT --uuid ID` still works. `--vless` now reads the full field set: every supported carrier, early data, `alpn`, `fp`, `allowInsecure`, certificate pins, verify names and REALITY's `pbk`/`sid`/`spx`/`pqv`.
-            - **More carriers on existing lanes**: xHTTP (including h2/h3 and stream modes), HTTP/3, MASQUE/Connect-UDP, REALITY over QUIC and KCP, and the Linux TUN system stack. Psiphon keeps CDN fronting and the wider establishment race.
+            - **`--udp-via`: one lane, two egresses.** Keep TCP on the Foxy lane and send every datagram — DNS included — through a second, tagged outbound in the same config. `warp` reuses the `--warp` hop or registers one; `psiphon` and `psiphon-cdn` ride Psiphon's udpgw; `direct` sends datagrams unencrypted; `block` drops them; `foxy` (the default) leaves the single-outbound config untouched. The catch-all `network: udp` rule fixes one association per lane instead of choosing per datagram; IPv4, IPv6 and port 53 behave alike, and a rule added through the management API before the first packet is the one dialled.
+            - **`--warp`: the WARP lane.** Chain any lane through a one-tap Cloudflare WARP registration that races WireGuard against its MASQUE dialect, with no account and no client binary: `ferrox-cli up --foxy --warp`, or `--udp-via warp` to put only datagrams there.
+            - **Foxy sign-in over WARP.** On the Foxy lane `--warp` is applied before the account plane, so the Firefox sign-in and the carrier catalogue see a WARP exit instead of a region block. An explicit `--upstream` still wins, and a 451 from the sign-in moves the lane onto the hop by itself once.
+            - **The Foxy lane.** A Firefox account is the only input; the edge comes from Mozilla's catalogue with `locations`, `location` and `--country`, and `--carrier` picks h1, h2 or the QUIC-h3 carrier that also carries UDP natively.
+            - **VeePN, with nothing typed.** Anonymous and serverless: the plane launches this device, names the region and lists the upstream pairs that answer, with `--region` to pin one.
+            - **Native Psiphon.** No account and no `psiphon-tunnel-core`: the lane fetches the signed server list and speaks OSSH/SSH itself. `--psiphon-cdn` adds CDN fronting and the wider establishment race, while `--psiphon-conduit-mode private` names the WebRTC path that needs volunteer relays.
+            - **Share links and custom configs.** VLESS, VMess (v2rayN base64-JSON and URI forms), Trojan, Shadowsocks/Shadowsocks-2022 and `--config` all use the same launcher. VLESS maps every carrier, early data, `alpn`, fingerprint, `allowInsecure`, certificate pins, verify names and REALITY's `pbk`/`sid`/`spx`/`pqv`.
+            - **Routing and ports.** `--exclude-domains` and `--exclude-ports` take named targets out of the tunnel; named `--instance` lanes keep separate configs, pids, logs and ports; every lane serves SOCKS5, HTTP+HTTPS and mixed fronts.
+            - **Carriers.** xHTTP (including h2/h3 and stream modes), HTTP/3, MASQUE/Connect-UDP, REALITY over QUIC and KCP, and the tree's own Linux TUN engine; the launcher still refuses `--tun` by name and says what that costs.
 
             These packages are rebuilt from the commit that carries this release; `SHA256SUMS` is regenerated for every asset, so a download from an older date cannot be mixed with this one.
 
@@ -251,6 +256,8 @@ jobs:
             | Shadowsocks | `HOST:PORT`, method, and password | `ferrox-cli up --ss host:8388 --method aes-256-gcm --password PW` |
             | Any config | a JSON config the binary serves | `ferrox-cli up --config mine.json` |
 
+            Every Foxy command above also accepts `--udp-via foxy|warp|psiphon|psiphon-cdn|direct|block` to split TCP and UDP inside one lane.
+
             Psiphon is native: the lane fetches the signed server list and speaks OSSH/SSH itself, with no `psiphon-tunnel-core` and no account.
 
             Direct SSH/OSSH:
@@ -293,7 +300,7 @@ jobs:
 
             All lanes serve the same loopback fronts: SOCKS5 `127.0.0.1:10808`, HTTP and HTTPS `127.0.0.1:8080`, and mixed `127.0.0.1:10809`.
 
-            `--vpn` points the system proxy at those fronts only after a real flow answers. It is supported on macOS by `ferrox-cli.sh` and on Windows by `ferrox-cli.exe`. Without `--vpn`, point apps at a front directly. This build does not create a TUN device, so apps that ignore proxies and raw UDP are not captured.
+            `--vpn` points the system proxy at those fronts only after a real flow answers. It is supported on macOS by `ferrox-cli.sh` and on Windows by `ferrox-cli.exe`. Without `--vpn`, point apps at a front directly. The launcher does not offer a TUN device: `--tun` and `ferrox-cli tun` refuse by name and explain that apps which ignore proxies, and raw UDP without `--udp-via`, are not captured.
 
             | package | platform |
             | --- | --- |
