@@ -1035,6 +1035,7 @@ fn inbound_sockets(inbound: &Json, protocol: &str) -> (bool, bool) {
                 // CR-029: a tcp carrier still serves when its optional udp front loses the bind, so only preflight a udp-only inbound.
                 Carrier::Raw(_) => (tcp, udp && !tcp),
                 Carrier::Xhttp { .. } if inbound_is_xhttp_h3(inbound) => (false, true),
+                Carrier::Xdrive { .. } => (false, false),
                 _ => (tcp, false),
             }
         }
@@ -1075,8 +1076,6 @@ fn preflight_tcp(
     Ok(Some(Reservation::Tcp(listener)))
 }
 
-/// Bind every socket a dynamic inbound would open before serving any of them, so a port already
-/// taken refuses the whole add and nothing is left behind.
 fn dokodemo_transparent_mode(inbound: &Json) -> Option<crate::sockopt::Tproxy> {
     let settings = inbound.get("settings");
     let follow = settings
@@ -1097,6 +1096,7 @@ fn dokodemo_transparent_mode(inbound: &Json) -> Option<crate::sockopt::Tproxy> {
     }
 }
 
+/// Bind every socket a dynamic inbound opens before serving any, so one taken port refuses the whole add.
 fn preflight_inbound(inbound: &Json, protocol: &str, addresses: &[String]) -> Result<(), String> {
     let (tcp, udp) = inbound_sockets(inbound, protocol);
     // A transparent door binds its sockets with options plain `bind` cannot set.
@@ -73977,9 +73977,10 @@ mod tests {
         while let Ok((written, info)) = conn.send(&mut out) {
             sock.send_to(&out[..written], info.to).expect("pumps");
         }
-        // Read until the echo returns over the lane, driving the connection so the reply's packets are delivered.
+        // Read until the echo returns over the lane, driving the connection so the reply's packets are delivered; then repeat with a header-only frame that carries no payload.
         sock.set_read_timeout(Some(Duration::from_millis(200)))
             .expect("timeout");
+        let mut echoed = false;
         loop {
             assert!(std::time::Instant::now() < horizon, "echo never returns");
             if let Ok((n, from)) = sock.recv_from(&mut out) {
@@ -73990,9 +73991,28 @@ mod tests {
                 let _ = sock.send_to(&out[..written], info.to);
             }
             if let Ok(data) = conn.dgram_recv_buf() {
-                let got = ferrox_core::hysteria::decode_udp(&data).expect("decodes");
-                if got.session == 1 && got.payload == b"hello" {
-                    assert_eq!(got.address, address);
+                let got = ferrox_core::hysteria::decode_udp_allow_empty(&data).expect("decodes");
+                if got.session != 1 {
+                    continue;
+                }
+                assert_eq!(got.address, address);
+                if !echoed && got.payload == b"hello" {
+                    echoed = true;
+                    let empty = ferrox_core::hysteria::UdpMessage {
+                        session: 1,
+                        packet: 2,
+                        frag: 0,
+                        frags: 1,
+                        address: &address,
+                        payload: b"",
+                    };
+                    let mut wire = Vec::new();
+                    ferrox_core::hysteria::encode_udp_unchecked(&empty, &mut wire);
+                    conn.dgram_send(&wire).expect("sends");
+                    while let Ok((written, info)) = conn.send(&mut out) {
+                        sock.send_to(&out[..written], info.to).expect("pumps");
+                    }
+                } else if echoed && got.payload.is_empty() {
                     return;
                 }
             }

@@ -92,18 +92,20 @@ impl Client {
     /// rendezvous itself names `http` — the scheme already chose which one travels.
     fn open(&self) -> Option<DynStream> {
         self.open_with_timeout(Some(Duration::from_secs(5)))
+            .map(|(stream, _)| stream)
     }
 
-    fn open_with_timeout(&self, read_timeout: Option<Duration>) -> Option<DynStream> {
+    fn open_with_timeout(&self, read_timeout: Option<Duration>) -> Option<(DynStream, TcpStream)> {
         let address: SocketAddr = format!("{}:{}", self.host, self.port)
             .to_socket_addrs()
             .ok()?
             .next()?;
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).ok()?;
+        let interrupt = stream.try_clone().ok()?;
         let _ = stream.set_read_timeout(read_timeout);
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
         if !self.is_https() {
-            return Some(Box::new(stream));
+            return Some((Box::new(stream), interrupt));
         }
         let config = ferrox_core::tls::TlsConfig {
             server_name: self.host.clone(),
@@ -113,7 +115,7 @@ impl Client {
             ..Default::default()
         };
         let tls = ferrox_core::tls::connect(&config, stream).ok()?;
-        Some(Box::new(tls))
+        Some((Box::new(tls), interrupt))
     }
 
     fn host_header(&self) -> String {
@@ -212,8 +214,13 @@ impl Client {
     /// forever. A non-2xx reply ends the open instead of
     /// the punches the loop would otherwise read off the error body.
     #[must_use]
-    pub(crate) fn open_events(&self, id: &str, session: &str) -> Option<EventStream> {
-        let mut stream = self.open_with_timeout(Some(Duration::from_secs(60)))?;
+    pub(crate) fn open_events(
+        &self,
+        id: &str,
+        session: &str,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<EventStream> {
+        let (mut stream, interrupt) = self.open_with_timeout(Some(Duration::from_secs(60)))?;
         let host_header = self.host_header();
         let path = join_path(id, "events");
         let mut request = Vec::with_capacity(128);
@@ -257,6 +264,8 @@ impl Client {
             reader: BufReader::new(source),
             event: String::new(),
             data: String::new(),
+            stop,
+            interrupt,
         })
     }
 }
@@ -357,6 +366,8 @@ pub(crate) struct EventStream {
     reader: BufReader<Box<dyn Read + Send>>,
     event: String,
     data: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    interrupt: TcpStream,
 }
 
 impl EventStream {
@@ -366,6 +377,9 @@ impl EventStream {
     #[must_use]
     pub(crate) fn next_punch(&mut self) -> Option<(Vec<SocketAddr>, Metadata)> {
         loop {
+            if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
             let mut line = String::new();
             if self.reader.read_line(&mut line).ok()? == 0 {
                 return None;
@@ -694,6 +708,7 @@ pub(crate) fn dial_peer(socket: &UdpSocket, config: &Config) -> Option<SocketAdd
 /// senders.
 #[allow(clippy::type_complexity)]
 pub(crate) struct RealmState {
+    events: std::sync::Mutex<Option<TcpStream>>,
     stun: std::sync::Mutex<
         std::collections::HashMap<
             [u8; ferrox_core::stun::TRANSACTION_SIZE],
@@ -713,9 +728,33 @@ impl RealmState {
     #[must_use]
     pub(crate) fn new() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
+            events: std::sync::Mutex::new(None),
             stun: std::sync::Mutex::new(std::collections::HashMap::new()),
             punch: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Remember the events socket a stop must interrupt.
+    pub(crate) fn watch_events(&self, stream: TcpStream) {
+        if let Ok(mut slot) = self.events.lock() {
+            *slot = Some(stream);
+        }
+    }
+
+    /// Forget the events socket once its stream ends.
+    pub(crate) fn clear_events(&self) {
+        if let Ok(mut slot) = self.events.lock() {
+            let _ = slot.take();
+        }
+    }
+
+    /// Shut the events socket so a blocked read returns.
+    pub(crate) fn interrupt_events(&self) {
+        if let Ok(mut slot) = self.events.lock() {
+            if let Some(stream) = slot.take() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
     }
 }
 
@@ -976,7 +1015,9 @@ pub(crate) fn serve_registration(
             let _ = events_client.deregister(&config.id, &session);
             return;
         }
-        let Some(mut stream) = events_client.open_events(&config.id, &session) else {
+        let Some(mut stream) =
+            events_client.open_events(&config.id, &session, std::sync::Arc::clone(&stop))
+        else {
             session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
             napping(backoff.min(Duration::from_secs(30)), || {
                 stop.load(std::sync::atomic::Ordering::Relaxed)
@@ -984,6 +1025,14 @@ pub(crate) fn serve_registration(
             backoff = (backoff * 2).min(Duration::from_secs(30));
             continue;
         };
+        if let Some(handle) = stream.interrupt_handle() {
+            state.watch_events(handle);
+        }
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            state.clear_events();
+            session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         backoff = Duration::from_secs(1);
         while let Some((peer_addresses, meta)) = stream.next_punch() {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1008,6 +1057,7 @@ pub(crate) fn serve_registration(
             });
         }
         // The stream ended: re-register with the same backoff a refused register pays.
+        state.clear_events();
         session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         napping(backoff.min(Duration::from_secs(30)), || {
             stop.load(std::sync::atomic::Ordering::Relaxed)

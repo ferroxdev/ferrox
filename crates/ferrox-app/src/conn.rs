@@ -2868,6 +2868,7 @@ fn take_stale(path: &std::path::Path, stale: Option<(u64, u64)>) -> io::Result<(
     let Some((dev, ino)) = stale else {
         return Ok(());
     };
+    // The inode check and unlink are not atomic across processes, so a replacement can slip between them.
     match std::fs::symlink_metadata(path) {
         Ok(meta) if (meta.dev(), meta.ino()) == (dev, ino) => std::fs::remove_file(path),
         Ok(_) => Err(io::Error::new(
@@ -2956,6 +2957,7 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
                     io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                 ) =>
             {
+                // The refused probe and unlink are not atomic across processes, so a replacement can slip between them.
                 std::fs::remove_file(path)?
             }
             Err(error) => return Err(error),

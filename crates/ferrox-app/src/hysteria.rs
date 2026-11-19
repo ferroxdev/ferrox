@@ -1467,6 +1467,7 @@ struct UdpFlow {
     defrag: Defrag,
     last: Instant,
     stop: Arc<AtomicBool>,
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 fn answer_auth(
@@ -2174,7 +2175,7 @@ fn open_udp(
     target.set_read_timeout(Some(UDP_POLL)).ok()?;
     let target = Arc::new(target);
     let stop = Arc::new(AtomicBool::new(false));
-    std::thread::spawn({
+    let reader = std::thread::spawn({
         let shared = Arc::clone(shared);
         let sock = Arc::clone(sock);
         let target = Arc::clone(&target);
@@ -2187,6 +2188,7 @@ fn open_udp(
         defrag: Defrag::new(),
         last: Instant::now(),
         stop,
+        reader: Some(reader),
     })
 }
 
@@ -2238,7 +2240,7 @@ fn udp_reader(
             address,
             payload: &buf[..n],
         };
-        let Ok(fragments) = hysteria::fragments_udp(&message, max) else {
+        let Ok(fragments) = hysteria::fragments_udp_allow_empty(&message, max) else {
             break;
         };
         for frag in fragments {
@@ -2363,7 +2365,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
             address,
             payload,
         };
-        let Ok(fragments) = hysteria::fragments_udp(&message, max) else {
+        let Ok(fragments) = hysteria::fragments_udp_allow_empty(&message, max) else {
             continue;
         };
         for frag in fragments {
@@ -2400,7 +2402,7 @@ fn take_reply<'a>(
         .defrag
         .lock()
         .ok()?
-        .feed(message, assembled)
+        .feed_allow_empty(message, assembled)
         .ok()
         .flatten()
         .map(|(_address, payload)| payload)?;
@@ -2419,7 +2421,7 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
         }
         while let Some(data) = recv_one(session.shared.as_ref(), |conn| conn.dgram_recv_buf().ok())
         {
-            let Ok(message) = hysteria::decode_udp(&data) else {
+            let Ok(message) = hysteria::decode_udp_allow_empty(&data) else {
                 continue;
             };
             let Some((destination, src, payload)) =
@@ -2445,7 +2447,7 @@ fn relay_datagrams(
         return;
     }
     while let Ok(data) = conn.dgram_recv_buf() {
-        let Ok(message) = hysteria::decode_udp(&data) else {
+        let Ok(message) = hysteria::decode_udp_allow_empty(&data) else {
             continue;
         };
         let session = message.session;
@@ -2463,7 +2465,7 @@ fn relay_datagrams(
             }
         };
         let mut assembled = Vec::new();
-        let whole = flow.defrag.feed(&message, &mut assembled);
+        let whole = flow.defrag.feed_allow_empty(&message, &mut assembled);
         flow.last = Instant::now();
         let forged = whole.is_err();
         match whole {
@@ -3118,6 +3120,27 @@ pub(crate) fn serve_prepared(
         }
     }
     realm_stop.store(true, Ordering::SeqCst);
+    if let Some(state) = router.realm_state.as_ref() {
+        state.interrupt_events();
+    }
+    let mut readers = Vec::new();
+    for inbound in router.routes.values_mut() {
+        if inbound.udp.is_empty() {
+            continue;
+        }
+        for (_, mut flow) in inbound.udp.drain() {
+            flow.stop.store(true, Ordering::Relaxed);
+            if let Some(reader) = flow.reader.take() {
+                readers.push(reader);
+            }
+        }
+        if let Ok(mut conn) = inbound.conn.lock() {
+            let _ = conn.close(true, 0, b"");
+        }
+    }
+    for reader in readers {
+        let _ = reader.join();
+    }
     if let Some(worker) = realm_worker {
         let _ = worker.join();
     }
@@ -3833,6 +3856,7 @@ mod tests {
                         .checked_sub(Duration::from_secs(6))
                         .expect("six seconds ago"),
                     stop: Arc::clone(&stop),
+                    reader: None,
                 },
             );
             let mut by_scid = HashMap::new();
