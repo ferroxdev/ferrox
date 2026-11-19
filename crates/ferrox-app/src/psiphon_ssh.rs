@@ -1934,19 +1934,12 @@ impl Session {
             return Err("psiphon ssh: establishment deadline expired before api".to_owned());
         }
         let api_timeout = api_timeout.unwrap_or(left).min(left);
+        let api_deadline = Instant::now() + api_timeout;
         output
-            .clear_deadline()
+            .set_deadline(api_deadline)
             .map_err(|error| format!("psiphon ssh api timeout: {error}"))?;
         input
-            .clear_deadline()
-            .map_err(|error| format!("psiphon ssh api timeout: {error}"))?;
-        output
-            .io
-            .set_timeout(Some(api_timeout))
-            .map_err(|error| format!("psiphon ssh api timeout: {error}"))?;
-        input
-            .io
-            .set_timeout(Some(api_timeout))
+            .set_deadline(api_deadline)
             .map_err(|error| format!("psiphon ssh api timeout: {error}"))?;
         // A legacy entry or TargetAPIProtocol=web speaks the API over tunneled HTTPS instead.
         let web_api = !server.ssh_api || identity.api_protocol == ApiProtocol::Web;
@@ -1964,12 +1957,10 @@ impl Session {
             )?
         };
         output
-            .io
-            .set_timeout(None)
+            .clear_deadline()
             .map_err(|error| format!("psiphon ssh api timeout: {error}"))?;
         input
-            .io
-            .set_timeout(None)
+            .clear_deadline()
             .map_err(|error| format!("psiphon ssh api timeout: {error}"))?;
         control
             .set_timeout(None)
@@ -3836,7 +3827,7 @@ impl PacketWriter {
             IoSlice::new(&tag),
         ];
         let count = if signed { 4 } else { 3 };
-        write_vectored_all(&mut self.io, &mut slices[..count])
+        write_vectored_all(&mut self.io, self.deadline, &mut slices[..count])
     }
 
     fn set_deadline(&mut self, deadline: Instant) -> io::Result<()> {
@@ -3876,8 +3867,7 @@ impl PacketWriter {
         if let Some(obfuscation) = self.obfuscation.as_mut() {
             obfuscation.apply(&mut self.scratch[..total]);
         }
-        arm_deadline(&self.io, self.deadline)?;
-        self.io.write_all(&self.scratch[..total])
+        write_all_deadline(&mut self.io, self.deadline, &self.scratch[..total])
     }
 }
 
@@ -3958,8 +3948,7 @@ impl PacketReader {
         }
         let taken = self.take_pending(&mut buffer[..self.block]);
         if taken < self.block {
-            arm_deadline(&self.io, self.deadline)?;
-            self.io.read_exact(&mut buffer[taken..self.block])?;
+            read_exact_deadline(&mut self.io, self.deadline, &mut buffer[taken..self.block])?;
         }
         if let Some(obfuscation) = self.obfuscation.as_mut() {
             obfuscation.apply(&mut buffer[..self.block]);
@@ -3985,9 +3974,11 @@ impl PacketReader {
         }
         let taken = self.take_pending(&mut buffer[self.block..framed]);
         if taken < framed - self.block {
-            arm_deadline(&self.io, self.deadline)?;
-            self.io
-                .read_exact(&mut buffer[self.block + taken..framed])?;
+            read_exact_deadline(
+                &mut self.io,
+                self.deadline,
+                &mut buffer[self.block + taken..framed],
+            )?;
         }
         if let Some(obfuscation) = self.obfuscation.as_mut() {
             obfuscation.apply(&mut buffer[self.block..total]);
@@ -4057,8 +4048,13 @@ fn tag_bytes(tag: hmac::Tag) -> [u8; 32] {
     bytes
 }
 
-fn write_vectored_all(io: &mut Stream, mut slices: &mut [IoSlice<'_>]) -> io::Result<()> {
+fn write_vectored_all(
+    io: &mut Stream,
+    deadline: Option<Instant>,
+    mut slices: &mut [IoSlice<'_>],
+) -> io::Result<()> {
     while !slices.is_empty() {
+        arm_deadline(io, deadline)?;
         let written = match io.write_vectored(slices) {
             Ok(written) => written,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -4099,10 +4095,52 @@ fn write_all(writer: &mut PacketWriter, bytes: &[u8]) -> Result<(), String> {
     if let Some(obfuscation) = writer.obfuscation.as_mut() {
         obfuscation.apply(&mut bytes);
     }
-    writer
-        .io
-        .write_all(&bytes)
+    write_all_deadline(&mut writer.io, writer.deadline, &bytes)
         .map_err(|error| format!("psiphon ssh write: {error}"))
+}
+
+fn read_exact_deadline(
+    io: &mut Stream,
+    deadline: Option<Instant>,
+    mut out: &mut [u8],
+) -> io::Result<()> {
+    while !out.is_empty() {
+        arm_deadline(io, deadline)?;
+        match io.read(out) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ))
+            }
+            Ok(read) => out = &mut out[read..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_all_deadline(
+    io: &mut Stream,
+    deadline: Option<Instant>,
+    mut bytes: &[u8],
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        arm_deadline(io, deadline)?;
+        match io.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ))
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Read the server banner, retaining bytes read past its newline.
