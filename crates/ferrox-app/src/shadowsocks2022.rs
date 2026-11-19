@@ -574,15 +574,16 @@ pub(crate) fn serve_xhttp_accepted(
     serve_accepted(accepted, reader, writer, close);
 }
 
-pub(crate) fn serve_httpheader(
+pub(crate) fn serve_httpheader_with(
     stream: Connection,
     password: &str,
     method: &str,
     identities: &[(String, u32)],
     path: &str,
     freedom: bool,
+    response: Option<&[u8]>,
 ) {
-    let Some((mut reader, writer)) = crate::httpheader::accept(stream, path) else {
+    let Some((mut reader, writer)) = crate::httpheader::accept(stream, path, response) else {
         return;
     };
     let Some(accepted) = accept_on(&mut reader, password, method, identities, freedom) else {

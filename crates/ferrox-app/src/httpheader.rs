@@ -62,7 +62,14 @@ fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
     crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
 }
 
-pub(crate) fn accept(stream: Connection, path: &str) -> Option<(HeadReader, Connection)> {
+const DEFAULT_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+
+pub(crate) fn accept(
+    stream: Connection,
+    path: &str,
+    response: Option<&[u8]>,
+) -> Option<(HeadReader, Connection)> {
     let mut read = stream;
     let (head, at) = read_head(&mut read)?;
     check_request(&head[..at], path)?;
@@ -70,9 +77,7 @@ pub(crate) fn accept(stream: Connection, path: &str) -> Option<(HeadReader, Conn
         return None;
     };
     let mut write = write;
-    write
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
-        .ok()?;
+    write.write_all(response.unwrap_or(DEFAULT_RESPONSE)).ok()?;
     Some((HeadReader::new(read, head, at), write))
 }
 
@@ -88,13 +93,12 @@ pub(crate) fn accept_split<R: Read, W: Write>(
     mut read: R,
     mut write: W,
     path: &str,
+    response: Option<&[u8]>,
 ) -> Option<(HeadReader<R>, W)> {
     let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_request(&head[..at], path)?;
-    write
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
-        .ok()?;
+    write.write_all(response.unwrap_or(DEFAULT_RESPONSE)).ok()?;
     Some((HeadReader::new(read, head, at), write))
 }
 
@@ -143,7 +147,9 @@ pub(crate) fn connect(
 fn check_response(head: &[u8]) -> Option<()> {
     let end = ferrox_core::foxy::line_end(head)?;
     let mut parts = head[..end].split(|byte| *byte == b' ');
-    if parts.next()? != b"HTTP/1.1" || parts.next()? != b"200" {
+    let version = parts.next()?;
+    let status = parts.next()?;
+    if !version.starts_with(b"HTTP/1.") || status.len() != 3 || status[0] != b'2' {
         return None;
     }
     Some(())
@@ -175,7 +181,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            let (mut reader, mut write) = accept(stream, "/camouflage").expect("headers");
+            let (mut reader, mut write) = accept(stream, "/camouflage", None).expect("headers");
             let mut buf = [0u8; 4];
             reader.read_exact(&mut buf).expect("reads");
             assert_eq!(&buf, b"ping");
@@ -215,6 +221,41 @@ mod tests {
         server.join().expect("joins");
     }
 
+    #[test]
+    fn a_custom_204_response_is_accepted() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).expect("reads");
+                head.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .expect("writes");
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        connect(stream, "oracle.example", "/camouflage", &[]).expect("accepts the response");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn a_configured_response_is_the_one_the_carrier_sends() {
+        let head = b"GET /camouflage HTTP/1.1\r\nHost: h\r\n\r\n";
+        let response = b"HTTP/1.1 204 No Content\r\nX-Camo: 1\r\n\r\n";
+        let (_reader, writer) = accept_split(
+            std::io::Cursor::new(head),
+            Vec::new(),
+            "/camouflage",
+            Some(response),
+        )
+        .expect("answers");
+        assert_eq!(writer, response);
+    }
+
     /// The record arm takes the buffer its own head read filled, head octets and all: what rode behind the delimiter is handed over inside it, not copied into a second owner.
     #[test]
     fn the_record_head_hands_over_the_buffer_it_filled() {
@@ -223,7 +264,8 @@ mod tests {
         let mut wire = Vec::from(HEAD);
         wire.extend_from_slice(TAIL);
         let (reader, _write) =
-            accept_split(std::io::Cursor::new(wire), Vec::new(), "/camouflage").expect("answers");
+            accept_split(std::io::Cursor::new(wire), Vec::new(), "/camouflage", None)
+                .expect("answers");
         assert_eq!(reader.at, HEAD.len(), "the cursor sits past the head");
         assert_eq!(
             reader.prefix.len(),
@@ -384,7 +426,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            assert!(accept(stream, "/camouflage").is_none());
+            assert!(accept(stream, "/camouflage", None).is_none());
         });
         let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream

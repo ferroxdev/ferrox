@@ -362,14 +362,17 @@ pub(crate) struct Routing {
 
 /// One server inbound's fixed direct dial, checked against the rules that can reach it — at startup,
 /// and against a candidate table before `AddRule` writes it.
-#[derive(Clone, Copy)]
 pub(crate) struct ServerProof<'a> {
     pub inbound: Option<&'a str>,
     pub default_direct: bool,
     /// The target networks the inbound serves: a stream-only lane cannot reach a datagram rule.
     pub networks: &'a [Network],
-    /// Whether a plain outbound tag dials direct: the default tag or a freedom outbound.
-    pub direct: &'a dyn Fn(&str) -> bool,
+    /// Whether a plain outbound tag needs no dial here: a freedom outbound or the default direct lane.
+    pub direct: Box<dyn Fn(&str) -> bool + 'a>,
+    /// Whether this inbound's direct handler enforces the policy that tag's lane selects.
+    pub direct_policy: Box<dyn Fn(&str) -> bool + 'a>,
+    /// Whether a rule selects a portal for the exact domain that portal carries.
+    pub portal_rule: Box<dyn Fn(&Rule) -> bool + 'a>,
     /// Each balancer's resolved candidate tags, so every tag it can pick is checked too.
     pub candidates: &'a HashMap<String, Vec<String>>,
     pub fallbacks: &'a HashMap<String, String>,
@@ -945,7 +948,7 @@ impl Names<'_> {
 }
 
 #[derive(Debug)]
-struct Rule {
+pub(crate) struct Rule {
     target: String,
     balancer: bool,
     tag: Option<String>,
@@ -966,6 +969,38 @@ struct Rule {
     process: Option<ProcessSelector>,
     webhook: Option<Arc<crate::webhook::Webhook>>,
     sets: Option<Vec<Arc<RuleSet>>>,
+}
+
+impl Rule {
+    /// The outbound or balancer tag this rule selects.
+    pub(crate) fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// Whether every name this rule can match is exactly `domain`, so a portal's own domain handler
+    /// is the only path it can take.
+    pub(crate) fn only_matches_domain(&self, domain: &str) -> bool {
+        !self.balancer
+            && self.inbound_tags.is_none()
+            && self.networks.is_none()
+            && self.local_os.is_none()
+            && self.ports.is_none()
+            && self.source_ports.is_none()
+            && self.local_ports.is_none()
+            && self.ips.is_none()
+            && self.source_ips.is_none()
+            && self.local_ips.is_none()
+            && self.protocols.is_none()
+            && self.users.is_none()
+            && self.vless_routes.is_none()
+            && self.attrs.is_none()
+            && self.process.is_none()
+            && self.sets.is_none()
+            && self
+                .domains
+                .as_ref()
+                .is_some_and(|matcher| matcher.only_matches(domain))
+    }
 }
 
 /// One `ruleSet`/`rule_set` entry. A flow matches when any of its headless rules does; each rule is
@@ -1588,6 +1623,25 @@ impl Routing {
             .collect()
     }
 
+    /// The portal tags a server inbound may attach to: a reachable rule names the portal and the
+    /// exact domain that portal carries, the same proof `server_routes` accepts at startup.
+    pub(crate) fn portal_targets(
+        &self,
+        inbound: Option<&str>,
+        portal: &dyn Fn(&str) -> bool,
+        domain: &dyn Fn(&str) -> Option<String>,
+    ) -> Vec<String> {
+        self.rules
+            .iter()
+            .filter(|rule| {
+                rule.reachable(inbound, Network::Tcp)
+                    && portal(rule.target())
+                    && domain(rule.target()).is_some_and(|domain| rule.only_matches_domain(&domain))
+            })
+            .map(|rule| rule.target().to_owned())
+            .collect()
+    }
+
     /// The tag `OverrideBalancerTarget` forced on a balancer, when one is active.
     fn forced_tag(&self, tag: &str) -> Option<String> {
         let forced = self.balancer(tag)?.forced();
@@ -1606,9 +1660,11 @@ impl Routing {
             default_direct,
             networks,
             direct,
+            direct_policy,
+            portal_rule,
             candidates,
             fallbacks,
-        } = *proof;
+        } = proof;
         if script {
             return Err(format!(
                 "inbound {} names a routing script, which the server inbound cannot evaluate",
@@ -1617,7 +1673,7 @@ impl Routing {
         }
         // Stop at the first direct rule covering a network; later rules cannot decide it.
         let mut open = [false; 2];
-        for network in networks {
+        for network in *networks {
             match network {
                 Network::Tcp => open[0] = true,
                 Network::Udp => open[1] = true,
@@ -1629,28 +1685,27 @@ impl Routing {
                 continue;
             }
             let reaches = [
-                open[0] && rule.server_reachable(inbound, Network::Tcp),
-                open[1] && rule.server_reachable(inbound, Network::Udp),
+                open[0] && rule.server_reachable(*inbound, Network::Tcp),
+                open[1] && rule.server_reachable(*inbound, Network::Udp),
             ];
             if !reaches[0] && !reaches[1] {
                 continue;
             }
             // A rule naming a fact the server flow does not carry still gates the target.
             let dials_direct = if rule.balancer {
-                let forced_tag = forced(&rule.target);
-                if let Some(tag) = forced_tag.as_deref() {
-                    direct(tag)
+                if let Some(tag) = forced(&rule.target) {
+                    direct(&tag) && direct_policy(&tag)
                 } else {
                     let list = candidates.get(&rule.target).map_or(&[][..], Vec::as_slice);
                     let fallback = fallbacks.get(&rule.target);
-                    list.iter().all(|tag| direct(tag))
-                        && fallback.is_none_or(|tag| direct(tag))
+                    list.iter().all(|tag| direct(tag) && direct_policy(tag))
+                        && fallback.is_none_or(|tag| direct(tag) && direct_policy(tag))
                         && (fallback.is_some()
-                            || default_direct
+                            || *default_direct
                             || (always_picks.contains(rule.target.as_str()) && !list.is_empty()))
                 }
             } else {
-                direct(&rule.target)
+                (direct(&rule.target) && direct_policy(&rule.target)) || portal_rule(rule)
             };
             if !dials_direct {
                 return Err(format!(
@@ -1677,7 +1732,7 @@ impl Routing {
         if !open[0] && !open[1] {
             return Ok(());
         }
-        if default_direct {
+        if *default_direct {
             Ok(())
         } else {
             Err(format!(
@@ -2843,6 +2898,19 @@ impl DomainMatcher {
                 }
             }
         }
+    }
+
+    pub(crate) fn only_matches(&self, domain: &str) -> bool {
+        !self.full.entries.is_empty()
+            && self
+                .full
+                .entries
+                .iter()
+                .all(|(_, value)| value.eq_ignore_ascii_case(domain))
+            && self.suffix.entries.is_empty()
+            && self.suffix_only.entries.is_empty()
+            && self.substr.is_empty()
+            && self.regex.is_empty()
     }
 
     pub(crate) fn matches(&self, host: &str, lower: &str) -> bool {
@@ -5834,7 +5902,9 @@ mod tests {
             inbound,
             default_direct,
             networks,
-            direct: &direct,
+            direct: Box::new(move |tag| direct(tag)),
+            direct_policy: Box::new(|_| true),
+            portal_rule: Box::new(|_| false),
             candidates: &candidates,
             fallbacks: &fallbacks,
         };
@@ -5916,7 +5986,9 @@ mod tests {
             inbound: Some("server"),
             default_direct: true,
             networks: &both,
-            direct: &direct,
+            direct: Box::new(move |tag| direct(tag)),
+            direct_policy: Box::new(|_| true),
+            portal_rule: Box::new(|_| false),
             candidates: &candidates,
             fallbacks: &fallbacks,
         };
@@ -5972,7 +6044,9 @@ mod tests {
             inbound: Some("server"),
             default_direct: true,
             networks: &both,
-            direct: &direct,
+            direct: Box::new(move |tag| direct(tag)),
+            direct_policy: Box::new(|_| true),
+            portal_rule: Box::new(|_| false),
             candidates: &candidates,
             fallbacks: &fallbacks,
         };
@@ -6018,7 +6092,9 @@ mod tests {
             inbound: Some("server"),
             default_direct: false,
             networks: &both,
-            direct: &direct,
+            direct: Box::new(move |tag| direct(tag)),
+            direct_policy: Box::new(|_| true),
+            portal_rule: Box::new(|_| false),
             candidates: &candidates,
             fallbacks: &fallbacks,
         };
@@ -6106,7 +6182,9 @@ mod tests {
             inbound: Some("server"),
             default_direct: true,
             networks: &both,
-            direct: &direct,
+            direct: Box::new(move |tag| direct(tag)),
+            direct_policy: Box::new(|_| true),
+            portal_rule: Box::new(|_| false),
             candidates: &candidates,
             fallbacks: &fallbacks,
         };
@@ -6323,7 +6401,9 @@ mod tests {
             inbound: Some("server"),
             default_direct: true,
             networks: &both,
-            direct: &|_| true,
+            direct: Box::new(|_| true),
+            direct_policy: Box::new(|_| true),
+            portal_rule: Box::new(|_| false),
             candidates: &HashMap::new(),
             fallbacks: &HashMap::new(),
         };

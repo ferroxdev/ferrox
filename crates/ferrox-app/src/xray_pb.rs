@@ -25,6 +25,7 @@ pub(crate) struct Seed {
     pub(crate) stats: bool,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn to_json_seeded(bytes: &[u8]) -> Result<(Json, Seed), String> {
     let mut reader = Reader::new(bytes, "xray.core.Config");
     let mut inbounds = Vec::new();
@@ -34,6 +35,8 @@ pub(crate) fn to_json_seeded(bytes: &[u8]) -> Result<(Json, Seed), String> {
     let mut dns = None;
     let mut observatory = None;
     let mut burst_observatory = None;
+    let mut metrics = None;
+    let mut reverse = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
@@ -81,6 +84,18 @@ pub(crate) fn to_json_seeded(bytes: &[u8]) -> Result<(Json, Seed), String> {
                         }
                         observatory = Some(observatory_settings(value)?);
                     }
+                    "xray.app.reverse.Config" => {
+                        if reverse.is_some() {
+                            return Err("xray.core.Config: two reverse apps".to_owned());
+                        }
+                        reverse = Some(reverse_settings(value)?);
+                    }
+                    "xray.app.metrics.Config" => {
+                        if metrics.is_some() {
+                            return Err("xray.core.Config: two metrics apps".to_owned());
+                        }
+                        metrics = Some(metrics_settings(value)?);
+                    }
                     "xray.app.observatory.burst.Config" => {
                         if burst_observatory.is_some() {
                             return Err("xray.core.Config: two burst observatory apps".to_owned());
@@ -109,6 +124,12 @@ pub(crate) fn to_json_seeded(bytes: &[u8]) -> Result<(Json, Seed), String> {
     }
     if seed.stats {
         pairs.push(("stats", Json::Obj(Vec::new())));
+    }
+    if let Some(metrics) = metrics {
+        pairs.push(("metrics", metrics));
+    }
+    if let Some(reverse) = reverse {
+        pairs.push(("reverse", reverse));
     }
     if let Some(observatory) = observatory {
         pairs.push(("observatory", observatory));
@@ -181,10 +202,7 @@ pub(crate) fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
         receiver.ok_or("xray.core.InboundHandlerConfig: no receiver settings")?;
     let (name, value) = settings.ok_or("xray.core.InboundHandlerConfig: no proxy settings")?;
     let (protocol, inbound_settings) = match name.as_str() {
-        "xray.proxy.http.ServerConfig" => {
-            http_settings(value)?;
-            ("http", Json::Null)
-        }
+        "xray.proxy.http.ServerConfig" => ("http", http_settings(value)?),
         "xray.proxy.dokodemo.Config" => ("dokodemo-door", dokodemo_settings(value)?),
         "xray.proxy.vmess.inbound.Config" => ("vmess", vmess_inbound_settings(value)?),
         "xray.proxy.vless.inbound.Config" => ("vless", vless_inbound_settings(value)?),
@@ -977,10 +995,11 @@ fn socket_custom(bytes: &[u8]) -> Result<Json, String> {
 /// `security_type` name selects from the carried settings. An absent protocol name is xray's
 /// own default (`tcp`), and a named security whose settings bytes are absent is that type's
 /// zero value, which is how the reference reads it (`GetEffectiveSecuritySettings`).
+#[allow(clippy::too_many_lines)]
 fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.transport.internet.StreamConfig");
     let mut network = String::new();
-    let mut transport_settings: Option<Json> = None;
+    let mut transports: Vec<(String, Option<Vec<u8>>)> = Vec::new();
     let mut security_type = String::new();
     let mut security: Option<(&'static str, Json)> = None;
     let mut sockopt = None;
@@ -989,13 +1008,7 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut quic_policy = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (2, 2) => {
-                let (json, name) = transport_config(reader.bytes()?)?;
-                transport_settings = json;
-                if !name.is_empty() {
-                    network = name;
-                }
-            }
+            (2, 2) => transports.push(transport_config_raw(reader.bytes()?)?),
             (3, 2) => security_type = account_text(&mut reader)?,
             (4, 2) => {
                 let (name, value) = typed_message(reader.bytes()?)?;
@@ -1015,12 +1028,59 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let network = if network.is_empty() {
-        "tcp".to_owned()
+    let explicit = !network.is_empty();
+    let mut network = transport_kind(&network).to_owned();
+    let selected = if explicit {
+        let wanted = transport_lookup(&network);
+        let mut selected = None;
+        for (index, (name, settings)) in transports.iter().enumerate() {
+            if transport_lookup(name) == wanted {
+                selected = Some(index);
+                break;
+            }
+            if wanted == "kcp" && transport_lookup(name) == "tcp" {
+                if let Some(settings) = settings {
+                    let (message, _) = typed_message(settings)?;
+                    if message == "xray.transport.internet.kcp.Config" {
+                        selected = Some(index);
+                        break;
+                    }
+                }
+            }
+        }
+        selected.map(|index| transports.remove(index))
+    } else if let Some(index) = transports
+        .iter()
+        .position(|(name, _)| transport_lookup(name) == "tcp")
+    {
+        Some(transports.remove(index))
     } else {
-        network
+        transports.into_iter().next()
     };
-    if !matches!(network.as_str(), "tcp" | "masque" | "kcp" | "mkcp") {
+    let mut transport_settings = None;
+    if let Some((name, settings)) = selected {
+        let (payload, inferred) = match settings {
+            Some(settings) => transport_payload(&settings, name)?,
+            None => (None, name),
+        };
+        if explicit && transport_lookup(&inferred) != transport_lookup(&network) {
+            return Err(format!(
+                "transport settings are `{inferred}`, but the network names `{network}`"
+            ));
+        }
+        if !explicit {
+            network.clear();
+            network.push_str(transport_kind(&inferred));
+        }
+        transport_settings = payload;
+    }
+    if network.is_empty() {
+        network.push_str("tcp");
+    }
+    if !matches!(
+        network.as_str(),
+        "tcp" | "raw" | "masque" | "kcp" | "mkcp" | "ws" | "grpc"
+    ) {
         return Err(format!("network `{network}` is not carried"));
     }
     let mut pairs = vec![("network", Json::Str(network.clone()))];
@@ -1044,6 +1104,8 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
         let key = match network.as_str() {
             "masque" => "masqueSettings",
             "kcp" | "mkcp" => "kcpSettings",
+            "ws" => "wsSettings",
+            "grpc" => "grpcSettings",
             _ => "tcpSettings",
         };
         pairs.push((key, settings));
@@ -1082,43 +1144,79 @@ fn security_settings_exists(name: &str) -> Result<(), String> {
     security_kind(name).map(|_| ())
 }
 
+/// The dialect's name for a transport a config spells with xray's own `websocket`.
+fn transport_kind(name: &str) -> &str {
+    match name {
+        "websocket" => "ws",
+        _ => name,
+    }
+}
+
+/// The key two transport names share when they select the same settings; xray reads `raw` as `tcp`.
+fn transport_lookup(name: &str) -> &str {
+    match transport_kind(name) {
+        "raw" => "tcp",
+        "kcp" | "mkcp" => "kcp",
+        other => other,
+    }
+}
+
 /// One transport's settings: the tree's raw tcp carrier reads none, so a named tcp config is
 /// the `tcpSettings` key the dialect answers empty and a camouflaged header or a proxy
 /// protocol verdict is a refusal by name. A masque config carries the host, path and headers
 /// its request names.
-fn transport_config(bytes: &[u8]) -> Result<(Option<Json>, String), String> {
+fn transport_config_raw(bytes: &[u8]) -> Result<(String, Option<Vec<u8>>), String> {
     let mut reader = Reader::new(bytes, "xray.transport.internet.TransportConfig");
     let mut name = "tcp".to_owned();
     let mut settings = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (2, 2) => settings = Some(typed_message(reader.bytes()?)?),
+            (2, 2) => settings = Some(reader.bytes()?.to_vec()),
             (3, 2) => name = account_text(&mut reader)?,
             _ => return Err(reader.refuse(field, wire)),
         }
     }
+    Ok((name, settings))
+}
+
+#[cfg(test)]
+fn transport_config(bytes: &[u8]) -> Result<(Option<Json>, String), String> {
+    let (name, settings) = transport_config_raw(bytes)?;
     match settings {
         None => Ok((None, name)),
-        Some((message, value)) if message == "xray.transport.internet.tcp.Config" => {
-            tcp_transport(value).map(|()| (None, name))
+        Some(settings) => transport_payload(&settings, name),
+    }
+}
+
+fn transport_payload(settings: &[u8], mut name: String) -> Result<(Option<Json>, String), String> {
+    let (message, value) = typed_message(settings)?;
+    match message.as_str() {
+        "xray.transport.internet.tcp.Config" => tcp_transport(value).map(|json| (json, name)),
+        "xray.transport.internet.websocket.Config" => {
+            if name.is_empty() || name == "tcp" {
+                "ws".clone_into(&mut name);
+            }
+            ws_transport(value).map(|json| (Some(json), name))
         }
-        Some((message, value)) if message == "xray.transport.internet.masque.Config" => {
-            let name = if name.is_empty() || name == "tcp" {
-                "masque".to_owned()
-            } else {
-                name
-            };
+        "xray.transport.internet.grpc.encoding.Config" => {
+            if name.is_empty() || name == "tcp" {
+                "grpc".clone_into(&mut name);
+            }
+            grpc_transport(value).map(|json| (Some(json), name))
+        }
+        "xray.transport.internet.masque.Config" => {
+            if name.is_empty() || name == "tcp" {
+                "masque".clone_into(&mut name);
+            }
             masque_transport(value).map(|json| (Some(json), name))
         }
-        Some((message, value)) if message == "xray.transport.internet.kcp.Config" => {
-            let name = if name.is_empty() || name == "tcp" {
-                "mkcp".to_owned()
-            } else {
-                name
-            };
+        "xray.transport.internet.kcp.Config" => {
+            if name.is_empty() || name == "tcp" {
+                "mkcp".clone_into(&mut name);
+            }
             kcp_transport(value).map(|json| (Some(json), name))
         }
-        Some((message, _)) => Err(format!("transport settings `{message}` is not carried")),
+        message => Err(format!("transport settings `{message}` is not carried")),
     }
 }
 
@@ -1155,31 +1253,447 @@ fn kcp_transport(bytes: &[u8]) -> Result<Json, String> {
     ))
 }
 
-fn tcp_transport(bytes: &[u8]) -> Result<(), String> {
+fn tcp_transport(bytes: &[u8]) -> Result<Option<Json>, String> {
     let mut reader = Reader::new(bytes, "xray.transport.internet.tcp.Config");
-    let mut header = false;
+    let mut header = None;
     let mut proxy_protocol = false;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (2, 2) => {
-                header = true;
-                reader.bytes()?;
+                let (name, value) = typed_message(reader.bytes()?)?;
+                if name != "xray.transport.internet.headers.http.Config" {
+                    return Err(format!("transport header `{name}` is not carried"));
+                }
+                header = tcp_http_header(value)?;
             }
             (3, 0) => proxy_protocol = reader.varint()? != 0,
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    if header {
-        return Err(
-            "xray.transport.internet.tcp.Config: a camouflaged header is not carried".to_owned(),
-        );
+    let mut pairs = Vec::new();
+    if let Some(header) = header {
+        pairs.push(("header", header));
     }
     if proxy_protocol {
-        return Err(
-            "xray.transport.internet.tcp.Config: accept_proxy_protocol is not carried".to_owned(),
-        );
+        pairs.push(("acceptProxyProtocol", Json::Bool(true)));
     }
-    Ok(())
+    Ok((!pairs.is_empty()).then(|| object(pairs)))
+}
+
+/// The http camouflage header's request block: absent fields keep the reference's own request,
+/// so an empty `Config` spells the default GET shape.
+fn tcp_http_header(bytes: &[u8]) -> Result<Option<Json>, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.headers.http.Config");
+    let mut request = None;
+    let mut response = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                let next = tcp_http_request_config(reader.bytes()?)?;
+                match &mut request {
+                    Some(held) => merge_http_request(held, next),
+                    None => request = Some(next),
+                }
+            }
+            (2, 2) => {
+                let next = tcp_http_response_config(reader.bytes()?)?;
+                match &mut response {
+                    Some(held) => merge_http_response(held, next),
+                    None => response = Some(next),
+                }
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    if request.is_none() && response.is_none() {
+        return Ok(None);
+    }
+    let mut pairs = vec![
+        ("type", Json::Str("http".to_owned())),
+        ("request", request.unwrap_or_else(|| Json::Obj(Vec::new()))),
+    ];
+    if let Some(response) = response {
+        pairs.push(("response", response));
+    }
+    Ok(Some(object(pairs)))
+}
+
+/// Merge one `RequestConfig` occurrence into another: repeated paths and headers accumulate in
+/// wire order, and a header the caller repeats replaces the earlier value, as one occurrence does.
+fn merge_http_request(held: &mut Json, next: Json) {
+    let Json::Obj(held) = held else {
+        return;
+    };
+    let Json::Obj(next) = next else {
+        return;
+    };
+    for (key, value) in next {
+        match key.as_str() {
+            "path" => {
+                let Some((_, slot)) = held.iter_mut().find(|(name, _)| name == "path") else {
+                    held.push((key, value));
+                    continue;
+                };
+                let mut paths = match std::mem::replace(slot, Json::Null) {
+                    Json::Arr(paths) => paths,
+                    other => vec![other],
+                };
+                match value {
+                    Json::Arr(values) => paths.extend(values),
+                    other => paths.push(other),
+                }
+                *slot = if paths.len() == 1 {
+                    paths.pop().expect("one path")
+                } else {
+                    Json::Arr(paths)
+                };
+            }
+            "headers" => {
+                let Json::Obj(values) = value else {
+                    continue;
+                };
+                if let Some(Json::Obj(existing)) = held
+                    .iter_mut()
+                    .find(|(name, _)| name == "headers")
+                    .map(|(_, value)| value)
+                {
+                    for (name, value) in values {
+                        if let Some(slot) = existing.iter_mut().find(|(held, _)| *held == name) {
+                            slot.1 = value;
+                        } else {
+                            existing.push((name, value));
+                        }
+                    }
+                } else {
+                    held.push((key, Json::Obj(values)));
+                }
+            }
+            _ => {
+                if let Some(slot) = held.iter_mut().find(|(name, _)| *name == key) {
+                    slot.1 = value;
+                } else {
+                    held.push((key, value));
+                }
+            }
+        }
+    }
+}
+
+/// Merge one `ResponseConfig` occurrence into another: singular messages merge field by field,
+/// while the repeated header entries append in wire order.
+fn merge_http_response(held: &mut Json, next: Json) {
+    let Json::Obj(next) = next else {
+        return;
+    };
+    let Json::Obj(held) = held else {
+        return;
+    };
+    for (key, value) in next {
+        match key.as_str() {
+            "headers" => {
+                let Json::Obj(values) = value else {
+                    continue;
+                };
+                if let Some(Json::Obj(existing)) = held
+                    .iter_mut()
+                    .find(|(name, _)| name == "headers")
+                    .map(|(_, value)| value)
+                {
+                    existing.extend(values);
+                } else {
+                    held.push((key, Json::Obj(values)));
+                }
+            }
+            "status" => {
+                let Json::Obj(values) = value else {
+                    continue;
+                };
+                if let Some(Json::Obj(existing)) = held
+                    .iter_mut()
+                    .find(|(name, _)| name == "status")
+                    .map(|(_, value)| value)
+                {
+                    for (field, value) in values {
+                        if let Some(slot) = existing.iter_mut().find(|(name, _)| *name == field) {
+                            slot.1 = value;
+                        } else {
+                            existing.push((field, value));
+                        }
+                    }
+                } else {
+                    held.push((key, Json::Obj(values)));
+                }
+            }
+            _ => {
+                if let Some(slot) = held.iter_mut().find(|(name, _)| *name == key) {
+                    slot.1 = value;
+                } else {
+                    held.push((key, value));
+                }
+            }
+        }
+    }
+}
+
+/// The HTTP camouflage response block: version, status and headers, with the same defaults the
+/// reference fills for an empty `Config`.
+fn tcp_http_response_config(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.headers.http.ResponseConfig");
+    let mut version = None;
+    let mut status = None;
+    let mut headers: Vec<(String, Json)> = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => version = Some(tcp_http_value(reader.bytes()?, "response version")?),
+            (2, 2) => {
+                let next = tcp_http_status(reader.bytes()?)?;
+                if let Some(Json::Obj(held)) = status.as_mut() {
+                    let Json::Obj(next) = next else { continue };
+                    for (field, value) in next {
+                        if let Some(slot) = held.iter_mut().find(|(name, _)| *name == field) {
+                            slot.1 = value;
+                        } else {
+                            held.push((field, value));
+                        }
+                    }
+                } else {
+                    status = Some(next);
+                }
+            }
+            (3, 2) => {
+                let (name, value) = tcp_http_request_header(reader.bytes()?)?;
+                headers.push((name, value));
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    if let Some(version) = version {
+        pairs.push(("version", Json::Str(version)));
+    }
+    if let Some(status) = status {
+        pairs.push(("status", status));
+    }
+    if !headers.is_empty() {
+        pairs.push(("headers", Json::Obj(headers)));
+    }
+    Ok(object(pairs))
+}
+
+fn tcp_http_status(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.headers.http.Status");
+    let mut code = None;
+    let mut reason = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => code = Some(account_text(&mut reader)?),
+            (2, 2) => reason = Some(account_text(&mut reader)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    if let Some(code) = code {
+        pairs.push(("code", Json::Str(code)));
+    }
+    if let Some(reason) = reason {
+        pairs.push(("reason", Json::Str(reason)));
+    }
+    Ok(object(pairs))
+}
+
+fn tcp_http_request_config(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.headers.http.RequestConfig");
+    let mut request = Vec::new();
+    let mut paths = Vec::new();
+    let mut headers: Vec<(String, Json)> = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                let value = tcp_http_value(reader.bytes()?, "request version")?;
+                if !value.is_empty() && value != "1.1" {
+                    return Err(format!(
+                        "transport header request version `{value}` is not carried"
+                    ));
+                }
+            }
+            (2, 2) => {
+                let value = tcp_http_value(reader.bytes()?, "request method")?;
+                if !value.is_empty() && value != "GET" {
+                    return Err(format!(
+                        "transport header request method `{value}` is not carried"
+                    ));
+                }
+            }
+            (3, 2) => paths.push(Json::Str(account_text(&mut reader)?)),
+            (4, 2) => {
+                let (name, value) = tcp_http_request_header(reader.bytes()?)?;
+                if let Some(slot) = headers.iter_mut().find(|(held, _)| *held == name) {
+                    slot.1 = value;
+                } else {
+                    headers.push((name, value));
+                }
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    match paths.len() {
+        0 => {}
+        1 => request.push(("path", paths.remove(0))),
+        _ => request.push(("path", Json::Arr(paths))),
+    }
+    if !headers.is_empty() {
+        request.push(("headers", Json::Obj(headers)));
+    }
+    Ok(object(request))
+}
+
+fn tcp_http_value(bytes: &[u8], label: &'static str) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, label);
+    let mut value = String::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => value = account_text(&mut reader)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(value)
+}
+
+fn tcp_http_request_header(bytes: &[u8]) -> Result<(String, Json), String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.headers.http.Header");
+    let mut name = String::new();
+    let mut values = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => name = account_text(&mut reader)?,
+            (2, 2) => values.push(Json::Str(account_text(&mut reader)?)),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    if name.is_empty() {
+        return Err("transport header entry has no name".to_owned());
+    }
+    Ok((name, Json::Arr(values)))
+}
+
+/// One websocket settings message: the host, path, header map and early-data tunables the
+/// dialect's `wsSettings` reads.
+fn ws_transport(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.websocket.Config");
+    let mut host = String::new();
+    let mut path = String::new();
+    let mut headers = Vec::new();
+    let mut proxy_protocol = false;
+    let mut ed = 0;
+    let mut heartbeat = 0;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => host = account_text(&mut reader)?,
+            (2, 2) => path = account_text(&mut reader)?,
+            (3, 2) => {
+                let (name, value) = map_text(reader.bytes()?)?;
+                if let Some(slot) = headers.iter_mut().find(|(held, _)| *held == name) {
+                    slot.1 = Json::Str(value);
+                } else {
+                    headers.push((name, Json::Str(value)));
+                }
+            }
+            (4, 0) => proxy_protocol = reader.varint()? != 0,
+            (5, 0) => ed = u32_value(reader.varint()?, "websocket early data")?,
+            (6, 0) => heartbeat = u32_value(reader.varint()?, "websocket heartbeat")?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    if !host.is_empty() {
+        pairs.push(("host", Json::Str(host)));
+    }
+    if !path.is_empty() {
+        pairs.push(("path", Json::Str(path)));
+    }
+    if !headers.is_empty() {
+        pairs.push(("headers", Json::Obj(headers)));
+    }
+    if proxy_protocol {
+        pairs.push(("acceptProxyProtocol", Json::Bool(true)));
+    }
+    if ed != 0 {
+        pairs.push(("ed", Json::Num(f64::from(ed))));
+    }
+    if heartbeat != 0 {
+        pairs.push(("heartbeatPeriod", Json::Num(f64::from(heartbeat))));
+    }
+    Ok(object(pairs))
+}
+
+/// One gRPC settings message, keyed by the `grpcSettings` names this tree parses.
+fn grpc_transport(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.grpc.encoding.Config");
+    let mut pairs: Vec<(&str, Json)> = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => grpc_pair(
+                &mut pairs,
+                "authority",
+                Json::Str(account_text(&mut reader)?),
+            ),
+            (2, 2) => grpc_pair(
+                &mut pairs,
+                "serviceName",
+                Json::Str(account_text(&mut reader)?),
+            ),
+            (3, 0) => grpc_pair(&mut pairs, "multiMode", Json::Bool(reader.varint()? != 0)),
+            (4, 0) => grpc_positive(&mut pairs, "idleTimeout", int32(reader.varint()?)),
+            (5, 0) => grpc_positive(&mut pairs, "healthCheckTimeout", int32(reader.varint()?)),
+            (6, 0) => grpc_pair(
+                &mut pairs,
+                "permitWithoutStream",
+                Json::Bool(reader.varint()? != 0),
+            ),
+            (7, 0) => grpc_positive(&mut pairs, "initialWindowsSize", int32(reader.varint()?)),
+            (8, 2) => grpc_pair(
+                &mut pairs,
+                "userAgent",
+                Json::Str(account_text(&mut reader)?),
+            ),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(object(pairs))
+}
+
+/// A gRPC scalar's last occurrence wins, as the protobuf decoder keeps one value per field.
+fn grpc_pair(pairs: &mut Vec<(&str, Json)>, key: &'static str, value: Json) {
+    if let Some(slot) = pairs.iter_mut().find(|(name, _)| *name == key) {
+        slot.1 = value;
+    } else {
+        pairs.push((key, value));
+    }
+}
+
+/// A nonpositive timeout or window is xray's absent default, and a later occurrence still replaces
+/// an earlier positive one.
+fn grpc_positive(pairs: &mut Vec<(&str, Json)>, key: &'static str, value: i32) {
+    if value > 0 {
+        grpc_pair(pairs, key, Json::Num(f64::from(value)));
+    } else {
+        pairs.retain(|(name, _)| *name != key);
+    }
+}
+
+/// One protobuf map entry whose key and value are strings.
+fn map_text(bytes: &[u8]) -> Result<(String, String), String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.websocket.Config.header");
+    let mut key = String::new();
+    let mut value = String::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => key = account_text(&mut reader)?,
+            (2, 2) => value = account_text(&mut reader)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((key, value))
 }
 
 fn masque_transport(bytes: &[u8]) -> Result<Json, String> {
@@ -1833,7 +2347,12 @@ fn tls_certificate(bytes: &[u8]) -> Result<Json, String> {
     } else {
         pairs.push(("keyFile", Json::Str(key_path)));
     }
-    if pairs.len() < 2 {
+    // A verify-only authority needs the certificate alone; served identities and issuers name both halves.
+    let authority_verify = usage == "verify"
+        && pairs
+            .iter()
+            .any(|(name, _)| *name == "certificate" || *name == "certificateFile");
+    if pairs.len() < 2 && !authority_verify {
         return Err(
             "xray.transport.internet.tls.Certificate: no certificate bytes or paths".to_owned(),
         );
@@ -2253,6 +2772,73 @@ fn ip_or_domain(bytes: &[u8]) -> Result<String, String> {
     }
 }
 
+/// The reverse app's portals and bridges, each a tag and the domain it matches.
+fn reverse_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.reverse.Config");
+    let mut bridges = Vec::new();
+    let mut portals = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => bridges.push(reverse_endpoint(reader.bytes()?, "BridgeConfig")?),
+            (2, 2) => portals.push(reverse_endpoint(reader.bytes()?, "PortalConfig")?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    if !bridges.is_empty() {
+        pairs.push(("bridges", Json::Arr(bridges)));
+    }
+    if !portals.is_empty() {
+        pairs.push(("portals", Json::Arr(portals)));
+    }
+    Ok(object(pairs))
+}
+
+fn reverse_endpoint(bytes: &[u8], name: &'static str) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, name);
+    let mut tag = String::new();
+    let mut domain = String::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => tag = account_text(&mut reader)?,
+            (2, 2) => domain = account_text(&mut reader)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    if tag.is_empty() {
+        return Err(format!("xray.app.reverse.{name}: the tag is empty"));
+    }
+    if domain.is_empty() {
+        return Err(format!("xray.app.reverse.{name}: the domain is empty"));
+    }
+    Ok(object(vec![
+        ("tag", Json::Str(tag)),
+        ("domain", Json::Str(domain)),
+    ]))
+}
+
+/// The metrics app's listener address and the tag its internal inbound registers.
+fn metrics_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.metrics.Config");
+    let mut tag = String::new();
+    let mut listen = String::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => tag = account_text(&mut reader)?,
+            (2, 2) => listen = account_text(&mut reader)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    if !tag.is_empty() {
+        pairs.push(("tag", Json::Str(tag)));
+    }
+    if !listen.is_empty() {
+        pairs.push(("listen", Json::Str(listen)));
+    }
+    Ok(object(pairs))
+}
+
 fn typed_message(bytes: &[u8]) -> Result<(String, &[u8]), String> {
     let mut reader = Reader::new(bytes, "xray.common.serial.TypedMessage");
     let mut name = None;
@@ -2278,15 +2864,31 @@ fn typed_message(bytes: &[u8]) -> Result<(String, &[u8]), String> {
     ))
 }
 
-fn http_settings(bytes: &[u8]) -> Result<(), String> {
+fn http_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.proxy.http.ServerConfig");
-    // Every field of the empty ServerConfig is a capability this tree lacks, so the first one set is the refusal.
-    match reader.field()? {
-        None => Ok(()),
-        Some((2, 2)) => Err(reader.uncarried("an account map")),
-        Some((3, 0)) => Err(reader.uncarried("allow_transparent")),
-        Some((4, 0)) => Err(reader.uncarried("user_level")),
-        Some((field, wire)) => Err(reader.refuse(field, wire)),
+    let mut accounts: Vec<Json> = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (2, 2) => {
+                let (user, pass) = socks_account_entry(reader.bytes()?)?;
+                accounts.retain(|account| {
+                    account.get("user").and_then(Json::as_str) != Some(user.as_str())
+                });
+                accounts.push(object(vec![
+                    ("user", Json::Str(user.clone())),
+                    ("email", Json::Str(user)),
+                    ("pass", Json::Str(pass)),
+                ]));
+            }
+            (3, 0) => return Err(reader.uncarried("allow_transparent")),
+            (4, 0) => return Err(reader.uncarried("user_level")),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    if accounts.is_empty() {
+        Ok(Json::Null)
+    } else {
+        Ok(object(vec![("accounts", Json::Arr(accounts))]))
     }
 }
 
@@ -4281,6 +4883,9 @@ fn socks_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
             (1, 0) => auth_type = reader.varint()?,
             (2, 2) => {
                 let (user, pass) = socks_account_entry(reader.bytes()?)?;
+                accounts.retain(|account| {
+                    account.get("user").and_then(Json::as_str) != Some(user.as_str())
+                });
                 accounts.push(object(vec![
                     ("user", Json::Str(user)),
                     ("pass", Json::Str(pass)),
@@ -4324,10 +4929,7 @@ fn socks_account_entry(bytes: &[u8]) -> Result<(String, String), String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    Ok((
-        user.ok_or("xray.proxy.socks.ServerConfig: an account with no name")?,
-        pass.ok_or("xray.proxy.socks.ServerConfig: an account with no password")?,
-    ))
+    Ok((user.unwrap_or_default(), pass.unwrap_or_default()))
 }
 
 /// A socks client dials the one endpoint its config names, with the credential it names.
@@ -5842,15 +6444,25 @@ mod tests {
     }
 
     #[test]
-    fn an_account_map_is_refused() {
+    fn an_account_map_becomes_http_accounts() {
         let account = message(&[bytes_field(1, b"user"), bytes_field(2, b"pass")]);
         let settings = message(&[bytes_field(2, &account)]);
         let bytes = config(
             &http_inbound(&receiver(5000, None), &settings),
             &freedom_outbound(),
         );
-        let error = to_json(&bytes).expect_err("refused");
-        assert!(error.contains("account map"), "{error}");
+        let json = to_json(&bytes).expect("decoded");
+        let accounts = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .and_then(|inbounds| inbounds.first())
+            .and_then(|inbound| inbound.get("settings"))
+            .and_then(|settings| settings.get("accounts"))
+            .and_then(Json::as_arr)
+            .expect("accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].get("user").and_then(Json::as_str), Some("user"));
+        assert_eq!(accounts[0].get("pass").and_then(Json::as_str), Some("pass"));
     }
 
     #[test]
@@ -6133,6 +6745,139 @@ mod tests {
         assert_eq!(
             kcp.get("maxSendingWindow").and_then(Json::as_u32),
             Some(1_048_576)
+        );
+    }
+
+    #[test]
+    fn an_explicit_mkcp_network_selects_an_unnamed_kcp_entry() {
+        let kcp = message(&[varint_field(1, 1400), varint_field(3, 10)]);
+        let stream = message(&[
+            bytes_field(
+                2,
+                &message(&[bytes_field(
+                    2,
+                    &typed("xray.transport.internet.kcp.Config", &kcp),
+                )]),
+            ),
+            bytes_field(5, b"mkcp"),
+        ]);
+        let account = vmess_account(b"bbbb-bbbb", None, None);
+        let settings = bytes_field(1, &vmess_user(&account));
+        let inbound = message(&[
+            bytes_field(
+                2,
+                &typed(
+                    "xray.app.proxyman.ReceiverConfig",
+                    &receiver_stream(5000, &stream),
+                ),
+            ),
+            bytes_field(3, &typed("xray.proxy.vmess.inbound.Config", &settings)),
+        ]);
+        let json = to_json(&config(&inbound, &freedom_outbound())).expect("kcp inbound decodes");
+        let stream = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("streamSettings")
+            .expect("stream settings");
+        assert_eq!(stream.get("network").and_then(Json::as_str), Some("mkcp"));
+        assert_eq!(
+            stream
+                .get("kcpSettings")
+                .and_then(|kcp| kcp.get("mtu"))
+                .and_then(Json::as_u32),
+            Some(1400)
+        );
+    }
+
+    #[test]
+    fn repeated_http_response_occurrences_merge() {
+        let first = message(&[
+            bytes_field(2, &message(&[bytes_field(1, b"201")])),
+            bytes_field(2, &message(&[bytes_field(2, b"Created")])),
+        ]);
+        let second = message(&[bytes_field(
+            3,
+            &message(&[bytes_field(1, b"X-Test"), bytes_field(2, b"a")]),
+        )]);
+        let header = message(&[bytes_field(2, &first), bytes_field(2, &second)]);
+        let json = tcp_http_header(&header)
+            .expect("merges")
+            .expect("http header");
+        let response = json.get("response").expect("response");
+        assert_eq!(
+            response
+                .get("status")
+                .and_then(|status| status.get("code"))
+                .and_then(Json::as_str),
+            Some("201")
+        );
+        assert_eq!(
+            response
+                .get("status")
+                .and_then(|status| status.get("reason"))
+                .and_then(Json::as_str),
+            Some("Created"),
+            "a later status occurrence merges its reason without dropping the code"
+        );
+        assert_eq!(
+            response
+                .get("headers")
+                .and_then(|headers| headers.get("X-Test"))
+                .and_then(Json::as_arr)
+                .and_then(|values| values.first())
+                .and_then(Json::as_str),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn repeated_http_request_occurrences_merge() {
+        let first = message(&[bytes_field(3, b"/camouflage")]);
+        let second = message(&[bytes_field(
+            4,
+            &message(&[bytes_field(1, b"X-Test"), bytes_field(2, b"a")]),
+        )]);
+        let header = message(&[bytes_field(1, &first), bytes_field(1, &second)]);
+        let json = tcp_http_header(&header)
+            .expect("merges")
+            .expect("http header");
+        let request = json.get("request").expect("request");
+        assert_eq!(
+            request.get("path").and_then(Json::as_str),
+            Some("/camouflage"),
+            "a later request occurrence keeps the earlier URI"
+        );
+        assert_eq!(
+            request
+                .get("headers")
+                .and_then(|headers| headers.get("X-Test"))
+                .and_then(Json::as_arr)
+                .and_then(|values| values.first())
+                .and_then(Json::as_str),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn a_repeated_websocket_header_key_replaces_the_earlier_value() {
+        let headers = message(&[
+            bytes_field(
+                3,
+                &message(&[bytes_field(1, b"Host"), bytes_field(2, b"old.test")]),
+            ),
+            bytes_field(
+                3,
+                &message(&[bytes_field(1, b"Host"), bytes_field(2, b"new.test")]),
+            ),
+        ]);
+        let json = ws_transport(&headers).expect("websocket settings");
+        assert_eq!(
+            json.get("headers")
+                .and_then(|headers| headers.get("Host"))
+                .and_then(Json::as_str),
+            Some("new.test"),
+            "the last map entry for a key wins"
         );
     }
 

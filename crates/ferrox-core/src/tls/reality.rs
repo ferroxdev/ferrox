@@ -206,6 +206,7 @@ impl<S: Stream> RealityServer<S> {
             send_tickets: false,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
+            issuer: None,
             ech_server_keys: None,
             master_key_log: None,
             kernel_tx: false,
@@ -3449,6 +3450,7 @@ mod tests {
             send_tickets: false,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
+            issuer: None,
             ech_server_keys: None,
             master_key_log: None,
             kernel_tx: false,
@@ -3457,6 +3459,7 @@ mod tests {
         let plain = super::super::TlsServerConfig {
             send_tickets: true,
             server_config_cache: std::sync::Arc::default(),
+            issuer: None,
             ..forged()
         };
         let without = crate::tls::rustls_backend::server_config(forged()).expect("identity");

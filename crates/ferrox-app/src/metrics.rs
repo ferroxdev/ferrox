@@ -174,6 +174,11 @@ fn answer(mut stream: TcpStream) {
     let (status, content_type, body) = match path {
         "/debug/vars" => ("200 OK", "application/json", expvar()),
         "/metrics" => ("200 OK", "text/plain; version=0.0.4", prometheus()),
+        path if path.starts_with("/debug/pprof/") => (
+            "501 Not Implemented",
+            "text/plain; charset=utf-8",
+            "runtime profiles are not available\n".to_owned(),
+        ),
         _ => ("404 Not Found", "text/plain", "not found\n".to_owned()),
     };
     let response = format!(

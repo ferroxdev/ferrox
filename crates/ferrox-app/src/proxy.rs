@@ -319,9 +319,13 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         }
         selected => selected,
     };
+    if let Some(Outbound::Freedom(freedom)) = &outbound {
+        let _ = DIRECT_FREEDOM.set(Arc::clone(freedom));
+    }
     // Named only when no outbound was built, so the reason behind an exit that names nothing is on its own line first.
     let refused = outbound.is_none().then(|| diagnose_outbounds(root));
-    let portals = reverse_portals(root);
+    let portals =
+        reverse_portals(root).unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     let routing = routing_for(root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
         .or_else(|| {
@@ -556,7 +560,6 @@ fn serve_inbounds_counted(
     let routed =
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
     let mut inbounds = 0;
-    let mut vmess_tables: HashMap<String, crate::vmess::UsersRef> = HashMap::new();
     let configured = configured_emails(root);
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
@@ -601,15 +604,13 @@ fn serve_inbounds_counted(
             });
             let mut handler_stops: Vec<(Arc<Stop>, String)> = Vec::new();
             let vmess_users = (protocol == "vmess").then(|| {
-                let tag = handler_tag.clone().unwrap_or_default();
-                if !tag.is_empty() {
-                    if let Some(users) = vmess_tables.get(&tag) {
-                        return std::sync::Arc::clone(users);
-                    }
-                }
-                let users = inbound_vmess_users(inbound);
-                if !tag.is_empty() {
-                    vmess_tables.insert(tag, std::sync::Arc::clone(&users));
+                let make = || inbound_vmess_users(inbound);
+                let users = match (route, handler_tag.as_deref()) {
+                    (Some(shared), Some(tag)) => shared.vmess_users(tag, make),
+                    _ => make(),
+                };
+                if let Some(shared) = route {
+                    shared.restrict_user_portals(handler_tag.as_deref(), &users);
                 }
                 users
             });
@@ -831,7 +832,11 @@ fn serve_inbounds_counted(
             if !prove && inbounds > before {
                 if let Some(networks) = server_networks(inbound) {
                     if let Some(shared) = route {
-                        shared.record_server_inbound(handler_tag.clone(), &networks);
+                        shared.record_server_inbound(
+                            handler_tag.clone(),
+                            &networks,
+                            portal_inbound(protocol),
+                        );
                     }
                 }
             }
@@ -1922,7 +1927,7 @@ fn stream_params(carrier: &Carrier) -> Option<(&str, u32)> {
     match carrier {
         Carrier::Ws { path, ed } => Some((path, *ed)),
         Carrier::Grpc(settings) => Some((settings.path.as_str(), 0)),
-        Carrier::HttpUpgrade { path, .. } | Carrier::HttpHeader { path } => Some((path, 0)),
+        Carrier::HttpUpgrade { path, .. } | Carrier::HttpHeader { path, .. } => Some((path, 0)),
         Carrier::Xhttp { settings, .. } => Some((settings.path.as_str(), 0)),
         _ => None,
     }
@@ -2449,7 +2454,7 @@ impl Role {
                     );
                 });
             }
-            Carrier::HttpHeader { path } => {
+            Carrier::HttpHeader { path, response } => {
                 let Ok(raw) = stream.try_clone() else {
                     return;
                 };
@@ -2470,6 +2475,7 @@ impl Role {
                         &path,
                         keys.as_ref(),
                         freedom,
+                        response.as_deref(),
                     );
                 });
             }
@@ -2672,6 +2678,7 @@ struct Dynamic {
 struct ServerInbound {
     tag: Option<String>,
     networks: Vec<crate::router::Network>,
+    portal: bool,
 }
 
 /// Routing once its assets are read: the rules, every outbound a rule names, and the first
@@ -2687,6 +2694,8 @@ pub(crate) struct RouteShared {
     /// Every server inbound's tag and target networks, including one the management API added,
     /// so an `AddRule` proves the same direct dial the start did.
     server_inbounds: Mutex<Vec<ServerInbound>>,
+    /// The `VMess` users each inbound serves, so a rule change can refresh their portal restriction.
+    vmess_users: Mutex<HashMap<String, crate::vmess::UsersRef>>,
     observatory: Option<Arc<crate::observatory::Observatory>>,
     /// The script router, kept outside the routing lock: a script callback re-enters the table.
     script_router: Option<Arc<crate::router_script::ScriptRouter>>,
@@ -2802,12 +2811,19 @@ impl RouteShared {
     /// The outbound a `geodata.outbound` tag names, or the default when the tag is empty, which is
     /// what the reference's forced-tag dispatch falls back to.
     pub(crate) fn outbound_for(&self, tag: &str) -> Option<Outbound> {
-        self.outbound_ref(tag).cloned()
+        self.outbound_ref(tag)
+            .cloned()
+            .or_else(|| crate::reverse::portal_for_tag(tag).map(Outbound::ReversePortal))
     }
 
     /// Remember a direct-dial server inbound the management API added, so a later rule that can
     /// reach it is proved against the lane it really serves.
-    fn record_server_inbound(&self, tag: Option<String>, networks: &[crate::router::Network]) {
+    fn record_server_inbound(
+        &self,
+        tag: Option<String>,
+        networks: &[crate::router::Network],
+        portal: bool,
+    ) {
         let mut inbounds = self
             .server_inbounds
             .lock()
@@ -2819,7 +2835,52 @@ impl RouteShared {
             inbounds.push(ServerInbound {
                 tag,
                 networks: networks.to_vec(),
+                portal,
             });
+        }
+    }
+
+    fn vmess_users(
+        &self,
+        tag: &str,
+        make: impl FnOnce() -> crate::vmess::UsersRef,
+    ) -> crate::vmess::UsersRef {
+        let mut users = self
+            .vmess_users
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::sync::Arc::clone(users.entry(tag.to_owned()).or_insert_with(make))
+    }
+
+    fn restrict_user_portals(&self, tag: Option<&str>, users: &crate::vmess::UsersRef) {
+        let routing = self
+            .routing
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        users.restrict_portals(routing.portal_targets(
+            tag,
+            &|named| portal_tag(self, named),
+            &|named| portal_domain(self, named),
+        ));
+    }
+
+    fn forget_vmess_users(&self, tag: &str) {
+        self.vmess_users
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(tag);
+    }
+
+    fn refresh_portal_rules(&self) {
+        let users: Vec<(String, crate::vmess::UsersRef)> = self
+            .vmess_users
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(tag, users)| (tag.clone(), std::sync::Arc::clone(users)))
+            .collect();
+        for (tag, users) in users {
+            self.restrict_user_portals(Some(&tag), &users);
         }
     }
 
@@ -3030,8 +3091,11 @@ impl Runtime {
         let Some(route) = &self.route else {
             return Err("routing not configured".to_owned());
         };
-        let known =
-            |tag: &str| route.tagged.contains_key(tag) || Some(tag) == route.default_tag.as_deref();
+        let known = |tag: &str| {
+            route.tagged.contains_key(tag)
+                || Some(tag) == route.default_tag.as_deref()
+                || crate::reverse::portal_for_tag(tag).is_some()
+        };
         let direct = |named: &str| direct_tag(route, named);
         let server_inbounds = route
             .server_inbounds
@@ -3040,13 +3104,23 @@ impl Runtime {
             .clone();
         let proofs: Vec<crate::router::ServerProof<'_>> = server_inbounds
             .iter()
-            .map(|inbound| server_proof(route, inbound.tag.as_deref(), &inbound.networks, &direct))
+            .map(|inbound| {
+                server_proof(
+                    route,
+                    inbound.tag.as_deref(),
+                    &inbound.networks,
+                    &direct,
+                    inbound.portal,
+                )
+            })
             .collect();
         route
             .routing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .add_rules(rules, append, known, &proofs)
+            .add_rules(rules, append, known, &proofs)?;
+        route.refresh_portal_rules();
+        Ok(())
     }
 
     /// Drop a server inbound the management API stopped, so a later rule is not proved against a
@@ -3054,6 +3128,7 @@ impl Runtime {
     pub(crate) fn forget_server_inbound(&self, tag: &str) {
         if let Some(route) = &self.route {
             route.forget_server_inbound(tag);
+            route.forget_vmess_users(tag);
         }
     }
 
@@ -3070,13 +3145,23 @@ impl Runtime {
         let direct = |named: &str| direct_tag(route, named);
         let proofs: Vec<crate::router::ServerProof<'_>> = server_inbounds
             .iter()
-            .map(|inbound| server_proof(route, inbound.tag.as_deref(), &inbound.networks, &direct))
+            .map(|inbound| {
+                server_proof(
+                    route,
+                    inbound.tag.as_deref(),
+                    &inbound.networks,
+                    &direct,
+                    inbound.portal,
+                )
+            })
             .collect();
         route
             .routing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove_rules(tag, &proofs)
+            .remove_rules(tag, &proofs)?;
+        route.refresh_portal_rules();
+        Ok(())
     }
 
     /// The tag a `RoutingService.TestRoute` context routes to, or `None` for xray's no-clue.
@@ -3148,6 +3233,7 @@ impl Runtime {
                 inbound.tag.as_deref(),
                 &inbound.networks,
                 &direct,
+                inbound.portal,
             )) {
                 balancer.force(&previous);
                 return Err(reason);
@@ -3640,7 +3726,7 @@ pub(crate) fn build_outbound(config: &Json, tag: &str) -> Result<Outbound, Strin
 /// a rule names is built once here rather than per flow.
 /// The portals the config names: one per reverse tag an inbound user carries. The same registry
 /// both builds the users and answers the routes that name a portal tag.
-fn reverse_portals(root: &Json) -> Arc<crate::reverse::Portals> {
+fn reverse_portals(root: &Json) -> Result<Arc<crate::reverse::Portals>, String> {
     let mut portals = crate::reverse::Portals::default();
     for inbound in root.get("inbounds").and_then(Json::as_arr).unwrap_or(&[]) {
         if canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""))
@@ -3677,7 +3763,25 @@ fn reverse_portals(root: &Json) -> Arc<crate::reverse::Portals> {
             portals.insert(tag);
         }
     }
-    Arc::new(portals)
+    for portal in root
+        .get("reverse")
+        .and_then(|reverse| reverse.get("portals"))
+        .and_then(Json::as_arr)
+        .unwrap_or(&[])
+    {
+        let Some(tag) = portal.get("tag").and_then(Json::as_str) else {
+            continue;
+        };
+        let Some(domain) = portal.get("domain").and_then(Json::as_str) else {
+            continue;
+        };
+        if !tag.is_empty() && !domain.is_empty() {
+            portals.insert_domain(tag, domain)?;
+        }
+    }
+    let portals = Arc::new(portals);
+    crate::reverse::install_portals(Arc::clone(&portals));
+    Ok(portals)
 }
 
 /// One routing target, with loopback built as the named tag's second pass instead of refused.
@@ -4043,6 +4147,7 @@ fn route_shared_with_api(
             server_networks(inbound).map(|networks| ServerInbound {
                 tag: inbound_tag(inbound),
                 networks,
+                portal: portal_inbound(protocol),
             })
         })
         .collect();
@@ -4298,6 +4403,7 @@ fn route_shared_with_api(
         balancers,
         balancer_fallbacks,
         server_inbounds: Mutex::new(server_inbounds),
+        vmess_users: Mutex::new(HashMap::new()),
         observatory,
         script_router,
         script,
@@ -4416,16 +4522,21 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
         return;
     };
     let tag = inbound_tag(inbound);
+    let portal = portal_inbound(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
     let direct = |named: &str| direct_tag(shared, named);
     let routing = shared
         .routing
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Err(error) =
-        routing.server_routes(&server_proof(shared, tag.as_deref(), &networks, &direct))
-    {
+    if let Err(error) = routing.server_routes(&server_proof(
+        shared,
+        tag.as_deref(),
+        &networks,
+        &direct,
+        portal,
+    )) {
         exit(&format!("bad config {label}: {error}"));
-    }
+    };
 }
 
 /// A server inbound's fixed direct dial, as the rules that reach it must see it.
@@ -4434,17 +4545,59 @@ fn server_proof<'a>(
     inbound: Option<&'a str>,
     networks: &'a [crate::router::Network],
     direct: &'a dyn Fn(&str) -> bool,
+    portal: bool,
 ) -> crate::router::ServerProof<'a> {
+    let default_direct = match shared.default_tag.as_deref() {
+        Some(tag) => {
+            direct_tag(shared, tag)
+                || (portal
+                    && matches!(&shared.default, Outbound::Block(_))
+                    && !shared.has_freedom())
+        }
+        None => {
+            matches!(&shared.default, Outbound::Freedom(_))
+                || (portal
+                    && matches!(&shared.default, Outbound::Block(_))
+                    && !shared.has_freedom())
+        }
+    };
+    let blocks = matches!(&shared.default, Outbound::Freedom(lane) if lane.blocks_any());
+    let default_tag = shared.default_tag.clone();
     crate::router::ServerProof {
         inbound,
-        default_direct: match shared.default_tag.as_deref() {
-            Some(tag) => direct(tag),
-            None => matches!(&shared.default, Outbound::Freedom(_)),
-        },
+        default_direct,
         networks,
-        direct,
+        direct: Box::new(move |named| direct(named)),
+        direct_policy: Box::new(move |named| {
+            !portal || !blocks || default_tag.as_deref() == Some(named)
+        }),
+        portal_rule: Box::new(move |rule| {
+            portal
+                && portal_tag(shared, rule.target())
+                && portal_domain(shared, rule.target())
+                    .is_some_and(|domain| rule.only_matches_domain(&domain))
+        }),
         candidates: &shared.balancers,
         fallbacks: &shared.balancer_fallbacks,
+    }
+}
+
+impl RouteShared {
+    fn has_freedom(&self) -> bool {
+        if matches!(&self.default, Outbound::Freedom(_))
+            || self
+                .tagged
+                .values()
+                .any(|out| matches!(out, Outbound::Freedom(_)))
+        {
+            return true;
+        }
+        self.dynamic
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .added
+            .values()
+            .any(|out| matches!(out.as_ref(), Outbound::Freedom(_)))
     }
 }
 
@@ -4460,7 +4613,10 @@ fn direct_tag(shared: &RouteShared, tag: &str) -> bool {
             return false;
         }
         if let Some(out) = dynamic.added.get(tag) {
-            return matches!(out.as_ref(), Outbound::Freedom(_));
+            return match out.as_ref() {
+                Outbound::Freedom(freedom) => !freedom.has_final_rules(),
+                _ => false,
+            };
         }
     }
     // A direct-only inbound dials its own target, so a lane naming a hop is not a direct route.
@@ -4472,8 +4628,41 @@ fn direct_tag(shared: &RouteShared, tag: &str) -> bool {
     if options.is_some_and(|options| options.dialer_proxy().is_some()) {
         return false;
     }
-    (Some(tag) == shared.default_tag.as_deref() && matches!(&shared.default, Outbound::Freedom(_)))
-        || matches!(shared.tagged.get(tag), Some(Outbound::Freedom(_)))
+    let default_tag = Some(tag) == shared.default_tag.as_deref();
+    (default_tag && matches!(&shared.default, Outbound::Freedom(_)))
+        || matches!(shared.tagged.get(tag), Some(Outbound::Freedom(lane))
+            if default_tag || !lane.has_final_rules())
+}
+
+/// Whether an inbound protocol attaches reverse portals, so a rule naming one is served rather than dialed.
+fn portal_inbound(protocol: &str) -> bool {
+    matches!(canonical_protocol(protocol), "vless" | "vmess")
+}
+
+/// Whether a tag names a reverse portal the inbound carries.
+fn portal_tag(shared: &RouteShared, tag: &str) -> bool {
+    if shared.changed.load(Ordering::Relaxed) {
+        let dynamic = shared
+            .dynamic
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if dynamic.removed.contains(tag) {
+            return false;
+        }
+        if let Some(out) = dynamic.added.get(tag) {
+            return matches!(out.as_ref(), Outbound::ReversePortal(_));
+        }
+    }
+    matches!(shared.tagged.get(tag), Some(Outbound::ReversePortal(_)))
+        || crate::reverse::portal_for_tag(tag).is_some()
+}
+
+/// The domain a portal target serves, from the startup table or the live registry.
+fn portal_domain(shared: &RouteShared, tag: &str) -> Option<String> {
+    if let Some(Outbound::ReversePortal(portal)) = shared.tagged.get(tag) {
+        return Some(portal.domain().to_owned());
+    }
+    crate::reverse::portal_for_tag(tag).map(|portal| portal.domain().to_owned())
 }
 
 /// The Foxy lane: an account's pass over an edge in one pinned country, plus the split-tunnel list.
@@ -4696,6 +4885,12 @@ pub(crate) struct FreedomOut {
     final_rules: Vec<FreedomFinalRule>,
 }
 
+static DIRECT_FREEDOM: OnceLock<Arc<FreedomOut>> = OnceLock::new();
+
+fn direct_freedom() -> Option<&'static Arc<FreedomOut>> {
+    DIRECT_FREEDOM.get()
+}
+
 impl FreedomOut {
     fn is_plain(&self) -> bool {
         self.redirect.is_none()
@@ -4704,6 +4899,18 @@ impl FreedomOut {
             && self.fragment.is_none()
             && self.noises.is_empty()
             && self.final_rules.is_empty()
+    }
+
+    /// Whether this lane carries block or allow rules a direct handler that reads only the default
+    /// lane would silently skip.
+    fn has_final_rules(&self) -> bool {
+        !self.final_rules.is_empty()
+    }
+
+    fn blocks_any(&self) -> bool {
+        self.final_rules
+            .iter()
+            .any(|rule| rule.action == FreedomRuleAction::Block)
     }
 
     /// The first final rule the destination matches; `Allow` and `Block` both stop the search.
@@ -5692,14 +5899,15 @@ fn serve_shadowsocks(
                     stream, password, method, identities, settings, freedom,
                 );
             }
-            Carrier::HttpHeader { path } => {
-                crate::shadowsocks2022::serve_httpheader(
+            Carrier::HttpHeader { path, response } => {
+                crate::shadowsocks2022::serve_httpheader_with(
                     stream,
                     password,
                     method,
                     identities,
                     path.as_str(),
                     freedom,
+                    response.as_deref(),
                 );
             }
             refused_carriers!() => {}
@@ -5721,8 +5929,14 @@ fn serve_shadowsocks(
         Carrier::Xhttp { settings, .. } => {
             crate::shadowsocks::serve_xhttp(stream, users, settings, freedom);
         }
-        Carrier::HttpHeader { path } => {
-            crate::shadowsocks::serve_httpheader(stream, users, path.as_str(), freedom);
+        Carrier::HttpHeader { path, response } => {
+            crate::shadowsocks::serve_httpheader_with(
+                stream,
+                users,
+                path.as_str(),
+                freedom,
+                response.as_deref(),
+            );
         }
         refused_carriers!() => {}
     }
@@ -5894,14 +6108,15 @@ fn serve_shadowsocks_tls(
             let (reader, writer) = session_halves(session, out);
             serve_ss_xhttp_carrier(reader, writer, settings, accounts.clone(), freedom);
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, response } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            let Some((reader, writer)) = crate::httpheader::accept_split(reader, writer, path)
+            let Some((reader, writer)) =
+                crate::httpheader::accept_split(reader, writer, path, response.as_deref())
             else {
                 return;
             };
@@ -6009,8 +6224,15 @@ fn serve_vless_inner(
         Carrier::Xhttp { settings, .. } => {
             serve_vless_xhttp(stream, settings, users, shared, freedom, decryption);
         }
-        Carrier::HttpHeader { path } => {
-            serve_vless_httpheader(stream, users, path, freedom, decryption.cloned().as_deref());
+        Carrier::HttpHeader { path, response } => {
+            serve_vless_httpheader(
+                stream,
+                users,
+                path,
+                freedom,
+                decryption.cloned().as_deref(),
+                response.as_deref(),
+            );
         }
         refused_carriers!() => {}
     }
@@ -6296,8 +6518,9 @@ fn serve_vless_httpheader(
     path: &str,
     freedom: bool,
     decryption: Option<&ferrox_core::vless_encryption::Server>,
+    response: Option<&[u8]>,
 ) {
-    let Some((reader, mut write)) = crate::httpheader::accept(stream, path) else {
+    let Some((reader, mut write)) = crate::httpheader::accept(stream, path, response) else {
         return;
     };
     let mut reader = reader;
@@ -6854,10 +7077,6 @@ fn vless_raw_reply<D, R>(
     if !freedom || !vless_flow_ok(user, flow, cmd, false) {
         return;
     }
-    if cmd == 2 {
-        serve_vless_udp(stream, &target, carried);
-        return;
-    }
     if cmd == 3 || is_singmux_request(cmd, &target) {
         if stream.write_all(&[0, 0]).is_err() {
             return;
@@ -6868,6 +7087,25 @@ fn vless_raw_reply<D, R>(
         } else {
             spawn_singmux_connection(stream, carried);
         }
+        return;
+    }
+    if cmd != 2 {
+        if let Some(rule) = direct_freedom().and_then(|freedom| {
+            freedom.final_rule(crate::router::Network::Tcp, target.ip(), target.port())
+        }) {
+            if rule.action == FreedomRuleAction::Block {
+                if cmd == 1 {
+                    if stream.write_all(&[0, 0]).is_err() {
+                        return;
+                    }
+                    freedom_blackhole(&stream, rule);
+                }
+                return;
+            }
+        }
+    }
+    if cmd == 2 {
+        serve_vless_udp(stream, &target, carried);
         return;
     }
     if cmd != 1 {
@@ -7339,6 +7577,14 @@ pub(crate) fn serve_mux_tunnel(
             MuxTarget::Address(address) => Some(*address),
             MuxTarget::Name(host, port) => (io.resolve)(host, *port),
         }?;
+        if direct_freedom()
+            .and_then(|freedom| {
+                freedom.final_rule(crate::router::Network::Tcp, address.ip(), address.port())
+            })
+            .is_some_and(|rule| rule.action == FreedomRuleAction::Block)
+        {
+            return None;
+        }
         (io.dial)(&address)
     });
     let udp: MuxUdpOk = Arc::new(|_| true);
@@ -7389,6 +7635,15 @@ fn serve_singmux_stream(mut stream: crate::singmux::Stream) {
         stream.reset();
         return;
     };
+    if direct_freedom()
+        .and_then(|freedom| {
+            freedom.final_rule(crate::router::Network::Tcp, address.ip(), address.port())
+        })
+        .is_some_and(|rule| rule.action == FreedomRuleAction::Block)
+    {
+        stream.reset();
+        return;
+    }
     let Some(mut uplink) = dial_or_report(&address) else {
         stream.reset();
         return;
@@ -9086,6 +9341,25 @@ impl BridgeLane {
         }
     }
 
+    fn with_inbound(
+        tag: &str,
+        route: Option<&Arc<RouteShared>>,
+        outbound: Option<&Outbound>,
+    ) -> Self {
+        Self {
+            plan: route.map(|shared| {
+                Arc::new(RoutePlan::new(
+                    Arc::clone(shared),
+                    Some(tag.to_owned()),
+                    None,
+                    false,
+                ))
+            }),
+            fixed: outbound.cloned(),
+            tag: tag.to_owned(),
+        }
+    }
+
     fn pick(&self, asked: &Destination, network: crate::router::Network) -> Option<Picked<'_>> {
         match &self.plan {
             Some(plan) => Some(plan.pick(asked, network, None, None)),
@@ -9162,7 +9436,68 @@ fn start_bridges(root: &Json, outbound: Option<&Outbound>, route: Option<&Arc<Ro
             let worker_lane = Arc::clone(&lane);
             let wire = MuxWire::Tunnel(tunnel.clone());
             thread::spawn(move || serve_bridge_mux(&wire, worker_lane, &worker_state));
-            Some(crate::reverse::BridgeHandle { tunnel, state })
+            Some(crate::reverse::BridgeHandle {
+                tunnel,
+                state,
+                replaces: None,
+            })
+        });
+    }
+    let app_route = route.cloned();
+    let app_out = outbound.cloned();
+    for bridge in root
+        .get("reverse")
+        .and_then(|reverse| reverse.get("bridges"))
+        .and_then(Json::as_arr)
+        .unwrap_or(&[])
+    {
+        let Some(tag) = bridge.get("tag").and_then(Json::as_str) else {
+            continue;
+        };
+        let Some(domain) = bridge.get("domain").and_then(Json::as_str) else {
+            continue;
+        };
+        if tag.is_empty() || domain.is_empty() {
+            continue;
+        }
+        let tag = tag.to_owned();
+        let domain = domain.to_owned();
+        let lane = Arc::new(BridgeLane::with_inbound(
+            &tag,
+            app_route.as_ref(),
+            app_out.as_ref(),
+        ));
+        let worker_lane = Arc::clone(&lane);
+        crate::reverse::monitor(&tag, move |_| {
+            let (client, server) = crate::reverse::loopback_pair()?;
+            let tunnel = crate::reverse::Tunnel::from_connection(&server)?;
+            let state = crate::reverse::WorkerState::new();
+            let asked = Destination::Name(domain.clone(), 0);
+            let worker_state = Arc::clone(&state);
+            let pick_lane = Arc::clone(&worker_lane);
+            let mux_lane = Arc::clone(&worker_lane);
+            thread::spawn(move || {
+                let Some(picked) = pick_lane.pick(&asked, crate::router::Network::Tcp) else {
+                    let _ = client.shutdown(Shutdown::Both);
+                    return;
+                };
+                serve_connect(
+                    client,
+                    &picked,
+                    &asked,
+                    Front::Socks,
+                    &[],
+                    None,
+                    FlowFacts::default(),
+                );
+            });
+            let wire = MuxWire::Tunnel(tunnel.clone());
+            thread::spawn(move || serve_bridge_mux(&wire, mux_lane, &worker_state));
+            Some(crate::reverse::BridgeHandle {
+                tunnel,
+                state,
+                replaces: None,
+            })
         });
     }
 }
@@ -9181,6 +9516,7 @@ struct UdpMux {
     done: Arc<AtomicBool>,
     stop: std::sync::mpsc::Sender<()>,
     wire: MuxWire,
+    _connection: Option<crate::reverse::ConnectionGuard>,
 }
 
 type UdpTable = HashMap<u16, Arc<UdpMux>>;
@@ -9195,19 +9531,9 @@ fn mux_done(table: &MuxTable) -> bool {
     }
 }
 
-fn remove_mux_session(
-    table: &MuxTable,
-    id: u16,
-    wire: &MuxWire,
-    staging: &mut Vec<u8>,
-    worker: Option<&crate::reverse::WorkerState>,
-) {
+fn remove_mux_session(table: &MuxTable, id: u16, wire: &MuxWire, staging: &mut Vec<u8>) {
     if let Ok(mut table) = table.lock() {
-        if table.flows.remove(&id).is_some() {
-            if let Some(worker) = worker {
-                worker.release_connection();
-            }
-        }
+        table.flows.remove(&id);
     }
     send_mux_end(wire, staging, id);
 }
@@ -9320,7 +9646,6 @@ fn teardown_mux(
     };
     // The session's own socket goes first: a flow parked in a Keep to a client that stopped reading wakes here instead of at its deadline.
     wire.shutdown();
-    let flow_count = u32::try_from(flows.len()).unwrap_or(u32::MAX);
     for flow in flows {
         flow.control.cancel();
     }
@@ -9329,12 +9654,6 @@ fn teardown_mux(
         session.done.store(true, Ordering::Relaxed);
     }
     if let Some(worker) = worker {
-        for _ in 0..flow_count {
-            worker.release_connection();
-        }
-        for _ in udp.values() {
-            worker.release_connection();
-        }
         worker.closed();
     }
     for done in handles {
@@ -9402,9 +9721,6 @@ fn handle_mux_frame(
                 };
                 flow.control.cancel();
                 if removed {
-                    if let Some(worker) = out.worker {
-                        worker.release_connection();
-                    }
                     send_mux_end(out.wire, out.staging, frame.id);
                 }
             }
@@ -9413,17 +9729,10 @@ fn handle_mux_frame(
             if let Some(session) = udp.remove(&frame.id) {
                 session.done.store(true, Ordering::Relaxed);
                 global.retain(|_, id| *id != frame.id);
-                if let Some(worker) = out.worker {
-                    worker.release_connection();
-                }
             }
             if let Ok(mut table) = table.lock() {
                 // Dropping the sender lets the writer drain what the client already sent, then half-close.
-                if table.flows.remove(&frame.id).is_some() {
-                    if let Some(worker) = out.worker {
-                        worker.release_connection();
-                    }
-                }
+                table.flows.remove(&frame.id);
             }
         }
         Status::KeepAlive => {}
@@ -9459,9 +9768,10 @@ fn handle_mux_control_new(
     if refused {
         return;
     }
-    worker.note_connection();
+    let connection = worker.note_connection();
     let state = Arc::clone(worker);
     out.handles.push(RelayPool::global().run(move || {
+        let _connection = connection;
         while let Ok(message) = queued.recv() {
             state.control(&message);
             if !state.active() {
@@ -9505,10 +9815,7 @@ fn handle_mux_tcp_new(
     if refused {
         return send_mux_end(out.wire, out.staging, frame.id);
     }
-    let worker = out.worker.cloned();
-    if let Some(worker) = &worker {
-        worker.note_connection();
-    }
+    let connection = out.worker.as_ref().map(|worker| worker.note_connection());
     // The session keeps reading while this flow dials; the first Keep is already queued and the writer drains it once the origin answers.
     let flow = MuxTcpFlow {
         target,
@@ -9517,7 +9824,7 @@ fn handle_mux_tcp_new(
         wire: out.wire.clone(),
         id: frame.id,
         control,
-        worker: out.worker.cloned(),
+        _connection: connection,
     };
     out.handles
         .push(RelayPool::global().run(move || flow.run(queued)));
@@ -9533,18 +9840,12 @@ struct MuxTcpFlow {
     wire: MuxWire,
     id: u16,
     control: Arc<MuxControl>,
-    worker: Option<Arc<crate::reverse::WorkerState>>,
+    _connection: Option<crate::reverse::ConnectionGuard>,
 }
 
 impl MuxTcpFlow {
     fn remove(&self, scratch: &mut Vec<u8>) {
-        remove_mux_session(
-            &self.table,
-            self.id,
-            &self.wire,
-            scratch,
-            self.worker.as_deref(),
-        );
+        remove_mux_session(&self.table, self.id, &self.wire, scratch);
     }
 
     fn run(self, queued: std::sync::mpsc::Receiver<Vec<u8>>) {
@@ -9639,6 +9940,7 @@ fn handle_mux_udp_new(
             return send_mux_end(out.wire, out.staging, frame.id);
         };
         let (stop, stopped) = std::sync::mpsc::channel();
+        let connection = out.worker.map(crate::reverse::WorkerState::note_connection);
         let session = Arc::new(UdpMux {
             socket: Arc::new(socket),
             dest: Mutex::new(dest),
@@ -9646,23 +9948,18 @@ fn handle_mux_udp_new(
             done: Arc::new(AtomicBool::new(false)),
             stop,
             wire: out.wire.clone(),
+            _connection: connection,
         });
         let Some(reader) = spawn_mux_udp_reader(&session, stopped) else {
             return send_mux_end(out.wire, out.staging, frame.id);
         };
         out.handles.push(reader);
-        if let Some(worker) = out.worker {
-            worker.note_connection();
-        }
         session
     };
     if let Some(old) = udp.insert(frame.id, Arc::clone(&session)) {
         // The stop orders the death with a reader's check-then-write, so no replaced datagram lands after the id.
         let _ = old.stop.send(());
         old.done.store(true, Ordering::Relaxed);
-        if let Some(worker) = out.worker {
-            worker.release_connection();
-        }
     }
     global.retain(|_, id| *id != frame.id);
     if let Some(identity) = identity {
@@ -10568,6 +10865,7 @@ fn serve_session_httpupgrade<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_session_httpheader<
     R: Read + Send + 'static + RelayPoll,
     W: Write + Clone + Send + 'static,
@@ -10579,9 +10877,11 @@ fn serve_session_httpheader<
     users: &[VlessUser],
     freedom: bool,
     decryption: Option<&ferrox_core::vless_encryption::Server>,
+    response: Option<&[u8]>,
 ) {
     let close = connection_closer(&raw);
-    let Some((creader, cwriter)) = crate::httpheader::accept_split(read, write, path) else {
+    let Some((creader, cwriter)) = crate::httpheader::accept_split(read, write, path, response)
+    else {
         echo_trace("session httpheader accept refused");
         return;
     };
@@ -10804,7 +11104,7 @@ fn serve_vless_tls(
                 decryption.cloned().as_deref(),
             );
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, response } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
@@ -10819,6 +11119,7 @@ fn serve_vless_tls(
                 users,
                 freedom,
                 decryption.cloned().as_deref(),
+                response.as_deref(),
             );
         }
         Carrier::Grpc(settings) => {
@@ -11145,7 +11446,7 @@ fn serve_vless_reality(
                 );
             });
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, response } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
@@ -11161,6 +11462,7 @@ fn serve_vless_reality(
                     users,
                     freedom,
                     decryption.cloned().as_deref(),
+                    response.as_deref(),
                 );
             });
         }
@@ -13188,7 +13490,7 @@ fn dial_vless_headed(
     vless: &VlessOut,
     header: &[u8],
 ) -> bool {
-    let Carrier::HttpHeader { path } = &vless.carrier else {
+    let Carrier::HttpHeader { path, .. } = &vless.carrier else {
         return true;
     };
     let Some((reader, write)) =
@@ -16067,8 +16369,16 @@ fn serve_vmess_tls(
         Carrier::Xhttp { settings, .. } => {
             serve_vmess_xhttp_carrier(reader, writer, settings, users, freedom, &close);
         }
-        Carrier::HttpHeader { path } => {
-            crate::vmess::serve_httpheader_split(reader, writer, path, users, freedom, &close);
+        Carrier::HttpHeader { path, response } => {
+            crate::vmess::serve_httpheader_split_with(
+                reader,
+                writer,
+                path,
+                users,
+                freedom,
+                &close,
+                response.as_deref(),
+            );
         }
         Carrier::HttpUpgrade { path, host, .. } => {
             crate::vmess::serve_httpupgrade_split(
@@ -16151,7 +16461,7 @@ fn serve_vmess_reality(
                 serve_vmess_xhttp_carrier(reader, writer, settings, users, freedom, &close);
             });
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, response } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = raw.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
@@ -16162,7 +16472,15 @@ fn serve_vmess_reality(
                 let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                     let _ = raw.shutdown(Shutdown::Both);
                 });
-                crate::vmess::serve_httpheader_split(reader, writer, path, users, freedom, &close);
+                crate::vmess::serve_httpheader_split_with(
+                    reader,
+                    writer,
+                    path,
+                    users,
+                    freedom,
+                    &close,
+                    response.as_deref(),
+                );
             });
         }
         Carrier::HttpUpgrade { path, host, .. } => {
@@ -17920,7 +18238,7 @@ fn open_vmess_udp_plain(
                 response: (response_key, response_iv, auth),
             })
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, .. } => {
             let (mut reader, mut writer) =
                 crate::httpheader::connect(uplink, &vmess.host, path, &vmess.headers)?;
             reader.set_poll(Some(RELAY_POLL));
@@ -18061,7 +18379,7 @@ fn open_vmess_udp_session<S: Dialed>(
                 response: (response_key, response_iv, auth),
             })
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, .. } => {
             let (reader, mut writer) =
                 tls_httpheader(server, session, &vmess.host, path, &vmess.headers)?;
             let (request, send, recv, response_key, response_iv, auth) =
@@ -18523,7 +18841,7 @@ fn udp_plain_carried(
             };
             Some((Box::new(reader), Box::new(writer), Arc::new(close)))
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, .. } => {
             let (reader, mut writer) = crate::httpheader::connect(uplink, host, path, headers)?;
             writer.write_all(header).ok()?;
             let socket = writer.try_clone().ok()?;
@@ -18651,7 +18969,7 @@ fn udp_carried_session<S: Dialed>(
             };
             Some((Box::new(reader), Box::new(writer), Arc::new(close)))
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, .. } => {
             let (reader, writer, raw) = session.into_halves()?;
             let (reader, writer) =
                 crate::httpheader::connect_split(reader, writer, host, path, headers)?;
@@ -18878,7 +19196,7 @@ fn vless_mux_plain(server: &SocketAddr, vless: &VlessOut) -> Option<MuxUplink> {
                 &header,
             )
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, .. } => {
             let close = connection_closer(&uplink);
             let (read, writer) =
                 crate::httpheader::connect(uplink, &vless.host, path, &vless.headers)?;
@@ -18982,7 +19300,7 @@ where
                 &header,
             )
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, .. } => {
             let (read, writer) =
                 tls_httpheader(server, session, &vless.host, path, &vless.headers)?;
             let close = connection_closer(&writer.raw);
@@ -19732,7 +20050,7 @@ fn trojan_mux_plain(server: &SocketAddr, trojan: &TrojanOut) -> Option<MuxUplink
                 close: Arc::new(move || closer.finish()),
             })
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, .. } => {
             let close = connection_closer(&uplink);
             let (read, mut writer) =
                 crate::httpheader::connect(uplink, &trojan.host, path, &trojan.headers)?;
@@ -19827,7 +20145,7 @@ where
                 close: Arc::new(move || closer.finish()),
             })
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, .. } => {
             let (read, mut writer) =
                 tls_httpheader(server, session, &trojan.host, path, &trojan.headers)?;
             writer.write_all(&header).ok()?;
@@ -20424,7 +20742,7 @@ fn dial_vmess_headed(
     vmess: &VmessOut,
     target: &Destination,
 ) -> bool {
-    let Carrier::HttpHeader { path } = &vmess.carrier else {
+    let Carrier::HttpHeader { path, .. } = &vmess.carrier else {
         return true;
     };
     let Some((reader, mut write)) =
@@ -20769,7 +21087,7 @@ fn dial_trojan_headed(
     _target: &Destination,
     header: &[u8],
 ) -> bool {
-    let Carrier::HttpHeader { path } = &trojan.carrier else {
+    let Carrier::HttpHeader { path, .. } = &trojan.carrier else {
         return true;
     };
     let Some((mut reader, mut write)) =
@@ -21353,7 +21671,7 @@ fn dial_tls_carried_stream(
                 writer: Box::new(writer) as Box<dyn Write + Send>,
             })
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, .. } => {
             let (reader, writer) = tls_httpheader(server, session, host, path, headers)?;
             Some(CarrierStream {
                 reader: Box::new(reader) as Box<dyn Read + Send>,
@@ -22915,7 +23233,7 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             };
             relay_vless_xhttp_session(server, client, vless, header, reader, writer);
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, .. } => {
             let Some((reader, sink)) =
                 tls_httpheader(server, session, &vless.host, path, &vless.headers)
             else {
@@ -23582,7 +23900,7 @@ fn dial_trojan_session<S, D>(
             }
             relay_sink_xhttp_drained(reader, &writer, client);
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, .. } => {
             let Some((reader, mut sink)) =
                 tls_httpheader(server, session, &trojan.host, path, &trojan.headers)
             else {
@@ -23775,7 +24093,7 @@ fn vmess_tls_carried<S: Dialed, D: Dialed>(
                 Some((response_key, response_iv, auth)),
             );
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, .. } => {
             let Some((reader, sink)) =
                 tls_httpheader(server, session, &vmess.host, path, &vmess.headers)
             else {
@@ -24019,7 +24337,7 @@ fn dial_ss_headed(
     ss: &ShadowsocksOut,
     target: &Destination,
 ) -> bool {
-    let Carrier::HttpHeader { path } = &ss.carrier else {
+    let Carrier::HttpHeader { path, .. } = &ss.carrier else {
         return true;
     };
     let Some((reader, mut writer)) =
@@ -24067,7 +24385,7 @@ fn dial_ss_tls_headed(
     target: &Destination,
     cfg: &ferrox_core::tls::TlsConfig,
 ) -> bool {
-    let Carrier::HttpHeader { path } = &ss.carrier else {
+    let Carrier::HttpHeader { path, .. } = &ss.carrier else {
         return false;
     };
     let Some(session) = dial_tls_session(server, cfg, ss.carrier.tcp_mask()) else {
@@ -24090,7 +24408,7 @@ fn dial_ss_reality_headed(
     target: &Destination,
     cfg: &ferrox_core::tls::RealityClientConfig,
 ) -> bool {
-    let Carrier::HttpHeader { path } = &ss.carrier else {
+    let Carrier::HttpHeader { path, .. } = &ss.carrier else {
         return false;
     };
     let Some(session) = dial_reality_session(server, cfg, ss.carrier.tcp_mask()) else {
@@ -24721,8 +25039,8 @@ fn serve_trojan(stream: Connection, key: &[[u8; 56]], carrier: &Carrier, freedom
             let arm = |read: &Connection, timeout| read.set_read_timeout(timeout).is_ok();
             serve_trojan_xhttp_carrier(read, stream, settings, key, freedom, arm);
         }
-        Carrier::HttpHeader { path } => {
-            serve_trojan_httpheader(stream, key, path.as_str(), freedom);
+        Carrier::HttpHeader { path, response } => {
+            serve_trojan_httpheader_with(stream, key, path.as_str(), freedom, response.as_deref());
         }
         refused_carriers!() => {}
     }
@@ -25127,8 +25445,19 @@ pub(crate) fn serve_trojan_grpc_muxed(
     }
 }
 
+#[cfg(test)]
 fn serve_trojan_httpheader(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bool) {
-    let Some((mut reader, write)) = crate::httpheader::accept(stream, path) else {
+    serve_trojan_httpheader_with(stream, key, path, freedom, None);
+}
+
+fn serve_trojan_httpheader_with(
+    stream: Connection,
+    key: &[[u8; 56]],
+    path: &str,
+    freedom: bool,
+    response: Option<&[u8]>,
+) {
+    let Some((mut reader, write)) = crate::httpheader::accept(stream, path, response) else {
         return;
     };
     let Some((cmd, target)) = decode_trojan_request(&mut reader, key) else {
@@ -25242,14 +25571,22 @@ fn serve_trojan_tls(
             let (reader, writer) = session_halves(session, out);
             serve_session_trojan_httpupgrade(reader, writer, raw, path, host, key, freedom);
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, response } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_trojan_httpheader(reader, writer, raw, path, key, freedom);
+            serve_session_trojan_httpheader(
+                reader,
+                writer,
+                raw,
+                path,
+                key,
+                freedom,
+                response.as_deref(),
+            );
         }
         Carrier::Grpc(settings) => {
             let Ok(out) = stream.try_clone() else { return };
@@ -25313,7 +25650,7 @@ fn serve_trojan_reality(
                 serve_session_trojan_httpupgrade(reader, writer, raw, path, host, key, freedom);
             });
         }
-        Carrier::HttpHeader { path } => {
+        Carrier::HttpHeader { path, response } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
@@ -25321,7 +25658,15 @@ fn serve_trojan_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_session_trojan_httpheader(reader, writer, raw, path, key, freedom);
+                serve_session_trojan_httpheader(
+                    reader,
+                    writer,
+                    raw,
+                    path,
+                    key,
+                    freedom,
+                    response.as_deref(),
+                );
             });
         }
         Carrier::Grpc(settings) => {
@@ -26071,8 +26416,10 @@ fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + 
     path: &str,
     key: &[[u8; 56]],
     freedom: bool,
+    response: Option<&[u8]>,
 ) {
-    let Some((mut creader, cwriter)) = crate::httpheader::accept_split(read, write, path) else {
+    let Some((mut creader, cwriter)) = crate::httpheader::accept_split(read, write, path, response)
+    else {
         echo_trace("session httpheader trojan accept refused");
         return;
     };
@@ -43482,6 +43829,53 @@ mod tests {
     }
 
     #[test]
+    fn a_live_portal_rule_reaches_and_leaves_the_vmess_restriction() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"}],"routing":{"rules":[{"type":"field","ruleTag":"seed","inboundTag":["other"],"domain":["full:edge.test"],"outboundTag":"edge"}]}}"#,
+        )
+        .expect("parses");
+        let mut portals = crate::reverse::Portals::default();
+        portals.insert("edge");
+        portals
+            .insert_domain("edge", "edge.test")
+            .expect("the portal domain is unique");
+        let portals = Arc::new(portals);
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let users = shared.vmess_users("vmess", || crate::vmess::Users::single([7; 16]));
+        shared.restrict_user_portals(Some("vmess"), &users);
+        assert!(
+            !users.portal_allowed("edge"),
+            "the seed rule names another inbound"
+        );
+        let runtime = Runtime::new(None, Some(Arc::clone(&shared)), true, Arc::clone(&portals));
+        let added = crate::json::parse(
+            r#"[{"type":"field","ruleTag":"live","domain":["full:edge.test"],"outboundTag":"edge"}]"#,
+        )
+        .expect("rule");
+        runtime
+            .add_rules(added.as_arr().expect("rules"), true)
+            .expect("the portal rule lands");
+        assert!(
+            users.portal_allowed("edge"),
+            "a portal rule added after startup restricts the running users"
+        );
+        runtime.remove_rules("live").expect("the rule leaves");
+        assert!(
+            !users.portal_allowed("edge"),
+            "removing the rule revokes the portal again"
+        );
+        runtime.forget_server_inbound("vmess");
+        let replacement = shared.vmess_users("vmess", || crate::vmess::Users::single([9; 16]));
+        assert!(
+            !std::sync::Arc::ptr_eq(&users, &replacement),
+            "a re-added inbound builds a fresh account table"
+        );
+    }
+
+    #[test]
     fn a_dynamic_inbound_naming_a_source_selector_is_not_served() {
         let root = crate::json::parse(
             r#"{"outbounds":[{"tag":"direct","protocol":"freedom"}],"routing":{"rules":[{"type":"field","outboundTag":"direct","inboundTag":["dyn"],"source":["192.0.2.0/24"]}]}}"#,
@@ -43516,7 +43910,7 @@ mod tests {
     #[test]
     fn a_dynamic_server_inbound_is_proved_before_a_later_rule_is_published() {
         let root = crate::json::parse(
-            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"blocked","protocol":"blackhole"}],"routing":{"rules":[{"type":"field","ruleTag":"seed","inboundTag":["other"],"outboundTag":"blocked"}]}}"#,
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"remote","protocol":"vmess","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}]}}],"routing":{"rules":[{"type":"field","ruleTag":"seed","inboundTag":["other"],"outboundTag":"remote"}]}}"#,
         )
         .expect("parses");
         let routing = crate::router::Routing::parse_in(&root, Vec::new())
@@ -43527,19 +43921,19 @@ mod tests {
         shared.record_server_inbound(
             Some("dyn".to_owned()),
             &[crate::router::Network::Tcp, crate::router::Network::Udp],
+            false,
         );
         let runtime = Runtime::new(None, Some(Arc::clone(&shared)), true, Arc::clone(&portals));
-        let rules = crate::json::parse(
-            r#"[{"type":"field","inboundTag":["dyn"],"outboundTag":"blocked"}]"#,
-        )
-        .expect("parses");
+        let rules =
+            crate::json::parse(r#"[{"type":"field","inboundTag":["dyn"],"outboundTag":"remote"}]"#)
+                .expect("parses");
         assert_eq!(
             runtime.add_rules(rules.as_arr().expect("rules"), true),
             Err(
-                "a rule for inbound dyn targets `blocked`, which the server inbound serves direct"
+                "a rule for inbound dyn targets `remote`, which the server inbound serves direct"
                     .to_owned()
             ),
-            "the rule that sends the dynamic inbound to a blackhole is refused"
+            "the rule that sends the dynamic inbound to a proxied outbound is refused"
         );
     }
 
@@ -45079,6 +45473,7 @@ mod tests {
         encrypted_vless_carried_echo(
             Carrier::HttpHeader {
                 path: "/sealed".to_owned(),
+                response: None,
             },
             "header.test",
         );
@@ -45248,6 +45643,7 @@ mod tests {
         encrypted_vless_carried_vision_echo(
             Carrier::HttpHeader {
                 path: "/sealed".to_owned(),
+                response: None,
             },
             "header.test",
             ferrox_core::vless::VISION_FLOW,
@@ -50555,7 +50951,7 @@ mod tests {
         .expect("parses");
         assert!(matches!(
             stream_carrier(camouflage.get("streamSettings")),
-            Carrier::HttpHeader { path } if path == "/camouflage"
+            Carrier::HttpHeader { path, .. } if path == "/camouflage"
         ));
         let plain =
             crate::json::parse(r#"{"streamSettings": {"network": "tcp"}}"#).expect("parses");
@@ -51372,6 +51768,7 @@ mod tests {
         vless_over_carrier_reaches_echo(
             &Carrier::HttpHeader {
                 path: "/camouflage".to_owned(),
+                response: None,
             },
             "oracle.example",
             "/camouflage",
@@ -51429,6 +51826,7 @@ mod tests {
             id,
             carrier: Carrier::HttpHeader {
                 path: "/p".to_owned(),
+                response: None,
             },
             host: "127.0.0.1".to_owned(),
             mux: Mux::default(),
@@ -51588,7 +51986,7 @@ mod tests {
         carried_round_trip(
             "httpheader",
             |stream| {
-                let (reader, write) = crate::httpheader::accept(stream, "/camouflage")?;
+                let (reader, write) = crate::httpheader::accept(stream, "/camouflage", None)?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(write) as Box<dyn Write + Send>,
@@ -51822,6 +52220,7 @@ mod tests {
             send_tickets: true,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
+            issuer: None,
             ech_server_keys: None,
             master_key_log: None,
             kernel_tx: false,
@@ -53015,7 +53414,10 @@ mod tests {
             ..Default::default()
         });
         let id = [0x24u8; 16];
-        let carrier = Carrier::HttpHeader { path: "/p".into() };
+        let carrier = Carrier::HttpHeader {
+            path: "/p".into(),
+            response: None,
+        };
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -58845,6 +59247,7 @@ mod tests {
             },
             Carrier::HttpHeader {
                 path: "/vmess-header".to_owned(),
+                response: None,
             },
         ]
     }
@@ -58872,7 +59275,7 @@ mod tests {
             Carrier::HttpUpgrade { path, host, .. } => {
                 crate::vmess::serve_httpupgrade(stream, path, host, &users, true);
             }
-            Carrier::HttpHeader { path } => {
+            Carrier::HttpHeader { path, .. } => {
                 crate::vmess::serve_httpheader(stream, path, &users, true);
             }
             _ => unreachable!("the test carrier list carries a server"),
@@ -59865,7 +60268,7 @@ mod tests {
         read: ServerHalf,
         write: ServerHalf,
     ) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
-        let (reader, writer) = crate::httpheader::accept_split(read, write, "/c")?;
+        let (reader, writer) = crate::httpheader::accept_split(read, write, "/c", None)?;
         Some((Box::new(reader), Box::new(writer)))
     }
 
@@ -60355,6 +60758,7 @@ mod tests {
                     id,
                     Carrier::HttpHeader {
                         path: "/c".to_owned(),
+                        response: None,
                     },
                     client_config,
                 )
@@ -60508,6 +60912,7 @@ mod tests {
                     id,
                     Carrier::HttpHeader {
                         path: "/c".to_owned(),
+                        response: None,
                     },
                     client_config,
                 )
@@ -60920,6 +61325,7 @@ mod tests {
                     key,
                     Carrier::HttpHeader {
                         path: "/c".to_owned(),
+                        response: None,
                     },
                     client_config,
                 )
@@ -61381,6 +61787,7 @@ mod tests {
         socks_dials_ss_via(
             Carrier::HttpHeader {
                 path: "/ss-camouflage".to_owned(),
+                response: None,
             },
             ss_serve(crate::shadowsocks::serve_httpheader),
             "/ss-camouflage",
@@ -64762,10 +65169,11 @@ mod tests {
             };
             handle_mux_udp_new(new(second_port), &mut udp, &mut global, &mut out);
         }
+        drop(old);
         assert_eq!(
             worker.connections(),
             1,
-            "the replaced session kept the worker slot the new one needs"
+            "the replaced session releases its slot"
         );
         server
             .set_read_timeout(Some(Duration::from_millis(500)))
@@ -66664,6 +67072,7 @@ mod tests {
             key: trojan_key("secret"),
             carrier: Carrier::HttpHeader {
                 path: "/tunnel".to_owned(),
+                response: None,
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
@@ -68054,6 +68463,7 @@ mod tests {
             (
                 Carrier::HttpHeader {
                     path: "/t".to_owned(),
+                    response: None,
                 },
                 Rung::Raw,
             ),
@@ -70705,6 +71115,7 @@ mod tests {
             send_tickets: true,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
+            issuer: None,
             ech_server_keys: None,
             master_key_log: None,
             kernel_tx: false,
@@ -79211,21 +79622,21 @@ end
             r#"{"inbounds":[{"tag":"served","protocol":"vless","listen":"127.0.0.1","port":12345,
                 "settings":{"clients":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}},
                 {"tag":"client","protocol":"socks","listen":"127.0.0.1","port":12346,"settings":{"auth":"noauth"}}],
-                "outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
-                "routing":{"rules":[{"type":"field","inboundTag":["client"],"domain":["full:other.test"],"outboundTag":"block"}]}}"#,
+                "outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"},{"tag":"remote","protocol":"vmess","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}]}}],
+                "routing":{"rules":[{"type":"field","inboundTag":["client"],"domain":["full:other.test"],"outboundTag":"block"},{"type":"field","inboundTag":["client"],"domain":["full:remote.test"],"outboundTag":"remote"}]}}"#,
         )
         .expect("parses");
         let runtime = test_runtime(&root);
         let before = runtime.listed_rules().len();
         let blocked = crate::json::parse(
-            r#"{"type":"field","ruleTag":"blocked","inboundTag":["served"],"outboundTag":"block"}"#,
+            r#"{"type":"field","ruleTag":"blocked","inboundTag":["served"],"outboundTag":"remote"}"#,
         )
         .expect("parses");
         let error = runtime
             .add_rules(&[blocked], true)
             .expect_err("the server inbound dials direct");
         assert!(
-            error.contains("served") && error.contains("block"),
+            error.contains("served") && error.contains("remote"),
             "{error}"
         );
         assert_eq!(
@@ -79251,7 +79662,7 @@ end
         let root = crate::json::parse(
             r#"{"inbounds":[{"tag":"served","protocol":"vless","listen":"127.0.0.1","port":12345,
                 "settings":{"clients":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}}],
-                "outbounds":[{"tag":"default","protocol":"blackhole"}],"routing":{}}"#,
+                "outbounds":[{"tag":"default","protocol":"vmess","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}]}}],"routing":{}}"#,
         )
         .expect("parses");
         let runtime = test_runtime(&root);
@@ -84350,8 +84761,14 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             Carrier::Xhttp { settings, .. } => {
                 crate::vmess::serve_xhttp_settings(stream, &settings, &users, freedom);
             }
-            Carrier::HttpHeader { path } => {
-                crate::vmess::serve_httpheader(stream, path.as_str(), &users, freedom);
+            Carrier::HttpHeader { path, response } => {
+                crate::vmess::serve_httpheader_with(
+                    stream,
+                    path.as_str(),
+                    &users,
+                    freedom,
+                    response.as_deref(),
+                );
             }
             Carrier::HttpUpgrade { path, host, .. } => {
                 crate::vmess::serve_httpupgrade(stream, path.as_str(), &host, &users, freedom);

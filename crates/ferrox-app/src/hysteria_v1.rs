@@ -1166,6 +1166,7 @@ pub(crate) fn serve_loop(
     };
     let local = sock.local_addr().unwrap_or(bound);
     let Some(mut template) = server_config(identity, config.cc, config.quic.as_ref()) else {
+        eprintln!("hysteria v1 inbound on {address} cannot build its quic tls: serves nothing");
         return;
     };
     let sock = match XPlus::new(&config.obfs_password) {
@@ -1473,6 +1474,7 @@ mod tests {
             send_tickets: true,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
+            issuer: None,
             ech_server_keys: None,
             master_key_log: None,
             kernel_tx: false,
