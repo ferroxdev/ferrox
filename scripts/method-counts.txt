@@ -332,6 +332,7 @@ carrier-grpc header-block-allocations-per-frame 1 ferrox-app-h2::tests::a_header
 carrier-xhttp ops-retired-instructions 33046 scripts/count-ops.sh
 carrier-xhttp framing-size-lines-without-an-allocation 0 ferrox-app-xhttp::tests::size_lines_match_format_without_allocating
 carrier-xhttp framing-read-syscalls-per-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
+carrier-xhttp framing-buffer-reallocations-per-steady-fill 0 ferrox-app-xhttp::tests::a_second_fill_keeps_the_framing_buffers_allocation
 carrier-xhttp read-syscalls-per-chunk 2 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
 carrier-xhttp read-syscalls-for-16-peer-chunks 3 ferrox-app-xhttp::tests::a_peer_chunk_smaller_than_the_window_amortises_its_framing
 carrier-xhttp read-syscalls-for-16-maximum-size-lines 17 ferrox-app-xhttp::tests::a_maximum_size_line_keeps_the_closing_crlf_in_the_framing_read
