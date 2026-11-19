@@ -83,7 +83,10 @@ pub(crate) fn accept(
 
 fn check_request(head: &[u8], paths: &[String]) -> Option<()> {
     let path = crate::proxy::request_path(head)?;
-    paths.iter().any(|held| held.as_str() == path).then_some(())
+    paths
+        .iter()
+        .any(|held| held.split_once('?').map_or(held.as_str(), |(base, _)| base) == path)
+        .then_some(())
 }
 
 // The same accept over halves that cannot peek: the kept read consumes the head, so what rode in behind it is the reader's own prefix.
@@ -182,6 +185,7 @@ mod tests {
         let paths = ["/one".to_owned(), "/two".to_owned()];
         assert!(check_request(head, &paths).is_some());
         assert!(check_request(head, &["/one".to_owned()]).is_none());
+        assert!(check_request(head, &["/two?x=1".to_owned()]).is_some());
     }
 
     #[test]

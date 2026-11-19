@@ -697,7 +697,7 @@ pub fn issuer_lane_error(cfg: &TlsServerConfig) -> Option<&'static str> {
     cfg.issuer.as_ref()?;
     if cfg.ech_server_keys.is_some() {
         Some("the ECH backend")
-    } else if cipher_suites::shaped_server(&cfg.cipher_suites, cfg.min_version, cfg.max_version) {
+    } else if cipher_suites::shaped_listener(&cfg.cipher_suites, cfg.min_version) {
         Some("the shaped TLS 1.2 engine")
     } else if legacy::needed(&cfg.cipher_suites) {
         Some("the BoringSSL legacy lane")

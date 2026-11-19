@@ -4662,15 +4662,11 @@ fn server_proof_for_candidate<'a>(
         match shared.default_tag.as_deref() {
             Some(default) => {
                 direct_tag(shared, default)
-                    || (portal
-                        && matches!(&shared.default, Outbound::Block(_))
-                        && !shared.has_freedom())
+                    || (portal && matches!(&shared.default, Outbound::Block(_)) && !has_freedom)
             }
             None => {
                 matches!(&shared.default, Outbound::Freedom(_))
-                    || (portal
-                        && matches!(&shared.default, Outbound::Block(_))
-                        && !shared.has_freedom())
+                    || (portal && matches!(&shared.default, Outbound::Block(_)) && !has_freedom)
             }
         }
     };
@@ -36829,6 +36825,9 @@ pub(crate) trait FrameWrite: Write + Send {
 
     /// Clears the clock so an established relay waits on the peer rather than a task budget.
     fn clear_write_timeout(&mut self) {}
+
+    /// Closes both directions of the transport, so a reader blocked beside this writer ends.
+    fn shutdown(&mut self) {}
 }
 
 impl FrameWrite for Connection {
@@ -36851,6 +36850,10 @@ impl FrameWrite for Connection {
 
     fn clear_write_timeout(&mut self) {
         let _ = self.set_write_timeout(None);
+    }
+
+    fn shutdown(&mut self) {
+        let _ = Connection::shutdown(self, std::net::Shutdown::Both);
     }
 }
 
