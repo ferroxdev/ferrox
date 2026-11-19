@@ -496,7 +496,7 @@ fn defer_close(close: Arc<dyn Fn() + Send + Sync>) {
             .name("singmux-close".to_owned())
             .spawn(move || {
                 while let Ok(close) = pending.recv() {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(close));
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| close()));
                 }
             });
         if spawned.is_err() {
@@ -509,7 +509,8 @@ fn defer_close(close: Arc<dyn Fn() + Send + Sync>) {
     if let Some(sender) = queue.as_ref() {
         match sender.send(close) {
             Ok(()) => return,
-            Err(close) => {
+            Err(error) => {
+                let close = error.0;
                 *queue = None;
                 drop(queue);
                 defer_close(close);
