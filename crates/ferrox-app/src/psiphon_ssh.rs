@@ -1792,7 +1792,7 @@ impl Session {
                             &server.host,
                             tls_passthrough_key(server),
                             server.meek_obfuscated_key.as_deref().unwrap_or(""),
-                            timeout,
+                            deadline,
                             shape,
                             base,
                         )?,
@@ -1826,7 +1826,7 @@ impl Session {
                             &server.host,
                             tls_passthrough_key(server),
                             server.meek_obfuscated_key.as_deref().unwrap_or(""),
-                            timeout,
+                            deadline,
                             shape,
                             base,
                         )?,
@@ -1884,12 +1884,8 @@ impl Session {
                 };
                 (stream, Some(relay), destination.protocol, base)
             } else {
-                let timeout = deadline.saturating_duration_since(Instant::now());
-                if timeout.is_zero() {
-                    return Err("psiphon ssh: establishment deadline expired".to_owned());
-                }
                 let (stream, protocol) =
-                    direct_stream(server, timeout, proxy, dns, shape, limit_meek_buffers)?;
+                    direct_stream(server, deadline, proxy, dns, shape, limit_meek_buffers)?;
                 (stream, None, protocol, protocol)
             };
 
@@ -1897,8 +1893,14 @@ impl Session {
             .try_clone()
             .map_err(|error| format!("psiphon ssh socket clone: {error}"))?;
         let pool = Arc::new(Mutex::new(Vec::new()));
-        let (mut output, mut input) =
-            split(stream, server, relay.is_some(), Arc::clone(&pool), shape)?;
+        let (mut output, mut input) = split(
+            stream,
+            server,
+            relay.is_some(),
+            Arc::clone(&pool),
+            shape,
+            deadline,
+        )?;
         output
             .set_deadline(deadline)
             .map_err(|error| format!("psiphon ssh socket: {error}"))?;
@@ -3188,12 +3190,16 @@ pub(crate) fn tls_passthrough(key: &str) -> Result<[u8; 32], String> {
 /// Dial a direct or unfronted transport, wrapping it in TLS when the entry names TLS-OSSH.
 fn direct_stream(
     server: &Server,
-    timeout: Duration,
+    deadline: Instant,
     proxy: Option<&Proxy>,
     dns: &crate::psiphon_dns::Config,
     shape: &TlsShape,
     limit_meek_buffers: bool,
 ) -> Result<(Stream, &'static str), String> {
+    let timeout = deadline.saturating_duration_since(Instant::now());
+    if timeout.is_zero() {
+        return Err("psiphon ssh: establishment deadline expired".to_owned());
+    }
     if server.quic {
         let stream = crate::psiphon_quic::QuicStream::connect(server, timeout, proxy, shape)?;
         return Ok((Stream::Quic(stream), "QUIC-OSSH"));
@@ -3261,7 +3267,7 @@ fn direct_stream(
                 &server.host,
                 tls_passthrough_key(server),
                 server.meek_obfuscated_key.as_deref().unwrap_or(""),
-                timeout,
+                deadline,
                 shape,
                 protocol,
             )?
@@ -3303,10 +3309,14 @@ fn tls_tunnel(
     server_name: &str,
     passthrough_key: &str,
     obfuscated_key: &str,
-    timeout: Duration,
+    deadline: Instant,
     shape: &TlsShape,
     protocol: &str,
 ) -> Result<Stream, String> {
+    let timeout = deadline.saturating_duration_since(Instant::now());
+    if timeout.is_zero() {
+        return Err("psiphon tls: establishment deadline expired".to_owned());
+    }
     stream
         .set_timeout(Some(timeout))
         .map_err(|error| format!("psiphon tls socket: {error}"))?;
@@ -3328,6 +3338,7 @@ fn tls_tunnel(
     let stream = crate::psiphon_fragment::TlsHelloFragmentor::new(stream, fragment);
     let mut tls = ferrox_core::tls::connect(&config, stream)
         .map_err(|error| format!("psiphon tls {name}: {error}"))?;
+    tls.set_handshake_deadline(deadline);
     tls.handshake()
         .map_err(|error| format!("psiphon tls handshake {name}: {error}"))?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -3335,12 +3346,16 @@ fn tls_tunnel(
     let address = listener
         .local_addr()
         .map_err(|error| format!("psiphon tls listener: {error}"))?;
-    let local = TcpStream::connect_timeout(&address, timeout)
+    let loopback_timeout = deadline.saturating_duration_since(Instant::now());
+    if loopback_timeout.is_zero() {
+        return Err("psiphon tls: establishment deadline expired".to_owned());
+    }
+    let local = TcpStream::connect_timeout(&address, loopback_timeout)
         .map_err(|error| format!("psiphon tls loopback: {error}"))?;
     local
         .set_nodelay(true)
-        .and_then(|()| local.set_read_timeout(Some(timeout)))
-        .and_then(|()| local.set_write_timeout(Some(timeout)))
+        .and_then(|()| local.set_read_timeout(Some(loopback_timeout)))
+        .and_then(|()| local.set_write_timeout(Some(loopback_timeout)))
         .map_err(|error| format!("psiphon tls loopback: {error}"))?;
     std::thread::Builder::new()
         .name("psiphon-tls".to_owned())
@@ -3410,6 +3425,7 @@ fn split(
     relayed: bool,
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
     shape: &TlsShape,
+    deadline: Instant,
 ) -> Result<(PacketWriter, PacketReader), String> {
     let write = socket
         .try_clone()
@@ -3465,16 +3481,23 @@ fn split(
         client.apply(&mut preamble[magic_at..]);
         let mut write = write;
         if let Some(prefix) = &prefix {
+            arm_stream(&write, deadline)?;
             write
                 .write_all(&preamble[..prefix.prefix_len])
                 .map_err(|error| format!("psiphon ssh prefix: {error}"))?;
             if let Some(delay) = prefix_split(prefix.split_min, prefix.split_max) {
-                std::thread::sleep(delay);
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err("psiphon ssh: establishment deadline expired".to_owned());
+                }
+                std::thread::sleep(delay.min(left));
             }
+            arm_stream(&write, deadline)?;
             write
                 .write_all(&preamble[prefix.prefix_len..])
                 .map_err(|error| format!("psiphon ssh preamble: {error}"))?;
         } else {
+            arm_stream(&write, deadline)?;
             write
                 .write_all(&preamble)
                 .map_err(|error| format!("psiphon ssh preamble: {error}"))?;
@@ -3737,6 +3760,16 @@ struct PacketReader {
     /// Bytes a banner read took past its newline, still obfuscated until `recv` applies the keystream.
     pending: Vec<u8>,
     deadline: Option<Instant>,
+}
+
+fn arm_stream(stream: &Stream, deadline: Instant) -> Result<(), String> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err("psiphon ssh: establishment deadline expired".to_owned());
+    }
+    stream
+        .set_timeout(Some(left))
+        .map_err(|error| format!("psiphon ssh socket: {error}"))
 }
 
 fn arm_deadline(io: &Stream, deadline: Option<Instant>) -> io::Result<()> {

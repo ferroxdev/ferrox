@@ -10,7 +10,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 use str0m::change::{SdpAnswer, SdpPendingOffer};
@@ -1615,6 +1615,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Lock without waiting past the offer deadline.
+fn lock_until<T>(mutex: &Mutex<T>, deadline: Instant) -> Result<MutexGuard<'_, T>, String> {
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err("psiphon conduit: offer retry window expired".to_owned());
+                }
+                std::thread::sleep(left.min(Duration::from_millis(2)));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Cidr {
     base: IpAddr,
@@ -2042,7 +2059,7 @@ impl Conduit {
             use_media_streams: offers_media(&sdp),
         };
         let offer = {
-            let mut client = lock(&client);
+            let mut client = lock_until(&client, deadline).map_err(|error| (error, false))?;
             let offer_remaining = deadline.saturating_duration_since(Instant::now());
             if offer_remaining.is_zero() {
                 return Err((
