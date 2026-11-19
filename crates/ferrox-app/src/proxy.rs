@@ -17423,17 +17423,30 @@ fn serve_ss_relay_inbound(
                 return RelayFront::Refused;
             }
         };
-        let method = method.to_owned();
-        let psk = psk.clone();
-        let relay_dests = relay_dests.clone();
+        let method = Arc::new(method.to_owned());
+        let psk = Arc::new(psk.clone());
+        let relay_dests = Arc::new(relay_dests.clone());
         let stop = stop.cloned();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 if stop.as_ref().is_some_and(|stop| stop.stopped()) {
                     break;
                 }
-                crate::shadowsocks2022::serve_relay(stream, &method, &psk, &relay_dests);
+                let (method, psk, relay_dests) = (
+                    Arc::clone(&method),
+                    Arc::clone(&psk),
+                    Arc::clone(&relay_dests),
+                );
+                thread::spawn(move || {
+                    crate::shadowsocks2022::serve_relay(
+                        stream,
+                        method.as_str(),
+                        &psk[..],
+                        &relay_dests[..],
+                    );
+                });
             }
+            drop(listener);
             if let Some(stop) = stop {
                 stop.mark_closed();
             }

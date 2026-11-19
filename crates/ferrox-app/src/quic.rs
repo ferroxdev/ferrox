@@ -5261,6 +5261,10 @@ pub(crate) fn serve_loop(
     if left != 0 {
         eprintln!("quic: {left} stream handlers still running at shutdown");
     }
+    // A stream handler holds a socket clone; the port is not free until the last one drops it.
+    while Arc::strong_count(&sock) > 1 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Source IDs quiche issues mid-connection: any packet may carry one, so every new one routes.
