@@ -4514,10 +4514,8 @@ fn server_networks(inbound: &Json) -> Option<Vec<crate::router::Network>> {
             let served = !matches!(
                 carrier,
                 Carrier::Quic
-                    | Carrier::Kcp(_)
                     | Carrier::Hysteria(_)
                     | Carrier::Masque
-                    | Carrier::Xdrive { .. }
                     | Carrier::Http
                     | Carrier::Unknown { .. }
             );
@@ -46119,6 +46117,24 @@ mod tests {
             ]),
             "a ws mux tunnel serves both networks"
         );
+    }
+
+    #[test]
+    fn a_kcp_or_xdrive_shadowsocks_inbound_proves_the_udp_its_mux_carries() {
+        for network in ["kcp", "xdrive"] {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol":"shadowsocks","settings":{{"network":"tcp","password":"p"}},"streamSettings":{{"network":"{network}"}}}}"#
+            ))
+            .expect("parses");
+            assert_eq!(
+                server_networks(&inbound),
+                Some(vec![
+                    crate::router::Network::Tcp,
+                    crate::router::Network::Udp,
+                ]),
+                "a {network} mux tunnel serves both networks"
+            );
+        }
     }
 
     #[test]

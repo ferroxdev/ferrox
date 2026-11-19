@@ -3750,9 +3750,7 @@ fn split(
         client.apply(&mut preamble[magic_at..]);
         let mut write = write;
         if let Some(prefix) = &prefix {
-            arm_stream(&write, deadline)?;
-            write
-                .write_all(&preamble[..prefix.prefix_len])
+            write_all_deadline(&mut write, Some(deadline), &preamble[..prefix.prefix_len])
                 .map_err(|error| format!("psiphon ssh prefix: {error}"))?;
             if let Some(delay) = prefix_split(prefix.split_min, prefix.split_max) {
                 let left = deadline.saturating_duration_since(Instant::now());
@@ -3761,14 +3759,10 @@ fn split(
                 }
                 std::thread::sleep(delay.min(left));
             }
-            arm_stream(&write, deadline)?;
-            write
-                .write_all(&preamble[prefix.prefix_len..])
+            write_all_deadline(&mut write, Some(deadline), &preamble[prefix.prefix_len..])
                 .map_err(|error| format!("psiphon ssh preamble: {error}"))?;
         } else {
-            arm_stream(&write, deadline)?;
-            write
-                .write_all(&preamble)
+            write_all_deadline(&mut write, Some(deadline), &preamble)
                 .map_err(|error| format!("psiphon ssh preamble: {error}"))?;
         }
         Ok((
@@ -4029,16 +4023,6 @@ struct PacketReader {
     /// Bytes a banner read took past its newline, still obfuscated until `recv` applies the keystream.
     pending: Vec<u8>,
     deadline: Option<Instant>,
-}
-
-fn arm_stream(stream: &Stream, deadline: Instant) -> Result<(), String> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        return Err("psiphon ssh: establishment deadline expired".to_owned());
-    }
-    stream
-        .set_timeout(Some(left))
-        .map_err(|error| format!("psiphon ssh socket: {error}"))
 }
 
 fn arm_deadline(io: &Stream, deadline: Option<Instant>) -> io::Result<()> {

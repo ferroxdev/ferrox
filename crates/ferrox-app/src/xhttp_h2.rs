@@ -6872,12 +6872,18 @@ mod tests {
             let _ = sent.send(sender.send_data(1, b"ping"));
         });
         // Both windows are zero and the stream is live, so false is the relay-stall timeout.
+        let began = std::time::Instant::now();
         let verdict = got.recv_timeout(Duration::from_secs(30));
+        let took = began.elapsed();
         conn.dead.store(true, Ordering::SeqCst);
         conn.wake.notify_all();
         running.join().expect("sender thread");
         crate::budgets::clear();
         assert_eq!(verdict, Ok(false), "a sender with no credit returned");
+        assert!(
+            took < Duration::from_secs(10),
+            "the sender waited {took:?}, not the configured 500 ms stall"
+        );
     }
 
     /// A request that ended its own body still has a response to send: waiting for credit must not

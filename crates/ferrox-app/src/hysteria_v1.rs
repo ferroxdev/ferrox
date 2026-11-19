@@ -1100,6 +1100,7 @@ fn resolve_pending(
                 lane.pending.remove(&session);
             }
         }
+        resume_lane(&lane);
         return;
     };
     let Some(mut flow) = open_udp(&shared, &sock, session, peer) else {
@@ -1108,6 +1109,7 @@ fn resolve_pending(
                 lane.pending.remove(&session);
             }
         }
+        resume_lane(&lane);
         return;
     };
     let Ok(mut guard) = lane.lock() else {
@@ -1118,10 +1120,14 @@ fn resolve_pending(
         || !guard.sessions.contains(&session)
     {
         flow.stop.store(true, Ordering::Relaxed);
+        drop(guard);
+        resume_lane(&lane);
         return;
     }
     let Some(pending) = guard.pending.remove(&session) else {
         flow.stop.store(true, Ordering::Relaxed);
+        drop(guard);
+        resume_lane(&lane);
         return;
     };
     let first = (pending.host.clone(), pending.port);
@@ -1156,6 +1162,23 @@ fn resolve_pending(
     }
 }
 
+/// A resolver that ends without installing its flow still releases a slot: start the queued work that slot can now carry.
+fn resume_lane(lane: &Arc<Mutex<UdpLane>>) {
+    let Ok(mut guard) = lane.lock() else {
+        return;
+    };
+    let room = MAX_PENDING_RESOLVERS.saturating_sub(guard.resolving.saturating_sub(1));
+    let spawn = guard.start_waiting(room);
+    guard.resolving += spawn.len();
+    drop(guard);
+    for (session, host, port) in spawn {
+        std::thread::spawn({
+            let lane = Arc::clone(lane);
+            move || resolve_dest(lane, session, host, port)
+        });
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn resolve_dest(handle: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u16) {
     let _resolving = Resolving(Arc::clone(&handle));
@@ -1170,10 +1193,7 @@ fn resolve_dest(handle: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u
         return;
     };
     let room = MAX_PENDING_RESOLVERS.saturating_sub(lane.resolving.saturating_sub(1));
-    {
-        let Some(flow) = lane.flows.get_mut(&session) else {
-            return;
-        };
+    if let Some(flow) = lane.flows.get_mut(&session) {
         flow.resolving.remove(&key);
         if let Some(peer) = peer {
             flow.dests.insert(key.clone(), peer);

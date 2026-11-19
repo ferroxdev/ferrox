@@ -2068,12 +2068,26 @@ fn is_hop_by_hop(name: &str) -> bool {
 fn read_origin<R: Read>(stream: &mut R, head: &[u8]) -> Option<hysteria::OriginResponse> {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 8 * 1024];
+    let mut clipped = false;
     loop {
         match stream.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                if raw.len() + n > MASQ_BODY_CAP {
+                    clipped = true;
+                    break;
+                }
                 raw.extend_from_slice(&chunk[..n]);
-                if raw.len() >= MASQ_BODY_CAP {
+                if raw.len() == MASQ_BODY_CAP {
+                    let mut extra = [0u8; 1];
+                    clipped = loop {
+                        match stream.read(&mut extra) {
+                            Ok(0) => break false,
+                            Ok(_) => break true,
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(_) => break true,
+                        }
+                    };
                     break;
                 }
             }
@@ -2085,7 +2099,7 @@ fn read_origin<R: Read>(stream: &mut R, head: &[u8]) -> Option<hysteria::OriginR
         .and_then(|method| std::str::from_utf8(method).ok())
         .unwrap_or("");
     let parsed = hysteria::parse_origin_response(&raw, method);
-    if parsed.is_none() && raw.len() >= MASQ_BODY_CAP {
+    if clipped || (parsed.is_none() && raw.len() >= MASQ_BODY_CAP) {
         return Some(hysteria::OriginResponse {
             status: 502,
             headers: vec![(
@@ -3074,6 +3088,16 @@ mod tests {
     fn a_response_clipped_at_the_cap_reports_the_size_limit() {
         let mut raw = b"HTTP/1.1 200 OK\r\nContent-Length: 70000\r\n\r\n".to_vec();
         raw.resize(MASQ_BODY_CAP, b'x');
+        let response = read_origin(&mut std::io::Cursor::new(raw), b"GET / HTTP/1.1\r\n")
+            .expect("a size-limit answer");
+        assert_eq!(response.status, 502);
+        assert_eq!(response.body, b"502 origin response too large\n");
+    }
+
+    #[test]
+    fn a_close_delimited_response_past_the_cap_is_not_accepted_as_complete() {
+        let mut raw = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        raw.resize(MASQ_BODY_CAP + 1, b'x');
         let response = read_origin(&mut std::io::Cursor::new(raw), b"GET / HTTP/1.1\r\n")
             .expect("a size-limit answer");
         assert_eq!(response.status, 502);

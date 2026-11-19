@@ -38,7 +38,7 @@ fn salt_seen(salt: &[u8]) -> bool {
     let mut key = [0u8; 32];
     key[..salt.len()].copy_from_slice(salt);
     let mut guard = WINDOW
-        .get_or_init(|| Mutex::new(crate::proxy::Replay::new(SKEW)))
+        .get_or_init(|| Mutex::new(crate::proxy::Replay::new(SKEW + 1)))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.seen(&key, now_secs())
@@ -2444,7 +2444,7 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
         let live: HashSet<u64> = upstreams.keys().map(|(session, _)| *session).collect();
         clients_of.retain(|session, _| live.contains(session));
         users.retain(|session, _| live.contains(session));
-        let replay_ttl = Duration::from_secs(SKEW * 2);
+        let replay_ttl = Duration::from_secs(SKEW * 2 + 1);
         datagrams.sessions.retain(|session, entry| {
             live.contains(session) || now.saturating_duration_since(entry.seen) < replay_ttl
         });
@@ -4178,5 +4178,12 @@ mod tests {
             !flow.ended_and_idle(idle),
             "the forwarded chunk did not restart the grace"
         );
+    }
+    #[test]
+    fn a_replay_at_the_timestamp_boundary_is_still_refused() {
+        let mut replay = crate::proxy::Replay::new(SKEW + 1);
+        let key = [7u8; 32];
+        assert!(!replay.seen(&key, 1_000));
+        assert!(replay.seen(&key, 1_000 + SKEW * 2));
     }
 }
