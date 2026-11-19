@@ -4391,8 +4391,13 @@ fn drain_udp(conn: &mut quiche::Connection, tunnel: &mut Tunnel) {
             tunnel.udp_frame.extend_from_slice(&head[..length]);
             udp_capsule::datagram_encode(&payload, &mut tunnel.udp_frame);
         }
-        if !stream_frame(conn, stream, &tunnel.udp_frame, &mut tunnel.udp_at) {
-            return;
+        match stream_frame(conn, stream, &tunnel.udp_frame, &mut tunnel.udp_at) {
+            FrameSend::Sent => {}
+            FrameSend::Blocked => return,
+            FrameSend::Failed => {
+                cancel(conn, tunnel);
+                return;
+            }
         }
     }
 }
