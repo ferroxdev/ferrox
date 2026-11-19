@@ -195,6 +195,7 @@ enum Body {
     None,
     Fixed(usize),
     Chunked,
+    Close,
 }
 
 fn response_body(head: &[u8], status: u16) -> Option<Body> {
@@ -231,8 +232,10 @@ fn response_body(head: &[u8], status: u16) -> Option<Body> {
         Some(Body::Chunked)
     } else if let Some(length) = length {
         Some(Body::Fixed(length))
-    } else {
+    } else if (200..300).contains(&status) {
         Some(Body::None)
+    } else {
+        Some(Body::Close)
     }
 }
 
@@ -297,6 +300,7 @@ fn skip_body<R: Read>(reader: &mut R, body: Body, until: Instant) -> Option<()> 
         Body::None => Some(()),
         Body::Fixed(length) => skip_exact(reader, length, until),
         Body::Chunked => skip_chunked(reader, until),
+        Body::Close => None,
     }
 }
 
@@ -696,6 +700,19 @@ mod tests {
         let mut got = [0u8; 4];
         reader.read_exact(&mut got).expect("reads");
         assert_eq!(&got, b"next");
+    }
+
+    #[test]
+    fn an_unframed_error_body_is_not_tunnel_traffic() {
+        let response = b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nerror";
+        assert!(connect_split(
+            std::io::Cursor::new(Vec::from(&response[..])),
+            Vec::new(),
+            "oracle.example",
+            "/camouflage",
+            &[],
+        )
+        .is_none());
     }
 
     #[test]
