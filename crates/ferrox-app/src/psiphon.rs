@@ -1503,7 +1503,7 @@ impl Inner {
                 Arc::clone(&self.requests) as Arc<dyn crate::psiphon_ssh::ServerRequests>;
             let cdn_scan_specs = self.settings.cdn_scan_specs.clone();
             let cdn_scan_state = Arc::clone(&self.settings.cdn_scan_state);
-            let batch_deadline = Instant::now() + budget;
+            let batch_deadline = (Instant::now() + budget).min(deadline);
             let attempt = move |server: &Server| {
                 let lease = replay.begin(server, config_state);
                 let _scope = crate::psiphon_ssh::dial_seed_scope(lease.seed());

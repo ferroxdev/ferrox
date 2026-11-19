@@ -10,7 +10,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 use str0m::change::{SdpAnswer, SdpPendingOffer};
@@ -760,7 +760,8 @@ fn stun_binding(
     } else {
         (server.to_owned(), 3478)
     };
-    let target = crate::psiphon_dns::resolve_with(dns, &host, port)
+    let deadline = Instant::now() + timeout;
+    let target = crate::psiphon_dns::resolve_with_deadline(dns, &host, port, Some(deadline))
         .map_err(|error| format!("psiphon webrtc STUN {server}: {error}"))?
         .into_iter()
         .find(same_family)
@@ -771,7 +772,6 @@ fn stun_binding(
     socket
         .send_to(&request, target)
         .map_err(|error| format!("psiphon webrtc STUN send: {error}"))?;
-    let deadline = Instant::now() + timeout;
     let mut reply = [0u8; 512];
     loop {
         let now = Instant::now();
@@ -1615,6 +1615,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Lock without waiting past the offer deadline.
+fn lock_until<T>(mutex: &Mutex<T>, deadline: Instant) -> Result<MutexGuard<'_, T>, String> {
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err("psiphon conduit: offer retry window expired".to_owned());
+                }
+                std::thread::sleep(left.min(Duration::from_millis(2)));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Cidr {
     base: IpAddr,
@@ -2042,7 +2059,7 @@ impl Conduit {
             use_media_streams: offers_media(&sdp),
         };
         let offer = {
-            let mut client = lock(&client);
+            let mut client = lock_until(&client, deadline).map_err(|error| (error, false))?;
             let offer_remaining = deadline.saturating_duration_since(Instant::now());
             if offer_remaining.is_zero() {
                 return Err((
@@ -2167,9 +2184,18 @@ impl Relay {
         &self.connection_id
     }
 
-    /// Relay one server packet and return the broker's next packet.
+    /// Relay one server packet with the configured relay timeout.
     pub(crate) fn relay(&mut self, packet: &[u8]) -> Result<Vec<u8>, String> {
         lock(&self.client).relay_packet(&self.connection_id, packet)
+    }
+
+    /// Relay one server packet, bounded by the handshake's absolute deadline.
+    pub(crate) fn relay_until(
+        &mut self,
+        packet: &[u8],
+        deadline: Instant,
+    ) -> Result<Vec<u8>, String> {
+        lock(&self.client).relay_packet_until(&self.connection_id, packet, deadline)
     }
 }
 
