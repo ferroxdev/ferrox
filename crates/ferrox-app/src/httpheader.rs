@@ -1,5 +1,6 @@
 use crate::conn::Connection;
 use std::io::{Read, Write};
+use std::time::Instant;
 
 const HEAD_LIMIT: usize = 8192;
 
@@ -85,11 +86,11 @@ fn check_request(head: &[u8], paths: &[String]) -> Option<()> {
     let path = decode_path(crate::proxy::request_path(head)?)?;
     paths
         .iter()
-        .any(|held| {
-            held.split_once('?')
-                .map_or(held.as_str(), |(base, _)| base)
-                .as_bytes()
-                == path.as_ref()
+        .any(|configured| {
+            let configured = configured
+                .split_once('?')
+                .map_or(configured.as_str(), |(base, _)| base);
+            decode_path(configured).is_some_and(|configured| configured.as_ref() == path.as_ref())
         })
         .then_some(())
 }
@@ -165,7 +166,10 @@ pub(crate) fn connect(
     let mut read = stream;
     send_request(&mut read, host, path, headers)?;
     let (head, at) = read_head(&mut read)?;
-    let reader = read_response(read, head, at)?;
+    let previous = read.read_timeout().ok().flatten();
+    let _ = read.set_read_timeout(Some(crate::budgets::head_arrival()));
+    let mut reader = read_response(read, head, at)?;
+    reader.set_poll(previous);
     let Ok(write) = reader.read.try_clone() else {
         return None;
     };
@@ -256,15 +260,18 @@ fn read_response<R: Read>(read: R, head: Vec<u8>, at: usize) -> Option<HeadReade
     loop {
         let status = response_status(&head[..at])?;
         if (100..200).contains(&status) && status != 101 {
-            let stream = if let Some(stream) = source.as_mut() {
-                stream
-            } else {
-                source.insert(HeadReader::new(read.take()?, std::mem::take(&mut head), at))
+            let mut stream = match source.take() {
+                Some(source) => flatten(source, std::mem::take(&mut head), at),
+                None => HeadReader::new(read.take()?, std::mem::take(&mut head), at),
             };
-            let (next, next_at) =
-                crate::proxy::read_exact_head(stream, HEAD_LIMIT, crate::budgets::head_arrival())?;
+            let (next, next_at) = crate::proxy::read_exact_head(
+                &mut stream,
+                HEAD_LIMIT,
+                crate::budgets::head_arrival(),
+            )?;
             head = next;
             at = next_at;
+            source = Some(stream);
             continue;
         }
         let body = response_body(&head[..at], status)?;
@@ -272,7 +279,8 @@ fn read_response<R: Read>(read: R, head: Vec<u8>, at: usize) -> Option<HeadReade
             Some(source) => flatten(source, head, at),
             None => HeadReader::new(read.take()?, head, at),
         };
-        skip_body(&mut reader, body)?;
+        let until = Instant::now() + crate::budgets::head_arrival();
+        skip_body(&mut reader, body, until)?;
         return Some(reader);
     }
 }
@@ -284,53 +292,69 @@ fn flatten<R: Read>(source: HeadReader<R>, mut head: Vec<u8>, at: usize) -> Head
     HeadReader::new(source.read, head, at)
 }
 
-fn skip_body<R: Read>(reader: &mut R, body: Body) -> Option<()> {
+fn skip_body<R: Read>(reader: &mut R, body: Body, until: Instant) -> Option<()> {
     match body {
         Body::None => Some(()),
-        Body::Fixed(length) => skip_exact(reader, length),
-        Body::Chunked => skip_chunked(reader),
+        Body::Fixed(length) => skip_exact(reader, length, until),
+        Body::Chunked => skip_chunked(reader, until),
     }
 }
 
-fn skip_exact<R: Read>(reader: &mut R, mut left: usize) -> Option<()> {
+fn read_within<R: Read>(reader: &mut R, buf: &mut [u8], until: Instant) -> Option<()> {
+    let mut at = 0;
+    while at < buf.len() {
+        if Instant::now() >= until {
+            return None;
+        }
+        match reader.read(&mut buf[at..]) {
+            Ok(0) => return None,
+            Ok(read) => at += read,
+            Err(error) if crate::proxy::is_timeout(&error) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(())
+}
+
+fn skip_exact<R: Read>(reader: &mut R, mut left: usize, until: Instant) -> Option<()> {
     let mut buf = [0u8; 512];
     while left > 0 {
         let take = left.min(buf.len());
-        reader.read_exact(&mut buf[..take]).ok()?;
+        read_within(reader, &mut buf[..take], until)?;
         left -= take;
     }
     Some(())
 }
 
-fn skip_chunked<R: Read>(reader: &mut R) -> Option<()> {
+fn skip_chunked<R: Read>(reader: &mut R, until: Instant) -> Option<()> {
     let mut trailers = HEAD_LIMIT;
     loop {
-        let line = read_line(reader)?;
+        let line = read_line(reader, until)?;
         let size = trim_ows(line.split(|byte| *byte == b';').next()?);
         let size = usize::from_str_radix(std::str::from_utf8(size).ok()?, 16).ok()?;
         if size == 0 {
             loop {
-                let line = read_line(reader)?;
+                let line = read_line(reader, until)?;
                 trailers = trailers.checked_sub(line.len() + 2)?;
                 if line.is_empty() {
                     return Some(());
                 }
             }
         }
-        skip_exact(reader, size)?;
+        skip_exact(reader, size, until)?;
         let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf).ok()?;
+        read_within(reader, &mut crlf, until)?;
         if crlf != *b"\r\n" {
             return None;
         }
     }
 }
 
-fn read_line<R: Read>(reader: &mut R) -> Option<Vec<u8>> {
+fn read_line<R: Read>(reader: &mut R, until: Instant) -> Option<Vec<u8>> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        reader.read_exact(&mut byte).ok()?;
+        read_within(reader, &mut byte, until)?;
         if byte[0] == b'\n' {
             if line.last() != Some(&b'\r') {
                 return None;
@@ -346,7 +370,7 @@ fn read_line<R: Read>(reader: &mut R) -> Option<Vec<u8>> {
 }
 
 // The same connect over halves that cannot peek: pipelined bytes arrive as a prefix.
-pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
+pub(crate) fn connect_split<R: Read + crate::proxy::RelayPoll, W: crate::proxy::FrameWrite>(
     mut read: R,
     mut write: W,
     host: &str,
@@ -356,7 +380,9 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
     send_request(&mut write, host, path, headers)?;
     let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
-    let reader = read_response(read, head, at)?;
+    crate::proxy::RelayPoll::arm_head_poll(&mut read);
+    let mut reader = read_response(read, head, at)?;
+    crate::proxy::RelayPoll::arm_relay_poll(&mut reader);
     Some((reader, write))
 }
 
@@ -640,8 +666,13 @@ mod tests {
 
     #[test]
     fn a_percent_escaped_path_matches_the_configured_path_and_plus_stays_plus() {
-        let paths = ["/two/part".to_owned(), "/two+part".to_owned()];
+        let paths = [
+            "/two/part".to_owned(),
+            "/two+part".to_owned(),
+            "/two%2Fpart".to_owned(),
+        ];
         assert!(check_request(b"GET /two%2Fpart HTTP/1.1\r\nHost: h\r\n\r\n", &paths).is_some());
+        assert!(check_request(b"GET /two/part HTTP/1.1\r\nHost: h\r\n\r\n", &paths).is_some());
         assert!(check_request(b"GET /two+part HTTP/1.1\r\nHost: h\r\n\r\n", &paths).is_some());
         assert!(check_request(
             b"GET /two%20part HTTP/1.1\r\nHost: h\r\n\r\n",
@@ -688,6 +719,22 @@ mod tests {
     fn an_interim_response_is_read_through_to_the_final_head() {
         let response =
             b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nnext";
+        let (mut reader, _write) = connect_split(
+            std::io::Cursor::new(Vec::from(&response[..])),
+            Vec::new(),
+            "oracle.example",
+            "/camouflage",
+            &[],
+        )
+        .expect("answers");
+        let mut got = [0u8; 4];
+        reader.read_exact(&mut got).expect("reads");
+        assert_eq!(&got, b"next");
+    }
+
+    #[test]
+    fn two_interim_responses_keep_the_final_head_and_tunnel_bytes() {
+        let response = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nnext";
         let (mut reader, _write) = connect_split(
             std::io::Cursor::new(Vec::from(&response[..])),
             Vec::new(),
