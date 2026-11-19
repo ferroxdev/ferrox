@@ -26820,7 +26820,7 @@ impl Datagram {
         (self.ready)()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn always(open: Arc<dyn Fn() -> Option<DirectDatagram> + Send + Sync>) -> Self {
         Self::new(open, Arc::new(|| true))
     }
