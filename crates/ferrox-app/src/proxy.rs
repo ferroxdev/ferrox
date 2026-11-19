@@ -1037,9 +1037,7 @@ fn preflight_inbound(inbound: &Json, protocol: &str, addresses: &[String]) -> Re
     // A transparent door binds its datagram socket with options plain `UdpSocket::bind` cannot set.
     let transparent_door = protocol == "dokodemo-door"
         && crate::sockopt::inbound_tproxy(inbound.get("streamSettings"))
-            .ok()
-            .flatten()
-            .is_some();
+            .is_ok_and(|mode| mode != crate::sockopt::Tproxy::Off);
     let mut held = Vec::new();
     for address in addresses {
         if address.is_empty() {
@@ -15803,7 +15801,6 @@ fn serve_blackhole_inbound(
         }
         Err(error) => exit(&format!("cannot listen on {address}: {error}")),
     };
-    let address = address.to_owned();
     thread::spawn(move || {
         if stop.as_ref().is_some_and(|stop| stop.stopped()) {
             drop(listener);
@@ -15871,7 +15868,6 @@ fn serve_hc_inbound(address: &str, inbound: &Json, stop: Option<Arc<Stop>>) -> b
         }
         Err(error) => exit(&format!("cannot listen on {address}: {error}")),
     };
-    let address = address.to_owned();
     thread::spawn(move || {
         for stream in listener.incoming() {
             if stop.as_ref().is_some_and(|stop| stop.stopped()) {

@@ -4217,8 +4217,10 @@ mod tests {
         let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::clone(&close), None);
         assert_eq!(
             crate::proxy::lane_pool::Next::Done,
+            let eof = Connection::Tcp(server.try_clone().expect("clones"));
             uplink_step(
                 &mut Connection::Tcp(server),
+                &eof,
                 &mut buf,
                 &mut send,
                 &mut Refuse,
@@ -4255,8 +4257,10 @@ mod tests {
         );
         let mut buf = vec![0u8; uplink_buffer_len(&send)];
         let mut wire = Vec::new();
+        let eof = Connection::Tcp(server.try_clone().expect("clones"));
         let next = uplink_step(
             &mut Connection::Tcp(server),
+            &eof,
             &mut buf,
             &mut send,
             &mut wire,
