@@ -1381,7 +1381,7 @@ impl WebRtcStream {
             return Ok(total);
         }
         if let Some(shaping) = &self.shaping {
-            let mut shaping = lock(shaping);
+            let mut shaping = lock_write(shaping, deadline)?;
             let mut queued = 0;
             for buf in bufs {
                 for chunk in buf.chunks(STREAM_MESSAGE) {
@@ -1639,6 +1639,26 @@ fn try_lock<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
         Ok(guard) => Some(guard),
         Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
         Err(TryLockError::WouldBlock) => None,
+    }
+}
+
+/// Lock without waiting past the write deadline, or block when there is none.
+fn lock_write<T>(mutex: &Mutex<T>, deadline: Option<Instant>) -> io::Result<MutexGuard<'_, T>> {
+    let Some(deadline) = deadline else {
+        return Ok(lock(mutex));
+    };
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::Error::from(ErrorKind::TimedOut));
+                }
+                thread::sleep(left.min(Duration::from_millis(1)));
+            }
+        }
     }
 }
 

@@ -260,6 +260,7 @@ fn read_response<R: Read>(read: R, head: Vec<u8>, at: usize) -> Option<HeadReade
     let mut source: Option<HeadReader<R>> = None;
     let mut head = head;
     let mut at = at;
+    let until = Instant::now() + crate::budgets::head_arrival();
     loop {
         let status = response_status(&head[..at])?;
         if (100..200).contains(&status) && status != 101 {
@@ -267,11 +268,11 @@ fn read_response<R: Read>(read: R, head: Vec<u8>, at: usize) -> Option<HeadReade
                 Some(source) => flatten(source, std::mem::take(&mut head), at),
                 None => HeadReader::new(read.take()?, std::mem::take(&mut head), at),
             };
-            let (next, next_at) = crate::proxy::read_exact_head(
-                &mut stream,
-                HEAD_LIMIT,
-                crate::budgets::head_arrival(),
-            )?;
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let (next, next_at) = crate::proxy::read_exact_head(&mut stream, HEAD_LIMIT, left)?;
             head = next;
             at = next_at;
             source = Some(stream);
@@ -282,8 +283,8 @@ fn read_response<R: Read>(read: R, head: Vec<u8>, at: usize) -> Option<HeadReade
             Some(source) => flatten(source, head, at),
             None => HeadReader::new(read.take()?, head, at),
         };
-        let until = Instant::now() + crate::budgets::head_arrival();
-        skip_body(&mut reader, body, until)?;
+        let body_until = Instant::now() + crate::budgets::head_arrival();
+        skip_body(&mut reader, body, body_until)?;
         return Some(reader);
     }
 }
