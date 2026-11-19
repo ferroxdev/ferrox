@@ -1,6 +1,4 @@
-// The device lane's own traffic generator: servers on the far side of the tunnel and
-// clients on this side, so `scripts/tun-bench.sh` measures a device without shipping a
-// reference engine's benchmark binary. One header, four modes, one JSON shape per command.
+//! The device lane's own traffic generator, so the bench ships no reference engine's binary.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -397,8 +395,7 @@ fn udp_client(args: &Args) {
     let mut sequence = 0u64;
     let mut rbuf = vec![0u8; 65_535];
     while Instant::now() < deadline && sent < total {
-        // Pace off the clock rather than a fixed tick, so a tick the scheduler delays is made up
-        // instead of shrinking the offered load.
+        // Pace off the clock, so a delayed tick is made up instead of shrinking the offer.
         let owed = ((pps as f64 * start.elapsed().as_secs_f64()) as u64).min(total);
         let mut want = owed.saturating_sub(sent);
         if want == 0 && sent < total {
@@ -420,8 +417,7 @@ fn udp_client(args: &Args) {
                     want -= n as u64;
                 }
                 Err(_) if segments > 1 => {
-                    // A kernel that refuses the segment option: the batch went nowhere, so drop
-                    // back to single datagrams rather than reporting an engine that moved nothing.
+                    // The batch went nowhere, so drop back to single datagrams.
                     segments = 1;
                 }
                 Err(_) => break,
@@ -449,8 +445,7 @@ fn udp_client(args: &Args) {
     println!("{received} of {sent} echoed, {measured:.0} pps");
 }
 
-/// Stamps and sends one batch, returning how many left. A single `sendmmsg(2)` per batch is what
-/// keeps a 100k pps offer inside one thread instead of paying one syscall a datagram.
+/// Stamps and sends one batch, so a 100k pps offer does not pay a syscall a datagram.
 fn send_batch(
     socket: &UdpSocket,
     payload: &mut [u8],
