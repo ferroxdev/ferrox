@@ -15,6 +15,7 @@ use crate::shadowsocks::waited;
 
 const READ_CHUNK: usize = 0x4000;
 const SKEW: u64 = 30;
+const MAX_UDP_SESSIONS: usize = 256;
 const UPSTREAM_IDLE: Duration = Duration::from_secs(60);
 
 /// One turn drains at most this many replies from an upstream, so a busy socket cannot starve the client path or the other address family.
@@ -218,6 +219,7 @@ fn serve_relay_on(
     if relay_psk.len() != key_len {
         return;
     }
+    let _ = stream.set_read_timeout(Some(crate::budgets::handshake()));
     let mut salt = vec![0u8; key_len];
     if read_exact(&mut stream, &mut salt).is_err() {
         return;
@@ -264,9 +266,17 @@ fn relay_raw(a: &mut Connection, b: &mut Connection) {
         let mut src = a_read;
         loop {
             match src.read(buf.as_mut()) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => {
+                    let _ = b_write.shutdown(std::net::Shutdown::Write);
+                    break;
+                }
+                Err(_) => {
+                    let _ = b_write.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
                 Ok(n) => {
                     if b_write.write_all(&buf.as_mut()[..n]).is_err() {
+                        let _ = b_write.shutdown(std::net::Shutdown::Both);
                         break;
                     }
                 }
@@ -276,9 +286,17 @@ fn relay_raw(a: &mut Connection, b: &mut Connection) {
     let mut buf = crate::proxy::RelayBuf::new();
     loop {
         match b.read(buf.as_mut()) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                let _ = a.shutdown(std::net::Shutdown::Write);
+                break;
+            }
+            Err(_) => {
+                let _ = a.shutdown(std::net::Shutdown::Both);
+                break;
+            }
             Ok(n) => {
                 if a.write_all(&buf.as_mut()[..n]).is_err() {
+                    let _ = a.shutdown(std::net::Shutdown::Both);
                     break;
                 }
             }
@@ -976,6 +994,7 @@ fn pump_relay_carried_inner<R, W>(
     let mut plain_read = plain_read;
     let mut plain_write = plain_write;
     let _ = plain_read.set_read_timeout(Some(RELAY_POLL));
+    let _ = plain_write.set_write_timeout(Some(crate::budgets::RELAY_RESPONSE_IDLE));
     // The carrier ends once both legs have: an upload that finishes first must not cut a download still sealing.
     let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::clone(close), None);
     let mut outbound = outbound;
@@ -1007,7 +1026,9 @@ fn pump_relay_carried_inner<R, W>(
     crate::proxy::lane_pool::submit(
         Box::new(move || {
             let next = link.step(&mut plain_write, Some(&down_flow));
-            if next == crate::proxy::lane_pool::Next::Idle {
+            if next == crate::proxy::lane_pool::Next::Done {
+                let _ = plain_write.shutdown(std::net::Shutdown::Write);
+            } else if next == crate::proxy::lane_pool::Next::Idle {
                 crate::proxy::note_wait_finish(&down_flow);
             }
             next
@@ -1576,6 +1597,25 @@ pub(crate) struct Datagrams {
 }
 
 impl Datagrams {
+    /// Admit a client session, refusing a new one past the cap; the listener's live-aware sweep owns expiry.
+    fn session_mut(&mut self, session: u64) -> Option<&mut ServerUdp> {
+        let now = Instant::now();
+        if !self.sessions.contains_key(&session) && self.sessions.len() >= MAX_UDP_SESSIONS {
+            return None;
+        }
+        let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
+            window: shadowsocks2022::SlidingWindow::new(),
+            seen: now,
+            cipher: None,
+            user: None,
+            server_session: 0,
+            server_packet: 0,
+            server_cipher: None,
+        });
+        entry.seen = now;
+        Some(entry)
+    }
+
     pub(crate) fn new() -> Self {
         let mut session = [0u8; 8];
         let _ = getrandom::fill(&mut session);
@@ -1748,23 +1788,19 @@ impl Datagrams {
             if body.len() < 11 + pad {
                 return None;
             }
-            let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
-                window: shadowsocks2022::SlidingWindow::new(),
-                seen: Instant::now(),
-                cipher: None,
-                user: None,
-                server_session: 0,
-                server_packet: 0,
-                server_cipher: None,
-            });
-            if !entry.window.check_and_add(packet_id) {
+            if !self
+                .sessions
+                .get(&session)
+                .is_none_or(|entry| entry.window.check(packet_id))
+            {
                 return None;
             }
-            entry.seen = Instant::now();
             let (target, used) = parse_addr_header(&body[11 + pad..])?;
             if body.len() < 11 + pad + used {
                 return None;
             }
+            let entry = self.session_mut(session)?;
+            entry.window.add(packet_id);
             Some((
                 target,
                 &packet[24 + 16 + 11 + pad + used..24 + len],
@@ -1785,20 +1821,19 @@ impl Datagrams {
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
             let len = authenticate_body(&cipher, &nonce, &mut packet[16..])?;
-            let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
-                window: shadowsocks2022::SlidingWindow::new(),
-                seen: Instant::now(),
-                cipher: None,
-                user: None,
-                server_session: 0,
-                server_packet: 0,
-                server_cipher: None,
-            });
+            let (target, total) = parse_body(&packet[16..16 + len], 11, 0)?;
+            if !self
+                .sessions
+                .get(&session)
+                .is_none_or(|entry| entry.window.check(packet_id))
+            {
+                return None;
+            }
+            let entry = self.session_mut(session)?;
             if !entry.window.check_and_add(packet_id) {
                 return None;
             }
             entry.seen = Instant::now();
-            let (target, total) = parse_body(&packet[16..16 + len], 11, 0)?;
             self.sessions
                 .get_mut(&session)?
                 .cipher
@@ -1836,20 +1871,22 @@ impl Datagrams {
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&raw[4..16]);
         let len = authenticate_body(&cipher, &nonce, &mut packet[32..])?;
-        let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
-            window: shadowsocks2022::SlidingWindow::new(),
-            seen: Instant::now(),
-            cipher: None,
-            user: None,
-            server_session: 0,
-            server_packet: 0,
-            server_cipher: None,
-        });
-        if let Some(user) = entry.user {
-            if user != idx {
-                return None;
-            }
+        let (target, total) = parse_body(&packet[32..32 + len], 11, 0)?;
+        if self
+            .sessions
+            .get(&session)
+            .is_some_and(|entry| entry.user.is_some_and(|user| user != idx))
+        {
+            return None;
         }
+        if !self
+            .sessions
+            .get(&session)
+            .is_none_or(|entry| entry.window.check(packet_id))
+        {
+            return None;
+        }
+        let entry = self.session_mut(session)?;
         if !entry.window.check_and_add(packet_id) {
             return None;
         }
@@ -1857,7 +1894,6 @@ impl Datagrams {
         if entry.user.is_none() {
             entry.user = Some(idx);
         }
-        let (target, total) = parse_body(&packet[32..32 + len], 11, 0)?;
         self.sessions
             .get_mut(&session)?
             .cipher
@@ -1875,6 +1911,9 @@ impl Datagrams {
         if user_psk.len() != method.key_len() {
             return None;
         }
+        if let Some(entry) = self.sessions.get_mut(&client_session) {
+            entry.seen = Instant::now();
+        }
         let fresh = self.sessions.get(&client_session).is_none_or(|e| {
             e.server_session == 0 || (!method.is_chacha() && e.server_cipher.is_none())
         });
@@ -1885,18 +1924,7 @@ impl Datagrams {
             if sid == 0 {
                 return None;
             }
-            let entry = self
-                .sessions
-                .entry(client_session)
-                .or_insert_with(|| ServerUdp {
-                    window: shadowsocks2022::SlidingWindow::new(),
-                    seen: Instant::now(),
-                    cipher: None,
-                    user: None,
-                    server_session: 0,
-                    server_packet: 0,
-                    server_cipher: None,
-                });
+            let entry = self.session_mut(client_session)?;
             entry.server_session = sid;
             if !method.is_chacha() {
                 let sub = shadowsocks2022::session_subkey(user_psk, &sid.to_be_bytes())?;
@@ -2066,12 +2094,6 @@ fn peer_check(
         return peer.window.check_and_add(packet_id);
     }
     peers.retain(|_, peer: &mut PeerServer| now.wrapping_sub(peer.last_seen) < 60);
-    if peers
-        .values()
-        .any(|peer| now.wrapping_sub(peer.last_seen) < 60)
-    {
-        return false;
-    }
     if peers.len() >= 8 {
         return false;
     }

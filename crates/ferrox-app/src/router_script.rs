@@ -132,6 +132,7 @@ struct ScriptContext {
     network: i64,
     protocol: String,
     user: String,
+    vless_route: u16,
     attributes: HashMap<String, String>,
 }
 
@@ -229,6 +230,7 @@ impl ScriptRouter {
             },
             protocol: flow.protocol.unwrap_or("").to_owned(),
             user: flow.user.unwrap_or("").to_owned(),
+            vless_route: flow.vless_route,
             attributes: flow.attrs.map_or_else(HashMap::new, |attrs| {
                 attrs
                     .iter()
@@ -293,6 +295,7 @@ fn call(lua: &Lua, context: ScriptContext) -> Result<Option<String>, String> {
         network,
         protocol,
         user,
+        vless_route,
         attributes,
     } = context;
     let context = lua
@@ -314,7 +317,7 @@ fn call(lua: &Lua, context: ScriptContext) -> Result<Option<String>, String> {
             network,
             protocol,
             user,
-            0,
+            vless_route,
             false,
         ))
         .map_err(|error| error.to_string())?;
@@ -585,14 +588,16 @@ fn install(lua: &Lua, hooks: &Arc<CallHooks>, dirs: &Arc<Vec<PathBuf>>) -> LuaRe
     geodata.set(
         "BuildDomainMatcher",
         lua.create_function(move |_, rules: Variadic<String>| {
-            build_domain_matcher(rules.into_iter().collect(), &dns_dirs)
+            let rules: Vec<String> = rules.into_iter().collect();
+            build_domain_matcher(&rules, &dns_dirs)
         })?,
     )?;
     let ip_dirs = Arc::clone(dirs);
     geodata.set(
         "BuildIPMatcher",
         lua.create_function(move |_, rules: Variadic<String>| {
-            build_ip_matcher(rules.into_iter().collect(), &ip_dirs)
+            let rules: Vec<String> = rules.into_iter().collect();
+            build_ip_matcher(&rules, &ip_dirs)
         })?,
     )?;
     let modules: HashMap<&'static str, Table> = [
@@ -613,7 +618,7 @@ fn install(lua: &Lua, hooks: &Arc<CallHooks>, dirs: &Arc<Vec<PathBuf>>) -> LuaRe
     Ok(())
 }
 
-fn build_domain_matcher(rules: Vec<String>, dirs: &[PathBuf]) -> LuaResult<DomainMatcherUser> {
+fn build_domain_matcher(rules: &[String], dirs: &[PathBuf]) -> LuaResult<DomainMatcherUser> {
     let mut assets = Assets::new(dirs.to_vec());
     let mut matchers = Vec::with_capacity(rules.len());
     for rule in rules {
@@ -638,18 +643,22 @@ fn build_domain_matcher(rules: Vec<String>, dirs: &[PathBuf]) -> LuaResult<Domai
         matcher.finish().map_err(LuaError::RuntimeError)?;
         matchers.push(matcher);
     }
-    Ok(DomainMatcherUser { rules: matchers })
+    Ok(DomainMatcherUser { matchers })
 }
 
-fn build_ip_matcher(rules: Vec<String>, dirs: &[PathBuf]) -> LuaResult<IpMatcherUser> {
+fn build_ip_matcher(rules: &[String], dirs: &[PathBuf]) -> LuaResult<IpMatcherUser> {
     let mut assets = Assets::new(dirs.to_vec());
-    let value = Json::Arr(rules.into_iter().map(Json::Str).collect());
+    let value = Json::Arr(rules.iter().cloned().map(Json::Str).collect());
     let matcher = ip_matcher(&value, &mut assets, "geodata ip").map_err(LuaError::RuntimeError)?;
-    Ok(IpMatcherUser { matcher })
+    Ok(IpMatcherUser {
+        matcher,
+        reverse: None,
+        flip: false,
+    })
 }
 
 struct DomainMatcherUser {
-    rules: Vec<DomainMatcher>,
+    matchers: Vec<DomainMatcher>,
 }
 
 impl UserData for DomainMatcherUser {
@@ -657,7 +666,7 @@ impl UserData for DomainMatcherUser {
         methods.add_method("Match", |_, this, domain: String| {
             let lower = domain.to_ascii_lowercase();
             let mut found = Vec::new();
-            for (at, matcher) in this.rules.iter().enumerate() {
+            for (at, matcher) in this.matchers.iter().enumerate() {
                 if matcher.matches(&lower, &lower) {
                     found.push(u32::try_from(at).unwrap_or(u32::MAX));
                 }
@@ -667,7 +676,7 @@ impl UserData for DomainMatcherUser {
         methods.add_method("MatchAny", |_, this, domain: String| {
             let lower = domain.to_ascii_lowercase();
             Ok(this
-                .rules
+                .matchers
                 .iter()
                 .any(|matcher| matcher.matches(&lower, &lower)))
         });
@@ -676,6 +685,20 @@ impl UserData for DomainMatcherUser {
 
 struct IpMatcherUser {
     matcher: IpMatcher,
+    reverse: Option<bool>,
+    flip: bool,
+}
+
+impl IpMatcherUser {
+    fn matcher(&self) -> IpMatcher {
+        let mut matcher = self.matcher.clone();
+        if let Some(reverse) = self.reverse {
+            matcher.set_reverse(reverse);
+        } else if self.flip {
+            matcher.flip_reverse();
+        }
+        matcher
+    }
 }
 
 impl UserData for IpMatcherUser {
@@ -685,50 +708,57 @@ impl UserData for IpMatcherUser {
                 return Ok(false);
             };
             let ip = ip.borrow::<IpUser>()?;
-            Ok(this.matcher.matches(ip.0))
+            Ok(this.matcher().matches(ip.0))
         });
         methods.add_method("AnyMatch", |_, this, ips: Option<AnyUserData>| {
             let Some(ips) = ips else {
                 return Ok(false);
             };
             let ips = ips.borrow::<IpList>()?;
-            Ok(ips.items.iter().any(|ip| this.matcher.matches(*ip)))
+            let matcher = this.matcher();
+            Ok(ips.items.iter().any(|ip| matcher.matches(*ip)))
         });
         methods.add_method("Matches", |_, this, ips: Option<AnyUserData>| {
             let Some(ips) = ips else {
                 return Ok(false);
             };
             let ips = ips.borrow::<IpList>()?;
-            Ok(!ips.items.is_empty() && ips.items.iter().all(|ip| this.matcher.matches(*ip)))
+            let matcher = this.matcher();
+            Ok(!ips.items.is_empty() && ips.items.iter().all(|ip| matcher.matches(*ip)))
         });
         methods.add_method("FilterIPs", |lua, this, ips: Option<AnyUserData>| {
             let ips = match ips {
                 Some(ips) => ips.borrow::<IpList>()?.items.clone(),
                 None => Arc::new(Vec::<IpAddr>::new()),
             };
-            let mut matched = Vec::new();
+            let matcher = this.matcher();
+            let mut kept = Vec::new();
             let mut unmatched = Vec::new();
             for ip in ips.iter() {
-                if this.matcher.matches(*ip) {
-                    matched.push(*ip);
+                if matcher.matches(*ip) {
+                    kept.push(*ip);
                 } else {
                     unmatched.push(*ip);
                 }
             }
-            let matched = lua.create_userdata(IpList {
-                items: Arc::new(matched),
+            let kept = lua.create_userdata(IpList {
+                items: Arc::new(kept),
             })?;
             let unmatched = lua.create_userdata(IpList {
                 items: Arc::new(unmatched),
             })?;
-            Ok((matched, unmatched))
+            Ok((kept, unmatched))
         });
         methods.add_method_mut("SetReverse", |_, this, reverse: bool| {
-            this.matcher.set_reverse(reverse);
+            this.reverse = Some(reverse);
+            this.flip = false;
             Ok(())
         });
         methods.add_method_mut("ToggleReverse", |_, this, ()| {
-            this.matcher.toggle_reverse();
+            match this.reverse {
+                Some(reverse) => this.reverse = Some(!reverse),
+                None => this.flip = !this.flip,
+            }
             Ok(())
         });
     }

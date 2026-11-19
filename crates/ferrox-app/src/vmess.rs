@@ -577,6 +577,7 @@ struct SizeAead {
     aead: Aead,
     nonce: [u8; 12],
     counter: u16,
+    exhausted: bool,
 }
 
 impl SizeAead {
@@ -594,10 +595,14 @@ impl SizeAead {
             aead,
             nonce,
             counter: 0,
+            exhausted: false,
         })
     }
     /// The wire's 18 bytes open to the frame's total: the two plain octets are sealed here (`AEADChunkSizeParser::Decode`) and the overhead is added back.
     fn unseal_len(&mut self, sealed: &mut [u8; SIZE_FIELD]) -> Option<u16> {
+        if self.exhausted {
+            return None;
+        }
         let (size, tag) = sealed.split_at_mut(HEADER_LEN);
         let tag: [u8; TAG_LEN] = <[u8; TAG_LEN]>::try_from(tag).ok()?;
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
@@ -613,11 +618,18 @@ impl SizeAead {
             }
             Aead::Plain => return None,
         };
-        self.counter = self.counter.wrapping_add(1);
+        if self.counter == u16::MAX {
+            self.exhausted = true;
+        } else {
+            self.counter += 1;
+        }
         Some(u16::from_be_bytes([plain[0], plain[1]]).wrapping_add(TAG_LEN as u16))
     }
     /// The wire's 18 bytes seal the frame's body total less the tag, the shape the reference's encoder writes (`AEADChunkSizeParser::Encode`) and its nonce steps beside the body's.
     fn seal_len(&mut self, total: u16, sealed: &mut [u8; SIZE_FIELD]) -> bool {
+        if self.exhausted {
+            return false;
+        }
         let mut plain = total.wrapping_sub(TAG_LEN as u16).to_be_bytes();
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         let nonce = &self.nonce;
@@ -630,7 +642,11 @@ impl SizeAead {
         };
         sealed[..HEADER_LEN].copy_from_slice(&plain);
         sealed[HEADER_LEN..].copy_from_slice(&tag);
-        self.counter = self.counter.wrapping_add(1);
+        if self.counter == u16::MAX {
+            self.exhausted = true;
+        } else {
+            self.counter += 1;
+        }
         true
     }
 }
@@ -648,6 +664,8 @@ pub(crate) struct Flow {
     /// Whether this direction closes with the zero-length marker. The reference's
     /// `NoTerminationSignal` account turns it off for that side (`proxy/vmess/{inbound,outbound}`).
     end_marker: bool,
+    /// Whether the nonce's 16-bit counter reached its end; further seals would reuse it.
+    exhausted: bool,
 }
 
 impl Flow {
@@ -696,6 +714,7 @@ impl Flow {
             shake,
             len_seal: None,
             end_marker: true,
+            exhausted: false,
         })
     }
     /// How many octets the next frame's size field takes on the wire.
@@ -712,6 +731,9 @@ impl Flow {
         &self.nonce
     }
     fn seal_onto(&mut self, plain: &[u8], out: &mut Vec<u8>) -> bool {
+        if !matches!(self.aead, Aead::Plain) && self.exhausted {
+            return false;
+        }
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         let nonce = &self.nonce;
         match &self.aead {
@@ -742,10 +764,23 @@ impl Flow {
                 out.extend_from_slice(&tag);
             }
         }
-        self.counter = self.counter.wrapping_add(1);
+        self.advance();
         true
     }
+    /// Step the nonce, ending the stream rather than wrapping where an AEAD seals.
+    fn advance(&mut self) {
+        if matches!(self.aead, Aead::Plain) {
+            self.counter = self.counter.wrapping_add(1);
+        } else if self.counter == u16::MAX {
+            self.exhausted = true;
+        } else {
+            self.counter += 1;
+        }
+    }
     fn open_chunk(&mut self, chunk: &mut [u8]) -> Option<usize> {
+        if !matches!(self.aead, Aead::Plain) && self.exhausted {
+            return None;
+        }
         let plain_len = match &self.aead {
             Aead::Aes(aes) => {
                 if chunk.len() < TAG_LEN {
@@ -773,7 +808,7 @@ impl Flow {
             }
             Aead::Plain => chunk.len(),
         };
-        self.counter = self.counter.wrapping_add(1);
+        self.advance();
         Some(plain_len)
     }
 }
@@ -1084,7 +1119,7 @@ pub(crate) fn read_frame<'a>(
     scratch: &'a mut Vec<u8>,
 ) -> Option<&'a [u8]> {
     let (total, padding) = read_wire_len(stream, recv)?;
-    if total <= padding {
+    if total <= padding && recv.cipher == Cipher::None {
         let mut discard = [0u8; 64];
         let mut left = total;
         while left > 0 {
@@ -4766,13 +4801,21 @@ mod tests {
             assert!(send.seal_onto(b"ping", &mut sealed));
             let back = recv.open_chunk(&mut sealed).expect("opens");
             assert_eq!(&sealed[..back], b"ping");
-            assert_eq!(send.counter, 0);
-            assert_eq!(recv.counter, 0);
+            if cipher == Cipher::None {
+                assert_eq!(send.counter, 0);
+                assert_eq!(recv.counter, 0);
+            } else {
+                assert_eq!(send.counter, u16::MAX);
+                assert_eq!(recv.counter, u16::MAX);
+                assert!(!send.seal_onto(b"pong", &mut Vec::new()));
+                assert!(recv.open_chunk(&mut sealed).is_none());
+            }
             let mut field = [0u8; SIZE_FIELD];
             if let Some(sizes) = send.len_seal.as_mut() {
                 sizes.counter = u16::MAX;
                 assert!(sizes.seal_len(32, &mut field));
-                assert_eq!(sizes.counter, 0);
+                assert_eq!(sizes.counter, u16::MAX);
+                assert!(!sizes.seal_len(32, &mut field));
             }
         }
     }
@@ -5689,16 +5732,7 @@ mod tests {
 
     #[test]
     fn an_end_marker_mid_batch_sends_what_the_batch_already_holds() {
-        let (mut sealed, plain, mut recv) = frames(&[1000, 1000]);
-        let key = [0x55u8; 16];
-        let iv = [0x66u8; 16];
-        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
-        let mut send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
-        let mut pad = PadSource::fresh().expect("entropy");
-        assert!(
-            stage_frame(&mut send, &[], &mut sealed, &mut pad),
-            "seals the marker"
-        );
+        let (sealed, plain, mut recv) = frames(&[1000, 1000, 0]);
         let carrier = Sealed {
             held: sealed,
             at: 0,
@@ -5712,6 +5746,11 @@ mod tests {
             "the two frames that came first are not lost to the marker"
         );
         assert_eq!(got, plain);
+        assert!(wire.ended_by_marker(), "the marker ends the stream");
+        assert!(
+            !wire.corrupt(),
+            "the marker opened under the session's nonce"
+        );
     }
 
     #[test]

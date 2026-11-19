@@ -865,6 +865,9 @@ impl<R: Read> SsMuxReader<R> {
 
 impl<R: Read> Read for SsMuxReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         loop {
             if self.at < self.pending.len() {
                 let n = (self.pending.len() - self.at).min(buf.len());
@@ -1077,6 +1080,7 @@ pub(crate) fn pump_relay_carried<R, W>(
     let mut plain_read = plain_read;
     let mut plain_write = plain_write;
     let _ = plain_read.set_read_timeout(Some(RELAY_POLL));
+    let _ = plain_write.set_write_timeout(Some(crate::budgets::relay_stall()));
     // The carrier ends once both legs have: an upload that finishes first must not cut a download still sealing.
     let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::clone(close), None);
     let mut send = send;
@@ -1102,7 +1106,13 @@ pub(crate) fn pump_relay_carried<R, W>(
     let mut link = Downlink::new(reader, recv);
     let down_flow = std::sync::Arc::clone(&flow);
     crate::proxy::lane_pool::submit(
-        Box::new(move || link.step(&mut plain_write, Some(&down_flow))),
+        Box::new(move || {
+            let next = link.step(&mut plain_write, Some(&down_flow));
+            if next == crate::proxy::lane_pool::Next::Done {
+                let _ = plain_write.shutdown(Shutdown::Write);
+            }
+            next
+        }),
         Box::new(crate::proxy::stream_lane_done(&flow)),
     );
 }
@@ -1437,6 +1447,15 @@ struct UdpSource {
     v6: Option<UdpSocket>,
     hop: Option<Cipher>,
     last: Instant,
+    idle: Duration,
+}
+
+/// A UDP association's idle limit is the account level's `connIdle`, with the UDP budget as the
+/// fallback, so a level that shortens TCP connections shortens its datagram association too.
+fn source_idle(user: &SsUser, fallback: Duration) -> Duration {
+    crate::policy::flow(user.level)
+        .conn_idle()
+        .unwrap_or(fallback)
 }
 
 /// One readiness wait over the front's client socket and every association's sockets, so a pass
@@ -1625,7 +1644,7 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
         let now = Instant::now();
         let timeout = sources
             .values()
-            .map(|source| (source.last + idle).saturating_duration_since(now))
+            .map(|source| (source.last + source.idle).saturating_duration_since(now))
             .min()
             .map_or(-1, |left| {
                 i32::try_from(left.as_millis()).unwrap_or(i32::MAX)
@@ -1674,7 +1693,8 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
                             continue;
                         };
                         if sources.len() >= SS_UDP_SOURCES {
-                            sources.retain(|_, source| now.duration_since(source.last) < idle);
+                            sources
+                                .retain(|_, source| now.duration_since(source.last) < source.idle);
                             if sources.len() >= SS_UDP_SOURCES {
                                 continue;
                             }
@@ -1706,6 +1726,7 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
                                 v6,
                                 hop,
                                 last: now,
+                                idle: source_idle(&users[which], idle),
                             },
                         );
                     }

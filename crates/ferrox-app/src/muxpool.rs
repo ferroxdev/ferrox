@@ -81,10 +81,15 @@ pub(crate) struct UdpFlow {
     carrier: Arc<Carrier>,
     id: u16,
     ended: Arc<std::sync::atomic::AtomicBool>,
+    gate: Arc<std::sync::Mutex<()>>,
 }
 
 impl UdpFlow {
     pub(crate) fn send(&self, target: &mux::Target<'_>, data: &[u8]) -> bool {
+        let _gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.ended.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
@@ -100,6 +105,10 @@ impl UdpFlow {
 
     pub(crate) fn close(self) {
         // Same order as `Flow::close`: the End write returns before the id is released.
+        let _gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self.ended.load(std::sync::atomic::Ordering::Relaxed) {
             self.carrier
                 .frame(self.id, mux::Status::End, 0, None, None, &[]);
@@ -113,7 +122,11 @@ pub(crate) type Deliver = Arc<dyn Fn(&[u8], Option<SocketAddr>) + Send + Sync>;
 #[derive(Clone)]
 enum Sink {
     Tcp(SyncSender<Msg>, Arc<std::sync::atomic::AtomicBool>),
-    Udp(Deliver, Arc<std::sync::atomic::AtomicBool>),
+    Udp(
+        Deliver,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::Mutex<()>>,
+    ),
 }
 
 /// Frames one bulk `Keep` leaves in a single vectored write: a 64 KiB upload read is eight frames
@@ -461,8 +474,11 @@ impl Carrier {
                     self.drop_sink(frame.id);
                 }
             }
-            Sink::Udp(deliver, ended) => {
+            Sink::Udp(deliver, ended, gate) => {
                 if frame.status == mux::Status::End {
+                    let _gate = gate
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     ended.store(true, std::sync::atomic::Ordering::Relaxed);
                     self.release(frame.id);
                     return;
@@ -664,8 +680,13 @@ impl Manager {
         deliver: &Deliver,
     ) -> Option<UdpFlow> {
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (carrier, id, ()) =
-            self.reserve(|_| (Sink::Udp(Arc::clone(deliver), Arc::clone(&ended)), ()))?;
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let (carrier, id, ()) = self.reserve(|_| {
+            (
+                Sink::Udp(Arc::clone(deliver), Arc::clone(&ended), Arc::clone(&gate)),
+                (),
+            )
+        })?;
         if !carrier.frame(
             id,
             mux::Status::New,
@@ -677,7 +698,12 @@ impl Manager {
             carrier.release(id);
             return None;
         }
-        Some(UdpFlow { carrier, id, ended })
+        Some(UdpFlow {
+            carrier,
+            id,
+            ended,
+            gate,
+        })
     }
 
     #[cfg(all(test, unix))]

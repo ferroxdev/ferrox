@@ -954,7 +954,12 @@ fn dump_config(configs: &[String]) -> ! {
         };
         let body = std::str::from_utf8(&bytes)
             .unwrap_or_else(|error| dump_fail(&format!("bad config {file}: {error}")));
-        let root = crate::json::parse(body)
+        let body = if extension.as_deref() == Some("jsonc") {
+            crate::json::strip_jsonc(body)
+        } else {
+            std::borrow::Cow::Borrowed(body)
+        };
+        let root = crate::json::parse(&body)
             .unwrap_or_else(|error| dump_fail(&format!("bad config {file}: {error}")));
         if first {
             merged = root;

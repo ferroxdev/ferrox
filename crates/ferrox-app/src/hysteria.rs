@@ -30,6 +30,8 @@ const UDP_POLL: Duration = Duration::from_secs(1);
 /// A target reply is a whole UDP datagram, so one buffer of the wire's UDP ceiling holds any single response the association reads.
 const UDP_TARGET_BUF: usize = hysteria::MAX_UDP_PAYLOAD;
 
+const MAX_UDP_ASSOCIATIONS: usize = 256;
+
 pub(crate) struct Dial {
     pub(crate) host: String,
     pub(crate) address: String,
@@ -2149,7 +2151,12 @@ fn udp_reader(
     loop {
         let n = match target.recv(&mut buf) {
             Ok(n) => n,
-            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(ref error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
                 let closed = shared.lock().map_or(true, |conn| conn.is_closed());
                 if closed || stop.load(Ordering::Relaxed) {
                     break;
@@ -2254,6 +2261,10 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
             continue;
         };
         if payload.is_empty() {
+            continue;
+        }
+        let pinned = lane.source.lock().ok().and_then(|slot| *slot);
+        if pinned.is_some_and(|held| held != src) {
             continue;
         }
         let Ok(mut conn) = session.shared.lock() else {
@@ -2386,9 +2397,13 @@ fn relay_datagrams(
             continue;
         };
         let session = message.session;
+        let full = inbound.udp.len() >= MAX_UDP_ASSOCIATIONS;
         let flow = match inbound.udp.entry(session) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(vacant) => {
+                if full {
+                    continue;
+                }
                 let Some(opened) = open_udp(shared, sock, session, message.address) else {
                     continue;
                 };

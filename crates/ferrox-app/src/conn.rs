@@ -2518,12 +2518,18 @@ fn split_permission(path: &std::path::Path) -> (&std::path::Path, Option<u32>) {
 /// hard-linked into place, so nothing but our own socket ever takes the permission — or, when the
 /// directory leaves no room for a staged name, to the bound socket after a no-follow check.
 #[cfg(unix)]
+static UNIX_BIND: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
 fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some((name, padded)) = abstract_name(path) {
         return abstract_listener(name, padded);
     }
+    let _guard = UNIX_BIND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (path, perm) = split_permission(path);
     let stale = match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => Some((meta.dev(), meta.ino())),

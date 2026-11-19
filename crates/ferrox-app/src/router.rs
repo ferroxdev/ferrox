@@ -2948,7 +2948,7 @@ enum DomainKind {
     Full,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct IpMatcher {
     sets: Vec<(RangeSet, bool)>,
 }
@@ -2974,14 +2974,14 @@ impl IpMatcher {
         }
     }
 
-    pub(crate) fn toggle_reverse(&mut self) {
+    pub(crate) fn flip_reverse(&mut self) {
         for (_, current) in &mut self.sets {
             *current = !*current;
         }
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct RangeSet {
     v4: Vec<(u32, u32)>,
     v6: Vec<(u128, u128)>,

@@ -3,13 +3,20 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+const DNS_CNAME: u16 = 5;
 const DNS_HTTPS: u16 = 65;
 const DNS_CLASS_IN: u16 = 1;
 const EDNS_OPT: u16 = 41;
 const ECH_PARAM: u16 = 5;
 const TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_ALIASES: usize = 8;
 
 type Cache = HashMap<String, (Instant, Vec<u8>)>;
+
+enum Answer {
+    Found(Vec<u8>, u32, usize),
+    Alias(String, u32),
+}
 
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
@@ -148,20 +155,61 @@ fn random_id() -> Result<u16, String> {
     Ok(u16::from_be_bytes(raw))
 }
 
+fn follow<F>(mut ask: F, name: &str) -> Result<(Vec<u8>, u32), String>
+where
+    F: FnMut(&str) -> Result<Answer, String>,
+{
+    let mut name = name.to_owned();
+    let mut seen: Vec<String> = Vec::new();
+    let mut hops = 0;
+    let mut ttl = u32::MAX;
+    loop {
+        if seen.iter().any(|seen| seen.eq_ignore_ascii_case(&name)) {
+            return Err("ech: alias loop".to_owned());
+        }
+        seen.push(name.clone());
+        match ask(&name)? {
+            Answer::Found(ech, found, local) => {
+                if hops + local > MAX_ALIASES {
+                    return Err("ech: alias chain too long".to_owned());
+                }
+                return Ok((ech, ttl.min(found)));
+            }
+            Answer::Alias(next, alias_ttl) => {
+                hops += 1;
+                if hops > MAX_ALIASES {
+                    return Err("ech: alias chain too long".to_owned());
+                }
+                ttl = ttl.min(alias_ttl);
+                name = next;
+            }
+        }
+    }
+}
+
 fn udp(
     host: &str,
     port: u16,
     name: &str,
     options: Option<&SocketOptions>,
 ) -> Result<(Vec<u8>, u32), String> {
+    follow(|name| udp_once(host, port, name, options), name)
+}
+
+fn udp_once(
+    host: &str,
+    port: u16,
+    name: &str,
+    options: Option<&SocketOptions>,
+) -> Result<Answer, String> {
     let id = random_id()?;
     let packet = question(name, id, true)?;
     let response = crate::dnsnet::udp(host, port, &packet, None, options, TIMEOUT, true)?;
     // A UDP answer over the 512-byte limit carries the truncation bit, so the question moves to TCP.
     if response.get(2).is_some_and(|byte| byte & 0x02 != 0) {
-        return tcp(host, port, name, options);
+        return tcp_once(host, port, name, options);
     }
-    parse_response(&response, Some(id), name)
+    parse_answer(&response, Some(id), name)
 }
 
 fn tcp(
@@ -170,10 +218,19 @@ fn tcp(
     name: &str,
     options: Option<&SocketOptions>,
 ) -> Result<(Vec<u8>, u32), String> {
+    follow(|name| tcp_once(host, port, name, options), name)
+}
+
+fn tcp_once(
+    host: &str,
+    port: u16,
+    name: &str,
+    options: Option<&SocketOptions>,
+) -> Result<Answer, String> {
     let id = random_id()?;
     let packet = question(name, id, false)?;
     let response = crate::dnsnet::tcp(host, port, &packet, None, options, TIMEOUT, true)?;
-    parse_response(&response, Some(id), name)
+    parse_answer(&response, Some(id), name)
 }
 
 fn doh(
@@ -184,14 +241,36 @@ fn doh(
     cleartext: bool,
     options: Option<&SocketOptions>,
 ) -> Result<(Vec<u8>, u32), String> {
+    follow(
+        |name| doh_once(host, port, path, name, cleartext, options),
+        name,
+    )
+}
+
+fn doh_once(
+    host: &str,
+    port: u16,
+    path: &str,
+    name: &str,
+    cleartext: bool,
+    options: Option<&SocketOptions>,
+) -> Result<Answer, String> {
     let packet = question(name, 0, true)?;
     let body = crate::dnsnet::doh(
         host, port, path, cleartext, &packet, None, options, TIMEOUT, true,
     )?;
-    parse_response(&body, None, name)
+    parse_answer(&body, None, name)
 }
 
+#[cfg(test)]
 fn parse_response(packet: &[u8], id: Option<u16>, name: &str) -> Result<(Vec<u8>, u32), String> {
+    match parse_answer(packet, id, name)? {
+        Answer::Found(ech, ttl, _) => Ok((ech, ttl)),
+        Answer::Alias(alias, _) => Err(format!("ech: alias {alias} carried no ECH config")),
+    }
+}
+
+fn parse_answer(packet: &[u8], id: Option<u16>, name: &str) -> Result<Answer, String> {
     if packet.len() < 12 {
         return Err("ech: short DNS response".to_owned());
     }
@@ -218,6 +297,7 @@ fn parse_response(packet: &[u8], id: Option<u16>, name: &str) -> Result<(Vec<u8>
             .filter(|at| *at <= packet.len())
             .ok_or("ech: short question")?;
     }
+    let mut records = Vec::with_capacity(answers);
     for _ in 0..answers {
         let owner = read_name(packet, &mut at)?;
         let kind = take_u16(packet, &mut at)?;
@@ -228,20 +308,71 @@ fn parse_response(packet: &[u8], id: Option<u16>, name: &str) -> Result<(Vec<u8>
             .checked_add(length)
             .filter(|end| *end <= packet.len())
             .ok_or("ech: answer past the end")?;
-        if kind == DNS_HTTPS && owner.eq_ignore_ascii_case(name) {
-            if let Some(ech) = svcb_ech(packet, at, end)? {
-                return Ok((ech, ttl));
+        records.push((owner, kind, ttl, at, end));
+        at = end;
+    }
+    let mut names = vec![name.to_ascii_lowercase()];
+    let mut alias_ttl = u32::MAX;
+    loop {
+        let before = names.len();
+        for (owner, kind, ttl, start, end) in &records {
+            if !names.iter().any(|seen| seen.eq_ignore_ascii_case(owner)) {
+                continue;
+            }
+            let mut next = *start;
+            let target = match *kind {
+                DNS_CNAME => read_name(packet, &mut next)?,
+                DNS_HTTPS => {
+                    let priority = take_u16(packet, &mut next)?;
+                    if priority != 0 {
+                        continue;
+                    }
+                    read_name(packet, &mut next)?
+                }
+                _ => continue,
+            };
+            if next > *end {
+                return Err("ech: alias name past its record".to_owned());
+            }
+            if target.is_empty()
+                || target == "."
+                || names.iter().any(|seen| seen.eq_ignore_ascii_case(&target))
+            {
+                continue;
+            }
+            if names.len() >= MAX_ALIASES {
+                return Err("ech: alias chain too long".to_owned());
+            }
+            alias_ttl = alias_ttl.min(*ttl);
+            names.push(target.to_ascii_lowercase());
+        }
+        if names.len() == before {
+            break;
+        }
+    }
+    for (owner, kind, ttl, start, end) in &records {
+        if *kind == DNS_HTTPS && names.iter().any(|seen| seen.eq_ignore_ascii_case(owner)) {
+            if let Some(ech) = svcb_ech(packet, *start, *end)? {
+                return Ok(Answer::Found(ech, (*ttl).min(alias_ttl), names.len() - 1));
             }
         }
-        at = end;
+    }
+    if let Some(alias) = names.into_iter().nth(1) {
+        return Ok(Answer::Alias(alias, alias_ttl));
     }
     Err(format!("ech: no ECH config in the HTTPS record for {name}"))
 }
 
 fn svcb_ech(packet: &[u8], start: usize, end: usize) -> Result<Option<Vec<u8>>, String> {
     let mut at = start;
-    let _priority = take_u16(packet, &mut at)?;
+    let priority = take_u16(packet, &mut at)?;
+    if priority == 0 {
+        return Ok(None);
+    }
     skip_name(packet, &mut at)?;
+    if at > end {
+        return Err("ech: SVCB target past the end".to_owned());
+    }
     while at + 4 <= end {
         let key = take_u16(packet, &mut at)?;
         let length = usize::from(take_u16(packet, &mut at)?);

@@ -104,6 +104,8 @@ pub(crate) struct VeepnOut {
     picked: Arc<AtomicUsize>,
     /// One refresh at a time, so a cold cache is fetched once rather than once per waiting flow.
     refresh: Arc<Mutex<()>>,
+    /// The token's own turn: a list refresh may launch a token, so its lock cannot be this one.
+    access_refresh: Arc<Mutex<()>>,
 }
 
 /// What one walk of the rotation came back with: an answer, or the plane's name for the token it carried.
@@ -148,6 +150,7 @@ impl VeepnOut {
         Ok(Self {
             plane: Arc::new(Mutex::new(Plane::default())),
             refresh: Arc::new(Mutex::new(())),
+            access_refresh: Arc::new(Mutex::new(())),
             domains: origins.into(),
             cursor: Arc::new(AtomicUsize::new(0)),
             region: Arc::from(region),
@@ -376,6 +379,19 @@ impl VeepnOut {
     fn access(&self, force: bool) -> Result<String, Miss> {
         let now = foxy_account::epoch();
         if !force {
+            if let Some((value, _)) = self
+                .plane
+                .lock()
+                .ok()
+                .and_then(|plane| plane.access.clone())
+                .filter(|(_, until)| *until > now)
+            {
+                return Ok(value);
+            }
+        }
+        let _refresh = self.access_refresh.lock();
+        if !force {
+            let now = foxy_account::epoch();
             if let Some((value, _)) = self
                 .plane
                 .lock()
