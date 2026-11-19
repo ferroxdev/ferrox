@@ -462,6 +462,13 @@ mod tests {
     use crate::kcp::connection::ConnMetadata;
     use crate::kcp::mask::{HeaderKind, Mask, Spec};
 
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
     #[cfg_attr(miri, ignore = "binds a loopback UDP socket")]
     /// The room a datagram is received into is zeroed once per feed thread, not per receive.
     #[test]
@@ -534,12 +541,6 @@ mod tests {
                 inner.sessions.lock().unwrap().remove(&key);
             }
         });
-        struct ReleaseOnDrop(Arc<AtomicBool>);
-        impl Drop for ReleaseOnDrop {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
         let released = Arc::new(AtomicBool::new(false));
         let guard = ReleaseOnDrop(Arc::clone(&released));
         let session = Connection::new(
