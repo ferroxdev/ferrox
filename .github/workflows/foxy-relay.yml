@@ -162,6 +162,7 @@ jobs:
         if: steps.secrets.outputs.present == 'true'
         run: |
           code=0
+          : > control.bin
           timing=$(curl -sS --fail --noproxy '*' --max-time 300 \
             -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
             'https://speed.cloudflare.com/__down?bytes=1000000' -o control.bin) || code=$?
@@ -285,6 +286,7 @@ jobs:
             fi
             grep -E '^(loc|ip)=' trace.txt || true
             code=0
+            : > "file-$carrier.bin"
             timing=$(curl -sS --fail --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
               -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
               'https://speed.cloudflare.com/__down?bytes=1000000' -o "file-$carrier.bin") || code=$?
@@ -302,6 +304,7 @@ jobs:
               # proven against the live edge too, not only on loopback.
               for flow in 2 3; do
                 code=0
+                : > "file-$carrier-w$flow.bin"
                 timing=$(curl -sS --fail --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
                   -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                   'https://speed.cloudflare.com/__down?bytes=200000' -o "file-$carrier-w$flow.bin") || code=$?
@@ -326,6 +329,7 @@ jobs:
               # measured cloudflare's cap rather than the lane's window.
               if [ "${{ matrix.os }}" = "ubuntu-latest" ] && { [ "$carrier" = h3 ] || [ "$carrier" = h2 ]; }; then
                 code=0
+                : > "bulk-$carrier.bin"
                 timing=$(curl -sS --fail --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
                   -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                   'https://speed.cloudflare.com/__down?bytes=10485760' -o "bulk-$carrier.bin") || code=$?
@@ -475,6 +479,7 @@ jobs:
           fetch_mb() {
             FRONT="$1" FILE="$2" LABEL="$3"
             code=0
+            : > "$FILE"
             if [ "$FRONT" = http ]; then
               timing=$(curl -sS --fail --max-time 60 -x "http://127.0.0.1:$PORT" \
                 -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
@@ -665,6 +670,7 @@ jobs:
           if start_lane socks "$PORT" h2 DE; then
             trace_socks "$PORT" DE "second country DE" || FAILED="$FAILED de(trace)"
             de_code=0
+            : > file-de.bin
             de_timing=$(curl -sS --fail --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
               -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
               'https://speed.cloudflare.com/__down?bytes=1000000' -o file-de.bin) || de_code=$?

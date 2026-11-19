@@ -179,7 +179,7 @@ jobs:
                       if not data:
                           print("TLS EOF", flush=True)
                           break
-                      print(f"frames: {data[:48].hex()}", flush=True)
+                      print(f"frames: len={len(data)}", flush=True)
                       for event in conn.receive_data(data):
                           print(f"[conn] EVENT {type(event).__name__}", flush=True)
                           cap.handle(event)
