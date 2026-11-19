@@ -406,6 +406,7 @@ impl Listener {
                     Err(_) => break,
                 }
             }
+            drop(sock_r);
             if let Some(inner) = weak.upgrade() {
                 *inner.feed_done.lock().unwrap() = true;
                 inner.feed_cv.notify_all();
