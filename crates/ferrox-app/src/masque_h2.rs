@@ -31,6 +31,8 @@ const SETTINGS_ENABLE_CONNECT: u16 = 0x8;
 const FRAME_CAP: usize = 1 << 20;
 const FRAME_HEAD: usize = 9;
 const QUEUED_CAP: usize = 64;
+/// The capsules one downlink DATA frame carries: a frame head costs the peer once per burst rather than once per datagram.
+const BATCH_BODY: usize = 16 * 1024;
 const CREDIT_BATCH: usize = 64 * 1024;
 const DEFAULT_WINDOW: i64 = 65_535;
 const H2_CONNECTIONS: usize = 256;
@@ -1709,42 +1711,52 @@ impl Session {
         if self.half_closed && drainable && self.udp_quiet.is_none() {
             self.udp_quiet = Some(Instant::now());
         }
-        for _ in 0..QUEUED_CAP {
-            // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
-            if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
-                break;
-            }
-            let packet = if let Some(udp) = &self.udp {
-                udp.try_recv()
-            } else {
-                match self
-                    .outgoing
-                    .as_ref()
-                    .map(std::sync::mpsc::Receiver::try_recv)
-                {
-                    Some(Ok(packet)) => Some(packet),
-                    Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                        origin_closed = true;
-                        None
-                    }
-                    _ => None,
+        let mut pulled = 0;
+        if let Some(id) = self.request {
+            while pulled < QUEUED_CAP {
+                // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
+                if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
+                    break;
                 }
-            };
-            let Some(packet) = packet else {
-                break;
-            };
-            self.udp_quiet = Some(Instant::now());
-            let Some(id) = self.request else {
-                break;
-            };
-            data_frame(&mut frame, id, |out| {
-                if self.warp {
-                    bare_datagram(&packet, out);
+                let packet = if let Some(udp) = &self.udp {
+                    udp.try_recv()
                 } else {
-                    datagram(&packet, out);
+                    match self
+                        .outgoing
+                        .as_ref()
+                        .map(std::sync::mpsc::Receiver::try_recv)
+                    {
+                        Some(Ok(packet)) => Some(packet),
+                        Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                            origin_closed = true;
+                            None
+                        }
+                        _ => None,
+                    }
+                };
+                let Some(packet) = packet else {
+                    break;
+                };
+                self.udp_quiet = Some(Instant::now());
+                if pulled == 0 {
+                    frame.clear();
+                    frame.resize(FRAME_HEAD, 0);
                 }
-            });
-            self.send(wire, &frame);
+                if self.warp {
+                    bare_datagram(&packet, &mut frame);
+                } else {
+                    datagram(&packet, &mut frame);
+                }
+                pulled += 1;
+                if frame.len() - FRAME_HEAD >= BATCH_BODY {
+                    break;
+                }
+            }
+            if pulled > 0 {
+                let body = frame.len() - FRAME_HEAD;
+                frame[..FRAME_HEAD].copy_from_slice(&h2::frame_head(body, h2::T_DATA, 0, id));
+                self.send(wire, &frame);
+            }
         }
         self.frame = frame;
         let udp_drained = self.half_closed
@@ -2061,7 +2073,7 @@ mod tests {
         session.connection_window = 0;
         let (sender, outgoing) = mpsc::sync_channel(masque::QUEUE);
         session.outgoing = Some(outgoing);
-        for _ in 0..=QUEUED_CAP {
+        for _ in 0..QUEUED_CAP {
             sender.send(udp_packet(53)).expect("a packet");
         }
         let mut wire = Wire {
@@ -2073,8 +2085,22 @@ mod tests {
         session.flush(&mut wire);
         assert_eq!(
             session.queued.len(),
-            QUEUED_CAP,
-            "a stalled window keeps at most {QUEUED_CAP} capsules"
+            1,
+            "a stalled window queues the burst as one frame"
+        );
+        let queued: usize = session.queued.iter().map(Vec::len).sum();
+        assert!(
+            session.queued.len() <= QUEUED_CAP && queued <= QUEUED_CAP * BATCH_BODY,
+            "a stalled window keeps at most {QUEUED_CAP} frames of {BATCH_BODY} bytes"
+        );
+        assert!(
+            session
+                .outgoing
+                .as_ref()
+                .expect("receiver")
+                .try_recv()
+                .is_err(),
+            "the whole burst left the channel"
         );
         assert!(
             !session.end,
@@ -2127,6 +2153,43 @@ mod tests {
             &h2::frame_head(bytes.len() - FRAME_HEAD, h2::T_DATA, 0, 1)
         );
         assert_eq!(bytes[FRAME_HEAD], 0, "the capsule leads with its type");
+    }
+
+    /// A burst leaves as one DATA frame: the peer reads one head per burst instead of one per datagram.
+    #[test]
+    fn a_burst_leaves_as_one_data_frame() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.request = Some(1);
+        let (sender, outgoing) = mpsc::sync_channel(masque::QUEUE);
+        session.outgoing = Some(outgoing);
+        let mut expected = Vec::new();
+        for _ in 0..4 {
+            sender.send(udp_packet(53)).expect("a packet");
+            datagram(&udp_packet(53), &mut expected);
+        }
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut wire = Wire {
+            stream: Box::new(Recorder {
+                out: Arc::clone(&out),
+                writes: Arc::clone(&writes),
+            }),
+            pending: Vec::new(),
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        session.flush(&mut wire);
+        assert_eq!(writes.load(Ordering::Relaxed), 1, "the burst is one write");
+        let bytes = out.lock().expect("a recorder");
+        assert_eq!(
+            &bytes[..FRAME_HEAD],
+            &h2::frame_head(expected.len(), h2::T_DATA, 0, 1)
+        );
+        assert_eq!(
+            &bytes[FRAME_HEAD..],
+            expected.as_slice(),
+            "one frame carries every capsule"
+        );
     }
 
     #[test]
