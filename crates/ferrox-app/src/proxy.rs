@@ -26785,18 +26785,26 @@ pub(crate) struct DirectDatagram {
 
 /// The device front's datagram dial: a static SOCKS5 outbound with no TLS opens its association
 /// once, and the handler frames every datagram straight at the relay, so no loopback association
-/// and no SOCKS server sit between the device and the outbound's own server. `None` means the
-/// lane falls back to the association the front serves.
+/// and no SOCKS server sit between the device and the outbound's own server. A route plan
+/// resolves its datagram lane once; a split association has no one lane and keeps the fallback.
+/// `None` means the lane falls back to the association the front serves.
 pub(crate) type Datagram = Arc<dyn Fn() -> Option<DirectDatagram> + Send + Sync>;
 
 pub(crate) fn device_datagram(out: &Outbound) -> Option<Datagram> {
-    let Outbound::Socks(socks) = out else {
-        return None;
+    let socks = match out {
+        Outbound::Socks(socks) => socks.clone(),
+        Outbound::Route(plan) => {
+            let association = plan.association();
+            match plan.udp_out(&association).ok()?.into_owned() {
+                Outbound::Socks(socks) => socks,
+                _ => return None,
+            }
+        }
+        _ => return None,
     };
     if socks.tls.is_some() || socks.version == crate::socks::Version::V4 {
         return None;
     }
-    let socks = socks.clone();
     Some(std::sync::Arc::new(move || {
         let server = resolve_outbound(&socks.address, socks.port)?;
         let stream = dial_or_report(&server)?;
@@ -79713,6 +79721,128 @@ end
             matches!(plan.association(), Association::Default),
             "removing the rule puts the association back on the default lane"
         );
+    }
+
+    /// Split egress: one catch-all `network: udp` rule sends every datagram to a second outbound
+    /// while TCP keeps the first. The association collapses to that tag, so the lane is opened once
+    /// per association rather than chosen per datagram, and the destination's family or a DNS port
+    /// changes nothing.
+    #[test]
+    fn a_udp_rule_splits_datagrams_without_moving_tcp() {
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"foxy","protocol":"freedom"},{"tag":"udp-warp","protocol":"blackhole"}],
+                "routing":{"rules":[{"type":"field","network":"udp","outboundTag":"udp-warp"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        let tcp = [
+            Destination::Address("192.0.2.10:443".parse().expect("v4")),
+            Destination::Address("[2001:db8::10]:443".parse().expect("v6")),
+            Destination::Name("example.test".to_owned(), 443),
+        ];
+        for asked in &tcp {
+            let (picked, tag) = plan.lane(asked, crate::router::Network::Tcp, None, None);
+            assert!(matches!(&*picked, Outbound::Freedom(_)), "{asked:?}");
+            assert_eq!(tag, None, "TCP never takes the datagram lane");
+        }
+        let udp = [
+            Destination::Address("192.0.2.10:53".parse().expect("v4")),
+            Destination::Address("[2001:db8::10]:53".parse().expect("v6")),
+            Destination::Name("dns.test".to_owned(), 53),
+            Destination::Address("192.0.2.10:443".parse().expect("v4 quic")),
+        ];
+        for asked in &udp {
+            let (picked, tag) = plan.lane(asked, crate::router::Network::Udp, None, None);
+            assert!(matches!(&*picked, Outbound::Block(_)), "{asked:?}");
+            assert_eq!(tag.as_deref(), Some("udp-warp"), "{asked:?}");
+        }
+        let association = plan.association();
+        assert!(
+            matches!(&association, Association::Tag(tag) if tag == "udp-warp"),
+            "one catch-all rule fixes the association"
+        );
+        assert!(matches!(
+            &*plan.udp_out(&association).expect("the lane"),
+            Outbound::Block(_)
+        ));
+    }
+
+    /// The TUN front rides the same split: its direct datagram lane resolves the route plan once,
+    /// and a SOCKS UDP lane opens that server's association with no loopback association between
+    /// the device and the relay. Every datagram then carries its own destination to the echo.
+    #[test]
+    fn a_device_datagram_lane_takes_the_udp_rule() {
+        let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let target_addr = target.local_addr().expect("addr");
+        thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, src)) = target.recv_from(&mut buf) {
+                let _ = target.send_to(&buf[..n], src);
+            }
+        });
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_port = server.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = server.accept().expect("accepts");
+            serve_socks(stream, &freedom(), &no_accounts());
+        });
+        let out = route_outbound(
+            &format!(
+                r#"{{"outbounds":[{{"tag":"foxy","protocol":"freedom"}},
+                    {{"tag":"udp-socks","protocol":"socks","settings":{{"servers":[{{"address":"127.0.0.1","port":{server_port}}}]}}}}],
+                    "routing":{{"rules":[{{"type":"field","network":"udp","outboundTag":"udp-socks"}}]}}}}"#
+            ),
+            Some("in"),
+            true,
+        );
+        let direct = device_datagram(&out).expect("the UDP lane is a direct association");
+        let direct = direct().expect("the association opens");
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        socket.connect(direct.relay).expect("connects");
+        let mut frame = vec![0, 0, 0];
+        push_socks_addr(&mut frame, &target_addr);
+        frame.extend_from_slice(b"split");
+        socket.send(&frame).expect("sends");
+        let mut back = vec![0u8; 2048];
+        let (n, _) = socket.recv_from(&mut back).expect("the echo");
+        let (from, payload) = parse_socks_udp(&back[..n]).expect("the frame");
+        assert_eq!(payload, b"split");
+        assert_eq!(from, target_addr);
+    }
+
+    /// A rule that names a destination cannot fix one lane per association, so the same split
+    /// stays per datagram instead of silently sending the rest to one tag.
+    #[test]
+    fn a_destination_udp_rule_leaves_the_association_split() {
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"foxy","protocol":"freedom"},{"tag":"udp-warp","protocol":"blackhole"}],
+                "routing":{"rules":[{"type":"field","network":"udp","domain":["full:quic.test"],"outboundTag":"udp-warp"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        assert!(matches!(plan.association(), Association::Split));
+        let (picked, tag) = plan.lane(
+            &Destination::Name("quic.test".to_owned(), 443),
+            crate::router::Network::Udp,
+            None,
+            None,
+        );
+        assert!(matches!(&*picked, Outbound::Block(_)));
+        assert_eq!(tag.as_deref(), Some("udp-warp"));
+        let (picked, tag) = plan.lane(
+            &Destination::Name("other.test".to_owned(), 443),
+            crate::router::Network::Udp,
+            None,
+            None,
+        );
+        assert!(matches!(&*picked, Outbound::Freedom(_)));
+        assert_eq!(tag, None, "an unmatched datagram keeps the default lane");
     }
 
     /// A server inbound never evaluates a rule, so a rule the API adds for one must agree with its

@@ -63,6 +63,7 @@ Pick an exit before connecting — the catalogue is public, so this needs no acc
 ./ferrox-cli.sh location --veepn nl # remember a VeePN region
 ./ferrox-cli.sh location --psiphon US
 ./ferrox-cli.sh up --foxy --exclude-ports 22 --exclude-domains printer.lan   # these leave the tunnel
+./ferrox-cli.sh up --foxy --udp-via warp        # TCP on foxy, UDP on a separate WARP lane
 ```
 
 Run more than one lane at once — each named instance owns its config, pid, log, ports and remembered exit, while the account and catalogue stay shared; ports left unnamed are the first free ones near the defaults:
