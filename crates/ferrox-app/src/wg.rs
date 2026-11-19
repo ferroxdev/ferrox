@@ -1465,7 +1465,56 @@ fn io(
                 }
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            let mut received = 0;
+            match wait_readable(&socket, IO_TICK) {
+                Ok(true) => loop {
+                    match socket.recv_from(&mut buf) {
+                        Ok((n, source)) => {
+                            received += 1;
+                            if n >= 4 {
+                                let source = recv_endpoint(source, ipv6_socket);
+                                receive_datagram(
+                                    &mut peers,
+                                    &mut cookies,
+                                    now,
+                                    source,
+                                    &mut buf[..n],
+                                    &socket,
+                                    &to_stack,
+                                    &mut incoming,
+                                    routes.as_ref(),
+                                    ipv6_socket,
+                                    &mut sends,
+                                );
+                            }
+                            let more = match wait_readable(&socket, Duration::ZERO) {
+                                Ok(more) => more,
+                                Err(_) => return,
+                            };
+                            if received >= RX_BURST || !more {
+                                break;
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) if crate::proxy::is_udp_gone(&error) => break,
+                        Err(_) => return,
+                    }
+                },
+                Ok(false) => {}
+                Err(_) => return,
+            }
+        }
+        #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
         {
             let mut received = 0;
             let mut nonblocking = false;
@@ -2451,6 +2500,29 @@ fn bind_dual_stack() -> Result<UdpSocket, String> {
         .bind(&address.into())
         .map_err(|error| format!("cannot bind wireguard's dual-stack socket: {error}"))?;
     Ok(socket.into())
+}
+
+/// Wait for a datagram without asking `recv_from` to do the waiting:
+/// `WSAPoll` reports readiness, and the blocking read runs only once a packet
+/// is queued, so a receive timeout never stands between a queued packet and
+/// its reader.
+#[cfg(windows)]
+fn wait_readable(socket: &UdpSocket, timeout: Duration) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawSocket as _;
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAPoll, POLLERR, POLLIN, POLLNVAL, POLLRDNORM, SOCKET, SOCKET_ERROR, WSAPOLLFD,
+    };
+    let mut row = WSAPOLLFD {
+        fd: socket.as_raw_socket() as SOCKET,
+        events: POLLIN | POLLRDNORM,
+        revents: 0,
+    };
+    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    let ready = unsafe { WSAPoll(&mut row, 1, millis) };
+    if ready == SOCKET_ERROR {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ready > 0 && row.revents & (POLLIN | POLLRDNORM | POLLERR | POLLNVAL) != 0)
 }
 
 /// Ask the kernel for the queue the reference gives its `WireGuard` socket. It

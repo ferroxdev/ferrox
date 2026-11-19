@@ -162,11 +162,7 @@ impl Read for DeadlineStream {
 impl Write for DeadlineStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.prepare_write()?;
-        let written = self.io.write(buf)?;
-        if self.deadline.remaining().is_some_and(|left| left.is_zero()) {
-            return Err(std::io::ErrorKind::TimedOut.into());
-        }
-        Ok(written)
+        self.io.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -668,6 +664,9 @@ fn handshake(
         }
     } else {
         client.request_addresses()?;
+    }
+    if client.wire.closed || client.end {
+        return Err("the edge closed before the handshake completed".to_owned());
     }
     client.wire.deadline.clear();
     Ok(client)
