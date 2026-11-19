@@ -46121,9 +46121,15 @@ mod tests {
 
     #[test]
     fn a_kcp_or_xdrive_shadowsocks_inbound_proves_the_udp_its_mux_carries() {
-        for network in ["kcp", "xdrive"] {
+        for (network, extra) in [
+            ("kcp", ""),
+            (
+                "xdrive",
+                r#","xdriveSettings":{"remoteFolder":"/tmp/xdrive","service":"local"}"#,
+            ),
+        ] {
             let inbound = crate::json::parse(&format!(
-                r#"{{"protocol":"shadowsocks","settings":{{"network":"tcp","password":"p"}},"streamSettings":{{"network":"{network}"}}}}"#
+                r#"{{"protocol":"shadowsocks","settings":{{"network":"tcp","password":"p"}},"streamSettings":{{"network":"{network}"{extra}}}}}"#
             ))
             .expect("parses");
             assert_eq!(
