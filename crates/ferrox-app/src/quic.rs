@@ -5185,7 +5185,7 @@ impl Routing {
         }
     }
 
-    fn retire(&mut self, retired: Retired) {
+    fn retire(&mut self, retired: &Retired) {
         self.lanes = self.lanes.saturating_sub(retired.lanes);
         self.unverified = self
             .unverified
@@ -5431,7 +5431,7 @@ fn reap(
         }
     }
     scratch.deadline = deadline;
-    routes.retire(retired);
+    routes.retire(&retired);
     for (key, state) in scratch.learned.drain(..) {
         routes.conns.entry(key).or_insert(state);
     }
