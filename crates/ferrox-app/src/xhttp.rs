@@ -251,6 +251,8 @@ const CHUNK_LINE_LUT: [u8; 256] = {
 pub(crate) struct Reader<R> {
     read: R,
     prefix: Vec<u8>,
+    /// The first byte of `prefix` no read has proved initialised: `fill` zeroes only the room past it, so a steady read room is not rewritten every fill.
+    prefix_init: usize,
     at: usize,
     left: usize,
     ended: bool,
@@ -347,16 +349,30 @@ impl<R: Read> Reader<R> {
 
     /// One read past the framing into the buffer holding what it proved: xray's 8 KiB chunks otherwise cost a framing syscall each.
     fn fill(&mut self, want: usize) -> std::io::Result<usize> {
-        let base = self.prefix.len();
-        crate::proxy::grow_scratch(&mut self.prefix, base + want);
-        match take_into(&mut self.read, &mut self.reads, &mut self.prefix[base..]) {
-            Ok(n) => {
-                self.prefix.truncate(base + n);
-                Ok(n)
-            }
-            Err(error) => {
-                self.prefix.truncate(base);
+        loop {
+            self.reads += 1;
+            // SAFETY: `prefix_init` describes `prefix` — every byte below it is initialised, and a fresh reader starts at zero, which claims nothing.
+            let read = unsafe {
+                crate::proxy::read_into_tail_room(
+                    &mut self.read,
+                    &mut self.prefix,
+                    &mut self.prefix_init,
+                    want,
+                )
+            };
+            match read {
                 Err(error)
+                    if crate::proxy::is_timeout(&error)
+                        && !crate::proxy::relay_step_owns_poll() =>
+                {
+                    if crate::proxy::body_deadline()
+                        .is_some_and(|until| std::time::Instant::now() >= until)
+                    {
+                        return Err(error);
+                    }
+                    std::thread::sleep(crate::budgets::RELAY_POLL);
+                }
+                other => return other,
             }
         }
     }
@@ -397,6 +413,7 @@ impl<R: Read> Reader<R> {
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
         }
         self.prefix = head;
+        self.prefix_init = 0;
         self.at = at;
         Ok(())
     }
@@ -985,6 +1002,7 @@ impl<R: Read> crate::proxy::WindowRead for Reader<R> {
             if self.at == self.prefix.len() {
                 if len == 0 {
                     self.prefix.clear();
+                    self.prefix_init = 0;
                     self.at = 0;
                     if self.fill(CHUNK)? == 0 {
                         return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
@@ -1210,6 +1228,7 @@ fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
     let reader = Reader {
         read,
         prefix,
+        prefix_init: 0,
         at,
         left: 0,
         ended: false,
@@ -3045,6 +3064,7 @@ impl<R: Read + Send + 'static> Upload<R> {
             Self::Read(read) => Box::new(Reader {
                 read,
                 prefix,
+                prefix_init: 0,
                 at: 0,
                 left: 0,
                 ended: false,
@@ -3435,6 +3455,7 @@ pub(crate) fn accept_core<
                     let mut framed = Reader {
                         read: &mut chain,
                         prefix: Vec::new(),
+                        prefix_init: 0,
                         at: 0,
                         left: 0,
                         ended: false,
@@ -3968,6 +3989,7 @@ pub(crate) fn connect_dual_split<
     let reader = Reader {
         read: down,
         prefix: Vec::new(),
+        prefix_init: 0,
         at: 0,
         left: 0,
         ended: false,
@@ -4458,6 +4480,50 @@ mod tests {
         server.join().expect("joins");
     }
 
+    /// A steady read room is zeroed when the allocation grows, not once per fill: the same pointer and capacity answer a second read.
+    #[test]
+    fn a_second_fill_keeps_the_framing_buffers_allocation() {
+        struct Window(usize);
+        impl Read for Window {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(7);
+                for (slot, byte) in buf[..n].iter_mut().zip(b"chunked") {
+                    *slot = *byte;
+                }
+                self.0 += n;
+                Ok(n)
+            }
+        }
+        let mut reader = Reader {
+            read: Window(0),
+            prefix: Vec::new(),
+            prefix_init: 0,
+            at: 0,
+            left: 0,
+            ended: false,
+            reads: 0,
+            pending_head: false,
+            head_progress: None,
+            chunk: Chunk::Body,
+        };
+        assert_eq!(reader.fill(CHUNK).expect("first fill"), 7);
+        let (base, room) = (reader.prefix.as_ptr(), reader.prefix.capacity());
+        reader.prefix.clear();
+        assert_eq!(reader.fill(CHUNK).expect("second fill"), 7);
+        assert_eq!(
+            reader.prefix.as_ptr(),
+            base,
+            "the framing room is the same allocation"
+        );
+        assert_eq!(
+            reader.prefix.capacity(),
+            room,
+            "and its capacity did not grow"
+        );
+        assert_eq!(reader.prefix, *b"chunked", "the bytes are the read's own");
+        assert_eq!(reader.reads, 2, "one read per fill");
+    }
+
     /// Reads are driven with a fixed CHUNK buffer, the way `relay_ordered` drives them, so the count is the reader's and not `read_to_end`'s buffer growth; `reads` is the counter that says so.
     #[test]
     fn a_chunk_costs_two_reads_not_three() {
@@ -4467,6 +4533,7 @@ mod tests {
             let mut reader = Reader {
                 read: std::io::Cursor::new(framed(&chunks)),
                 prefix: Vec::new(),
+                prefix_init: 0,
                 at: 0,
                 left: 0,
                 ended: false,
@@ -4504,6 +4571,7 @@ mod tests {
         let mut reader = Reader {
             read: std::io::Cursor::new(framed(&chunks)),
             prefix: Vec::new(),
+            prefix_init: 0,
             at: 0,
             left: 0,
             ended: false,
@@ -4546,6 +4614,7 @@ mod tests {
             let mut reader = Reader {
                 read: std::io::Cursor::new(wire),
                 prefix: Vec::new(),
+                prefix_init: 0,
                 at: 0,
                 left: 0,
                 ended: false,
@@ -4690,6 +4759,7 @@ mod tests {
         let mut plain = Reader {
             read: std::io::Cursor::new(wire.clone()),
             prefix: Vec::new(),
+            prefix_init: 0,
             at: 0,
             left: 0,
             ended: false,
@@ -4710,6 +4780,7 @@ mod tests {
         let mut windowed = Reader {
             read: std::io::Cursor::new(wire),
             prefix: Vec::new(),
+            prefix_init: 0,
             at: 0,
             left: 0,
             ended: false,
@@ -4751,6 +4822,7 @@ mod tests {
         let mut reader = Reader {
             read: std::io::Cursor::new(Vec::new()),
             prefix: wire,
+            prefix_init: 0,
             at: 0,
             left: 0,
             ended: false,
@@ -4785,6 +4857,7 @@ mod tests {
         let mut reader = Reader {
             read: std::io::Cursor::new(Vec::new()),
             prefix: b"1\r\na\r\nG\r\n".to_vec(),
+            prefix_init: 0,
             at: 0,
             left: 0,
             ended: false,
@@ -4831,6 +4904,7 @@ mod tests {
                 inner: std::io::Cursor::new(wire),
             },
             prefix: Vec::new(),
+            prefix_init: 0,
             at: 0,
             left: 0,
             ended: false,
@@ -4871,6 +4945,7 @@ mod tests {
                 pieces: vec![b"4\r\nping\r".as_slice(), b"\n4\r\npong\r\n0\r\n\r\n"].into_iter(),
             },
             prefix: Vec::new(),
+            prefix_init: 0,
             at: 0,
             left: 0,
             ended: false,
@@ -5536,6 +5611,7 @@ mod tests {
         let mut framed = Reader {
             read: Silent,
             prefix: Vec::new(),
+            prefix_init: 0,
             at: 0,
             left: 0,
             ended: false,
