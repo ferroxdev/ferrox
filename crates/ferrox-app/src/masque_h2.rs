@@ -21,6 +21,7 @@ use crate::wg_stack::{Packet, UdpRoutes};
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const EDGE_RETRY: Duration = Duration::from_secs(1);
 const READ_WAIT: Duration = Duration::from_millis(10);
+const CLOSE_WAIT: Duration = Duration::from_millis(100);
 const UDP_DRAIN: Duration = Duration::from_secs(1);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
 const PING_TIMEOUT: Duration = Duration::from_secs(15);
@@ -294,6 +295,7 @@ fn connection(
     };
     if wire.preface() {
         Session::new(shared, spec).run(&mut wire);
+        wire.quiet();
     }
 }
 
@@ -342,6 +344,7 @@ fn connection_cleartext(stream: TcpStream, shared: Arc<Shared>, spec: Arc<Server
     drop(cap);
     if ready {
         Session::new(shared, spec).run(&mut wire);
+        wire.quiet();
     }
 }
 
@@ -423,6 +426,31 @@ impl Wire {
             return false;
         }
         true
+    }
+
+    /// Read out whatever the peer sent behind our last frame, so a close does not reset the reply away.
+    fn quiet(&mut self) {
+        self.quiet_until(Instant::now() + CLOSE_WAIT);
+    }
+
+    fn quiet_until(&mut self, until: Instant) {
+        let mut room = [0u8; READ_ROOM];
+        let mut got = false;
+        loop {
+            if Instant::now() >= until {
+                return;
+            }
+            match self.stream.read(&mut room) {
+                Ok(0) => return,
+                Ok(_) => got = true,
+                Err(error) if ferrox_core::tls::TlsError::is_timeout(&error) => {
+                    if got || Instant::now() >= until {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
     }
 
     /// One write for a frame whose head and body are already one buffer.
@@ -2464,6 +2492,55 @@ mod tests {
         assert!(
             error.is_some_and(|reason| reason.kind() == std::io::ErrorKind::TimedOut),
             "the read outlived its absolute deadline"
+        );
+    }
+
+    struct Behind {
+        reads: Arc<AtomicUsize>,
+        left: usize,
+    }
+
+    impl Read for Behind {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            if self.left == 0 {
+                return Ok(0);
+            }
+            self.left -= 1;
+            if self.left == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            Ok(1)
+        }
+    }
+
+    impl Write for Behind {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_finished_wire_reads_what_the_peer_sent_behind_the_reply() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut wire = Wire {
+            stream: Box::new(Behind {
+                reads: Arc::clone(&reads),
+                left: 2,
+            }),
+            pending: Vec::new(),
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        wire.quiet_until(Instant::now() + Duration::from_secs(60));
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            2,
+            "the byte behind the reply is read before the socket closes"
         );
     }
 
