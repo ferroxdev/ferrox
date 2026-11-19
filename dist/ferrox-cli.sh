@@ -896,7 +896,9 @@ if udp:
     doc["routing"] = {
         "rules": [{"type": "field", "network": "udp", "outboundTag": tag}]
     }
-with open(cfg, "w") as handle:
+fd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.chmod(cfg, 0o600)
+with os.fdopen(fd, "w") as handle:
     json.dump(doc, handle, indent=2)
 PY
   ) || rc=$?
@@ -2865,14 +2867,16 @@ start_warp_hop() {
   [ -n "$port" ] || return 1
   ( umask 077
     python3 - "$WARP_CFG" "$port" "$CONF_DIR/warp-identity.json" <<'PY'
-import json, sys
+import json, os, sys
 cfg, port, identity = sys.argv[1:4]
 doc = {
     "inbounds": [{"protocol": "socks", "listen": "127.0.0.1", "port": int(port)}],
     "outbounds": [{"protocol": "warp", "settings": {
         "identityFile": identity, "register": True, "mode": "auto"}}],
 }
-with open(cfg, "w") as handle:
+fd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.chmod(cfg, 0o600)
+with os.fdopen(fd, "w") as handle:
     json.dump(doc, handle, indent=2)
 PY
   ) || return 1
