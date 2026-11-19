@@ -1346,7 +1346,7 @@ impl Session {
                         } else {
                             self.request(wire, id, &block);
                         }
-                        if head_flags & h2::F_END != 0 {
+                        if stream == self.request && head_flags & h2::F_END != 0 {
                             self.half_close();
                         }
                     } else {
@@ -1392,6 +1392,12 @@ impl Session {
     fn headers(&mut self, wire: &mut Wire, flags: u8, id: u32, body: &[u8]) {
         if let Some(active) = self.request {
             if id != active {
+                let block = strip_padding(flags, body, true);
+                if flags & h2::F_END_HEADERS != 0 {
+                    self.trailers(block);
+                } else {
+                    self.continuation = Some((id, block.to_vec(), flags, true));
+                }
                 wire.send(h2::T_RST, 0, id, &7u32.to_be_bytes());
                 return;
             }
@@ -2494,6 +2500,27 @@ mod tests {
             strip_padding(h2::F_PRIORITY, &body, false),
             &body,
             "the priority bit has no meaning outside HEADERS"
+        );
+    }
+
+    #[test]
+    fn a_refused_stream_still_advances_the_hpack_table() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.request = Some(3);
+        let mut wire = Wire {
+            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            pending: Vec::new(),
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        let refused = h2::block_encode(&[("x-pad", "a")]);
+        session.on(&mut wire, h2::T_HEADERS, h2::F_END_HEADERS, 1, &refused);
+        assert_eq!(session.request, Some(3), "the active stream stays active");
+        assert!(!session.end);
+        session.on(&mut wire, h2::T_HEADERS, h2::F_END_HEADERS, 3, &[0xbe]);
+        assert!(
+            !session.end,
+            "the refused block left the hpack table out of step"
         );
     }
 

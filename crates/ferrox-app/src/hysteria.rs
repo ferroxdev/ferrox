@@ -1984,7 +1984,7 @@ fn exchange_plain(scheme: &str, rest: &str, head: &[u8]) -> Option<hysteria::Ori
     let mut stream = dial_origin(&target)?;
     stream.write_all(head).ok()?;
     stream.flush().ok()?;
-    read_origin(&mut stream)
+    read_origin(&mut stream, head)
 }
 
 /// Runs one closed exchange over the client TLS session the relay already speaks: the same authority split and default port as the plain dial, then the request written and the reply read through the encrypted stream, so a cover that dials a real site carries its bytes no further than any other origin answer.
@@ -1994,7 +1994,7 @@ fn exchange_tls(rest: &str, head: &[u8], insecure: bool) -> Option<hysteria::Ori
     let mut tls = ferrox_core::tls::connect(&origin_tls_config(host, insecure), stream).ok()?;
     tls.write_all(head).ok()?;
     tls.flush().ok()?;
-    read_origin(&mut tls)
+    read_origin(&mut tls, head)
 }
 
 /// Rebuilds the browser request as an HTTP/1.1 exchange line: the method and path, a `Host` from the origin or the request's own authority, the request's ordinary headers minus the hop-by-hop ones, and the forwarded headers when asked. The body follows its copied `content-length`.
@@ -2063,7 +2063,7 @@ fn is_hop_by_hop(name: &str) -> bool {
 }
 
 /// Reads an origin's whole HTTP/1.1 reply to its close, then reduces it to status, headers, and body; the buffered bytes stop at the cover's cap so a runaway origin never exhausts memory.
-fn read_origin<R: Read>(stream: &mut R) -> Option<hysteria::OriginResponse> {
+fn read_origin<R: Read>(stream: &mut R, head: &[u8]) -> Option<hysteria::OriginResponse> {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 8 * 1024];
     loop {
@@ -2077,7 +2077,8 @@ fn read_origin<R: Read>(stream: &mut R) -> Option<hysteria::OriginResponse> {
             }
         }
     }
-    hysteria::parse_origin_response(&raw)
+    let method = head.split(|&byte| byte == b' ').next().unwrap_or_default();
+    hysteria::parse_origin_response(&raw, method)
 }
 
 /// Bring one datagram association up: resolve the address the client named, connect a target socket of the matching family, and hand a reader thread the same socket so its replies return over the lane. `None` when the address is unresolvable or no socket can be raised, and the datagram is then dropped.
