@@ -3390,18 +3390,17 @@ fn direct_socket(
     deadline: Instant,
     proxy: Option<&Proxy>,
 ) -> Result<TcpStream, String> {
-    match proxy {
-        Some(proxy) => proxy
+    if let Some(proxy) = proxy {
+        proxy
             .connect(address, deadline)
-            .map_err(|error| format!("psiphon ssh proxy {}: {error}", proxy.display())),
-        None => {
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            if timeout.is_zero() {
-                return Err("psiphon ssh: establishment deadline expired".to_owned());
-            }
-            TcpStream::connect_timeout(&address, timeout)
-                .map_err(|error| format!("psiphon ssh {}: {error}", server.host))
+            .map_err(|error| format!("psiphon ssh proxy {}: {error}", proxy.display()))
+    } else {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return Err("psiphon ssh: establishment deadline expired".to_owned());
         }
+        TcpStream::connect_timeout(&address, timeout)
+            .map_err(|error| format!("psiphon ssh {}: {error}", server.host))
     }
 }
 
