@@ -359,18 +359,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: pkg-*
-          path: packages
-          merge-multiple: true
-      - name: fetch the optional country database
-        shell: bash
-        run: |
-          mkdir -p packages
-          curl -fsSL --retry 3 -o packages/GeoLite2-Country.mmdb \
-            https://github.com/mojolabs-id/GeoLite2-Database/releases/download/2026.11.01/GeoLite2-Country.mmdb
-          test -s packages/GeoLite2-Country.mmdb
       - name: write the checksums
         shell: bash
         env:
@@ -378,7 +366,10 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
+          mkdir -p packages
+          gh release download "$VERSION" --dir packages --clobber
           cd packages
+          rm -f SHA256SUMS
           shopt -s nullglob
           assets=(./*.tar.gz ./*.zip ./*.mmdb)
           [ "${#assets[@]}" -gt 0 ] || { echo "no packages to checksum"; exit 0; }
