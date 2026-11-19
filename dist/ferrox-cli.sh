@@ -2848,7 +2848,8 @@ warp_hop_running() {
   local pid port
   pid="$(cat "$WARP_PID_FILE" 2>/dev/null || true)"
   port="$(cat "$WARP_PORT_FILE" 2>/dev/null || true)"
-  [ -n "$pid" ] && [ -n "$port" ] && kill -0 "$pid" 2>/dev/null && port_open "$port"
+  [ -n "$pid" ] && [ -n "$port" ] && kill -0 "$pid" 2>/dev/null &&
+    lane_pid_runs "$pid" "$WARP_CFG" && port_open "$port"
 }
 
 start_warp_hop() {
@@ -2907,7 +2908,7 @@ PY
 stop_warp_hop() {
   local pid
   pid="$(cat "$WARP_PID_FILE" 2>/dev/null || true)"
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && lane_pid_runs "$pid" "$WARP_CFG"; then
     kill "$pid" 2>/dev/null || true
     sleep 1
     kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true

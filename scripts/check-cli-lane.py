@@ -3493,6 +3493,47 @@ def check_warp_ladder(state: pathlib.Path) -> int:
     return 0
 
 
+# A stale WARP pid file is a claim about a process, not ownership of one: a PID
+# that has since been reused must not be killed by a later down.
+def check_stale_warp_pid(state: pathlib.Path) -> int:
+    for stale in ("warp-hop.pid", "warp-hop.port", "warp-hop.json", "lane.pid"):
+        (state / stale).unlink(missing_ok=True)
+    sleeper = subprocess.Popen(["sleep", "30"])
+    try:
+        (state / "warp-hop.pid").write_text(f"{sleeper.pid}\n", encoding="utf-8")
+        (state / "warp-hop.port").write_text("9\n", encoding="utf-8")
+        (state / "warp-hop.json").write_text("{}\n", encoding="utf-8")
+        run = subprocess.run(
+            [str(CLI), "down"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env_for(state),
+        )
+        output = run.stdout + run.stderr
+        if run.returncode != 0:
+            print(
+                f"check-cli-lane: down over a stale warp pid exited {run.returncode}:"
+                f"\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        if sleeper.poll() is not None:
+            print(
+                "check-cli-lane: down killed a process a stale warp pid only named:"
+                f"\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+    finally:
+        if sleeper.poll() is None:
+            sleeper.kill()
+        sleeper.wait()
+    print("check-cli-lane: a stale warp pid never kills the process that reused its number")
+    return 0
+
+
 # The gates job allows ten minutes and check-cli-args runs first: stop a wedged
 # suite early enough that CI kills the job after the failure is already named.
 SUITE = 240
@@ -3506,6 +3547,7 @@ CHECKS = (
     ("failed lane", check_failed_lane_is_closed),
     ("interrupted attempt", check_interrupted_attempt_leaves_nothing),
     ("warp ladder", check_warp_ladder),
+    ("warp owner", check_stale_warp_pid),
     ("config survives", check_config_survives),
     ("instance ports", check_instance_ports),
     ("vpn fronts", check_vpn_fronts),
