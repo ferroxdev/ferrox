@@ -527,6 +527,7 @@ struct IssuerLive {
     cert_chain: Vec<Vec<u8>>,
     cert_pem: Vec<u8>,
     key_pem: Vec<u8>,
+    build_chain: bool,
     checked: Option<std::time::Instant>,
 }
 
@@ -535,6 +536,7 @@ pub(crate) struct IssuerMaterial {
     pub(crate) cert_chain: Vec<Vec<u8>>,
     pub(crate) cert_pem: Vec<u8>,
     pub(crate) key_pem: Vec<u8>,
+    pub(crate) build_chain: bool,
 }
 
 impl CertIssuer {
@@ -542,6 +544,7 @@ impl CertIssuer {
         cert_chain: Vec<Vec<u8>>,
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
+        build_chain: bool,
         reload: Option<CertReload>,
     ) -> Self {
         Self {
@@ -549,6 +552,7 @@ impl CertIssuer {
                 cert_chain,
                 cert_pem,
                 key_pem,
+                build_chain,
                 checked: reload.as_ref().map(|reload| (reload.now)()),
             }),
             reload,
@@ -597,6 +601,7 @@ impl CertIssuer {
                 cert_chain: live.cert_chain.clone(),
                 cert_pem: live.cert_pem.clone(),
                 key_pem: live.key_pem.clone(),
+                build_chain: live.build_chain,
             },
             generation: self.generation.load(std::sync::atomic::Ordering::Relaxed),
         }
@@ -659,12 +664,14 @@ pub struct TlsServerConfig {
     /// Whether to send TLS 1.3 session tickets. REALITY declines them, as both
     /// references do, so an authenticated handshake is followed by no records.
     pub send_tickets: bool,
-    /// Whether an SNI no certificate name matches aborts the handshake.
+    /// Whether an SNI no certificate name matches aborts the handshake. A configured [`issuer`](Self::issuer)
+    /// wins over this flag: it signs a leaf for the name before the rejection is considered.
     pub reject_unknown_sni: bool,
     /// Memoised server-config builds, one per identity kind.
     pub server_config_cache: crate::tls::rustls_backend::ServerConfigCache,
     /// The CA an `AUTHORITY_ISSUE` certificate names, used to sign a leaf for
-    /// an SNI no served certificate covers.
+    /// an SNI no served certificate covers. It signs before `reject_unknown_sni` is consulted, so
+    /// an issuer-backed listener serves the issued leaf even when that flag is set.
     pub issuer: Option<std::sync::Arc<CertIssuer>>,
     /// ECH server keys as the xray TLV: `u16 key || u16 config`, repeated.
     pub ech_server_keys: Option<std::sync::Arc<[u8]>>,
@@ -681,6 +688,22 @@ pub enum ServerKeyKind {
     Pkcs8,
     Sec1,
     Pkcs1,
+}
+
+/// The lane an `AUTHORITY_ISSUE` identity cannot serve, if the listener selects one: ECH,
+/// the shaped TLS 1.2 engine, and the `BoringSSL` legacy lane each read only static identities.
+#[must_use]
+pub fn issuer_lane_error(cfg: &TlsServerConfig) -> Option<&'static str> {
+    cfg.issuer.as_ref()?;
+    if cfg.ech_server_keys.is_some() {
+        Some("the ECH backend")
+    } else if cipher_suites::shaped_listener(&cfg.cipher_suites, cfg.min_version) {
+        Some("the shaped TLS 1.2 engine")
+    } else if legacy::needed(&cfg.cipher_suites) {
+        Some("the BoringSSL legacy lane")
+    } else {
+        None
+    }
 }
 
 impl TlsServerConfig {

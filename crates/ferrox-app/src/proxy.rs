@@ -2478,7 +2478,9 @@ impl Role {
                     );
                 });
             }
-            Carrier::HttpHeader { path, response } => {
+            Carrier::HttpHeader {
+                paths, response, ..
+            } => {
                 let Ok(raw) = stream.try_clone() else {
                     return;
                 };
@@ -2496,7 +2498,7 @@ impl Role {
                         reader,
                         writer,
                         raw,
-                        &path,
+                        &paths,
                         keys.as_ref(),
                         freedom,
                         response.as_deref(),
@@ -2919,6 +2921,27 @@ impl RouteShared {
     /// Register an outbound the management API added. A tag a rule already names, or the default,
     /// is a duplicate until it was removed; a removed tag can be added again, as in the reference.
     fn add_outbound(&self, tag: &str, out: Outbound) -> Result<(), String> {
+        let server_inbounds = self
+            .server_inbounds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        {
+            let routing = self
+                .routing
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for inbound in &server_inbounds {
+                routing.server_routes(&server_proof_for_candidate(
+                    self,
+                    inbound.tag.as_deref(),
+                    &inbound.networks,
+                    tag,
+                    &out,
+                    inbound.portal,
+                ))?;
+            }
+        }
         let mut dynamic = self
             .dynamic
             .write()
@@ -4613,6 +4636,67 @@ fn server_proof<'a>(
     }
 }
 
+/// Whether a candidate outbound dials direct, by the same rule the dynamic table applies: a
+/// freedom lane with no final block rules.
+fn candidate_direct(out: &Outbound) -> bool {
+    matches!(out, Outbound::Freedom(freedom) if !freedom.has_final_rules())
+}
+
+/// One server inbound's proof against a candidate outbound that is not published yet, so an
+/// `AddOutbound` cannot replace a proven direct lane with a blocked one.
+fn server_proof_for_candidate<'a>(
+    shared: &'a RouteShared,
+    inbound: Option<&'a str>,
+    networks: &'a [crate::router::Network],
+    tag: &'a str,
+    candidate: &'a Outbound,
+    portal: bool,
+) -> crate::router::ServerProof<'a> {
+    let direct = move |named: &str| {
+        if named == tag {
+            candidate_direct(candidate)
+        } else {
+            direct_tag(shared, named)
+        }
+    };
+    let candidate_is_default = shared.default_tag.as_deref() == Some(tag);
+    let has_freedom = shared.has_freedom() || matches!(candidate, Outbound::Freedom(_));
+    let default_direct = if candidate_is_default {
+        candidate_direct(candidate)
+            || (portal && matches!(&shared.default, Outbound::Block(_)) && !has_freedom)
+    } else {
+        match shared.default_tag.as_deref() {
+            Some(default) => {
+                direct_tag(shared, default)
+                    || (portal && matches!(&shared.default, Outbound::Block(_)) && !has_freedom)
+            }
+            None => {
+                matches!(&shared.default, Outbound::Freedom(_))
+                    || (portal && matches!(&shared.default, Outbound::Block(_)) && !has_freedom)
+            }
+        }
+    };
+    let blocks = matches!(&shared.default, Outbound::Freedom(lane) if lane.blocks_any());
+    let default_tag = shared.default_tag.clone();
+    crate::router::ServerProof {
+        inbound,
+        default_direct,
+        networks,
+        direct: Box::new(direct),
+        direct_policy: Box::new(move |named| {
+            !portal || !blocks || default_tag.as_deref() == Some(named)
+        }),
+        portal_rule: Box::new(move |rule| {
+            portal
+                && portal_tag(shared, rule.target())
+                && portal_domain(shared, rule.target())
+                    .is_some_and(|domain| rule.only_matches_domain(&domain))
+        }),
+        candidates: &shared.balancers,
+        fallbacks: &shared.balancer_fallbacks,
+    }
+}
+
 impl RouteShared {
     fn has_freedom(&self) -> bool {
         if matches!(&self.default, Outbound::Freedom(_))
@@ -5944,13 +6028,15 @@ fn serve_shadowsocks(
                     stream, password, method, identities, settings, freedom,
                 );
             }
-            Carrier::HttpHeader { path, response } => {
+            Carrier::HttpHeader {
+                paths, response, ..
+            } => {
                 crate::shadowsocks2022::serve_httpheader_with(
                     stream,
                     password,
                     method,
                     identities,
-                    path.as_str(),
+                    paths,
                     freedom,
                     response.as_deref(),
                 );
@@ -5974,11 +6060,13 @@ fn serve_shadowsocks(
         Carrier::Xhttp { settings, .. } => {
             crate::shadowsocks::serve_xhttp(stream, users, settings, freedom);
         }
-        Carrier::HttpHeader { path, response } => {
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
             crate::shadowsocks::serve_httpheader_with(
                 stream,
                 users,
-                path.as_str(),
+                paths,
                 freedom,
                 response.as_deref(),
             );
@@ -6153,7 +6241,9 @@ fn serve_shadowsocks_tls(
             let (reader, writer) = session_halves(session, out);
             serve_ss_xhttp_carrier(reader, writer, settings, accounts.clone(), freedom);
         }
-        Carrier::HttpHeader { path, response } => {
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
@@ -6161,7 +6251,7 @@ fn serve_shadowsocks_tls(
             };
             let (reader, writer) = session_halves(session, out);
             let Some((reader, writer)) =
-                crate::httpheader::accept_split(reader, writer, path, response.as_deref())
+                crate::httpheader::accept_split(reader, writer, paths, response.as_deref())
             else {
                 return;
             };
@@ -6269,11 +6359,13 @@ fn serve_vless_inner(
         Carrier::Xhttp { settings, .. } => {
             serve_vless_xhttp(stream, settings, users, shared, freedom, decryption);
         }
-        Carrier::HttpHeader { path, response } => {
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
             serve_vless_httpheader(
                 stream,
                 users,
-                path,
+                paths,
                 freedom,
                 decryption.cloned().as_deref(),
                 response.as_deref(),
@@ -6560,12 +6652,12 @@ pub(crate) fn serve_grpc_muxed(
 fn serve_vless_httpheader(
     stream: Connection,
     users: &[VlessUser],
-    path: &str,
+    paths: &[String],
     freedom: bool,
     decryption: Option<&ferrox_core::vless_encryption::Server>,
     response: Option<&[u8]>,
 ) {
-    let Some((reader, mut write)) = crate::httpheader::accept(stream, path, response) else {
+    let Some((reader, mut write)) = crate::httpheader::accept(stream, paths, response) else {
         return;
     };
     let mut reader = reader;
@@ -10923,14 +11015,14 @@ fn serve_session_httpheader<
     read: R,
     write: W,
     raw: Connection,
-    path: &str,
+    paths: &[String],
     users: &[VlessUser],
     freedom: bool,
     decryption: Option<&ferrox_core::vless_encryption::Server>,
     response: Option<&[u8]>,
 ) {
     let close = connection_closer(&raw);
-    let Some((creader, cwriter)) = crate::httpheader::accept_split(read, write, path, response)
+    let Some((creader, cwriter)) = crate::httpheader::accept_split(read, write, paths, response)
     else {
         echo_trace("session httpheader accept refused");
         return;
@@ -11154,7 +11246,9 @@ fn serve_vless_tls(
                 decryption.cloned().as_deref(),
             );
         }
-        Carrier::HttpHeader { path, response } => {
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
@@ -11165,7 +11259,7 @@ fn serve_vless_tls(
                 reader,
                 writer,
                 raw,
-                path,
+                paths,
                 users,
                 freedom,
                 decryption.cloned().as_deref(),
@@ -11496,7 +11590,9 @@ fn serve_vless_reality(
                 );
             });
         }
-        Carrier::HttpHeader { path, response } => {
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
@@ -11508,7 +11604,7 @@ fn serve_vless_reality(
                     reader,
                     writer,
                     raw,
-                    path,
+                    paths,
                     users,
                     freedom,
                     decryption.cloned().as_deref(),
@@ -16419,11 +16515,13 @@ fn serve_vmess_tls(
         Carrier::Xhttp { settings, .. } => {
             serve_vmess_xhttp_carrier(reader, writer, settings, users, freedom, &close);
         }
-        Carrier::HttpHeader { path, response } => {
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
             crate::vmess::serve_httpheader_split_with(
                 reader,
                 writer,
-                path,
+                paths,
                 users,
                 freedom,
                 &close,
@@ -16511,7 +16609,9 @@ fn serve_vmess_reality(
                 serve_vmess_xhttp_carrier(reader, writer, settings, users, freedom, &close);
             });
         }
-        Carrier::HttpHeader { path, response } => {
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = raw.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
@@ -16525,7 +16625,7 @@ fn serve_vmess_reality(
                 crate::vmess::serve_httpheader_split_with(
                     reader,
                     writer,
-                    path,
+                    paths,
                     users,
                     freedom,
                     &close,
@@ -25100,8 +25200,10 @@ fn serve_trojan(stream: Connection, key: &[[u8; 56]], carrier: &Carrier, freedom
             let arm = |read: &Connection, timeout| read.set_read_timeout(timeout).is_ok();
             serve_trojan_xhttp_carrier(read, stream, settings, key, freedom, arm);
         }
-        Carrier::HttpHeader { path, response } => {
-            serve_trojan_httpheader_with(stream, key, path.as_str(), freedom, response.as_deref());
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
+            serve_trojan_httpheader_with(stream, key, paths, freedom, response.as_deref());
         }
         refused_carriers!() => {}
     }
@@ -25508,17 +25610,17 @@ pub(crate) fn serve_trojan_grpc_muxed(
 
 #[cfg(test)]
 fn serve_trojan_httpheader(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bool) {
-    serve_trojan_httpheader_with(stream, key, path, freedom, None);
+    serve_trojan_httpheader_with(stream, key, &[path.to_owned()], freedom, None);
 }
 
 fn serve_trojan_httpheader_with(
     stream: Connection,
     key: &[[u8; 56]],
-    path: &str,
+    paths: &[String],
     freedom: bool,
     response: Option<&[u8]>,
 ) {
-    let Some((mut reader, write)) = crate::httpheader::accept(stream, path, response) else {
+    let Some((mut reader, write)) = crate::httpheader::accept(stream, paths, response) else {
         return;
     };
     let Some((cmd, target)) = decode_trojan_request(&mut reader, key) else {
@@ -25632,7 +25734,9 @@ fn serve_trojan_tls(
             let (reader, writer) = session_halves(session, out);
             serve_session_trojan_httpupgrade(reader, writer, raw, path, host, key, freedom);
         }
-        Carrier::HttpHeader { path, response } => {
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
@@ -25643,7 +25747,7 @@ fn serve_trojan_tls(
                 reader,
                 writer,
                 raw,
-                path,
+                paths,
                 key,
                 freedom,
                 response.as_deref(),
@@ -25711,7 +25815,9 @@ fn serve_trojan_reality(
                 serve_session_trojan_httpupgrade(reader, writer, raw, path, host, key, freedom);
             });
         }
-        Carrier::HttpHeader { path, response } => {
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
@@ -25723,7 +25829,7 @@ fn serve_trojan_reality(
                     reader,
                     writer,
                     raw,
-                    path,
+                    paths,
                     key,
                     freedom,
                     response.as_deref(),
@@ -26474,12 +26580,13 @@ fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + 
     read: R,
     write: W,
     raw: Connection,
-    path: &str,
+    paths: &[String],
     key: &[[u8; 56]],
     freedom: bool,
     response: Option<&[u8]>,
 ) {
-    let Some((mut creader, cwriter)) = crate::httpheader::accept_split(read, write, path, response)
+    let Some((mut creader, cwriter)) =
+        crate::httpheader::accept_split(read, write, paths, response)
     else {
         echo_trace("session httpheader trojan accept refused");
         return;
@@ -36808,6 +36915,9 @@ pub(crate) trait FrameWrite: Write + Send {
 
     /// Clears the clock so an established relay waits on the peer rather than a task budget.
     fn clear_write_timeout(&mut self) {}
+
+    /// Closes both directions of the transport, so a reader blocked beside this writer ends.
+    fn shutdown_both(&mut self) {}
 }
 
 impl FrameWrite for Connection {
@@ -36830,6 +36940,10 @@ impl FrameWrite for Connection {
 
     fn clear_write_timeout(&mut self) {
         let _ = self.set_write_timeout(None);
+    }
+
+    fn shutdown_both(&mut self) {
+        let _ = Connection::shutdown(self, std::net::Shutdown::Both);
     }
 }
 
@@ -45613,6 +45727,7 @@ mod tests {
     fn an_encrypted_vless_httpheader_session_echoes_over_loopback() {
         encrypted_vless_carried_echo(
             Carrier::HttpHeader {
+                paths: vec!["/sealed".to_owned()],
                 path: "/sealed".to_owned(),
                 response: None,
             },
@@ -45783,6 +45898,7 @@ mod tests {
     fn an_encrypted_vless_httpheader_vision_session_echoes_over_loopback() {
         encrypted_vless_carried_vision_echo(
             Carrier::HttpHeader {
+                paths: vec!["/sealed".to_owned()],
                 path: "/sealed".to_owned(),
                 response: None,
             },
@@ -51936,6 +52052,7 @@ mod tests {
     fn vless_over_http_camouflage_reaches_echo() {
         vless_over_carrier_reaches_echo(
             &Carrier::HttpHeader {
+                paths: vec!["/camouflage".to_owned()],
                 path: "/camouflage".to_owned(),
                 response: None,
             },
@@ -51994,6 +52111,7 @@ mod tests {
             port: server_addr.port(),
             id,
             carrier: Carrier::HttpHeader {
+                paths: vec!["/p".to_owned()],
                 path: "/p".to_owned(),
                 response: None,
             },
@@ -52155,7 +52273,8 @@ mod tests {
         carried_round_trip(
             "httpheader",
             |stream| {
-                let (reader, write) = crate::httpheader::accept(stream, "/camouflage", None)?;
+                let (reader, write) =
+                    crate::httpheader::accept(stream, &["/camouflage".to_owned()], None)?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(write) as Box<dyn Write + Send>,
@@ -53521,7 +53640,7 @@ mod tests {
         });
         let id = [0x22u8; 16];
         let carrier = Carrier::Ws {
-            path: "/p".into(),
+            path: "/p".to_owned(),
             ed: 0,
         };
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -53552,7 +53671,7 @@ mod tests {
         });
         let id = [0x23u8; 16];
         let carrier = Carrier::HttpUpgrade {
-            path: "/p".into(),
+            path: "/p".to_owned(),
             host: String::new(),
         };
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -53584,7 +53703,8 @@ mod tests {
         });
         let id = [0x24u8; 16];
         let carrier = Carrier::HttpHeader {
-            path: "/p".into(),
+            paths: vec!["/p".to_owned()],
+            path: "/p".to_owned(),
             response: None,
         };
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -59415,6 +59535,7 @@ mod tests {
                 host: String::new(),
             },
             Carrier::HttpHeader {
+                paths: vec!["/vmess-header".to_owned()],
                 path: "/vmess-header".to_owned(),
                 response: None,
             },
@@ -60437,7 +60558,8 @@ mod tests {
         read: ServerHalf,
         write: ServerHalf,
     ) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
-        let (reader, writer) = crate::httpheader::accept_split(read, write, "/c", None)?;
+        let (reader, writer) =
+            crate::httpheader::accept_split(read, write, &["/c".to_owned()], None)?;
         Some((Box::new(reader), Box::new(writer)))
     }
 
@@ -60926,6 +61048,7 @@ mod tests {
                     port,
                     id,
                     Carrier::HttpHeader {
+                        paths: vec!["/c".to_owned()],
                         path: "/c".to_owned(),
                         response: None,
                     },
@@ -61080,6 +61203,7 @@ mod tests {
                     port,
                     id,
                     Carrier::HttpHeader {
+                        paths: vec!["/c".to_owned()],
                         path: "/c".to_owned(),
                         response: None,
                     },
@@ -61493,6 +61617,7 @@ mod tests {
                     port,
                     key,
                     Carrier::HttpHeader {
+                        paths: vec!["/c".to_owned()],
                         path: "/c".to_owned(),
                         response: None,
                     },
@@ -61955,6 +62080,7 @@ mod tests {
     fn socks_dials_ss_over_httpheader_to_echo() {
         socks_dials_ss_via(
             Carrier::HttpHeader {
+                paths: vec!["/ss-camouflage".to_owned()],
                 path: "/ss-camouflage".to_owned(),
                 response: None,
             },
@@ -67240,6 +67366,7 @@ mod tests {
             port: tunnel_port,
             key: trojan_key("secret"),
             carrier: Carrier::HttpHeader {
+                paths: vec!["/tunnel".to_owned()],
                 path: "/tunnel".to_owned(),
                 response: None,
             },
@@ -68631,6 +68758,7 @@ mod tests {
             ),
             (
                 Carrier::HttpHeader {
+                    paths: vec!["/t".to_owned()],
                     path: "/t".to_owned(),
                     response: None,
                 },
@@ -80102,6 +80230,9 @@ end
             .expect_err("the default tag was removed, so it no longer dials direct");
         assert!(error.contains("direct"), "{error}");
 
+        shared
+            .add_outbound("direct", freedom())
+            .expect("restores the default as freedom");
         shared.remove_outbound("alt");
         shared
             .add_outbound("alt", freedom())
@@ -80109,6 +80240,30 @@ end
         runtime
             .add_rules(&[rule("alt")], true)
             .expect("a live freedom tag is still a direct dial");
+    }
+
+    #[test]
+    fn adding_a_blocked_outbound_cannot_break_a_running_server_route() {
+        let root = crate::json::parse(
+            r#"{"inbounds":[{"tag":"served","protocol":"vless","listen":"127.0.0.1","port":12345,
+                "settings":{"clients":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}}],
+                "outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"alt","protocol":"freedom"}],
+                "routing":{"rules":[{"type":"field","inboundTag":["served"],"outboundTag":"alt"}]}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let shared = Arc::clone(runtime.route.as_ref().expect("route"));
+        shared.remove_outbound("alt");
+        let error = shared
+            .add_outbound(
+                "alt",
+                Outbound::Block(ferrox_core::blackhole::Response::None),
+            )
+            .expect_err("the served inbound still needs a direct lane");
+        assert!(error.contains("alt"), "{error}");
+        shared
+            .add_outbound("alt", freedom())
+            .expect("a direct lane keeps the server route valid");
     }
 
     /// A `vlessRoute` rule reads the route id a flow carries: a socks flow carries none, so it reads
@@ -85149,10 +85304,12 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             Carrier::Xhttp { settings, .. } => {
                 crate::vmess::serve_xhttp_settings(stream, &settings, &users, freedom);
             }
-            Carrier::HttpHeader { path, response } => {
+            Carrier::HttpHeader {
+                paths, response, ..
+            } => {
                 crate::vmess::serve_httpheader_with(
                     stream,
-                    path.as_str(),
+                    &paths,
                     &users,
                     freedom,
                     response.as_deref(),

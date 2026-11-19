@@ -1264,10 +1264,13 @@ fn tcp_transport(bytes: &[u8]) -> Result<Option<Json>, String> {
         match (field, wire) {
             (2, 2) => {
                 let (name, value) = typed_message(reader.bytes()?)?;
-                if name != "xray.transport.internet.headers.http.Config" {
+                if name == "xray.transport.internet.headers.noop.ConnectionConfig" {
+                    header = None;
+                } else if name == "xray.transport.internet.headers.http.Config" {
+                    header = tcp_http_header(value)?;
+                } else {
                     return Err(format!("transport header `{name}` is not carried"));
                 }
-                header = tcp_http_header(value)?;
             }
             (3, 0) => proxy_protocol = reader.varint()? != 0,
             _ => return Err(reader.refuse(field, wire)),
@@ -1322,7 +1325,7 @@ fn tcp_http_header(bytes: &[u8]) -> Result<Option<Json>, String> {
 }
 
 /// Merge one `RequestConfig` occurrence into another: repeated paths and headers accumulate in
-/// wire order, and a header the caller repeats replaces the earlier value, as one occurrence does.
+/// wire order, including two header entries that share a name.
 fn merge_http_request(held: &mut Json, next: Json) {
     let Json::Obj(held) = held else {
         return;
@@ -1352,23 +1355,17 @@ fn merge_http_request(held: &mut Json, next: Json) {
                 };
             }
             "headers" => {
-                let Json::Obj(values) = value else {
+                let Json::Arr(values) = value else {
                     continue;
                 };
-                if let Some(Json::Obj(existing)) = held
+                if let Some(Json::Arr(existing)) = held
                     .iter_mut()
                     .find(|(name, _)| name == "headers")
                     .map(|(_, value)| value)
                 {
-                    for (name, value) in values {
-                        if let Some(slot) = existing.iter_mut().find(|(held, _)| *held == name) {
-                            slot.1 = value;
-                        } else {
-                            existing.push((name, value));
-                        }
-                    }
+                    existing.extend(values);
                 } else {
-                    held.push((key, Json::Obj(values)));
+                    held.push((key, Json::Arr(values)));
                 }
             }
             _ => {
@@ -1508,7 +1505,7 @@ fn tcp_http_request_config(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.transport.internet.headers.http.RequestConfig");
     let mut request = Vec::new();
     let mut paths = Vec::new();
-    let mut headers: Vec<(String, Json)> = Vec::new();
+    let mut headers: Vec<String> = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
@@ -1530,11 +1527,14 @@ fn tcp_http_request_config(bytes: &[u8]) -> Result<Json, String> {
             (3, 2) => paths.push(Json::Str(account_text(&mut reader)?)),
             (4, 2) => {
                 let (name, value) = tcp_http_request_header(reader.bytes()?)?;
-                if let Some(slot) = headers.iter_mut().find(|(held, _)| *held == name) {
-                    slot.1 = value;
-                } else {
-                    headers.push((name, value));
-                }
+                let Some(value) = value
+                    .as_arr()
+                    .and_then(|values| values.first())
+                    .and_then(Json::as_str)
+                else {
+                    continue;
+                };
+                headers.push(format!("{name}: {value}"));
             }
             _ => return Err(reader.refuse(field, wire)),
         }
@@ -1545,7 +1545,10 @@ fn tcp_http_request_config(bytes: &[u8]) -> Result<Json, String> {
         _ => request.push(("path", Json::Arr(paths))),
     }
     if !headers.is_empty() {
-        request.push(("headers", Json::Obj(headers)));
+        request.push((
+            "headers",
+            Json::Arr(headers.into_iter().map(Json::Str).collect()),
+        ));
     }
     Ok(object(request))
 }
@@ -1646,7 +1649,7 @@ fn grpc_transport(bytes: &[u8]) -> Result<Json, String> {
                 Json::Str(account_text(&mut reader)?),
             ),
             (3, 0) => grpc_pair(&mut pairs, "multiMode", Json::Bool(reader.varint()? != 0)),
-            (4, 0) => grpc_positive(&mut pairs, "idleTimeout", int32(reader.varint()?)),
+            (4, 0) => grpc_signed(&mut pairs, "idleTimeout", int32(reader.varint()?)),
             (5, 0) => grpc_positive(&mut pairs, "healthCheckTimeout", int32(reader.varint()?)),
             (6, 0) => grpc_pair(
                 &mut pairs,
@@ -1671,6 +1674,16 @@ fn grpc_pair(pairs: &mut Vec<(&str, Json)>, key: &'static str, value: Json) {
         slot.1 = value;
     } else {
         pairs.push((key, value));
+    }
+}
+
+/// A signed gRPC scalar: zero is the default and leaves the field absent, while a negative idle
+/// timeout is retained because xray still arms keepalive when the health timeout is positive.
+fn grpc_signed(pairs: &mut Vec<(&str, Json)>, key: &'static str, value: i32) {
+    if value == 0 {
+        pairs.retain(|(name, _)| *name != key);
+    } else {
+        grpc_pair(pairs, key, Json::Num(f64::from(value)));
     }
 }
 
@@ -2307,6 +2320,7 @@ fn tls_certificate(bytes: &[u8]) -> Result<Json, String> {
     let mut usage = "encipherment";
     let mut ocsp_stapling = 0;
     let mut one_time_loading = false;
+    let mut build_chain = false;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => certificate = Some(account_text(&mut reader)?),
@@ -2327,10 +2341,7 @@ fn tls_certificate(bytes: &[u8]) -> Result<Json, String> {
             (5, 2) => certificate_path = account_text(&mut reader)?,
             (6, 2) => key_path = account_text(&mut reader)?,
             (7, 0) => one_time_loading = reader.varint()? != 0,
-            // buildChain shapes a chain minted from an issuing CA; the tree serves listed identities only.
-            (8, 0) => {
-                reader.varint()?;
-            }
+            (8, 0) => build_chain = reader.varint()? != 0,
             _ => return Err(reader.refuse(field, wire)),
         }
     }
@@ -2377,6 +2388,9 @@ fn tls_certificate(bytes: &[u8]) -> Result<Json, String> {
     }
     if one_time_loading {
         pairs.push(("oneTimeLoading", Json::Bool(true)));
+    }
+    if build_chain {
+        pairs.push(("buildChain", Json::Bool(true)));
     }
     Ok(object(pairs))
 }
@@ -2840,6 +2854,9 @@ fn metrics_settings(bytes: &[u8]) -> Result<Json, String> {
             (2, 2) => listen = account_text(&mut reader)?,
             _ => return Err(reader.refuse(field, wire)),
         }
+    }
+    if tag.is_empty() && listen.is_empty() {
+        return Err("xray.app.metrics.Config: neither tag nor listen is set".to_owned());
     }
     let mut pairs = Vec::new();
     if !tag.is_empty() {
@@ -6863,11 +6880,40 @@ mod tests {
         assert_eq!(
             request
                 .get("headers")
-                .and_then(|headers| headers.get("X-Test"))
                 .and_then(Json::as_arr)
                 .and_then(|values| values.first())
                 .and_then(Json::as_str),
-            Some("a")
+            Some("X-Test: a")
+        );
+    }
+
+    #[test]
+    fn repeated_http_request_header_names_keep_every_occurrence() {
+        let first = message(&[
+            bytes_field(3, b"/camouflage"),
+            bytes_field(
+                4,
+                &message(&[bytes_field(1, b"X-Test"), bytes_field(2, b"a")]),
+            ),
+        ]);
+        let second = message(&[bytes_field(
+            4,
+            &message(&[bytes_field(1, b"X-Test"), bytes_field(2, b"b")]),
+        )]);
+        let header = message(&[bytes_field(1, &first), bytes_field(1, &second)]);
+        let json = tcp_http_header(&header)
+            .expect("merges")
+            .expect("http header");
+        assert_eq!(
+            json.get("request")
+                .and_then(|request| request.get("headers"))
+                .and_then(Json::as_arr),
+            Some(
+                &[
+                    Json::Str("X-Test: a".to_owned()),
+                    Json::Str("X-Test: b".to_owned()),
+                ][..]
+            )
         );
     }
 
@@ -9610,5 +9656,42 @@ mod tests {
                 Json::Num(3.0)
             ]))
         );
+    }
+
+    #[test]
+    fn a_noop_tcp_header_is_the_default_route() {
+        let noop = typed("xray.transport.internet.headers.noop.ConnectionConfig", &[]);
+        assert_eq!(
+            tcp_transport(&message(&[bytes_field(2, &noop)])),
+            Ok(None),
+            "the no-op header means no camouflage block, not an unknown one"
+        );
+    }
+
+    #[test]
+    fn a_negative_grpc_idle_timeout_survives_the_wire() {
+        let json = grpc_transport(&message(&[varint_field(4, (-5i64) as u64)]))
+            .expect("signed idle timeout");
+        assert_eq!(
+            json.get("idleTimeout").and_then(Json::as_i64),
+            Some(-5),
+            "xray keeps a negative idle timeout so a positive health timeout still arms keepalive"
+        );
+    }
+
+    #[test]
+    fn metrics_with_neither_tag_nor_listen_is_refused() {
+        assert!(metrics_settings(&[]).is_err());
+    }
+
+    #[test]
+    fn a_tls_certificate_carries_build_chain() {
+        let json = tls_certificate(&message(&[
+            bytes_field(1, b"certificate"),
+            bytes_field(2, b"key"),
+            varint_field(8, 1),
+        ]))
+        .expect("certificate");
+        assert_eq!(json.get("buildChain"), Some(&Json::Bool(true)));
     }
 }

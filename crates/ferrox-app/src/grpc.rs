@@ -81,6 +81,8 @@ struct Shared {
     stream: Mutex<Box<dyn crate::proxy::FrameWrite + Send>>,
     send: Mutex<SendWindow>,
     wake: Condvar,
+    keepalive_gate: Mutex<()>,
+    keepalive_wake: Condvar,
     max_frame: Mutex<usize>,
     init: Mutex<u64>,
     ended: AtomicBool,
@@ -374,6 +376,7 @@ impl<R: Read> GrpcReader<R> {
             .is_ok_and(|mut stream| write_frame(&mut **stream, kind, flags, id, body));
         if !sent {
             self.shared.dead.store(true, Ordering::SeqCst);
+            wake_keepalive(&self.shared);
         }
         sent
     }
@@ -466,6 +469,7 @@ impl<R: Read> GrpcReader<R> {
         };
         if !stream.write_slices(&[out]) {
             self.shared.dead.store(true, Ordering::SeqCst);
+            wake_keepalive(&self.shared);
         }
     }
 
@@ -1681,6 +1685,8 @@ impl GrpcWriter {
         // A served call's downlink end is the trailer: its status belongs to the response, not to the request lane.
         if self.trailers {
             self.shared.ended.store(true, Ordering::SeqCst);
+            self.shared.wake.notify_all();
+            wake_keepalive(&self.shared);
             if !self.send_trailer() {
                 self.shared.ended.store(false, Ordering::SeqCst);
                 return;
@@ -1717,7 +1723,10 @@ impl GrpcWriter {
             .upload_gate
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if self.shared.ended.swap(true, Ordering::SeqCst) {
+        let ended = self.shared.ended.swap(true, Ordering::SeqCst);
+        self.shared.wake.notify_all();
+        wake_keepalive(&self.shared);
+        if ended {
             return;
         }
         if self.trailers {
@@ -2405,6 +2414,8 @@ fn mux_shared(write: Box<dyn FrameWrite + Send>, max: usize, window: u64) -> Arc
             unlimited: true,
         }),
         wake: Condvar::new(),
+        keepalive_gate: Mutex::new(()),
+        keepalive_wake: Condvar::new(),
         max_frame: Mutex::new(max),
         init: Mutex::new(window),
         ended: AtomicBool::new(false),
@@ -3106,6 +3117,10 @@ impl crate::proxy::FrameWrite for Tail {
     fn arm_write(&mut self, timeout: Duration) {
         self.inner.arm_write(timeout);
     }
+
+    fn shutdown_both(&mut self) {
+        self.inner.shutdown_both();
+    }
 }
 
 fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
@@ -3117,6 +3132,8 @@ fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
             unlimited: false,
         }),
         wake: Condvar::new(),
+        keepalive_gate: Mutex::new(()),
+        keepalive_wake: Condvar::new(),
         max_frame: Mutex::new(16_384),
         init: Mutex::new(65_535),
         ended: AtomicBool::new(false),
@@ -3382,16 +3399,19 @@ fn user_agent(name: &str) -> &str {
 fn start_keepalive(shared: Arc<Shared>, settings: &GrpcSettings) {
     // The reference pings between streams; this connection carries one stream for its life, so there is no interval to cover.
     let _ = settings.permit_without_stream;
-    if settings.idle_timeout == 0 {
+    if settings.idle_timeout <= 0 && settings.health_check_timeout == 0 {
         return;
     }
-    let every = u64::from(settings.idle_timeout);
+    let every = if settings.idle_timeout > 0 {
+        u64::from(settings.idle_timeout.unsigned_abs())
+    } else {
+        u64::from(settings.health_check_timeout)
+    };
     let health = settings.health_check_timeout;
     std::thread::spawn(move || {
         let mut seq = 0u64;
         loop {
-            std::thread::sleep(Duration::from_secs(every));
-            if shared.dead.load(Ordering::SeqCst) || shared.ended.load(Ordering::SeqCst) {
+            if !keepalive_wait(&shared, Duration::from_secs(every)) {
                 return;
             }
             seq += 1;
@@ -3402,21 +3422,67 @@ fn start_keepalive(shared: Arc<Shared>, settings: &GrpcSettings) {
                 .lock()
                 .is_ok_and(|mut socket| socket.write_slices(&[&head, &body]));
             if !sent {
-                shared.dead.store(true, Ordering::SeqCst);
+                keepalive_stop(&shared);
                 return;
             }
             if health > 0 {
                 let until = Instant::now() + Duration::from_secs(u64::from(health));
                 while Instant::now() < until && shared.pong.load(Ordering::SeqCst) < seq {
-                    std::thread::sleep(Duration::from_millis(50));
+                    let left = until
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(50));
+                    if !keepalive_wait(&shared, left) {
+                        return;
+                    }
                 }
                 if shared.pong.load(Ordering::SeqCst) < seq {
-                    shared.dead.store(true, Ordering::SeqCst);
+                    keepalive_stop(&shared);
                     return;
                 }
             }
         }
     });
+}
+
+/// Waits for the next ping without outliving the connection: `false` when it ended first.
+fn keepalive_wait(shared: &Shared, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    let mut gate = shared
+        .keepalive_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        if shared.dead.load(Ordering::SeqCst) || shared.ended.load(Ordering::SeqCst) {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        let (next, _) = shared
+            .keepalive_wake
+            .wait_timeout(gate, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gate = next;
+    }
+}
+
+fn wake_keepalive(shared: &Shared) {
+    let _gate = shared
+        .keepalive_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    shared.keepalive_wake.notify_all();
+}
+
+/// Records the failed health check, wakes the lanes, and closes the socket a blocked read sits on.
+fn keepalive_stop(shared: &Shared) {
+    shared.dead.store(true, Ordering::SeqCst);
+    if let Ok(mut stream) = shared.stream.lock() {
+        stream.shutdown_both();
+    }
+    shared.wake.notify_all();
+    wake_keepalive(shared);
 }
 
 impl crate::proxy::CarrierSink for GrpcWriter {
@@ -3470,6 +3536,7 @@ pub(crate) fn mark_reader_dead<R: Read>(reader: &mut GrpcReader<R>) {
     }
     reader.shared.dead.store(true, Ordering::SeqCst);
     reader.shared.wake.notify_all();
+    wake_keepalive(&reader.shared);
 }
 
 pub(crate) fn request_ended<R: Read>(reader: &GrpcReader<R>) -> bool {
@@ -5877,6 +5944,8 @@ mod tests {
                             unlimited: false,
                         }),
                         wake: Condvar::new(),
+                        keepalive_gate: Mutex::new(()),
+                        keepalive_wake: Condvar::new(),
                         max_frame: Mutex::new(max),
                         init: Mutex::new(u64::from(WINDOW)),
                         ended: AtomicBool::new(false),

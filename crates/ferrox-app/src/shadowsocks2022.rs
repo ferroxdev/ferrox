@@ -603,11 +603,11 @@ pub(crate) fn serve_httpheader_with(
     password: &str,
     method: &str,
     identities: &[(String, u32)],
-    path: &str,
+    paths: &[String],
     freedom: bool,
     response: Option<&[u8]>,
 ) {
-    let Some((mut reader, writer)) = crate::httpheader::accept(stream, path, response) else {
+    let Some((mut reader, writer)) = crate::httpheader::accept(stream, paths, response) else {
         return;
     };
     let Some(accepted) = accept_on(&mut reader, password, method, identities, freedom) else {

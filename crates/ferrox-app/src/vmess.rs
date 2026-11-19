@@ -822,6 +822,7 @@ fn decode_target(
     header: &[u8],
     cursor: &mut usize,
     users: Option<&Users>,
+    cmd: u8,
 ) -> Option<(SocketAddr, bool, Option<Arc<crate::reverse::Portal>>)> {
     let port = u16::from_be_bytes(header.get(*cursor..*cursor + 2)?.try_into().ok()?);
     let rest = &header[*cursor + 2..];
@@ -847,7 +848,10 @@ fn decode_target(
         crate::proxy::AddrBody::Domain(host) => {
             if crate::singmux::is_rendezvous(host, port) {
                 (SocketAddr::from(([0, 0, 0, 0], 0)), true, None)
-            } else if let Some(portal) = crate::reverse::portal_for_domain(host) {
+            } else if let Some(portal) = (cmd == 1)
+                .then(|| crate::reverse::portal_for_domain(host))
+                .flatten()
+            {
                 if users.is_none_or(|users| users.portal_allowed(portal.tag())) {
                     (SocketAddr::from(([0, 0, 0, 0], 0)), false, Some(portal))
                 } else {
@@ -1845,7 +1849,7 @@ fn decode_header_in(header: &[u8], users: Option<&Users>) -> Option<HeaderParts>
     let (target, rendezvous, portal) = if cmd == 3 {
         (None, false, None)
     } else {
-        let (target, rendezvous, portal) = decode_target(header, &mut cursor, users)?;
+        let (target, rendezvous, portal) = decode_target(header, &mut cursor, users, cmd)?;
         (
             if rendezvous { None } else { Some(target) },
             rendezvous,
@@ -2730,17 +2734,17 @@ pub(crate) fn serve_xhttp_accepted(
 
 #[cfg(test)]
 pub(crate) fn serve_httpheader(stream: Connection, path: &str, users: &Users, freedom: bool) {
-    serve_httpheader_with(stream, path, users, freedom, None);
+    serve_httpheader_with(stream, &[path.to_owned()], users, freedom, None);
 }
 
 pub(crate) fn serve_httpheader_with(
     stream: Connection,
-    path: &str,
+    paths: &[String],
     users: &Users,
     freedom: bool,
     response: Option<&[u8]>,
 ) {
-    let Some((mut reader, write)) = crate::httpheader::accept(stream, path, response) else {
+    let Some((mut reader, write)) = crate::httpheader::accept(stream, paths, response) else {
         return;
     };
     reader.set_poll(Some(crate::budgets::RELAY_POLL));
@@ -2759,7 +2763,7 @@ pub(crate) fn serve_httpheader_with(
 pub(crate) fn serve_httpheader_split_with<R, W>(
     reader: R,
     writer: W,
-    path: &str,
+    paths: &[String],
     users: &Users,
     freedom: bool,
     close: &Close,
@@ -2769,7 +2773,7 @@ pub(crate) fn serve_httpheader_split_with<R, W>(
     W: Write + Send + 'static,
 {
     let Some((mut reader, writer)) =
-        crate::httpheader::accept_split(reader, writer, path, response)
+        crate::httpheader::accept_split(reader, writer, paths, response)
     else {
         return;
     };

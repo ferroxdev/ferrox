@@ -500,7 +500,7 @@ impl<S: Stream> Server<S> {
             if let Some(at) = certs.iter().position(|entry| {
                 entry.cert_chain.first().is_some_and(|leaf| {
                     crate::tls::rustls_backend::sni_matches(
-                        &crate::tls::rustls_backend::certificate_names(leaf),
+                        &crate::tls::rustls_backend::certificate_names(leaf, false),
                         name,
                     )
                 })
