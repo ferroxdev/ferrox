@@ -416,7 +416,7 @@ jobs:
           fetch_mb socks 10808 psiphon-socks.bin "native socks" || FAILED="$FAILED native(socks)"
           trace_front http 10819 "native http" || FAILED="$FAILED native(http trace)"
           fetch_mb http 10819 psiphon-http.bin "native http" || FAILED="$FAILED native(http)"
-          fetch_mb socks 10808 psiphon-socks-warm.bin "native socks warm" || FAILED="$FAILED native(socks warm)"
+          fetch_mb socks 10808 psiphon-socks-warm.bin "native socks warmup" || FAILED="$FAILED native(socks warmup)"
           # A cold first fetch and a slow-start connection make an early leg
           # read lower than the lane carries. One warm-up fetch warms both
           # sides of the tunnel before the measured pair, so the measured
@@ -508,7 +508,7 @@ jobs:
               echo "::warning::the shipped engine's HTTP proxy carried no trace in 120s"
               REF_FAILED="$REF_FAILED http(unbound)"
             fi
-            fetch_mb socks 10808 reference-socks-warm.bin "reference socks warm" || REF_FAILED="$REF_FAILED socks(warm)"
+            fetch_mb socks 10808 reference-socks-warm.bin "reference socks warmup" || REF_FAILED="$REF_FAILED socks(warmup)"
             # Same warm-up as the native lane, so both measured legs carry
             # steady-state traffic.
             fetch_mb socks 10808 reference-socks-warm2.bin "reference socks warm" || REF_FAILED="$REF_FAILED socks(warm)"

@@ -240,6 +240,7 @@ jobs:
             mkdir -p "$dest/charts"
             cp -r "$bundle/cells" "$dest/cells"
             cp "$bundle/matrix-results.json" "$bundle/manifest.txt" "$bundle/README.md" "$dest/"
+            cp "$bundle/table.md" "$bundle/table.csv" "$bundle/distribution.csv" "$dest/"
             if [[ -n "$baseline" ]]; then
               delta=0
               python3 scripts/benchmark-delta.py \

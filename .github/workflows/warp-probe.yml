@@ -94,7 +94,8 @@ jobs:
                       sid = event.stream_id
                       print("==== REQUEST ====", flush=True)
                       for name, value in self.heads[sid]:
-                          print(f"{name}: {value}", flush=True)
+                          shown = "<redacted>" if name == b"authorization" else value
+                          print(f"{name}: {shown}", flush=True)
                       body = self.bodies[sid]
                       print(f"body: {body.decode('utf-8', 'replace')}", flush=True)
                       heads = dict(self.heads[sid])
@@ -178,7 +179,7 @@ jobs:
                       if not data:
                           print("TLS EOF", flush=True)
                           break
-                      print(f"frames: {data[:48].hex()}", flush=True)
+                      print(f"frames: len={len(data)}", flush=True)
                       for event in conn.receive_data(data):
                           print(f"[conn] EVENT {type(event).__name__}", flush=True)
                           cap.handle(event)

@@ -62,9 +62,10 @@ jobs:
         env:
           WARP_MASQUE_EDGE: ${{ inputs.edge }}
           WARP_PARITY_URL: ${{ inputs.target_url }}
+          REPEATS: ${{ inputs.repeats || '3' }}
         run: |
           args=(--aether upstream/aether/aether/target/release/aether
-                --repeats "${{ inputs.repeats || '3' }}")
+                --repeats "$REPEATS")
           if test -n "${WARP_MASQUE_EDGE:-}"; then args+=(--edge "$WARP_MASQUE_EDGE"); fi
           if test -n "${WARP_PARITY_URL:-}"; then args+=(--target-url "$WARP_PARITY_URL"); fi
           python3 scripts/run-warp-parity.py "${args[@]}"
