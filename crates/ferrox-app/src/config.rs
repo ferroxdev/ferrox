@@ -825,6 +825,27 @@ fn quic_owned_tls(settings: &Json) -> bool {
 /// `encipherment` feeds no handshake, an entry with no key or an unparseable pair is skipped
 /// the way xray warns and moves on, and a named file that cannot be read refuses the listener.
 /// The first `AUTHORITY_ISSUE` entry: its CA signs a leaf for an SNI no served certificate covers.
+/// One half of an `AUTHORITY_ISSUE` pair: a file when named, otherwise the inline PEM. A file that
+/// cannot be read skips its entry with the reason named, rather than silently serving no issuer.
+fn authority_pem(cert: &Json, file: &str, inline: &str, index: usize) -> Option<Vec<u8>> {
+    if let Some(path) = cert
+        .get(file)
+        .and_then(Json::as_str)
+        .filter(|path| !path.is_empty())
+    {
+        if let Some(pem) = read_cert_file(path) {
+            return Some(pem);
+        }
+        eprintln!("tls: skipping AUTHORITY_ISSUE entry {index}: {file} `{path}` cannot be read");
+        return None;
+    }
+    if let Some(pem) = inline_pem(cert, inline) {
+        return Some(pem);
+    }
+    eprintln!("tls: skipping AUTHORITY_ISSUE entry {index}: no {inline} bytes or readable file");
+    None
+}
+
 fn tls_issue_authority(settings: &Json) -> Option<Arc<ferrox_core::tls::CertIssuer>> {
     let list = settings.get("tlsSettings")?.get("certificates")?.as_arr()?;
     for (index, cert) in list.iter().enumerate() {
@@ -842,45 +863,11 @@ fn tls_issue_authority(settings: &Json) -> Option<Arc<ferrox_core::tls::CertIssu
         };
         let certificate = named("certificateFile");
         let key = named("keyFile");
-        let cert_pem = match certificate {
-            Some(path) => match read_cert_file(path) {
-                Some(pem) => pem,
-                None => {
-                    eprintln!(
-                        "tls: skipping AUTHORITY_ISSUE entry {index}: certificateFile `{path}` cannot be read"
-                    );
-                    continue;
-                }
-            },
-            None => match inline_pem(cert, "certificate") {
-                Some(pem) => pem,
-                None => {
-                    eprintln!(
-                        "tls: skipping AUTHORITY_ISSUE entry {index}: no certificate bytes or readable file"
-                    );
-                    continue;
-                }
-            },
+        let Some(cert_pem) = authority_pem(cert, "certificateFile", "certificate", index) else {
+            continue;
         };
-        let key_pem = match key {
-            Some(path) => match read_cert_file(path) {
-                Some(pem) => pem,
-                None => {
-                    eprintln!(
-                        "tls: skipping AUTHORITY_ISSUE entry {index}: keyFile `{path}` cannot be read"
-                    );
-                    continue;
-                }
-            },
-            None => match inline_pem(cert, "key") {
-                Some(pem) => pem,
-                None => {
-                    eprintln!(
-                        "tls: skipping AUTHORITY_ISSUE entry {index}: no private key bytes or readable file"
-                    );
-                    continue;
-                }
-            },
+        let Some(key_pem) = authority_pem(cert, "keyFile", "key", index) else {
+            continue;
         };
         let entry = match ferrox_core::tls::parse_pem_entry(&cert_pem, &key_pem) {
             Ok(entry) => entry,
@@ -1983,10 +1970,6 @@ fn tcp_http_response(settings: Option<&Json>) -> Option<Vec<u8>> {
     }
     head.push_str("\r\n");
     Some(head.into_bytes())
-}
-
-pub(crate) fn tcp_http_path(settings: Option<&Json>) -> Option<String> {
-    tcp_http_paths(settings).map(|paths| paths[0].clone())
 }
 
 /// Every request path the reference accepts for one TCP-HTTP carrier. The first is the one a
@@ -6693,7 +6676,10 @@ mod tests {
             tcp_http_paths(Some(&settings)),
             Some(vec!["/one".to_owned(), "/two".to_owned()])
         );
-        assert_eq!(tcp_http_path(Some(&settings)).as_deref(), Some("/one"));
+        assert_eq!(
+            tcp_http_paths(Some(&settings)).as_deref(),
+            Some(&["/one".to_owned(), "/two".to_owned()][..])
+        );
     }
 
     #[test]
@@ -6702,7 +6688,10 @@ mod tests {
             r#"{"network":"raw","tcpSettings":{"header":{"type":"http","request":{"path":["/old"],"headers":{"X-Old":"1"}}}},"rawSettings":{"header":{"type":"http","request":{"path":["/new"],"headers":{"X-New":"1"}}}}}"#,
         )
         .expect("raw");
-        assert_eq!(tcp_http_path(Some(&settings)).as_deref(), Some("/new"));
+        assert_eq!(
+            tcp_http_paths(Some(&settings)).as_deref(),
+            Some(&["/new".to_owned()][..])
+        );
         assert_eq!(
             carrier_headers(Some(&settings)).0,
             vec![("X-New".to_owned(), "1".to_owned())]
@@ -6712,7 +6701,10 @@ mod tests {
             r#"{"network":"tcp","tcpSettings":{"header":{"type":"http","request":{"path":["/tcp"],"headers":{"X-Tcp":"1"}}}}}"#,
         )
         .expect("tcp");
-        assert_eq!(tcp_http_path(Some(&tcp)).as_deref(), Some("/tcp"));
+        assert_eq!(
+            tcp_http_paths(Some(&tcp)).as_deref(),
+            Some(&["/tcp".to_owned()][..])
+        );
         assert_eq!(
             carrier_headers(Some(&tcp)).0,
             vec![("X-Tcp".to_owned(), "1".to_owned())]

@@ -2498,7 +2498,7 @@ impl Role {
                         reader,
                         writer,
                         raw,
-                        &paths,
+                        paths,
                         keys.as_ref(),
                         freedom,
                         response.as_deref(),
@@ -6034,7 +6034,7 @@ fn serve_shadowsocks(
                     password,
                     method,
                     identities,
-                    &paths,
+                    paths,
                     freedom,
                     response.as_deref(),
                 );
@@ -6064,7 +6064,7 @@ fn serve_shadowsocks(
             crate::shadowsocks::serve_httpheader_with(
                 stream,
                 users,
-                &paths,
+                paths,
                 freedom,
                 response.as_deref(),
             );
@@ -6249,7 +6249,7 @@ fn serve_shadowsocks_tls(
             };
             let (reader, writer) = session_halves(session, out);
             let Some((reader, writer)) =
-                crate::httpheader::accept_split(reader, writer, &paths, response.as_deref())
+                crate::httpheader::accept_split(reader, writer, paths, response.as_deref())
             else {
                 return;
             };
@@ -6363,7 +6363,7 @@ fn serve_vless_inner(
             serve_vless_httpheader(
                 stream,
                 users,
-                &paths,
+                paths,
                 freedom,
                 decryption.cloned().as_deref(),
                 response.as_deref(),
@@ -11257,7 +11257,7 @@ fn serve_vless_tls(
                 reader,
                 writer,
                 raw,
-                &paths,
+                paths,
                 users,
                 freedom,
                 decryption.cloned().as_deref(),
@@ -11602,7 +11602,7 @@ fn serve_vless_reality(
                     reader,
                     writer,
                     raw,
-                    &paths,
+                    paths,
                     users,
                     freedom,
                     decryption.cloned().as_deref(),
@@ -16519,7 +16519,7 @@ fn serve_vmess_tls(
             crate::vmess::serve_httpheader_split_with(
                 reader,
                 writer,
-                &paths,
+                paths,
                 users,
                 freedom,
                 &close,
@@ -16623,7 +16623,7 @@ fn serve_vmess_reality(
                 crate::vmess::serve_httpheader_split_with(
                     reader,
                     writer,
-                    &paths,
+                    paths,
                     users,
                     freedom,
                     &close,
@@ -25201,7 +25201,7 @@ fn serve_trojan(stream: Connection, key: &[[u8; 56]], carrier: &Carrier, freedom
         Carrier::HttpHeader {
             paths, response, ..
         } => {
-            serve_trojan_httpheader_with(stream, key, &paths, freedom, response.as_deref());
+            serve_trojan_httpheader_with(stream, key, paths, freedom, response.as_deref());
         }
         refused_carriers!() => {}
     }
@@ -25745,7 +25745,7 @@ fn serve_trojan_tls(
                 reader,
                 writer,
                 raw,
-                &paths,
+                paths,
                 key,
                 freedom,
                 response.as_deref(),
@@ -25827,7 +25827,7 @@ fn serve_trojan_reality(
                     reader,
                     writer,
                     raw,
-                    &paths,
+                    paths,
                     key,
                     freedom,
                     response.as_deref(),
@@ -84970,7 +84970,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             } => {
                 crate::vmess::serve_httpheader_with(
                     stream,
-                    &paths,
+                    paths,
                     &users,
                     freedom,
                     response.as_deref(),
