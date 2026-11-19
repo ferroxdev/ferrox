@@ -3408,8 +3408,8 @@ fn start_keepalive(shared: Arc<Shared>, settings: &GrpcSettings) {
 /// Waits for the next ping without outliving the connection: `false` when it ended first.
 fn keepalive_wait(shared: &Shared, duration: Duration) -> bool {
     let deadline = Instant::now() + duration;
-    let mut send = shared
-        .send
+    let mut gate = shared
+        .upload_gate
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
@@ -3422,9 +3422,9 @@ fn keepalive_wait(shared: &Shared, duration: Duration) -> bool {
         }
         let (next, _) = shared
             .wake
-            .wait_timeout(send, left)
+            .wait_timeout(gate, left)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        send = next;
+        gate = next;
     }
 }
 
