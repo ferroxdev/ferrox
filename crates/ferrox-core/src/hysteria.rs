@@ -1212,69 +1212,76 @@ pub fn content_type(path: &str) -> &'static str {
 
 /// One origin HTTP/1.1 response reduced to what ferrox re-emits as HTTP/3: the status code, every header as it arrived (the caller drops the hop-by-hop ones), and the body with any chunked framing or content-length tail already removed. The whole response, read to the origin's close, is the input; a head that never reaches its blank line is not a response. `method` is the request method, so a HEAD reply and every status that forbids a body keep their declared length while carrying none.
 pub fn parse_origin_response(raw: &[u8], method: &str) -> Option<OriginResponse> {
-    let end = head_end(raw)?;
-    let mut body = &raw[end + 4..];
-    let mut lines = raw[..end].split(|&byte| byte == b'\n');
-    let status = lines
-        .next()?
-        .split(|&byte| byte == b' ')
-        .nth(1)
-        .and_then(|code| std::str::from_utf8(code).ok())
-        .and_then(|code| code.parse::<u16>().ok())?;
-    let mut headers = Vec::new();
-    let mut chunked = false;
-    let mut length = None;
-    for line in lines {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() {
+    let mut rest = raw;
+    loop {
+        let end = head_end(rest)?;
+        let body = &rest[end + 4..];
+        let mut lines = rest[..end].split(|&byte| byte == b'\n');
+        let status = lines
+            .next()?
+            .split(|&byte| byte == b' ')
+            .nth(1)
+            .and_then(|code| std::str::from_utf8(code).ok())
+            .and_then(|code| code.parse::<u16>().ok())?;
+        let mut headers = Vec::new();
+        let mut chunked = false;
+        let mut length = None;
+        for line in lines {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.splitn(2, |&byte| byte == b':');
+            let name = parts.next()?;
+            let value = match parts.next() {
+                Some(value) => value.strip_prefix(b" ").unwrap_or(value),
+                None => continue,
+            };
+            let name = String::from_utf8_lossy(name).into_owned();
+            let value = String::from_utf8_lossy(value).into_owned();
+            if name.eq_ignore_ascii_case("transfer-encoding")
+                && value
+                    .as_bytes()
+                    .windows(7)
+                    .any(|window| window.eq_ignore_ascii_case(b"chunked"))
+            {
+                chunked = true;
+            } else if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse::<usize>().ok();
+            }
+            headers.push((name, value));
+        }
+        if (100..200).contains(&status) && status != 101 {
+            rest = body;
             continue;
         }
-        let mut parts = line.splitn(2, |&byte| byte == b':');
-        let name = parts.next()?;
-        let value = match parts.next() {
-            Some(value) => value.strip_prefix(b" ").unwrap_or(value),
-            None => continue,
-        };
-        let name = String::from_utf8_lossy(name).into_owned();
-        let value = String::from_utf8_lossy(value).into_owned();
-        if name.eq_ignore_ascii_case("transfer-encoding")
-            && value
-                .as_bytes()
-                .windows(7)
-                .any(|window| window.eq_ignore_ascii_case(b"chunked"))
-        {
-            chunked = true;
-        } else if name.eq_ignore_ascii_case("content-length") {
-            length = value.trim().parse::<usize>().ok();
+        if method == "HEAD" || status == 101 || status == 204 || status == 304 {
+            return Some(OriginResponse {
+                status,
+                headers,
+                body: Vec::new(),
+            });
         }
-        headers.push((name, value));
-    }
-    if method.eq_ignore_ascii_case("HEAD")
-        || status == 204
-        || status == 304
-        || (100..200).contains(&status)
-    {
+        if chunked {
+            return Some(OriginResponse {
+                status,
+                headers,
+                body: dechunk(body)?,
+            });
+        }
+        if let Some(want) = length {
+            return Some(OriginResponse {
+                status,
+                headers,
+                body: body.get(..want)?.to_vec(),
+            });
+        }
         return Some(OriginResponse {
             status,
             headers,
-            body: Vec::new(),
+            body: body.to_vec(),
         });
     }
-    if chunked {
-        return Some(OriginResponse {
-            status,
-            headers,
-            body: dechunk(body)?,
-        });
-    }
-    if let Some(want) = length {
-        body = body.get(..want)?;
-    }
-    Some(OriginResponse {
-        status,
-        headers,
-        body: body.to_vec(),
-    })
 }
 
 /// The parts ferrox re-emits from a reverse-proxied origin: kept apart from the HTTP/3 encoder so a chunked body is proven de-framed without a socket in the test.
@@ -2322,6 +2329,15 @@ mod tests {
             .body
             .is_empty(),
             "304 keeps its declared length and carries no body"
+        );
+        assert_eq!(
+            parse_origin_response(
+                b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                "GET"
+            )
+            .expect("the final response follows the interim one")
+            .status,
+            200
         );
         assert!(
             parse_origin_response(b"HTTP/1.1 200 OK\r\n", "GET").is_none(),

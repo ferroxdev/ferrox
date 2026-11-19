@@ -483,39 +483,14 @@ enum Role {
     Server,
 }
 
-static CLOSE_QUEUE: Mutex<Option<Sender<Arc<dyn Fn() + Send + Sync>>>> = Mutex::new(None);
-
 fn defer_close(close: Arc<dyn Fn() + Send + Sync>) {
-    let mut queue = match CLOSE_QUEUE.lock() {
-        Ok(queue) => queue,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if queue.is_none() {
-        let (sender, pending) = channel::<Arc<dyn Fn() + Send + Sync>>();
-        let spawned = std::thread::Builder::new()
-            .name("singmux-close".to_owned())
-            .spawn(move || {
-                while let Ok(close) = pending.recv() {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| close()));
-                }
-            });
-        if spawned.is_err() {
-            drop(queue);
-            close();
-            return;
-        }
-        *queue = Some(sender);
-    }
-    if let Some(sender) = queue.as_ref() {
-        match sender.send(close) {
-            Ok(()) => return,
-            Err(error) => {
-                let close = error.0;
-                *queue = None;
-                drop(queue);
-                defer_close(close);
-            }
-        }
+    let callback = Arc::clone(&close);
+    if std::thread::Builder::new()
+        .name("singmux-close".to_owned())
+        .spawn(move || close())
+        .is_err()
+    {
+        callback();
     }
 }
 
