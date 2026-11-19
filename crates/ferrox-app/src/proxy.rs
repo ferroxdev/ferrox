@@ -79913,7 +79913,8 @@ end
             r#"{{"outbounds":[{{"tag":"foxy","protocol":"freedom"}},
                 {{"tag":"udp-socks","protocol":"socks","sendThrough":"{dial_source}",
                   "settings":{{"servers":[{{"address":"127.0.0.1","port":{server_port}}}]}}}}],
-                "routing":{{"rules":[]}}}}"#
+                "routing":{{"rules":[{{"type":"field","network":"udp","domain":["full:quic.test"],
+                  "outboundTag":"udp-socks"}}]}}}}"#
         ))
         .expect("parses");
         let runtime = test_runtime(&root);
@@ -79925,15 +79926,21 @@ end
             true,
         )));
         let datagram = device_datagram(&out).expect("a route plan can supply a lane");
-        assert!(!datagram.ready(), "no rule selects a socks lane yet");
-        assert!(datagram.open().is_none(), "the default lane is not socks");
+        assert!(
+            !datagram.ready(),
+            "a destination rule leaves the association split"
+        );
+        assert!(
+            datagram.open().is_none(),
+            "a split association has no one lane"
+        );
 
         let rule = crate::json::parse(
             r#"{"type":"field","ruleTag":"udp-lane","network":"udp","outboundTag":"udp-socks"}"#,
         )
         .expect("parses");
         runtime.add_rules(&[rule], true).expect("adds");
-        assert!(datagram.ready(), "the added rule makes the lane direct");
+        assert!(datagram.ready(), "the catch-all rule makes the lane stable");
         let direct = datagram.open().expect("the live rule opens the socks lane");
         let peer = peer_rx
             .recv_timeout(Duration::from_secs(10))
@@ -79949,7 +79956,10 @@ end
         drop(direct);
 
         runtime.remove_rules("udp-lane").expect("removes");
-        assert!(!datagram.ready(), "the removed rule drops the direct lane");
+        assert!(
+            !datagram.ready(),
+            "removing the catch-all returns the association to split"
+        );
         assert!(
             datagram.open().is_none(),
             "no stale socks lane survives the removal"
