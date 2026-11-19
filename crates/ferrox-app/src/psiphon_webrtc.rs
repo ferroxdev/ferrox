@@ -760,7 +760,8 @@ fn stun_binding(
     } else {
         (server.to_owned(), 3478)
     };
-    let target = crate::psiphon_dns::resolve_with(dns, &host, port)
+    let deadline = Instant::now() + timeout;
+    let target = crate::psiphon_dns::resolve_with_deadline(dns, &host, port, Some(deadline))
         .map_err(|error| format!("psiphon webrtc STUN {server}: {error}"))?
         .into_iter()
         .find(same_family)
@@ -771,7 +772,6 @@ fn stun_binding(
     socket
         .send_to(&request, target)
         .map_err(|error| format!("psiphon webrtc STUN send: {error}"))?;
-    let deadline = Instant::now() + timeout;
     let mut reply = [0u8; 512];
     loop {
         let now = Instant::now();

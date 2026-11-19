@@ -2016,7 +2016,7 @@ impl Session {
             packet_tunnel_channel_window: server.packet_tunnel_channel_window,
         };
         if web_api && !identity.disable_api {
-            let state = session.web_handshake(server, identity, relay_protocol, timeout)?;
+            let state = session.web_handshake(server, identity, relay_protocol, api_deadline)?;
             let _ = session.inner.handshake.set(state);
         }
         Ok(session)
@@ -2050,6 +2050,7 @@ impl Session {
             &[],
             "packet tunnel",
             self.packet_tunnel_channel_window,
+            None,
         )?
         .ok_or_else(|| "psiphon ssh refused the packet tunnel channel".to_owned())
     }
@@ -2059,6 +2060,16 @@ impl Session {
         host: &str,
         port: u16,
         channel_type: &[u8],
+    ) -> Result<Option<Channel>, String> {
+        self.open_named_with_deadline(host, port, channel_type, None)
+    }
+
+    fn open_named_with_deadline(
+        &self,
+        host: &str,
+        port: u16,
+        channel_type: &[u8],
+        deadline: Option<Instant>,
     ) -> Result<Option<Channel>, String> {
         let mut extra = Vec::with_capacity(host.len() + 16);
         put_str(&mut extra, host.as_bytes());
@@ -2070,6 +2081,7 @@ impl Session {
             &extra,
             &format!("{host}:{port}"),
             self.inner.channel_window,
+            deadline,
         )
     }
 
@@ -2189,7 +2201,7 @@ impl Session {
         extra: &[u8],
         target: &str,
     ) -> Result<Option<Channel>, String> {
-        self.open_payload_with_window(channel_type, extra, target, API_CHANNEL_WINDOW)
+        self.open_payload_with_window(channel_type, extra, target, API_CHANNEL_WINDOW, None)
     }
 
     fn open_payload_with_window(
@@ -2198,6 +2210,7 @@ impl Session {
         extra: &[u8],
         target: &str,
         channel_window: u32,
+        deadline: Option<Instant>,
     ) -> Result<Option<Channel>, String> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err("psiphon ssh is closed".to_owned());
@@ -2239,7 +2252,18 @@ impl Session {
             return Err(why);
         }
 
-        match rx.recv_timeout(Duration::from_secs(30)) {
+        let wait = match deadline {
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    self.inner.close();
+                    return Err(format!("psiphon ssh channel to {target} timed out"));
+                }
+                left
+            }
+            None => Duration::from_secs(30),
+        };
+        match rx.recv_timeout(wait) {
             Ok(Ok(OpenResult::Confirmed)) => {
                 let owner = Arc::new(ChannelOwner {
                     session: Arc::clone(&self.inner),
@@ -2344,7 +2368,7 @@ impl Session {
         server: &Server,
         identity: &Identity<'_>,
         relay_protocol: &str,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<HandshakeState, String> {
         let port = server
             .web_server_port
@@ -2361,8 +2385,15 @@ impl Session {
                 .then_some(server.web_server_secret.as_str());
             web_handshake_query(relay_protocol, identity, relay.as_ref(), secret)
         };
-        let mut channel = self.open(&server.address.to_string(), port)?;
-        channel.set_deadline(Some(Instant::now() + timeout));
+        let mut channel = self
+            .open_named_with_deadline(
+                &server.address.to_string(),
+                port,
+                b"direct-tcpip",
+                Some(deadline),
+            )?
+            .ok_or_else(|| format!("psiphon web api split-tunnels {}:{port}", server.address))?;
+        channel.set_deadline(Some(deadline));
         let config = TlsConfig {
             server_name: server.address.to_string(),
             insecure: true,
