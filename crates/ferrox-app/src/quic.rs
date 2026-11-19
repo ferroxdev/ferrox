@@ -1165,7 +1165,8 @@ fn send_mmsg(
                     }
                     return false;
                 }
-                return true;
+                // The kernel rejected this datagram, not the sweep: the per-packet loop dropped it and kept the tail.
+                done += 1;
             }
             n => done += usize::try_from(n).unwrap_or(0),
         }
@@ -2113,7 +2114,7 @@ pub(crate) fn rebind_path(
             return Rebind::Retry;
         }
     }
-    set_gro(&fresh, sock.gso && sock.whole_datagrams());
+    set_gro(&fresh, sock.gro && sock.gso && sock.whole_datagrams());
     set_receive_buffer(&fresh, DATAGRAM_BUFFER);
     set_send_buffer(&fresh, DATAGRAM_BUFFER);
     if let Ok(mut slot) = sock.source.lock() {
@@ -2458,6 +2459,9 @@ pub(crate) struct Datagram {
     udp_mask: Option<Arc<UdpMask>>,
     /// Whether the platform may coalesce a burst into one GSO write.
     gso: bool,
+    /// Whether this lane's reader splits a coalesced burst: a kernel that hands back one read per
+    /// `recv_batch` slot must not coalesce under a reader that takes one datagram per read.
+    gro: bool,
     /// The destination a `dialerProxy` shim answers for: the socket is connected
     /// to the shim, so sends ignore their target and reads are relabelled.
     proxy_peer: Option<SocketAddr>,
@@ -3086,6 +3090,7 @@ impl Datagram {
             source: Arc::default(),
             udp_mask: None,
             gso: true,
+            gro: true,
             proxy_peer: None,
             proxy_stop: None,
             options: None,
@@ -3114,6 +3119,7 @@ impl Datagram {
             source: Arc::default(),
             udp_mask: Some(Arc::new(UdpMask::new(mask, filters))),
             gso: true,
+            gro: false,
             proxy_peer: None,
             proxy_stop: None,
             options: None,
@@ -3137,6 +3143,7 @@ impl Datagram {
             source: Arc::default(),
             udp_mask: None,
             gso: true,
+            gro: false,
             proxy_peer: Some(peer),
             proxy_stop: Some(stop),
             options: None,
@@ -3177,6 +3184,15 @@ impl Datagram {
         self.gso
     }
 
+    /// Keep the kernel from coalescing reads under a reader that takes one datagram per `recv_from`.
+    pub(crate) fn with_gro(mut self, gro: bool) -> Self {
+        if !gro {
+            clear_gro(&self.sock);
+        }
+        self.gro = gro;
+        self
+    }
+
     /// Stop coalescing writes when the config names `disableGSO`; a lane that no longer takes the
     /// batched read also stops GRO, so one wire datagram stays one read.
     pub(crate) fn with_gso(mut self, gso: bool) -> Self {
@@ -3213,6 +3229,7 @@ impl Datagram {
             source: Arc::default(),
             udp_mask: None,
             gso: true,
+            gro: false,
             proxy_peer: None,
             proxy_stop: None,
             options: None,
@@ -3235,6 +3252,7 @@ impl Datagram {
             source: Arc::default(),
             udp_mask: None,
             gso: true,
+            gro: false,
             proxy_peer: None,
             proxy_stop: None,
             options: None,
@@ -3259,6 +3277,7 @@ impl Datagram {
             source: Arc::default(),
             udp_mask: None,
             gso: true,
+            gro: false,
             proxy_peer: None,
             proxy_stop: None,
             options: None,
@@ -3288,6 +3307,7 @@ impl Datagram {
             source: Arc::default(),
             udp_mask: None,
             gso: true,
+            gro: false,
             proxy_peer: None,
             proxy_stop: None,
             options: None,
@@ -3319,6 +3339,7 @@ impl Datagram {
             source: Arc::default(),
             udp_mask: None,
             gso: true,
+            gro: false,
             proxy_peer: None,
             proxy_stop: None,
             options: None,
@@ -3352,6 +3373,7 @@ impl Datagram {
             source: Arc::default(),
             udp_mask: None,
             gso: true,
+            gro: false,
             proxy_peer: None,
             proxy_stop: None,
             options: None,
@@ -3443,7 +3465,7 @@ impl Datagram {
     /// new path: the old descriptor stays for a reply already in flight, and the
     /// flag keeps a lane that never roams on the direct path.
     pub(crate) fn rebind(&self, sock: UdpSocket) -> std::io::Result<()> {
-        set_gro(&sock, self.gso && self.whole_datagrams());
+        set_gro(&sock, self.gro && self.gso && self.whole_datagrams());
         if let Ok(armed) = self.armed.lock() {
             if let Some(Some(timeout)) = *armed {
                 sock.set_read_timeout(Some(timeout))?;
@@ -3581,6 +3603,7 @@ impl Datagram {
             source: Arc::clone(&self.source),
             udp_mask: self.udp_mask.clone(),
             gso: self.gso,
+            gro: self.gro,
             proxy_peer: self.proxy_peer,
             proxy_stop: self.proxy_stop.clone(),
             options: self.options.clone(),
@@ -4695,6 +4718,9 @@ pub(crate) struct QuicStream {
 /// How long one stream read polls quiche before idling: FIN and close land inside the next quantum.
 const STREAM_QUANTUM: Duration = Duration::from_millis(100);
 
+/// What a flow-control-blocked writer waits before it asks quiche again: the window reopens on an ack that lands in microseconds, and a quantum of 5 ms caps a stream at window/quantum.
+const SEND_POLL: Duration = Duration::from_micros(250);
+
 /// Between polls of quiche state, so a waiting read never holds the connection lock.
 const STREAM_POLL: Duration = Duration::from_millis(5);
 
@@ -4780,7 +4806,7 @@ impl Write for QuicStream {
                         }
                         return Err(std::io::Error::other("quic stream send timed out"));
                     }
-                    std::thread::sleep(STREAM_POLL);
+                    std::thread::sleep(SEND_POLL);
                 }
                 Ok(n) => {
                     self.meter.write(n);

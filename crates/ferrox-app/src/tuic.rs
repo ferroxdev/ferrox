@@ -367,7 +367,7 @@ impl TuicOut {
                     options.as_deref(),
                     proxy::flow_source().ok()?,
                 )?;
-                (quic::Datagram::plain(sock).with_gso(false), peer, local)
+                (quic::Datagram::plain(sock).with_gro(false), peer, local)
             };
         let socket = socket.with_options(options);
         let mut config = self.client_config()?;
@@ -1472,7 +1472,7 @@ pub(crate) fn serve_inbound(
     let meter = proxy::inbound_meter(inbound);
     thread::spawn(move || {
         run(
-            Arc::new(Datagram::plain(socket)),
+            Arc::new(Datagram::plain(socket).with_gro(false)),
             local,
             users,
             template,
@@ -2642,7 +2642,7 @@ mod tests {
         let server = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let address = server.local_addr().expect("address");
         let server_thread = thread::spawn(move || {
-            let sock = Datagram::plain(server);
+            let sock = Datagram::plain(server).with_gro(false);
             let _ = quic::server_accept(&sock, address, &mut config);
         });
         let mut out = test_out(address, roots);
@@ -2666,7 +2666,7 @@ mod tests {
         let address = server.local_addr().expect("address");
         let (early, observed) = std::sync::mpsc::channel();
         let server_thread = thread::spawn(move || {
-            let sock = Datagram::plain(server);
+            let sock = Datagram::plain(server).with_gro(false);
             let mut buf = vec![0u8; 65535];
             let mut out = vec![0u8; 65535];
             let mut first = quic::server_accept(&sock, address, &mut config);
