@@ -188,10 +188,7 @@ fn tcp_client(args: &Args) {
     }
     let elapsed = start.elapsed().as_secs_f64();
     let total = bytes.load(Ordering::SeqCst);
-    if failed.load(Ordering::SeqCst) > 0 && total == 0 {
-        eprintln!("every stream failed");
-        exit(1);
-    }
+    let failures = failed.load(Ordering::SeqCst);
     let gbps = total as f64 * 8.0 / 1e9 / elapsed;
     json(
         args.value("--json"),
@@ -203,6 +200,10 @@ fn tcp_client(args: &Args) {
         "{} streams {:.3} Gbit/s over {:.2} s",
         streams, gbps, elapsed
     );
+    if failures > 0 || total == 0 {
+        eprintln!("{failures} of {streams} streams failed");
+        exit(1);
+    }
 }
 
 fn stream_run(
@@ -236,16 +237,7 @@ fn stream_run(
             Ok(0) => break,
             Ok(n) => moved += n as u64,
             // A full pipe is a stall, not the deadline: the loop asks again until the clock says stop.
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::Interrupted
-                        | std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                continue
-            }
+            Err(error) if lease(&error) => continue,
             Err(_) => {
                 failed.fetch_add(1, Ordering::SeqCst);
                 break;
@@ -260,6 +252,10 @@ fn rr_client(args: &Args) {
     let conns: usize = args.number("--conns", 1);
     let seconds: u64 = args.number("--seconds", 5);
     let size: u16 = args.number("--size", 64);
+    if size == 0 || size > 16_384 {
+        eprintln!("--size must be 1..=16384, got {size}");
+        exit(2);
+    }
     let start = Instant::now();
     let deadline = start + Duration::from_secs(seconds);
     let mut handles = Vec::with_capacity(conns.max(1));
@@ -297,7 +293,7 @@ fn rr_client(args: &Args) {
 }
 
 fn round_trips(endpoint: SocketAddr, size: u16, deadline: Instant) -> (Vec<u64>, u64) {
-    let size = size.max(1) as usize;
+    let size = size as usize;
     let Ok(mut stream) = TcpStream::connect(endpoint) else {
         return (Vec::new(), 1);
     };
@@ -312,13 +308,54 @@ fn round_trips(endpoint: SocketAddr, size: u16, deadline: Instant) -> (Vec<u64>,
     let mut errors = 0u64;
     while Instant::now() < deadline {
         let at = Instant::now();
-        if stream.write_all(&buf).is_err() || stream.read_exact(&mut buf).is_err() {
+        if !move_all(&mut stream, &buf, deadline) || !fill_all(&mut stream, &mut buf, deadline) {
             errors += 1;
             break;
         }
         samples.push(at.elapsed().as_nanos() as u64);
     }
     (samples, errors)
+}
+
+fn move_all(stream: &mut TcpStream, buf: &[u8], deadline: Instant) -> bool {
+    let mut done = 0;
+    while done < buf.len() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        match stream.write(&buf[done..]) {
+            Ok(0) => return false,
+            Ok(n) => done += n,
+            Err(error) if lease(&error) => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn fill_all(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> bool {
+    let mut done = 0;
+    while done < buf.len() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        match stream.read(&mut buf[done..]) {
+            Ok(0) => return false,
+            Ok(n) => done += n,
+            Err(error) if lease(&error) => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn lease(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    )
 }
 
 fn udp_server(listen: SocketAddr, echo: bool) -> ! {
@@ -385,9 +422,14 @@ fn udp_client(args: &Args) {
     let endpoint = args.endpoint("--connect");
     let seconds: u64 = args.number("--seconds", 5);
     let size: usize = args.number("--size", 1200).clamp(16, 65_000);
-    let pps: u64 = args.number("--pps", 0).max(1);
+    let pps: u64 = args.number("--pps", 0);
     let gso = args.flag("--gso");
-    let socket = UdpSocket::bind("0.0.0.0:0").unwrap_or_else(|error| {
+    let wildcard = if endpoint.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = UdpSocket::bind(wildcard).unwrap_or_else(|error| {
         eprintln!("cannot open a client socket: {error}");
         exit(1)
     });
@@ -397,11 +439,12 @@ fn udp_client(args: &Args) {
         exit(1);
     }
     let _ = socket.set_nonblocking(true);
-    set_segment(&socket, size, gso);
+    let gso = gso && set_segment(&socket, size);
     let start = Instant::now();
     let deadline = start + Duration::from_secs(seconds);
-    let total = pps * seconds;
-    let per_tick = (pps / 1000).max(1);
+    // `--pps 0` is the unreported `udp` scenario: offer as fast as the socket takes datagrams.
+    let paced = pps > 0;
+    let total = if paced { pps * seconds } else { u64::MAX };
     const BATCH: usize = 64;
     let mut segments = if gso { (64_000 / size).max(1) } else { 1 };
     let mut payload = vec![0u8; size * BATCH.max(segments)];
@@ -412,31 +455,37 @@ fn udp_client(args: &Args) {
     let mut rbuf = vec![0u8; 65_535];
     while Instant::now() < deadline && sent < total {
         // Pace off the clock, so a delayed tick is made up instead of shrinking the offer.
-        let owed = ((pps as f64 * start.elapsed().as_secs_f64()) as u64).min(total);
-        let mut want = owed.saturating_sub(sent);
-        if want == 0 && sent < total {
-            want = per_tick;
-        }
-        while want > 0 {
-            let chunk = want.min(BATCH as u64) as usize;
-            let step = if segments > 1 {
-                stamp(&mut payload[..size], sequence);
-                socket.send(&payload[..size * segments]).map(|_| 1)
-            } else {
-                Ok(send_batch(&socket, &mut payload, size, sequence, chunk))
-            };
-            match step {
-                Ok(0) => break,
-                Ok(n) => {
-                    sent += n as u64;
-                    sequence += n as u64;
-                    want -= n as u64;
+        let mut want = if paced {
+            let owed = ((pps as f64 * start.elapsed().as_secs_f64()) as u64).min(total);
+            owed.saturating_sub(sent)
+        } else {
+            (BATCH * 8) as u64
+        };
+        while want > 0 && sent < total {
+            if segments > 1 {
+                for index in 0..segments {
+                    let start = index * size;
+                    stamp(&mut payload[start..start + size], sequence + index as u64);
                 }
-                Err(_) if segments > 1 => {
+                match socket.send(&payload[..size * segments]) {
+                    Ok(_) => {
+                        let sent_now = segments as u64;
+                        sent += sent_now;
+                        sequence += sent_now;
+                        want = want.saturating_sub(sent_now);
+                    }
                     // The batch went nowhere, so drop back to single datagrams.
-                    segments = 1;
+                    Err(_) => segments = 1,
                 }
-                Err(_) => break,
+            } else {
+                let chunk = want.min(BATCH as u64) as usize;
+                let moved = send_batch(&socket, &mut payload, size, sequence, chunk);
+                if moved == 0 {
+                    break;
+                }
+                sent += moved as u64;
+                sequence += moved as u64;
+                want -= moved as u64;
             }
         }
         drain(&socket, &mut rbuf, &mut received, &mut corrupt);
@@ -538,28 +587,28 @@ fn drain(socket: &UdpSocket, buf: &mut [u8], received: &mut u64, corrupt: &mut u
     }
 }
 
-fn set_segment(socket: &UdpSocket, size: usize, gso: bool) {
+fn set_segment(socket: &UdpSocket, size: usize) -> bool {
     #[cfg(target_os = "linux")]
     {
-        if !gso {
-            return;
-        }
         const UDP_SEGMENT: libc::c_int = 103;
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(socket);
         let segment = size as libc::c_int;
-        // A kernel without UDP_SEGMENT refuses the option; the batch still goes out whole.
-        unsafe {
+        let applied = unsafe {
             libc::setsockopt(
                 fd,
                 libc::IPPROTO_UDP,
                 UDP_SEGMENT,
                 &segment as *const libc::c_int as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
+            )
+        };
+        applied == 0
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = (socket, size, gso);
+    {
+        let _ = (socket, size);
+        false
+    }
 }
 
 fn monitor(args: &Args) {
