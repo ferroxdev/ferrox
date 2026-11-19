@@ -2498,7 +2498,6 @@ build_outbound() {
 }
 
 build_config() {
-  local outbound
   case "$OUTBOUND" in
     foxy)
       read_credentials
@@ -2520,7 +2519,7 @@ build_config() {
         require_bin
         start_warp_hop || die "the warp hop did not start; nothing was chained."
       fi
-      outbound="$(build_outbound foxy)" || exit 1
+      BUILT_OUTBOUND="$(build_outbound foxy)" || exit 1
       save_lane_location
       ;;
     vless)
@@ -2529,16 +2528,16 @@ build_config() {
         *) die "--vless wants a vless:// share link, got '$VLESS'; nothing was started.
   example: ferrox-cli up --vless 'vless://uuid@host:443?type=ws&security=tls&sni=host&path=/ws'" ;;
       esac
-      outbound="$(build_outbound vless)" || exit 1
+      BUILT_OUTBOUND="$(build_outbound vless)" || exit 1
       ;;
     veepn)
       load_lane_location
-      outbound="$(build_outbound veepn)" || exit 1
+      BUILT_OUTBOUND="$(build_outbound veepn)" || exit 1
       save_lane_location
       ;;
     psiphon)
       load_lane_location
-      outbound="$(build_outbound psiphon)" || exit 1
+      BUILT_OUTBOUND="$(build_outbound psiphon)" || exit 1
       save_lane_location
       ;;
     vmess)
@@ -2551,10 +2550,10 @@ build_config() {
   example: ferrox-cli up --vmess 'vmess://base64-json'
   or: ferrox-cli up --vmess host:443 --uuid UUID" ;;
       esac
-      outbound="$(build_outbound vmess)" || exit 1
+      BUILT_OUTBOUND="$(build_outbound vmess)" || exit 1
       ;;
-    trojan) outbound="$(build_outbound trojan)" || exit 1 ;;
-    ss) outbound="$(build_outbound ss)" || exit 1 ;;
+    trojan) BUILT_OUTBOUND="$(build_outbound trojan)" || exit 1 ;;
+    ss) BUILT_OUTBOUND="$(build_outbound ss)" || exit 1 ;;
     config)
       [ -f "$CONFIG_FILE" ] || die "no such config: $CONFIG_FILE"
       CFG="$CONFIG_FILE"
@@ -2576,7 +2575,7 @@ EOF
       exit 2
       ;;
   esac
-  write_config "$outbound" || die "cannot write $CFG"
+  write_config "$BUILT_OUTBOUND" || die "cannot write $CFG"
 }
 
 # The carrier is a choice, not a default: h2 is the rung auto opens on and h3 is
@@ -2608,14 +2607,25 @@ start_lane() {
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
   require_bin
-  proxy_lock || return 1
   # Validate first: an invocation that cannot start must not stop a healthy lane,
   # and a bad link must not send the user to a build before saying what is wrong.
   old_exit="$(trap -p EXIT)"
-  trap 'status=$?; [ "$WARP_STARTED" = 1 ] && stop_warp_hop; proxy_unlock; exit $status' EXIT
+  trap 'status=$?; [ "$WARP_STARTED" = 1 ] && stop_warp_hop; exit $status' EXIT
   build_config
   if [ -n "$old_exit" ]; then eval "$old_exit"; else trap - EXIT; fi
-  reg_dir="$(absolute_path "$CONF_DIR")"
+  proxy_lock || return 1
+  if [ "$OUTBOUND" != config ] && ! write_config "$BUILT_OUTBOUND"; then
+    proxy_unlock
+    say "cannot write $CFG" >&2
+    return 1
+  fi
+  save_lane_location
+  if [ "$WARP_STARTED" = 1 ] && ! warp_hop_running; then
+    proxy_unlock
+    say "the warp hop was stopped by a concurrent down; try again." >&2
+    return 1
+  fi
+  reg_dir="$(resolve_real "$CONF_DIR")"
   if ! { touch "$LANES_FILE" &&
          { grep -Fxq "$reg_dir" "$LANES_FILE" || printf '%s\n' "$reg_dir" >> "$LANES_FILE"; }; }; then
     proxy_unlock
@@ -2776,13 +2786,35 @@ stop_all_lanes() {
   proxy_lock || return 1
   if [ -r "$pending" ]; then
     while IFS= read -r dir; do
-      [ -n "$dir" ] && forget+=("$(absolute_path "$dir")")
+      [ -n "$dir" ] && forget+=("$(resolve_real "$dir")")
     done <"$pending"
   fi
   if [ -r "$LANES_FILE" ]; then
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue
-      CONF_DIR="$(absolute_path "$dir")"
+      dir="$(resolve_real "$dir")"
+      for pidfile in "$dir"/lane*.json "$dir"/lane.meta "$dir"/lane-*.meta; do
+        [ -f "$pidfile" ] && forget+=("$pidfile")
+      done
+    done < "$LANES_FILE"
+  fi
+  dir="$(resolve_real "$saved_conf")"
+  for pidfile in "$dir"/lane*.json "$dir"/lane.meta "$dir"/lane-*.meta; do
+    [ -f "$pidfile" ] && forget+=("$pidfile")
+  done
+  if [ "${#forget[@]}" -gt 0 ]; then
+    pending_tmp="$pending.$$"
+    if ! { printf '%s\n' "${forget[@]}" >"$pending_tmp" && mv -f "$pending_tmp" "$pending"; }; then
+      rm -f "$pending_tmp"
+      proxy_unlock
+      say "cannot record the configs to remove; nothing was stopped." >&2
+      return 1
+    fi
+  fi
+  if [ -r "$LANES_FILE" ]; then
+    while IFS= read -r dir; do
+      [ -n "$dir" ] || continue
+      CONF_DIR="$(resolve_real "$dir")"
       INSTANCE=""
       apply_instance
       for pidfile in "$CONF_DIR"/lane*.pid; do
@@ -2791,8 +2823,6 @@ stop_all_lanes() {
         INSTANCE="${base#-}"
         apply_instance
         stop_lane 0 || rc=1
-        case "$CFG" in "$CONF_DIR"/lane*.json) forget+=("$CFG") ;; esac
-        forget+=("$META_FILE")
       done
       for pidfile in "$CONF_DIR"/warp-hop*.pid; do
         [ -f "$pidfile" ] || continue
@@ -2803,7 +2833,7 @@ stop_all_lanes() {
       done
     done < "$LANES_FILE"
   fi
-  CONF_DIR="$(absolute_path "$saved_conf")"
+  CONF_DIR="$(resolve_real "$saved_conf")"
   INSTANCE=""
   apply_instance
   for pidfile in "$CONF_DIR"/lane*.pid; do
@@ -2812,8 +2842,6 @@ stop_all_lanes() {
     INSTANCE="${base#-}"
     apply_instance
     stop_lane 0 || rc=1
-    case "$CFG" in "$CONF_DIR"/lane*.json) forget+=("$CFG") ;; esac
-    forget+=("$META_FILE")
   done
   for pidfile in "$CONF_DIR"/warp-hop*.pid; do
     [ -f "$pidfile" ] || continue
@@ -2831,13 +2859,6 @@ stop_all_lanes() {
     fi
     if [ "$rc" -eq 0 ]; then
       rm -f "$pending"
-    fi
-  fi
-  if [ "$rc" -ne 0 ] && [ "${#forget[@]}" -gt 0 ]; then
-    pending_tmp="$pending.$$"
-    if ! { printf '%s\n' "${forget[@]}" >"$pending_tmp" && mv -f "$pending_tmp" "$pending"; }; then
-      rm -f "$pending_tmp"
-      rc=1
     fi
   fi
   proxy_unlock
