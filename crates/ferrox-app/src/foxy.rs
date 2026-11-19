@@ -3903,7 +3903,7 @@ impl Tls2 {
         // The request rides the capsule stream inside DATA frames, the way a packet does: raw TLS bytes would desynchronise the edge's frame walk.
         self.send_capsules(&request)?;
 
-        let deadline = Instant::now() + HEADER_TIMEOUT;
+        let deadline = Instant::now() + crate::budgets::head_arrival();
         let mut assigned = None;
         while Instant::now() < deadline {
             let own = self.stream;
@@ -8539,6 +8539,30 @@ pub(crate) mod loopback {
         join_edge_within(edge, Duration::from_secs(5));
     }
 
+    /// An assignment the edge never sends costs the open its configured head budget, not the constant: the retry added for a shared socket's grain must not stretch a short budget back to twenty seconds.
+    #[test]
+    fn an_unanswered_assignment_costs_the_open_its_head_budget() {
+        let root = crate::json::parse(r#"{"budgets": {"headArrival": "300ms"}}"#).expect("parses");
+        crate::budgets::apply(&crate::config::budgets(&root).expect("a name the engine acts on"));
+        let (roots, server) = minted(b"\x68\x32");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = ip_h2_unassigned_edge(listener, server);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let at = Instant::now();
+        let opened = Ip::open(&dial, None);
+        crate::budgets::clear();
+        let (lane, assigned) = opened.expect("the status arrived");
+        assert!(assigned.is_none(), "no address was assigned");
+        assert!(
+            at.elapsed() < Duration::from_secs(5),
+            "the head budget expired the assignment, it took {:?}",
+            at.elapsed()
+        );
+        drop(lane);
+        join_edge_within(edge, Duration::from_secs(10));
+    }
+
     /// The packet a datagram is built in is the lane's own buffer, and it stays that buffer: across a push and a drain the base pointer does not move and the capacity does not grow. A byte-level test passes with the copy and without it, so only the pointer can witness that the packet was not built in a buffer of its own.
     #[test]
     fn the_packet_scratch_is_the_lanes_own_buffer_and_it_stays_there() {
@@ -8996,6 +9020,73 @@ pub(crate) mod loopback {
                 }
             }
             std::thread::sleep(Duration::from_millis(250));
+        })
+    }
+
+    /// A CONNECT-IP edge that answers the open and then withholds the assignment, holding the session open: the wait must end at the head budget that bounds every other open read.
+    fn ip_h2_unassigned_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let socket = stream.try_clone().expect("clones");
+            stream
+                .set_read_timeout(Some(crate::budgets::handshake()))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            socket
+                .set_read_timeout(Some(crate::budgets::RELAY_QUANTUM))
+                .expect("times out");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let Some(frame) = frames::H2Frame::parse(&header) else {
+                    return;
+                };
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frames::h2_event(frame, &payload, 1) {
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::H2Event::Headers { .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut out);
+                        tls.write_all(&out).expect("answers");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // The assignment never comes, but the session stays open: a lane that stops reading on the first timeout is not what this edge is testing.
+            let mut sink = [0u8; 256];
+            loop {
+                match tls.read(&mut sink) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => return,
+                }
+            }
         })
     }
 
