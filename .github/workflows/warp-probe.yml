@@ -94,7 +94,8 @@ jobs:
                       sid = event.stream_id
                       print("==== REQUEST ====", flush=True)
                       for name, value in self.heads[sid]:
-                          print(f"{name}: {value}", flush=True)
+                          shown = "<redacted>" if name == b"authorization" else value
+                          print(f"{name}: {shown}", flush=True)
                       body = self.bodies[sid]
                       print(f"body: {body.decode('utf-8', 'replace')}", flush=True)
                       heads = dict(self.heads[sid])

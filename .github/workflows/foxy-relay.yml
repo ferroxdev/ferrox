@@ -162,7 +162,7 @@ jobs:
         if: steps.secrets.outputs.present == 'true'
         run: |
           code=0
-          timing=$(curl -sS --noproxy '*' --max-time 300 \
+          timing=$(curl -sS --fail --noproxy '*' --max-time 300 \
             -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
             'https://speed.cloudflare.com/__down?bytes=1000000' -o control.bin) || code=$?
           echo "control, no lane ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
@@ -272,7 +272,7 @@ jobs:
             # lane behind a second attempt's cached answer, so a stall fails this
             # leg by name instead of scrolling past in a green job.
             code=0
-            trace_timing=$(curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
+            trace_timing=$(curl -sS --fail --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
               -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
               https://www.cloudflare.com/cdn-cgi/trace -o trace.txt) || code=$?
             echo "trace $carrier ${trace_timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
@@ -285,7 +285,7 @@ jobs:
             fi
             grep -E '^(loc|ip)=' trace.txt || true
             code=0
-            timing=$(curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
+            timing=$(curl -sS --fail --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
               -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
               'https://speed.cloudflare.com/__down?bytes=1000000' -o "file-$carrier.bin") || code=$?
             echo "carrier $carrier ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
@@ -302,7 +302,7 @@ jobs:
               # proven against the live edge too, not only on loopback.
               for flow in 2 3; do
                 code=0
-                timing=$(curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
+                timing=$(curl -sS --fail --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
                   -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                   'https://speed.cloudflare.com/__down?bytes=200000' -o "file-$carrier-w$flow.bin") || code=$?
                 echo "carrier $carrier warm$flow ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
@@ -326,7 +326,7 @@ jobs:
               # measured cloudflare's cap rather than the lane's window.
               if [ "${{ matrix.os }}" = "ubuntu-latest" ] && { [ "$carrier" = h3 ] || [ "$carrier" = h2 ]; }; then
                 code=0
-                timing=$(curl -sS --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
+                timing=$(curl -sS --fail --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
                   -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                   'https://speed.cloudflare.com/__down?bytes=10485760' -o "bulk-$carrier.bin") || code=$?
                 echo "carrier $carrier bulk ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
@@ -457,11 +457,11 @@ jobs:
             : > trace-lane.txt
             code=0
             if [ "$FRONT" = http ]; then
-              timing=$(curl -sS --max-time 15 -x "http://127.0.0.1:$PORT" \
+              timing=$(curl -sS --fail --max-time 15 -x "http://127.0.0.1:$PORT" \
                 -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                 https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt) || code=$?
             else
-              timing=$(curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
+              timing=$(curl -sS --fail --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
                 -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                 https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt) || code=$?
             fi
@@ -476,11 +476,11 @@ jobs:
             FRONT="$1" FILE="$2" LABEL="$3"
             code=0
             if [ "$FRONT" = http ]; then
-              timing=$(curl -sS --max-time 60 -x "http://127.0.0.1:$PORT" \
+              timing=$(curl -sS --fail --max-time 60 -x "http://127.0.0.1:$PORT" \
                 -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                 'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE") || code=$?
             else
-              timing=$(curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
+              timing=$(curl -sS --fail --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
                 -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                 'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE") || code=$?
             fi
@@ -647,7 +647,7 @@ jobs:
             # answered must fail on its own trace, not grep the previous step's.
             : > trace-lane.txt
             code=0
-            timing=$(curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
+            timing=$(curl -sS --fail --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
               -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
               https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt) || code=$?
             echo "$LABEL trace ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
@@ -662,18 +662,22 @@ jobs:
           leg_share
           echo "== second country DE over h2 =="
           PORT=10817
-          start_lane socks "$PORT" h2 DE
-          trace_socks "$PORT" DE "second country DE" || FAILED="$FAILED de(trace)"
-          de_code=0
-          de_timing=$(curl -sS --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
-            -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
-            'https://speed.cloudflare.com/__down?bytes=1000000' -o file-de.bin) || de_code=$?
-          echo "second country DE ${de_timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
-          de_got=$(wc -c < file-de.bin 2>/dev/null | tr -d ' ')
-          test "$de_code" = 0 && test "${de_got:-0}" = 1000000 || {
-            echo "second country DE FAILED: curl exit $de_code after ${de_got:-0} of 1000000 B" >&2
-            FAILED="$FAILED de(download)"
-          }
+          if start_lane socks "$PORT" h2 DE; then
+            trace_socks "$PORT" DE "second country DE" || FAILED="$FAILED de(trace)"
+            de_code=0
+            de_timing=$(curl -sS --fail --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
+              -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
+              'https://speed.cloudflare.com/__down?bytes=1000000' -o file-de.bin) || de_code=$?
+            echo "second country DE ${de_timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
+            de_got=$(wc -c < file-de.bin 2>/dev/null | tr -d ' ')
+            test "$de_code" = 0 && test "${de_got:-0}" = 1000000 || {
+              echo "second country DE FAILED: curl exit $de_code after ${de_got:-0} of 1000000 B" >&2
+              FAILED="$FAILED de(download)"
+            }
+          else
+            echo "second country DE FAILED: the lane never listened" >&2
+            FAILED="$FAILED de(listen)"
+          fi
           stop_lane
 
           # DNS through the tunnel over UDP. UDP rides CONNECT-UDP and the lane's
@@ -703,9 +707,9 @@ jobs:
           def udp_addr(packet):
               atyp = packet[0]
               if atyp == 1:
-                  return 4 + 2, socket.inet_ntoa(packet[1:5])
+                  return 1 + 4 + 2, socket.inet_ntoa(packet[1:5])
               if atyp == 4:
-                  return 16 + 2, socket.inet_ntop(socket.AF_INET6, packet[1:17])
+                  return 1 + 16 + 2, socket.inet_ntop(socket.AF_INET6, packet[1:17])
               ln = packet[1]
               return 1 + 1 + ln + 2, packet[2:2 + ln].decode()
 
@@ -733,8 +737,8 @@ jobs:
                       while reply[at] != 0:
                           at += 1 + reply[at]
                       at += 1
-                  rtype, _, _, rdlen = struct.unpack('>HHIH', reply[at:at + 8])
-                  at += 8
+                  rtype, _, _, rdlen = struct.unpack('>HHIH', reply[at:at + 10])
+                  at += 10
                   if rtype == 1 and rdlen == 4:
                       out.append(socket.inet_ntoa(reply[at:at + 4]))
                   at += rdlen

@@ -27,12 +27,11 @@ on:
         default: ""
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
-# The release job writes the tag and the assets; the build jobs only read.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,10 +41,16 @@ jobs:
     name: the version to ship
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.v.outputs.version }}
+      ref: ${{ steps.v.outputs.ref }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - name: name the release
         id: v
         shell: bash
@@ -57,12 +62,15 @@ jobs:
           valid_version() {
             printf '%s' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
           }
+          echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           if [ "$EVENT" = push ]; then
             valid_version "$REF_NAME" || { echo "::error::the pushed tag must be vX.Y.Z, got: $REF_NAME"; exit 1; }
             echo "version=$REF_NAME" >> "$GITHUB_OUTPUT"
           elif [ -n "$WANT" ]; then
             valid_version "$WANT" || { echo "::error::the tag input must name an existing vX.Y.Z tag, got: $WANT"; exit 1; }
+            SHA="$(git rev-parse --verify --quiet "$WANT^{commit}")" || { echo "::error::the tag input names no tag here: $WANT"; exit 1; }
             echo "version=$WANT" >> "$GITHUB_OUTPUT"
+            echo "ref=$SHA" >> "$GITHUB_OUTPUT"
           else
             # Nothing typed: the version this workspace declares is the version
             # to ship, so pressing the button once is the whole interaction.
@@ -77,6 +85,8 @@ jobs:
     needs: [plan, start]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -95,6 +105,9 @@ jobs:
             os: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -111,7 +124,7 @@ jobs:
           # The same crypto cfgs ci.yml arms and .cargo/config.toml documents:
           # aarch64 consults them, x86_64 consults neither, so every package
           # holds the runtime-dispatching build the local gates measured.
-          RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8
+          RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8 ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-C target-feature=+crt-static' || '' }}
         run: cargo build --locked --release -p ferrox-app -p ferrox-cli --target "${{ matrix.target }}"
       - name: prove the binaries run
         shell: bash
@@ -178,6 +191,8 @@ jobs:
     needs: [plan]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - name: the handout
         shell: bash
@@ -329,6 +344,7 @@ jobs:
           # This job holds no checkout, so the repo has to be named for gh.
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.plan.outputs.version }}
+          REF: ${{ needs.plan.outputs.ref }}
           EVENT: ${{ github.event_name }}
         run: |
           if gh release view "$VERSION" >/dev/null 2>&1; then
@@ -336,7 +352,7 @@ jobs:
           elif [ "$EVENT" = workflow_dispatch ]; then
             # A dispatched release of a version with no tag yet: cut the tag at
             # the commit that dispatched it, before any build is waited on.
-            gh release create "$VERSION" --target "$GITHUB_SHA" \
+            gh release create "$VERSION" --target "$REF" \
               --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" --notes-file RELEASE-BODY.md
           else
             gh release create "$VERSION" --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" \
@@ -351,6 +367,8 @@ jobs:
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write
     steps:
       - name: fetch and attach the optional country database
         shell: bash
@@ -376,6 +394,8 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - name: write the checksums
         shell: bash
@@ -418,8 +438,12 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/result
         with:
           title: release

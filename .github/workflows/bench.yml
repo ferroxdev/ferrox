@@ -69,6 +69,7 @@ jobs:
         run: cargo run --locked --release -p ferrox-bench --bin record-aead
       - name: publish the table
         if: always()
+        shell: bash
         run: |
           {
             echo

@@ -65,7 +65,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     # The backstop, not the clock: every curl carries its own budget and the
     # step below bounds the whole set, so a stall fails in minutes.
-    timeout-minutes: 25
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -161,9 +161,9 @@ jobs:
             local front="$1" port="$2"
             shift 2
             if [ "$front" = http ] || [ "$front" = mixed ]; then
-              curl -sS "$@" -x "http://127.0.0.1:$port"
+              curl -sS --fail "$@" -x "http://127.0.0.1:$port"
             else
-              curl -sS "$@" --socks5-hostname "127.0.0.1:$port"
+              curl -sS --fail "$@" --socks5-hostname "127.0.0.1:$port"
             fi
           }
           # One attempt, timed, its exit taken at face value: a retry here would
@@ -227,8 +227,10 @@ jobs:
           fi
           # Measurement, not a gate: which free-pool ids still carry a megabyte
           # from this runner. A dead id is the plane's pool, not this lane.
+          SWEEP_END=$((SECONDS + 300))
           for region in us-va us-or gb-lnd fr-prs sg ru-spb; do
             [ "$region" = "$VEEPN_REGION" ] && continue
+            (( SECONDS < SWEEP_END )) || { echo "sweep budget spent"; break; }
             port=$((10812 + $(printf '%s' "$region" | cksum | cut -d' ' -f1) % 40))
             if start_lane "[{\"protocol\":\"socks\",\"listen\":\"127.0.0.1\",\"port\":$port}]" "$region"; then
               fetch_mb socks "$port" "sweep-$region.bin" "sweep $region" \
