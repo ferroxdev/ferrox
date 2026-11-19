@@ -491,7 +491,7 @@ fn defer_close(close: Arc<dyn Fn() + Send + Sync>) {
         Err(poisoned) => poisoned.into_inner(),
     };
     if queue.is_none() {
-        let (sender, pending) = channel();
+        let (sender, pending) = channel::<Arc<dyn Fn() + Send + Sync>>();
         let spawned = std::thread::Builder::new()
             .name("singmux-close".to_owned())
             .spawn(move || {
