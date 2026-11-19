@@ -2933,8 +2933,7 @@ impl RouteShared {
             return Ok(());
         };
         let next_script = next.script_shared();
-        // Script flows hold the router read guard while they run and route through callbacks, so
-        // taking the write guard first makes the rules and the script swap as one generation.
+        // Script flows hold the router read guard while they run, so taking the write guard first swaps rules and script as one generation.
         let mut script = self
             .script_router
             .write()
