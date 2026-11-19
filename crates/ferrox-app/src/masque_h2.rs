@@ -1725,7 +1725,10 @@ impl Session {
             return;
         };
         let length = i64::try_from(capsule.len()).unwrap_or(i64::MAX);
-        if self.queued.is_empty() && length <= self.send_window.min(self.connection_window) {
+        if self.queued.is_empty()
+            && capsule.len() <= MAX_FRAME_BODY
+            && length <= self.send_window.min(self.connection_window)
+        {
             if wire.send(h2::T_DATA, 0, id, capsule) {
                 self.send_window -= length;
                 self.connection_window -= length;
@@ -1755,7 +1758,9 @@ impl Session {
                 self.queued.push_front(answer);
                 break;
             }
-            let take = (answer.len() - start).min(usize::try_from(room).unwrap_or(usize::MAX));
+            let take = (answer.len() - start)
+                .min(usize::try_from(room).unwrap_or(usize::MAX))
+                .min(MAX_FRAME_BODY);
             // A queued body leaves in one write: its head and the credited slice share a frame.
             frame.clear();
             frame.resize(FRAME_HEAD, 0);
@@ -2129,6 +2134,16 @@ mod tests {
             !session.end,
             "a stalled window parks the tunnel instead of ending it"
         );
+        for _ in 1..QUEUED_CAP {
+            session.capsule(&mut wire, &[0, 2, 0, 42]);
+        }
+        assert_eq!(
+            session.queued.len(),
+            QUEUED_CAP,
+            "the cap itself is accepted"
+        );
+        session.capsule(&mut wire, &[0, 2, 0, 42]);
+        assert!(session.end, "the next capsule ends the session");
     }
 
     /// One DATA frame leaves in one write, and the server reuses one frame buffer instead of allocating per packet.

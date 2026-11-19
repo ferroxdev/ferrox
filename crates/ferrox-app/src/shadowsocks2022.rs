@@ -4229,5 +4229,15 @@ mod tests {
         let key = [7u8; 32];
         assert!(!replay.seen(&key, 1_000));
         assert!(replay.seen(&key, 1_000 + SKEW * 2));
+
+        let mut replay = crate::proxy::Replay::new(SKEW * 2 + 1);
+        assert!(!replay.seen(&[8u8; 32], 971));
+        assert!(!replay.seen(&key, 1_000));
+        assert!(!replay.seen(&[9u8; 32], 1_002));
+        assert!(!replay.seen(&[10u8; 32], 1_033));
+        assert!(
+            replay.seen(&key, 1_060),
+            "a rotation after the retry still holds the key"
+        );
     }
 }

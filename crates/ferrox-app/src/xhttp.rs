@@ -1002,7 +1002,6 @@ impl<R: Read> crate::proxy::WindowRead for Reader<R> {
             if self.at == self.prefix.len() {
                 if len == 0 {
                     self.prefix.clear();
-                    self.prefix_init = 0;
                     self.at = 0;
                     if self.fill(CHUNK)? == 0 {
                         return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));

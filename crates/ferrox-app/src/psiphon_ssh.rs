@@ -4139,7 +4139,7 @@ fn arm_deadline(io: &Stream, deadline: Option<Instant>) -> io::Result<()> {
 /// A write deadline belongs to the socket's write half; arming it must not shorten a concurrent read.
 fn arm_write_deadline(io: &Stream, deadline: Option<Instant>) -> io::Result<()> {
     let Some(deadline) = deadline else {
-        return io.set_write_timeout(None);
+        return Ok(());
     };
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
@@ -4484,7 +4484,7 @@ fn write_vectored_all(
     mut slices: &mut [IoSlice<'_>],
 ) -> io::Result<()> {
     while !slices.is_empty() {
-        arm_deadline(io, deadline)?;
+        arm_write_deadline(io, deadline)?;
         io.set_write_deadline(deadline);
         let written = match io.write_vectored(slices) {
             Ok(written) => written,
@@ -4558,7 +4558,7 @@ fn write_all_deadline(
     mut bytes: &[u8],
 ) -> io::Result<()> {
     while !bytes.is_empty() {
-        arm_deadline(io, deadline)?;
+        arm_write_deadline(io, deadline)?;
         io.set_write_deadline(deadline);
         match io.write(bytes) {
             Ok(0) => {

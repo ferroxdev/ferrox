@@ -374,7 +374,7 @@ run_scenario() {
             case "$pps" in *k) pps=$((${pps%k} * 1000)) ;; esac
             timeout "$CLIENT_TIMEOUT" "$BENCH" udp-client --connect "$SERVER_ADDR:5202" --seconds "$DURATION" \
                 --size "$size" --pps "$pps" --echo $gso --json "$OUT_DIR/$tag.json" > /dev/null 2>&1 || ok=0
-            value=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('%.0f echo pps (%.1f%% of %.0f sent)' % (d['received']/d['seconds'], 100.0*d['received']/max(d['sent'],1), d['sent']/d['seconds']))" "$OUT_DIR/$tag.json" 2> /dev/null) || ok=0
+            value=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); d['received'] or sys.exit(1); print('%.0f echo pps (%.1f%% of %.0f sent)' % (d['received']/d['seconds'], 100.0*d['received']/max(d['sent'],1), d['sent']/d['seconds']))" "$OUT_DIR/$tag.json" 2> /dev/null) || ok=0
             unit=""
             ;;
         *) note "unknown scenario $scenario"; return 0 ;;

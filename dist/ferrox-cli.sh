@@ -3263,6 +3263,7 @@ verify_flow() {
 # the exit, and the ladder takes it once before anything is reported refused.
 warp_ladder() {
   [ "$OUTBOUND" = foxy ] || return 1
+  [ -z "$UPSTREAM" ] || return 1
   [ "$WANT_WARP" = 0 ] || return 1
   grep -q "the account plane answered 451" "$LOG" 2>/dev/null || return 1
   stop_and_forget
