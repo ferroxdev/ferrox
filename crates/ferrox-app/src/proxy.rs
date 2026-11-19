@@ -6984,6 +6984,11 @@ pub(crate) trait RelayPoll {
     /// Arms the clock the head's own read runs under: a peer that sends part of a head and stops must not hold the lane forever.
     fn arm_head_poll(&mut self) {}
 
+    /// Arms the same clock with only the caller's remaining budget, so a blocking read cannot outlive the shared head deadline.
+    fn arm_head_poll_for(&mut self, _left: Duration) {
+        self.arm_head_poll();
+    }
+
     /// Reads and dispatches carrier control frames after the data half ends, so a write side still waiting on the peer's window keeps being fed; `None` when the carrier has no such frames.
     fn pump_control(&mut self) -> Option<bool> {
         None
@@ -6997,6 +7002,10 @@ impl RelayPoll for Connection {
 
     fn arm_head_poll(&mut self) {
         let _ = self.set_read_timeout(Some(budgets::head_arrival()));
+    }
+
+    fn arm_head_poll_for(&mut self, left: Duration) {
+        let _ = self.set_read_timeout(Some(left));
     }
 }
 
@@ -36708,6 +36717,19 @@ fn kept_head_into(
     let mut until = Instant::now() + budget;
     let mut seen = progress.map(|progress| progress.load(Ordering::Relaxed));
     loop {
+        if Instant::now() >= until {
+            match (progress, seen.as_mut()) {
+                (Some(progress), Some(seen)) => {
+                    let advanced = progress.load(Ordering::Relaxed);
+                    if advanced == *seen {
+                        return None;
+                    }
+                    *seen = advanced;
+                    until = Instant::now() + budget;
+                }
+                _ => return None,
+            }
+        }
         if head.len() >= limit {
             return None;
         }
@@ -36740,7 +36762,7 @@ fn kept_head_into(
             }
         };
         head.truncate(base + n);
-        if n == 0 {
+        if n == 0 || (progress.is_none() && Instant::now() >= until) {
             return None;
         }
         // A fresh delimiter can straddle the round's bytes, so the scan starts three octets before them.

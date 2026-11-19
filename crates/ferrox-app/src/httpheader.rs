@@ -22,6 +22,10 @@ impl<R: Read + crate::proxy::RelayPoll> crate::proxy::RelayPoll for HeadReader<R
     fn arm_relay_poll(&mut self) {
         self.read.arm_relay_poll();
     }
+
+    fn arm_head_poll_for(&mut self, left: std::time::Duration) {
+        crate::proxy::RelayPoll::arm_head_poll_for(&mut self.read, left);
+    }
 }
 
 impl<R: Read> HeadReader<R> {
@@ -255,7 +259,27 @@ fn trim_ows(mut value: &[u8]) -> &[u8] {
     value
 }
 
-fn read_response<R: Read>(read: R, head: Vec<u8>, at: usize) -> Option<HeadReader<R>> {
+struct HeadDeadline<R> {
+    read: R,
+    until: Instant,
+}
+
+impl<R: Read + crate::proxy::RelayPoll> Read for HeadDeadline<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        }
+        crate::proxy::RelayPoll::arm_head_poll_for(&mut self.read, left);
+        self.read.read(buf)
+    }
+}
+
+fn read_response<R: Read + crate::proxy::RelayPoll>(
+    read: R,
+    head: Vec<u8>,
+    at: usize,
+) -> Option<HeadReader<R>> {
     let mut read = Some(read);
     let mut source: Option<HeadReader<R>> = None;
     let mut head = head;
@@ -272,7 +296,13 @@ fn read_response<R: Read>(read: R, head: Vec<u8>, at: usize) -> Option<HeadReade
             if left.is_zero() {
                 return None;
             }
-            let (next, next_at) = crate::proxy::read_exact_head(&mut stream, HEAD_LIMIT, left)?;
+            let mut bounded = HeadDeadline {
+                read: stream,
+                until,
+            };
+            let next = crate::proxy::read_exact_head(&mut bounded, HEAD_LIMIT, left);
+            stream = bounded.read;
+            let (next, next_at) = next?;
             head = next;
             at = next_at;
             source = Some(stream);
