@@ -1764,7 +1764,7 @@ pub(crate) type Associate = Arc<dyn Fn(Connection) + Send + Sync>;
 
 /// The device's one association: the control leg stays open for its life, as every other SOCKS front's does, and `relay` is where every flow's framed datagram is sent.
 struct Association {
-    control: Connection,
+    _control: Connection,
     relay: SocketAddr,
 }
 
@@ -1782,7 +1782,7 @@ impl Association {
                 )
             })?;
         Ok(Self {
-            control: association.control,
+            _control: association.control,
             relay: association.relay,
         })
     }
@@ -1843,12 +1843,16 @@ impl Flows {
     }
 }
 
-/// One leg in the shared datagram table: its id, the socket that frames its datagrams, and the
-/// direct relay it was opened for, so a dead control drops only the legs that rode that relay.
+/// One leg in the shared datagram table: its id, the socket that frames its datagrams, the
+/// direct relay it was opened for (so a dead control drops only the legs that rode it), and the
+/// association the leg opened for itself on the front lane, whose one accepted source is why two
+/// legs cannot share it.
 struct Leg {
     id: u64,
     socket: Arc<UdpSocket>,
     relay: Option<SocketAddr>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    association: Option<Association>,
 }
 
 /// The datagram table every queue reads: one leg per tuple, so a client's packets that hash to
@@ -1881,6 +1885,18 @@ impl Legs {
     fn relay_of(&self, key: &UdpKey) -> Option<SocketAddr> {
         self.table().get(key).and_then(|leg| leg.relay)
     }
+
+    #[cfg(all(test, unix))]
+    fn associations(&self) -> Vec<SocketAddr> {
+        self.table()
+            .values()
+            .filter_map(|leg| {
+                leg.association
+                    .as_ref()
+                    .map(|association| association.relay)
+            })
+            .collect()
+    }
 }
 
 /// The TUN handler: reads packets, relays each TCP flow and each UDP flow through the proxy outbound.
@@ -1899,7 +1915,6 @@ pub(crate) struct Handler {
     emit: Vec<u8>,
     /// The inline serve's buffer: sized once to one read's worth and never cleared, so an answer a queue takes keeps the flow thread's zeroing out of the hot path.
     served: Vec<u8>,
-    association: Option<Association>,
     /// The direct datagram lane this handler opened, kept alive by its control connection.
     direct_datagram: Option<crate::proxy::DirectDatagram>,
     /// The direct lane's association while a worker dials it: the dial and its handshake cost a
@@ -1975,7 +1990,6 @@ impl Handler {
             frame: Vec::with_capacity(FRAME_CAP),
             emit,
             served: Vec::new(),
-            association: None,
             direct_datagram: None,
             opening: None,
             datagram_retry: None,
@@ -2036,21 +2050,15 @@ impl Handler {
             self.datagram_retry = Some(std::time::Instant::now() + budgets::handshake());
         }
         self.poll_datagram_lane();
-        if self.association.is_none() && self.direct_datagram.is_none() && self.opening.is_none() {
+        if self.direct_datagram.is_none() && self.opening.is_none() {
             let direct_due = self
                 .datagram_retry
                 .is_none_or(|at| std::time::Instant::now() >= at);
             if self.datagram.as_ref().is_some_and(Datagram::ready) && direct_due {
                 self.open_datagram_lane();
-            } else if let Ok(association) = Association::open(&self.associate) {
-                self.association = Some(association);
             }
         }
-        let (relay, direct_relay) = match (&self.direct_datagram, &self.association) {
-            (Some(direct), _) => (direct.relay, Some(direct.relay)),
-            (None, Some(association)) => (association.relay, None),
-            (None, None) => return Ok(()),
-        };
+        let direct_relay = self.direct_datagram.as_ref().map(|direct| direct.relay);
         let target = SocketAddr::new(
             self.hijack(ip.destination, udp.destination_port),
             udp.destination_port,
@@ -2092,6 +2100,14 @@ impl Handler {
                 }
                 std::collections::hash_map::Entry::Vacant(vacant) => {
                     let id = self.legs.next_id();
+                    // The front lane pins the first datagram source an association sees, so each leg opens its own association instead of sharing one relay and being refused as a second source.
+                    let (relay, association) = match direct_relay {
+                        Some(relay) => (relay, None),
+                        None => match Association::open(&self.associate) {
+                            Ok(association) => (association.relay, Some(association)),
+                            Err(_) => return Ok(()),
+                        },
+                    };
                     let filter = pinned.map(|_| (target.ip(), target.port()));
                     let socket = Arc::new(open_leg(
                         &self.device,
@@ -2108,6 +2124,7 @@ impl Handler {
                         id,
                         socket: Arc::clone(&socket),
                         relay: direct_relay,
+                        association,
                     });
                     (id, socket)
                 }
@@ -2828,9 +2845,6 @@ impl Handler {
 impl Drop for Handler {
     /// The device is gone: closing the control leg ends the association, whose relay socket and reader threads would otherwise outlive the inbound that opened them.
     fn drop(&mut self) {
-        if let Some(association) = self.association.take() {
-            let _ = association.control.shutdown(Shutdown::Both);
-        }
         if let Some(direct) = self.direct_datagram.take() {
             let _ = direct.control.shutdown(Shutdown::Both);
         }
@@ -5579,6 +5593,37 @@ mod tests {
         }
         wait_for_frames(&frames, 2);
         assert_eq!(handler.legs.len(), 2, "one leg per destination");
+    }
+
+    /// The front pins the first datagram source it sees, so every leg opens its own association: two destinations must name two relay addresses.
+    #[cfg(unix)]
+    #[test]
+    fn each_front_leg_names_its_own_association() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+        let mut handler = Handler::on(
+            Device::from_handle(a, DEFAULT_MTU),
+            relay,
+            echo_associate(frames.clone()),
+            None,
+            None,
+            Flows::default(),
+            Legs::default(),
+            &Spec::new(None, None),
+        );
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        for destination in [[198, 51, 100, 7], [203, 0, 113, 9]] {
+            let query = datagram(SCRIPT_CLIENT, destination, 51500, 53, b"x");
+            peer.write_all(&query).unwrap();
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+        }
+        wait_for_frames(&frames, 2);
+        let mut relays = handler.legs.associations();
+        relays.sort_unstable();
+        relays.dedup();
+        assert_eq!(relays.len(), 2, "each leg names its own association relay");
     }
 
     /// A recording association: the SOCKS5 UDP server the device's leg reaches, but
