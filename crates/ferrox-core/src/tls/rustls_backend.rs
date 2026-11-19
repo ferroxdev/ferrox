@@ -2024,13 +2024,15 @@ impl IdentityResolver {
             let leaf_key = rcgen::KeyPair::generate().ok()?;
             let leaf = params.signed_by(&leaf_key, &authority).ok()?;
             let mut chain = vec![leaf.der().clone()];
-            chain.extend(
-                issuer
-                    .cert_chain
-                    .iter()
-                    .cloned()
-                    .map(rustls::pki_types::CertificateDer::from),
-            );
+            if issuer.build_chain {
+                chain.extend(
+                    issuer
+                        .cert_chain
+                        .iter()
+                        .cloned()
+                        .map(rustls::pki_types::CertificateDer::from),
+                );
+            }
             let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
                 rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()),
             );
@@ -2098,8 +2100,10 @@ pub(crate) fn sni_matches(names: &[String], sni: &str) -> bool {
         .any(|name| name.eq_ignore_ascii_case(sni) || name.eq_ignore_ascii_case(&wildcard))
 }
 
-/// The names xray compares an SNI against: the leaf's DNS SANs and subject common name.
-pub(crate) fn certificate_names(leaf: &[u8]) -> Vec<String> {
+/// The names xray compares an SNI against: the leaf's DNS SANs and subject common name. An
+/// issuer-backed resolver ignores a Common Name once the leaf carries any DNS SAN, because a
+/// verifier that sees SANs does not fall back to the Common Name.
+pub(crate) fn certificate_names(leaf: &[u8], issuer: bool) -> Vec<String> {
     let Ok(cert) = boring::x509::X509::from_der(leaf) else {
         return Vec::new();
     };
@@ -2110,6 +2114,9 @@ pub(crate) fn certificate_names(leaf: &[u8]) -> Vec<String> {
                 names.push(name.to_ascii_lowercase());
             }
         }
+    }
+    if issuer && !names.is_empty() {
+        return names;
     }
     for entry in cert
         .subject_name()
@@ -2188,7 +2195,7 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
             let names = entry
                 .cert_chain
                 .first()
-                .map(|leaf| certificate_names(leaf))
+                .map(|leaf| certificate_names(leaf, cfg.issuer.is_some()))
                 .unwrap_or_default();
             let key = key_of(&entry);
             let mut key = rustls::sign::CertifiedKey::from_der(
@@ -2767,9 +2774,12 @@ pub(crate) fn server_identity_builder(
         let mut names = Vec::with_capacity(cfg.certs.len());
         let mut statuses: Vec<Option<Vec<u8>>> = Vec::with_capacity(cfg.certs.len());
         for entry in &cfg.certs {
-            names.push(certificate_names(entry.cert_chain.first().ok_or_else(
-                || TlsError::Other("server identity has no certificate".to_owned()),
-            )?));
+            names.push(certificate_names(
+                entry.cert_chain.first().ok_or_else(|| {
+                    TlsError::Other("server identity has no certificate".to_owned())
+                })?,
+                false,
+            ));
             statuses.push(entry.ocsp.as_ref().and_then(|ocsp| ocsp.response.clone()));
         }
         let mut contexts = Vec::with_capacity(cfg.certs.len().saturating_sub(1));
@@ -3000,6 +3010,26 @@ mod tests {
         assert!(
             issuer_usable(cert.pem().as_bytes(), key.serialize_pem().as_bytes()).is_ok(),
             "a CA whose last instant is the calendar's edge still signs leaves"
+        );
+    }
+
+    #[test]
+    fn an_issued_leaf_ignores_a_common_name_once_it_has_a_dns_san() {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["san.test".to_owned()]).expect("params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "cn.test");
+        let cert = params.self_signed(&key).expect("cert");
+        assert_eq!(
+            certificate_names(cert.der().as_ref(), false),
+            vec!["san.test".to_owned(), "cn.test".to_owned()]
+        );
+        assert_eq!(
+            certificate_names(cert.der().as_ref(), true),
+            vec!["san.test".to_owned()],
+            "a verifier that sees a SAN does not fall back to the Common Name"
         );
     }
 

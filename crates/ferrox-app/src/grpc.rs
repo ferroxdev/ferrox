@@ -3353,10 +3353,14 @@ fn user_agent(name: &str) -> &str {
 fn start_keepalive(shared: Arc<Shared>, settings: &GrpcSettings) {
     // The reference pings between streams; this connection carries one stream for its life, so there is no interval to cover.
     let _ = settings.permit_without_stream;
-    if settings.idle_timeout == 0 {
+    if settings.idle_timeout <= 0 && settings.health_check_timeout == 0 {
         return;
     }
-    let every = u64::from(settings.idle_timeout);
+    let every = if settings.idle_timeout > 0 {
+        u64::from(settings.idle_timeout.unsigned_abs())
+    } else {
+        u64::from(settings.health_check_timeout)
+    };
     let health = settings.health_check_timeout;
     std::thread::spawn(move || {
         let mut seq = 0u64;

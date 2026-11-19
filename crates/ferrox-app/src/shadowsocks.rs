@@ -450,17 +450,17 @@ pub(crate) fn serve_xhttp_legacy(stream: Connection, users: &[SsUser], path: &st
 
 #[cfg(test)]
 pub(crate) fn serve_httpheader(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
-    serve_httpheader_with(stream, users, path, freedom, None);
+    serve_httpheader_with(stream, users, &[path.to_owned()], freedom, None);
 }
 
 pub(crate) fn serve_httpheader_with(
     stream: Connection,
     users: &[SsUser],
-    path: &str,
+    paths: &[String],
     freedom: bool,
     response: Option<&[u8]>,
 ) {
-    let Some((mut reader, mut writer)) = crate::httpheader::accept(stream, path, response) else {
+    let Some((mut reader, mut writer)) = crate::httpheader::accept(stream, paths, response) else {
         return;
     };
     let Some((accepted, meter)) = accept_on(&mut reader, &mut writer, users, freedom) else {

@@ -67,12 +67,12 @@ const DEFAULT_RESPONSE: &[u8] =
 
 pub(crate) fn accept(
     stream: Connection,
-    path: &str,
+    paths: &[String],
     response: Option<&[u8]>,
 ) -> Option<(HeadReader, Connection)> {
     let mut read = stream;
     let (head, at) = read_head(&mut read)?;
-    check_request(&head[..at], path)?;
+    check_request(&head[..at], paths)?;
     let Ok(write) = read.try_clone() else {
         return None;
     };
@@ -81,23 +81,21 @@ pub(crate) fn accept(
     Some((HeadReader::new(read, head, at), write))
 }
 
-fn check_request(head: &[u8], path: &str) -> Option<()> {
-    if crate::proxy::request_path(head)? != path {
-        return None;
-    }
-    Some(())
+fn check_request(head: &[u8], paths: &[String]) -> Option<()> {
+    let path = crate::proxy::request_path(head)?;
+    paths.iter().any(|held| held.as_str() == path).then_some(())
 }
 
 // The same accept over halves that cannot peek: the kept read consumes the head, so what rode in behind it is the reader's own prefix.
 pub(crate) fn accept_split<R: Read, W: Write>(
     mut read: R,
     mut write: W,
-    path: &str,
+    paths: &[String],
     response: Option<&[u8]>,
 ) -> Option<(HeadReader<R>, W)> {
     let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
-    check_request(&head[..at], path)?;
+    check_request(&head[..at], paths)?;
     write.write_all(response.unwrap_or(DEFAULT_RESPONSE)).ok()?;
     Some((HeadReader::new(read, head, at), write))
 }
@@ -149,7 +147,10 @@ fn check_response(head: &[u8]) -> Option<()> {
     let mut parts = head[..end].split(|byte| *byte == b' ');
     let version = parts.next()?;
     let status = parts.next()?;
-    if !version.starts_with(b"HTTP/1.") || status.len() != 3 || status[0] != b'2' {
+    if !version.starts_with(b"HTTP/1.")
+        || status.len() != 3
+        || !status.iter().all(u8::is_ascii_digit)
+    {
         return None;
     }
     Some(())
@@ -176,12 +177,21 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn any_configured_path_is_accepted() {
+        let head = b"GET /two HTTP/1.1\r\nHost: h\r\n\r\n";
+        let paths = ["/one".to_owned(), "/two".to_owned()];
+        assert!(check_request(head, &paths).is_some());
+        assert!(check_request(head, &["/one".to_owned()]).is_none());
+    }
+
+    #[test]
     fn header_carries_an_echo_over_loopback() {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            let (mut reader, mut write) = accept(stream, "/camouflage", None).expect("headers");
+            let (mut reader, mut write) =
+                accept(stream, &["/camouflage".to_owned()], None).expect("headers");
             let mut buf = [0u8; 4];
             reader.read_exact(&mut buf).expect("reads");
             assert_eq!(&buf, b"ping");
@@ -421,12 +431,20 @@ mod tests {
     }
 
     #[test]
+    fn a_configured_non_success_status_is_a_valid_camouflage_response() {
+        assert!(check_response(b"HTTP/1.1 404 Not Found\r\n\r\n").is_some());
+        assert!(check_response(b"HTTP/1.0 204 No Content\r\n\r\n").is_some());
+        assert!(check_response(b"HTTP/2 200 OK\r\n\r\n").is_none());
+        assert!(check_response(b"HTTP/1.1 20 OK\r\n\r\n").is_none());
+    }
+
+    #[test]
     fn header_rejects_a_wrong_path() {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            assert!(accept(stream, "/camouflage", None).is_none());
+            assert!(accept(stream, &["/camouflage".to_owned()], None).is_none());
         });
         let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream

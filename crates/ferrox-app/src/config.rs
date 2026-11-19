@@ -736,6 +736,20 @@ pub(crate) fn tls_identity_from_settings(
         return None;
     }
     identity.master_key_log = tls_master_key_log(tls);
+    if identity.issuer.is_some() {
+        if let Some(lane) = ferrox_core::tls::issuer_lane_error(&identity) {
+            eprintln!(
+                "tls: AUTHORITY_ISSUE cannot sign for {lane}; the inbound is refused, not served without issuance"
+            );
+            return None;
+        }
+        if quic_owned_tls(settings) {
+            eprintln!(
+                "tls: AUTHORITY_ISSUE cannot sign for a QUIC carrier; the inbound is refused, not served without issuance"
+            );
+            return None;
+        }
+    }
     let identity = Arc::new(identity);
     start_cert_ticker(&identity);
     Some(identity)
@@ -799,6 +813,14 @@ fn ech_server_keys(settings: &Json) -> Result<Option<Arc<[u8]>>, String> {
         .map(Some)
 }
 
+/// Carriers whose TLS context is built by quiche, where an issuer cannot select a leaf per SNI.
+fn quic_owned_tls(settings: &Json) -> bool {
+    matches!(
+        settings.get("network").and_then(Json::as_str),
+        Some("quic" | "hysteria" | "masque" | "h3")
+    )
+}
+
 /// Every `certificates` entry xray would serve, in block order: `usage` other than
 /// `encipherment` feeds no handshake, an entry with no key or an unparseable pair is skipped
 /// the way xray warns and moves on, and a named file that cannot be read refuses the listener.
@@ -821,12 +843,44 @@ fn tls_issue_authority(settings: &Json) -> Option<Arc<ferrox_core::tls::CertIssu
         let certificate = named("certificateFile");
         let key = named("keyFile");
         let cert_pem = match certificate {
-            Some(path) => read_cert_file(path)?,
-            None => inline_pem(cert, "certificate")?,
+            Some(path) => match read_cert_file(path) {
+                Some(pem) => pem,
+                None => {
+                    eprintln!(
+                        "tls: skipping AUTHORITY_ISSUE entry {index}: certificateFile `{path}` cannot be read"
+                    );
+                    continue;
+                }
+            },
+            None => match inline_pem(cert, "certificate") {
+                Some(pem) => pem,
+                None => {
+                    eprintln!(
+                        "tls: skipping AUTHORITY_ISSUE entry {index}: no certificate bytes or readable file"
+                    );
+                    continue;
+                }
+            },
         };
         let key_pem = match key {
-            Some(path) => read_cert_file(path)?,
-            None => inline_pem(cert, "key")?,
+            Some(path) => match read_cert_file(path) {
+                Some(pem) => pem,
+                None => {
+                    eprintln!(
+                        "tls: skipping AUTHORITY_ISSUE entry {index}: keyFile `{path}` cannot be read"
+                    );
+                    continue;
+                }
+            },
+            None => match inline_pem(cert, "key") {
+                Some(pem) => pem,
+                None => {
+                    eprintln!(
+                        "tls: skipping AUTHORITY_ISSUE entry {index}: no private key bytes or readable file"
+                    );
+                    continue;
+                }
+            },
         };
         let entry = match ferrox_core::tls::parse_pem_entry(&cert_pem, &key_pem) {
             Ok(entry) => entry,
@@ -857,7 +911,17 @@ fn tls_issue_authority(settings: &Json) -> Option<Arc<ferrox_core::tls::CertIssu
             }
             _ => None,
         };
-        let issuer = ferrox_core::tls::CertIssuer::new(entry.cert_chain, cert_pem, key_pem, reload);
+        let build_chain = cert
+            .get("buildChain")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let issuer = ferrox_core::tls::CertIssuer::new(
+            entry.cert_chain,
+            cert_pem,
+            key_pem,
+            build_chain,
+            reload,
+        );
         if let Err(error) = issuer.signing_ready() {
             eprintln!(
                 "tls: skipping an AUTHORITY_ISSUE entry the signing backend refuses: {error}"
@@ -1752,7 +1816,7 @@ pub(crate) struct GrpcSettings {
     pub(crate) authority: String,
     pub(crate) user_agent: String,
     pub(crate) multi_mode: bool,
-    pub(crate) idle_timeout: u32,
+    pub(crate) idle_timeout: i32,
     pub(crate) health_check_timeout: u32,
     pub(crate) permit_without_stream: bool,
     pub(crate) initial_window_size: u32,
@@ -1784,6 +1848,12 @@ impl GrpcSettings {
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(0)
         };
+        let signed = |key: &str| {
+            node.and_then(|s| s.get(key))
+                .and_then(Json::as_i64)
+                .and_then(|n| i32::try_from(n).ok())
+                .unwrap_or(0)
+        };
         let tls_authority = settings
             .filter(|s| s.get("security").and_then(Json::as_str) == Some("tls"))
             .and_then(|s| s.get("tlsSettings"))
@@ -1804,7 +1874,7 @@ impl GrpcSettings {
                 .and_then(|s| s.get("multiMode"))
                 .and_then(Json::as_bool)
                 .unwrap_or(false),
-            idle_timeout: seconds("idleTimeout"),
+            idle_timeout: signed("idleTimeout"),
             health_check_timeout: seconds("healthCheckTimeout"),
             permit_without_stream: node
                 .and_then(|s| s.get("permitWithoutStream"))
@@ -1916,20 +1986,36 @@ fn tcp_http_response(settings: Option<&Json>) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn tcp_http_path(settings: Option<&Json>) -> Option<String> {
+    tcp_http_paths(settings).map(|paths| paths[0].clone())
+}
+
+/// Every request path the reference accepts for one TCP-HTTP carrier. The first is the one a
+/// client dials; a server answers any of them.
+pub(crate) fn tcp_http_paths(settings: Option<&Json>) -> Option<Vec<String>> {
     tcp_http_header(settings)?;
     let Some(request) = tcp_http_request(settings) else {
-        return Some("/".to_owned());
+        return Some(vec!["/".to_owned()]);
     };
-    if let Some(paths) = request.get("path").and_then(Json::as_arr) {
-        let first = paths.iter().find_map(Json::as_str);
-        if let Some(path) = first {
-            return Some(path.to_owned());
+    let mut paths: Vec<String> = request
+        .get("path")
+        .and_then(Json::as_arr)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if paths.is_empty() {
+        if let Some(path) = request.get("path").and_then(Json::as_str) {
+            paths.push(path.to_owned());
         }
     }
-    if let Some(path) = request.get("path").and_then(Json::as_str) {
-        return Some(path.to_owned());
+    if paths.is_empty() {
+        paths.push("/".to_owned());
     }
-    Some("/".to_owned())
+    Some(paths)
 }
 
 /// The headers and WebSocket heartbeat a carrier's settings carry. TCP-HTTP keeps its headers under the request block; every other carrier writes them beside the path.
@@ -2036,6 +2122,7 @@ pub(crate) enum Carrier {
     },
     HttpHeader {
         path: String,
+        paths: Vec<String>,
         response: Option<Vec<u8>>,
     },
     Quic,
@@ -2400,13 +2487,14 @@ fn resolve_tcp_or_header(settings: Option<&Json>, network: &str) -> Carrier {
             network: network.to_owned(),
         };
     };
-    match tcp_http_path(settings) {
+    match tcp_http_paths(settings) {
         // A header masquerade plus a tcp mask is the pairing the reference answers with the refused `header-custom`.
         Some(_) if !mask.is_empty() => Carrier::Unknown {
             network: network.to_owned(),
         },
-        Some(path) => Carrier::HttpHeader {
-            path,
+        Some(paths) => Carrier::HttpHeader {
+            path: paths[0].clone(),
+            paths,
             response: tcp_http_response(settings),
         },
         None => Carrier::Raw(mask),
@@ -6583,6 +6671,29 @@ mod tests {
             carrier_headers(Some(&xhttp)).0,
             vec![("X-Fetch".to_owned(), "1".to_owned())]
         );
+    }
+
+    #[test]
+    fn a_signed_grpc_idle_timeout_keeps_its_negative_value() {
+        let settings =
+            crate::json::parse(r#"{"grpcSettings":{"idleTimeout":-5,"healthCheckTimeout":10}}"#)
+                .expect("grpc");
+        let settings = GrpcSettings::from_json(Some(&settings));
+        assert_eq!(settings.idle_timeout, -5);
+        assert_eq!(settings.health_check_timeout, 10);
+    }
+
+    #[test]
+    fn tcp_http_paths_keep_every_configured_uri() {
+        let settings = crate::json::parse(
+            r#"{"network":"tcp","tcpSettings":{"header":{"type":"http","request":{"path":["/one","/two"]}}}}"#,
+        )
+        .expect("tcp");
+        assert_eq!(
+            tcp_http_paths(Some(&settings)),
+            Some(vec!["/one".to_owned(), "/two".to_owned()])
+        );
+        assert_eq!(tcp_http_path(Some(&settings)).as_deref(), Some("/one"));
     }
 
     #[test]
