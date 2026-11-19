@@ -2498,7 +2498,7 @@ impl Role {
                         reader,
                         writer,
                         raw,
-                        paths,
+                        &paths,
                         keys.as_ref(),
                         freedom,
                         response.as_deref(),
@@ -84970,7 +84970,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             } => {
                 crate::vmess::serve_httpheader_with(
                     stream,
-                    paths,
+                    &paths,
                     &users,
                     freedom,
                     response.as_deref(),
