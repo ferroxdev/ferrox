@@ -1394,16 +1394,12 @@ impl Proxy {
             request.push_str("\r\n");
         }
         request.push_str("\r\n");
-        arm_tcp(stream, deadline)?;
-        stream
-            .write_all(request.as_bytes())
+        write_all_until(stream, deadline, request.as_bytes())
             .map_err(|error| format!("psiphon: upstream proxy write: {error}"))?;
         let mut head = Vec::with_capacity(128);
         loop {
-            arm_tcp(stream, deadline)?;
             let mut byte = [0u8; 1];
-            stream
-                .read_exact(&mut byte)
+            read_exact_until(stream, deadline, &mut byte)
                 .map_err(|error| format!("psiphon: upstream proxy read: {error}"))?;
             head.push(byte[0]);
             if head.ends_with(b"\r\n\r\n") {
@@ -1436,14 +1432,10 @@ impl Proxy {
     ) -> Result<(), String> {
         let auth = !self.user.is_empty() || !self.pass.is_empty();
         let greeting: &[u8] = if auth { &[5, 2, 0, 2] } else { &[5, 1, 0] };
-        arm_tcp(stream, deadline)?;
-        stream
-            .write_all(greeting)
+        write_all_until(stream, deadline, greeting)
             .map_err(|error| format!("psiphon: upstream proxy greeting: {error}"))?;
         let mut method = [0u8; 2];
-        arm_tcp(stream, deadline)?;
-        stream
-            .read_exact(&mut method)
+        read_exact_until(stream, deadline, &mut method)
             .map_err(|error| format!("psiphon: upstream proxy greeting: {error}"))?;
         if method[0] != 5 {
             return Err("psiphon: upstream proxy is not SOCKS5".to_owned());
@@ -1459,14 +1451,10 @@ impl Proxy {
                 request.extend_from_slice(user);
                 request.push(u8::try_from(pass.len()).unwrap_or(u8::MAX));
                 request.extend_from_slice(pass);
-                arm_tcp(stream, deadline)?;
-                stream
-                    .write_all(&request)
+                write_all_until(stream, deadline, &request)
                     .map_err(|error| format!("psiphon: upstream proxy auth: {error}"))?;
                 let mut reply = [0u8; 2];
-                arm_tcp(stream, deadline)?;
-                stream
-                    .read_exact(&mut reply)
+                read_exact_until(stream, deadline, &mut reply)
                     .map_err(|error| format!("psiphon: upstream proxy auth: {error}"))?;
                 if reply != [1, 0] {
                     return Err("psiphon: upstream proxy refused its credentials".to_owned());
@@ -1494,14 +1482,10 @@ impl Proxy {
             }
         }
         request.extend_from_slice(&port.to_be_bytes());
-        arm_tcp(stream, deadline)?;
-        stream
-            .write_all(&request)
+        write_all_until(stream, deadline, &request)
             .map_err(|error| format!("psiphon: upstream proxy request: {error}"))?;
         let mut head = [0u8; 4];
-        arm_tcp(stream, deadline)?;
-        stream
-            .read_exact(&mut head)
+        read_exact_until(stream, deadline, &mut head)
             .map_err(|error| format!("psiphon: upstream proxy reply: {error}"))?;
         if head[0] != 5 || head[1] != 0 {
             return Err(format!(
@@ -1517,31 +1501,73 @@ impl Proxy {
             4 => 16,
             3 => {
                 let mut length = [0u8; 1];
-                arm_tcp(stream, deadline)?;
-                stream
-                    .read_exact(&mut length)
+                read_exact_until(stream, deadline, &mut length)
                     .map_err(|error| format!("psiphon: upstream proxy reply: {error}"))?;
                 usize::from(length[0])
             }
             _ => return Err("psiphon: upstream proxy named no address".to_owned()),
         };
-        arm_tcp(stream, deadline)?;
-        stream
-            .read_exact(&mut bound[..skip + 2])
+        read_exact_until(stream, deadline, &mut bound[..skip + 2])
             .map_err(|error| format!("psiphon: upstream proxy reply: {error}"))?;
         Ok(())
     }
 }
 
 fn arm_tcp(stream: &TcpStream, deadline: Instant) -> Result<(), String> {
+    arm_tcp_io(stream, deadline).map_err(|error| format!("psiphon: upstream proxy socket: {error}"))
+}
+
+fn arm_tcp_io(stream: &TcpStream, deadline: Instant) -> io::Result<()> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
-        return Err("psiphon: upstream proxy deadline expired".to_owned());
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "psiphon: upstream proxy deadline expired",
+        ));
     }
     stream
         .set_read_timeout(Some(left))
         .and_then(|()| stream.set_write_timeout(Some(left)))
-        .map_err(|error| format!("psiphon: upstream proxy socket: {error}"))
+}
+
+fn read_exact_until(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    mut buf: &mut [u8],
+) -> io::Result<()> {
+    while !buf.is_empty() {
+        arm_tcp_io(stream, deadline)?;
+        match stream.read(buf) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ))
+            }
+            Ok(read) => buf = &mut buf[read..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_all_until(stream: &mut TcpStream, deadline: Instant, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        arm_tcp_io(stream, deadline)?;
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ))
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn authority_host(host: &str, port: u16) -> String {
@@ -3246,8 +3272,12 @@ fn with_writer_deadline<T>(
     }
     let result = send(writer);
     if deadline.is_some() {
-        writer.deadline = previous;
-        let _ = arm_deadline(&writer.io, previous);
+        if previous.is_some() {
+            writer.deadline = previous;
+            let _ = arm_deadline(&writer.io, previous);
+        } else {
+            let _ = writer.clear_deadline();
+        }
     }
     result
 }
@@ -3415,11 +3445,16 @@ const TLS_DRAIN: usize = 1024 * 1024;
 /// Re-arm only the read timeout on the TLS transport, leaving its write bound alone.
 trait RelayTimeout {
     fn set_relay_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn set_relay_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
 }
 
 impl RelayTimeout for Stream {
     fn set_relay_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.set_read_timeout(timeout)
+    }
+
+    fn set_relay_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_write_timeout(timeout)
     }
 }
 
@@ -3427,11 +3462,19 @@ impl RelayTimeout for DeadlineIo {
     fn set_relay_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.io.set_read_timeout(timeout)
     }
+
+    fn set_relay_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.io.set_write_timeout(timeout)
+    }
 }
 
 impl<S: RelayTimeout> RelayTimeout for crate::psiphon_fragment::TlsHelloFragmentor<S> {
     fn set_relay_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.inner().set_relay_read_timeout(timeout)
+    }
+
+    fn set_relay_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner().set_relay_write_timeout(timeout)
     }
 }
 
