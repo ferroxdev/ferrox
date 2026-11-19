@@ -1479,6 +1479,11 @@ impl Inner {
             } else {
                 None
             };
+            let budget = budget.min(deadline.saturating_duration_since(Instant::now()));
+            if budget.is_zero() {
+                break;
+            }
+            let timeout = timeout.min(budget);
             let inproxy_prefer = self.settings.inproxy_prefer_probability;
             let inproxy_only = !self.settings.protocols.is_empty()
                 && self
