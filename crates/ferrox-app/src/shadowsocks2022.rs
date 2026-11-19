@@ -2047,11 +2047,23 @@ impl Datagrams {
             let raw = shadowsocks2022::block_decrypt(psk, &enc)?;
             let session = u64::from_be_bytes(raw[..8].try_into().ok()?);
             let packet_id = u64::from_be_bytes(raw[8..].try_into().ok()?);
-            let sub = shadowsocks2022::session_subkey(psk, &raw[..8])?;
-            let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
-            let len = cipher.open_with_nonce(&nonce, &mut packet[16..])?;
+            let (len, derived) = match self
+                .peers
+                .get(&session)
+                .and_then(|peer| peer.cipher.as_ref())
+            {
+                Some(cipher) => (cipher.open_with_nonce(&nonce, &mut packet[16..])?, None),
+                None => {
+                    let sub = shadowsocks2022::session_subkey(psk, &raw[..8])?;
+                    let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
+                    (
+                        cipher.open_with_nonce(&nonce, &mut packet[16..])?,
+                        Some(cipher),
+                    )
+                }
+            };
             if len > packet.len() - 16 {
                 return None;
             }
@@ -2076,12 +2088,14 @@ impl Datagrams {
             if !peer_check(&mut self.peers, session, packet_id, now) {
                 return None;
             }
-            if self
-                .peers
-                .get(&session)
-                .is_none_or(|peer| peer.cipher.is_none())
-            {
-                self.peers.get_mut(&session)?.cipher = Some(cipher);
+            if let Some(cipher) = derived {
+                if self
+                    .peers
+                    .get(&session)
+                    .is_none_or(|peer| peer.cipher.is_none())
+                {
+                    self.peers.get_mut(&session)?.cipher = Some(cipher);
+                }
             }
             Some((target, &packet[16 + 19 + pad + used..16 + len]))
         }
@@ -2095,8 +2109,11 @@ fn peer_check(
     now: u64,
 ) -> bool {
     if let Some(peer) = peers.get_mut(&session) {
+        if !peer.window.check_and_add(packet_id) {
+            return false;
+        }
         peer.last_seen = now;
-        return peer.window.check_and_add(packet_id);
+        return true;
     }
     peers.retain(|_, peer: &mut PeerServer| now.wrapping_sub(peer.last_seen) < SKEW * 2 + 1);
     if peers.len() >= 8 {

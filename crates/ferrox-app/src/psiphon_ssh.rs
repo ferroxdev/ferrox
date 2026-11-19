@@ -46,6 +46,8 @@ fn window_adjust_at(window: u32) -> u64 {
     WINDOW_ADJUST_AT.min(u64::from(window) / 2)
 }
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
+/// A close frame may not hold local closure on a backpressured transport.
+const CLOSE_FRAME_TIMEOUT: Duration = Duration::from_secs(1);
 /// A flow's channel retires its session after this long without a payload.
 const CHANNEL_IDLE: Duration = Duration::from_secs(60);
 
@@ -1657,6 +1659,7 @@ type ApiReply = mpsc::Sender<Result<Vec<u8>, String>>;
 struct Inner {
     writer: Mutex<PacketWriter>,
     channels: Mutex<HashMap<u32, Arc<ChannelState>>>,
+    deferred_close: Mutex<Vec<u32>>,
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
     channel_window: u32,
     next_channel: AtomicU32,
@@ -2074,6 +2077,7 @@ impl Session {
         let inner = Arc::new(Inner {
             writer: Mutex::new(output),
             channels: Mutex::new(HashMap::new()),
+            deferred_close: Mutex::new(Vec::new()),
             pool,
             channel_window: server.channel_window,
             next_channel: AtomicU32::new(1),
@@ -2586,8 +2590,38 @@ impl Inner {
             Some(deadline) => lock_until(&self.writer, deadline)?,
             None => lock(&self.writer),
         };
+        if !self.flush_deferred_close(&mut writer) {
+            return Err("psiphon ssh write: session closed".to_owned());
+        }
         with_writer_deadline(&mut writer, deadline, |writer| writer.send(payload))
             .map_err(|error| format!("psiphon ssh write: {error}"))
+    }
+
+    /// Send every close frame a contended writer deferred, before the caller's own payload.
+    fn flush_deferred_close(&self, writer: &mut PacketWriter) -> bool {
+        let pending = {
+            let mut deferred = lock(&self.deferred_close);
+            std::mem::take(&mut *deferred)
+        };
+        if pending.is_empty() {
+            return true;
+        }
+        let result = with_writer_deadline(
+            writer,
+            Some(Instant::now() + CLOSE_FRAME_TIMEOUT),
+            |writer| {
+                for remote in pending {
+                    writer.send(&channel_close(remote))?;
+                }
+                Ok(())
+            },
+        );
+        if result.is_err() {
+            // A half-written close packet leaves the sequence advanced; the stream is unusable.
+            self.close();
+            return false;
+        }
+        true
     }
 
     fn send_channel_data(
@@ -2600,6 +2634,9 @@ impl Inner {
             Some(deadline) => lock_until(&self.writer, deadline)?,
             None => lock(&self.writer),
         };
+        if !self.flush_deferred_close(&mut writer) {
+            return Err("psiphon channel closed".to_owned());
+        }
         let remote = state.remote.load(Ordering::Acquire);
         if remote == NO_CHANNEL {
             return Err("psiphon channel closed".to_owned());
@@ -2623,6 +2660,9 @@ impl Inner {
             Some(deadline) => lock_until(&self.writer, deadline)?,
             None => lock(&self.writer),
         };
+        if !self.flush_deferred_close(&mut writer) {
+            return Err("psiphon channel closed".to_owned());
+        }
         let remote = state.remote.load(Ordering::Acquire);
         if remote == NO_CHANNEL {
             return Err("psiphon channel closed".to_owned());
@@ -2639,6 +2679,9 @@ impl Inner {
     /// A per-channel frame leaves only while the channel still names a remote id, read under the writer lock.
     fn send_framed(&self, state: &ChannelState, payload: &mut [u8]) -> bool {
         let mut writer = lock(&self.writer);
+        if !self.flush_deferred_close(&mut writer) {
+            return false;
+        }
         let remote = state.remote.load(Ordering::Acquire);
         if remote == NO_CHANNEL || self.closed.load(Ordering::Acquire) {
             return false;
@@ -2651,25 +2694,18 @@ impl Inner {
         sent
     }
 
-    /// End a channel: its remote id is retired and its close frame sent under one writer lock.
+    /// End a channel: its remote id is retired and its close frame queued for the writer.
     fn close_channel(&self, state: &ChannelState) {
+        let remote = state.remote.swap(NO_CHANNEL, Ordering::AcqRel);
+        if remote != NO_CHANNEL && !self.closed.load(Ordering::Acquire) {
+            lock(&self.deferred_close).push(remote);
+        }
         let mut writer = match self.writer.try_lock() {
             Ok(writer) => writer,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                state.remote.store(NO_CHANNEL, Ordering::Release);
-                return;
-            }
+            Err(TryLockError::WouldBlock) => return,
         };
-        let remote = state.remote.swap(NO_CHANNEL, Ordering::AcqRel);
-        let failed = remote != NO_CHANNEL
-            && !self.closed.load(Ordering::Acquire)
-            && writer.send(&channel_close(remote)).is_err();
-        drop(writer);
-        if failed {
-            // A half-written close packet leaves the sequence advanced; the stream is unusable.
-            self.close();
-        }
+        self.flush_deferred_close(&mut writer);
     }
 
     fn relay_round_trip(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
@@ -5868,6 +5904,7 @@ fn test_channel_with_window(payloads: &[&[u8]], window: u32) -> Channel {
     let inner = Arc::new(Inner {
         writer: Mutex::new(PacketWriter::new(writer, None, None, None)),
         channels: Mutex::new(HashMap::new()),
+        deferred_close: Mutex::new(Vec::new()),
         pool: Arc::clone(&pool),
         channel_window: DEFAULT_CHANNEL_WINDOW,
         next_channel: AtomicU32::new(1),
@@ -6271,6 +6308,7 @@ mod tests {
                 None,
             )),
             channels: Mutex::new(HashMap::new()),
+            deferred_close: Mutex::new(Vec::new()),
             pool: Arc::clone(&pool),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(1),
@@ -6363,6 +6401,7 @@ mod tests {
                 None,
             )),
             channels: Mutex::new(HashMap::new()),
+            deferred_close: Mutex::new(Vec::new()),
             pool: Arc::clone(&pool),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(1),
@@ -6437,6 +6476,7 @@ mod tests {
         let inner = Arc::new(Inner {
             writer: Mutex::new(PacketWriter::new(writer, None, None, None)),
             channels: Mutex::new(HashMap::new()),
+            deferred_close: Mutex::new(Vec::new()),
             pool: Arc::clone(&pool),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),
@@ -6539,6 +6579,7 @@ mod tests {
                 None,
             )),
             channels: Mutex::new(HashMap::new()),
+            deferred_close: Mutex::new(Vec::new()),
             pool: Arc::clone(&pool),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),
@@ -6637,6 +6678,7 @@ mod tests {
                 None,
             )),
             channels: Mutex::new(HashMap::new()),
+            deferred_close: Mutex::new(Vec::new()),
             pool: Arc::new(Mutex::new(Vec::new())),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(1),
@@ -6691,6 +6733,7 @@ mod tests {
                 None,
             )),
             channels: Mutex::new(HashMap::new()),
+            deferred_close: Mutex::new(Vec::new()),
             pool: Arc::clone(&pool),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),
@@ -6778,6 +6821,7 @@ mod tests {
                 None,
             )),
             channels: Mutex::new(HashMap::new()),
+            deferred_close: Mutex::new(Vec::new()),
             pool: Arc::clone(&pool),
             channel_window: DEFAULT_CHANNEL_WINDOW,
             next_channel: AtomicU32::new(2),

@@ -1380,13 +1380,17 @@ impl WebRtcStream {
             return Ok(total);
         }
         if let Some(shaping) = &self.shaping {
+            let mut queued = 0;
             for buf in bufs {
                 for chunk in buf.chunks(STREAM_MESSAGE) {
                     let message = {
                         let mut shaping = lock(shaping);
                         shaping.frame(chunk, MAX_DATAGRAM)
                     };
-                    self.send_until(message, deadline)?;
+                    if let Err(error) = self.send_until(message, deadline) {
+                        return if queued > 0 { Ok(queued) } else { Err(error) };
+                    }
+                    queued += chunk.len();
                 }
             }
             return Ok(total);
@@ -1394,6 +1398,7 @@ impl WebRtcStream {
         let first = !self.padding_sent.swap(true, Ordering::AcqRel);
         let mut message = Vec::with_capacity(STREAM_MESSAGE + 2);
         let mut header_len = 0;
+        let mut queued = 0;
         if first {
             put_varint(&mut message, PADDING_DONE);
             header_len = message.len();
@@ -1402,7 +1407,11 @@ impl WebRtcStream {
             let mut at = 0;
             while at < buf.len() {
                 if message.len() - header_len >= STREAM_MESSAGE {
-                    self.send_until(std::mem::take(&mut message), deadline)?;
+                    let have = message.len() - header_len;
+                    if let Err(error) = self.send_until(std::mem::take(&mut message), deadline) {
+                        return if queued > 0 { Ok(queued) } else { Err(error) };
+                    }
+                    queued += have;
                     message.reserve(STREAM_MESSAGE + 2);
                     header_len = 0;
                 }
@@ -1413,9 +1422,13 @@ impl WebRtcStream {
             }
         }
         if message.len() > header_len {
-            self.send_until(message, deadline)?;
+            let have = message.len() - header_len;
+            if let Err(error) = self.send_until(message, deadline) {
+                return if queued > 0 { Ok(queued) } else { Err(error) };
+            }
+            queued += have;
         }
-        Ok(total)
+        Ok(queued)
     }
 
     /// Queue one framed message against a deadline fixed before the first of a batch.

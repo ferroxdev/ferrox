@@ -183,13 +183,34 @@ impl FragmentStream {
             .deadline
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
-        if deadline.is_none() {
+        if deadline.is_some() {
+            let _ = self.arm_deadline();
+        } else {
             let timeout = *self
                 .write_timeout
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = self.socket.set_write_timeout(timeout);
         }
+    }
+
+    /// Point the socket's write timeout at whatever the active establishment deadline leaves.
+    fn arm_deadline(&self) -> io::Result<()> {
+        let deadline = *self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(deadline) = deadline else {
+            return Ok(());
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "psiphon fragmentor: establishment deadline expired",
+            ));
+        }
+        self.socket.set_write_timeout(Some(left))
     }
 
     /// Clone the socket and its remaining fragment plan.
@@ -269,6 +290,7 @@ impl Write for FragmentStream {
             state.bytes_to_fragment = i64::try_from(self.config.plan()).unwrap_or(i64::MAX);
         }
         if state.fragmented >= usize::try_from(state.bytes_to_fragment).unwrap_or(usize::MAX) {
+            self.arm_deadline()?;
             return self.socket.write(buffer);
         }
         let target = usize::try_from(state.bytes_to_fragment).unwrap_or(usize::MAX);
@@ -303,23 +325,8 @@ impl Write for FragmentStream {
                 .config
                 .write_size((buffer.len() - written).min(remaining));
             let end = written + size;
-            if let Some(deadline) = *self
-                .deadline
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-            {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return if written > 0 {
-                        Ok(written)
-                    } else {
-                        Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "psiphon fragmentor: establishment deadline expired",
-                        ))
-                    };
-                }
-                self.socket.set_write_timeout(Some(left))?;
+            if let Err(error) = self.arm_deadline() {
+                return if written > 0 { Ok(written) } else { Err(error) };
             }
             match self.socket.write(&buffer[written..end]) {
                 Ok(0) => {
