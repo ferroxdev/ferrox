@@ -2038,8 +2038,7 @@ impl Datagrams {
             }
             Some((target, &packet[24 + 16 + 19 + pad + used..24 + len]))
         } else {
-            let key_len = method.key_len();
-            if psk.len() != key_len || packet.len() < 16 + TAG_LEN {
+            if psk.len() != method.key_len() || packet.len() < 16 + TAG_LEN {
                 return None;
             }
             let mut enc = [0u8; BLOCK_LEN];
@@ -2049,21 +2048,15 @@ impl Datagrams {
             let packet_id = u64::from_be_bytes(raw[8..].try_into().ok()?);
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
-            let (len, derived) = match self
-                .peers
-                .get(&session)
-                .and_then(|peer| peer.cipher.as_ref())
-            {
-                Some(cipher) => (cipher.open_with_nonce(&nonce, &mut packet[16..])?, None),
-                None => {
-                    let sub = shadowsocks2022::session_subkey(psk, &raw[..8])?;
-                    let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
-                    (
-                        cipher.open_with_nonce(&nonce, &mut packet[16..])?,
-                        Some(cipher),
-                    )
-                }
-            };
+            let (len, derived) = open_peer_body(
+                &self.peers,
+                session,
+                psk,
+                method,
+                &raw[..8],
+                &nonce,
+                &mut packet[16..],
+            )?;
             if len > packet.len() - 16 {
                 return None;
             }
@@ -2100,6 +2093,23 @@ impl Datagrams {
             Some((target, &packet[16 + 19 + pad + used..16 + len]))
         }
     }
+}
+
+fn open_peer_body(
+    peers: &HashMap<u64, PeerServer>,
+    session: u64,
+    psk: &[u8],
+    method: Method,
+    salt: &[u8],
+    nonce: &[u8; 12],
+    body: &mut [u8],
+) -> Option<(usize, Option<Cipher>)> {
+    if let Some(cipher) = peers.get(&session).and_then(|peer| peer.cipher.as_ref()) {
+        return Some((cipher.open_with_nonce(nonce, body)?, None));
+    }
+    let sub = shadowsocks2022::session_subkey(psk, salt)?;
+    let cipher = Cipher::from_subkey(method, &sub[..method.key_len()])?;
+    Some((cipher.open_with_nonce(nonce, body)?, Some(cipher)))
 }
 
 fn peer_check(
