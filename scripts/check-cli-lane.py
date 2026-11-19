@@ -563,8 +563,8 @@ def snapshot_binary(state: pathlib.Path) -> pathlib.Path:
     binary = state / "fake-carrier-lane"
     binary.write_text(
         """#!/bin/sh
-cp "$3" "$FERROX_CONF_DIR/lane-snapshot.json"
 python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$3" > "$FERROX_CONF_DIR/lane-mode"
+cp "$3" "$FERROX_CONF_DIR/lane-snapshot.json"
 """,
         encoding="utf-8",
     )
