@@ -2445,6 +2445,7 @@ fn relay_datagrams(
     sock: &Arc<crate::quic::Datagram>,
     shared: &Arc<Mutex<quiche::Connection>>,
     conn: &mut quiche::Connection,
+    retired: &mut Vec<std::thread::JoinHandle<()>>,
 ) {
     if !matches!(inbound.standing, Standing::Authed) {
         return;
