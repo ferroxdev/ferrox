@@ -921,14 +921,22 @@ impl Endpoint {
     /// A challenge page's origin: the caller's dial, TLS settings and pins under the page's own authority, with the fronted `Host` cleared so the request names the origin that issued the challenge.
     #[must_use]
     pub(crate) fn challenged(&self, host: &str) -> Self {
+        let fronted = self.host_header.is_some();
+        let same = host.eq_ignore_ascii_case(&self.host);
         let mut endpoint = self.clone();
         endpoint.base = String::new();
         endpoint.host_header = None;
-        if !host.eq_ignore_ascii_case(&self.host) {
+        if !same {
             endpoint.port = 443;
         }
         host.clone_into(&mut endpoint.host);
-        endpoint.address = self.address.or_else(|| edge_peer(host, endpoint.port));
+        endpoint.address = if same {
+            self.address.or_else(|| edge_peer(host, endpoint.port))
+        } else if fronted {
+            self.address
+        } else {
+            edge_peer(host, endpoint.port)
+        };
         endpoint
     }
 
@@ -2061,6 +2069,38 @@ mod tests {
                 .port,
             8443
         );
+    }
+
+    #[test]
+    fn a_challenge_on_another_name_drops_the_stale_numeric_dial() {
+        let endpoint = Endpoint::parse("https://203.0.113.1", Vec::new().into()).expect("parses");
+        let challenged = endpoint.challenged("oauth.accounts.firefox.com");
+        assert_eq!(challenged.host, "oauth.accounts.firefox.com");
+        assert_eq!(challenged.port, 443);
+        assert_eq!(challenged.address, None);
+        assert!(challenged.host_header.is_none());
+    }
+
+    #[test]
+    fn a_challenge_under_fronting_keeps_the_edge_it_dials() {
+        let endpoint = Endpoint::parse("https://vpn.mozilla.org", Vec::new().into())
+            .expect("parses")
+            .with_fronting(
+                "vpn.mozilla.org",
+                "203.0.113.9",
+                443,
+                false,
+                None,
+                Vec::new(),
+            )
+            .expect("fronted");
+        let challenged = endpoint.challenged("oauth.accounts.firefox.com");
+        assert_eq!(challenged.host, "oauth.accounts.firefox.com");
+        assert_eq!(
+            challenged.address,
+            Some("203.0.113.9:443".parse().expect("addr"))
+        );
+        assert!(challenged.host_header.is_none());
     }
 
     /// The pause before the next ask: the plane's own when it names one, else a curve that grows and stops growing.
