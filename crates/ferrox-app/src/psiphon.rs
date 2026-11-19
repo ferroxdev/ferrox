@@ -1563,8 +1563,7 @@ impl Inner {
                     lease.failed();
                     return Err("psiphon: dial budget expired before the attempt".to_owned());
                 }
-                let timeout = timeout.min(left);
-                let api_timeout = use_inproxy.then_some(inproxy_api_timeout.min(left));
+                let api_timeout = use_inproxy.then_some(inproxy_api_timeout);
                 let identity = Identity {
                     session_id: &session_id,
                     authorizations: &authorizations,
@@ -1587,7 +1586,7 @@ impl Inner {
                 match Session::connect(
                     &selected,
                     &identity,
-                    timeout,
+                    deadline,
                     proxy.as_ref(),
                     &dns,
                     conduit.as_deref(),
@@ -7072,14 +7071,17 @@ pub(crate) fn broker_offer(
             server.inproxy.as_ref().is_some_and(inproxy_uses_quic),
             media_secret,
         )?;
+        let nat_deadline = Instant::now()
+            + settings
+                .inproxy_discover_nat_timeout
+                .mul_f64(settings.latency.multiplier())
+                .min(Duration::from_secs(600))
+                .min(timeout);
         if coin(settings.inproxy_discover_nat) {
             if let Some(nat) = crate::psiphon_webrtc::discover_nat_type(
                 &inproxy_stun_servers_rfc5780(&settings, &tactics),
                 server.address,
-                settings
-                    .inproxy_discover_nat_timeout
-                    .mul_f64(settings.latency.multiplier())
-                    .min(Duration::from_secs(600)),
+                nat_deadline,
                 &settings.dns,
             ) {
                 client.set_nat_type(nat);

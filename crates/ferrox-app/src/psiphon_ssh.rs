@@ -1731,7 +1731,7 @@ impl Session {
     pub(crate) fn connect(
         server: &Server,
         identity: &Identity<'_>,
-        timeout: Duration,
+        deadline: Instant,
         proxy: Option<&Proxy>,
         dns: &crate::psiphon_dns::Config,
         conduit: Option<&Conduit>,
@@ -1742,6 +1742,10 @@ impl Session {
         requests: Option<Arc<dyn ServerRequests>>,
         burst: Option<crate::psiphon_burst::Config>,
     ) -> Result<Self, String> {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return Err("psiphon ssh: establishment deadline expired".to_owned());
+        }
         let (stream, mut relay, protocol, relay_protocol) =
             if let (Some(conduit), Some(destination)) = (conduit, server.inproxy.as_ref()) {
                 let (stream, relay) =
@@ -1911,6 +1915,16 @@ impl Session {
             identity.session_id,
             identity.sponsor,
         )?;
+        let api_timeout = match api_timeout {
+            Some(configured) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err("psiphon ssh: establishment deadline expired before api".to_owned());
+                }
+                Some(configured.min(left))
+            }
+            None => None,
+        };
         if let Some(timeout) = api_timeout {
             output
                 .io
