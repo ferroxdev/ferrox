@@ -245,9 +245,7 @@ fn http(url: &str, method: &str, body: Option<&[u8]>) -> Option<Vec<u8>> {
     if response.len() >= FETCH_MAX_BYTES {
         return None;
     }
-    let head_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")?;
+    let head_end = crate::foxy::head_end(&response)?;
     let head = std::str::from_utf8(&response[..head_end]).ok()?;
     if !head.starts_with("HTTP/")
         || !head
@@ -274,7 +272,7 @@ fn http(url: &str, method: &str, body: Option<&[u8]>) -> Option<Vec<u8>> {
         let mut out = Vec::new();
         let mut at = 0usize;
         let mut terminated = false;
-        while let Some(line_end) = body[at..].windows(2).position(|w| w == b"\r\n") {
+        while let Some(line_end) = crate::foxy::line_end(&body[at..]) {
             let size = usize::from_str_radix(
                 std::str::from_utf8(&body[at..at + line_end])
                     .ok()?

@@ -785,7 +785,7 @@ fn hop_by_hop(name: &str) -> bool {
 
 /// HTTP/2 field names are lowercase (RFC 9113 8.2.1), so the canonical spelling is lowered in place.
 fn lower_field_names(head: &mut [u8]) {
-    let mut at = match head.windows(2).position(|w| w == b"\r\n") {
+    let mut at = match ferrox_core::foxy::line_end(head) {
         Some(end) => end + 2,
         None => return,
     };
@@ -794,7 +794,7 @@ fn lower_field_names(head: &mut [u8]) {
             return;
         };
         head[at..at + colon].make_ascii_lowercase();
-        at = match head[at + colon..].windows(2).position(|w| w == b"\r\n") {
+        at = match ferrox_core::foxy::line_end(&head[at + colon..]) {
             Some(end) => at + colon + end + 2,
             None => return,
         };

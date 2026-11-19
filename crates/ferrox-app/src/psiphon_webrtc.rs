@@ -809,16 +809,15 @@ fn parse_stun(reply: &[u8], transaction: &[u8; 12]) -> Option<SocketAddr> {
 pub(crate) fn discover_nat_type(
     servers: &[String],
     local: IpAddr,
-    timeout: Duration,
+    deadline: Instant,
     dns: &crate::psiphon_dns::Config,
 ) -> Option<u64> {
-    if timeout.is_zero() {
+    if Instant::now() >= deadline {
         return None;
     }
     let server = choose_stun(servers)?;
     let ipv6 = local.is_ipv6();
-    let target = resolve_nat_server(server, ipv6, dns).ok()?;
-    let deadline = Instant::now() + timeout;
+    let target = resolve_nat_server(server, ipv6, dns, deadline).ok()?;
     let family = if ipv6 {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
     } else {
@@ -838,6 +837,7 @@ fn resolve_nat_server(
     server: &str,
     ipv6: bool,
     dns: &crate::psiphon_dns::Config,
+    deadline: Instant,
 ) -> Result<SocketAddr, String> {
     let (host, port) = if let Ok(address) = server.parse::<SocketAddr>() {
         (address.ip().to_string(), address.port())
@@ -851,7 +851,7 @@ fn resolve_nat_server(
     } else {
         (server.to_owned(), 3478)
     };
-    crate::psiphon_dns::resolve_with(dns, &host, port)
+    crate::psiphon_dns::resolve_with_deadline(dns, &host, port, Some(deadline))
         .map_err(|error| format!("psiphon NAT discovery {server}: {error}"))?
         .into_iter()
         .find(|address| address.is_ipv6() == ipv6)
@@ -1852,6 +1852,7 @@ impl Conduit {
         address: IpAddr,
         destination: &Destination,
         identity: &Identity<'_>,
+        allowance: Duration,
     ) -> Result<(InproxyStream, Relay), String> {
         if !self.routes.iter().any(|route| !route.fronts.is_empty()) {
             return Err("psiphon conduit: no broker front".to_owned());
@@ -1886,12 +1887,18 @@ impl Conduit {
                 destination.protocol
             ));
         }
+        let deadline = Instant::now()
+            + self
+                .timeout
+                .min(self.offer_timeout.saturating_add(self.await_ready_timeout))
+                .min(allowance);
         let mut metrics = Metrics::from_identity(identity);
-        if weighted(self.discover_nat, random_unit()) {
+        let nat_deadline = deadline.min(Instant::now() + self.discover_nat_timeout);
+        if Instant::now() < nat_deadline && weighted(self.discover_nat, random_unit()) {
             if let Some(nat) = discover_nat_type(
                 &self.rfc5780_stun_servers,
                 address,
-                self.discover_nat_timeout,
+                nat_deadline,
                 &self.dns_config,
             ) {
                 *lock(&self.nat_type) = Some(nat);
@@ -1900,10 +1907,6 @@ impl Conduit {
         if let Some(nat) = *lock(&self.nat_type) {
             metrics.set_nat_type(nat);
         }
-        let deadline = Instant::now()
-            + self
-                .timeout
-                .min(self.offer_timeout.saturating_add(self.await_ready_timeout));
         let personal = !self.personal.is_empty();
         let failover = if personal {
             self.no_match_failover_personal
@@ -2099,14 +2102,28 @@ impl Conduit {
             }
         }
         let media = webrtc.media.is_some();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err((
+                "psiphon conduit: offer retry window expired".to_owned(),
+                false,
+            ));
+        }
         let stream = webrtc
-            .into_stream(self.timeout)
+            .into_stream(self.timeout.min(remaining))
             .map_err(|error| (error, false))?;
         let stream = if media && !unreliable {
+            let handshake_remaining = deadline.saturating_duration_since(Instant::now());
+            if handshake_remaining.is_zero() {
+                return Err((
+                    "psiphon conduit: offer retry window expired".to_owned(),
+                    false,
+                ));
+            }
             InproxyStream::Reliable(
                 crate::psiphon_quic::QuicStream::connect_inproxy_reliability(
                     SocketAddr::new(address, 0),
-                    self.timeout,
+                    handshake_remaining,
                     stream,
                     offer_secret,
                 )

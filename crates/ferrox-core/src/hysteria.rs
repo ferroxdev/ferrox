@@ -1,6 +1,6 @@
 //! Hysteria version 2 framing: the bytes around the QUIC streams and datagrams — every TCP flow is one bidirectional stream opening with the `0x401` type as a QUIC varint, the connection authenticates by HTTP/3 `POST /auth` answered with status `233`, and the UDP lane rides QUIC datagrams each carrying a `BE32` session id ahead of a packet id, fragment metadata, a varint address and its payload.
 
-use crate::foxy::{frames, head_end, hpack};
+use crate::foxy::{frames, head_end, hpack, line_end};
 
 pub const TCP_FRAME: u64 = 0x401;
 
@@ -1279,13 +1279,13 @@ fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
     // The framing is longer than the data it wraps, so the framed input bounds the answer and one buffer of its size replaces the doubling series a fresh `Vec` grows through.
     let mut out = Vec::with_capacity(body.len());
     loop {
-        let line_end = body.windows(2).position(|window| window == b"\r\n")?;
-        let header = std::str::from_utf8(&body[..line_end]).ok()?;
+        let end = line_end(body)?;
+        let header = std::str::from_utf8(&body[..end]).ok()?;
         let size = usize::from_str_radix(header.split(';').next()?.trim(), 16).ok()?;
         if size == 0 {
             return Some(out);
         }
-        let start = line_end + 2;
+        let start = end + 2;
         out.extend_from_slice(body.get(start..start + size)?);
         body = body.get(start + size + 2..)?;
     }

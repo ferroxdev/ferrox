@@ -1249,8 +1249,8 @@ fn has_token_bytes(head: &[u8], name: &[u8], token: &[u8]) -> bool {
 }
 
 fn check_response(head: &[u8], key: &[u8]) -> Option<()> {
-    let line_end = head.windows(2).position(|pair| pair == b"\r\n")?;
-    let mut parts = head[..line_end]
+    let end = ferrox_core::foxy::line_end(head)?;
+    let mut parts = head[..end]
         .split(|byte| *byte == b' ')
         .filter(|part| !part.is_empty());
     if parts.next()? != b"HTTP/1.1" || parts.next()? != b"101" {
@@ -1259,7 +1259,7 @@ fn check_response(head: &[u8], key: &[u8]) -> Option<()> {
     let accept = accept_key(base64_text(key));
     let mut seen = false;
     let mut accepted = false;
-    for line in head[line_end + 2..].split(|byte| *byte == b'\n') {
+    for line in head[end + 2..].split(|byte| *byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             break;

@@ -6,8 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ferrox_core::foxy::frames;
-use ferrox_core::foxy::hpack;
+use ferrox_core::foxy::{frames, head_end, hpack};
 
 use crate::quic::{self, Activity, Datagram};
 use crate::xhttp::{XhttpMode, XhttpSettings};
@@ -683,10 +682,6 @@ fn send_fields(wire: &Wire, kind: u64, fields: &[(String, String)]) -> bool {
 fn wire_ready(wire: &Wire, bytes: &[u8]) -> bool {
     let mut wire = wire.clone();
     wire.write_all(bytes).is_ok()
-}
-
-fn head_end(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 fn response_fields(head: &str) -> Vec<(String, String)> {
