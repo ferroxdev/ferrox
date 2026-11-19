@@ -649,10 +649,10 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].frag, 0);
         assert_eq!(fragments[0].frags, 1);
-        assert!(fragments[0].payload.is_empty());
+        assert_eq!(fragments[0].payload, &[] as &[u8]);
         let mut wire = Vec::new();
         encode_udp(&fragments[0], &mut wire).expect("encodes");
-        assert!(decode_udp(&wire).expect("decodes").payload.is_empty());
+        assert_eq!(decode_udp(&wire).expect("decodes").payload, &[] as &[u8]);
     }
 
     #[test]
