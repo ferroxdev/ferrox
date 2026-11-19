@@ -6785,14 +6785,25 @@ mod tests {
         let running = crate::budgets::spawn(move || {
             // Starts after the old observer gave up, so only a loaded-runner budget passes.
             std::thread::sleep(Duration::from_secs(4));
-            let _ = sent.send(sender.send_data(1, b"ping"));
+            let started = std::time::Instant::now();
+            let result = sender.send_data(1, b"ping");
+            let _ = sent.send((result, started.elapsed()));
         });
         let verdict = got.recv_timeout(Duration::from_secs(30));
         conn.dead.store(true, Ordering::SeqCst);
         conn.wake.notify_all();
         running.join().expect("sender thread");
         crate::budgets::clear();
-        assert_eq!(verdict, Ok(false), "a sender with no credit returned");
+        let (result, stall) = verdict.expect("a sender with no credit returned");
+        assert!(!result, "a sender with no credit returned");
+        assert!(
+            stall >= Duration::from_millis(500),
+            "the sender returned before its stall: {stall:?}"
+        );
+        assert!(
+            stall < Duration::from_secs(10),
+            "the sender outran its stall: {stall:?}"
+        );
     }
 
     /// A request that ended its own body still has a response to send: waiting for credit must not
