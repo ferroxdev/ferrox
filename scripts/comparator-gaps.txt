@@ -4,6 +4,10 @@
 # 1.00x of that comparator. A new one, or one worse than its last filed ratio by
 # more than 0.10, still fails the matrix; fixing one warns until its line goes.
 # scenario|comparator|ratio|issue, where scenario is the cell id in cell.json.
+# AnyTLS, after #244 removed the per-byte queue: run 44478024143, standard, ubuntu-latest.
+anytls-tls-raw-down-8--srv-ferrox|sing-box|0.84|249
+anytls-tls-raw-down-8--srv-sing-box|sing-box|0.91|249
+anytls-tls-raw-duplex-8--srv-sing-box|sing-box|0.87|197
 http-raw-down-8--srv-ferrox|sing-box|0.89|359
 http-raw-down-8--srv-xray-core|sing-box|0.86|359
 socks-raw-down-8--srv-ferrox|sing-box|0.89|359

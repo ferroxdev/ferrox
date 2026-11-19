@@ -31,6 +31,7 @@ const PASSWORD_LEN: usize = 32;
 const POLL: Duration = Duration::from_millis(100);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 const STREAM_QUEUE_LIMIT: usize = 64 * 1024;
+const QUEUE_CHUNKS: usize = 16;
 const SESSION_QUEUE_LIMIT: usize = 8 * 1024 * 1024;
 
 const DEFAULT_PADDING: &[u8] = b"stop=8
@@ -213,7 +214,9 @@ impl QueueBudget {
 }
 
 struct StreamInner {
-    queue: VecDeque<u8>,
+    queue: VecDeque<Vec<u8>>,
+    head: usize,
+    queued: usize,
     terminal: Option<Terminal>,
 }
 
@@ -229,6 +232,8 @@ impl StreamState {
         Self {
             inner: Mutex::new(StreamInner {
                 queue: VecDeque::new(),
+                head: 0,
+                queued: 0,
                 terminal: None,
             }),
             wake: Condvar::new(),
@@ -237,7 +242,7 @@ impl StreamState {
         }
     }
 
-    fn push(&self, data: &[u8], alive: &AtomicBool) {
+    fn push(&self, data: Vec<u8>, alive: &AtomicBool) {
         if data.is_empty() {
             return;
         }
@@ -246,7 +251,7 @@ impl StreamState {
         }
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         while inner.terminal.is_none()
-            && inner.queue.len().saturating_add(data.len()) > STREAM_QUEUE_LIMIT
+            && inner.queued.saturating_add(data.len()) > STREAM_QUEUE_LIMIT
             && alive.load(Ordering::Relaxed)
         {
             inner = self
@@ -260,7 +265,14 @@ impl StreamState {
             self.budget.release(data.len());
             return;
         }
-        inner.queue.extend(data.iter().copied());
+        let state = &mut *inner;
+        state.queued += data.len();
+        // A frame keeps its own buffer until the stream holds QUEUE_CHUNKS of them; past that a small frame rides the tail, so a one-byte-frame peer cannot buy one allocation per byte.
+        if state.queue.len() < QUEUE_CHUNKS {
+            state.queue.push_back(data);
+        } else if let Some(tail) = state.queue.back_mut() {
+            tail.extend_from_slice(&data);
+        }
         drop(inner);
         self.wake.notify_all();
     }
@@ -283,14 +295,28 @@ impl StreamState {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if !inner.queue.is_empty() {
-                let len = inner.queue.len().min(buf.len());
-                for slot in &mut buf[..len] {
-                    *slot = inner.queue.pop_front().expect("the queue is not empty");
+                let state = &mut *inner;
+                let mut filled = 0;
+                while filled < buf.len() {
+                    let Some(front) = state.queue.front() else {
+                        break;
+                    };
+                    let take = (front.len() - state.head).min(buf.len() - filled);
+                    buf[filled..filled + take]
+                        .copy_from_slice(&front[state.head..state.head + take]);
+                    filled += take;
+                    state.head += take;
+                    let drained = state.head == front.len();
+                    if drained {
+                        state.head = 0;
+                        state.queue.pop_front();
+                    }
                 }
+                state.queued -= filled;
                 drop(inner);
-                self.budget.release(len);
+                self.budget.release(filled);
                 self.wake.notify_all();
-                return Ok(len);
+                return Ok(filled);
             }
             if let Some(terminal) = &inner.terminal {
                 return match terminal {
@@ -326,8 +352,7 @@ impl Drop for StreamState {
             .inner
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
-            .queue
-            .len();
+            .queued;
         self.budget.release(bytes);
     }
 }
@@ -1076,7 +1101,7 @@ fn read_server(reader: &mut dyn Read, session: &Arc<Session>, context: &Arc<Serv
                     .get(&frame.stream)
                     .cloned();
                 if let Some(state) = state {
-                    state.push(&frame.payload, &shared.alive);
+                    state.push(frame.payload, &shared.alive);
                 }
             }
             SYN => {
@@ -1189,7 +1214,7 @@ fn read_loop(reader: &mut dyn Read, shared: &Arc<Shared>) {
                     .get(&frame.stream)
                     .cloned();
                 if let Some(state) = state {
-                    state.push(&frame.payload, &shared.alive);
+                    state.push(frame.payload, &shared.alive);
                 }
             }
             FIN => {
@@ -1725,7 +1750,7 @@ mod tests {
         encode_address(&destination, &mut encoded).expect("encodes");
         let stream = test_stream(&shared, 1);
         for byte in &encoded {
-            stream.state.push(std::slice::from_ref(byte), &shared.alive);
+            stream.state.push(vec![*byte], &shared.alive);
         }
         assert!(matches!(
             read_address_stream(&stream, Instant::now() + OPEN_TIMEOUT),
@@ -1734,12 +1759,106 @@ mod tests {
 
         let short = test_stream(&shared, 2);
         encoded.pop();
-        short.state.push(&encoded, &shared.alive);
+        short.state.push(encoded, &shared.alive);
         short.state.end(Terminal::Eof);
         let error = read_address_stream(&short, Instant::now() + OPEN_TIMEOUT)
             .err()
             .expect("short address");
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn a_read_drains_across_queued_frames_and_then_the_end() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::new(Shared::new(
+            Box::new(Sink(written)),
+            Padding::default_scheme(),
+            false,
+        ));
+        let stream = test_stream(&shared, 4);
+        stream.state.push(vec![0xa; 3], &shared.alive);
+        stream.state.push(vec![0xb; 2], &shared.alive);
+        stream.state.end(Terminal::Eof);
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            stream
+                .state
+                .read(&mut buf, None, &shared.alive)
+                .expect("reads"),
+            4
+        );
+        assert_eq!(buf, [0xa, 0xa, 0xa, 0xb]);
+        assert_eq!(
+            stream
+                .state
+                .read(&mut buf, None, &shared.alive)
+                .expect("reads"),
+            1
+        );
+        assert_eq!(buf[0], 0xb);
+        assert_eq!(
+            stream
+                .state
+                .read(&mut buf, None, &shared.alive)
+                .expect("ends"),
+            0
+        );
+    }
+
+    #[test]
+    fn a_queued_frame_keeps_the_buffer_it_arrived_in() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::new(Shared::new(
+            Box::new(Sink(written)),
+            Padding::default_scheme(),
+            false,
+        ));
+        let stream = test_stream(&shared, 6);
+        for size in [MAX_FRAME, 4096, 1] {
+            let payload = vec![0x5a; size];
+            let base = payload.as_ptr();
+            let room = payload.capacity();
+            stream.state.push(payload, &shared.alive);
+            let inner = stream
+                .state
+                .inner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let queued = inner.queue.back().expect("a queued chunk");
+            assert_eq!(queued.as_ptr(), base);
+            assert_eq!(queued.capacity(), room);
+            drop(inner);
+            let mut buf = vec![0u8; size];
+            assert_eq!(
+                stream
+                    .state
+                    .read(&mut buf, None, &shared.alive)
+                    .expect("reads"),
+                size
+            );
+            assert!(buf.iter().all(|byte| *byte == 0x5a));
+        }
+    }
+
+    #[test]
+    fn a_stream_queue_keeps_its_slots_bounded() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::new(Shared::new(
+            Box::new(Sink(written)),
+            Padding::default_scheme(),
+            false,
+        ));
+        let stream = test_stream(&shared, 5);
+        for _ in 0..4096 {
+            stream.state.push(vec![0x7], &shared.alive);
+        }
+        let inner = stream
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(inner.queue.len() <= QUEUE_CHUNKS);
+        assert_eq!(inner.queued, 4096);
     }
 
     #[test]
