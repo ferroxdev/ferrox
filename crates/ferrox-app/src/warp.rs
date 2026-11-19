@@ -2642,9 +2642,9 @@ fn validate_gool(identity: &Identity, spec: &WarpSpec) -> Result<(), String> {
     }
     let inner = spec.gool_identity_in(true)?;
     build_masque(identity, spec)?;
-    let remote = spec.gool.peer.unwrap_or(inner.wireguard.endpoint);
+    let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
     let settings =
-        wireguard_settings_with_endpoint(&inner, spec, remote, spec.mtu.min(GOOL_INNER_MTU));
+        wireguard_settings_with_endpoint(&inner, spec, local, spec.mtu.min(GOOL_INNER_MTU));
     let config = crate::wireguard::DeviceConfig::from_json(&settings)?;
     crate::wg::WireGuardOut::with_noise(config, spec.noize.wireguard())?;
     Ok(())

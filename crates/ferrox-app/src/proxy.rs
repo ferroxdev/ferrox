@@ -4379,7 +4379,7 @@ fn server_networks(inbound: &Json) -> Option<Vec<crate::router::Network>> {
     match canonical_protocol(protocol) {
         "shadowsocks" => {
             let (tcp, udp) = inbound_ss_networks(inbound);
-            let udp = matches!(inbound_carrier(inbound), Carrier::Raw(_)) && (tcp || udp);
+            let udp = udp && matches!(inbound_carrier(inbound), Carrier::Raw(_));
             let mut networks = Vec::with_capacity(2);
             if tcp {
                 networks.push(crate::router::Network::Tcp);
@@ -45645,6 +45645,19 @@ mod tests {
         assert_eq!(inbound_ss_networks(&unsupported), (false, false));
         let absent = crate::json::parse(r#"{"settings": {"password": "p"}}"#).expect("parses");
         assert_eq!(inbound_ss_networks(&absent), (true, true));
+    }
+
+    #[test]
+    fn a_tcp_only_shadowsocks_inbound_proves_only_tcp() {
+        let inbound = crate::json::parse(
+            r#"{"protocol":"shadowsocks","settings":{"network":"tcp","password":"p"}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            server_networks(&inbound),
+            Some(vec![crate::router::Network::Tcp]),
+            "a tcp-only listener serves no udp route"
+        );
     }
 
     #[test]
