@@ -48,15 +48,15 @@ graph TD
 | ops-retired-instructions | 32598 | scripts/count-ops.sh |
 | syscalls-per-tun-packet | UNBLESSED | no syscall checker yet |
 | user-space-copies-per-tun-packet | UNBLESSED | no copy checker yet |
-| time-tcp-down-1 | ferrox=13.694Gbit/s,zeptun=24.779Gbit/s,ratio=0.55 | tun-bench.yml |
-| time-tcp-down-10 | ferrox=20.155Gbit/s,zeptun=37.995Gbit/s,ratio=0.53 | tun-bench.yml |
-| time-tcp-up-1 | ferrox=18.249Gbit/s,zeptun=25.497Gbit/s,ratio=0.72 | tun-bench.yml |
-| time-tcp-up-10 | ferrox=21.682Gbit/s,zeptun=34.407Gbit/s,ratio=0.63 | tun-bench.yml |
-| time-rr | ferrox=8777tps,zeptun=20447tps,ratio=0.43 | tun-bench.yml |
-| time-rr-8x1k | ferrox=57098tps,zeptun=113654tps,ratio=0.50 | tun-bench.yml |
-| time-udp-100k | ferrox=96226pps,zeptun=99950pps,ratio=0.96 | tun-bench.yml |
-| cpu-cores-at-tcp-down-10 | ferrox=2.9cores,zeptun=1.8cores | tun-bench.yml |
-| rss-mb-at-ten-flows | ferrox=74MB,zeptun=5MB | tun-bench.yml |
+| time-tcp-down-1 | ferrox=13.392Gbit/s,hev=16.669Gbit/s,ratio=0.80 | tun-bench.yml |
+| time-tcp-down-10 | ferrox=19.778Gbit/s,hev=44.010Gbit/s,ratio=0.45 | tun-bench.yml |
+| time-tcp-up-1 | ferrox=17.395Gbit/s,hev=22.832Gbit/s,ratio=0.76 | tun-bench.yml |
+| time-tcp-up-10 | ferrox=20.417Gbit/s,hev=38.620Gbit/s,ratio=0.53 | tun-bench.yml |
+| time-rr | ferrox=8544tps,hev=16513tps,ratio=0.52 | tun-bench.yml |
+| time-rr-8x1k | ferrox=58519tps,hev=91060tps,ratio=0.64 | tun-bench.yml |
+| time-udp-100k | ferrox=99240pps,hev=99301pps,ratio=1.00 | tun-bench.yml |
+| cpu-cores-at-tcp-down-10 | ferrox=2.96cores,hev=2.09cores | tun-bench.yml |
+| rss-mb-at-ten-flows | ferrox=74.0MB,hev=2.5MB | tun-bench.yml |
 | writes-after-a-refused-packet | 2 | ferrox-app-tun-stack::tests::a_refused_packet_is_dropped_and_the_next_still_goes_out |
 <!-- counts:end -->
 
