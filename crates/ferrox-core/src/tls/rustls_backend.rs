@@ -2100,9 +2100,9 @@ pub(crate) fn sni_matches(names: &[String], sni: &str) -> bool {
         .any(|name| name.eq_ignore_ascii_case(sni) || name.eq_ignore_ascii_case(&wildcard))
 }
 
-/// The names xray compares an SNI against: the leaf's DNS SANs and subject common name. An
-/// issuer-backed resolver ignores a Common Name once the leaf carries any DNS SAN, because a
-/// verifier that sees SANs does not fall back to the Common Name.
+/// The names a served certificate answers: its DNS SANs and subject common name. An issuer-backed
+/// resolver serves only DNS SANs, since a verifier does not fall back to the Common Name, so a leaf
+/// with none reaches the issuer for every host instead of shadowing it with an unusable name.
 pub(crate) fn certificate_names(leaf: &[u8], issuer: bool) -> Vec<String> {
     let Ok(cert) = boring::x509::X509::from_der(leaf) else {
         return Vec::new();
@@ -2115,7 +2115,7 @@ pub(crate) fn certificate_names(leaf: &[u8], issuer: bool) -> Vec<String> {
             }
         }
     }
-    if issuer && !names.is_empty() {
+    if issuer {
         return names;
     }
     for entry in cert
@@ -3010,6 +3010,25 @@ mod tests {
         assert!(
             issuer_usable(cert.pem().as_bytes(), key.serialize_pem().as_bytes()).is_ok(),
             "a CA whose last instant is the calendar's edge still signs leaves"
+        );
+    }
+
+    #[test]
+    fn an_issued_leaf_does_not_shadow_the_issuer_with_a_common_name_alone() {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "cn.test");
+        let cert = params.self_signed(&key).expect("cert");
+        assert_eq!(
+            certificate_names(cert.der().as_ref(), false),
+            vec!["cn.test".to_owned()],
+            "a static-only server still answers the Common Name"
+        );
+        assert!(
+            certificate_names(cert.der().as_ref(), true).is_empty(),
+            "an issuer-backed server sends the host to the issuer instead"
         );
     }
 
