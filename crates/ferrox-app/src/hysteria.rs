@@ -2082,9 +2082,9 @@ fn read_origin<R: Read>(stream: &mut R, head: &[u8]) -> Option<hysteria::OriginR
                     let mut extra = [0u8; 1];
                     clipped = loop {
                         match stream.read(&mut extra) {
-                            Ok(0) => break false,
                             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                            Ok(_) | Err(_) => break true,
+                            Ok(0) | Err(_) => break false,
+                            Ok(_) => break true,
                         }
                     };
                     break;

@@ -226,6 +226,15 @@ impl Stream {
         }
     }
 
+    /// Carry the absolute establishment deadline into a fragment loop that sleeps between writes.
+    fn set_write_deadline(&self, deadline: Option<Instant>) {
+        match self {
+            Self::Fragment(stream) => stream.set_deadline(deadline),
+            Self::ShadowsocksFragment(stream) => stream.set_deadline(deadline),
+            _ => {}
+        }
+    }
+
     fn shutdown(&self) -> io::Result<()> {
         match self {
             Self::Tcp(socket) => socket.shutdown(Shutdown::Both),
@@ -4446,6 +4455,7 @@ fn write_all_deadline(
 ) -> io::Result<()> {
     while !bytes.is_empty() {
         arm_deadline(io, deadline)?;
+        io.set_write_deadline(deadline);
         match io.write(bytes) {
             Ok(0) => {
                 return Err(io::Error::new(

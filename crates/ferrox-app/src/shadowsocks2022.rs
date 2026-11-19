@@ -38,7 +38,7 @@ fn salt_seen(salt: &[u8]) -> bool {
     let mut key = [0u8; 32];
     key[..salt.len()].copy_from_slice(salt);
     let mut guard = WINDOW
-        .get_or_init(|| Mutex::new(crate::proxy::Replay::new(SKEW + 1)))
+        .get_or_init(|| Mutex::new(crate::proxy::Replay::new(SKEW * 2 + 1)))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.seen(&key, now_secs())
@@ -334,11 +334,11 @@ fn accept_on(
         let key_len = method.key_len();
         let mut salt = vec![0u8; key_len];
         read_exact(reader, &mut salt).ok()?;
+        let mut recv = Cipher::from_psk(method, &list[0], &salt)?;
+        let (target, early) = read_request(reader, &mut recv)?;
         if salt_seen(&salt) {
             return None;
         }
-        let mut recv = Cipher::from_psk(method, &list[0], &salt)?;
-        let (target, early) = read_request(reader, &mut recv)?;
         let server_salt = fresh_salt(key_len)?;
         let send = Cipher::from_psk(method, &list[0], &server_salt)?;
         let response = Response::new(send, server_salt, salt);
@@ -356,9 +356,6 @@ fn accept_on(
     }
     let mut salt_probe = vec![0u8; method.key_len()];
     read_exact(reader, &mut salt_probe).ok()?;
-    if salt_seen(&salt_probe) {
-        return None;
-    }
     let mut eih = [0u8; BLOCK_LEN];
     read_exact(reader, &mut eih).ok()?;
     let hash = shadowsocks2022::decrypt_eih(method, &list[0], &salt_probe, &eih)?;
@@ -373,6 +370,9 @@ fn accept_on(
         .unwrap_or_default();
     let mut recv = Cipher::from_psk(method, &user, &salt_probe)?;
     let (target, early) = read_request(reader, &mut recv)?;
+    if salt_seen(&salt_probe) {
+        return None;
+    }
     let server_salt = fresh_salt(method.key_len())?;
     let send = Cipher::from_psk(method, &user, &server_salt)?;
     let response = Response::new(send, server_salt, salt_probe);
@@ -4181,7 +4181,7 @@ mod tests {
     }
     #[test]
     fn a_replay_at_the_timestamp_boundary_is_still_refused() {
-        let mut replay = crate::proxy::Replay::new(SKEW + 1);
+        let mut replay = crate::proxy::Replay::new(SKEW * 2 + 1);
         let key = [7u8; 32];
         assert!(!replay.seen(&key, 1_000));
         assert!(replay.seen(&key, 1_000 + SKEW * 2));
