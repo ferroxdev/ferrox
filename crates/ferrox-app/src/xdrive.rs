@@ -4749,7 +4749,11 @@ impl Template {
             vars.sub(&op.url)
         };
         let store = Target::parse(&store_url);
-        let store_ips = store.as_ref().map(target_ips).unwrap_or_default();
+        let store_ips = if self.http.front.is_none() {
+            store.as_ref().map(target_ips).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let (status, payload) = self.do_op(op, vars, None)?;
         if !(200..300).contains(&status) {
             return Ok((status, payload));
