@@ -4797,7 +4797,6 @@ mod tests {
             &masque_inbound,
             &freedom_outbound(Some(&redirect)),
             "127.0.0.1:0",
-            None,
         )
         .expect("the masque server serves");
 
@@ -4906,7 +4905,6 @@ mod tests {
             &outer_inbound,
             &freedom_outbound(Some(&redirect)),
             "127.0.0.1:0",
-            None,
         )
         .expect("the outer masque server serves");
 
