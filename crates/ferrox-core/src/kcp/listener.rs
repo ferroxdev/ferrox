@@ -534,13 +534,24 @@ mod tests {
                 inner.sessions.lock().unwrap().remove(&key);
             }
         });
+        struct ReleaseOnDrop(Arc<AtomicBool>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(AtomicBool::new(false));
+        let guard = ReleaseOnDrop(Arc::clone(&released));
         let session = Connection::new(
             ConnMetadata {
                 local,
                 remote: local,
                 conversation: 1,
             },
-            Box::new(|_| Ok(())),
+            Box::new(move |_| {
+                let _ = &guard;
+                Ok(())
+            }),
             closer,
             Config::default(),
         );
@@ -559,6 +570,10 @@ mod tests {
         assert!(
             seen.recv_timeout(Duration::from_secs(5)).is_ok(),
             "close did not return: it held the session lock across terminate"
+        );
+        assert!(
+            released.load(Ordering::SeqCst),
+            "terminate must release the writer's socket clone"
         );
     }
 
