@@ -8560,8 +8560,7 @@ pub(crate) mod loopback {
         let (lane, assigned) = opened.expect("the status arrived");
         assert!(assigned.is_none(), "no address was assigned");
         drop(lane);
-        // The pooled session outlives this lane, so the edge is left to its own hold rather than joined.
-        drop(edge);
+        join_edge_within(edge, Duration::from_secs(5));
     }
 
     /// The packet a datagram is built in is the lane's own buffer, and it stays that buffer: across a push and a drain the base pointer does not move and the capacity does not grow. A byte-level test passes with the copy and without it, so only the pointer can witness that the packet was not built in a buffer of its own.
@@ -9072,21 +9071,24 @@ pub(crate) mod loopback {
                     _ => {}
                 }
             }
-            // The assignment never comes, and the pooled session outlives the lane, so the edge holds long enough that only the budget can end the wait: a lane that stops reading on the first timeout is not what this edge is testing.
+            // The assignment never comes, and the pooled session outlives the lane, so the wait ends on the lane's own reset (or a backstop past the head budget): a lane that stops reading on the first timeout is not what this edge is testing.
             let hold = Instant::now() + Duration::from_secs(6);
-            let mut sink = [0u8; 256];
             while Instant::now() < hold {
-                match tls.read(&mut sink) {
-                    Ok(0) => return,
-                    Ok(_) => {}
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock
-                                | std::io::ErrorKind::TimedOut
-                                | std::io::ErrorKind::Interrupted
-                        ) => {}
-                    Err(_) => return,
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let Some(frame) = frames::H2Frame::parse(&header) else {
+                    return;
+                };
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if frame.stream == 1
+                    && (frame.kind == frames::RST_STREAM || frame.kind == frames::GOAWAY)
+                {
+                    return;
                 }
             }
         })
