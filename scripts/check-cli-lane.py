@@ -2818,16 +2818,15 @@ def check_instance_lifecycle(state: pathlib.Path) -> int:
                 file=sys.stderr,
             )
             return 1
-        for name, legacy in (("lane-backup", False), ("lane-legacy", True)):
-            (state / f"{name}.json").write_text(
-                '{"inbounds": [], "outbounds": []}\n', encoding="utf-8"
-            )
+        for instance, legacy in (("backup", False), ("legacy", True)):
+            config = state / f"lane-{instance}.json"
+            config.write_text('{"inbounds": [], "outbounds": []}\n', encoding="utf-8")
             if legacy:
-                (state / f"{name}.meta").write_text(
-                    f"config={state / f'{name}.json'}\nfronts=\n", encoding="utf-8"
+                (state / f"lane-{instance}.meta").write_text(
+                    f"config={config}\nfronts=\n", encoding="utf-8"
                 )
             unknown = subprocess.run(
-                [str(CLI), "down", "--instance", name],
+                [str(CLI), "down", "--instance", instance],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
@@ -2835,7 +2834,7 @@ def check_instance_lifecycle(state: pathlib.Path) -> int:
                 env=env,
             )
             output += unknown.stdout + unknown.stderr
-            if unknown.returncode != 0 or not (state / f"{name}.json").exists():
+            if unknown.returncode != 0 or not config.exists():
                 print(
                     f"check-cli-lane: down --instance deleted an unknown-owner config:\n{output}",
                     file=sys.stderr,
