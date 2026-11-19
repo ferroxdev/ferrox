@@ -2215,6 +2215,69 @@ pub(crate) fn parse_target(address: &str) -> io::Result<Target> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "address resolved to nothing"))
 }
 
+/// Probe a unix listen path without creating or removing it: a live socket refuses the name, a stale one and an absent path pass, and a file that is not a socket is refused.
+#[cfg(any(unix, windows))]
+pub(crate) fn probe_unix(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if abstract_name(path).is_some() {
+            return Ok(());
+        }
+        let (path, _) = split_permission(path);
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if !meta.file_type().is_socket() => Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "a unix listen path names a file that is not a socket",
+            )),
+            Ok(_) => match std::os::unix::net::UnixStream::connect(path) {
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "a unix listen path names a live socket",
+                )),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(windows)]
+    {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) if !is_unix_socket(path)? => Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "a unix listen path names a file that is not a socket",
+            )),
+            Ok(_) => match UnixStream::connect(path) {
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "a unix listen path names a live socket",
+                )),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// One `http`/`https` URL taken apart for a dial: the scheme's TLS need, the host and port to reach,
 /// the authority a `Host` line repeats, and the path with its query.
 #[derive(Debug, Clone)]
@@ -2638,6 +2701,22 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
+    if stale.is_some() {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "a unix listen path names a live socket",
+                ))
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
     let Some(mode) = perm else {
         take_stale(path, stale)?;
         return UnixListener::bind(path);
@@ -2856,7 +2935,23 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
                 "a unix listen path names a file that is not a socket",
             ))
         }
-        Ok(_) => std::fs::remove_file(path)?,
+        Ok(_) => match UnixStream::connect(path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "a unix listen path names a live socket",
+                ))
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                std::fs::remove_file(path)?
+            }
+            Err(error) => return Err(error),
+        },
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
@@ -4239,6 +4334,31 @@ mod tests {
             kept,
             "the file is untouched"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A preflight probe refuses a socket that still has a listener and leaves its path in place,
+    /// so a config that later proves unreadable cannot make the live listener unreachable.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_probe_refuses_a_live_socket_without_removing_it() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-probe-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("binds a live socket");
+        assert!(
+            probe_unix(&path).is_err(),
+            "a live socket refuses the probe"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "the live socket keeps its path"
+        );
+        drop(listener);
+        std::fs::remove_file(&path).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 

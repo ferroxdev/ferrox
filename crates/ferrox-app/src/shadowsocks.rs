@@ -1531,7 +1531,12 @@ mod poll_set {
     }
 }
 
-pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool) {
+pub(crate) fn serve_udp_on(
+    clients: &UdpSocket,
+    users: &[SsUser],
+    freedom: bool,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) {
     if !freedom || users.is_empty() {
         return;
     }
@@ -1540,13 +1545,17 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool)
     }
     match users.iter().position(|user| user.method.is_stream()) {
         // Nothing in a stream datagram proves which client sent it, so the first stream account owns the front's udp side.
-        Some(which) => serve_udp_stream(clients, &users[which]),
-        None => serve_udp_aead(clients, users),
+        Some(which) => serve_udp_stream(clients, &users[which], stop),
+        None => serve_udp_aead(clients, users, stop),
     }
 }
 
 /// One socket pair and one destination table serve a stream account: a reply is addressed to the last client that named its destination, and the table is capped rather than grown, so a stream front admits no descriptor for traffic it cannot prove.
-fn serve_udp_stream(clients: &UdpSocket, user: &SsUser) {
+fn serve_udp_stream(
+    clients: &UdpSocket,
+    user: &SsUser,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) {
     let Ok(v4) = UdpSocket::bind("0.0.0.0:0") else {
         return;
     };
@@ -1565,6 +1574,9 @@ fn serve_udp_stream(clients: &UdpSocket, user: &SsUser) {
     let mut buf = vec![0u8; DATAGRAM_MAX];
     let mut reply = vec![0u8; DATAGRAM_MAX];
     loop {
+        if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst)) {
+            break;
+        }
         match clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
             Ok((n, src)) => {
                 let datagram = &mut buf[SEAL_ROOM..SEAL_ROOM + n];
@@ -1617,7 +1629,11 @@ fn serve_udp_stream(clients: &UdpSocket, user: &SsUser) {
 /// Serve an AEAD front: one upstream association per client source, each with its own sockets, so a
 /// reply reaches the one account that opened it. The pass parks in `poll` until a socket is ready or
 /// the earliest association goes idle, so a quiet front costs no wakeups.
-fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
+fn serve_udp_aead(
+    clients: &UdpSocket,
+    users: &[SsUser],
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) {
     if clients.set_nonblocking(true).is_err() {
         return;
     }
@@ -1629,6 +1645,9 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
     let mut owners: Vec<Option<(SocketAddr, bool)>> = Vec::new();
     let idle = crate::budgets::udp_idle();
     loop {
+        if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst)) {
+            break;
+        }
         rows.clear();
         owners.clear();
         rows.push(poll_set::socket_row(clients));
@@ -1649,6 +1668,16 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
             .map_or(-1, |left| {
                 i32::try_from(left.as_millis()).unwrap_or(i32::MAX)
             });
+        let timeout = if stop.is_some() {
+            let poll = i32::try_from(RELAY_POLL.as_millis()).unwrap_or(i32::MAX);
+            if timeout < 0 {
+                poll
+            } else {
+                timeout.min(poll)
+            }
+        } else {
+            timeout
+        };
         let Ok(ready) = poll_set::wait(&mut rows, timeout) else {
             break;
         };
@@ -2807,7 +2836,7 @@ mod tests {
         let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let front_addr = front.local_addr().expect("addr");
         let serving = users.clone();
-        thread::spawn(move || serve_udp_on(&front, &serving, true));
+        thread::spawn(move || serve_udp_on(&front, &serving, true, None));
         let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let mut wire = vec![0u8; DATAGRAM_MAX];
@@ -2872,7 +2901,7 @@ mod tests {
         let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let front_addr = front.local_addr().expect("addr");
         let serving = users.clone();
-        thread::spawn(move || serve_udp_on(&front, &serving, true));
+        thread::spawn(move || serve_udp_on(&front, &serving, true, None));
         let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
         client
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -3804,7 +3833,7 @@ mod tests {
         }];
         let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let front_addr = front.local_addr().expect("addr");
-        thread::spawn(move || serve_udp_on(&front, &users, true));
+        thread::spawn(move || serve_udp_on(&front, &users, true, None));
         let (a, b) = (
             UdpSocket::bind("127.0.0.1:0").expect("binds"),
             UdpSocket::bind("127.0.0.1:0").expect("binds"),

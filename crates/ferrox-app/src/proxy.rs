@@ -557,11 +557,12 @@ fn stop_covers_inbound(inbound: &Json, protocol: &str) -> bool {
         "shadowsocks" => match carrier {
             Carrier::Raw(_) => {
                 let (tcp, udp) = inbound_ss_networks(inbound);
-                tcp && !udp
+                tcp || udp
             }
             Carrier::Kcp(_) | Carrier::Xdrive { .. } | Carrier::Hysteria(_) | Carrier::Quic => {
                 false
             }
+            Carrier::Xhttp { .. } if inbound_is_xhttp_h3(inbound) => true,
             _ => inbound_ss_networks(inbound).0,
         },
         "socks" | "http" | "mixed" => true,
@@ -704,15 +705,18 @@ fn serve_inbounds_counted(
                         }
                     }
                     "shadowsocks" => {
-                        if serve_shadowsocks_inbound(
+                        let listeners = serve_shadowsocks_inbound(
                             address,
                             inbound,
                             freedom,
                             &configured,
                             handler_stop.as_ref(),
-                        ) {
+                        );
+                        if listeners > 0 {
                             if let Some(stop) = recorded_stop {
-                                handler_stops.push((Arc::clone(stop), address.clone()));
+                                for _ in 0..listeners {
+                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                }
                             }
                             inbounds += 1;
                         }
@@ -933,6 +937,10 @@ fn serve_inbounds_counted(
                     for address in &armed_addresses {
                         wake_listener(stop, address);
                     }
+                    if !handler_stops.is_empty() {
+                        stop.expect_listeners(handler_stops.len());
+                        let _ = stop.wait_closed();
+                    }
                 }
                 inbounds = before;
                 continue;
@@ -1028,6 +1036,7 @@ fn inbound_sockets(inbound: &Json, protocol: &str) -> (bool, bool) {
                 Carrier::Kcp(_) | Carrier::Hysteria(_) => (false, tcp),
                 // CR-029: a tcp carrier still serves when its optional udp front loses the bind, so only preflight a udp-only inbound.
                 Carrier::Raw(_) => (tcp, udp && !tcp),
+                Carrier::Xhttp { .. } if inbound_is_xhttp_h3(inbound) => (false, true),
                 _ => (tcp, false),
             }
         }
@@ -1047,6 +1056,22 @@ enum Reservation {
     Udp(UdpSocket),
 }
 
+/// Reserve a listener without destroying a unix socket: a path is probed for a live listener, an IP target is bound.
+fn preflight_tcp(
+    target: &crate::conn::Target,
+    address: &str,
+) -> Result<Option<Reservation>, String> {
+    #[cfg(any(unix, windows))]
+    if let crate::conn::Target::Unix(path) = target {
+        crate::conn::probe_unix(path)
+            .map_err(|error| format!("cannot listen on {address}: {error}"))?;
+        return Ok(None);
+    }
+    let listener = crate::conn::Listener::bind(target)
+        .map_err(|error| format!("cannot listen on {address}: {error}"))?;
+    Ok(Some(Reservation::Tcp(listener)))
+}
+
 /// Bind every socket a dynamic inbound would open before serving any of them, so a port already
 /// taken refuses the whole add and nothing is left behind.
 fn preflight_inbound(inbound: &Json, protocol: &str, addresses: &[String]) -> Result<(), String> {
@@ -1062,9 +1087,9 @@ fn preflight_inbound(inbound: &Json, protocol: &str, addresses: &[String]) -> Re
         }
         if tcp {
             let target = parse_target(address).map_err(|error| format!("{address}: {error}"))?;
-            let listener = crate::conn::Listener::bind(&target)
-                .map_err(|error| format!("cannot listen on {address}: {error}"))?;
-            held.push(Reservation::Tcp(listener));
+            if let Some(reservation) = preflight_tcp(&target, address)? {
+                held.push(reservation);
+            }
         }
         if udp && !transparent_door {
             let socket = UdpSocket::bind(address)
@@ -17357,7 +17382,7 @@ fn bind_udp_front(address: &str, tcp: bool, wanted: bool, label: &str) -> UdpFro
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RelayFront {
     NotRelay,
-    Served,
+    Served(usize),
     Refused,
 }
 
@@ -17392,7 +17417,6 @@ fn serve_ss_relay_inbound(
         UdpFront::Unasked => None,
         UdpFront::Bound(clients) => Some(clients),
     };
-    let udp_served = udp_front.is_some();
     if tcp {
         let Ok(target) = parse_target(address) else {
             if FALLIBLE_BIND.with(std::cell::Cell::get) {
@@ -17439,15 +17463,28 @@ fn serve_ss_relay_inbound(
             }
         });
     }
+    let mut listeners = usize::from(tcp);
     if let Some(clients) = udp_front {
+        listeners += 1;
         let udp_dests = relay_dests.clone();
         let udp_psk = psk.clone();
+        let udp_stop = stop.cloned();
+        let udp_cancel = stop.map(|stop| stop.shared());
         thread::spawn(move || {
-            crate::shadowsocks2022::serve_udp_relay(&clients, parsed, &udp_psk, &udp_dests);
+            crate::shadowsocks2022::serve_udp_relay(
+                &clients,
+                parsed,
+                &udp_psk,
+                &udp_dests,
+                udp_cancel.as_deref(),
+            );
+            if let Some(stop) = udp_stop {
+                stop.mark_closed();
+            }
         });
     }
-    if tcp || udp_served {
-        RelayFront::Served
+    if listeners > 0 {
+        RelayFront::Served(listeners)
     } else {
         RelayFront::Refused
     }
@@ -17460,19 +17497,19 @@ fn serve_ss_relay_front(
     carrier: &Carrier,
     freedom: bool,
     stop: Option<&Arc<Stop>>,
-) -> Option<bool> {
+) -> Option<usize> {
     if let Carrier::Hysteria(config) = carrier {
         let tcp = inbound_ss_networks(inbound).0;
-        return Some(serve_ss_hysteria_front(
+        return Some(usize::from(serve_ss_hysteria_front(
             config, address, inbound, accounts, tcp, freedom,
-        ));
+        )));
     }
     if !matches!(carrier, Carrier::Raw(_)) {
         return None;
     }
     match serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method, stop) {
-        RelayFront::Served => Some(true),
-        RelayFront::Refused => Some(false),
+        RelayFront::Served(listeners) => Some(listeners),
+        RelayFront::Refused => Some(0),
         RelayFront::NotRelay => None,
     }
 }
@@ -17590,7 +17627,7 @@ fn serve_ss_tls_front(
     accounts: Arc<crate::shadowsocks::SsAccounts>,
     freedom: bool,
     stop: Option<&Arc<Stop>>,
-) -> Option<bool> {
+) -> Option<usize> {
     let Some(server) = inbound_tls_identity(inbound) else {
         // A refused identity takes only the stream half: a udp relay this config asked for still opens.
         eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
@@ -17598,12 +17635,12 @@ fn serve_ss_tls_front(
     };
     if let Carrier::Xhttp { settings } = &carrier {
         if crate::xhttp_h3::is_h3(&server.alpn) {
-            return Some(serve_ss_xhttp_h3(
+            return Some(usize::from(serve_ss_xhttp_h3(
                 address, &server, settings, &accounts, freedom, stop,
-            ));
+            )));
         }
     }
-    Some(spawn_role_stopped(
+    Some(usize::from(spawn_role_stopped(
         address,
         inbound_role(
             inbound,
@@ -17616,7 +17653,7 @@ fn serve_ss_tls_front(
         ),
         inbound_tag(inbound),
         stop.cloned(),
-    ))
+    )))
 }
 
 fn serve_shadowsocks_inbound(
@@ -17625,7 +17662,7 @@ fn serve_shadowsocks_inbound(
     freedom: bool,
     configured: &HashSet<String>,
     stop: Option<&Arc<Stop>>,
-) -> bool {
+) -> usize {
     let password = inbound_ss_password(inbound);
     let account = inbound_account(inbound);
     let method = inbound_method(inbound);
@@ -17646,14 +17683,14 @@ fn serve_shadowsocks_inbound(
     }
     // Bind the datagram front here: a worker that binds after this function answers true would turn a lost race for the port into a live inbound that never answers.
     let udp_front = match bind_udp_front(address, tcp, udp_accounts.is_some(), "shadowsocks udp") {
-        UdpFront::Refused => return false,
+        UdpFront::Refused => return 0,
         UdpFront::Unasked => None,
         UdpFront::Bound(socket) => Some(socket),
     };
     if !tcp && !udp {
-        return false;
+        return 0;
     }
-    let mut served = false;
+    let mut served = 0usize;
     if tcp {
         match carrier {
             Carrier::Kcp(config) => {
@@ -17666,9 +17703,9 @@ fn serve_shadowsocks_inbound(
                     &account.email,
                     account.level,
                 ) {
-                    return false;
+                    return 0;
                 }
-                served = true;
+                served += 1;
             }
             Carrier::Xdrive { settings } => {
                 let accounts = Arc::clone(&accounts);
@@ -17680,13 +17717,13 @@ fn serve_shadowsocks_inbound(
                     serve_ss_xdrive(session.with_meter(meter.clone()), &accounts, freedom);
                 });
                 serve_xdrive_loop(&settings, address, accept);
-                served = true;
+                served += 1;
             }
             carrier if stream_security(inbound) == "tls" => {
-                if let Some(served) =
+                if let Some(listeners) =
                     serve_ss_tls_front(address, inbound, carrier, accounts, freedom, stop)
                 {
-                    return served;
+                    return listeners;
                 }
             }
             _ if !matches!(stream_security(inbound), "" | "none") => {
@@ -17694,7 +17731,7 @@ fn serve_shadowsocks_inbound(
                 eprintln!("shadowsocks security `{security}` on {address}: refused, not served");
             }
             other => {
-                served = spawn_role_stopped(
+                if spawn_role_stopped(
                     address,
                     inbound_role(
                         inbound,
@@ -17707,12 +17744,16 @@ fn serve_shadowsocks_inbound(
                     ),
                     inbound_tag(inbound),
                     stop.cloned(),
-                );
+                ) {
+                    served += 1;
+                }
             }
         }
     }
     if let (Some(accounts), Some(clients)) = (udp_accounts, udp_front) {
-        served = true;
+        served += 1;
+        let udp_stop = stop.cloned();
+        let udp_cancel = stop.map(|stop| stop.shared());
         thread::spawn(move || {
             if accounts.is_2022 {
                 crate::shadowsocks2022::serve_udp_on(
@@ -17720,9 +17761,18 @@ fn serve_shadowsocks_inbound(
                     &accounts.password,
                     &accounts.method,
                     freedom,
+                    udp_cancel.as_deref(),
                 );
             } else {
-                crate::shadowsocks::serve_udp_on(&clients, &accounts.users, freedom);
+                crate::shadowsocks::serve_udp_on(
+                    &clients,
+                    &accounts.users,
+                    freedom,
+                    udp_cancel.as_deref(),
+                );
+            }
+            if let Some(stop) = udp_stop {
+                stop.mark_closed();
             }
         });
     }
@@ -58669,7 +58719,7 @@ mod tests {
                 true,
                 &std::collections::HashSet::new(),
                 None,
-            ),
+            ) > 0,
             "the kcp listener arms"
         );
         let ss = ShadowsocksOut {
@@ -58791,13 +58841,13 @@ mod tests {
         )
         .expect("parses");
         assert!(
-            !serve_shadowsocks_inbound(
+            serve_shadowsocks_inbound(
                 "127.0.0.1:0",
                 &inbound,
                 true,
                 &std::collections::HashSet::new(),
                 None
-            ),
+            ) == 0,
             "a network list with neither tcp nor udp opens no listener"
         );
     }
@@ -59314,13 +59364,15 @@ mod tests {
                 "streamSettings": {{{settings}}}}}"#
         ))
         .expect("parses");
-        assert!(serve_shadowsocks_inbound(
-            "127.0.0.1:9",
-            &inbound,
-            true,
-            &std::collections::HashSet::new(),
-            None
-        ));
+        assert!(
+            serve_shadowsocks_inbound(
+                "127.0.0.1:9",
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None
+            ) > 0
+        );
         let root = crate::json::parse(&format!(
             r#"{{"outbounds": [{{"protocol": "shadowsocks",
                 "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
@@ -59551,13 +59603,15 @@ mod tests {
                 "streamSettings": {{{settings}}}}}"#
         ))
         .expect("parses");
-        assert!(serve_shadowsocks_inbound(
-            "127.0.0.1:9",
-            &inbound,
-            true,
-            &std::collections::HashSet::new(),
-            None
-        ));
+        assert!(
+            serve_shadowsocks_inbound(
+                "127.0.0.1:9",
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None
+            ) > 0
+        );
         let root = crate::json::parse(&format!(
             r#"{{"outbounds": [{{"protocol": "shadowsocks",
                 "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
@@ -64269,7 +64323,7 @@ mod tests {
         let password = "an-example-shared-password";
         let users = crate::shadowsocks::account(password, "aes-256-gcm");
         thread::spawn(move || {
-            crate::shadowsocks::serve_udp_on(&front, &users, true);
+            crate::shadowsocks::serve_udp_on(&front, &users, true, None);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let master = ferrox_core::shadowsocks::MasterKey::new(password, 32);
@@ -64323,7 +64377,7 @@ mod tests {
         let users: Vec<crate::shadowsocks::SsUser> =
             first.iter().chain(second.iter()).cloned().collect();
         thread::spawn(move || {
-            crate::shadowsocks::serve_udp_on(&front, &users, true);
+            crate::shadowsocks::serve_udp_on(&front, &users, true, None);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let ask = |password: &str,
@@ -64559,13 +64613,15 @@ mod tests {
         .expect("parses");
         let port = trojan_mux_probe_port();
         let address = format!("127.0.0.1:{port}");
-        assert!(serve_shadowsocks_inbound(
-            &address,
-            &inbound,
-            true,
-            &std::collections::HashSet::new(),
-            None
-        ));
+        assert!(
+            serve_shadowsocks_inbound(
+                &address,
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None
+            ) > 0
+        );
         wait_tcp(port, "ss2022");
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let ss = ss2022_mux_out(port, Carrier::Raw(Chain::default()), &password);
@@ -64614,13 +64670,15 @@ mod tests {
         .expect("parses");
         let port = trojan_mux_probe_port();
         let address = format!("127.0.0.1:{port}");
-        assert!(serve_shadowsocks_inbound(
-            &address,
-            &inbound,
-            true,
-            &std::collections::HashSet::new(),
-            None
-        ));
+        assert!(
+            serve_shadowsocks_inbound(
+                &address,
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None
+            ) > 0
+        );
         wait_tcp(port, "ss2022 udp");
         let ss = ss2022_mux_out(port, Carrier::Raw(Chain::default()), &password);
         let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
@@ -64723,13 +64781,15 @@ mod tests {
             let port = probe.local_addr().expect("addr").port();
             drop(probe);
             let address = format!("127.0.0.1:{port}");
-            assert!(serve_shadowsocks_inbound(
-                &address,
-                &inbound,
-                true,
-                &std::collections::HashSet::new(),
-                None
-            ));
+            assert!(
+                serve_shadowsocks_inbound(
+                    &address,
+                    &inbound,
+                    true,
+                    &std::collections::HashSet::new(),
+                    None
+                ) > 0
+            );
             assert!(matches!(inbound_carrier(&inbound), Carrier::Kcp(_)));
             thread::sleep(Duration::from_millis(100));
             let ss = ss_mux_out(port, method, password, inbound_carrier(&inbound));
@@ -64764,13 +64824,15 @@ mod tests {
         .expect("parses");
         let port = trojan_mux_probe_port();
         let address = format!("127.0.0.1:{port}");
-        assert!(serve_shadowsocks_inbound(
-            &address,
-            &inbound,
-            true,
-            &std::collections::HashSet::new(),
-            None
-        ));
+        assert!(
+            serve_shadowsocks_inbound(
+                &address,
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None
+            ) > 0
+        );
         wait_tcp(port, "ss ws");
         let ss = ShadowsocksOut {
             address: "127.0.0.1".to_owned(),
@@ -65160,13 +65222,14 @@ mod tests {
                 drop(udp);
                 drop(tcp);
                 let address = format!("127.0.0.1:{port}");
-                if !serve_shadowsocks_inbound(
+                if serve_shadowsocks_inbound(
                     &address,
                     &inbound,
                     true,
                     &std::collections::HashSet::new(),
                     None,
-                ) {
+                ) == 0
+                {
                     return None;
                 }
                 std::net::TcpStream::connect(("127.0.0.1", port))
@@ -65224,13 +65287,13 @@ mod tests {
         )
         .expect("parses");
         assert!(
-            !serve_shadowsocks_inbound(
+            serve_shadowsocks_inbound(
                 "203.0.113.1:9",
                 &inbound,
                 true,
                 &std::collections::HashSet::new(),
                 None
-            ),
+            ) == 0,
             "a udp-only front that cannot bind is not served"
         );
     }
@@ -65307,7 +65370,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let users = crate::shadowsocks::account("an-example-shared-password", "aes-256-gcm");
-            crate::shadowsocks::serve_udp_on(&tunnel, &users, true);
+            crate::shadowsocks::serve_udp_on(&tunnel, &users, true, None);
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -65388,7 +65451,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let users = crate::shadowsocks::account("an-example-shared-password", "aes-256-gcm");
-            crate::shadowsocks::serve_udp_on(&tunnel, &users, true);
+            crate::shadowsocks::serve_udp_on(&tunnel, &users, true, None);
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
