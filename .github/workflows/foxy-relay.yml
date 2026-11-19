@@ -842,7 +842,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ferrox-relay-log-${{ matrix.os }}
-          path: ferrox-relay.log
+          path: |
+            ferrox-relay.log
+            foxy-resources.tsv
+          if-no-files-found: ignore
           retention-days: 3
       - name: Summarise
         if: always() && steps.secrets.outputs.present == 'true'
@@ -902,6 +905,10 @@ jobs:
               print("| (no leg recorded a transfer) | 0 | 0.00 | 0.00 | - | 0.00 | 0.00 | 0.00 | 0.00 |")
           PY
           )
+          resources=""
+          if [ -f foxy-resources.tsv ]; then
+            resources=$(tail -n +2 foxy-resources.tsv | awk '{printf "| %s | %s | %s |\n", $1, $2, $3}')
+          fi
           echo "$table"
           {
             echo
@@ -910,15 +917,19 @@ jobs:
             echo "| leg | bytes | seconds | MiB/s | vs this runner's own egress | proxy open | tls through the lane | first byte | transfer tail |"
             echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
             echo "$table"
-            if [ -f foxy-resources.tsv ]; then
+            if [ -n "$resources" ]; then
               echo
               echo "### Lane CPU and peak RSS, live (${{ matrix.os }})"
               echo
               echo "| carrier | CPU ms | peak RSS KiB |"
               echo "| --- | --- | --- |"
-              tail -n +2 foxy-resources.tsv | awk '{printf "| %s | %s | %s |\n", $1, $2, $3}'
+              echo "$resources"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$resources" ]; then
+            echo "### Lane CPU and peak RSS, live (${{ matrix.os }})"
+            echo "$resources"
+          fi
 
   result:
     name: result
