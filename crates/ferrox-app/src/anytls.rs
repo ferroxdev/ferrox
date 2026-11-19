@@ -1806,6 +1806,41 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_frame_keeps_the_buffer_it_arrived_in() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::new(Shared::new(
+            Box::new(Sink(written)),
+            Padding::default_scheme(),
+            false,
+        ));
+        let stream = test_stream(&shared, 6);
+        for size in [MAX_FRAME, 4096, 1] {
+            let payload = vec![0x5a; size];
+            let base = payload.as_ptr();
+            let room = payload.capacity();
+            stream.state.push(payload, &shared.alive);
+            let inner = stream
+                .state
+                .inner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let queued = inner.queue.back().expect("a queued chunk");
+            assert_eq!(queued.as_ptr(), base);
+            assert_eq!(queued.capacity(), room);
+            drop(inner);
+            let mut buf = vec![0u8; size];
+            assert_eq!(
+                stream
+                    .state
+                    .read(&mut buf, None, &shared.alive)
+                    .expect("reads"),
+                size
+            );
+            assert!(buf.iter().all(|byte| *byte == 0x5a));
+        }
+    }
+
+    #[test]
     fn a_stream_queue_keeps_its_slots_bounded() {
         let written = Arc::new(Mutex::new(Vec::new()));
         let shared = Arc::new(Shared::new(
