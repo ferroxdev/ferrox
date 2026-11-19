@@ -5658,6 +5658,7 @@ pub(crate) mod loopback {
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;
             }
+            let mut left = statuses.len();
             let mut answers = statuses.into_iter();
             loop {
                 let mut header = [0u8; frames::H2_HEADER];
@@ -5686,6 +5687,11 @@ pub(crate) mod loopback {
                 );
                 tls.write_all(&out).expect("answers");
                 tls.flush().expect("flushes");
+                left -= 1;
+                if left == 0 {
+                    std::thread::sleep(Duration::from_millis(250));
+                    return;
+                }
             }
         })
     }
