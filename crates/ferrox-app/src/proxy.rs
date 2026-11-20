@@ -586,6 +586,15 @@ fn serve_inbounds_counted(
 ) -> usize {
     if fallible {
         FALLIBLE_BIND.with(|fallible| fallible.set(true));
+        let mut closing = CLOSING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        closing.retain(|stop| !stop.is_closed());
+        if !closing.is_empty() {
+            eprintln!("inbound add refused: a previous listener is still closing");
+            FALLIBLE_BIND.with(|fallible| fallible.set(false));
+            return 0;
+        }
     }
     let routed =
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
@@ -1238,6 +1247,10 @@ impl Stop {
 
     fn stopped(&self) -> bool {
         self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.lock().map_or(false, |closed| *closed)
     }
 
     pub(crate) fn mark_closed(&self) {
@@ -3008,7 +3021,7 @@ impl RouteShared {
             return Ok(());
         };
         let next_script = next.script_shared();
-        // Both writers swap rules and script as one generation, so no flow reads a half-swapped pair.
+        // Both writers swap rules and script as one generation, so a flow reads one whole script or one whole table.
         let mut script = self
             .script_router
             .write()
@@ -3861,12 +3874,15 @@ impl RoutePlan {
             attrs: facts.attrs,
             process: facts.process,
         };
-        let script = self
-            .shared
-            .script_router
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(script) = script.as_deref() {
+        let script = {
+            let router = self
+                .shared
+                .script_router
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            router.as_ref().map(Arc::clone)
+        };
+        if let Some(script) = script {
             let Some(callbacks) = self.shared.script.as_ref() else {
                 return self.default_lane();
             };
