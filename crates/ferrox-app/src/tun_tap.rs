@@ -211,21 +211,22 @@ fn frame_ipv6(
     Some(out)
 }
 
-/// The ICMPv6 checksum over the IPv6 pseudo-header and the message.
+/// The `ICMPv6` checksum over the IPv6 pseudo-header and the message.
 fn icmpv6_checksum(source: &Ipv6Addr, destination: &Ipv6Addr, message: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     for octets in [source.octets(), destination.octets()] {
-        for pair in octets.chunks_exact(2) {
-            sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+        let (pairs, _) = octets.as_chunks::<2>();
+        for pair in pairs {
+            sum += u32::from(u16::from_be_bytes(*pair));
         }
     }
     sum += u32::from(u16::try_from(message.len()).unwrap_or(u16::MAX));
     sum += u32::from(ICMPV6);
-    let mut words = message.chunks_exact(2);
-    for pair in &mut words {
-        sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+    let (words, rest) = message.as_chunks::<2>();
+    for pair in words {
+        sum += u32::from(u16::from_be_bytes(*pair));
     }
-    if let [last] = words.remainder() {
+    if let [last] = rest {
         sum += u32::from(u16::from_be_bytes([*last, 0]));
     }
     while sum >> 16 != 0 {

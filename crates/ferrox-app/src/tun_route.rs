@@ -259,16 +259,12 @@ impl Drop for Guard {
         for route in routes.into_iter().rev() {
             // Two live captures can add the same destination; the kernel keeps one entry, so the last one to close removes it.
             let shared = others.iter().any(|guard| {
-                guard
-                    .added
-                    .lock()
-                    .map(|held| {
-                        held.iter().any(|other| {
-                            other.destination() == route.destination()
-                                && other.prefix() == route.prefix()
-                        })
+                guard.added.lock().is_ok_and(|held| {
+                    held.iter().any(|other| {
+                        other.destination() == route.destination()
+                            && other.prefix() == route.prefix()
                     })
-                    .unwrap_or(false)
+                })
             });
             if !shared {
                 let _ = manager.delete(&route);

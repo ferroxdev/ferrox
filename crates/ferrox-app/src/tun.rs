@@ -92,6 +92,7 @@ const DEFAULT_PREFIX: u8 = 15;
 const DEFAULT_PREFIX_V6: u8 = 64;
 const MAX_QUEUES: usize = 4;
 
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Spec {
     name: String,
     mtu: usize,
@@ -202,7 +203,7 @@ impl Spec {
         self.tap
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn peer(&self) -> Option<&str> {
         self.peer.as_deref()
     }
@@ -892,6 +893,7 @@ pub(crate) struct Device {
 
 impl Device {
     /// One device per configured queue; every handler reads its own queue and passes the same flow table, so a segment that lands on another queue still finds its flow.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn open_all(spec: &Spec) -> io::Result<Vec<Self>> {
         #[cfg(unix)]
         if let Some(fd) = spec.fd() {

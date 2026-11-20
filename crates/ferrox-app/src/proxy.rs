@@ -17870,7 +17870,15 @@ fn tun_spec(inbound: &Json) -> Result<crate::tun::Spec, String> {
         eprintln!("tun inbound: `tap` opens a macOS feth pair; this host opens a TUN instead");
     }
     let peer = tun_string(inbound, "peer")?.or(tun_string(inbound, "peer_feth")?);
-    spec = spec.with_tap(tap && cfg!(target_os = "macos"), peer.as_deref());
+    // The pair's other half is a macOS `feth` name; elsewhere the value is validated and dropped with the one-line warning above.
+    #[cfg(target_os = "macos")]
+    let peer = peer.as_deref();
+    #[cfg(not(target_os = "macos"))]
+    let peer = {
+        let _ = peer;
+        None
+    };
+    spec = spec.with_tap(tap && cfg!(target_os = "macos"), peer);
     spec.validate().map_err(|error| error.to_string())?;
     Ok(spec)
 }
