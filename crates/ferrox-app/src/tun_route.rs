@@ -193,7 +193,8 @@ impl Guard {
         let covered = |(outer, prefix): &(IpAddr, u8)| {
             same_family(*outer, address) && covers(*outer, *prefix, address, bits)
         };
-        if self.plan.keep().iter().any(covered) || self.plan.routes().iter().any(covered) {
+        // A kept prefix already has its route; a capture prefix does not, so the dial still needs its host route above the halves.
+        if self.plan.keep().iter().any(covered) {
             return;
         }
         let base = if address.is_ipv4() {
@@ -347,12 +348,15 @@ mod tests {
             ],
             &keep,
         );
-        assert!(plan
-            .routes()
-            .contains(&(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16)));
-        assert!(!plan
-            .routes()
-            .contains(&(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16)));
+        assert!(
+            plan.routes()
+                .contains(&(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16))
+        );
+        assert!(
+            !plan
+                .routes()
+                .contains(&(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16))
+        );
     }
 
     #[test]
@@ -391,6 +395,41 @@ mod tests {
                 .filter(|named| **named == route)
                 .count(),
             1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN; ci.yml runs it as root"]
+    fn a_real_guard_installs_pins_and_retires_a_route() {
+        let target: IpAddr = "192.0.2.1".parse().unwrap();
+        let captured = "192.0.2.0".parse().unwrap();
+        let first = Guard::install("lo", &Plan::new(false, false, &[(captured, 24)], &[]))
+            .expect("install a route on loopback");
+        let mut manager = RouteManager::new().expect("route table");
+        let installed = manager.find_route(&target).expect("read").expect("route");
+        assert_eq!(installed.prefix(), 24);
+        let second =
+            Guard::install("lo", &Plan::new(false, false, &[], &[])).expect("second capture");
+        pin_dialled(target);
+        let pinned = manager.find_route(&target).expect("read").expect("route");
+        assert_eq!(
+            pinned.prefix(),
+            32,
+            "the dialled address is pinned above the /24"
+        );
+        drop(first);
+        let shared = manager.find_route(&target).expect("read").expect("route");
+        assert_eq!(
+            shared.prefix(),
+            32,
+            "the last live guard keeps the pinned route"
+        );
+        drop(second);
+        let retired = manager.find_route(&target).expect("read");
+        assert!(
+            retired.is_none_or(|route| route.prefix() != 32),
+            "the last guard removes the route it added"
         );
     }
 

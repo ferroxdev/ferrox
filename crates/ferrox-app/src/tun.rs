@@ -8,8 +8,8 @@
 //! the loopback test set; the oracle lives in `scripts/tun-oracle`.
 //!
 //! Platform opens: the `tun-rs` builder on Linux and macOS, or an inherited descriptor
-//! (`FERROX_TUN_FD`). The privileged opens are compile-checked only — no CI runner holds
-//! `CAP_NET_ADMIN` — while the inherited-fd path runs fully in tests.
+//! (`FERROX_TUN_FD`). The inherited-fd path runs fully in tests; `ci.yml` runs the privileged
+//! Linux TUN open, the Linux route table and the macOS `feth` pair under `sudo`.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, UdpSocket};
 #[cfg(any(not(unix), test))]
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -27,8 +27,9 @@ use std::os::unix::net::UnixStream;
 use crate::budgets;
 use crate::conn::Connection;
 use ferrox_core::foxy::connectip::{
-    icmp_echo_reply, ipv4_checksum, ipv4_head, ipv6_head, pseudo_header_checksum, tcp_checksum,
-    udp_datagram, udp_head, UdpDatagram, IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP, UDP_HEADER,
+    IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP, UDP_HEADER, UdpDatagram, icmp_echo_reply,
+    ipv4_checksum, ipv4_head, ipv6_head, pseudo_header_checksum, tcp_checksum, udp_datagram,
+    udp_head,
 };
 
 const DEFAULT_MTU: usize = 1500;
@@ -668,11 +669,7 @@ fn path_mss(mtu: u32, ipv6: bool) -> u32 {
 
 /// How much a response read may take: one segment without offload, the whole buffer when the descriptor can split a GSO packet.
 fn read_limit(gso: bool, mss: usize, room: usize) -> usize {
-    if gso {
-        room
-    } else {
-        mss.min(room)
-    }
+    if gso { room } else { mss.min(room) }
 }
 
 /// How long a queue waits for an answer that follows its own upload: an echo replies inside this window on this bench's own p50, and past it the response thread's read is the cheaper waiter, so a queue that carries a second flow holds it for less.
@@ -2407,6 +2404,7 @@ impl Handler {
             let len = payload.len() as u32;
             // What the queue served behind the upload: an answer already carries this segment's ack, a refused one ends the flow.
             let mut served = Served::None;
+            let mut advanced = false;
             // A pure ACK only moves the window: it never touches the upload half, so it takes no pipe lock.
             if !payload.is_empty() || fin {
                 let mut guard = flow
@@ -2431,6 +2429,7 @@ impl Handler {
                     // The cursor moves by what the pipe accepted, so a short or refused write is the device's to retransmit; the read leg still delivers what the relay wrote before it closed.
                     let sent = half.write(&payload[skip..]).unwrap_or(0);
                     end = rcv.wrapping_add(sent as u32);
+                    advanced = sent > 0;
                     flow.rcv_nxt.store(end, Relaxed);
                     if sent > 0 && !fin {
                         served = self.serve_inline(half, &flow);
@@ -2446,15 +2445,20 @@ impl Handler {
                 self.retire(&flow, Some(FLAG_RST | FLAG_ACK));
                 return Ok(());
             }
-            // Every data segment or FIN gets an ACK: a segment without PSH must not wait for a later one that may never come, and a duplicate still has to stop a retransmit.
+            // A push, a finish, a duplicate or two segments of new data earn an ACK: a full segment without PSH waits for the one after it, and a duplicate through the gap still stops the retransmit.
             let unacked = flow
                 .rcv_nxt
                 .load(Relaxed)
                 .wrapping_sub(flow.last_acked.load(Relaxed));
+            let limit = 2 * flow.mss.load(Relaxed).max(1);
+            let due = fin
+                || tcp.flags & FLAG_PSH != 0
+                || (!payload.is_empty() && (!advanced || unacked >= limit))
+                || (payload.is_empty() && unacked > 0);
             if let Served::Ack(ack) = served {
                 // The response carried this segment's ack, so the standalone one would only repeat it, and the cursor stored is the one that left rather than whatever another queue advanced meanwhile.
                 flow.last_acked.store(ack, Relaxed);
-            } else if fin || !payload.is_empty() || unacked > 0 {
+            } else if due {
                 let snd = flow.snd_nxt.load(Relaxed);
                 let rcv = flow.rcv_nxt.load(Relaxed);
                 let mut emit = std::mem::take(&mut self.emit);
@@ -3170,21 +3174,31 @@ mod tests {
     fn the_tun_spec_defaults_ipv6_and_bounds_its_values() {
         let spec = Spec::with(None, None, Some("2001:db8::1".parse().unwrap()), None, None);
         assert_eq!(spec.prefix(), 64);
-        assert!(Spec::with(None, Some(65_536), None, None, None)
-            .validate()
-            .is_err());
-        assert!(Spec::with(None, None, None, Some(33), None)
-            .validate()
-            .is_err());
-        assert!(Spec::with(None, None, None, None, Some(0))
-            .validate()
-            .is_err());
-        assert!(Spec::with(None, None, None, None, Some(5))
-            .validate()
-            .is_err());
-        assert!(Spec::with(None, None, None, Some(0), None)
-            .validate()
-            .is_ok());
+        assert!(
+            Spec::with(None, Some(65_536), None, None, None)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Spec::with(None, None, None, Some(33), None)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Spec::with(None, None, None, None, Some(0))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Spec::with(None, None, None, None, Some(5))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Spec::with(None, None, None, Some(0), None)
+                .validate()
+                .is_ok()
+        );
     }
 
     #[cfg(unix)]
@@ -3213,6 +3227,25 @@ mod tests {
             "the host's own flags are left alone"
         );
         unsafe { libc::close(fd) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN; ci.yml runs it as root"]
+    fn a_real_tun_device_opens_and_names_itself() {
+        let name = format!("fxt{}", std::process::id() % 10000);
+        let spec = Spec::new(Some(&name), Some(1500))
+            .with_addresses(vec![("192.0.2.1".parse().unwrap(), 24)]);
+        let (device, _, _) =
+            crate::tun_stack::build(&spec, false, false).expect("create a real TUN device");
+        assert_eq!(device.name().expect("the kernel names the device"), name);
+        device.set_nonblocking(true).expect("poll the device");
+        let mut buf = [0u8; 2048];
+        match device.recv(&mut buf) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("read the idle device: {error}"),
+            Ok(n) => panic!("an idle device carries no packet, read {n}"),
+        }
     }
 
     #[test]

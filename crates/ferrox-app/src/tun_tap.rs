@@ -435,6 +435,70 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "needs root for a feth pair; ci.yml runs it under sudo"]
+    fn a_real_feth_pair_carries_an_arp_request_to_the_bridge() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let base = 2000 + (std::process::id() % 500) as usize;
+        let name = format!("feth{base}");
+        let peer = format!("feth{}", base + 1);
+        let _ = Command::new("route")
+            .args(["-n", "delete", "-host", "198.18.0.9"])
+            .status();
+        let spec = crate::tun::Spec::new(Some(&name), Some(1500))
+            .with_addresses(vec![("198.18.0.1".parse().unwrap(), 15)])
+            .with_tap(true, Some(&peer));
+        let (device, _, _) =
+            crate::tun_stack::build(&spec, false, false).expect("open a real feth pair");
+        let device_name = device.name().expect("the device names its half");
+        let bridge = Bridge::new(&device_name, vec!["198.18.0.1".parse().unwrap()], true);
+        let added = Command::new("route")
+            .args([
+                "-n",
+                "add",
+                "-host",
+                "198.18.0.9",
+                "-interface",
+                &device_name,
+            ])
+            .status()
+            .expect("route add");
+        assert!(added.success(), "a host route through the device");
+        device.set_nonblocking(true).expect("poll the device");
+        let mut ping = Command::new("ping")
+            .args(["-c", "1", "-t", "1", "198.18.0.9"])
+            .spawn()
+            .expect("ping the peer");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut buf = [0u8; 2048];
+        let mut answered = false;
+        while Instant::now() < deadline && !answered {
+            match device.recv(&mut buf) {
+                Ok(n) => match bridge.accept(&buf[..n]) {
+                    Accepted::Reply(reply) => {
+                        assert_eq!(u16::from_be_bytes([reply[12], reply[13]]), ARP);
+                        assert_eq!(&reply[20..22], &[0, 2], "an ARP reply");
+                        device.send(&reply).expect("write the reply to the peer");
+                        answered = true;
+                    }
+                    Accepted::Ip(_) | Accepted::Ignore => {}
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("read the feth peer: {error}"),
+            }
+        }
+        let _ = ping.wait();
+        let _ = Command::new("route")
+            .args(["-n", "delete", "-host", "198.18.0.9"])
+            .status();
+        assert!(answered, "the kernel's ARP request reached the bridge");
+    }
+
     #[test]
     fn a_tap_leaves_a_frame_for_another_address_alone() {
         let bridge = Bridge::new("feth0", vec!["10.0.0.1".parse().unwrap()], false);
