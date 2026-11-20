@@ -2315,7 +2315,7 @@ fn register_staged(inner: &std::path::Path, published: &std::path::Path) {
 
 /// One staged bind's registry entry, released when its listener closes so repeated adds do not grow the table.
 #[cfg(unix)]
-struct StagedRegistration {
+pub(crate) struct StagedRegistration {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     inner: std::path::PathBuf,
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
@@ -2682,6 +2682,7 @@ pub(crate) enum Listener {
     Unix {
         listener: UnixListener,
         #[cfg(unix)]
+        #[allow(dead_code, reason = "held until the listener drops")]
         staged: Option<StagedRegistration>,
     },
 }
