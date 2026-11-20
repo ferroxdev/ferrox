@@ -30779,6 +30779,7 @@ fn datagram_uplink(
 }
 
 /// Freedom UDP: the machine's own socket per destination, since a datagram here has no carrier to ride.
+#[allow(clippy::too_many_lines)]
 fn serve_socks_udp_freedom(
     relay: &UdpSocket,
     freedom: &FreedomOut,

@@ -2294,7 +2294,7 @@ fn proc_unix_entry(line: &[u8]) -> Option<(&[u8], bool)> {
         rest = trim_ascii_start(rest);
         let end = rest
             .iter()
-            .position(|byte| byte.is_ascii_whitespace())
+            .position(u8::is_ascii_whitespace)
             .unwrap_or(rest.len());
         if field == 3 {
             flags = &rest[..end];
@@ -2316,11 +2316,6 @@ fn trim_ascii_start(mut bytes: &[u8]) -> &[u8] {
         bytes = &bytes[1..];
     }
     bytes
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn proc_unix_row(line: &str) -> Option<(&[u8], bool)> {
-    proc_unix_entry(line.as_bytes())
 }
 
 /// A bind records the private staging address it bound, so a copied staging name is never mistaken for another path's listener.
@@ -4727,7 +4722,7 @@ mod tests {
     fn a_proc_row_keeps_the_whole_pathname() {
         let row = "0000000000000000: 00000002 00000000 00010000 0001 01   123 /tmp/a b";
         assert_eq!(
-            proc_unix_row(row),
+            proc_unix_entry(row.as_bytes()),
             Some((&b"/tmp/a b"[..], true)),
             "a pathname with a space was truncated"
         );
