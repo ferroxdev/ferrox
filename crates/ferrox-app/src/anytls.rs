@@ -696,7 +696,12 @@ impl Read for AnyTlsStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let timeout = self.state.armed.load(Ordering::Relaxed).then_some(POLL);
+        // A relay lane reads this stream to learn whether the peer has bytes, so its corpus matches a socket's armed read rather than a frame's wait.
+        let timeout = self
+            .state
+            .armed
+            .load(Ordering::Relaxed)
+            .then_some(crate::budgets::RELAY_POLL);
         self.state.read(buf, timeout, &self.session.shared.alive)
     }
 }

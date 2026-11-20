@@ -46,6 +46,8 @@ What is not removed: the auth prologue still hashes the password with SHA-256, e
 
 No CI benchmark has measured an AnyTLS frame, so `nanoseconds-per-frame` is `UNBLESSED` and no local duration is quoted.
 
+What the armed read costs, measured by `benchmark-matrix.yml` (standard tier, ubuntu, five repeats, run 44694333777 against base run 44690485212). A served flow's read of the tunnel is the leg that finds whether the peer has bytes; it waited a 100 ms frame's worth of time, and with eight flows every relay lane worker was held in that wait, so the downlink only moved one window per wait. Arming it at the relay's own 1 ms grain lets the worker come back and pump the other direction: `anytls-tls-raw-down-8--srv-ferrox` went 236.6 to 989.6 MiB/s for our client, and 233.1 to 996.1 for the sing-box client riding the same listener — the server was the cap for every client, not this engine. `anytls-tls-raw-duplex-8--srv-ferrox` went 1115.8 to 1479.1, and the `--srv-sing-box` cells (where the reference serves) moved 0.74x with every engine, so the difference is runner state and not this change; `vless-raw-down-1` controls ran 1.03 to 1.08x faster and pay nothing. The read still wakes on the stream's own condvar, so a busy leg is notified rather than polled.
+
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/anytls.rs
 - symbols: anytls
