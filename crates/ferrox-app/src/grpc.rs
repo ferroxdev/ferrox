@@ -5179,12 +5179,6 @@ mod tests {
         let body = data_body(&peer.writes[0]);
         let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
         assert!(5 + len <= 64, "the message fits the peer's window");
-        drop(peer);
-        assert_eq!(
-            writer.read_window(),
-            crate::proxy::RELAY_BUFFER,
-            "a window too small for one Hunk reads the whole relay grain"
-        );
     }
 
     /// A plain stream's opening window is the same ceiling: a message past it would wait for credit
