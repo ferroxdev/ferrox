@@ -95,7 +95,7 @@ pub(crate) fn host_local(ip: IpAddr) -> bool {
     }
     let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: `getifaddrs` initializes `list` on success; the matching `freeifaddrs` releases it.
-    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+    if unsafe { libc::getifaddrs(std::ptr::addr_of_mut!(list)) } != 0 {
         return true;
     }
     if list.is_null() {
