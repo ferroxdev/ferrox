@@ -205,8 +205,8 @@ pub(crate) fn masque_candidates(mode: ScanMode) -> Vec<SocketAddr> {
     for ip in &sampled {
         push(*ip, MASQUE_PORTS[0]);
     }
-    for seed in &seeds {
-        for &port in &MASQUE_PORTS[1..] {
+    for &port in &MASQUE_PORTS[1..] {
+        for seed in &seeds {
             push(*seed, port);
         }
     }
@@ -309,32 +309,83 @@ pub(crate) fn hunt<F>(
 where
     F: Fn(SocketAddr) -> Option<Duration> + Sync,
 {
+    hunt_with_early(candidates, Vec::new(), mode, excluded, verify)
+}
+
+pub(crate) fn masque_hunt<F>(
+    mode: ScanMode,
+    excluded: &HashSet<SocketAddr>,
+    verify: F,
+) -> Vec<(SocketAddr, Duration)>
+where
+    F: Fn(SocketAddr) -> Option<Duration> + Sync,
+{
+    let candidates = masque_candidates(mode);
+    let fallback = candidates
+        .iter()
+        .position(|edge| edge.port() != MASQUE_PORTS[0])
+        .unwrap_or(candidates.len());
+    let (edges, fallbacks) = candidates.split_at(fallback);
+    hunt_with_early(edges.to_vec(), fallbacks.to_vec(), mode, excluded, verify)
+}
+
+fn hunt_with_early<F>(
+    candidates: Vec<SocketAddr>,
+    early: Vec<SocketAddr>,
+    mode: ScanMode,
+    excluded: &HashSet<SocketAddr>,
+    verify: F,
+) -> Vec<(SocketAddr, Duration)>
+where
+    F: Fn(SocketAddr) -> Option<Duration> + Sync,
+{
     let strategy = mode.strategy();
     let candidates: Vec<SocketAddr> = candidates
         .into_iter()
         .filter(|edge| !excluded.contains(edge))
         .collect();
-    if candidates.is_empty() {
+    let early: Vec<SocketAddr> = early
+        .into_iter()
+        .filter(|edge| !excluded.contains(edge))
+        .collect();
+    if candidates.is_empty() && early.is_empty() {
         return Vec::new();
     }
     let index = AtomicUsize::new(0);
+    let early_index = AtomicUsize::new(0);
     let done = AtomicBool::new(false);
     let deadline = Instant::now() + strategy.deadline;
     let (sender, receiver) = mpsc::channel();
     let mut found = Vec::new();
     std::thread::scope(|scope| {
-        for _ in 0..strategy.concurrency.min(candidates.len()) {
+        let workers = strategy.concurrency.min(candidates.len() + early.len());
+        for worker in 0..workers {
             let sender = sender.clone();
             let index = &index;
+            let early_index = &early_index;
+            // One worker keeps the seed fallbacks from waiting behind every sampled 443 edge.
+            let early_lane = worker == 0 && !early.is_empty();
             let done = &done;
             let candidates = &candidates;
+            let early = &early;
             let verify = &verify;
             scope.spawn(move || loop {
                 if done.load(Ordering::Relaxed) || Instant::now() >= deadline {
                     break;
                 }
-                let at = index.fetch_add(1, Ordering::Relaxed);
-                let Some(&edge) = candidates.get(at) else {
+                let next = if early_lane {
+                    early
+                        .get(early_index.fetch_add(1, Ordering::Relaxed))
+                        .copied()
+                } else {
+                    None
+                };
+                let edge = next.or_else(|| {
+                    candidates
+                        .get(index.fetch_add(1, Ordering::Relaxed))
+                        .copied()
+                });
+                let Some(edge) = edge else {
                     break;
                 };
                 let result = verify(edge);
