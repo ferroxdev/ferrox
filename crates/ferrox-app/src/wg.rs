@@ -430,9 +430,19 @@ impl WireGuardOut {
         asked: &Destination,
         prefix: &[u8],
     ) {
-        let destinations = self.destinations(asked);
-        if destinations.is_empty() {
+        let allowed = self.destinations(asked);
+        if allowed.is_empty() {
             eprintln!("wireguard: no peer allows `{asked:?}`");
+            return;
+        }
+        let destinations: Vec<_> = allowed
+            .into_iter()
+            .filter(|target| !crate::wg_kernel::host_local(target.ip()))
+            .collect();
+        if destinations.is_empty() {
+            eprintln!(
+                "wireguard: kernel mode cannot carry host-local `{asked:?}`; set `kernelMode: false` for the userspace stack"
+            );
             return;
         }
         let kernel = Arc::clone(kernel);
@@ -478,6 +488,7 @@ impl WireGuardOut {
         let mut buf = crate::proxy::udp_buffer();
         let mut app = None;
         let mut seen = 0u64;
+        let mut local_warned = false;
         let mut quiet = Instant::now();
         let _ = relay.set_read_timeout(Some(KERNEL_UDP_POLL));
         if let Some(associate) = associate {
@@ -528,6 +539,16 @@ impl WireGuardOut {
             };
             let mut targets = self.destinations(&dest);
             if targets.is_empty() {
+                continue;
+            }
+            targets.retain(|target| !crate::wg_kernel::host_local(target.ip()));
+            if targets.is_empty() {
+                if !local_warned {
+                    eprintln!(
+                        "wireguard: kernel mode cannot carry host-local `{dest:?}`; set `kernelMode: false` for the userspace stack"
+                    );
+                    local_warned = true;
+                }
                 continue;
             }
             if let Some(key) = &key {
@@ -684,8 +705,17 @@ impl WireGuardOut {
 
     #[cfg(target_os = "linux")]
     fn query_kernel(&self, host: &str) -> Option<(Vec<IpAddr>, u32)> {
+        static LOCAL_DNS_WARNED: AtomicBool = AtomicBool::new(false);
         let kernel = self.kernel.as_ref()?;
         self.query_with(host, &|_source, server, name, qtype| {
+            if crate::wg_kernel::host_local(server) {
+                if !LOCAL_DNS_WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "wireguard: kernel mode cannot carry the host-local DNS server `{server}`; set `kernelMode: false` for the userspace stack"
+                    );
+                }
+                return None;
+            }
             self.exchange_kernel(kernel, server, name, qtype)
         })
     }

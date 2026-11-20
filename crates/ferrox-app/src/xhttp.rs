@@ -588,16 +588,16 @@ impl StreamOut {
         }
     }
 
-    pub(crate) fn bind_session(&self, sid: &str) {
+    pub(crate) fn bind_session(&self, sid: &str, handle: &SessionHandle) {
         match self {
-            Self::H2(out) => out.bind_session(sid),
+            Self::H2(out) => out.bind_session(sid, handle),
             Self::H3(_) => {}
         }
     }
 
-    pub(crate) fn bind_upload(&self, sid: &str) {
+    pub(crate) fn bind_upload(&self, sid: &str, handle: &SessionHandle) {
         match self {
-            Self::H2(out) => out.bind_upload(sid),
+            Self::H2(out) => out.bind_upload(sid, handle),
             Self::H3(_) => {}
         }
     }
@@ -2127,7 +2127,7 @@ pub(crate) fn extract_meta<'a>(
     (sid, seq)
 }
 
-struct Session {
+pub(crate) struct Session {
     state: Mutex<SessionState>,
     cv: Condvar,
     id: String,
@@ -2366,6 +2366,43 @@ fn remove_session_if_owned(id: &str, session: &Session) {
     }
 }
 
+/// An opaque hold on the session a carrier bound to, so a later connection that reuses the id is not the one this hold ends.
+#[derive(Clone)]
+pub(crate) struct SessionHandle(Arc<Session>);
+
+impl SessionHandle {
+    pub(crate) fn of(session: &Arc<Session>) -> Self {
+        Self(Arc::clone(session))
+    }
+
+    /// Whether two holds name the same session, not merely the same id a peer may have reused.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn session_handle(id: &str) -> SessionHandle {
+    SessionHandle(get_or_create_session(id))
+}
+
+pub(crate) fn end_session_handle(id: &str, handle: &SessionHandle) {
+    let carried = {
+        let mut map = sessions().lock().expect("sessions lock");
+        if map
+            .get(id)
+            .is_some_and(|carried| Arc::ptr_eq(carried, &handle.0))
+        {
+            map.remove(id)
+        } else {
+            None
+        }
+    };
+    if let Some(carried) = carried {
+        close_session(&carried);
+    }
+}
+
 // Drop is the only other way a session ends, and a waiter parked before a reader exists has no Drop to run.
 pub(crate) fn end_session(id: &str) {
     let carried = sessions().lock().expect("sessions lock").remove(id);
@@ -2426,10 +2463,11 @@ fn bound_session(sid: &str, stream: Option<&StreamOut>, downlink: bool) -> Optio
         if !stream.claim(&session, sid) {
             return None;
         }
+        let handle = SessionHandle::of(&session);
         if downlink {
-            stream.bind_session(sid);
+            stream.bind_session(sid, &handle);
         } else {
-            stream.bind_upload(sid);
+            stream.bind_upload(sid, &handle);
         }
     }
     if downlink {
@@ -3385,7 +3423,7 @@ pub(crate) fn accept_core<
                 return Served::Closed;
             }
             if let Some(h2) = h2.as_ref() {
-                h2.bind_upload(sid);
+                h2.bind_upload(sid, &SessionHandle::of(&session));
             }
             // Go writes the 200 only when the handler returns; a stream-up POST hands that answer to its session so no accepted thread waits out the download, and the other shapes keep the inline wait.
             if h2.is_none() && settings.mode == XhttpMode::StreamUp {
@@ -7157,6 +7195,27 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .is_ok(),
             "an uplink with no downlink parked its POST thread forever"
+        );
+    }
+
+    /// A connection that closes after its id moved to a new session must not end the replacement:
+    /// the handle it bound is a hold on that exact session, not on the string every carrier repeats.
+    #[test]
+    fn an_old_handle_does_not_end_a_replacement_session() {
+        let id = "replacement-session-handle";
+        let old = session_handle(id);
+        end_session(id);
+        let new = session_handle(id);
+        assert!(session_is_carried(id), "the replacement is live");
+        end_session_handle(id, &old);
+        assert!(
+            session_is_carried(id),
+            "a stale connection ended the replacement session"
+        );
+        end_session_handle(id, &new);
+        assert!(
+            !session_is_carried(id),
+            "the owner still ends its own session"
         );
     }
 

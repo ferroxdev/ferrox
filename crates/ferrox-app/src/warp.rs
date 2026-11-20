@@ -993,9 +993,16 @@ fn register(spec: &WarpSpec, enroll: bool) -> Result<Identity, String> {
         };
         match register_with(spec, enroll, &|method, path, headers, body| {
             let url = endpoint.url(path);
-            // The reference dials one fresh HTTP/2 connection per call and never retries over HTTP/1.1; a failed leg says so.
-            crate::foxy_account::h2_ask(&endpoint, method, &url, headers, body)
-                .map_err(RegisterError::retryable)
+            // The reference dials one fresh HTTP/2 connection per call and never retries over HTTP/1.1; a request that reached the peer is not replayed against another host.
+            crate::foxy_account::h2_ask_started(&endpoint, method, &url, headers, body).map_err(
+                |(reason, sent)| {
+                    if sent {
+                        RegisterError::fatal(reason)
+                    } else {
+                        RegisterError::retryable(reason)
+                    }
+                },
+            )
         }) {
             Ok(identity) => return Ok(identity),
             Err(error) if error.fatal => {
@@ -1027,14 +1034,10 @@ where
     let body = registration_body(&public, &tos, &serial);
     let headers = registration_headers(None);
     let headers = borrow_headers(&headers);
-    let reply = call("POST", "/reg", &headers, &body)
-        .map_err(|error| RegisterError::retryable(error.reason))?;
-    // A 2xx that names the device it made is not posted again: another host would mint a second.
+    let reply = call("POST", "/reg", &headers, &body)?;
+    // A 2xx is not posted again, even when its body is unreadable: another host would mint a second device.
     let registered = parse_registration(&reply).map_err(|error| {
-        let minted = (200..300).contains(&reply.status)
-            && crate::json::parse(&String::from_utf8_lossy(&reply.body))
-                .is_ok_and(|root| root.get("id").is_some() || root.get("token").is_some());
-        if minted {
+        if (200..300).contains(&reply.status) {
             RegisterError::fatal(error.reason)
         } else {
             error
@@ -2948,6 +2951,18 @@ impl Slot {
         match self {
             Self::WireGuard => paths.wireguard.clone(),
             Self::WireGuardInner => derive_sibling_path(&paths.wireguard, "secondary"),
+            Self::Masque => paths.masque_path(),
+            Self::MasqueInner => paths.masque_sibling("secondary"),
+            Self::Gool => paths.masque_sibling("gool"),
+        }
+    }
+
+    /// Where registration writes this slot: the allocated file, not the runtime fallback, so a base
+    /// that already names the MASQUE half still gives `WireGuard` and MASQUE distinct files.
+    fn allocation(self, paths: &KeyPaths) -> PathBuf {
+        match self {
+            Self::WireGuard => paths.wireguard.clone(),
+            Self::WireGuardInner => derive_sibling_path(&paths.wireguard, "secondary"),
             Self::Masque => paths.masque.clone(),
             Self::MasqueInner => derive_sibling_path(&paths.masque, "secondary"),
             Self::Gool => derive_sibling_path(&paths.masque, "gool"),
@@ -2959,7 +2974,10 @@ impl Slot {
 /// MASQUE file beside it, and every second hop derived from its own first.
 struct KeyPaths {
     wireguard: PathBuf,
+    /// The file a multi-slot registration allocates for the MASQUE half.
     masque: PathBuf,
+    /// The base when it already names the MASQUE half: runtime lookup prefers it, registration does not.
+    named_masque: Option<PathBuf>,
 }
 
 impl KeyPaths {
@@ -2967,8 +2985,56 @@ impl KeyPaths {
         Self {
             wireguard: wireguard.map_or_else(|| base.to_path_buf(), Path::to_path_buf),
             masque: masque.map_or_else(|| derive_sibling_path(base, "masque"), Path::to_path_buf),
+            named_masque: (masque.is_none() && named_slot(base, "masque"))
+                .then(|| base.to_path_buf()),
         }
     }
+
+    /// The MASQUE identity to load: the named file, then the derived one, then the named path again
+    /// so a runtime pointed at `account-masque.json` keeps using it.
+    fn masque_path(&self) -> PathBuf {
+        if let Some(named) = self.named_masque.as_ref().filter(|path| path.exists()) {
+            return named.clone();
+        }
+        if self.masque.exists() {
+            return self.masque.clone();
+        }
+        self.named_masque
+            .clone()
+            .unwrap_or_else(|| self.masque.clone())
+    }
+
+    fn masque_sibling(&self, suffix: &str) -> PathBuf {
+        let effective = self.masque_path();
+        let current = derive_sibling_path(&effective, suffix);
+        if current.exists() {
+            return current;
+        }
+        let allocated = derive_sibling_path(&self.masque, suffix);
+        if allocated.exists() {
+            return allocated;
+        }
+        if let Some(named) = self.named_masque.as_ref() {
+            let old = derive_sibling_path(named, suffix);
+            if old.exists() {
+                return old;
+            }
+        }
+        current
+    }
+}
+
+/// Whether a path already names a slot, so a runtime pointed at the MASQUE half does not derive a second `-masque`.
+fn named_slot(path: &Path, suffix: &str) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let stem = match name.rfind('.') {
+        Some(dot) if dot > 0 => &name[..dot],
+        _ => &name,
+    };
+    stem.ends_with(&format!("-{suffix}"))
 }
 
 fn derive_sibling_path(base: &Path, suffix: &str) -> PathBuf {
@@ -2986,7 +3052,7 @@ fn derive_sibling_path(base: &Path, suffix: &str) -> PathBuf {
 fn planned_slots(kind: KeyKind, paths: &KeyPaths) -> Result<Vec<(Slot, PathBuf)>, String> {
     let mut planned: Vec<(Slot, PathBuf)> = Vec::new();
     for &slot in kind.slots() {
-        let path = slot.path(paths);
+        let path = slot.allocation(paths);
         if planned.iter().any(|(_, other)| *other == path) {
             return Err(format!(
                 "warp-register: the {} identity would share {}; give each slot its own file",
@@ -3122,11 +3188,16 @@ pub(crate) fn one_tap(
 ) -> Result<String, String> {
     let mode = Mode::parse(Some(mode))?;
     let path = PathBuf::from(path);
-    if path.is_file() {
-        return Err(format!(
-            "warp: identity file {} already exists; refusing to overwrite a working device",
-            path.display()
-        ));
+    let resumed = path.is_file();
+    if resumed {
+        // The outer device was already created; a failed inner enrollment must be able to finish on the next run instead of minting a second device.
+        let saved = Identity::load(&path).map_err(LoadError::into_message)?;
+        if matches!(mode, Mode::Masque | Mode::Gool | Mode::Mim) && saved.masque.is_none() {
+            return Err(format!(
+                "warp: `{}` has no MASQUE key for mode `{mode:?}`; remove it to register a new device",
+                path.display()
+            ));
+        }
     }
     let ForcedEdges {
         wiw_outer,
@@ -3179,19 +3250,16 @@ pub(crate) fn one_tap(
             ..MimSettings::default()
         },
     };
-    let identity = register(&spec, !matches!(mode, Mode::WireGuard | Mode::GoolClassic))?;
-    identity.save(&path)?;
+    if !resumed {
+        let identity = register(&spec, !matches!(mode, Mode::WireGuard | Mode::GoolClassic))?;
+        identity.save(&path)?;
+    }
+    // The outer registration is the half that must not be repeated, so an inner failure keeps it for the next run.
     if matches!(mode, Mode::Gool | Mode::GoolClassic) {
-        if let Err(reason) = spec.gool_identity() {
-            let _ = std::fs::remove_file(&path);
-            return Err(reason);
-        }
+        spec.gool_identity()?;
     }
     if mode == Mode::Mim {
-        if let Err(reason) = spec.mim_identity() {
-            let _ = std::fs::remove_file(&path);
-            return Err(reason);
-        }
+        spec.mim_identity()?;
     }
     let mut settings = vec![
         ("mode", string(mode.label())),
@@ -3916,6 +3984,94 @@ mod tests {
         );
     }
 
+    /// A runtime pointed straight at the MASQUE half keeps that file: deriving beside it would
+    /// look for `account-masque-masque.json`, which no earlier run ever wrote.
+    #[test]
+    fn a_masque_path_is_not_suffixed_again() {
+        let base = Path::new("/tmp/account-masque.json");
+        let paths = KeyPaths::new(base, Some(Path::new("/tmp/account-wg.json")), None);
+        assert_eq!(Slot::Masque.path(&paths), base);
+        assert_eq!(
+            Slot::WireGuard.path(&paths),
+            Path::new("/tmp/account-wg.json")
+        );
+        assert!(!named_slot(
+            Path::new("/tmp/account-masquerade.json"),
+            "masque"
+        ));
+    }
+
+    /// A base that already names the MASQUE half still has to register both slots: runtime reuses
+    /// the base, but allocation derives the old distinct file or `planned_slots` sees a collision.
+    #[test]
+    fn a_named_masque_base_allocates_a_distinct_registration_file() {
+        let base = Path::new("/tmp/account-masque.json");
+        let paths = KeyPaths::new(base, None, None);
+        assert_eq!(Slot::WireGuard.allocation(&paths), base);
+        assert_eq!(
+            Slot::Masque.allocation(&paths),
+            Path::new("/tmp/account-masque-masque.json")
+        );
+        assert_eq!(
+            Slot::MasqueInner.allocation(&paths),
+            Path::new("/tmp/account-masque-masque-secondary.json")
+        );
+        assert!(planned_slots(KeyKind::All, &paths).is_ok());
+    }
+
+    /// `auto` can serve a WireGuard-only device, so resuming one must not demand a MASQUE key that
+    /// only the explicit MASQUE lanes need.
+    #[test]
+    fn auto_resume_accepts_a_wireguard_only_identity() {
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-warp-auto-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        sample_identity().save(&path).expect("saves the identity");
+        let out = one_tap(
+            &path.to_string_lossy(),
+            "auto",
+            None,
+            None,
+            &ForcedPeers {
+                wiw_outer: None,
+                wiw_inner: None,
+                mim_outer: None,
+                mim_inner: None,
+                noize: None,
+                no_profile_retry: false,
+                no_quic_v2: false,
+            },
+        );
+        std::fs::remove_file(&path).ok();
+        assert!(out.is_ok(), "{out:?}");
+    }
+
+    /// The old rule derived beside a base that already named the MASQUE half; an identity enrolled
+    /// then must still be the one a later run loads, both for the outer hop and its inner hops.
+    #[test]
+    fn a_legacy_named_masque_slot_keeps_its_inner_identities() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-warp-legacy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let base = dir.join("account-masque.json");
+        let legacy = dir.join("account-masque-masque.json");
+        let legacy_inner = dir.join("account-masque-masque-secondary.json");
+        let legacy_gool = dir.join("account-masque-masque-gool.json");
+        for path in [&legacy, &legacy_inner, &legacy_gool] {
+            std::fs::write(path, b"{}").expect("a legacy identity file");
+        }
+        let paths = KeyPaths::new(&base, None, None);
+        assert_eq!(Slot::Masque.path(&paths), legacy);
+        assert_eq!(Slot::MasqueInner.path(&paths), legacy_inner);
+        assert_eq!(Slot::Gool.path(&paths), legacy_gool);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn two_slots_cannot_share_one_identity_file() {
         let base = Path::new("/tmp/warp-identity.json");
@@ -4167,7 +4323,19 @@ mod tests {
             })
         };
         let error = register_with(&spec, false, &page).expect_err("not the API");
-        assert!(!error.fatal, "{}", error.reason);
+        assert!(error.fatal, "{}", error.reason);
+    }
+
+    /// A POST that may have created the device stops host fallback even when its response was lost.
+    #[test]
+    fn a_lost_registration_response_stops_host_fallback() {
+        let spec = WarpSpec::for_command(Mode::Auto, None, None);
+        let lost = |_: &str, _: &str, _: &[(&str, &str)], _: &[u8]| {
+            Err::<Reply, _>(RegisterError::fatal("the response was lost"))
+        };
+        let error = register_with(&spec, false, &lost).expect_err("the response is lost");
+        assert!(error.fatal, "{}", error.reason);
+        assert!(error.reason.contains("lost"), "{}", error.reason);
     }
 
     #[test]

@@ -55,7 +55,12 @@ pub(crate) fn readings(edges: &[Candidate]) -> Vec<Option<u64>> {
 /// The first address that answers, timed to the handshake; a name that does not resolve is a silence like any other.
 fn probe(host: &str, port: u16, budget: Duration) -> Option<u64> {
     let deadline = Instant::now() + budget;
-    let addresses = (host, port).to_socket_addrs().ok()?;
+    // Probes resolve on their own pool, so a hung lookup cannot take a worker a flow's dial needs.
+    let addresses = crate::proxy::resolve_probe(host, port, budget, |host, port| {
+        (host, port)
+            .to_socket_addrs()
+            .map(std::iter::Iterator::collect)
+    })?;
     if Instant::now() >= deadline {
         return None;
     }

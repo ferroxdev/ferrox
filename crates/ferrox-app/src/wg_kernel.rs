@@ -10,7 +10,7 @@
 use std::ffi::CString;
 use std::io;
 use std::mem::size_of;
-use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -88,6 +88,57 @@ const NETLINK_TIMEOUT: Duration = Duration::from_secs(2);
 const NETLINK_BUF: usize = 8192;
 const SOCKET_BUFFER: usize = 7 << 20;
 
+/// An address this host owns: the kernel's local table answers it before a marked rule can send it through the device, so the kernel path must decline it rather than let it bypass the tunnel.
+pub(crate) fn host_local(ip: IpAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` initializes `list` on success; the matching `freeifaddrs` releases it.
+    if unsafe { libc::getifaddrs(std::ptr::addr_of_mut!(list)) } != 0 {
+        return true;
+    }
+    if list.is_null() {
+        return false;
+    }
+    let mut at = list;
+    let mut found = false;
+    while !at.is_null() {
+        // SAFETY: every node belongs to the list and stays alive until `freeifaddrs`.
+        let ifa = unsafe { &*at };
+        if !ifa.ifa_addr.is_null() {
+            // SAFETY: `ifa_addr` names a sockaddr whose family selects the layout below.
+            let family = unsafe { &*ifa.ifa_addr };
+            let owned = match i32::from(family.sa_family) {
+                libc::AF_INET => {
+                    // SAFETY: an AF_INET address is a `sockaddr_in`.
+                    let addr = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
+                    ip == IpAddr::V4(Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)))
+                }
+                libc::AF_INET6 => {
+                    // SAFETY: an AF_INET6 address is a `sockaddr_in6`.
+                    let addr = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in6>() };
+                    ip == IpAddr::V6(Ipv6Addr::from(addr.sin6_addr.s6_addr))
+                }
+                _ => false,
+            };
+            if owned {
+                found = true;
+                break;
+            }
+        }
+        // SAFETY: `ifa_next` links each node of the list.
+        at = unsafe { (*at).ifa_next };
+    }
+    // SAFETY: the list came from one successful `getifaddrs` and is freed exactly once.
+    unsafe { libc::freeifaddrs(list) };
+    found
+}
+
 /// The kernel device one outbound owns.
 #[derive(Debug)]
 pub(crate) struct KernelWireGuard {
@@ -156,6 +207,12 @@ impl KernelWireGuard {
         target: SocketAddr,
         timeout: Duration,
     ) -> io::Result<TcpStream> {
+        if host_local(target.ip()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "kernel wireguard: a host-local destination needs the userspace stack",
+            ));
+        }
         let socket = Socket::new(domain(target), Type::STREAM, Some(Protocol::TCP))?;
         set_mark(&socket, self.mark)?;
         socket.set_tcp_nodelay(true)?;
@@ -167,6 +224,12 @@ impl KernelWireGuard {
 
     /// A connected UDP socket that leaves through the marked table.
     pub(crate) fn udp_socket(&self, target: SocketAddr) -> io::Result<UdpSocket> {
+        if host_local(target.ip()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "kernel wireguard: a host-local destination needs the userspace stack",
+            ));
+        }
         let socket = Socket::new(domain(target), Type::DGRAM, Some(Protocol::UDP))?;
         set_mark(&socket, self.mark)?;
         socket.connect(&target.into())?;
@@ -898,6 +961,16 @@ mod tests {
         );
         assert_eq!(attr(v4, WGALLOWEDIP_A_IPADDR), Some(&[0u8; 4][..]));
         assert_eq!(attr(v4, WGALLOWEDIP_A_CIDR_MASK), Some(&[0u8][..]));
+    }
+
+    /// The local table answers these before a marked rule can see them, so the kernel path
+    /// must decline them instead of letting the dial leave outside the tunnel.
+    #[test]
+    fn a_host_local_target_is_declined() {
+        assert!(host_local("127.0.0.1".parse().unwrap()));
+        assert!(host_local("::1".parse().unwrap()));
+        assert!(host_local("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!host_local("192.0.2.1".parse().unwrap()));
     }
 
     #[test]

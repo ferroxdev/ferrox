@@ -116,7 +116,7 @@ impl DeviceConfig {
             .iter()
             .map(|address| parse_address(address))
             .collect::<Result<Vec<_>, _>>()?;
-        // `kernelMode` is the client switch; `noKernelTun` is its inverse, and the newer name wins when both are present.
+        // `kernelMode` is the client switch and takes precedence; `noKernelTun` is read only when it is absent.
         let no_kernel_tun = match settings.get("kernelMode").and_then(Json::as_bool) {
             Some(kernel) => !kernel,
             None => settings

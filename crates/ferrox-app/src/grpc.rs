@@ -9,8 +9,9 @@ use crate::proxy::{Accepted, FrameWrite, Settle};
 
 use crate::h2::{
     block_encode, frame_head, write_frame, Decoder, E_REFUSED, FRAME_CAP, F_ACK, F_END,
-    F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_CONCURRENT, S_MAX_FRAME, S_WINDOW,
-    T_CONT, T_DATA, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
+    F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_HEADER_TABLE, S_MAX_CONCURRENT,
+    S_MAX_FRAME, S_WINDOW, T_CONT, T_DATA, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW,
+    WINDOW_MAX,
 };
 
 const MSG_CAP: usize = 16 * 1024 * 1024;
@@ -77,6 +78,12 @@ struct SendWindow {
     unlimited: bool,
 }
 
+#[derive(Clone, Copy)]
+struct TableUpdate {
+    smallest: u32,
+    last: u32,
+}
+
 struct Shared {
     stream: Mutex<Box<dyn crate::proxy::FrameWrite + Send>>,
     send: Mutex<SendWindow>,
@@ -85,6 +92,11 @@ struct Shared {
     keepalive_wake: Condvar,
     max_frame: Mutex<usize>,
     init: Mutex<u64>,
+    /// A peer SETTINGS header-table size the next outgoing block must announce before its fields.
+    header_table: Mutex<Option<TableUpdate>>,
+    /// The header block, its table update and the write of the frame are one step: a SETTINGS update
+    /// cannot land between the build and the emit, and a failed emit keeps the update pending.
+    header_gate: Mutex<()>,
     ended: AtomicBool,
     upload_ended: AtomicBool,
     upload_gate: Mutex<()>,
@@ -108,6 +120,40 @@ impl std::fmt::Debug for Shared {
             .field("dead", &self.dead)
             .field("pong", &self.pong)
             .finish_non_exhaustive()
+    }
+}
+
+impl Shared {
+    /// A block whose first field is the peer's pending dynamic-table size, then the fields the caller
+    /// built: the update must open the first block after the SETTINGS that changed it.
+    fn header_block<W>(&self, headers: &[(&str, &str)], write: W) -> bool
+    where
+        W: FnOnce(&[u8]) -> bool,
+    {
+        let _gate = self
+            .header_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let update = *self
+            .header_table
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut block = Vec::new();
+        if let Some(update) = update {
+            if update.smallest != update.last {
+                ferrox_core::foxy::hpack::integer(&mut block, 5, 0x20, update.smallest as usize);
+            }
+            ferrox_core::foxy::hpack::integer(&mut block, 5, 0x20, update.last as usize);
+        }
+        block.extend(block_encode(headers));
+        if !write(&block) {
+            return false;
+        }
+        *self
+            .header_table
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        true
     }
 }
 
@@ -386,6 +432,11 @@ impl<R: Read> GrpcReader<R> {
             return true;
         }
         let mut at = 0;
+        let _gate = self
+            .shared
+            .header_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         while at + 6 <= body.len() {
             let id = u16::from_be_bytes([body[at], body[at + 1]]);
             let value =
@@ -417,6 +468,22 @@ impl<R: Read> GrpcReader<R> {
                 *max = usize::try_from(value)
                     .unwrap_or(FRAME_CAP)
                     .clamp(16_384, (1 << 24) - 1);
+            } else if id == S_HEADER_TABLE {
+                let mut pending = self
+                    .shared
+                    .header_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                *pending = Some(match *pending {
+                    Some(update) => TableUpdate {
+                        smallest: update.smallest.min(value),
+                        last: value,
+                    },
+                    None => TableUpdate {
+                        smallest: value,
+                        last: value,
+                    },
+                });
             }
             at += 6;
         }
@@ -523,12 +590,14 @@ impl<R: Read> GrpcReader<R> {
             return None;
         }
         self.method = served_method(gate);
-        let block = block_encode(&[
+        let headers = [
             (":status", "200"),
             ("content-type", "application/grpc"),
             ("grpc-encoding", "identity"),
-        ]);
-        if !self.emit(T_HEADERS, F_END_HEADERS, id, &block) {
+        ];
+        if !self.shared.header_block(&headers, |block| {
+            self.emit(T_HEADERS, F_END_HEADERS, id, block)
+        }) {
             return None;
         }
         self.stream = id;
@@ -1288,11 +1357,7 @@ impl GrpcWriter {
     pub(crate) fn send(&self, data: &[u8]) -> bool {
         let max = self.max_frame();
         // Four frames of the 16 KiB the peer advertises are one byte over the default 65_535-byte stream window, so the fourth waits for a credit; a body one byte under the frame fits all four.
-        let cap = if self.shared.muxed {
-            usize::try_from(self.hunk_cap()).unwrap_or(usize::MAX)
-        } else {
-            usize::MAX
-        };
+        let cap = usize::try_from(self.opening_cap()).unwrap_or(usize::MAX);
         let payload = message_payload(max.saturating_sub(1).min(cap)).max(1);
         if self.multi {
             return self.send_multi(data, payload);
@@ -1410,7 +1475,8 @@ impl GrpcWriter {
                 crate::proxy::Push::Lost
             };
         }
-        let payload = message_payload(max.saturating_sub(1)).max(1);
+        let cap = usize::try_from(self.opening_cap()).unwrap_or(usize::MAX);
+        let payload = message_payload(max.saturating_sub(1).min(cap)).max(1);
         if self.multi {
             return self.try_send_multi(data, payload);
         }
@@ -1666,11 +1732,13 @@ impl GrpcWriter {
     }
 
     fn send_trailer(&self) -> bool {
-        let block = block_encode(&[(
+        let headers = [(
             "grpc-status",
             status_text(self.shared.status.load(Ordering::SeqCst)),
-        )]);
-        self.emit(T_HEADERS, F_END_HEADERS | F_END, self.stream, &block)
+        )];
+        self.shared.header_block(&headers, |block| {
+            self.emit(T_HEADERS, F_END_HEADERS | F_END, self.stream, block)
+        })
     }
 
     pub(crate) fn upload_done(&self) {
@@ -1791,19 +1859,25 @@ impl GrpcWriter {
         take_window(&self.shared, need, true)
     }
 
-    /// The largest blocking batch a muxed peer's opening window pays for in one offer: the transport
-    /// takes a batch whole or not at all, so a batch past that window would wait for credit the peer
-    /// grants only for bytes it has already received.
-    fn hunk_cap(&self) -> u64 {
-        if !self.shared.muxed {
-            return u64::MAX;
-        }
+    /// The largest message the peer's opening window pays for: a message past it would wait for
+    /// credit the peer grants only for bytes it has already received.
+    fn opening_cap(&self) -> u64 {
         let init = self
             .shared
             .init
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         (*init).clamp(1, 65_535)
+    }
+
+    /// The batch-flush ceiling a muxed peer's opening window sets; a plain stream keeps the whole
+    /// window in one batch because its credit is its own.
+    fn hunk_cap(&self) -> u64 {
+        if self.shared.muxed {
+            self.opening_cap()
+        } else {
+            u64::MAX
+        }
     }
 
     /// Writes one message, splitting it only when it exceeds `max` bytes.
@@ -2418,6 +2492,8 @@ fn mux_shared(write: Box<dyn FrameWrite + Send>, max: usize, window: u64) -> Arc
         keepalive_wake: Condvar::new(),
         max_frame: Mutex::new(max),
         init: Mutex::new(window),
+        header_table: Mutex::new(None),
+        header_gate: Mutex::new(()),
         ended: AtomicBool::new(false),
         upload_ended: AtomicBool::new(false),
         upload_gate: Mutex::new(()),
@@ -3136,6 +3212,8 @@ fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
         keepalive_wake: Condvar::new(),
         max_frame: Mutex::new(16_384),
         init: Mutex::new(65_535),
+        header_table: Mutex::new(None),
+        header_gate: Mutex::new(()),
         ended: AtomicBool::new(false),
         upload_ended: AtomicBool::new(false),
         upload_gate: Mutex::new(()),
@@ -3540,7 +3618,10 @@ pub(crate) fn mark_reader_dead<R: Read>(reader: &mut GrpcReader<R>) {
 }
 
 pub(crate) fn request_ended<R: Read>(reader: &GrpcReader<R>) -> bool {
-    reader.remote_end && reader.msg_at >= reader.pay_end
+    reader.remote_end
+        && reader.msg_at >= reader.pay_end
+        && reader.msg_at >= reader.msg_end
+        && reader.msg_end == reader.msg.len()
 }
 
 #[cfg(test)]
@@ -3743,6 +3824,69 @@ mod tests {
             .expect("decodes");
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[1].1, b"/TunnelService/Tun");
+    }
+
+    /// A peer's new dynamic-table size must open the next block, not become a field: HPACK carries the
+    /// update as a size-prefixed integer before the headers it applies to.
+    #[test]
+    fn a_peer_table_size_opens_the_next_header_block() {
+        let shared = new_shared(Box::new(Sink::default()));
+        *shared
+            .header_table
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(TableUpdate {
+            smallest: 64,
+            last: 128,
+        });
+        let mut block = Vec::new();
+        assert!(shared.header_block(&[(":status", "200")], |built| {
+            block.extend_from_slice(built);
+            true
+        }));
+        let mut decoder = Decoder::default();
+        let mut headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        decoder
+            .decode(&block, &mut |name, value| {
+                headers.push((name.to_vec(), value.to_vec()));
+            })
+            .expect("decodes with the size updates");
+        assert_eq!(
+            headers,
+            vec![(b":status".to_vec(), b"200".to_vec())],
+            "the update is not a field and the headers follow it"
+        );
+        assert!(
+            shared
+                .header_table
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "an announced size is not announced twice"
+        );
+    }
+
+    #[test]
+    fn a_failed_header_emit_keeps_the_table_update_pending() {
+        let shared = new_shared(Box::new(Sink::default()));
+        *shared
+            .header_table
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(TableUpdate {
+            smallest: 128,
+            last: 128,
+        });
+        assert!(
+            !shared.header_block(&[(":status", "200")], |_| false),
+            "the caller is told the block went nowhere"
+        );
+        assert!(
+            shared
+                .header_table
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_some(),
+            "the update is still owed to the next block"
+        );
     }
 
     #[test]
@@ -4995,6 +5139,33 @@ mod tests {
         assert!(5 + len <= 64, "the message fits the peer's window");
     }
 
+    /// A plain stream's opening window is the same ceiling: a message past it would wait for credit
+    /// the peer grants only after it has received the bytes.
+    #[test]
+    fn a_plain_writer_caps_a_message_to_its_opening_window() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, 64);
+        assert_eq!(writer.opening_cap(), 64);
+        assert_eq!(writer.hunk_cap(), u64::MAX, "a plain batch is not cut");
+    }
+
+    /// The retrying half takes the same cap: a relay push must fit the opening window, or it parks
+    /// on credit the peer only grants for bytes it has already received.
+    #[test]
+    fn a_plain_try_send_fits_the_opening_window() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, 64);
+        let data: Vec<u8> = (0..100).map(|i| (i % 251) as u8).collect();
+        assert!(matches!(
+            writer.try_send(&data),
+            crate::proxy::Push::Took(n) if n > 0
+        ));
+        let peer = peer.lock().unwrap();
+        let body = data_body(&peer.writes[0]);
+        let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+        assert!(5 + len <= 64, "the message fits the peer's window");
+    }
+
     /// The same batch driven over a real socket, where the only thing a loopback test can assert is
     /// its bytes: ten segments is the widest list this carrier hands `writev` or `WSASend`, so a
     /// platform that split the list or refused its width would answer with missing or reordered
@@ -5584,6 +5755,46 @@ mod tests {
         assert!(request_ended(&reader));
     }
 
+    /// A `MultiHunk` message hands out its elements one at a time: the flag alone must not report the
+    /// request ended with another element of the same message still buffered.
+    #[test]
+    fn request_ended_waits_for_the_last_multi_hunk_element() {
+        let settings = GrpcSettings {
+            multi_mode: true,
+            ..GrpcSettings::default()
+        };
+        let mut wire = frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
+        );
+        wire.extend_from_slice(&frame(T_DATA, F_END, 1, &multi_message(&[b"pi", b"in"])));
+        let (mut reader, writer) = connect_split_with(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            &settings,
+        )
+        .expect("dials");
+        drop(writer);
+        let mut first = [0u8; 2];
+        reader
+            .read_exact(&mut first)
+            .expect("reads the first element");
+        assert_eq!(&first, b"pi");
+        assert!(
+            !request_ended(&reader),
+            "reported the request ended with another element buffered"
+        );
+        let mut second = [0u8; 2];
+        reader
+            .read_exact(&mut second)
+            .expect("reads the second element");
+        assert_eq!(&second, b"in");
+        assert!(request_ended(&reader));
+    }
+
     /// A zero-length `END_STREAM` frame is not flow-controlled, so it spends none of either window.
     #[test]
     fn an_empty_end_marker_does_not_charge_the_window() {
@@ -5948,6 +6159,8 @@ mod tests {
                         keepalive_wake: Condvar::new(),
                         max_frame: Mutex::new(max),
                         init: Mutex::new(u64::from(WINDOW)),
+                        header_table: Mutex::new(None),
+                        header_gate: Mutex::new(()),
                         ended: AtomicBool::new(false),
                         upload_ended: AtomicBool::new(false),
                         upload_gate: Mutex::new(()),
