@@ -154,6 +154,17 @@ selftest_gaps() {
   matrix_engine_skip_reason zeronet tuic-raw-down-8 server \
     | grep -q "TUIC server comparators" \
     || { echo "selftest: the ZeroNet TUIC server skip lost its reason" >&2; failed=1; }
+  matrix_engine_skip_reason xray-core vless-vision-reality-edge-down-8 server \
+    | grep -q "edge, ios and random" \
+    || { echo "selftest: the xray-core edge REALITY server skip lost its reason" >&2; failed=1; }
+  matrix_engine_skip_reason xray-core vless-vision-reality-ios-down-8 server >/dev/null \
+    || { echo "selftest: the xray-core ios REALITY server skip is missing" >&2; failed=1; }
+  matrix_engine_skip_reason xray-core vless-vision-reality-random-down-8 server >/dev/null \
+    || { echo "selftest: the xray-core random REALITY server skip is missing" >&2; failed=1; }
+  matrix_engine_skip_reason xray-core vless-vision-reality-randomized-down-8 server >/dev/null \
+    && { echo "selftest: the randomized vision cell is skipped" >&2; failed=1; }
+  matrix_engine_skip_reason ferrox vless-vision-reality-edge-down-8 server >/dev/null \
+    && { echo "selftest: the ferrox edge server is skipped" >&2; failed=1; }
   ((failed == 0)) || return 1
   echo "run-benchmark-matrix selftest: ${#gap_bases[@]} filed gap(s), selection exact"
 }
@@ -369,7 +380,9 @@ cpu_count() {
 
 status=0
 cells_run=0
+cells_skipped=0
 cells_failed=()
+skipped_cells=()
 
 manifest
 if ((build_only)); then
@@ -602,6 +615,8 @@ while read -r id traffic connections iterations payload duration_ms; do
     if skip_reason="$(matrix_engine_skip_reason "$server" "$id" server)"; then
       note "skipping $id on $server: $skip_reason"
       echo "# $id--srv-$server: skipped, $skip_reason" >>"$out/commands.sh"
+      cells_skipped=$((cells_skipped + 1))
+      skipped_cells+=("$id--srv-$server ($skip_reason)")
       continue
     fi
     cell="$id--srv-$server"
@@ -615,10 +630,12 @@ while read -r id traffic connections iterations payload duration_ms; do
       continue
     }
     client_args=(--outbound-config "$(cat "$celldir/client.json")")
+    reference_skipped=""
     for have in ${cell_engines[@]+"${cell_engines[@]}"}; do
       label="${have%%=*}"
       if skip_reason="$(matrix_engine_skip_reason "$label" "$id")"; then
         client_args+=(--skip-engine-for "$label=$skip_reason")
+        [[ "$label" == xray-core ]] && reference_skipped="$skip_reason"
         continue
       fi
       if [[ "$label" == aether && "$id" == masque-* && "$server" != ferrox ]]; then
@@ -693,6 +710,13 @@ while read -r id traffic connections iterations payload duration_ms; do
           ;;
       esac
     done
+    if [[ -n "$reference_skipped" ]]; then
+      note "skipping $cell: the reference xray-core is skipped: $reference_skipped"
+      echo "# $cell: skipped, the reference xray-core is skipped: $reference_skipped" >>"$out/commands.sh"
+      cells_skipped=$((cells_skipped + 1))
+      skipped_cells+=("$cell (reference xray-core skipped: $reference_skipped)")
+      continue
+    fi
     server_config="$celldir/server.json"
     if [[ "$server" == "sing-box" ]]; then
       python3 scripts/xray-to-singbox.py --server \
@@ -777,12 +801,14 @@ done < <(scenarios "$tier")
 
 {
   echo "cells run: $cells_run"
+  echo "cells skipped: $cells_skipped"
   echo "cells failed: ${#cells_failed[@]}"
   for f in "${cells_failed[@]+"${cells_failed[@]}"}"; do echo "failed: $f"; done
+  for s in "${skipped_cells[@]+"${skipped_cells[@]}"}"; do echo "skipped: $s"; done
   for s in "${skipped[@]+"${skipped[@]}"}"; do echo "skipped engine: $s"; done
 } | tee "$out/summary.txt" >&2
-if ((cells_run == 0)); then
-  echo "::error::no cells ran; the filters matched nothing, so this is not a passing run" >&2
+if ((cells_run == 0 && cells_skipped == 0)); then
+  echo "::error::no cells ran or skipped; the filters matched nothing, so this is not a passing run" >&2
   status=1
 fi
 return "$status"

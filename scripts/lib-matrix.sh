@@ -188,6 +188,14 @@ matrix_engine_skip_reason() {
         ;;
     esac
   fi
+  if [[ "$role" == server && "$engine" == xray-core ]]; then
+    case "$id" in
+      vless-vision-reality-edge-* | vless-vision-reality-ios-* | vless-vision-reality-random-*)
+        printf '%s\n' "xray-core at this pin refuses the edge, ios and random uTLS hellos, so REALITY cannot establish"
+        return 0
+        ;;
+    esac
+  fi
   case "$engine:$id" in
     sing-box:*-mux-*)
       printf '%s\n' "sing-box at this pin has no Mux.Cool carrier" ;;
