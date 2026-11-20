@@ -1326,7 +1326,7 @@ fn resolve_location_any(base: &str, location: &str, allow_http: bool) -> Result<
         return Ok(location.to_owned());
     }
     if prefix.starts_with("http://") {
-        if allow_http {
+        if allow_http && !HttpUrl::parse(base)?.tls {
             return Ok(location.to_owned());
         }
         return Err("redirected to non-https URL".to_owned());
@@ -1765,6 +1765,13 @@ mod tests {
             resolve_remote_location("https://example.test/a/b", "//cdn.test/c").expect("joined"),
             "https://cdn.test/c"
         );
+        assert_eq!(
+            resolve_remote_location("http://example.test/a", "http://cdn.test/b").expect("joined"),
+            "http://cdn.test/b"
+        );
+        let error = resolve_remote_location("https://example.test/a", "http://cdn.test/b")
+            .expect_err("an https source cannot downgrade");
+        assert!(error.contains("non-https"), "{error}");
     }
 
     #[test]
