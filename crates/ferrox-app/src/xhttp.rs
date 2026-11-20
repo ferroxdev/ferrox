@@ -2404,6 +2404,7 @@ pub(crate) fn end_session_handle(id: &str, handle: &SessionHandle) {
 }
 
 // Drop is the only other way a session ends, and a waiter parked before a reader exists has no Drop to run.
+#[cfg(test)]
 pub(crate) fn end_session(id: &str) {
     let carried = sessions().lock().expect("sessions lock").remove(id);
     if let Some(carried) = carried {
