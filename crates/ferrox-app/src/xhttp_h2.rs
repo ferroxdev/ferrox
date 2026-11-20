@@ -228,40 +228,66 @@ impl<'a> DataBatch<'a> {
         if self.used == 0 {
             return false;
         }
+        let Some((mut budgets, streams)) = self.fitting_budgets(conn) else {
+            return false;
+        };
+        let Some((fit, heads, included)) = self.fitting_plan(&mut budgets, streams) else {
+            return false;
+        };
+        if included == 0 {
+            return false;
+        }
+        self.write_fitting(conn, &fit, &heads, included)
+    }
+
+    /// What each stream's reduced window still allows out of this batch's reservation.
+    fn fitting_budgets(
+        &self,
+        conn: &H2Conn,
+    ) -> Option<([(u32, i64); DATA_FRAMES_PER_WRITE], usize)> {
         let mut budgets = [(0u32, 0i64); DATA_FRAMES_PER_WRITE];
         let mut streams = 0;
-        {
-            let table = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
-            for head in self.heads.iter().take(self.used) {
-                let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
-                if budgets[..streams].iter().any(|(known, _)| *known == id) {
-                    continue;
-                }
-                let Some(state) = table.get(&id) else {
-                    return false;
-                };
-                let window = *state
-                    .send_window
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                let reserved: i64 = self
-                    .heads
-                    .iter()
-                    .take(self.used)
-                    .filter(|head| u32::from_be_bytes([head[5], head[6], head[7], head[8]]) == id)
-                    .map(|head| i64::from(u32::from_be_bytes([0, head[0], head[1], head[2]])))
-                    .sum();
-                budgets[streams] = (
-                    id,
-                    if window < 0 {
-                        reserved.saturating_add(window).max(0)
-                    } else {
-                        reserved
-                    },
-                );
-                streams += 1;
+        let table = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        for head in self.heads.iter().take(self.used) {
+            let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+            if budgets[..streams].iter().any(|(known, _)| *known == id) {
+                continue;
             }
+            let window = *table
+                .get(&id)?
+                .send_window
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let reserved: i64 = self
+                .heads
+                .iter()
+                .take(self.used)
+                .filter(|head| u32::from_be_bytes([head[5], head[6], head[7], head[8]]) == id)
+                .map(|head| i64::from(u32::from_be_bytes([0, head[0], head[1], head[2]])))
+                .sum();
+            budgets[streams] = (
+                id,
+                if window < 0 {
+                    reserved.saturating_add(window).max(0)
+                } else {
+                    reserved
+                },
+            );
+            streams += 1;
         }
+        Some((budgets, streams))
+    }
+
+    /// Splits the batch in frame order at the first frame a stream's reduced window cuts short.
+    fn fitting_plan(
+        &self,
+        budgets: &mut [(u32, i64)],
+        streams: usize,
+    ) -> Option<(
+        [usize; DATA_FRAMES_PER_WRITE],
+        [[u8; 9]; DATA_FRAMES_PER_WRITE],
+        usize,
+    )> {
         let mut fit = [0usize; DATA_FRAMES_PER_WRITE];
         let mut heads = [[0u8; 9]; DATA_FRAMES_PER_WRITE];
         let mut included = 0;
@@ -269,12 +295,9 @@ impl<'a> DataBatch<'a> {
             let head = &self.heads[at];
             let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
             let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
-            let Some(slot) = budgets[..streams]
+            let slot = budgets[..streams]
                 .iter_mut()
-                .find(|(known, _)| *known == id)
-            else {
-                return false;
-            };
+                .find(|(known, _)| *known == id)?;
             let budget = usize::try_from(slot.1.max(0)).unwrap_or(usize::MAX);
             let take = if len == 0 { 0 } else { len.min(budget) };
             if len > 0 && take == 0 {
@@ -285,15 +308,23 @@ impl<'a> DataBatch<'a> {
             included = at + 1;
             if take == len {
                 if len > 0 {
-                    slot.1 -= take as i64;
+                    slot.1 -= i64::try_from(take).unwrap_or(i64::MAX);
                 }
                 continue;
             }
             break;
         }
-        if included == 0 {
-            return false;
-        }
+        Some((fit, heads, included))
+    }
+
+    /// Writes the planned prefix, then trims the batch to the frames the next grant must carry.
+    fn write_fitting(
+        &mut self,
+        conn: &H2Conn,
+        fit: &[usize; DATA_FRAMES_PER_WRITE],
+        heads: &[[u8; 9]; DATA_FRAMES_PER_WRITE],
+        included: usize,
+    ) -> bool {
         let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
         let mut pieces = 0;
         for at in 0..included {
