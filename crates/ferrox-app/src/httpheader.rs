@@ -450,6 +450,7 @@ struct Chunked<'a, R> {
     reader: &'a mut R,
     pending: Vec<u8>,
     at: usize,
+    scan: usize,
     init: usize,
 }
 
@@ -459,6 +460,7 @@ impl<'a, R: Read + crate::proxy::RelayPoll> Chunked<'a, R> {
             reader,
             pending: Vec::with_capacity(SKIP_ROOM),
             at: 0,
+            scan: 0,
             init: 0,
         }
     }
@@ -471,6 +473,7 @@ impl<'a, R: Read + crate::proxy::RelayPoll> Chunked<'a, R> {
         self.pending.copy_within(self.at..len, 0);
         self.pending.truncate(len - self.at);
         self.init = self.init.saturating_sub(self.at);
+        self.scan = self.scan.saturating_sub(self.at);
         self.at = 0;
     }
 
@@ -527,27 +530,28 @@ impl<'a, R: Read + crate::proxy::RelayPoll> Chunked<'a, R> {
         Some(())
     }
 
-    /// The next line without its `\r\n`, borrowed from the read room: the scan moves the cursor and hands back the bytes it found, so a body of n chunks is not n allocations.
+    /// The next line without its `\r\n`, borrowed from the read room: the scan moves the cursor and hands back the bytes it found, so a body of n chunks is not n allocations. A line split across reads keeps its start at the cursor, so the fill's compaction moves the unfinished bytes instead of dropping them; `scan` is how far into them the search already went.
     fn line(&mut self, until: Instant) -> Option<&[u8]> {
+        self.scan = self.at;
         loop {
             let start = self.at;
-            let room = self.pending.get(start..)?;
+            let room = self.pending.get(self.scan..)?;
             if let Some(rel) = room.iter().position(|byte| *byte == b'\n') {
-                if rel > HEAD_LIMIT {
+                let end = self.scan + rel;
+                if end - start > HEAD_LIMIT {
                     return None;
                 }
-                self.at = start + rel + 1;
-                let line = self.pending.get(start..start + rel)?;
+                self.at = end + 1;
+                let line = self.pending.get(start..end)?;
                 if line.last() != Some(&b'\r') {
                     return None;
                 }
                 return line.get(..line.len() - 1);
             }
-            let tail = room.len();
-            self.at = self.pending.len();
-            if tail > HEAD_LIMIT {
+            if self.pending.len() - start > HEAD_LIMIT {
                 return None;
             }
+            self.scan = self.pending.len();
             self.fill(until)?;
         }
     }
@@ -1167,6 +1171,42 @@ mod tests {
             ferrox_core::alloc_count::measure(|| skip_chunked_body(&mut chunks, until));
         assert_eq!(answer, Some(()));
         assert_eq!(counts.allocs, 0, "a line is scanned, not collected");
+    }
+
+    #[test]
+    fn a_chunk_line_split_across_reads_is_still_one_line() {
+        struct Splits {
+            body: Vec<u8>,
+            at: usize,
+            most: usize,
+        }
+        impl Read for Splits {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = (self.body.len() - self.at).min(buf.len()).min(self.most);
+                buf[..n].copy_from_slice(&self.body[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+        impl crate::proxy::RelayPoll for Splits {
+            fn arm_relay_poll(&mut self) {}
+        }
+        let body = b"10\r\n0123456789abcdef\r\n0\r\nx-trailer: v\r\n\r\nnext".to_vec();
+        for most in 1..=8 {
+            let mut read = Splits {
+                body: body.clone(),
+                at: 0,
+                most,
+            };
+            let until = Instant::now() + std::time::Duration::from_secs(5);
+            let mut chunks = Chunked::new(&mut read);
+            assert_eq!(
+                skip_chunked_body(&mut chunks, until),
+                Some(()),
+                "a line split into {most}-byte reads"
+            );
+            assert_eq!(chunks.take_remainder(), b"next");
+        }
     }
 
     #[test]

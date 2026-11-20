@@ -6791,10 +6791,27 @@ mod tests {
         };
         cycle(&mut payloads);
         let ((), counts) = ferrox_core::alloc_count::measure(|| cycle(&mut payloads));
+        let mut tree = std::collections::BTreeMap::new();
+        let tree_cycle = |tree: &mut std::collections::BTreeMap<u64, Vec<u8>>,
+                          payloads: &mut Vec<Vec<u8>>| {
+            for (seq, payload) in (0u64..).zip(payloads.drain(..)) {
+                tree.insert(seq, payload);
+            }
+            for seq in 0u64..PENDING as u64 {
+                payloads.push(tree.remove(&seq).expect("the head packet"));
+            }
+        };
+        tree_cycle(&mut tree, &mut payloads);
+        let ((), tree_counts) =
+            ferrox_core::alloc_count::measure(|| tree_cycle(&mut tree, &mut payloads));
         end_session("packet-map-reuse");
         assert_eq!(
             counts.allocs, 0,
             "a warm pending-packet round reaches the allocator"
+        );
+        assert_ne!(
+            tree_counts.allocs, 0,
+            "a tree frees its nodes on drain and allocates them again next round"
         );
     }
 
