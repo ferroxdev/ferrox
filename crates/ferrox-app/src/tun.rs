@@ -181,7 +181,7 @@ impl Spec {
         self
     }
 
-    /// An inherited descriptor: the VpnService or utun the app already opened, duplicated and served instead of a platform open.
+    /// An inherited descriptor: the `VpnService` or utun the app already opened, duplicated and served instead of a platform open.
     pub(crate) fn with_fd(mut self, fd: Option<i32>) -> Self {
         self.fd = fd;
         self

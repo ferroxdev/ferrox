@@ -17624,7 +17624,7 @@ fn tun_duration(text: &str) -> Option<std::time::Duration> {
     seen.then_some(total)
 }
 
-/// The inherited descriptor a mobile host hands its VpnService or utun: `fd`, `file_descriptor` or the dashed spelling, duplicated by the open so the host keeps its own.
+/// The inherited descriptor a mobile host hands its `VpnService` or utun: `fd`, `file_descriptor` or the dashed spelling, duplicated by the open so the host keeps its own.
 fn tun_fd(inbound: &Json) -> Result<Option<i32>, String> {
     let Some(value) = tun_field(inbound, "fd")
         .or_else(|| tun_field(inbound, "file_descriptor"))
