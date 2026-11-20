@@ -102,7 +102,7 @@ impl std::fmt::Debug for ScriptRouter {
 #[cfg(target_os = "ios")]
 impl ScriptRouter {
     pub(crate) fn parse_in(path: &str, dirs: Vec<PathBuf>) -> Result<Self, String> {
-        let resolved = super::resolve(path, &dirs)?;
+        let resolved = resolve(path, &dirs)?;
         eprintln!(
             "routing script `{}`: this platform has no Lua runtime, so the script is not run",
             resolved.display()
