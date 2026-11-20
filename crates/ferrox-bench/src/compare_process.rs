@@ -413,8 +413,7 @@ impl Comparison {
     }
 
     fn reference(&self) -> Option<&'static str> {
-        // The caller puts the selected reference first. A later external engine that landed runs
-        // does not substitute for it: zero reference runs is missing data, not a baseline.
+        // The caller puts the selected reference first; a later engine with runs does not substitute.
         self.by_engine
             .iter()
             .find(|e| e.engine != "ferrox")

@@ -82,8 +82,7 @@ matrix_reference_engine() {
   esac
 }
 
-# The harness reads the first external engine as its reference; keep the cell's selected
-# reference first so the CPU and RSS gates price the engine the ratio names.
+# The harness reads the first external engine as its reference; keep the selected one first.
 matrix_reference_first() {
   local reference="$1" have
   shift
