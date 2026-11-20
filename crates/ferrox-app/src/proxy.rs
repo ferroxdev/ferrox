@@ -689,7 +689,7 @@ fn serve_inbounds_counted(
                             handler_stop.as_ref(),
                         ) {
                             if !wake.is_empty() {
-                                wake_address = wake.clone();
+                                wake_address.clone_from(&wake);
                             }
                             if let Some(stop) = recorded_stop {
                                 handler_stops.push((Arc::clone(stop), wake));
@@ -30231,7 +30231,7 @@ pub(crate) fn serve_udp_lane(
     );
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn serve_udp_lane_with(
     relay: &UdpSocket,
     out: &Outbound,
