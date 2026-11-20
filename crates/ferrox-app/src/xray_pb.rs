@@ -3820,8 +3820,7 @@ pub(crate) fn add_rule_request(bytes: &[u8]) -> Result<(Vec<Json>, bool), String
 #[allow(clippy::too_many_lines)]
 fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.app.router.RoutingRule");
-    let mut outbound = None;
-    let mut balancer = None;
+    let mut target = None;
     let mut rule_tag = None;
     let mut domains = Vec::new();
     let mut ips = Vec::new();
@@ -3841,14 +3840,14 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     let mut webhook = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 2) => outbound = Some(account_text(&mut reader)?),
+            (1, 2) => target = Some(("outboundTag", account_text(&mut reader)?)),
             (2, 2) => domains.push(Json::Str(domain_rule(reader.bytes()?)?)),
             (7, 2) => users.push(Json::Str(account_text(&mut reader)?)),
             (8, 2) => inbound_tags.push(Json::Str(account_text(&mut reader)?)),
             (9, 2) => protocols.push(Json::Str(account_text(&mut reader)?)),
             (10, 2) => ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
             (11, 2) => source_ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
-            (12, 2) => balancer = Some(account_text(&mut reader)?),
+            (12, 2) => target = Some(("balancerTag", account_text(&mut reader)?)),
             (13, 0) => networks.push(Json::Str(network_name(reader.varint()?)?.to_owned())),
             (13, 2) => {
                 let mut packed = Reader::new(reader.bytes()?, "xray.common.net.Network");
@@ -3869,15 +3868,8 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let (key, tag) = match (outbound, balancer) {
-        (Some(tag), _) => ("outboundTag", tag),
-        (None, Some(tag)) => ("balancerTag", tag),
-        (None, None) => {
-            return Err(
-                "xray.app.router.RoutingRule: names neither an outbound nor a balancer".to_owned(),
-            )
-        }
-    };
+    let (key, tag) =
+        target.ok_or("xray.app.router.RoutingRule: names neither an outbound nor a balancer")?;
     let mut pairs = vec![(key, Json::Str(tag))];
     if let Some(rule_tag) = rule_tag {
         pairs.push(("ruleTag", Json::Str(rule_tag)));
@@ -8931,17 +8923,32 @@ mod tests {
         assert_eq!(routing.route(&flow), Some("blocked"));
     }
 
-    /// Both target fields are not a well-formed oneof, but wire order must not
-    /// choose the lane: the outbound wins as it does in the JSON spelling.
+    /// The two target fields are one protobuf oneof, so a rule carrying both
+    /// resolves to the last member on the wire, as the reference's unmarshal does.
     #[test]
-    fn a_pb_rule_with_both_targets_uses_the_outbound() {
-        for rule in [
-            message(&[bytes_field(1, b"node"), bytes_field(12, b"pool")]),
-            message(&[bytes_field(12, b"pool"), bytes_field(1, b"node")]),
+    fn a_pb_rule_with_both_targets_uses_the_last() {
+        for (rule, key, tag) in [
+            (
+                message(&[bytes_field(1, b"node"), bytes_field(12, b"pool")]),
+                "balancerTag",
+                "pool",
+            ),
+            (
+                message(&[bytes_field(12, b"pool"), bytes_field(1, b"node")]),
+                "outboundTag",
+                "node",
+            ),
         ] {
             let json = router_rule(&rule).expect("decodes");
-            assert_eq!(json.get("outboundTag").and_then(Json::as_str), Some("node"));
-            assert!(json.get("balancerTag").is_none());
+            assert_eq!(json.get(key).and_then(Json::as_str), Some(tag));
+            assert_eq!(
+                json.get(if key == "balancerTag" {
+                    "outboundTag"
+                } else {
+                    "balancerTag"
+                }),
+                None
+            );
         }
     }
 
