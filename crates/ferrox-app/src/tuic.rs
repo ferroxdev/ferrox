@@ -986,23 +986,30 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
         let alive = match quic::recv_batch(&lane.sock, &mut batch) {
             quic::Drain::Read => {
                 let taken = batch.len();
-                let Ok(mut conn) = lane.conn.lock() else {
-                    break;
-                };
-                for at in 0..taken {
-                    let Some((bytes, from)) = batch.at(at) else {
-                        continue;
+                {
+                    let Ok(mut conn) = lane.conn.lock() else {
+                        break;
                     };
-                    let _ = conn.recv(
-                        bytes,
-                        quiche::RecvInfo {
-                            from,
-                            to: lane.local,
-                        },
-                    );
+                    for at in 0..taken {
+                        let Some((bytes, from)) = batch.at(at) else {
+                            continue;
+                        };
+                        let _ = conn.recv(
+                            bytes,
+                            quiche::RecvInfo {
+                                from,
+                                to: lane.local,
+                            },
+                        );
+                    }
                 }
                 lane.finish_handshake()
-                    && client_turn(&mut conn, &lane, &mut buf, &replies, &mut uni, &mut ids)
+                    && match lane.conn.lock() {
+                        Ok(mut conn) => {
+                            client_turn(&mut conn, &lane, &mut buf, &replies, &mut uni, &mut ids)
+                        }
+                        Err(_) => false,
+                    }
             }
             quic::Drain::Empty => {
                 if !lane.finish_handshake() {
@@ -1025,8 +1032,14 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                             to: lane.local,
                         },
                     );
+                    drop(conn);
                     lane.finish_handshake()
-                        && client_turn(&mut conn, &lane, &mut buf, &replies, &mut uni, &mut ids)
+                        && match lane.conn.lock() {
+                            Ok(mut conn) => client_turn(
+                                &mut conn, &lane, &mut buf, &replies, &mut uni, &mut ids,
+                            ),
+                            Err(_) => false,
+                        }
                 }
                 Err(error) if is_wait(&error) => {
                     if !lane.finish_handshake() {
