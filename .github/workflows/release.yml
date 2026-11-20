@@ -390,12 +390,16 @@ jobs:
           tag_err="$RUNNER_TEMP/tag.err"
           if tag_ref="$(gh api "$tag_path" --jq '.object.type + " " + .object.sha' 2>"$tag_err")"; then
             read -r tag_type tag_sha <<< "$tag_ref"
-            if [ "$tag_type" = tag ]; then
+            while [ "$tag_type" = tag ]; do
               tag_api="repos/$GH_REPO/git/tags/$tag_sha"
-              tag_commit="$(gh api "$tag_api" --jq .object.sha)" || exit 1
-            else
-              tag_commit="$tag_sha"
+              tag_ref="$(gh api "$tag_api" --jq '.object.type + " " + .object.sha')" || exit 1
+              read -r tag_type tag_sha <<< "$tag_ref"
+            done
+            if [ "$tag_type" != commit ]; then
+              echo "::error::$VERSION resolves to $tag_type, not a commit"
+              exit 1
             fi
+            tag_commit="$tag_sha"
           elif grep -q '404' "$tag_err"; then
             tag_commit=""
           else
