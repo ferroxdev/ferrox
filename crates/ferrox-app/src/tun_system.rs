@@ -555,6 +555,7 @@ pub(crate) fn serve(
     wake_write.set_nonblocking(true)?;
     let stack_wake = wake_write.try_clone()?;
     let config = tun_stack::device_config(spec);
+    let dns_hijack = spec.dns_hijack();
     let stack_out = out.clone();
     let stack_failed = Arc::clone(&failed);
     let stack_recycle = recycle.clone();
@@ -567,7 +568,7 @@ pub(crate) fn serve(
             stack_out,
             Some(stack_recycle),
             0,
-            spec.dns_hijack(),
+            dns_hijack,
             wake_read,
             stack_failed,
         );

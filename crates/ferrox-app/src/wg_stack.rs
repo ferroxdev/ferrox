@@ -3862,9 +3862,9 @@ mod tests {
             });
         }
         assert_eq!(stack.udp.len(), 2, "each asked server keeps its own lane");
-        for ((_, kept, _), lane) in &stack.udp {
-            assert_eq!(kept.port(), 53);
-            assert_ne!(kept.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+        for ((_, _, asked), lane) in &stack.udp {
+            assert_eq!(asked.port(), 53);
+            assert_ne!(asked.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
             let (dial, _) = crate::proxy::parse_socks_udp(&lane.head).expect("socks header");
             assert_eq!(dial, "127.0.0.1:53".parse().expect("resolver"));
         }
