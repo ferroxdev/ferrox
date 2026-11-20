@@ -2774,7 +2774,7 @@ pub(crate) fn claim_udp_route(routes: &UdpRoutes, port: u16) -> Result<UdpRouteC
 /// inner UDP packet, and the reply the tunnel returns is framed back to the last
 /// app that spoke. Each name gets its own inner source port, so a reply pins
 /// only the name that raced it, and the relay port serves a literal address.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     relay: &UdpSocket,
     config: &DeviceConfig,
