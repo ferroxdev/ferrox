@@ -10,7 +10,7 @@ on:
       engines:
         description: Space-separated engines (`sing-tun-*` names the sing-box tun inbound, `hev` is the same engine as `hev-socks5-tunnel`; `tun2socks` and `xray` are built and run only when named here)
         type: string
-        default: "hev-socks5-tunnel ferrox ferrox-native singbox-system singbox-gvisor"
+        default: "hev-socks5-tunnel ferrox ferrox-native singbox-system singbox-gvisor xray"
       scenarios:
         description: Space-separated scenarios
         type: string
