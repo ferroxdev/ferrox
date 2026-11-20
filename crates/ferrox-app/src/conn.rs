@@ -136,6 +136,7 @@ struct XmcState {
     config: ferrox_core::finalmask::xmc::Config,
     role: ferrox_core::finalmask::MaskRole,
     deadline: HandshakeDeadline,
+    write_deadline: HandshakeDeadline,
     session: XmcSlot,
 }
 
@@ -275,12 +276,15 @@ impl XmcState {
             let _ = stream.set_write_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
             let result = (|| {
                 let deadline = self.deadline.clone();
-                deadline.arm(Instant::now() + xmc_deadline(crate::budgets::handshake_cap()));
+                let write_deadline = self.write_deadline.clone();
+                let budget = xmc_deadline(crate::budgets::handshake_cap());
+                deadline.arm(Instant::now() + budget);
+                write_deadline.arm(Instant::now() + budget);
                 let reader = DeadlineReader::new(stream.try_clone()?, deadline.clone());
                 let writer = XmcWriter {
                     stream: stream.try_clone()?,
                     chain: std::sync::Arc::clone(chain),
-                    deadline: deadline.clone(),
+                    deadline: write_deadline.clone(),
                 };
                 let session = match self.role {
                     ferrox_core::finalmask::MaskRole::Client => {
@@ -291,6 +295,7 @@ impl XmcState {
                     }
                 };
                 deadline.end();
+                write_deadline.end();
                 Ok::<_, io::Error>(std::sync::Arc::new(session))
             })();
             let _ = stream.set_read_timeout(saved_read);
@@ -846,6 +851,7 @@ impl Connection {
                         config: config.clone(),
                         role,
                         deadline: HandshakeDeadline::default(),
+                        write_deadline: HandshakeDeadline::default(),
                         session: std::sync::OnceLock::new(),
                     })
                 });
@@ -4575,6 +4581,7 @@ mod tests {
             },
             role: ferrox_core::finalmask::MaskRole::Server,
             deadline: HandshakeDeadline::default(),
+            write_deadline: HandshakeDeadline::default(),
             session: std::sync::OnceLock::new(),
         });
         let mut masked = masked_with(client, ferrox_core::evasion::SniShape::Record);
@@ -4582,11 +4589,19 @@ mod tests {
         let connection = Connection::Masked(masked);
 
         let until = Instant::now() + Duration::from_secs(1);
+        let writing = until + Duration::from_secs(1);
+        state.write_deadline.arm(writing);
         connection.set_read_until(Some(until));
         assert_eq!(*state.deadline.gate(), Some(until));
+        assert_eq!(
+            *state.write_deadline.gate(),
+            Some(writing),
+            "the read clock does not become a write clock"
+        );
 
         connection.set_read_until(None);
         assert_eq!(*state.deadline.gate(), None);
+        assert_eq!(*state.write_deadline.gate(), Some(writing));
     }
 
     /// The login keeps the reference's two minutes on a dial, and an admission shortens it to the
