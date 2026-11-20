@@ -1330,6 +1330,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
             move || flow.close()
         })),
     );
+    crate::proxy::track_relay(&done);
 
     let mut up = flow.clone();
     let forward = Arc::clone(&done);

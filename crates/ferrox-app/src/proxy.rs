@@ -648,6 +648,7 @@ fn serve_inbounds_counted(
                     .map(|(_, raw)| raw.clone())
             });
             let mut handler_stops: Vec<(Arc<Stop>, String)> = Vec::new();
+            let mut extra_threads = 0usize;
             let vmess_cached_before = protocol != "vmess"
                 || match (route, handler_tag.as_deref()) {
                     (Some(shared), Some(tag)) => shared.has_vmess_users(tag),
@@ -810,7 +811,7 @@ fn serve_inbounds_counted(
                     }
                     "dokodemo-door" => {
                         if let Some(out) = routed(inbound, true) {
-                            let (armed, tcp) = serve_dokodemo(
+                            let (armed, workers) = serve_dokodemo(
                                 address,
                                 inbound,
                                 &out,
@@ -819,10 +820,11 @@ fn serve_inbounds_counted(
                                 fallible,
                             );
                             inbounds += armed;
-                            if tcp && !dokodemo_has(&dokodemo_networks(inbound), "udp") {
+                            if workers > 0 {
                                 if let Some(stop) = &handler_stop {
                                     handler_stops.push((Arc::clone(stop), address.clone()));
                                 }
+                                extra_threads += workers - 1;
                             }
                         } else if fallible {
                             bind_failed();
@@ -969,7 +971,7 @@ fn serve_inbounds_counted(
             if bind_failure {
                 if let Some(stop) = &handler_stop {
                     if !handler_stops.is_empty() {
-                        stop.expect_listeners(handler_stops.len());
+                        stop.expect_listeners(handler_stops.len() + extra_threads);
                     }
                     stop.stop();
                     for address in &armed_addresses {
@@ -1000,7 +1002,7 @@ fn serve_inbounds_counted(
             }
             let handler_users = vmess_users;
             if let Some(stop) = &handler_stop {
-                stop.expect_listeners(handler_stops.len());
+                stop.expect_listeners(handler_stops.len() + extra_threads);
             }
             if let Some(api) = api {
                 if inbounds > before {
@@ -1360,6 +1362,17 @@ pub(crate) fn wake_listener(stop: &Stop, address: &str) {
     }
     if let Ok(target) = parse_target(address) {
         let _ = crate::conn::connect(&target, std::time::Duration::from_millis(500));
+    }
+}
+
+/// Marks a worker's socket released when its serving loop leaves, whichever path it took.
+struct WorkerDone(Option<Arc<Stop>>);
+
+impl Drop for WorkerDone {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.0 {
+            stop.mark_closed();
+        }
     }
 }
 
@@ -9183,6 +9196,8 @@ const RESOLVE_STACK: usize = 256 * 1024;
 static RESOLVE_POOL: Mutex<Option<ResolvePool>> = Mutex::new(None);
 /// Latency probes resolve here, so their fan-out cannot take the workers a flow's dial waits on.
 static PROBE_POOL: Mutex<Option<ResolvePool>> = Mutex::new(None);
+/// DNS-app lookups ride their own workers: a stopped caller's lookup cannot hold a dial's worker.
+static DNS_APP_POOL: Mutex<Option<ResolvePool>> = Mutex::new(None);
 
 impl ResolvePool {
     /// Start one set of long-lived workers; a resolver that hangs parks a worker, not a flow's thread.
@@ -9624,8 +9639,13 @@ fn resolve_name_watching(
     }
     if let Some(resolver) = crate::dnsapp::installed() {
         if stop.is_some() {
-            let addrs =
-                resolve_bounded_watching(host, port, budgets::dial(), stop, move |host, port| {
+            let addrs = resolve_on(
+                &DNS_APP_POOL,
+                host,
+                port,
+                budgets::dial(),
+                stop,
+                move |host, port| {
                     let answer = if local {
                         resolver.lookup_local(host)
                     } else {
@@ -9638,7 +9658,8 @@ fn resolve_name_watching(
                                 .collect()
                         })
                         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
-                })?;
+                },
+            )?;
             return addrs.first().copied();
         }
         let (ips, _) = if local {
@@ -14655,6 +14676,7 @@ fn serve_vless_kcp(
 
 /// Hysteria v2 flow: acknowledge before dialing, so a refused dial reads as EOF rather than as a refusal.
 fn serve_hysteria_flow(mut flow: crate::hysteria::Flow, freedom: bool) {
+    let _jobs = RelayJobsGuard::new();
     if !freedom {
         return;
     }
@@ -14868,6 +14890,7 @@ fn serve_hysteria_v1_flow(mut flow: crate::hysteria::Flow, host: &str, port: u16
 }
 
 fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], freedom: bool) {
+    let _jobs = RelayJobsGuard::new();
     let allows = |id: &[u8; 16], flow: Flow, cmd: u8| {
         vless_user_allows(users, id, flow, cmd, freedom, false)
     };
@@ -16628,6 +16651,7 @@ fn serve_ss_hysteria(
     accounts: &crate::shadowsocks::SsAccounts,
     freedom: bool,
 ) {
+    let _jobs = RelayJobsGuard::new();
     if !freedom {
         io.close();
         return;
@@ -16651,6 +16675,7 @@ fn serve_ss_hysteria(
 }
 
 fn serve_trojan_hysteria(mut io: crate::hysteria::Flow, key: &[[u8; 56]], freedom: bool) {
+    let _jobs = RelayJobsGuard::new();
     if !freedom {
         io.close();
         return;
@@ -16991,6 +17016,7 @@ fn serve_vmess_quic(
 }
 
 fn serve_vmess_hysteria(flow: crate::hysteria::Flow, users: &crate::vmess::Users, freedom: bool) {
+    let _jobs = RelayJobsGuard::new();
     let mut reader = crate::hysteria::FlowRead::new(flow.clone());
     let decoded = crate::vmess::accept_request_bounded(&mut reader, users);
     let closer = flow.clone();
@@ -17213,7 +17239,8 @@ fn serve_vmess_reality(
 }
 
 /// Bind a dokodemo-door flow and rewrite it to the target its config names, and say how many
-/// inbounds it armed. The tcp flow and the udp flow are served when the config names them.
+/// inbounds it armed and how many worker threads that leaves to close. The tcp flow and the udp
+/// flow are served when the config names them.
 #[allow(clippy::too_many_lines)]
 fn serve_dokodemo(
     address: &str,
@@ -17222,7 +17249,7 @@ fn serve_dokodemo(
     label: &str,
     stop: Option<&Arc<Stop>>,
     fallible: bool,
-) -> (usize, bool) {
+) -> (usize, usize) {
     let follow_redirect = inbound
         .get("settings")
         .and_then(|settings| settings.get("followRedirect"))
@@ -17237,13 +17264,13 @@ fn serve_dokodemo(
     let networks = dokodemo_networks(inbound);
     if !dokodemo_has(&networks, "tcp") && !dokodemo_has(&networks, "udp") {
         eprintln!("dokodemo-door without tcp or udp in {label}: no flow to serve");
-        return (0, false);
+        return (0, 0);
     }
     let mode = match crate::sockopt::inbound_tproxy(inbound.get("streamSettings")) {
         Ok(mode) => mode,
         Err(reason) => {
             eprintln!("dokodemo-door sockopt in {label}: {reason}");
-            return (0, false);
+            return (0, 0);
         }
     };
     let requested = dokodemo_transparent(receive_original_destination, mode);
@@ -17263,14 +17290,14 @@ fn serve_dokodemo(
         Some(_) => None,
         None => {
             eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");
-            return (0, false);
+            return (0, 0);
         }
     };
     let port_map = match dokodemo_port_map(inbound) {
         Ok(map) => map,
         Err(reason) => {
             eprintln!("dokodemo-door portMap in {label}: {reason}");
-            return (0, false);
+            return (0, 0);
         }
     };
     let listen = match parse_target(address) {
@@ -17321,8 +17348,9 @@ fn serve_dokodemo(
             armed += 1;
         }
     }
+    let mut workers = tcp_armed as usize;
     if fallible && dokodemo_has(&networks, "tcp") && !tcp_armed {
-        return (armed, tcp_armed);
+        return (armed, workers);
     }
     if dokodemo_has(&networks, "udp") {
         // The door's own socket is bound before the inbound is armed: a port nobody holds answers a datagram with a refusal.
@@ -17331,7 +17359,7 @@ fn serve_dokodemo(
             let Ok(crate::conn::Target::Ip(bound)) = parse_target(address) else {
                 bind_failed();
                 eprintln!("dokodemo-door udp: {address} names no IP in {label}");
-                return (armed, dokodemo_has(&networks, "tcp"));
+                return (armed, workers);
             };
             listen = Some(bound);
             crate::transparent::bind_udp(bound)
@@ -17351,14 +17379,14 @@ fn serve_dokodemo(
                 let Ok(socket) = UdpSocket::bind(address) else {
                     bind_failed();
                     eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
-                    return (armed, dokodemo_has(&networks, "tcp"));
+                    return (armed, workers);
                 };
                 (socket, false)
             }
             Err(_) => {
                 bind_failed();
                 eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
-                return (armed, dokodemo_has(&networks, "tcp"));
+                return (armed, workers);
             }
         };
         let door = out.clone();
@@ -17366,9 +17394,12 @@ fn serve_dokodemo(
             let Some(listen) = socket.local_addr().ok().or(listen) else {
                 bind_failed();
                 eprintln!("dokodemo-door udp: cannot read the bound address in {label}");
-                return (armed, dokodemo_has(&networks, "tcp"));
+                return (armed, workers);
             };
-            thread::spawn(move || dokodemo_transparent_udp_door(&socket, &door, listen));
+            let worker_stop = stop.cloned();
+            thread::spawn(move || {
+                dokodemo_transparent_udp_door(&socket, &door, listen, worker_stop);
+            });
         } else {
             let dest = if follow_redirect {
                 rewrite.configured()
@@ -17380,13 +17411,15 @@ fn serve_dokodemo(
                 eprintln!(
                     "dokodemo-door udp: followRedirect needs a rewrite address in {label}; no UDP flow is served"
                 );
-                return (armed, dokodemo_has(&networks, "tcp"));
+                return (armed, workers);
             };
-            thread::spawn(move || dokodemo_udp_door(&socket, &dest, &door));
+            let worker_stop = stop.cloned();
+            thread::spawn(move || dokodemo_udp_door(&socket, &dest, &door, worker_stop));
         }
         armed += 1;
+        workers += 1;
     }
-    (armed, tcp_armed)
+    (armed, workers)
 }
 
 fn dokodemo_original_destination(
@@ -29779,6 +29812,15 @@ pub(crate) fn relay_leg_armed(
 /// One association per source; the bound keeps distinct sources from pinning threads and sockets for the door's life.
 const MAX_DOKODEMO_LEGS: usize = 1024;
 
+/// A removed door wakes at least this often to see the stop flag; an idle door keeps its normal wait.
+fn door_idle(stop: Option<&Arc<Stop>>) -> std::time::Duration {
+    if stop.is_some() {
+        budgets::udp_idle().min(std::time::Duration::from_millis(250))
+    } else {
+        budgets::udp_idle()
+    }
+}
+
 /// The dokodemo UDP door: a datagram a client sends goes to the target the config
 /// names, and the answer comes back to the client that sent it.
 ///
@@ -29789,7 +29831,13 @@ const MAX_DOKODEMO_LEGS: usize = 1024;
 /// The socket is the one the front bound, so the port is held from the moment the
 /// inbound is armed, and a datagram that arrives before the door reads it waits in the
 /// kernel rather than in a refusal.
-fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
+fn dokodemo_udp_door(
+    socket: &UdpSocket,
+    dest: &Destination,
+    out: &Outbound,
+    stop: Option<Arc<Stop>>,
+) {
+    let _done = WorkerDone(stop.clone());
     let Some(target) = dest.socket() else {
         eprintln!("dokodemo-door udp: rewrite target unusable, refused");
         return;
@@ -29799,8 +29847,11 @@ fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
     let mut buf = udp_buffer();
     // The door's frame is the door's: the address it rewrites to is the same for every datagram.
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-    let _ = socket.set_read_timeout(Some(budgets::udp_idle()));
+    let _ = socket.set_read_timeout(Some(door_idle(stop.as_ref())));
     loop {
+        if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+            return;
+        }
         let (n, src) = match socket.recv_from(&mut buf) {
             Ok(read) => read,
             Err(error) if is_timeout(&error) => {
@@ -29872,13 +29923,22 @@ fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
 
 /// The transparent dokodemo UDP door: every datagram carries its own original destination,
 /// and the answer must leave from that destination or the client drops it.
-fn dokodemo_transparent_udp_door(socket: &UdpSocket, out: &Outbound, listen: SocketAddr) {
+fn dokodemo_transparent_udp_door(
+    socket: &UdpSocket,
+    out: &Outbound,
+    listen: SocketAddr,
+    stop: Option<Arc<Stop>>,
+) {
+    let _done = WorkerDone(stop.clone());
     type Flow = (SocketAddr, SocketAddr);
     let mut legs: HashMap<Flow, (UdpSocket, Connection, Arc<AtomicBool>)> = HashMap::new();
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-    let _ = socket.set_read_timeout(Some(budgets::udp_idle()));
+    let _ = socket.set_read_timeout(Some(door_idle(stop.as_ref())));
     loop {
+        if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+            return;
+        }
         let (n, client, original) = match crate::transparent::receive_original(socket, &mut buf) {
             Ok(read) => read,
             Err(error) if is_timeout(&error) => {
@@ -36885,6 +36945,44 @@ pub(crate) mod lane_pool {
     }
 }
 
+thread_local! {
+    /// The relay jobs a Hysteria stream thread hands to the lane pool, drained before its listener closes.
+    static RELAY_JOBS: std::cell::RefCell<Option<Vec<Arc<RelayFinish>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Records every relay a Hysteria stream hands off, and waits for them when the stream returns.
+pub(crate) struct RelayJobsGuard;
+
+impl RelayJobsGuard {
+    pub(crate) fn new() -> Self {
+        RELAY_JOBS.with(|jobs| {
+            jobs.borrow_mut().get_or_insert_with(Vec::new);
+        });
+        Self
+    }
+}
+
+impl Drop for RelayJobsGuard {
+    fn drop(&mut self) {
+        let jobs = RELAY_JOBS.with(|jobs| jobs.borrow_mut().take());
+        if let Some(jobs) = jobs {
+            for job in jobs {
+                job.wait_done();
+            }
+        }
+    }
+}
+
+/// A relay a Hysteria stream started; the guard on that stream's thread waits for it.
+pub(crate) fn track_relay(finish: &Arc<RelayFinish>) {
+    RELAY_JOBS.with(|jobs| {
+        if let Some(jobs) = jobs.borrow_mut().as_mut() {
+            jobs.push(Arc::clone(finish));
+        }
+    });
+}
+
 /// What both directions of one wrapped flow share: the close that ends the pair when either
 /// side does, the optional hand-back once both have, and the flag a parked read checks.
 pub(crate) struct RelayFinish {
@@ -36899,9 +36997,7 @@ pub(crate) struct RelayFinish {
     close_first: bool,
     close: Arc<dyn Fn() + Send + Sync>,
     finish: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    #[cfg(test)]
     done: Mutex<bool>,
-    #[cfg(test)]
     wake: std::sync::Condvar,
 }
 
@@ -36921,9 +37017,7 @@ impl RelayFinish {
             close_first,
             close,
             finish: Mutex::new(finish),
-            #[cfg(test)]
             done: Mutex::new(false),
-            #[cfg(test)]
             wake: std::sync::Condvar::new(),
         })
     }
@@ -37030,12 +37124,23 @@ impl RelayFinish {
         if let Some(finish) = finish {
             finish();
         }
-        #[cfg(test)]
-        {
-            if let Ok(mut done) = self.done.lock() {
-                *done = true;
-            }
+        if let Ok(mut done) = self.done.lock() {
+            *done = true;
             self.wake.notify_all();
+        }
+    }
+
+    /// Wait for both directions to leave their lanes, so a listener close covers the relay jobs
+    /// that still hold its socket.
+    pub(crate) fn wait_done(&self) {
+        let Ok(mut done) = self.done.lock() else {
+            return;
+        };
+        while !*done {
+            let Ok(next) = self.wake.wait_timeout(done, Duration::from_millis(100)) else {
+                return;
+            };
+            done = next.0;
         }
     }
 

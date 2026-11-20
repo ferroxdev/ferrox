@@ -1187,7 +1187,22 @@ pub(crate) fn serve_inbound(
     let io_config = config.clone();
     let io_packets = packets_tx.clone();
     let io_stop = stop.map(|stop| stop.shared());
+    let stack_stop = stop.map(|stop| stop.shared());
     let io_closed = stop.cloned();
+    let stack_config = config;
+    let stack_tunnel = to_tunnel;
+    let stack_out = out.clone();
+    let stack = std::thread::spawn(move || {
+        wg_stack::server(
+            stack_config,
+            stack_tunnel,
+            packets_rx,
+            stack_out,
+            WG_HEADER_SIZE,
+            Some(recycle),
+            stack_stop,
+        );
+    });
     std::thread::spawn(move || {
         io(
             io_config,
@@ -1200,23 +1215,11 @@ pub(crate) fn serve_inbound(
             recycled,
             crate::noize::WireGuardNoize::off(),
         );
+        // The stack can still start relay workers from queued packets; closure covers its end.
+        let _ = stack.join();
         if let Some(stop) = io_closed {
             stop.mark_closed();
         }
-    });
-    let stack_config = config;
-    let stack_tunnel = to_tunnel;
-    let stack_out = out.clone();
-    std::thread::spawn(move || {
-        wg_stack::server(
-            stack_config,
-            stack_tunnel,
-            packets_rx,
-            stack_out,
-            WG_HEADER_SIZE,
-            Some(recycle),
-            None,
-        );
     });
     Ok(port)
 }
