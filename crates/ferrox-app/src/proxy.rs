@@ -1207,6 +1207,8 @@ thread_local! {
     static BIND_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+static CLOSING: std::sync::Mutex<Vec<Arc<Stop>>> = std::sync::Mutex::new(Vec::new());
+
 fn bind_failed() {
     BIND_FAILED.with(|failed| failed.set(true));
 }
