@@ -3154,7 +3154,7 @@ pub(crate) fn one_tap(
     let resumed = path.is_file();
     if resumed {
         // The outer device was already created; a failed inner enrollment must be able to finish on the next run instead of minting a second device.
-        let saved = Identity::load(&path).map_err(|error| error.into_message())?;
+        let saved = Identity::load(&path).map_err(LoadError::into_message)?;
         if !matches!(mode, Mode::WireGuard | Mode::GoolClassic) && saved.masque.is_none() {
             return Err(format!(
                 "warp: `{}` has no MASQUE key for mode `{mode:?}`; remove it to register a new device",

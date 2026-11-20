@@ -1315,7 +1315,7 @@ impl GrpcWriter {
     pub(crate) fn send(&self, data: &[u8]) -> bool {
         let max = self.max_frame();
         // Four frames of the 16 KiB the peer advertises are one byte over the default 65_535-byte stream window, so the fourth waits for a credit; a body one byte under the frame fits all four.
-        let cap = usize::try_from(self.hunk_cap()).unwrap_or(usize::MAX);
+        let cap = usize::try_from(self.opening_cap()).unwrap_or(usize::MAX);
         let payload = message_payload(max.saturating_sub(1).min(cap)).max(1);
         if self.multi {
             return self.send_multi(data, payload);
@@ -1816,13 +1816,23 @@ impl GrpcWriter {
 
     /// The largest message the peer's opening window pays for: a message past it would wait for
     /// credit the peer grants only for bytes it has already received.
-    fn hunk_cap(&self) -> u64 {
+    fn opening_cap(&self) -> u64 {
         let init = self
             .shared
             .init
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         (*init).clamp(1, 65_535)
+    }
+
+    /// The batch-flush ceiling a muxed peer's opening window sets; a plain stream keeps the whole
+    /// window in one batch because its credit is its own.
+    fn hunk_cap(&self) -> u64 {
+        if self.shared.muxed {
+            self.opening_cap()
+        } else {
+            u64::MAX
+        }
     }
 
     /// Writes one message, splitting it only when it exceeds `max` bytes.
@@ -5054,7 +5064,8 @@ mod tests {
     fn a_plain_writer_caps_a_message_to_its_opening_window() {
         let peer = Arc::new(Mutex::new(Peer::default()));
         let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, 64);
-        assert_eq!(writer.hunk_cap(), 64);
+        assert_eq!(writer.opening_cap(), 64);
+        assert_eq!(writer.hunk_cap(), u64::MAX, "a plain batch is not cut");
     }
 
     /// The same batch driven over a real socket, where the only thing a loopback test can assert is

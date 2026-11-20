@@ -923,7 +923,7 @@ mod tests {
     fn a_host_local_target_is_declined() {
         assert!(host_local("127.0.0.1".parse().unwrap()));
         assert!(host_local("::1".parse().unwrap()));
-        assert!(!host_local("8.8.8.8".parse().unwrap()));
+        assert!(!host_local("192.0.2.1".parse().unwrap()));
     }
 
     #[test]
