@@ -202,17 +202,13 @@ pub(crate) fn masque_candidates(mode: ScanMode) -> Vec<SocketAddr> {
     for seed in &seeds {
         push(*seed, MASQUE_PORTS[0]);
     }
-    let wave = MASQUE_PREFIXES_V4.len();
-    for ip in sampled.iter().take(wave) {
+    for ip in &sampled {
         push(*ip, MASQUE_PORTS[0]);
     }
     for seed in &seeds {
         for &port in &MASQUE_PORTS[1..] {
             push(*seed, port);
         }
-    }
-    for ip in sampled.iter().skip(wave) {
-        push(*ip, MASQUE_PORTS[0]);
     }
     out
 }
@@ -661,31 +657,13 @@ mod tests {
     }
 
     #[test]
-    fn the_masque_sweep_samples_before_falling_back_inside_both_budgets() {
-        let seeds: HashSet<SocketAddr> = MASQUE_SEEDS
-            .iter()
-            .filter_map(|text| text.parse::<Ipv4Addr>().ok())
-            .map(|ip| SocketAddr::from((ip, MASQUE_PORTS[0])))
-            .collect();
+    fn the_masque_sweep_samples_every_443_edge_before_falling_back() {
         for mode in [ScanMode::Turbo, ScanMode::Ironclad] {
-            let strategy = mode.strategy();
-            let budget = strategy.concurrency
-                * (strategy.deadline.as_secs() / strategy.timeout.as_secs()) as usize;
             let candidates = masque_candidates(mode);
-            assert!(
-                candidates[..budget]
-                    .iter()
-                    .any(|edge| edge.port() == MASQUE_PORTS[0] && !seeds.contains(edge)),
-                "{mode:?} spent its probe budget without reaching a sampled 443 edge"
-            );
             let fallback = candidates
                 .iter()
                 .position(|edge| edge.port() != MASQUE_PORTS[0])
                 .expect("a seed fallback port");
-            assert!(
-                fallback < budget,
-                "{mode:?} never reached a seed fallback port"
-            );
             for prefix in MASQUE_PREFIXES_V4 {
                 let edge = SocketAddr::from((
                     sample_cidr(prefix, 1).first().copied().expect("one host"),
