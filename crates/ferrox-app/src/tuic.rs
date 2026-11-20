@@ -1582,12 +1582,18 @@ fn run(
     if server.sock.set_read_timeout(Some(POLL)).is_err() {
         return;
     }
+    let mut batch = quic::Batch::new();
     while !stop.load(Ordering::Relaxed) {
-        match server.sock.recv_from(&mut buf) {
-            Ok((n, from)) => server.route(&mut buf[..n], from),
-            Err(error)
-                if is_wait(&error) || error.kind() == std::io::ErrorKind::ConnectionReset => {}
-            Err(_) => break,
+        match quic::recv_batch(&server.sock, &mut batch) {
+            quic::Drain::Read => server.route_batch(&mut batch),
+            quic::Drain::Empty => {}
+            quic::Drain::Unbatchable => match server.sock.recv_from(&mut buf) {
+                Ok((n, from)) => server.route(&mut buf[..n], from),
+                Err(error)
+                    if is_wait(&error) || error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                Err(_) => break,
+            },
+            quic::Drain::Unreadable => break,
         }
         if last_tick.elapsed() >= POLL {
             server.tick();
@@ -1740,15 +1746,43 @@ impl UdpAssoc {
 
 impl Server {
     fn route(&mut self, bytes: &mut [u8], from: SocketAddr) {
-        let Ok(header) = quiche::Header::from_slice(bytes, SCID_LEN) else {
+        let Some(session) = self.session_for(bytes, from) else {
             return;
         };
+        self.feed(&session, bytes, from);
+        self.turn(&session);
+    }
+
+    /// One received burst: every datagram goes to quiche first, and the session whose packets it
+    /// carried takes one turn over them instead of one per datagram.
+    fn route_batch(&mut self, batch: &mut quic::Batch) {
+        let taken = batch.len();
+        let mut touched: Vec<Arc<Session>> = Vec::new();
+        for at in 0..taken {
+            let Some((bytes, from)) = batch.at(at) else {
+                continue;
+            };
+            let Some(session) = self.session_for(bytes, from) else {
+                continue;
+            };
+            self.feed(&session, bytes, from);
+            if !touched.iter().any(|held| Arc::ptr_eq(held, &session)) {
+                touched.push(session);
+            }
+        }
+        for session in touched {
+            self.turn(&session);
+        }
+    }
+
+    fn session_for(&mut self, bytes: &mut [u8], from: SocketAddr) -> Option<Arc<Session>> {
+        let header = quiche::Header::from_slice(bytes, SCID_LEN).ok()?;
         if header.ty != quiche::Type::Short && header.version != quiche::PROTOCOL_VERSION {
-            return;
+            return None;
         }
         let initial = header.ty == quiche::Type::Initial;
         let found = self.conns.get(header.dcid.as_ref()).cloned();
-        let session = match found {
+        match found {
             Some(session) => Some(session),
             None if initial => {
                 if let Some(token) = header.token.as_deref().filter(|token| !token.is_empty()) {
@@ -1759,11 +1793,7 @@ impl Server {
                 }
             }
             None => None,
-        };
-        let Some(session) = session else {
-            return;
-        };
-        self.drive(&session, bytes, from);
+        }
     }
 
     fn retry(&self, header: &quiche::Header, from: SocketAddr) {
@@ -1878,7 +1908,9 @@ impl Server {
         }
     }
 
-    fn drive(&mut self, session: &Arc<Session>, bytes: &mut [u8], from: SocketAddr) {
+    /// Hand one packet to its connection and register the source ids it named, so the rest of the
+    /// batch routes by them.
+    fn feed(&mut self, session: &Arc<Session>, bytes: &mut [u8], from: SocketAddr) {
         let Ok(mut conn) = session.conn.lock() else {
             return;
         };
@@ -1894,6 +1926,14 @@ impl Server {
                 .entry(id.as_ref().to_vec())
                 .or_insert_with(|| Arc::clone(session));
         }
+    }
+
+    /// What a session owes after its packets landed: the timers they advanced, the streams they
+    /// made readable, and the egress behind both.
+    fn turn(&mut self, session: &Arc<Session>) {
+        let Ok(mut conn) = session.conn.lock() else {
+            return;
+        };
         if conn
             .timeout_instant()
             .is_some_and(|at| at <= Instant::now())
