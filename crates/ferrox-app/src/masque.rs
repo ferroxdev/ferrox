@@ -2822,6 +2822,30 @@ fn lane_udp_bind(address: &str) -> std::io::Result<UdpSocket> {
     quic::bind_datagram(address)
 }
 
+/// Counts the listeners that must release their socket before the inbound reports closed.
+#[derive(Clone)]
+pub(crate) struct ListenerDone {
+    remaining: Arc<AtomicUsize>,
+    stop: Option<Arc<crate::proxy::Stop>>,
+}
+
+impl ListenerDone {
+    fn new(count: usize, stop: Option<&Arc<crate::proxy::Stop>>) -> Self {
+        Self {
+            remaining: Arc::new(AtomicUsize::new(count)),
+            stop: stop.cloned(),
+        }
+    }
+
+    fn finish(&self) {
+        if self.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+            if let Some(stop) = &self.stop {
+                stop.mark_closed();
+            }
+        }
+    }
+}
+
 /// Open a server inbound's socket and spawn its demultiplexer, stack and forwarder.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn serve_inbound(
@@ -2911,8 +2935,10 @@ pub(crate) fn serve_inbound(
         local: spec.pool.server.clone(),
     });
     let (to_tunnel, from_stack) = mpsc::sync_channel(QUEUE);
+    let listener_done = ListenerDone::new(1 + usize::from(h2_listener.is_some()), stop);
     let dispatcher = Arc::clone(&shared);
-    std::thread::spawn(move || dispatch(&dispatcher, from_stack));
+    let dispatch_stop = stop.map(|stop| stop.shared());
+    std::thread::spawn(move || dispatch(&dispatcher, from_stack, dispatch_stop));
     if let Some(listener) = h2_listener {
         crate::masque_h2::serve(
             Arc::clone(&identity),
@@ -2920,6 +2946,7 @@ pub(crate) fn serve_inbound(
             Arc::clone(&spec),
             listener,
             stop.map(|stop| stop.shared()),
+            listener_done.clone(),
         );
     }
     let device = DeviceConfig {
@@ -2934,15 +2961,17 @@ pub(crate) fn serve_inbound(
         dns: Vec::new(),
     };
     let stack_out = out.clone();
+    let stack_stop = stop.map(|stop| stop.shared());
     std::thread::spawn(move || {
-        wg_stack::server(device, to_tunnel, packets_rx, stack_out, 0, None);
+        wg_stack::server(
+            device, to_tunnel, packets_rx, stack_out, 0, None, stack_stop,
+        );
     });
     let demux_config = Arc::new(Mutex::new(config));
     let demux_sock = Arc::clone(&sock);
     let demux_shared = Arc::clone(&shared);
     let demux_spec = Arc::clone(&spec);
     let demux_stop = stop.map(|stop| stop.shared());
-    let demux_done = stop.cloned();
     std::thread::spawn(move || {
         demux(
             demux_sock,
@@ -2952,9 +2981,7 @@ pub(crate) fn serve_inbound(
             demux_spec,
             demux_stop,
         );
-        if let Some(stop) = demux_done {
-            stop.mark_closed();
-        }
+        listener_done.finish();
     });
     Ok(local.port())
 }
@@ -2985,9 +3012,10 @@ fn serve_cleartext_inbound(
     });
     let (to_tunnel, from_stack) = mpsc::sync_channel(QUEUE);
     let dispatcher = Arc::clone(&shared);
-    std::thread::spawn(move || dispatch(&dispatcher, from_stack));
+    let dispatch_stop = stop.map(|stop| stop.shared());
+    std::thread::spawn(move || dispatch(&dispatcher, from_stack, dispatch_stop));
     let clear_stop = stop.map(|stop| stop.shared());
-    let clear_done = stop.cloned();
+    let clear_done = ListenerDone::new(1, stop);
     crate::masque_h2::serve_cleartext(
         Arc::clone(&shared),
         Arc::clone(spec),
@@ -3007,8 +3035,11 @@ fn serve_cleartext_inbound(
         dns: Vec::new(),
     };
     let stack_out = out.clone();
+    let stack_stop = stop.map(|stop| stop.shared());
     std::thread::spawn(move || {
-        wg_stack::server(device, to_tunnel, packets_rx, stack_out, 0, None);
+        wg_stack::server(
+            device, to_tunnel, packets_rx, stack_out, 0, None, stack_stop,
+        );
     });
     Ok(local.port())
 }
@@ -3560,8 +3591,19 @@ impl Drop for Granted {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn dispatch(shared: &Shared, from_stack: Receiver<Vec<u8>>) {
-    while let Ok(packet) = from_stack.recv() {
+fn dispatch(shared: &Shared, from_stack: Receiver<Vec<u8>>, stop: Option<Arc<AtomicBool>>) {
+    loop {
+        if stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        let packet = match from_stack.recv_timeout(Duration::from_millis(100)) {
+            Ok(packet) => packet,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
         let Some(destination) = packet_destination(&packet) else {
             continue;
         };

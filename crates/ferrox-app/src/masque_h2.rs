@@ -15,7 +15,9 @@ use ferrox_core::tls::{CertEntry, ServerKeyKind, TlsConfig, TlsProvider as _, Tl
 
 use crate::conn::Connection;
 use crate::h2::{self, Decoder};
-use crate::masque::{self, deliver, withdrawn, Granted, ServerSpec, Shared, AUTH_REALM};
+use crate::masque::{
+    self, deliver, withdrawn, Granted, ListenerDone, ServerSpec, Shared, AUTH_REALM,
+};
 use crate::wg_stack::{Packet, UdpRoutes};
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
@@ -222,6 +224,7 @@ pub(crate) fn serve(
     spec: Arc<ServerSpec>,
     listener: TcpListener,
     stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    done: ListenerDone,
 ) {
     let slots = H2Slots::new(H2_CONNECTIONS);
     std::thread::spawn(move || {
@@ -256,6 +259,8 @@ pub(crate) fn serve(
                 eprintln!("masque: cannot spawn HTTP/2 connection handler: {error}");
             }
         }
+        drop(listener);
+        done.finish();
     });
 }
 
@@ -318,7 +323,7 @@ pub(crate) fn serve_cleartext(
     spec: Arc<ServerSpec>,
     listener: TcpListener,
     stop: Option<Arc<std::sync::atomic::AtomicBool>>,
-    done: Option<Arc<crate::proxy::Stop>>,
+    done: ListenerDone,
 ) {
     let slots = H2Slots::new(H2_CONNECTIONS);
     std::thread::spawn(move || {
@@ -353,9 +358,8 @@ pub(crate) fn serve_cleartext(
                 eprintln!("masque: cannot spawn HTTP/2 cleartext handler: {error}");
             }
         }
-        if let Some(stop) = done {
-            stop.mark_closed();
-        }
+        drop(listener);
+        done.finish();
     });
 }
 

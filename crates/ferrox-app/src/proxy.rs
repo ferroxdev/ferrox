@@ -17560,10 +17560,13 @@ fn serve_ss_relay_inbound(
         let relay_dests = Arc::new(relay_dests.clone());
         let stop = stop.cloned();
         thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
+            for stream in listener.incoming() {
                 if stop.as_ref().is_some_and(|stop| stop.stopped()) {
                     break;
                 }
+                let Ok(stream) = stream else {
+                    continue;
+                };
                 let (method, psk, relay_dests) = (
                     Arc::clone(&method),
                     Arc::clone(&psk),

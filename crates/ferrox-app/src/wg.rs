@@ -1215,6 +1215,7 @@ pub(crate) fn serve_inbound(
             stack_out,
             WG_HEADER_SIZE,
             Some(recycle),
+            None,
         );
     });
     Ok(port)

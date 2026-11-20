@@ -1389,10 +1389,17 @@ pub(crate) fn server(
     out: Outbound,
     headroom: usize,
     recycle: Option<Sender<Vec<u8>>>,
+    stop: Option<Arc<AtomicBool>>,
 ) {
     let mut stack = ServerStack::new(&config, to_tunnel, out, headroom);
     stack.device.recycle = recycle;
     loop {
+        if stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Relaxed))
+        {
+            return;
+        }
         if server_turn(&mut stack, &packets, TICK) {
             return;
         }
