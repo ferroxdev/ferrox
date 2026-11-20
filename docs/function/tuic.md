@@ -64,7 +64,7 @@ CI's `bench.yml` run `43998600542` (`23ef3f4`) measured the PACKET parse at **13
 
 CI's `bench.yml` run `44694951611` prices the removed per-frame tail shift on a 512-frame, 1220-byte burst: the drain shape read **5179.7 ns/frame** against **9.7** for the offset walk on linux x86_64, **6992.3** against **6.4** on linux aarch64, **6487.1** against **11.9** on macos aarch64 and **2377.1** against **4.5** on windows x86_64. The offset row is the codec walk alone; the difference is the tail the old shape moved once per frame.
 
-CI's `bench.yml` run `44783358849` sweeps a worker's 1024 sessions on linux x86_64, the cap the map holds: scanning the touched list costs **0.101 ms** per sweep, **98.6 ns** per session, against **0.016 ms**, **15.6 ns** per session marking the identity set — the probe the same run prints as its `## TUIC sweep dedupe` section. The set's per-session cost is fixed overhead spread over the sweep, so the row reads the cap rather than a session count the map cannot reach; the visits and their order are the same in both shapes.
+CI's `bench.yml` run `44783358849` sweeps a worker's 1024 sessions, the cap the map holds: scanning the touched list costs **98.6 ns** per session against **15.6** marking the identity set on linux x86_64, **90.2** against **13.7** on linux aarch64 and **85.8** against **12.5** on windows x86_64. The set's per-session cost is fixed overhead spread over the sweep, so the row reads the cap rather than a session count the map cannot reach; the visits and their order are the same in both shapes. That run's macos cell was cancelled by the runner, not by a failure.
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/tuic.rs, crates/ferrox-core/src/tuic.rs
