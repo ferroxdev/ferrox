@@ -17574,6 +17574,10 @@ fn tun_device_addresses(inbound: &Json) -> Result<(Vec<&str>, Option<u32>), Stri
         found.extend(tun_addresses(inbound, "inet4_address")?);
         found.extend(tun_addresses(inbound, "inet6_address")?);
     }
+    // xray names the same list `gateway`, with the prefix always inside each entry.
+    if found.is_empty() {
+        found.extend(tun_addresses(inbound, "gateway")?);
+    }
     Ok((found, prefix))
 }
 
@@ -17698,6 +17702,10 @@ const TUN_NOT_APPLIED: &[&str] = &[
     "strict_route",
     "route_address_set",
     "route_exclude_address_set",
+    "auto_system_wfp_block_leak",
+    "auto_outbounds_interface",
+    "user_level",
+    "desc",
     "include_interface",
     "exclude_interface",
     "include_uid",
@@ -17775,6 +17783,20 @@ fn tun_dns_hijack(inbound: &Json) -> Result<Option<IpAddr>, String> {
         }
     };
     if !hijack {
+        // xray names the resolvers `DNS` and selects the takeover with the switch below; without `dns_mode`, the first plain address is what a query rides.
+        if let Some(first) = tun_addresses(inbound, "DNS")?.first() {
+            match first.parse::<IpAddr>() {
+                Ok(address) => return Ok(Some(address)),
+                Err(_) => eprintln!(
+                    "tun inbound: `DNS` entry `{first}` is not an address; queries keep the device's own resolver"
+                ),
+            }
+        }
+        if tun_bool(inbound, "auto_system_dns_to_gateway")?.unwrap_or(false) {
+            eprintln!(
+                "tun inbound: `auto_system_dns_to_gateway` needs a resolver this build can name; set `DNS` or `dns_mode`"
+            );
+        }
         return Ok(None);
     }
     let listed = tun_addresses(inbound, "dns_address")?;
@@ -17818,7 +17840,16 @@ fn tun_spec(inbound: &Json) -> Result<crate::tun::Spec, String> {
     if let Some(on) = tun_bool(inbound, "gso")? {
         spec = spec.with_gso(on);
     }
-    let auto_route = tun_bool(inbound, "auto_route")?.unwrap_or(false);
+    // xray's `auto_system_routing_table` names the tables its half-defaults go into; this build installs the main table and names a table it cannot write.
+    let xray_tables = tun_addresses(inbound, "auto_system_routing_table")?;
+    let auto_route = tun_bool(inbound, "auto_route")?.unwrap_or(false) || !xray_tables.is_empty();
+    if let Some(named) = xray_tables.first() {
+        if !matches!(*named, "main" | "254") {
+            eprintln!(
+                "tun inbound: `auto_system_routing_table` names `{named}`; this build installs the main table"
+            );
+        }
+    }
     let routes = tun_prefixes(
         inbound,
         "route_address",
@@ -44260,6 +44291,26 @@ mod tests {
             listed.addresses()[1],
             ("fd00::1".parse::<std::net::IpAddr>().unwrap(), 126),
             "the device is opened with every address the config names"
+        );
+        let xray = spec(
+            r#"{"name":"xr0","gateway":["198.18.0.1/15"],"DNS":["1.1.1.1"],"auto_system_routing_table":["main"]}"#,
+        )
+        .expect("xray's own tun spelling");
+        assert_eq!(xray.name(), "xr0");
+        assert_eq!(
+            xray.address(),
+            "198.18.0.1".parse::<std::net::IpAddr>().unwrap(),
+            "`gateway` is the same list under xray's name"
+        );
+        assert_eq!(xray.prefix(), 15);
+        assert_eq!(
+            xray.dns_hijack(),
+            Some("1.1.1.1".parse().unwrap()),
+            "xray's first `DNS` address answers a hijacked query"
+        );
+        assert!(
+            xray.auto_route(),
+            "a named system table captures the default"
         );
         assert_eq!(
             spec(r#"{"udp_timeout":"5m"}"#)
