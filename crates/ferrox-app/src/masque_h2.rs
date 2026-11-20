@@ -21,6 +21,7 @@ use crate::wg_stack::{Packet, UdpRoutes};
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const EDGE_RETRY: Duration = Duration::from_secs(1);
 const READ_WAIT: Duration = Duration::from_millis(10);
+const CLOSE_WAIT: Duration = Duration::from_millis(100);
 const UDP_DRAIN: Duration = Duration::from_secs(1);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
 const PING_TIMEOUT: Duration = Duration::from_secs(15);
@@ -105,12 +106,14 @@ impl DeadlineStream {
         match self.deadline.remaining() {
             None => {
                 if self.read_tight.replace(false) {
+                    self.io.set_read_until(None);
                     let _ = self.io.set_read_timeout(Some(self.read_wait.get()));
                 }
                 Ok(())
             }
             Some(left) if left.is_zero() => Err(std::io::ErrorKind::TimedOut.into()),
             Some(left) => {
+                self.io.set_read_until(Some(Instant::now() + left));
                 self.io
                     .set_read_timeout(Some(left.min(self.read_wait.get())))?;
                 self.read_tight.set(true);
@@ -294,6 +297,7 @@ fn connection(
     };
     if wire.preface() {
         Session::new(shared, spec).run(&mut wire);
+        wire.quiet();
     }
 }
 
@@ -342,6 +346,7 @@ fn connection_cleartext(stream: TcpStream, shared: Arc<Shared>, spec: Arc<Server
     drop(cap);
     if ready {
         Session::new(shared, spec).run(&mut wire);
+        wire.quiet();
     }
 }
 
@@ -423,6 +428,31 @@ impl Wire {
             return false;
         }
         true
+    }
+
+    /// Read out whatever the peer sent behind our last frame, so a close does not reset the reply away.
+    fn quiet(&mut self) {
+        self.quiet_until(Instant::now() + CLOSE_WAIT);
+    }
+
+    fn quiet_until(&mut self, until: Instant) {
+        self.deadline.arm(until);
+        let mut room = [0u8; READ_ROOM];
+        loop {
+            if Instant::now() >= until {
+                return;
+            }
+            match self.stream.read(&mut room) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error) if ferrox_core::tls::TlsError::is_timeout(&error) => {
+                    if Instant::now() >= until {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
     }
 
     /// One write for a frame whose head and body are already one buffer.
@@ -2464,6 +2494,73 @@ mod tests {
         assert!(
             error.is_some_and(|reason| reason.kind() == std::io::ErrorKind::TimedOut),
             "the read outlived its absolute deadline"
+        );
+    }
+
+    struct Behind {
+        reads: Arc<AtomicUsize>,
+        left: usize,
+    }
+
+    impl Read for Behind {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            if self.left > 0 {
+                self.left -= 1;
+                return Ok(1);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        }
+    }
+
+    impl Write for Behind {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_finished_wire_reads_what_the_peer_sent_behind_the_reply() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut wire = Wire {
+            stream: Box::new(Behind {
+                reads: Arc::clone(&reads),
+                left: 2,
+            }),
+            pending: Vec::new(),
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        wire.quiet_until(Instant::now() + Duration::from_millis(25));
+        let read = reads.load(Ordering::Relaxed);
+        assert!(
+            read > 2,
+            "a byte behind the reply does not end the drain: {read} reads"
+        );
+    }
+
+    #[test]
+    fn a_quiet_wire_puts_the_drain_under_the_shared_clock() {
+        let mut wire = Wire {
+            stream: Box::new(Behind {
+                reads: Arc::new(AtomicUsize::new(0)),
+                left: 0,
+            }),
+            pending: Vec::new(),
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        let until = Instant::now() + std::time::Duration::from_millis(25);
+        wire.quiet_until(until);
+        let left = wire.deadline.remaining().expect("the drain clock is armed");
+        assert!(
+            left <= std::time::Duration::from_millis(25),
+            "the TLS reads behind the drain are not bounded: {left:?}"
         );
     }
 

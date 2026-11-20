@@ -63,8 +63,18 @@ impl<R: Read> Read for HeadReader<R> {
 }
 
 /// The head, the octets that arrived with it, and where the head ends: this read consumes what it proves, so bytes pipelined behind the head are already in hand.
-fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
-    crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
+fn read_head(stream: &mut Connection, until: Instant) -> Option<(Vec<u8>, usize)> {
+    crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, left(until)?)
+}
+
+fn left(until: Instant) -> Option<std::time::Duration> {
+    until
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+}
+
+fn read_head_within<R: Read>(read: &mut R, until: Instant) -> Option<(Vec<u8>, usize)> {
+    crate::proxy::read_exact_head(read, HEAD_LIMIT, left(until)?)
 }
 
 const DEFAULT_RESPONSE: &[u8] =
@@ -76,7 +86,8 @@ pub(crate) fn accept(
     response: Option<&[u8]>,
 ) -> Option<(HeadReader, Connection)> {
     let mut read = stream;
-    let (head, at) = read_head(&mut read)?;
+    let until = Instant::now() + crate::budgets::head_arrival();
+    let (head, at) = read_head(&mut read, until)?;
     check_request(&head[..at], paths)?;
     let Ok(write) = read.try_clone() else {
         return None;
@@ -128,8 +139,8 @@ pub(crate) fn accept_split<R: Read, W: Write>(
     paths: &[String],
     response: Option<&[u8]>,
 ) -> Option<(HeadReader<R>, W)> {
-    let (head, at) =
-        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
+    let until = Instant::now() + crate::budgets::head_arrival();
+    let (head, at) = read_head_within(&mut read, until)?;
     check_request(&head[..at], paths)?;
     write.write_all(response.unwrap_or(DEFAULT_RESPONSE)).ok()?;
     Some((HeadReader::new(read, head, at), write))
@@ -169,10 +180,11 @@ pub(crate) fn connect(
 ) -> Option<(HeadReader, Connection)> {
     let mut read = stream;
     send_request(&mut read, host, path, headers)?;
-    let (head, at) = read_head(&mut read)?;
+    let until = Instant::now() + crate::budgets::head_arrival();
+    let (head, at) = read_head(&mut read, until)?;
     let previous = read.read_timeout().ok().flatten();
-    let _ = read.set_read_timeout(Some(crate::budgets::head_arrival()));
-    let mut reader = read_response(read, head, at)?;
+    let _ = read.set_read_timeout(Some(left(until)?));
+    let mut reader = read_response(read, head, at, until)?;
     reader.set_poll(previous);
     let Ok(write) = reader.read.try_clone() else {
         return None;
@@ -185,13 +197,14 @@ fn response_status(head: &[u8]) -> Option<u16> {
     let mut parts = head[..end].split(|byte| *byte == b' ');
     let version = parts.next()?;
     let status = parts.next()?;
-    if !version.starts_with(b"HTTP/1.")
+    if (version != b"HTTP/1.0" && version != b"HTTP/1.1")
         || status.len() != 3
         || !status.iter().all(u8::is_ascii_digit)
     {
         return None;
     }
-    std::str::from_utf8(status).ok()?.parse().ok()
+    let status = std::str::from_utf8(status).ok()?.parse::<u16>().ok()?;
+    (100..=599).contains(&status).then_some(status)
 }
 
 #[derive(Clone, Copy)]
@@ -279,12 +292,12 @@ fn read_response<R: Read + crate::proxy::RelayPoll>(
     read: R,
     head: Vec<u8>,
     at: usize,
+    until: Instant,
 ) -> Option<HeadReader<R>> {
     let mut read = Some(read);
     let mut source: Option<HeadReader<R>> = None;
     let mut head = head;
     let mut at = at;
-    let until = Instant::now() + crate::budgets::head_arrival();
     loop {
         let status = response_status(&head[..at])?;
         if (100..200).contains(&status) && status != 101 {
@@ -292,10 +305,7 @@ fn read_response<R: Read + crate::proxy::RelayPoll>(
                 Some(source) => flatten(source, std::mem::take(&mut head), at),
                 None => HeadReader::new(read.take()?, std::mem::take(&mut head), at),
             };
-            let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return None;
-            }
+            let left = left(until)?;
             let mut bounded = HeadDeadline {
                 read: stream,
                 until,
@@ -313,8 +323,7 @@ fn read_response<R: Read + crate::proxy::RelayPoll>(
             Some(source) => flatten(source, head, at),
             None => HeadReader::new(read.take()?, head, at),
         };
-        let body_until = Instant::now() + crate::budgets::head_arrival();
-        skip_body(&mut reader, body, body_until)?;
+        skip_body(&mut reader, body, until)?;
         return Some(reader);
     }
 }
@@ -326,7 +335,11 @@ fn flatten<R: Read>(source: HeadReader<R>, mut head: Vec<u8>, at: usize) -> Head
     HeadReader::new(source.read, head, at)
 }
 
-fn skip_body<R: Read>(reader: &mut R, body: Body, until: Instant) -> Option<()> {
+fn skip_body<R: Read + crate::proxy::RelayPoll>(
+    reader: &mut R,
+    body: Body,
+    until: Instant,
+) -> Option<()> {
     match body {
         Body::None => Some(()),
         Body::Fixed(length) => skip_exact(reader, length, until),
@@ -335,15 +348,23 @@ fn skip_body<R: Read>(reader: &mut R, body: Body, until: Instant) -> Option<()> 
     }
 }
 
-fn read_within<R: Read>(reader: &mut R, buf: &mut [u8], until: Instant) -> Option<()> {
+fn read_within<R: Read + crate::proxy::RelayPoll>(
+    reader: &mut R,
+    buf: &mut [u8],
+    until: Instant,
+) -> Option<()> {
     let mut at = 0;
     while at < buf.len() {
-        if Instant::now() >= until {
-            return None;
-        }
+        let left = left(until)?;
+        crate::proxy::RelayPoll::arm_head_poll_for(reader, left);
         match reader.read(&mut buf[at..]) {
             Ok(0) => return None,
-            Ok(read) => at += read,
+            Ok(read) => {
+                if Instant::now() >= until {
+                    return None;
+                }
+                at += read;
+            }
             Err(error) if crate::proxy::is_timeout(&error) => {}
             Err(_) => return None,
         }
@@ -351,7 +372,11 @@ fn read_within<R: Read>(reader: &mut R, buf: &mut [u8], until: Instant) -> Optio
     Some(())
 }
 
-fn skip_exact<R: Read>(reader: &mut R, mut left: usize, until: Instant) -> Option<()> {
+fn skip_exact<R: Read + crate::proxy::RelayPoll>(
+    reader: &mut R,
+    mut left: usize,
+    until: Instant,
+) -> Option<()> {
     let mut buf = [0u8; 512];
     while left > 0 {
         let take = left.min(buf.len());
@@ -361,7 +386,7 @@ fn skip_exact<R: Read>(reader: &mut R, mut left: usize, until: Instant) -> Optio
     Some(())
 }
 
-fn skip_chunked<R: Read>(reader: &mut R, until: Instant) -> Option<()> {
+fn skip_chunked<R: Read + crate::proxy::RelayPoll>(reader: &mut R, until: Instant) -> Option<()> {
     let mut trailers = HEAD_LIMIT;
     loop {
         let line = read_line(reader, until)?;
@@ -385,7 +410,7 @@ fn skip_chunked<R: Read>(reader: &mut R, until: Instant) -> Option<()> {
     }
 }
 
-fn read_line<R: Read>(reader: &mut R, until: Instant) -> Option<Vec<u8>> {
+fn read_line<R: Read + crate::proxy::RelayPoll>(reader: &mut R, until: Instant) -> Option<Vec<u8>> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -413,10 +438,13 @@ pub(crate) fn connect_split<R: Read + crate::proxy::RelayPoll, W: crate::proxy::
     headers: &[(String, String)],
 ) -> Option<(HeadReader<R>, W)> {
     send_request(&mut write, host, path, headers)?;
-    let (head, at) =
-        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
+    let until = Instant::now() + crate::budgets::head_arrival();
+    let left = left(until)?;
+    let mut bounded = HeadDeadline { read, until };
+    let (head, at) = crate::proxy::read_exact_head(&mut bounded, HEAD_LIMIT, left)?;
+    read = bounded.read;
     crate::proxy::RelayPoll::arm_head_poll(&mut read);
-    let mut reader = read_response(read, head, at)?;
+    let mut reader = read_response(read, head, at, until)?;
     crate::proxy::RelayPoll::arm_relay_poll(&mut reader);
     Some((reader, write))
 }
@@ -424,6 +452,7 @@ pub(crate) fn connect_split<R: Read + crate::proxy::RelayPoll, W: crate::proxy::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     #[test]
@@ -731,6 +760,14 @@ mod tests {
         );
         assert_eq!(response_status(b"HTTP/2 200 OK\r\n\r\n"), None);
         assert_eq!(response_status(b"HTTP/1.1 20 OK\r\n\r\n"), None);
+        assert_eq!(
+            response_status(b"HTTP/1.not-a-version 200 OK\r\n\r\n"),
+            None
+        );
+        assert_eq!(response_status(b"HTTP/1.2 200 OK\r\n\r\n"), None);
+        assert_eq!(response_status(b"HTTP/1.1 099 OK\r\n\r\n"), None);
+        assert_eq!(response_status(b"HTTP/1.1 600 OK\r\n\r\n"), None);
+        assert_eq!(response_status(b"HTTP/1.1 599 OK\r\n\r\n"), Some(599));
     }
 
     #[test]
@@ -765,6 +802,175 @@ mod tests {
         let mut got = [0u8; 4];
         reader.read_exact(&mut got).expect("reads");
         assert_eq!(&got, b"next");
+    }
+
+    #[test]
+    fn a_framed_body_shares_the_head_deadline() {
+        let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n\r\nerror";
+        let at = response.len() - 5;
+        assert!(read_response(
+            std::io::Cursor::new(Vec::new()),
+            Vec::from(&response[..]),
+            at,
+            Instant::now(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_body_that_misses_its_deadline_is_not_read() {
+        struct Refused;
+        impl Read for Refused {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("the deadline had already passed")
+            }
+        }
+        impl crate::proxy::RelayPoll for Refused {
+            fn arm_relay_poll(&mut self) {}
+        }
+        let mut byte = [0u8; 1];
+        assert!(read_within(&mut Refused, &mut byte, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn a_framed_body_arms_only_the_time_the_head_left() {
+        struct BodyRead {
+            armed: Arc<Mutex<Option<std::time::Duration>>>,
+        }
+        impl Read for BodyRead {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    self.armed.lock().expect("armed lock").is_some(),
+                    "the body was read without a timeout"
+                );
+                Ok(0)
+            }
+        }
+        impl crate::proxy::RelayPoll for BodyRead {
+            fn arm_relay_poll(&mut self) {}
+
+            fn arm_head_poll_for(&mut self, left: std::time::Duration) {
+                *self.armed.lock().expect("armed lock") = Some(left);
+            }
+        }
+        let armed = Arc::new(Mutex::new(None));
+        let full = std::time::Duration::from_secs(10);
+        let until = Instant::now() + full;
+        let head = b"HTTP/1.1 404 Not Found\r\nContent-Length: 1\r\n\r\n";
+        thread::sleep(std::time::Duration::from_millis(100));
+        assert!(read_response(
+            BodyRead {
+                armed: Arc::clone(&armed),
+            },
+            Vec::from(&head[..]),
+            head.len(),
+            until,
+        )
+        .is_none());
+        let armed = armed
+            .lock()
+            .expect("armed lock")
+            .expect("an armed body read");
+        assert!(
+            armed <= full.saturating_sub(std::time::Duration::from_millis(50)),
+            "the body armed {armed:?} of a {full:?} budget after the head delay"
+        );
+    }
+
+    #[test]
+    fn a_body_byte_that_lands_after_the_deadline_is_refused() {
+        struct Slow;
+        impl Read for Slow {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                thread::sleep(std::time::Duration::from_millis(20));
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+        impl crate::proxy::RelayPoll for Slow {
+            fn arm_relay_poll(&mut self) {}
+        }
+        let mut byte = [0u8; 1];
+        let until = Instant::now() + std::time::Duration::from_millis(5);
+        assert!(read_within(&mut Slow, &mut byte, until).is_none());
+    }
+
+    #[test]
+    fn a_fixed_body_that_stalls_past_the_head_budget_is_refused() {
+        struct Stalls {
+            head: &'static [u8],
+            at: usize,
+        }
+        impl Read for Stalls {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.at < self.head.len() {
+                    let n = (self.head.len() - self.at).min(buf.len());
+                    buf[..n].copy_from_slice(&self.head[self.at..self.at + n]);
+                    self.at += n;
+                    return Ok(n);
+                }
+                thread::sleep(std::time::Duration::from_millis(20));
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+        impl crate::proxy::RelayPoll for Stalls {
+            fn arm_relay_poll(&mut self) {}
+        }
+        let head = b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\nx";
+        crate::budgets::apply(&crate::config::Budgets {
+            head_arrival: Some(std::time::Duration::from_millis(5)),
+            ..crate::config::Budgets::default()
+        });
+        let refused = connect_split(
+            Stalls { head, at: 0 },
+            Vec::new(),
+            "oracle.example",
+            "/camouflage",
+            &[],
+        )
+        .is_none();
+        crate::budgets::clear();
+        assert!(refused);
+    }
+
+    #[test]
+    fn a_chunk_that_stalls_past_the_head_budget_is_refused() {
+        struct Stalls {
+            head: &'static [u8],
+            at: usize,
+        }
+        impl Read for Stalls {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.at < self.head.len() {
+                    let n = (self.head.len() - self.at).min(buf.len());
+                    buf[..n].copy_from_slice(&self.head[self.at..self.at + n]);
+                    self.at += n;
+                    return Ok(n);
+                }
+                thread::sleep(std::time::Duration::from_millis(20));
+                buf[0] = b'r';
+                Ok(1)
+            }
+        }
+        impl crate::proxy::RelayPoll for Stalls {
+            fn arm_relay_poll(&mut self) {}
+        }
+        let head = b"HTTP/1.1 404 Not Found\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx";
+        crate::budgets::apply(&crate::config::Budgets {
+            head_arrival: Some(std::time::Duration::from_millis(5)),
+            ..crate::config::Budgets::default()
+        });
+        let refused = connect_split(
+            Stalls { head, at: 0 },
+            Vec::new(),
+            "oracle.example",
+            "/camouflage",
+            &[],
+        )
+        .is_none();
+        crate::budgets::clear();
+        assert!(refused);
     }
 
     #[test]

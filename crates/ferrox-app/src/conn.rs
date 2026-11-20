@@ -85,6 +85,8 @@ pub(crate) struct Masked {
     /// The bytes this side has read, for the server's read-past-mark window; `None` leaves reads
     /// untouched.
     mark: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// The absolute instant a masked read must stop, carried under a chain that may loop inside one call.
+    read_until: std::sync::Mutex<Option<Instant>>,
 }
 
 /// The first-write rewrite an outbound's `sniSpoof` arms, shared by every handle of one stream
@@ -133,6 +135,8 @@ impl SniState {
 struct XmcState {
     config: ferrox_core::finalmask::xmc::Config,
     role: ferrox_core::finalmask::MaskRole,
+    deadline: HandshakeDeadline,
+    write_deadline: HandshakeDeadline,
     session: XmcSlot,
 }
 
@@ -177,16 +181,14 @@ impl ReadClock for TcpStream {
 struct HandshakeDeadline(std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>);
 
 impl HandshakeDeadline {
-    fn begin(budget: Duration) -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(
-            std::time::Instant::now() + budget,
-        ))))
-    }
-
     fn gate(&self) -> std::sync::MutexGuard<'_, Option<std::time::Instant>> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn arm(&self, until: Instant) {
+        *self.gate() = Some(until);
     }
 
     fn end(&self) {
@@ -273,13 +275,16 @@ impl XmcState {
             let _ = stream.set_read_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
             let _ = stream.set_write_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
             let result = (|| {
-                let deadline =
-                    HandshakeDeadline::begin(xmc_deadline(crate::budgets::handshake_cap()));
+                let deadline = self.deadline.clone();
+                let write_deadline = self.write_deadline.clone();
+                let budget = xmc_deadline(crate::budgets::handshake_cap());
+                deadline.arm(Instant::now() + budget);
+                write_deadline.arm(Instant::now() + budget);
                 let reader = DeadlineReader::new(stream.try_clone()?, deadline.clone());
                 let writer = XmcWriter {
                     stream: stream.try_clone()?,
                     chain: std::sync::Arc::clone(chain),
-                    deadline: deadline.clone(),
+                    deadline: write_deadline.clone(),
                 };
                 let session = match self.role {
                     ferrox_core::finalmask::MaskRole::Client => {
@@ -290,6 +295,7 @@ impl XmcState {
                     }
                 };
                 deadline.end();
+                write_deadline.end();
                 Ok::<_, io::Error>(std::sync::Arc::new(session))
             })();
             let _ = stream.set_read_timeout(saved_read);
@@ -314,6 +320,18 @@ impl Masked {
         match &self.xmc {
             Some(state) => state.session(&self.stream, &self.chain).map(Some),
             None => Ok(None),
+        }
+    }
+
+    /// The XMC packet loop can consume control packet after control packet inside one read, so
+    /// the outer deadline has to reach the source it reads, not just the socket timeout.
+    fn arm_xmc(&self, until: Option<Instant>) {
+        let Some(state) = &self.xmc else {
+            return;
+        };
+        match until {
+            Some(until) => state.deadline.arm(until),
+            None => state.deadline.end(),
         }
     }
 }
@@ -575,6 +593,11 @@ impl Masked {
     /// A read through the codec chain, or the socket itself when no stage transforms bytes.
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         if let Some(session) = self.xmc_session()? {
+            let until = *self
+                .read_until
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.arm_xmc(until);
             return (&*session).read(buf);
         }
         self.ensure_header()?;
@@ -585,7 +608,14 @@ impl Masked {
         let Ok(mut chain) = chain.lock() else {
             return Err(io::Error::other("the mask chain is gone"));
         };
-        let mut source = &self.stream;
+        let until = *self
+            .read_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut source = BoundedRead {
+            stream: &self.stream,
+            until,
+        };
         chain.read(&mut source, buf)
     }
 
@@ -749,16 +779,43 @@ impl std::io::Read for HeaderWire<'_> {
                 "the header handshake deadline passed",
             ));
         }
-        self.stream
-            .set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
         let Some(chain) = self.read_chain else {
+            self.stream
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
             return (&*self.stream).read(buf);
         };
         let Ok(mut chain) = chain.lock() else {
-            return Err(std::io::Error::other("the mask chain is gone"));
+            return Err(io::Error::other("the mask chain is gone"));
         };
-        let mut source = self.stream;
+        let mut source = BoundedRead {
+            stream: self.stream,
+            until: Some(self.until),
+        };
         chain.read(&mut source, buf)
+    }
+}
+
+/// A masked read's inner source: each socket read stops at the absolute deadline a chain would
+/// otherwise pass through while it keeps consuming wire octets that decode to no plaintext.
+struct BoundedRead<'a> {
+    stream: &'a TcpStream,
+    until: Option<Instant>,
+}
+
+impl Read for BoundedRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(until) = self.until {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the masked read deadline passed",
+                ));
+            }
+            self.stream
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
+        }
+        (&*self.stream).read(buf)
     }
 }
 
@@ -793,6 +850,8 @@ impl Connection {
                     std::sync::Arc::new(XmcState {
                         config: config.clone(),
                         role,
+                        deadline: HandshakeDeadline::default(),
+                        write_deadline: HandshakeDeadline::default(),
                         session: std::sync::OnceLock::new(),
                     })
                 });
@@ -806,6 +865,7 @@ impl Connection {
                     xmc,
                     sni: None,
                     mark: None,
+                    read_until: std::sync::Mutex::new(None),
                 })
             }
             (Connection::Metered(metered), mask) => Connection::Metered(Metered {
@@ -845,6 +905,7 @@ impl Connection {
                 xmc: None,
                 sni: Some(state()),
                 mark: None,
+                read_until: std::sync::Mutex::new(None),
             }),
             Connection::Masked(mut masked) => {
                 masked.sni = Some(state());
@@ -881,6 +942,7 @@ impl Connection {
                 xmc: None,
                 sni: None,
                 mark: Some(mark),
+                read_until: std::sync::Mutex::new(None),
             }),
             Connection::Masked(mut masked) => {
                 masked.mark = Some(mark);
@@ -1531,6 +1593,7 @@ impl Connection {
                     xmc: masked.xmc.as_ref().map(std::sync::Arc::clone),
                     sni: masked.sni.as_ref().map(std::sync::Arc::clone),
                     mark: masked.mark.as_ref().map(std::sync::Arc::clone),
+                    read_until: std::sync::Mutex::new(None),
                 })
             }),
             Connection::Metered(metered) => metered.inner.try_clone().map(|inner| {
@@ -1725,6 +1788,24 @@ impl Connection {
             }
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => set_socket_timeout(stream, SO_RCVTIMEO, timeout),
+        }
+    }
+
+    /// Arm an absolute read deadline under a mask that may loop inside one `read`.
+    pub(crate) fn set_read_until(&self, until: Option<Instant>) {
+        match self {
+            Connection::Masked(masked) => {
+                *masked
+                    .read_until
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = until;
+                masked.arm_xmc(until);
+            }
+            Connection::Metered(metered) => metered.inner.set_read_until(until),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.set_read_until(until);
+            }
+            _ => {}
         }
     }
 
@@ -4401,7 +4482,8 @@ mod tests {
     #[test]
     fn a_read_past_the_handshake_deadline_never_arms_another_clock() {
         let armed = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let deadline = HandshakeDeadline::begin(Duration::from_millis(30));
+        let deadline = HandshakeDeadline::default();
+        deadline.arm(Instant::now() + Duration::from_millis(30));
         let mut reader = DeadlineReader::new(
             StalledReader {
                 armed: std::sync::Arc::clone(&armed),
@@ -4425,6 +4507,16 @@ mod tests {
         deadline.end();
         let after = reader.read(&mut byte).expect_err("nothing arrives");
         assert_eq!(after.kind(), io::ErrorKind::WouldBlock);
+
+        deadline.arm(Instant::now() + Duration::from_millis(30));
+        let rearmed = reader.read(&mut byte).expect_err("nothing arrives");
+        assert_eq!(rearmed.kind(), io::ErrorKind::WouldBlock);
+        let clock = armed.lock().expect("the clock").expect("a clock is armed");
+        assert!(clock <= Duration::from_millis(30));
+
+        deadline.arm(Instant::now());
+        let expired = reader.read(&mut byte).expect_err("the deadline passed");
+        assert_eq!(expired.kind(), io::ErrorKind::TimedOut);
     }
 
     /// A peer that dribbles a byte before each clock cannot hold a handshake open: the reads run to
@@ -4469,6 +4561,47 @@ mod tests {
             "the handshake outlived its one deadline"
         );
         peer.join().expect("joins");
+    }
+
+    /// The XMC packet loop reads through the same deadline the drain arms, so a control packet
+    /// cannot outlive it inside one logical read.
+    #[test]
+    fn an_armed_read_deadline_reaches_the_xmc_packet_source() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connects");
+        let _ = listener.accept().expect("accepts");
+        let state = std::sync::Arc::new(XmcState {
+            config: ferrox_core::finalmask::xmc::Config {
+                profiles: Vec::new(),
+                password: String::new(),
+                hostname: String::new(),
+                private_key_der: Vec::new(),
+                public_key_der: Vec::new(),
+            },
+            role: ferrox_core::finalmask::MaskRole::Server,
+            deadline: HandshakeDeadline::default(),
+            write_deadline: HandshakeDeadline::default(),
+            session: std::sync::OnceLock::new(),
+        });
+        let mut masked = masked_with(client, ferrox_core::evasion::SniShape::Record);
+        masked.xmc = Some(std::sync::Arc::clone(&state));
+        let connection = Connection::Masked(masked);
+
+        let until = Instant::now() + Duration::from_secs(1);
+        let writing = until + Duration::from_secs(1);
+        state.write_deadline.arm(writing);
+        connection.set_read_until(Some(until));
+        assert_eq!(*state.deadline.gate(), Some(until));
+        assert_eq!(
+            *state.write_deadline.gate(),
+            Some(writing),
+            "the read clock does not become a write clock"
+        );
+
+        connection.set_read_until(None);
+        assert_eq!(*state.deadline.gate(), None);
+        assert_eq!(*state.write_deadline.gate(), Some(writing));
     }
 
     /// The login keeps the reference's two minutes on a dial, and an admission shortens it to the
@@ -4524,7 +4657,53 @@ mod tests {
                 written: std::sync::atomic::AtomicU8::new(0),
             })),
             mark: None,
+            read_until: std::sync::Mutex::new(None),
         }
+    }
+
+    #[test]
+    fn a_masked_read_stops_at_its_absolute_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let mut peer = TcpStream::connect(addr).expect("connects");
+        let (server, _) = listener.accept().expect("accepts");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writing = std::sync::Arc::clone(&stop);
+        let trickle = std::thread::spawn(move || {
+            while !writing.load(std::sync::atomic::Ordering::Relaxed) {
+                if peer.write_all(&[0x80]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let deadline = Duration::from_millis(30);
+        let mut bounded = BoundedRead {
+            stream: &server,
+            until: Some(Instant::now() + deadline),
+        };
+        let started = Instant::now();
+        let mut buf = [0u8; 64];
+        loop {
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "a trickling peer held the masked read past its absolute deadline"
+            );
+            match bounded.read(&mut buf) {
+                Ok(_) => {}
+                Err(error)
+                    if error.kind() == io::ErrorKind::TimedOut
+                        || error.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    if started.elapsed() >= deadline {
+                        break;
+                    }
+                }
+                Err(error) => panic!("the masked read failed before its deadline: {error}"),
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        trickle.join().expect("joins");
     }
 
     /// The record shape rewrites the first hello's record version and leaves every other write
