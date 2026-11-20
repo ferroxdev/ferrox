@@ -3004,9 +3004,10 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
         other => other.clone(),
     };
     let _ = relay.set_read_timeout(Some(crate::budgets::udp_idle()));
-    std::thread::spawn(move || serve_udp_lane(&relay, &outbound, None));
-
     let stop = Arc::new(AtomicBool::new(false));
+    let relay_stop = Arc::clone(&stop);
+    std::thread::spawn(move || serve_udp_lane(&relay, &outbound, None, Some(&relay_stop)));
+
     let reader_stop = Arc::clone(&stop);
     let reader_activity = Arc::clone(last_used);
     let tunnel = to_tunnel.clone().into();

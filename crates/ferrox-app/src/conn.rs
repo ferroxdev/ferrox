@@ -2246,14 +2246,15 @@ fn refused_socket_is_stale(path: &std::path::Path) -> bool {
 fn socket_table_names(path: &std::path::Path) -> Option<bool> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let text = path.to_str()?;
-        let table = std::fs::read_to_string("/proc/net/unix").ok()?;
+        use std::os::unix::ffi::OsStrExt;
+        let wanted = path.as_os_str().as_bytes();
+        let table = std::fs::read("/proc/net/unix").ok()?;
         let mut unknown_staged = false;
-        for (listed, listening) in table.lines().skip(1).filter_map(proc_unix_entry) {
-            if !listening {
+        for line in table.split(|byte| *byte == b'\n').skip(1) {
+            let Some((listed, true)) = proc_unix_entry(line) else {
                 continue;
-            }
-            if listed == text {
+            };
+            if listed == wanted {
                 return Some(true);
             }
             match staged_owner(listed) {
@@ -2262,8 +2263,13 @@ fn socket_table_names(path: &std::path::Path) -> Option<bool> {
                         return Some(true);
                     }
                 }
-                None if staged_sibling(listed, path) => unknown_staged = true,
-                None => {}
+                None => {
+                    if let Ok(listed) = std::str::from_utf8(listed) {
+                        if staged_sibling(listed, path) {
+                            unknown_staged = true;
+                        }
+                    }
+                }
             }
         }
         (!unknown_staged).then_some(false)
@@ -2281,23 +2287,40 @@ fn socket_table_names(path: &std::path::Path) -> Option<bool> {
 
 /// A row's path and whether the socket is still accepting, so an accepted connection's copied address is not mistaken for a listener.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn proc_unix_entry(line: &str) -> Option<(&str, bool)> {
+fn proc_unix_entry(line: &[u8]) -> Option<(&[u8], bool)> {
     let mut rest = line;
-    let mut flags = "";
+    let mut flags = &[][..];
     for field in 0..7 {
-        rest = rest.trim_start();
-        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        rest = trim_ascii_start(rest);
+        let end = rest
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace())
+            .unwrap_or(rest.len());
         if field == 3 {
             flags = &rest[..end];
         }
         rest = &rest[end..];
     }
-    let listed = rest.strip_prefix(' ').unwrap_or(rest);
+    let listed = rest.strip_prefix(&b" "[..]).unwrap_or(rest);
     if listed.is_empty() {
         return None;
     }
+    let flags = std::str::from_utf8(flags).ok()?;
     let listening = u32::from_str_radix(flags, 16).ok()? & 0x0001_0000 != 0;
     Some((listed, listening))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn trim_ascii_start(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    bytes
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn proc_unix_row(line: &str) -> Option<(&[u8], bool)> {
+    proc_unix_entry(line.as_bytes())
 }
 
 /// A bind records the private staging address it bound, so a copied staging name is never mistaken for another path's listener.
@@ -2353,12 +2376,12 @@ impl Drop for StagedRegistration {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-fn staged_owner(listed: &str) -> Option<std::path::PathBuf> {
+fn staged_owner(listed: &[u8]) -> Option<std::path::PathBuf> {
     STAGED_BINDINGS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
-        .find(|(inner, _)| inner.as_os_str().as_encoded_bytes() == listed.as_bytes())
+        .find(|(inner, _)| inner.as_os_str().as_encoded_bytes() == listed)
         .map(|(_, published)| published.clone())
 }
 
@@ -4704,9 +4727,15 @@ mod tests {
     fn a_proc_row_keeps_the_whole_pathname() {
         let row = "0000000000000000: 00000002 00000000 00010000 0001 01   123 /tmp/a b";
         assert_eq!(
-            proc_unix_entry(row),
-            Some(("/tmp/a b", true)),
+            proc_unix_row(row),
+            Some((&b"/tmp/a b"[..], true)),
             "a pathname with a space was truncated"
+        );
+        let abstract_row = b"0000000000000000: 00000002 00000000 00010000 0001 01   123 @a\xffb";
+        assert_eq!(
+            proc_unix_entry(abstract_row),
+            Some((&b"@a\xffb"[..], true)),
+            "a non-utf8 abstract address rejected the whole table"
         );
     }
 
