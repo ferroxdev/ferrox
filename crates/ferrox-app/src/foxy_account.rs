@@ -1054,6 +1054,8 @@ struct H2Connection {
     tls: ferrox_core::tls::ClientSession<Connection>,
     next: u32,
     decoder: crate::h2::Decoder,
+    /// The request was handed to the socket: a POST failure past this point may have created the device it names.
+    started: bool,
 }
 
 impl H2Connection {
@@ -1077,6 +1079,7 @@ impl H2Connection {
             tls,
             next: 1,
             decoder: crate::h2::Decoder::default(),
+            started: false,
         })
     }
 
@@ -1134,6 +1137,8 @@ impl H2Connection {
             out.extend_from_slice(&frame_head(body.len(), T_DATA, F_END, stream));
             out.extend_from_slice(body);
         }
+        // From here a failure cannot be replayed: the request may already have reached the peer.
+        self.started = true;
         self.tls
             .write_all(&out)
             .and_then(|()| self.tls.flush())
@@ -1268,8 +1273,22 @@ pub(crate) fn h2_ask(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Reply, String> {
+    h2_ask_started(endpoint, method, path, headers, body).map_err(|(why, _)| why)
+}
+
+/// The same exchange with whether the request reached the peer: a caller that must not replay a
+/// POST can tell a failed dial from a lost answer.
+pub(crate) fn h2_ask_started(
+    endpoint: &Endpoint,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<Reply, (String, bool)> {
     // One call, one connection: the exchange the reference makes, and nothing kept for the next call to trust. A request that reached the peer is never replayed, because a POST cannot be sent twice safely.
-    H2Connection::connect(endpoint)?.request(endpoint, method, path, headers, body)
+    let mut conn = H2Connection::connect(endpoint).map_err(|why| (why, false))?;
+    conn.request(endpoint, method, path, headers, body)
+        .map_err(|why| (why, conn.started))
 }
 
 /// One request and its answer over HTTP/1.1, headers exactly as the caller wrote them: the exchange every plane of this app makes, cookie jar or none.
@@ -1529,14 +1548,14 @@ fn login_on(
             &[("Content-Type", JSON_ACCEPT)],
             &body,
         )?;
-        if let Some(errno) = errno(&reply) {
-            if errno == 107 && method.is_none() {
-                continue;
-            }
-            return Err(Denied::Other(reply.status));
+        if errno(&reply) == Some(107) && method.is_none() {
+            continue;
         }
         if let Some(denied) = reply.denied() {
             return Err(denied);
+        }
+        if errno(&reply).is_some() {
+            return Err(Denied::Other(reply.status));
         }
         let session = reply.field("sessionToken").ok_or(Denied::Token)?;
         return Ok(Login {

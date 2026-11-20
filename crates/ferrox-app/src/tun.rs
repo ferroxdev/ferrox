@@ -2084,7 +2084,7 @@ impl Handler {
                 self.retire(&flow, Some(FLAG_RST | FLAG_ACK));
                 return Ok(());
             }
-            // Delayed like the references: answer at a push, at a finish, or at a full MTU unacked.
+            // Every data segment or FIN gets an ACK: a segment without PSH must not wait for a later one that may never come, and a duplicate still has to stop a retransmit.
             let unacked = flow
                 .rcv_nxt
                 .load(Relaxed)
@@ -2092,10 +2092,7 @@ impl Handler {
             if let Served::Ack(ack) = served {
                 // The response carried this segment's ack, so the standalone one would only repeat it, and the cursor stored is the one that left rather than whatever another queue advanced meanwhile.
                 flow.last_acked.store(ack, Relaxed);
-            } else if fin
-                || (tcp.flags & FLAG_PSH != 0 && !payload.is_empty())
-                || unacked >= self.device.mtu as u32
-            {
+            } else if fin || !payload.is_empty() || unacked > 0 {
                 let snd = flow.snd_nxt.load(Relaxed);
                 let rcv = flow.rcv_nxt.load(Relaxed);
                 let mut emit = std::mem::take(&mut self.emit);
@@ -4651,6 +4648,55 @@ mod tests {
         let (late_ack, _) = next_tcp_packet(&mut peer, &mut buf);
         assert_eq!(late_ack.flags, FLAG_ACK);
         assert_eq!(late_ack.seq, end.seq.wrapping_add(1));
+    }
+
+    /// A segment without PSH is still acknowledged: waiting for a push that may never follow
+    /// leaves the peer retransmitting bytes this end already holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_segment_without_push_is_answered() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let (upstream, mut lane) = UnixStream::pair().unwrap();
+        lane.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let dial: Dial = Arc::new(move |_dest| {
+            DialOutcome::Direct(Connection::from(upstream.try_clone().unwrap()))
+        });
+        let mut handler = Handler::with_dial(
+            Device::from_handle(a, DEFAULT_MTU),
+            Arc::new(|_conn, _lane, _dest| Ok(())),
+            no_associate(),
+            dial,
+        );
+
+        let client = ([10, 0, 0, 2], 44444);
+        let endpoint = ([10, 0, 0, 1], 8080);
+        let syn = build_tcp_packet(client, endpoint, 1, 0, FLAG_SYN, 65535, &[]);
+        peer.write_all(&syn).unwrap();
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+        let syn_ack = next_syn_ack(&mut peer);
+
+        let request = build_tcp_packet(
+            client,
+            endpoint,
+            2,
+            syn_ack.seq.wrapping_add(1),
+            FLAG_ACK,
+            65535,
+            b"ping",
+        );
+        peer.write_all(&request).unwrap();
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+        let mut got = [0u8; 4];
+        lane.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"ping", "the segment reached the lane");
+        let (ack, payload) = next_tcp_packet(&mut peer, &mut buf);
+        assert_eq!(ack.flags, FLAG_ACK, "a quiet segment is acknowledged");
+        assert_eq!(ack.ack_num, 6, "the ACK names every byte that landed");
+        assert_eq!(payload, [] as [u8; 0]);
     }
 
     /// One queue's dead direct control drops only the legs that rode its relay: a second queue

@@ -4040,6 +4040,64 @@ fn rebind_if_moved(
     true
 }
 
+/// How long a downlink write may sit against a client that is not reading; the pump's other streams keep moving because this is a per-stream buffer, not a hold on the lane.
+const PUMP_WRITE: Duration = Duration::from_millis(1);
+
+/// Bytes a client has not taken yet: one chunk per stream, because the pump does not read that stream again until this drains.
+struct PendingWrite {
+    id: u64,
+    up: Arc<Connection>,
+    bytes: Vec<u8>,
+    at: usize,
+    fin: bool,
+}
+
+/// Offer each pending chunk again; a short write keeps its tail, and a timeout leaves it for the next turn instead of failing a flow whose client is merely slower than the lane.
+fn flush_downlink(
+    pending: &mut Vec<PendingWrite>,
+    table: &Arc<Mutex<PooledState>>,
+    conn: &Arc<Mutex<quiche::Connection>>,
+    sock: &Datagram,
+) {
+    let mut at = 0;
+    while at < pending.len() {
+        let write = &mut pending[at];
+        let mut up = &*write.up;
+        match up.write(&write.bytes[write.at..]) {
+            Ok(0) => {
+                stop_stream(conn, sock, write.id);
+                fail_session(table, write.id);
+                pending.swap_remove(at);
+            }
+            Ok(n) => {
+                write.at += n;
+                if write.at == write.bytes.len() {
+                    if write.fin {
+                        let _ = write.up.shutdown(Shutdown::Write);
+                        finish_session(table, write.id, false);
+                    }
+                    pending.swap_remove(at);
+                } else {
+                    at += 1;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                at += 1;
+            }
+            Err(_) => {
+                stop_stream(conn, sock, write.id);
+                fail_session(table, write.id);
+                pending.swap_remove(at);
+            }
+        }
+    }
+}
+
 /// Drive one connection's reads and writes until its socket or connection ends, taking a batch of datagrams per turn.
 #[allow(clippy::too_many_lines)]
 fn pump(
@@ -4058,8 +4116,11 @@ fn pump(
     let buf = room.as_mut();
     // The batch lives across the turns, so a turn does not build the slots again.
     let mut batch = Batch::new();
+    // A client that stops reading parks only its own stream: the bytes already taken from quiche wait here, and the next turn retries them instead of spending the pump's read clock.
+    let mut pending: Vec<PendingWrite> = Vec::new();
     let mut exit = PumpExit { table, armed: true };
     loop {
+        flush_downlink(&mut pending, table, shared, sock);
         let before = *local;
         if !rebind_if_moved(shared, sock, peer, net, local) {
             return;
@@ -4151,6 +4212,10 @@ fn pump(
             }
         }
         for (id, up) in ready.drain(..) {
+            // A pending chunk is the earlier bytes of this stream: read no more until the client takes them, or the two writes can leave out of order.
+            if pending.iter().any(|write| write.id == id) {
+                continue;
+            }
             loop {
                 let received = {
                     let Ok(mut conn) = shared.lock() else {
@@ -4169,10 +4234,19 @@ fn pump(
                 if n == 0 && !fin {
                     break;
                 }
-                if n > 0 && (&*up).write_all(&chunk[..n]).is_err() {
-                    stop_stream(shared, sock, id);
-                    fail_session(table, id);
-                    break;
+                if n > 0 {
+                    let _ = up.set_write_timeout(Some(PUMP_WRITE));
+                    pending.push(PendingWrite {
+                        id,
+                        up: Arc::clone(&up),
+                        bytes: chunk[..n].to_vec(),
+                        at: 0,
+                        fin,
+                    });
+                    flush_downlink(&mut pending, table, shared, sock);
+                    if fin || pending.iter().any(|write| write.id == id) {
+                        break;
+                    }
                 }
                 if fin {
                     let _ = up.shutdown(Shutdown::Write);

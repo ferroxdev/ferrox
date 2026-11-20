@@ -2366,6 +2366,31 @@ fn remove_session_if_owned(id: &str, session: &Session) {
     }
 }
 
+/// An opaque hold on the session a carrier bound to, so a later connection that reuses the id is not the one this hold ends.
+#[derive(Clone)]
+pub(crate) struct SessionHandle(Arc<Session>);
+
+pub(crate) fn session_handle(id: &str) -> SessionHandle {
+    SessionHandle(get_or_create_session(id))
+}
+
+pub(crate) fn end_session_handle(id: &str, handle: &SessionHandle) {
+    let carried = {
+        let mut map = sessions().lock().expect("sessions lock");
+        if map
+            .get(id)
+            .is_some_and(|carried| Arc::ptr_eq(carried, &handle.0))
+        {
+            map.remove(id)
+        } else {
+            None
+        }
+    };
+    if let Some(carried) = carried {
+        close_session(&carried);
+    }
+}
+
 // Drop is the only other way a session ends, and a waiter parked before a reader exists has no Drop to run.
 pub(crate) fn end_session(id: &str) {
     let carried = sessions().lock().expect("sessions lock").remove(id);
@@ -7157,6 +7182,27 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .is_ok(),
             "an uplink with no downlink parked its POST thread forever"
+        );
+    }
+
+    /// A connection that closes after its id moved to a new session must not end the replacement:
+    /// the handle it bound is a hold on that exact session, not on the string every carrier repeats.
+    #[test]
+    fn an_old_handle_does_not_end_a_replacement_session() {
+        let id = "replacement-session-handle";
+        let old = session_handle(id);
+        end_session(id);
+        let new = session_handle(id);
+        assert!(session_is_carried(id), "the replacement is live");
+        end_session_handle(id, &old);
+        assert!(
+            session_is_carried(id),
+            "a stale connection ended the replacement session"
+        );
+        end_session_handle(id, &new);
+        assert!(
+            !session_is_carried(id),
+            "the owner still ends its own session"
         );
     }
 

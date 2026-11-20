@@ -55,7 +55,12 @@ pub(crate) fn readings(edges: &[Candidate]) -> Vec<Option<u64>> {
 /// The first address that answers, timed to the handshake; a name that does not resolve is a silence like any other.
 fn probe(host: &str, port: u16, budget: Duration) -> Option<u64> {
     let deadline = Instant::now() + budget;
-    let addresses = (host, port).to_socket_addrs().ok()?;
+    // Resolution runs on the bounded pool: a resolver that hangs parks a shared worker for the budget instead of one thread per edge for the life of the process.
+    let addresses = crate::proxy::resolve_bounded(host, port, budget, |host, port| {
+        (host, port)
+            .to_socket_addrs()
+            .map(std::iter::Iterator::collect)
+    })?;
     if Instant::now() >= deadline {
         return None;
     }

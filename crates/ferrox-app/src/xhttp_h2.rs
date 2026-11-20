@@ -1,6 +1,6 @@
 // xHTTP over HTTP/2: one connection multiplexes many requests the way many TCP connections would — each stream is one GET, POST or packet — and the H1 dispatch is reused byte for byte, headers re-serialized into the H1-style head the same validators read and the response head parsed back into H2 HEADERS.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -552,7 +552,7 @@ pub(crate) struct H2Conn {
     write: SharedWriter,
     control: Control,
     streams: Mutex<HashMap<u32, Arc<H2Stream>>>,
-    sessions: Mutex<HashSet<String>>,
+    sessions: Mutex<HashMap<String, crate::xhttp::SessionHandle>>,
     session_of: Mutex<HashMap<u32, String>>,
     upload_of: Mutex<HashMap<u32, String>>,
     send_conn: Mutex<u64>,
@@ -961,23 +961,8 @@ impl H2StreamWriter {
         let text = std::str::from_utf8(head).unwrap_or_default();
         let headers = response_fields(text);
         let block = block_encode(&headers);
-        let max = *self
-            .conn
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut at = 0;
-        loop {
-            let end = (at + max).min(block.len());
-            let flags = if end == block.len() { F_END_HEADERS } else { 0 };
-            let kind = if at == 0 { T_HEADERS } else { T_CONT };
-            if !self.conn.frame(kind, flags, self.stream, &block[at..end]) {
-                return false;
-            }
-            at = end;
-            if at >= block.len() {
-                break;
-            }
+        if !self.conn.header_block(self.stream, &block, false) {
+            return false;
         }
         self.headed = true;
         if let Some(s) = self
@@ -1039,6 +1024,35 @@ impl H2Conn {
         if !write_frame(&mut **write, kind, flags, id, body) {
             self.dead.store(true, Ordering::SeqCst);
             return false;
+        }
+        true
+    }
+
+    /// One header block, its fragments kept contiguous: a control frame cannot slip between HEADERS and its CONTINUATION.
+    fn header_block(&self, id: u32, block: &[u8], end_stream: bool) -> bool {
+        let max = *self
+            .max_frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Ok(mut write) = self.write.lock() else {
+            return false;
+        };
+        let mut at = 0;
+        loop {
+            let end = (at + max).min(block.len());
+            let mut flags = if end == block.len() { F_END_HEADERS } else { 0 };
+            if at == 0 && end_stream {
+                flags |= F_END;
+            }
+            let kind = if at == 0 { T_HEADERS } else { T_CONT };
+            if !write_frame(&mut **write, kind, flags, id, &block[at..end]) {
+                self.dead.store(true, Ordering::SeqCst);
+                return false;
+            }
+            at = end;
+            if at >= block.len() {
+                break;
+            }
         }
         true
     }
@@ -1682,26 +1696,24 @@ impl H2Conn {
             st.dead = true;
             state.cv.notify_all();
         }
-        let sessions: Vec<String> = self
+        let sessions: Vec<(String, crate::xhttp::SessionHandle)> = self
             .sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .drain()
             .collect();
-        for session in sessions {
-            crate::xhttp::end_session(&session);
+        for (session, handle) in sessions {
+            crate::xhttp::end_session_handle(&session, &handle);
         }
     }
 
     /// The session a stream of this connection waits on dies with the connection: past `dead` there is no frame left to post, so a waiter would park on a sequence no peer can ever send.
     fn bind_session(&self, sid: &str, stream: u32, downlink: bool) {
-        {
-            let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-            // Every packet-up POST repeats its session's id, so the owned key is only made for a first bind.
-            if !sessions.contains(sid) {
-                sessions.insert(sid.to_owned());
-            }
-        }
+        let handle = crate::xhttp::session_handle(sid);
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(sid.to_owned(), handle.clone());
         let owner = if downlink {
             &self.session_of
         } else {
@@ -1711,9 +1723,9 @@ impl H2Conn {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(stream, sid.to_owned());
-        // `kill` sets `dead` before it drains this set, so a bind that raced the drain ends its own session.
+        // `kill` sets `dead` before it drains this map, so a bind that raced the drain ends its own session.
         if self.dead.load(Ordering::SeqCst) {
-            crate::xhttp::end_session(sid);
+            crate::xhttp::end_session_handle(sid, &handle);
         }
     }
 
@@ -1767,11 +1779,14 @@ impl H2Conn {
             .remove(&stream);
         if let Some(sid) = sid {
             self.end_uploads(&sid);
-            self.sessions
+            let handle = self
+                .sessions
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&sid);
-            crate::xhttp::end_session(&sid);
+            if let Some(handle) = handle {
+                crate::xhttp::end_session_handle(&sid, &handle);
+            }
         }
     }
 }
@@ -2192,7 +2207,7 @@ impl H2Client {
             control: Control::threaded(Arc::clone(&write), Arc::clone(&dead)),
             write,
             streams: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashSet::new()),
+            sessions: Mutex::new(HashMap::new()),
             session_of: Mutex::new(HashMap::new()),
             upload_of: Mutex::new(HashMap::new()),
             send_conn: Mutex::new(65_535),
@@ -2569,22 +2584,8 @@ impl H2Conn {
 
     pub(crate) fn respond(&self, sid: u32, fields: &[(&str, &str)]) -> bool {
         let block = block_encode(fields);
-        let max = *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut at = 0;
-        loop {
-            let end = (at + max).min(block.len());
-            let flags = if end == block.len() { F_END_HEADERS } else { 0 };
-            let kind = if at == 0 { T_HEADERS } else { T_CONT };
-            if !self.frame(kind, flags, sid, &block[at..end]) {
-                return false;
-            }
-            at = end;
-            if at >= block.len() {
-                break;
-            }
+        if !self.header_block(sid, &block, false) {
+            return false;
         }
         if let Some(state) = self
             .streams
@@ -2614,25 +2615,8 @@ impl H2Conn {
                 return false;
             }
         }
-        let max = *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut at = 0;
-        loop {
-            let end = (at + max).min(block.len());
-            let mut flags = if end == block.len() { F_END_HEADERS } else { 0 };
-            if at == 0 {
-                flags |= F_END;
-            }
-            let kind = if at == 0 { T_HEADERS } else { T_CONT };
-            if !self.frame(kind, flags, sid, &block[at..end]) {
-                return false;
-            }
-            at = end;
-            if at >= block.len() {
-                break;
-            }
+        if !self.header_block(sid, block, true) {
+            return false;
         }
         state.responded.store(true, Ordering::SeqCst);
         let ended = {
@@ -3165,7 +3149,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     control: Control::threaded(Arc::clone(&write), Arc::clone(&dead)),
                     write,
                     streams: Mutex::new(HashMap::new()),
-                    sessions: Mutex::new(HashSet::new()),
+                    sessions: Mutex::new(HashMap::new()),
                     session_of: Mutex::new(HashMap::new()),
                     upload_of: Mutex::new(HashMap::new()),
                     send_conn: Mutex::new(65_535),
@@ -3443,6 +3427,35 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
     true
 }
 
+/// A trailing HEADERS block on a stream already open: decode it in wire order to keep HPACK in step, then apply its `END_STREAM` to the waiting reader.
+fn apply_trailers(conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool) -> bool {
+    if !conn.decode_block(block, |_, _| {}) {
+        conn.reset_stream(sid);
+        return true;
+    }
+    let state = conn
+        .streams
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&sid)
+        .cloned();
+    if let Some(state) = state {
+        let done = {
+            let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if end_stream {
+                st.ended = true;
+            }
+            let done = st.both_ended();
+            state.cv.notify_all();
+            done
+        };
+        if done {
+            conn.retire(sid);
+        }
+    }
+    true
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -3467,23 +3480,26 @@ fn pump_frame(
                 return true;
             }
             let mut block = body;
-            let mut pos = 0;
+            let mut start = 0;
+            let mut end = block.len();
             if flags & F_PADDED != 0 {
-                let Some(&len) = block.first() else {
+                let Some(&pad) = block.first() else {
                     return true;
                 };
-                pos = 1 + len as usize;
-                if pos > block.len() {
-                    return true;
-                }
+                start = 1;
+                end = match block.len().checked_sub(pad as usize) {
+                    Some(end) if end >= start => end,
+                    _ => return true,
+                };
             }
             if flags & F_PRIORITY != 0 {
-                pos += 5;
-                if pos > block.len() {
+                start += 5;
+                if start > end {
                     return true;
                 }
             }
-            block.drain(..pos);
+            block.truncate(end);
+            block.drain(..start);
             let end_headers = flags & F_END_HEADERS != 0;
             let end_stream = flags & F_END != 0;
             if end_headers {
@@ -3495,7 +3511,7 @@ fn pump_frame(
                     .unwrap_or_else(PoisonError::into_inner)
                     .contains_key(&sid)
                 {
-                    return true;
+                    return apply_trailers(conn, sid, &block, end_stream);
                 }
                 if service.open(conn, sid, &block, end_stream) {
                     if let Some(opened) = opened {
@@ -3520,7 +3536,14 @@ fn pump_frame(
                 }
                 gathered.extend_from_slice(&body);
                 if flags & F_END_HEADERS != 0 {
-                    if service.open(conn, sid, &gathered, end_stream) {
+                    let attached = conn
+                        .streams
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .contains_key(&sid);
+                    if attached {
+                        apply_trailers(conn, sid, &gathered, end_stream);
+                    } else if service.open(conn, sid, &gathered, end_stream) {
                         if let Some(opened) = opened {
                             opened.store(true, Ordering::Relaxed);
                         }
@@ -5487,7 +5510,7 @@ mod tests {
             write,
             control: Control::Inline,
             streams: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashSet::new()),
+            sessions: Mutex::new(HashMap::new()),
             session_of: Mutex::new(HashMap::new()),
             upload_of: Mutex::new(HashMap::new()),
             send_conn: Mutex::new(65_535),
@@ -5582,6 +5605,28 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .status,
             Some(404)
+        );
+    }
+
+    /// A trailing block is HPACK data, not padding: it must decode in wire order and then apply its
+    /// `END_STREAM`, retiring the stream once the response half is done too.
+    #[test]
+    fn a_trailing_block_decodes_and_ends_the_stream() {
+        let (conn, state, _) = reading_conn(Box::new(Silent));
+        state
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finished = true;
+        let block = block_encode(&[("x-trailer", "done")]);
+        assert!(apply_trailers(&conn, 1, &block, true));
+        assert!(
+            !conn
+                .streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&1),
+            "both halves are done, so the stream retires"
         );
     }
 
@@ -5993,7 +6038,7 @@ mod tests {
             write,
             control,
             streams: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashSet::new()),
+            sessions: Mutex::new(HashMap::new()),
             session_of: Mutex::new(HashMap::new()),
             upload_of: Mutex::new(HashMap::new()),
             send_conn: Mutex::new(65_535),

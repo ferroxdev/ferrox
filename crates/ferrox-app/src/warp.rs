@@ -993,9 +993,16 @@ fn register(spec: &WarpSpec, enroll: bool) -> Result<Identity, String> {
         };
         match register_with(spec, enroll, &|method, path, headers, body| {
             let url = endpoint.url(path);
-            // The reference dials one fresh HTTP/2 connection per call and never retries over HTTP/1.1; a failed leg says so.
-            crate::foxy_account::h2_ask(&endpoint, method, &url, headers, body)
-                .map_err(RegisterError::retryable)
+            // The reference dials one fresh HTTP/2 connection per call and never retries over HTTP/1.1; a request that reached the peer is not replayed against another host.
+            crate::foxy_account::h2_ask_started(&endpoint, method, &url, headers, body).map_err(
+                |(reason, sent)| {
+                    if sent {
+                        RegisterError::fatal(reason)
+                    } else {
+                        RegisterError::retryable(reason)
+                    }
+                },
+            )
         }) {
             Ok(identity) => return Ok(identity),
             Err(error) if error.fatal => {
@@ -2966,9 +2973,31 @@ impl KeyPaths {
     fn new(base: &Path, wireguard: Option<&Path>, masque: Option<&Path>) -> Self {
         Self {
             wireguard: wireguard.map_or_else(|| base.to_path_buf(), Path::to_path_buf),
-            masque: masque.map_or_else(|| derive_sibling_path(base, "masque"), Path::to_path_buf),
+            masque: masque.map_or_else(
+                || {
+                    if named_slot(base, "masque") {
+                        base.to_path_buf()
+                    } else {
+                        derive_sibling_path(base, "masque")
+                    }
+                },
+                Path::to_path_buf,
+            ),
         }
     }
+}
+
+/// Whether a path already names a slot, so a runtime pointed at the MASQUE half does not derive a second `-masque`.
+fn named_slot(path: &Path, suffix: &str) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let stem = match name.rfind('.') {
+        Some(dot) if dot > 0 => &name[..dot],
+        _ => &name,
+    };
+    stem.ends_with(&format!("-{suffix}"))
 }
 
 fn derive_sibling_path(base: &Path, suffix: &str) -> PathBuf {
@@ -3122,11 +3151,16 @@ pub(crate) fn one_tap(
 ) -> Result<String, String> {
     let mode = Mode::parse(Some(mode))?;
     let path = PathBuf::from(path);
-    if path.is_file() {
-        return Err(format!(
-            "warp: identity file {} already exists; refusing to overwrite a working device",
-            path.display()
-        ));
+    let resumed = path.is_file();
+    if resumed {
+        // The outer device was already created; a failed inner enrollment must be able to finish on the next run instead of minting a second device.
+        let saved = Identity::load(&path).map_err(|error| error.into_message())?;
+        if !matches!(mode, Mode::WireGuard | Mode::GoolClassic) && saved.masque.is_none() {
+            return Err(format!(
+                "warp: `{}` has no MASQUE key for mode `{mode:?}`; remove it to register a new device",
+                path.display()
+            ));
+        }
     }
     let ForcedEdges {
         wiw_outer,
@@ -3179,19 +3213,16 @@ pub(crate) fn one_tap(
             ..MimSettings::default()
         },
     };
-    let identity = register(&spec, !matches!(mode, Mode::WireGuard | Mode::GoolClassic))?;
-    identity.save(&path)?;
+    if !resumed {
+        let identity = register(&spec, !matches!(mode, Mode::WireGuard | Mode::GoolClassic))?;
+        identity.save(&path)?;
+    }
+    // The outer registration is the half that must not be repeated, so an inner failure keeps it for the next run.
     if matches!(mode, Mode::Gool | Mode::GoolClassic) {
-        if let Err(reason) = spec.gool_identity() {
-            let _ = std::fs::remove_file(&path);
-            return Err(reason);
-        }
+        spec.gool_identity()?;
     }
     if mode == Mode::Mim {
-        if let Err(reason) = spec.mim_identity() {
-            let _ = std::fs::remove_file(&path);
-            return Err(reason);
-        }
+        spec.mim_identity()?;
     }
     let mut settings = vec![
         ("mode", string(mode.label())),
@@ -3914,6 +3945,23 @@ mod tests {
             Slot::Gool.path(&overridden),
             Path::new("/etc/masque-gool.json")
         );
+    }
+
+    /// A runtime pointed straight at the MASQUE half keeps that file: deriving beside it would
+    /// look for `account-masque-masque.json`, which no earlier run ever wrote.
+    #[test]
+    fn a_masque_path_is_not_suffixed_again() {
+        let base = Path::new("/tmp/account-masque.json");
+        let paths = KeyPaths::new(base, Some(Path::new("/tmp/account-wg.json")), None);
+        assert_eq!(Slot::Masque.path(&paths), base);
+        assert_eq!(
+            Slot::WireGuard.path(&paths),
+            Path::new("/tmp/account-wg.json")
+        );
+        assert!(!named_slot(
+            Path::new("/tmp/account-masquerade.json"),
+            "masque"
+        ));
     }
 
     #[test]

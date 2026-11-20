@@ -88,6 +88,11 @@ const NETLINK_TIMEOUT: Duration = Duration::from_secs(2);
 const NETLINK_BUF: usize = 8192;
 const SOCKET_BUFFER: usize = 7 << 20;
 
+/// An address this host owns: the kernel's local table answers it before a marked rule can send it through the device, so the kernel path must decline it rather than let it bypass the tunnel.
+pub(crate) fn host_local(ip: IpAddr) -> bool {
+    ip.is_loopback() || ip.is_unspecified() || UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
 /// The kernel device one outbound owns.
 #[derive(Debug)]
 pub(crate) struct KernelWireGuard {
@@ -156,6 +161,12 @@ impl KernelWireGuard {
         target: SocketAddr,
         timeout: Duration,
     ) -> io::Result<TcpStream> {
+        if host_local(target.ip()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "kernel wireguard: a host-local destination needs the userspace stack",
+            ));
+        }
         let socket = Socket::new(domain(target), Type::STREAM, Some(Protocol::TCP))?;
         set_mark(&socket, self.mark)?;
         socket.set_tcp_nodelay(true)?;
@@ -167,6 +178,12 @@ impl KernelWireGuard {
 
     /// A connected UDP socket that leaves through the marked table.
     pub(crate) fn udp_socket(&self, target: SocketAddr) -> io::Result<UdpSocket> {
+        if host_local(target.ip()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "kernel wireguard: a host-local destination needs the userspace stack",
+            ));
+        }
         let socket = Socket::new(domain(target), Type::DGRAM, Some(Protocol::UDP))?;
         set_mark(&socket, self.mark)?;
         socket.connect(&target.into())?;
@@ -898,6 +915,15 @@ mod tests {
         );
         assert_eq!(attr(v4, WGALLOWEDIP_A_IPADDR), Some(&[0u8; 4][..]));
         assert_eq!(attr(v4, WGALLOWEDIP_A_CIDR_MASK), Some(&[0u8][..]));
+    }
+
+    /// The local table answers these before a marked rule can see them, so the kernel path
+    /// must decline them instead of letting the dial leave outside the tunnel.
+    #[test]
+    fn a_host_local_target_is_declined() {
+        assert!(host_local("127.0.0.1".parse().unwrap()));
+        assert!(host_local("::1".parse().unwrap()));
+        assert!(!host_local("8.8.8.8".parse().unwrap()));
     }
 
     #[test]

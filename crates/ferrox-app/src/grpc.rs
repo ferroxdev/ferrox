@@ -9,8 +9,9 @@ use crate::proxy::{Accepted, FrameWrite, Settle};
 
 use crate::h2::{
     block_encode, frame_head, write_frame, Decoder, E_REFUSED, FRAME_CAP, F_ACK, F_END,
-    F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_CONCURRENT, S_MAX_FRAME, S_WINDOW,
-    T_CONT, T_DATA, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
+    F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_HEADER_TABLE, S_MAX_CONCURRENT,
+    S_MAX_FRAME, S_WINDOW, T_CONT, T_DATA, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW,
+    WINDOW_MAX,
 };
 
 const MSG_CAP: usize = 16 * 1024 * 1024;
@@ -85,6 +86,8 @@ struct Shared {
     keepalive_wake: Condvar,
     max_frame: Mutex<usize>,
     init: Mutex<u64>,
+    /// A peer SETTINGS header-table size the next outgoing block must announce before its fields.
+    header_table: Mutex<Option<u32>>,
     ended: AtomicBool,
     upload_ended: AtomicBool,
     upload_gate: Mutex<()>,
@@ -108,6 +111,24 @@ impl std::fmt::Debug for Shared {
             .field("dead", &self.dead)
             .field("pong", &self.pong)
             .finish_non_exhaustive()
+    }
+}
+
+impl Shared {
+    /// A block whose first field is the peer's pending dynamic-table size, then the fields the caller
+    /// built: the update must open the first block after the SETTINGS that changed it.
+    fn header_block(&self, headers: &[(&str, &str)]) -> Vec<u8> {
+        let update = self
+            .header_table
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let mut block = Vec::new();
+        if let Some(size) = update {
+            ferrox_core::foxy::hpack::integer(&mut block, 5, 0x20, size as usize);
+        }
+        block.extend(block_encode(headers));
+        block
     }
 }
 
@@ -417,6 +438,12 @@ impl<R: Read> GrpcReader<R> {
                 *max = usize::try_from(value)
                     .unwrap_or(FRAME_CAP)
                     .clamp(16_384, (1 << 24) - 1);
+            } else if id == S_HEADER_TABLE {
+                *self
+                    .shared
+                    .header_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(value);
             }
             at += 6;
         }
@@ -523,7 +550,7 @@ impl<R: Read> GrpcReader<R> {
             return None;
         }
         self.method = served_method(gate);
-        let block = block_encode(&[
+        let block = self.shared.header_block(&[
             (":status", "200"),
             ("content-type", "application/grpc"),
             ("grpc-encoding", "identity"),
@@ -1288,11 +1315,7 @@ impl GrpcWriter {
     pub(crate) fn send(&self, data: &[u8]) -> bool {
         let max = self.max_frame();
         // Four frames of the 16 KiB the peer advertises are one byte over the default 65_535-byte stream window, so the fourth waits for a credit; a body one byte under the frame fits all four.
-        let cap = if self.shared.muxed {
-            usize::try_from(self.hunk_cap()).unwrap_or(usize::MAX)
-        } else {
-            usize::MAX
-        };
+        let cap = usize::try_from(self.hunk_cap()).unwrap_or(usize::MAX);
         let payload = message_payload(max.saturating_sub(1).min(cap)).max(1);
         if self.multi {
             return self.send_multi(data, payload);
@@ -1666,7 +1689,7 @@ impl GrpcWriter {
     }
 
     fn send_trailer(&self) -> bool {
-        let block = block_encode(&[(
+        let block = self.shared.header_block(&[(
             "grpc-status",
             status_text(self.shared.status.load(Ordering::SeqCst)),
         )]);
@@ -1791,13 +1814,9 @@ impl GrpcWriter {
         take_window(&self.shared, need, true)
     }
 
-    /// The largest blocking batch a muxed peer's opening window pays for in one offer: the transport
-    /// takes a batch whole or not at all, so a batch past that window would wait for credit the peer
-    /// grants only for bytes it has already received.
+    /// The largest message the peer's opening window pays for: a message past it would wait for
+    /// credit the peer grants only for bytes it has already received.
     fn hunk_cap(&self) -> u64 {
-        if !self.shared.muxed {
-            return u64::MAX;
-        }
         let init = self
             .shared
             .init
@@ -2418,6 +2437,7 @@ fn mux_shared(write: Box<dyn FrameWrite + Send>, max: usize, window: u64) -> Arc
         keepalive_wake: Condvar::new(),
         max_frame: Mutex::new(max),
         init: Mutex::new(window),
+        header_table: Mutex::new(None),
         ended: AtomicBool::new(false),
         upload_ended: AtomicBool::new(false),
         upload_gate: Mutex::new(()),
@@ -3136,6 +3156,7 @@ fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
         keepalive_wake: Condvar::new(),
         max_frame: Mutex::new(16_384),
         init: Mutex::new(65_535),
+        header_table: Mutex::new(None),
         ended: AtomicBool::new(false),
         upload_ended: AtomicBool::new(false),
         upload_gate: Mutex::new(()),
@@ -3540,7 +3561,7 @@ pub(crate) fn mark_reader_dead<R: Read>(reader: &mut GrpcReader<R>) {
 }
 
 pub(crate) fn request_ended<R: Read>(reader: &GrpcReader<R>) -> bool {
-    reader.remote_end && reader.msg_at >= reader.pay_end
+    reader.remote_end && reader.msg_at >= reader.pay_end && reader.msg_end == reader.msg.len()
 }
 
 #[cfg(test)]
@@ -3743,6 +3764,38 @@ mod tests {
             .expect("decodes");
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[1].1, b"/TunnelService/Tun");
+    }
+
+    /// A peer's new dynamic-table size must open the next block, not become a field: HPACK carries the
+    /// update as a size-prefixed integer before the headers it applies to.
+    #[test]
+    fn a_peer_table_size_opens_the_next_header_block() {
+        let shared = new_shared(Box::new(Sink::default()));
+        *shared
+            .header_table
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(128);
+        let block = shared.header_block(&[(":status", "200")]);
+        let mut decoder = Decoder::default();
+        let mut headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        decoder
+            .decode(&block, &mut |name, value| {
+                headers.push((name.to_vec(), value.to_vec()));
+            })
+            .expect("decodes with the size update");
+        assert_eq!(
+            headers,
+            vec![(b":status".to_vec(), b"200".to_vec())],
+            "the update is not a field and the headers follow it"
+        );
+        assert!(
+            shared
+                .header_table
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "an announced size is not announced twice"
+        );
     }
 
     #[test]
@@ -4995,6 +5048,15 @@ mod tests {
         assert!(5 + len <= 64, "the message fits the peer's window");
     }
 
+    /// A plain stream's opening window is the same ceiling: a message past it would wait for credit
+    /// the peer grants only after it has received the bytes.
+    #[test]
+    fn a_plain_writer_caps_a_message_to_its_opening_window() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, 64);
+        assert_eq!(writer.hunk_cap(), 64);
+    }
+
     /// The same batch driven over a real socket, where the only thing a loopback test can assert is
     /// its bytes: ten segments is the widest list this carrier hands `writev` or `WSASend`, so a
     /// platform that split the list or refused its width would answer with missing or reordered
@@ -5948,6 +6010,7 @@ mod tests {
                         keepalive_wake: Condvar::new(),
                         max_frame: Mutex::new(max),
                         init: Mutex::new(u64::from(WINDOW)),
+                        header_table: Mutex::new(None),
                         ended: AtomicBool::new(false),
                         upload_ended: AtomicBool::new(false),
                         upload_gate: Mutex::new(()),
