@@ -8,9 +8,13 @@ on:
         type: string
         default: "latest"
       engines:
-        description: Space-separated engines (`sing-tun-*` names the sing-box tun inbound, `hev` is the same engine as `hev-socks5-tunnel`; `tun2socks` and `xray` are built and run only when named here)
+        description: Space-separated engines (`sing-tun-*` names the sing-box tun inbound, `singbox-head-*` builds its default-branch HEAD, `hev` is the same engine as `hev-socks5-tunnel`; `tun2socks` and `xray` are built and run only when named here)
         type: string
-        default: "hev-socks5-tunnel ferrox ferrox-native singbox-system singbox-gvisor xray"
+        default: "hev-socks5-tunnel ferrox ferrox-native singbox-head-system singbox-head-gvisor xray"
+      singbox_ref:
+        description: sing-box revision for `singbox-head-*`; `latest` resolves the default branch HEAD at dispatch and the sha is recorded in the run identity
+        type: string
+        default: "latest"
       scenarios:
         description: Space-separated scenarios
         type: string
@@ -36,7 +40,7 @@ on:
         type: string
         default: "3"
       raw_variants:
-        description: Space-separated raw device variants
+        description: Space-separated raw device variants; `none` skips the raw job
         type: string
         default: "ferrox-raw-plain ferrox-raw-gso ferrox-raw-mq ferrox-raw-gso-mq tun-rs-sync-normal tun-rs-sync-gso tun-rs-sync-gso-concurrent"
 
@@ -91,6 +95,22 @@ jobs:
           esac
           echo "HEV_TUNNEL_REV=$ref" >> "$GITHUB_ENV"
 
+      - name: resolve sing-box HEAD
+        if: contains(inputs.engines, 'singbox-head')
+        env:
+          SINGBOX_REQUESTED_REF: ${{ inputs.singbox_ref }}
+        run: |
+          ref="$SINGBOX_REQUESTED_REF"
+          if [ "$ref" = latest ]; then
+            ref="$(git ls-remote https://github.com/SagerNet/sing-box HEAD | cut -f1)"
+            [ -n "$ref" ] || { echo "::error::sing-box HEAD did not resolve"; exit 1; }
+            echo "sing-box HEAD resolved to $ref"
+          fi
+          case "$ref" in
+            *[[:space:]]*|*..*|/*) echo "::error::singbox_ref is not a single ref"; exit 1 ;;
+          esac
+          echo "SINGBOX_HEAD_REV=$ref" >> "$GITHUB_ENV"
+
       - name: allow unprivileged namespaces
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
@@ -134,14 +154,24 @@ jobs:
           echo "XRAY_SHA=$(git -C upstream/xray-core rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - uses: actions/setup-go@v5
-        if: contains(inputs.engines, 'xray')
+        if: contains(inputs.engines, 'xray') || contains(inputs.engines, 'singbox-head')
         with:
-          go-version-file: upstream/xray-core/go.mod
+          go-version: stable
 
       - name: build xray-core
         if: contains(inputs.engines, 'xray')
         run: |
           ( cd upstream/xray-core && go build -trimpath -o "$RUNNER_TEMP/xray" ./main )
+
+      - name: build sing-box HEAD
+        if: contains(inputs.engines, 'singbox-head')
+        run: |
+          git init --quiet "$RUNNER_TEMP/sing-box-head"
+          git -C "$RUNNER_TEMP/sing-box-head" remote add origin https://github.com/SagerNet/sing-box
+          git -C "$RUNNER_TEMP/sing-box-head" fetch --quiet --no-tags --depth 1 origin "$SINGBOX_HEAD_REV"
+          git -C "$RUNNER_TEMP/sing-box-head" checkout --quiet FETCH_HEAD
+          ( cd "$RUNNER_TEMP/sing-box-head" && go build -trimpath -o "$RUNNER_TEMP/sing-box-head" ./cmd/sing-box )
+          echo "SINGBOX_HEAD_SHA=$(git -C "$RUNNER_TEMP/sing-box-head" rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: fetch tun2socks
         if: contains(inputs.engines, 'tun2socks')
@@ -154,6 +184,7 @@ jobs:
       - name: build identity
         env:
           HEV_REQUESTED_REF: ${{ inputs.hev_ref }}
+          SINGBOX_REQUESTED_REF: ${{ inputs.singbox_ref }}
         run: |
           {
             printf '| component | revision |\n|---|---|\n'
@@ -162,6 +193,7 @@ jobs:
             printf '| hev-socks5-server | `%s` |\n' "$HEV_SERVER_REV"
             printf '| sing-box | `v%s` |\n' "$SINGBOX_VERSION"
             printf '| sing-tun | sing-box v%s tun inbound (`gvisor`, `system` stacks) |\n' "$SINGBOX_VERSION"
+            if [ -n "${SINGBOX_HEAD_SHA:-}" ]; then printf '| sing-box HEAD | `%s` (requested `%s`) |\n' "$SINGBOX_HEAD_SHA" "${SINGBOX_REQUESTED_REF:-latest}"; fi
             printf '| tun2socks | `v%s` |\n' "$TUN2SOCKS_VERSION"
             if [ -n "${XRAY_SHA:-}" ]; then printf '| xray-core | `%s` |\n' "$XRAY_SHA"; fi
           } > "$RUNNER_TEMP/tun-bench-identity.md"
@@ -174,6 +206,7 @@ jobs:
           HEV: ${{ runner.temp }}/hev-socks5-tunnel/bin/hev-socks5-tunnel
           HEV_SERVER: ${{ runner.temp }}/hev-socks5-server/bin/hev-socks5-server
           SINGBOX: ${{ runner.temp }}/sing-box-${{ env.SINGBOX_VERSION }}-linux-amd64/sing-box
+          SINGBOX_HEAD: ${{ runner.temp }}/sing-box-head
           XRAY: ${{ runner.temp }}/xray
           TUN2SOCKS: ${{ runner.temp }}/tun2socks/tun2socks-linux-amd64
           OUT_DIR: tun-bench-results
@@ -210,6 +243,7 @@ jobs:
 
   raw:
     name: raw device
+    if: inputs.raw_variants != 'none'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
