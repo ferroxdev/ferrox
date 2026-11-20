@@ -13,6 +13,7 @@ use crate::conn::Connection;
 use crate::proxy::{read_exact, under_handshake, write_all_runs, Destination, RelayPoll, UDP_BUF};
 
 const SALT_LEN: usize = 32;
+const STOP_POLL: Duration = Duration::from_millis(100);
 // Chunks one relay read takes and one write carries. A batch never waits for the chunk that has not arrived, so this is a syscall count rather than a latency budget: four costs the same one read and the same one write as one.
 const CHUNKS_PER_BATCH: usize = 4;
 // One relay read of a stream is exactly one chunk: a 16384 B read would seal as 16383 + 1, a second length seal and tag for a single tail byte, and a batch read of CHUNKS_PER_BATCH of them tiles into whole chunks for the same reason. A stream has no chunks to batch, so its granularity — and every carrier frame size that follows from it — is unchanged.
@@ -1669,7 +1670,7 @@ fn serve_udp_aead(
                 i32::try_from(left.as_millis()).unwrap_or(i32::MAX)
             });
         let timeout = if stop.is_some() {
-            let poll = i32::try_from(RELAY_POLL.as_millis()).unwrap_or(i32::MAX);
+            let poll = i32::try_from(STOP_POLL.as_millis()).unwrap_or(i32::MAX);
             if timeout < 0 {
                 poll
             } else {
