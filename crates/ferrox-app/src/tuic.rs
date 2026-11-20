@@ -500,7 +500,12 @@ impl TuicOut {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn serve_udp(&self, relay: &UdpSocket, associate: Option<&Connection>) {
+    pub(crate) fn serve_udp(
+        &self,
+        relay: &UdpSocket,
+        associate: Option<&Connection>,
+        peer: Option<IpAddr>,
+    ) {
         let Some(lane) = self.lane() else {
             return;
         };
@@ -566,6 +571,9 @@ impl TuicOut {
             }
             match relay.recv_from(&mut buf) {
                 Ok((n, client)) => {
+                    if !proxy::source_ip_ok(peer, client) {
+                        continue;
+                    }
                     let Some((destination, payload)) = proxy::parse_socks_udp_dest(&buf[..n])
                     else {
                         continue;
