@@ -3019,7 +3019,7 @@ pub(crate) fn accept_split_with_settings<
     crate::proxy::RelayPoll::arm_relay_poll(&mut read);
     match accept_core(&head, prefix, Upload::Read(read), write, settings, None, fd) {
         Served::Session(reader, writer) => Some((reader, writer)),
-        Served::Refused | Served::Closed => None,
+        Served::Refused | Served::Closed | Served::Deferred => None,
         Served::Again(next, next_write, carry) => {
             // The request is served, so the rest of this connection is a keep-alive tail: a pooled connection left idle waits up to the head budget, and that wait belongs to a goroutine, not a setup lane.
             let settings = settings.clone();
@@ -3065,7 +3065,7 @@ fn keep_alive_tail<
                 write = next_write;
                 read.set_carry(carry);
             }
-            Served::Session(..) | Served::Closed | Served::Refused => return,
+            Served::Session(..) | Served::Closed | Served::Deferred | Served::Refused => return,
         }
     }
 }
@@ -3129,6 +3129,8 @@ pub(crate) enum Served<R, W> {
     Session(Box<dyn crate::proxy::WindowRead + Send>, XhttpWriter),
     Again(R, W, Vec<u8>),
     Closed,
+    /// A thread owns the answer: the carrier keeps the stream open until that thread writes it.
+    Deferred,
     /// The carrier refused the session id: the transport is reset so no answer reaches a peer that does not own it.
     Refused,
 }
@@ -3427,10 +3429,27 @@ pub(crate) fn accept_core<
                 h2.bind_upload(sid, &SessionHandle::of(&session));
             }
             // Go writes the 200 only when the handler returns; a stream-up POST hands that answer to its session so no accepted thread waits out the download, and the other shapes keep the inline wait.
-            if h2.is_none() && settings.mode == XhttpMode::StreamUp {
-                let settings = settings.clone();
-                session.defer_response(Box::new(move || plain_ok(&mut write, &settings, &padded)));
-                return Served::Closed;
+            if settings.mode == XhttpMode::StreamUp {
+                match h2 {
+                    None => {
+                        let settings = settings.clone();
+                        session.defer_response(Box::new(move || {
+                            plain_ok(&mut write, &settings, &padded);
+                        }));
+                        return Served::Closed;
+                    }
+                    Some(StreamOut::H2(out)) => {
+                        // The session-long wait leaves the setup lane: the stream's own thread writes the 200 when the session ends.
+                        let settings = settings.clone();
+                        crate::budgets::spawn(move || {
+                            session.wait_ended();
+                            plain_ok(&mut write, &settings, &padded);
+                            out.end();
+                        });
+                        return Served::Deferred;
+                    }
+                    Some(StreamOut::H3(_)) => {}
+                }
             }
             session.wait_ended();
             plain_ok(&mut write, settings, &padded);
