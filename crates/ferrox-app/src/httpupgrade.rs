@@ -92,6 +92,7 @@ fn upgrade_head_end(head: &[u8]) -> Option<usize> {
 fn read_upgrade_head<R: Read>(read: &mut R, limit: usize) -> Option<(Vec<u8>, usize)> {
     const ROUND: usize = 512;
     let mut head = Vec::with_capacity(ROUND);
+    let mut init = 0;
     let until = Instant::now() + crate::budgets::head_arrival();
     loop {
         if head.len() >= limit {
@@ -99,7 +100,8 @@ fn read_upgrade_head<R: Read>(read: &mut R, limit: usize) -> Option<(Vec<u8>, us
         }
         let base = head.len();
         let want = ROUND.min(limit - base);
-        head.resize(base + want, 0);
+        // SAFETY: `init` is the first byte no earlier round initialised, and every byte below it is zeroed or was written by a read that kept its length.
+        unsafe { ferrox_core::read::init_room(&mut head, &mut init, base + want) };
         let n = match read.read(&mut head[base..]) {
             Ok(n) => n,
             Err(error) if crate::proxy::is_timeout(&error) => {

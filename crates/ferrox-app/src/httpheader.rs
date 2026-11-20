@@ -40,6 +40,19 @@ impl<R: Read> HeadReader<R> {
         }
         Self { read, prefix, at }
     }
+
+    /// Put bytes read past a line back in front of whatever prefix is still unread, so a
+    /// buffered scan never consumes the tunnel's first bytes.
+    fn prepend(&mut self, mut bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.at < self.prefix.len() {
+            bytes.extend_from_slice(&self.prefix[self.at..]);
+        }
+        self.prefix = bytes;
+        self.at = 0;
+    }
 }
 
 impl<R: Read> Read for HeadReader<R> {
@@ -124,9 +137,9 @@ fn decode_path(path: &str) -> Option<std::borrow::Cow<'_, [u8]>> {
             at += 1;
             continue;
         }
-        let high = (*bytes.get(at + 1)? as char).to_digit(16)?;
-        let low = (*bytes.get(at + 2)? as char).to_digit(16)?;
-        out.push((high * 16 + low) as u8);
+        let high = hex_digit(*bytes.get(at + 1)?)?;
+        let low = hex_digit(*bytes.get(at + 2)?)?;
+        out.push(high * 16 + low);
         at += 3;
     }
     Some(std::borrow::Cow::Owned(out))
@@ -197,13 +210,16 @@ fn response_status(head: &[u8]) -> Option<u16> {
     let mut parts = head[..end].split(|byte| *byte == b' ');
     let version = parts.next()?;
     let status = parts.next()?;
-    if (version != b"HTTP/1.0" && version != b"HTTP/1.1")
-        || status.len() != 3
-        || !status.iter().all(u8::is_ascii_digit)
-    {
+    if (version != b"HTTP/1.0" && version != b"HTTP/1.1") || status.len() != 3 {
         return None;
     }
-    let status = std::str::from_utf8(status).ok()?.parse::<u16>().ok()?;
+    let hundreds = status[0].wrapping_sub(b'0');
+    let tens = status[1].wrapping_sub(b'0');
+    let ones = status[2].wrapping_sub(b'0');
+    if hundreds > 9 || tens > 9 || ones > 9 {
+        return None;
+    }
+    let status = u16::from(hundreds) * 100 + u16::from(tens) * 10 + u16::from(ones);
     (100..=599).contains(&status).then_some(status)
 }
 
@@ -232,8 +248,7 @@ fn response_body(head: &[u8], status: u16) -> Option<Body> {
         let (name, value) = line.split_at(colon);
         let value = trim_ows(&value[1..]);
         if name.eq_ignore_ascii_case(b"content-length") {
-            let value = std::str::from_utf8(value).ok()?;
-            let parsed = value.parse::<usize>().ok()?;
+            let parsed = parse_decimal(value)?;
             if length.is_some_and(|held| held != parsed) {
                 return None;
             }
@@ -253,6 +268,46 @@ fn response_body(head: &[u8], status: u16) -> Option<Body> {
         Some(Body::None)
     } else {
         Some(Body::Close)
+    }
+}
+
+/// The decimal integer `str::parse::<usize>` would read, without the UTF-8 validation and
+/// the generic parser: an optional `+`, at least one digit, and a checked widening.
+fn parse_decimal(value: &[u8]) -> Option<usize> {
+    let value = value.strip_prefix(b"+").unwrap_or(value);
+    let digits = value.first().filter(|byte| byte.is_ascii_digit())?;
+    let mut number = usize::from(*digits - b'0');
+    for byte in &value[1..] {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        number = number
+            .checked_mul(10)?
+            .checked_add(usize::from(*byte - b'0'))?;
+    }
+    Some(number)
+}
+
+/// The hexadecimal integer `usize::from_str_radix(_, 16)` would read, over the same accepted
+/// alphabet, for a chunk size line that has already had its extension cut.
+fn parse_hex(value: &[u8]) -> Option<usize> {
+    let value = value.strip_prefix(b"+").unwrap_or(value);
+    let digits = value.first().filter(|byte| byte.is_ascii_hexdigit())?;
+    let mut number = usize::from(hex_digit(*digits)?);
+    for byte in &value[1..] {
+        number = number
+            .checked_mul(16)?
+            .checked_add(usize::from(hex_digit(*byte)?))?;
+    }
+    Some(number)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -336,7 +391,7 @@ fn flatten<R: Read>(source: HeadReader<R>, mut head: Vec<u8>, at: usize) -> Head
 }
 
 fn skip_body<R: Read + crate::proxy::RelayPoll>(
-    reader: &mut R,
+    reader: &mut HeadReader<R>,
     body: Body,
     until: Instant,
 ) -> Option<()> {
@@ -372,12 +427,14 @@ fn read_within<R: Read + crate::proxy::RelayPoll>(
     Some(())
 }
 
+const SKIP_ROOM: usize = 4096;
+
 fn skip_exact<R: Read + crate::proxy::RelayPoll>(
     reader: &mut R,
     mut left: usize,
     until: Instant,
 ) -> Option<()> {
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; SKIP_ROOM];
     while left > 0 {
         let take = left.min(buf.len());
         read_within(reader, &mut buf[..take], until)?;
@@ -386,46 +443,158 @@ fn skip_exact<R: Read + crate::proxy::RelayPoll>(
     Some(())
 }
 
-fn skip_chunked<R: Read + crate::proxy::RelayPoll>(reader: &mut R, until: Instant) -> Option<()> {
+/// A chunked body's lines and bytes over one reused read room: a line is scanned where the read
+/// put it instead of asking the reader for one octet at a time, and whatever follows the end of
+/// the body stays in `pending` for the tunnel.
+struct Chunked<'a, R> {
+    reader: &'a mut R,
+    pending: Vec<u8>,
+    at: usize,
+    init: usize,
+}
+
+impl<'a, R: Read + crate::proxy::RelayPoll> Chunked<'a, R> {
+    fn new(reader: &'a mut R) -> Self {
+        Self {
+            reader,
+            pending: Vec::with_capacity(SKIP_ROOM),
+            at: 0,
+            init: 0,
+        }
+    }
+
+    fn compact(&mut self) {
+        if self.at == 0 {
+            return;
+        }
+        let len = self.pending.len();
+        self.pending.copy_within(self.at..len, 0);
+        self.pending.truncate(len - self.at);
+        self.init = self.init.saturating_sub(self.at);
+        self.at = 0;
+    }
+
+    fn fill(&mut self, until: Instant) -> Option<()> {
+        self.compact();
+        loop {
+            let left = left(until)?;
+            crate::proxy::RelayPoll::arm_head_poll_for(&mut *self.reader, left);
+            // SAFETY: `init` is the first byte no earlier read initialised, and every byte below it is zeroed or was written by a read that kept its length.
+            match unsafe {
+                crate::proxy::read_into_tail_room(
+                    &mut *self.reader,
+                    &mut self.pending,
+                    &mut self.init,
+                    SKIP_ROOM,
+                )
+            } {
+                Ok(0) => return None,
+                Ok(_) => {
+                    if Instant::now() >= until {
+                        return None;
+                    }
+                    return Some(());
+                }
+                Err(error) if crate::proxy::is_timeout(&error) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn read_exact(&mut self, out: &mut [u8], until: Instant) -> Option<()> {
+        let mut at = 0;
+        while at < out.len() {
+            let room = self.pending.len() - self.at;
+            if room == 0 {
+                read_within(&mut *self.reader, &mut out[at..], until)?;
+                return Some(());
+            }
+            let take = room.min(out.len() - at);
+            out[at..at + take].copy_from_slice(&self.pending[self.at..self.at + take]);
+            self.at += take;
+            at += take;
+        }
+        Some(())
+    }
+
+    fn skip(&mut self, mut left: usize, until: Instant) -> Option<()> {
+        let mut buf = [0u8; SKIP_ROOM];
+        while left > 0 {
+            let take = left.min(buf.len());
+            self.read_exact(&mut buf[..take], until)?;
+            left -= take;
+        }
+        Some(())
+    }
+
+    fn line(&mut self, until: Instant) -> Option<Vec<u8>> {
+        let mut line = Vec::new();
+        loop {
+            if let Some(rel) = self.pending[self.at..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+            {
+                let end = self.at + rel;
+                if line.len() + rel > HEAD_LIMIT {
+                    return None;
+                }
+                line.extend_from_slice(&self.pending[self.at..end]);
+                self.at = end + 1;
+                if line.last() != Some(&b'\r') {
+                    return None;
+                }
+                line.pop();
+                return Some(line);
+            }
+            line.extend_from_slice(&self.pending[self.at..]);
+            self.at = self.pending.len();
+            if line.len() > HEAD_LIMIT {
+                return None;
+            }
+            self.fill(until)?;
+        }
+    }
+
+    fn take_remainder(self) -> Vec<u8> {
+        self.pending[self.at..].to_vec()
+    }
+}
+
+fn skip_chunked<R: Read + crate::proxy::RelayPoll>(
+    reader: &mut HeadReader<R>,
+    until: Instant,
+) -> Option<()> {
+    let mut chunks = Chunked::new(reader);
+    let answer = skip_chunked_body(&mut chunks, until);
+    let tail = chunks.take_remainder();
+    reader.prepend(tail);
+    answer
+}
+
+fn skip_chunked_body<R: Read + crate::proxy::RelayPoll>(
+    chunks: &mut Chunked<'_, R>,
+    until: Instant,
+) -> Option<()> {
     let mut trailers = HEAD_LIMIT;
     loop {
-        let line = read_line(reader, until)?;
+        let line = chunks.line(until)?;
         let size = trim_ows(line.split(|byte| *byte == b';').next()?);
-        let size = usize::from_str_radix(std::str::from_utf8(size).ok()?, 16).ok()?;
+        let size = parse_hex(size)?;
         if size == 0 {
             loop {
-                let line = read_line(reader, until)?;
+                let line = chunks.line(until)?;
                 trailers = trailers.checked_sub(line.len() + 2)?;
                 if line.is_empty() {
                     return Some(());
                 }
             }
         }
-        skip_exact(reader, size, until)?;
+        chunks.skip(size, until)?;
         let mut crlf = [0u8; 2];
-        read_within(reader, &mut crlf, until)?;
+        chunks.read_exact(&mut crlf, until)?;
         if crlf != *b"\r\n" {
             return None;
         }
-    }
-}
-
-fn read_line<R: Read + crate::proxy::RelayPoll>(reader: &mut R, until: Instant) -> Option<Vec<u8>> {
-    let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        read_within(reader, &mut byte, until)?;
-        if byte[0] == b'\n' {
-            if line.last() != Some(&b'\r') {
-                return None;
-            }
-            line.pop();
-            return Some(line);
-        }
-        if line.len() >= HEAD_LIMIT {
-            return None;
-        }
-        line.push(byte[0]);
     }
 }
 
@@ -1050,5 +1219,50 @@ mod tests {
             .expect("writes");
         server.join().expect("joins");
         drop(stream);
+    }
+
+    #[test]
+    fn the_narrow_decimal_reader_is_the_standard_one() {
+        for text in [
+            "",
+            "+",
+            "-1",
+            "0",
+            "+0",
+            "007",
+            "42",
+            " 42",
+            "42 ",
+            "4x",
+            "٣",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            let standard = text.parse::<usize>().ok();
+            assert_eq!(parse_decimal(text.as_bytes()), standard, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_narrow_hex_reader_is_the_standard_one() {
+        for text in [
+            "",
+            "+",
+            "-1",
+            "0",
+            "+0",
+            "00ff",
+            "FF",
+            "a",
+            "g",
+            " 10",
+            "10 ",
+            "0x10",
+            "ffffffffffffffff",
+            "10000000000000000",
+        ] {
+            let standard = usize::from_str_radix(text, 16).ok();
+            assert_eq!(parse_hex(text.as_bytes()), standard, "{text:?}");
+        }
     }
 }
