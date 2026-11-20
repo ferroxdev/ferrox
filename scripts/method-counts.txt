@@ -35,7 +35,7 @@ tuic ordered-reassembly-allocations-on-completion 0 ferrox-app-tuic::tests::an_o
 tuic nanoseconds-per-packet 13.8 .github/workflows/bench.yml
 tuic burst-walk-ns-per-frame 9.7 .github/workflows/bench.yml
 tuic sweep-dedupe-ns-per-session 15.6 .github/workflows/bench.yml
-tuic sink-lookup-ns-per-datagram UNBLESSED .github/workflows/bench.yml
+tuic sink-lookup-ns-per-datagram 4.7 .github/workflows/bench.yml
 tuic address-families 3 ferrox-core-tuic::tests::the_three_address_families_match_the_wire
 tuic outbound-spellings-parsed 1 ferrox-app-tuic::tests::a_tuic_outbound_reads_the_reference_spellings
 anytls ops-retired-instructions UNBLESSED scripts/count-ops.sh
