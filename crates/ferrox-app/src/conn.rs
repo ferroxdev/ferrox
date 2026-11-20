@@ -2260,7 +2260,7 @@ fn socket_table_names(path: &std::path::Path) -> Option<bool> {
     }
     #[cfg(target_os = "macos")]
     {
-        macos_socket_table().is_some_and(|table| macos_table_names(&table, path))
+        macos_socket_table().map(|table| macos_table_names(&table, path))
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
