@@ -2235,30 +2235,96 @@ fn unix_socket_is_live(path: &std::path::Path) -> io::Result<bool> {
     }
 }
 
-/// A refusal means stale only where the kernel still lists the path's inode; macOS refuses a live full queue, so there it means live.
+/// A refusal means stale only when the kernel's socket table no longer names the path; an unreadable table is inconclusive and preserves it.
 #[cfg(unix)]
 fn refused_socket_is_stale(path: &std::path::Path) -> bool {
+    socket_table_names(path) == Some(false)
+}
+
+/// Whether the kernel still has a unix socket bound to `path`, in the evidence each host offers.
+#[cfg(unix)]
+fn socket_table_names(path: &std::path::Path) -> Option<bool> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        use std::os::unix::fs::MetadataExt as _;
-        let Ok(meta) = std::fs::symlink_metadata(path) else {
-            return false;
-        };
-        let Ok(table) = std::fs::read_to_string("/proc/net/unix") else {
-            return false;
-        };
-        !table.lines().skip(1).any(|line| {
-            line.split_whitespace()
-                .nth(6)
-                .and_then(|ino| ino.parse::<u64>().ok())
-                == Some(meta.ino())
+        let text = path.to_str()?;
+        let table = std::fs::read_to_string("/proc/net/unix").ok()?;
+        Some(
+            table
+                .lines()
+                .skip(1)
+                .filter_map(proc_unix_path)
+                .any(|listed| listed == text),
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_socket_table().map(|table| {
+            let mut needle = path.as_os_str().as_encoded_bytes().to_vec();
+            needle.push(0);
+            table.windows(needle.len()).any(|window| window == needle)
         })
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         let _ = path;
-        false
+        None
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn proc_unix_path(line: &str) -> Option<&str> {
+    let mut rest = line.trim_start();
+    for _ in 0..7 {
+        let at = rest.find(char::is_whitespace)?;
+        rest = rest[at..].trim_start();
+    }
+    (!rest.is_empty()).then_some(rest)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_socket_table() -> Option<Vec<u8>> {
+    let name = c"net.local.stream.pcblist";
+    let mut len = 0usize;
+    // SAFETY: the name is NUL-terminated and the null pointers ask only for the required size.
+    let asked = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if asked != 0 || len == 0 {
+        return None;
+    }
+    let mut table = vec![0u8; len];
+    // SAFETY: `table` is writable for `len` bytes and `len` is the same length the probe found.
+    let read = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            table.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    table.truncate(len);
+    Some(table)
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn sysctlbyname(
+        name: *const std::ffi::c_char,
+        old: *mut std::ffi::c_void,
+        old_len: *mut usize,
+        new: *mut std::ffi::c_void,
+        new_len: usize,
+    ) -> std::ffi::c_int;
 }
 
 /// Probe a unix listen path without creating or removing it: a live socket refuses the name, a stale one and an absent path pass, and a file that is not a socket is refused.
@@ -4390,6 +4456,23 @@ mod tests {
             "the live socket keeps its path"
         );
         drop(listener);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A dropped unix listener leaves its path behind; the probe must still call it stale and let a bind recover it.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_probe_recovers_a_socket_its_listener_left() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-stale-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("binds a socket");
+        drop(listener);
+        assert!(probe_unix(&path).is_ok(), "an abandoned socket is stale");
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
