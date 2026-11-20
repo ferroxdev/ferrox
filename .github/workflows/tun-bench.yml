@@ -3,6 +3,10 @@ name: tun-bench
 on:
   workflow_dispatch:
     inputs:
+      hev_ref:
+        description: hev-socks5-tunnel revision; `latest` resolves refs/heads/master at dispatch and the sha is recorded in the run identity
+        type: string
+        default: "latest"
       engines:
         description: Space-separated engines (`sing-tun-*` names the sing-box tun inbound, `hev` is the same engine as `hev-socks5-tunnel`; `tun2socks` is fetched and run only when named here)
         type: string
@@ -47,7 +51,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8
-  HEV_TUNNEL_REV: 8e3b4cd7168fe64b64f8b58537b5623fb6a7074d
   HEV_SERVER_REV: d23aaad702eb532ddb7c03be4598ed6f79cb79c1
   SINGBOX_VERSION: 1.14.0
   TUN2SOCKS_VERSION: 2.7.0
@@ -72,6 +75,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential git python3 iproute2 util-linux curl unzip
+
+      - name: resolve hev-socks5-tunnel
+        run: |
+          ref="${{ inputs.hev_ref }}"
+          if [ "$ref" = latest ]; then
+            ref="$(git ls-remote https://github.com/heiher/hev-socks5-tunnel refs/heads/master | cut -f1)"
+            [ -n "$ref" ] || { echo "::error::hev-socks5-tunnel master did not resolve"; exit 1; }
+            echo "hev-socks5-tunnel master resolved to $ref"
+          fi
+          echo "HEV_TUNNEL_REV=$ref" >> "$GITHUB_ENV"
 
       - name: allow unprivileged namespaces
         run: |
@@ -121,7 +134,7 @@ jobs:
           {
             printf '| component | revision |\n|---|---|\n'
             printf '| ferrox | `%s` |\n' "$(git rev-parse HEAD)"
-            printf '| hev-socks5-tunnel | `%s` |\n' "$HEV_TUNNEL_REV"
+            printf '| hev-socks5-tunnel | `%s` (`%s`) |\n' "$HEV_TUNNEL_REV" '${{ inputs.hev_ref }}' 
             printf '| hev-socks5-server | `%s` |\n' "$HEV_SERVER_REV"
             printf '| sing-box | `v%s` |\n' "$SINGBOX_VERSION"
             printf '| sing-tun | sing-box v%s tun inbound (`gvisor`, `system` stacks) |\n' "$SINGBOX_VERSION"

@@ -96,6 +96,7 @@ Against the pinned references, xray-core and sing-box open the platform device a
 | the native fallback | `docs/function/front-tun.md`, `crates/ferrox-app/src/tun.rs` |
 | the system NAT loop, accepted flow and relay | `crates/ferrox-app/src/tun_system.rs` |
 | the kernel-TCP stack shape | `upstream/leaf/leaf/src/proxy/tun`, `upstream/sing-box/option/tun.go` |
+| the hev comparator's revision | `tun-bench.yml` `hev_ref`, `latest` by default: it resolves `refs/heads/master` at dispatch and the identity table records the sha, so a run is replayable by passing that sha back |
 
 ## CI scope
 
