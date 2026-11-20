@@ -1221,10 +1221,13 @@ impl Routing {
                     .is_some_and(|sets| sets.iter().any(|set| set.has_domains()))
         });
         let wants_attrs = script.is_some() || rules.iter().any(|rule| rule.attrs.is_some());
-        let wants_process = rules.iter().any(|rule| rule.process.is_some())
-            || rule_sets
-                .iter()
-                .any(|set| set.rules.iter().any(SetRule::has_process));
+        let wants_process = rules.iter().any(|rule| {
+            rule.process.is_some()
+                || rule.sets.as_ref().is_some_and(|sets| {
+                    sets.iter()
+                        .any(|set| set.rules.iter().any(SetRule::has_process))
+                })
+        });
         Ok(Some(Self {
             strategy,
             rules,
@@ -1462,11 +1465,13 @@ impl Routing {
         });
         self.wants_attrs =
             self.script.is_some() || self.rules.iter().any(|rule| rule.attrs.is_some());
-        self.wants_process = self.rules.iter().any(|rule| rule.process.is_some())
-            || self
-                .rule_sets
-                .iter()
-                .any(|set| set.rules.iter().any(SetRule::has_process));
+        self.wants_process = self.rules.iter().any(|rule| {
+            rule.process.is_some()
+                || rule.sets.as_ref().is_some_and(|sets| {
+                    sets.iter()
+                        .any(|set| set.rules.iter().any(SetRule::has_process))
+                })
+        });
     }
 
     /// Whether any rule reads the flow's HTTP attributes, which is the only reason a front pays to parse them.
@@ -2655,22 +2660,27 @@ fn read_srs_item(
         2 => {
             let set = read_succinct(reader)?;
             let matcher = rule.domains.get_or_insert_with(DomainMatcher::new);
-            set.walk_keys(&mut |key| {
+            let budget = reader
+                .bytes
+                .len()
+                .saturating_mul(8)
+                .min(MAX_EXPANDED_DOMAIN_BYTES);
+            set.walk_keys(budget, &mut |key| {
                 let original = reverse_domain(&String::from_utf8_lossy(key));
                 match original.as_bytes().first() {
                     Some(&PREFIX_LABEL) => {
                         let domain = original[1..].trim_start_matches('.');
                         if !domain.is_empty() {
-                            matcher.add(DomainKind::SuffixOnly, lower_arc(domain));
+                            matcher.add(DomainKind::SuffixOnly, lower_arc(domain))?;
                         }
                     }
                     Some(&ROOT_LABEL) => {
                         let domain = &original[1..];
                         if !domain.is_empty() {
-                            matcher.add(DomainKind::Domain, lower_arc(domain));
+                            matcher.add(DomainKind::Domain, lower_arc(domain))?;
                         }
                     }
-                    Some(_) => matcher.add(DomainKind::Full, lower_arc(&original)),
+                    Some(_) => matcher.add(DomainKind::Full, lower_arc(&original))?,
                     None => {}
                 }
                 Ok(())
@@ -2679,13 +2689,15 @@ fn read_srs_item(
         3 => {
             let matcher = rule.domains.get_or_insert_with(DomainMatcher::new);
             for keyword in reader.strings()? {
-                matcher.add(DomainKind::Substr, lower_arc(&keyword));
+                matcher.add(DomainKind::Substr, lower_arc(&keyword))?;
             }
         }
         4 => {
             let matcher = rule.domains.get_or_insert_with(DomainMatcher::new);
             for pattern in reader.strings()? {
-                matcher.add(DomainKind::Regex, Arc::from(pattern));
+                matcher
+                    .add(DomainKind::Regex, Arc::from(pattern))
+                    .map_err(|error| format!("routing rule set `{tag}` {error}"))?;
             }
         }
         5 => {
@@ -3103,7 +3115,7 @@ impl SetRule {
                                         "routing rule set rule domain_suffix is empty".to_owned()
                                     );
                                 }
-                                matcher.add(DomainKind::SuffixOnly, lower_arc(rest));
+                                matcher.add(DomainKind::SuffixOnly, lower_arc(rest))?;
                                 continue;
                             }
                         }
@@ -3536,6 +3548,7 @@ const ROOT_LABEL: u8 = b'\n';
 const SUFFIX_LABEL: u8 = 0x08;
 const ANY_LABEL: u8 = b'*';
 const MAX_DOMAIN_KEY: usize = 4096;
+const MAX_EXPANDED_DOMAIN_BYTES: usize = 64 * 1024 * 1024;
 
 /// A `sing-box` succinct domain trie, kept only for `AdGuard` rule items; ordinary domain items are
 /// flattened into the hash tables above so a match never walks a trie.
@@ -3715,11 +3728,23 @@ impl SuccinctSet {
         }
     }
 
-    fn walk_keys(&self, visit: &mut impl FnMut(&[u8]) -> Result<(), String>) -> Result<(), String> {
+    fn walk_keys(
+        &self,
+        budget: usize,
+        visit: &mut impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut expanded = 0usize;
+        let mut counted = |key: &[u8]| {
+            expanded = expanded
+                .checked_add(key.len())
+                .filter(|total| *total <= budget)
+                .ok_or_else(|| "SRS domain keys expand past the body budget".to_owned())?;
+            visit(key)
+        };
         if Self::get_bit(&self.leaves, 0) {
-            visit(b"")?;
+            counted(b"")?;
         }
-        self.walk(0, 0, &mut Vec::new(), visit)
+        self.walk(0, 0, &mut Vec::new(), &mut counted)
     }
 
     fn walk(
@@ -3890,20 +3915,19 @@ impl DomainMatcher {
         Ok(())
     }
 
-    fn add(&mut self, kind: DomainKind, value: Arc<str>) {
+    fn add(&mut self, kind: DomainKind, value: Arc<str>) -> Result<(), String> {
         match kind {
             DomainKind::Substr => self.substr.push(value),
             DomainKind::Domain => self.suffix.insert(value),
             DomainKind::SuffixOnly => self.suffix_only.insert(value),
             DomainKind::Full => self.full.insert(value),
             DomainKind::Regex => {
-                if let Ok(regex) = regex::Regex::new(value.as_ref()) {
-                    self.regex.push(regex);
-                } else {
-                    eprintln!("routing: ignoring an invalid geosite regex");
-                }
+                let regex = regex::Regex::new(value.as_ref())
+                    .map_err(|error| format!("invalid domain regex `{value}`: {error}"))?;
+                self.regex.push(regex);
             }
         }
+        Ok(())
     }
 
     pub(crate) fn only_matches(&self, domain: &str) -> bool {
@@ -4419,7 +4443,9 @@ fn add_geosite(
     }
     let attrs = attrs.to_ascii_lowercase();
     for entry in assets.site(file, code, &attrs)?.iter() {
-        matcher.add(entry.kind, Arc::clone(&entry.value));
+        if let Err(error) = matcher.add(entry.kind, Arc::clone(&entry.value)) {
+            eprintln!("routing: ignoring an invalid geosite regex: {error}");
+        }
     }
     Ok(())
 }
@@ -6332,7 +6358,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn a_binary_rule_set_reads_domains_ports_network_and_addresses() {
         let mut body = Vec::new();
-        body.extend(varint(3));
+        body.extend(varint(4));
         body.push(0);
         body.push(2);
         put_succinct(
@@ -6367,6 +6393,19 @@ mod tests {
             &[(
                 "192.0.2.9".parse().expect("address"),
                 "192.0.2.9".parse().expect("address"),
+            )],
+        );
+        body.push(0xff);
+        body.push(0);
+        body.push(0);
+        body.push(2);
+        put_succinct(&mut body, &[domain_key(0, "either.test")]);
+        body.push(6);
+        put_ip_set(
+            &mut body,
+            &[(
+                "192.0.2.10".parse().expect("address"),
+                "192.0.2.10".parse().expect("address"),
             )],
         );
         body.push(0xff);
@@ -6494,11 +6533,149 @@ mod tests {
         );
         assert_eq!(
             routing.route(&Flow {
+                domain: Some("either.test"),
+                ..flow
+            }),
+            Some("block"),
+            "a destination domain alone satisfies a leaf that also names a destination address"
+        );
+        assert_eq!(
+            routing.route(&Flow {
                 domain: Some("other.test"),
+                ip: Some("192.0.2.10".parse().expect("address")),
+                ..flow
+            }),
+            Some("block"),
+            "a destination address alone satisfies the same leaf"
+        );
+        assert_eq!(
+            routing.route(&Flow {
+                domain: Some("either.test"),
+                ip: Some("192.0.2.10".parse().expect("address")),
+                ..flow
+            }),
+            Some("block")
+        );
+        assert_eq!(
+            routing.route(&Flow {
+                domain: Some("other.test"),
+                ip: Some("198.51.100.1".parse().expect("address")),
                 ..flow
             }),
             None
         );
+    }
+
+    #[test]
+    fn a_binary_rule_set_refuses_a_domain_regex_that_does_not_compile() {
+        let mut body = Vec::new();
+        body.extend(varint(1));
+        body.push(0);
+        body.push(4);
+        put_strings(&mut body, &["["]);
+        body.push(0xff);
+        body.push(0);
+        let dir = dir();
+        std::fs::write(dir.join("rules.srs"), wrap_srs(&body)).expect("write");
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                (
+                    "ruleSets",
+                    array(vec![object(vec![
+                        ("tag", text("bin")),
+                        ("type", text("local")),
+                        ("path", text("rules.srs")),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "block",
+                        vec![("ruleSet", array(vec![text("bin")]))],
+                    )]),
+                ),
+            ]),
+        )]);
+        let error = Routing::parse_in(&root, vec![dir]).expect_err("refused");
+        assert!(error.contains("regex"), "{error}");
+    }
+
+    #[test]
+    fn a_binary_rule_set_refuses_domain_keys_past_the_body_budget() {
+        let mut body = Vec::new();
+        body.extend(varint(1));
+        body.push(0);
+        body.push(2);
+        let keys: Vec<String> = (0..512)
+            .map(|at| domain_key(0, &format!("{at}.{}", "a".repeat(200))))
+            .collect();
+        put_succinct(&mut body, &keys);
+        body.push(0xff);
+        body.push(0);
+        let dir = dir();
+        std::fs::write(dir.join("rules.srs"), wrap_srs(&body)).expect("write");
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                (
+                    "ruleSets",
+                    array(vec![object(vec![
+                        ("tag", text("bin")),
+                        ("type", text("local")),
+                        ("path", text("rules.srs")),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "block",
+                        vec![("ruleSet", array(vec![text("bin")]))],
+                    )]),
+                ),
+            ]),
+        )]);
+        let error = Routing::parse_in(&root, vec![dir]).expect_err("refused");
+        assert!(error.contains("budget"), "{error}");
+    }
+
+    #[test]
+    fn wants_process_follows_the_rules_that_remain() {
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                (
+                    "ruleSets",
+                    array(vec![object(vec![
+                        ("tag", text("proc")),
+                        ("type", text("inline")),
+                        (
+                            "rules",
+                            array(vec![object(vec![(
+                                "process_name",
+                                array(vec![text("curl")]),
+                            )])]),
+                        ),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "block",
+                        vec![
+                            ("ruleTag", text("managed")),
+                            ("ruleSet", array(vec![text("proc")])),
+                        ],
+                    )]),
+                ),
+            ]),
+        )]);
+        let mut routing = Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        assert!(routing.wants_process());
+        routing.remove_rules("managed", &[]).expect("removes");
+        assert!(!routing.wants_process());
     }
 
     #[test]

@@ -2993,7 +2993,9 @@ impl RouteShared {
                 return Ok(None);
             };
             let first = probe.flow(probe.targets[0], probe.sources[0], probe.locals[0]);
-            return script.route(&first, callbacks);
+            if let Some(tag) = script.route(&first, callbacks)? {
+                return Ok(Some(tag));
+            }
         }
         let (target, webhook) = {
             let routing = self

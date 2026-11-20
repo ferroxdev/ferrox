@@ -1390,8 +1390,7 @@ fn resolve_location_any(base: &str, location: &str, allow_http: bool) -> Result<
     let path = if location.starts_with('/') {
         location.to_owned()
     } else {
-        let directory = url
-            .path
+        let directory = path
             .rsplit_once('/')
             .map_or("/", |(directory, _)| directory);
         format!("{directory}/{location}")
@@ -1790,6 +1789,14 @@ mod tests {
         assert_eq!(
             resolve_location("https://example.test/a", "#part").expect("joined"),
             "https://example.test/a#part"
+        );
+        assert_eq!(
+            resolve_location(
+                "https://example.test/releases/old.srs?next=/archive",
+                "new.srs"
+            )
+            .expect("joined"),
+            "https://example.test/releases/new.srs"
         );
     }
 
