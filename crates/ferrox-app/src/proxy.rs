@@ -36778,6 +36778,7 @@ fn kept_head_into(
     progress: Option<&AtomicU64>,
 ) -> Option<(Vec<u8>, usize)> {
     head.clear();
+    let mut init = 0;
     let mut until = Instant::now() + budget;
     let mut seen = progress.map(|progress| progress.load(Ordering::Relaxed));
     loop {
@@ -36803,7 +36804,8 @@ fn kept_head_into(
         if room > 0 {
             want = want.min(room);
         }
-        head.resize(base + want, 0);
+        // SAFETY: `init` is the first byte no earlier round initialised, and every byte below it is zeroed or was written by a read that kept its length.
+        unsafe { ferrox_core::read::init_room(&mut head, &mut init, base + want) };
         let n = match stream.read(&mut head[base..]) {
             Ok(n) => n,
             Err(error) if is_timeout(&error) => {
@@ -36839,6 +36841,7 @@ fn kept_head_into(
 
 fn peek_head_rounds(stream: &mut Connection, limit: usize, budget: Duration) -> Option<Vec<u8>> {
     let mut head = Vec::with_capacity(512);
+    let mut init = 0;
     let mut probe = [0u8; 512];
     let until = Instant::now() + budget;
     loop {
@@ -36864,7 +36867,8 @@ fn peek_head_rounds(stream: &mut Connection, limit: usize, budget: Duration) -> 
             None => n.min(limit - head.len()),
         };
         let base = head.len();
-        head.resize(base + want, 0);
+        // SAFETY: `init` is the first byte no earlier round initialised, and every byte below it is zeroed or was written by a read that kept its length.
+        unsafe { ferrox_core::read::init_room(&mut head, &mut init, base + want) };
         if stream.read_exact(&mut head[base..]).is_err() {
             head.truncate(base);
             return None;

@@ -1264,9 +1264,10 @@ fn render_tcp_packet_ip(
     let Some(head) = ip_header_len(src.0, dst.0) else {
         return;
     };
-    out.resize(head + 20 + options.len() + payload.len(), 0);
-    out[head + 20 + options.len()..].copy_from_slice(payload);
-    render_tcp_headers_ip(
+    let header = head + 20 + options.len();
+    crate::proxy::resize_scratch(out, header + payload.len());
+    out[header..].copy_from_slice(payload);
+    let rendered = render_tcp_headers_ip(
         src,
         dst,
         seq,
@@ -1278,6 +1279,9 @@ fn render_tcp_packet_ip(
         partial,
         out,
     );
+    if !rendered {
+        out[..header].fill(0);
+    }
 }
 
 /// Render one IPv4/TCP packet with no offload, the shape the caller's tests and the v4-only path already exercised.
