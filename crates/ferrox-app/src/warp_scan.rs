@@ -199,18 +199,19 @@ pub(crate) fn masque_candidates(mode: ScanMode) -> Vec<SocketAddr> {
         }
     };
     let sampled = sample_prefixes(&MASQUE_PREFIXES_V4, strategy.full_subnet, strategy.sample);
-    for (index, seed) in seeds.iter().enumerate() {
+    for seed in &seeds {
         push(*seed, MASQUE_PORTS[0]);
-        if let Some(ip) = sampled.get(index) {
-            push(*ip, MASQUE_PORTS[0]);
-        }
+    }
+    let wave = MASQUE_PREFIXES_V4.len();
+    for ip in sampled.iter().take(wave) {
+        push(*ip, MASQUE_PORTS[0]);
     }
     for seed in &seeds {
         for &port in &MASQUE_PORTS[1..] {
             push(*seed, port);
         }
     }
-    for ip in sampled.iter().skip(seeds.len()) {
+    for ip in sampled.iter().skip(wave) {
         push(*ip, MASQUE_PORTS[0]);
     }
     out
@@ -677,12 +678,24 @@ mod tests {
                     .any(|edge| edge.port() == MASQUE_PORTS[0] && !seeds.contains(edge)),
                 "{mode:?} spent its probe budget without reaching a sampled 443 edge"
             );
+            let fallback = candidates
+                .iter()
+                .position(|edge| edge.port() != MASQUE_PORTS[0])
+                .expect("a seed fallback port");
             assert!(
-                candidates[..budget]
-                    .iter()
-                    .any(|edge| edge.port() != MASQUE_PORTS[0]),
-                "{mode:?} spent its probe budget without reaching a seed fallback port"
+                fallback < budget,
+                "{mode:?} never reached a seed fallback port"
             );
+            for prefix in MASQUE_PREFIXES_V4 {
+                let edge = SocketAddr::from((
+                    sample_cidr(prefix, 1).first().copied().expect("one host"),
+                    MASQUE_PORTS[0],
+                ));
+                assert!(
+                    candidates[..fallback].contains(&edge),
+                    "{mode:?} fell back before trying the edge of {prefix}"
+                );
+            }
         }
     }
 
