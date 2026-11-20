@@ -84,6 +84,7 @@ jobs:
       - name: Egress control - 1 MB with no lane
         run: |
           : > veepn-legs.tsv
+          : > control.bin
           code=0
           timing=$(curl -sS --noproxy '*' --max-time 300 \
             -w '%{size_download} %{time_total} %{speed_download}' \
@@ -186,6 +187,7 @@ jobs:
           }
           fetch_mb() {
             local front="$1" port="$2" file="$3" label="$4" limit="${5:-180}" code=0 timing got
+            : > "$file"
             timing=$(via "$front" "$port" --max-time "$limit" \
               -w '%{size_download} %{time_total} %{speed_download}' \
               'https://speed.cloudflare.com/__down?bytes=1000000' -o "$file") || code=$?

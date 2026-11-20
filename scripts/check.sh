@@ -27,7 +27,7 @@ run_gates() {
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/ferrox-gates.XXXXXX")"
   local -a pids=()
   for gate in "$@"; do
-    ( "./scripts/$gate.sh" >"$tmp/$gate.log" 2>&1; echo $? >"$tmp/$gate.rc" ) &
+    ( rc=0; "./scripts/$gate.sh" >"$tmp/$gate.log" 2>&1 || rc=$?; echo "$rc" >"$tmp/$gate.rc" ) &
     pids+=("$!")
   done
   for pid in "${pids[@]}"; do

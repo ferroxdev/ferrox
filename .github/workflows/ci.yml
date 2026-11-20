@@ -84,7 +84,7 @@ jobs:
           GATES: check-leak-surface check-comments check-merge-markers check-fixture-safety check-dependency-policy check-windows-binary-paths check-method-docs check-ci-scope
         run: |
           for gate in $GATES; do
-            ( "./scripts/$gate.sh" > "/tmp/$gate.log" 2>&1; echo $? > "/tmp/$gate.rc" ) &
+            ( rc=0; "./scripts/$gate.sh" > "/tmp/$gate.log" 2>&1 || rc=$?; echo "$rc" > "/tmp/$gate.rc" ) &
           done
           wait
           status=0

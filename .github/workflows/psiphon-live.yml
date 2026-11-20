@@ -135,7 +135,7 @@ jobs:
           timing=$(curl -sS --noproxy '*' --max-time 300 \
             -w '%{size_download} %{time_total} %{speed_download}' \
             'https://speed.cloudflare.com/__down?bytes=10000000' -o control.bin) || code=$?
-          echo "control, no lane ${timing:-0 0 0}" >> psiphon-legs.tsv
+          echo "control, no lane ${timing:-0 0 0} $code" >> psiphon-legs.tsv
           got=$(wc -c < control.bin 2>/dev/null | tr -d ' ')
           echo "egress control: curl exit $code, ${got:-0} bytes of 10000000"
           if test "$code" = 0 && test "${got:-0}" = 10000000; then
@@ -241,7 +241,7 @@ jobs:
             timing=$(via "$front" "$port" --max-time 300 \
               -w '%{size_download} %{time_total} %{speed_download}' \
               'https://speed.cloudflare.com/__down?bytes=10000000' -o "$file") || code=$?
-            echo "$label ${timing:-0 0 0}" >> psiphon-legs.tsv
+            echo "$label ${timing:-0 0 0} $code" >> psiphon-legs.tsv
             got=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
             got="${got:-0}"
             if test "$code" = 0 && test "$got" = 10000000; then
@@ -447,7 +447,7 @@ jobs:
             PAR_BYTES="${PAR_BYTES:-0}"
             PAR_SECONDS=$(python3 -c "print($PAR_END - $PAR_START)")
             PAR_SPEED=$(python3 -c "print($PAR_BYTES / max($PAR_SECONDS, 0.001))")
-            echo "native pool parallel $PAR_BYTES $PAR_SECONDS $PAR_SPEED" >> psiphon-legs.tsv
+            echo "native pool parallel $PAR_BYTES $PAR_SECONDS $PAR_SPEED $PAR_CODE" >> psiphon-legs.tsv
             FLOW_SERVERS=$(tail -n +"$((FLOW_BASE + 1))" psiphon-live.log 2>/dev/null | sed -n 's/.*flow via session \([0-9]*\).*/\1/p' | sort -u | wc -l | tr -d ' ' || true)
             FLOW_SERVERS="${FLOW_SERVERS:-0}"
             if [ "$PAR_CODE" != 0 ] || [ "$PAR_BYTES" != 80000000 ]; then
@@ -539,17 +539,23 @@ jobs:
             tail -n 60 psiphon-reference.log >&2 || true
             echo "reference failed 0 0 0" >> psiphon-legs.tsv
           else
-            printf 'reference ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
-            sample_process "reference ready" "$LANE_PID"
             REF_FAILED=""
-            trace_front socks 10808 "reference socks" || REF_FAILED="$REF_FAILED socks(trace)"
-            fetch_mb socks 10808 reference-socks.bin "reference socks" || REF_FAILED="$REF_FAILED socks"
+            REF_HTTP=""
             if wait_front http 10809 120; then
-              trace_front http 10809 "reference http" || REF_FAILED="$REF_FAILED http(trace)"
-              fetch_mb http 10809 reference-http.bin "reference http" || REF_FAILED="$REF_FAILED http"
+              REF_HTTP=1
             else
               echo "::warning::the console client's HTTP proxy carried no trace in 120s"
               REF_FAILED="$REF_FAILED http(unbound)"
+            fi
+            if [ -n "$REF_HTTP" ]; then
+              printf 'reference ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
+            fi
+            sample_process "reference ready" "$LANE_PID"
+            trace_front socks 10808 "reference socks" || REF_FAILED="$REF_FAILED socks(trace)"
+            fetch_mb socks 10808 reference-socks.bin "reference socks" || REF_FAILED="$REF_FAILED socks"
+            if [ -n "$REF_HTTP" ]; then
+              trace_front http 10809 "reference http" || REF_FAILED="$REF_FAILED http(trace)"
+              fetch_mb http 10809 reference-http.bin "reference http" || REF_FAILED="$REF_FAILED http"
             fi
             fetch_mb socks 10808 reference-socks-warm.bin "reference socks warm" || REF_FAILED="$REF_FAILED socks(warm)"
             sample_process "reference done" "$LANE_PID"
@@ -602,15 +608,28 @@ jobs:
           except OSError:
               lines = []
           for line in lines:
-              parts = line.rsplit(None, 3)
-              if len(parts) != 4:
+              parts = line.rsplit(None, 4)
+              if len(parts) == 5:
+                  try:
+                      label, size, seconds, speed, code = parts[0], float(parts[1]), float(parts[2]), float(parts[3]), int(parts[4])
+                  except ValueError:
+                      parts = line.rsplit(None, 3)
+                      if len(parts) != 4:
+                          continue
+                      try:
+                          label, size, seconds, speed = parts[0], float(parts[1]), float(parts[2]), float(parts[3])
+                      except ValueError:
+                          continue
+                      code = 0
+              elif len(parts) == 4:
+                  try:
+                      label, size, seconds, speed = parts[0], float(parts[1]), float(parts[2]), float(parts[3])
+                  except ValueError:
+                      continue
+                  code = 0
+              else:
                   continue
-              label, size, seconds, speed = parts
-              try:
-                  size, seconds, speed = float(size), float(seconds), float(speed)
-              except ValueError:
-                  continue
-              legs.append((label, size, seconds, speed))
+              legs.append((label, size, seconds, speed, code))
 
           metrics = {}
           try:
@@ -627,9 +646,9 @@ jobs:
               pass
 
           def leg(label):
-              for name, size, seconds, speed in legs:
+              for name, size, seconds, speed, code in legs:
                   if name == label:
-                      return size, seconds, speed
+                      return size, seconds, speed, code
               return None
 
           def delta(label):
@@ -658,8 +677,10 @@ jobs:
           print()
           print("| leg | bytes | seconds | MiB/s |")
           print("| --- | --- | --- | --- |")
-          for label, size, seconds, speed in legs:
-              print(f"| {label} | {int(size)} | {seconds:.2f} | {speed / 1048576:.2f} |")
+          for label, size, seconds, speed, code in legs:
+              expected = 80000000 if label == "native pool parallel" else 10000000
+              mibs = f"{speed / 1048576:.2f}" if size == expected and code == 0 else "n/a"
+              print(f"| {label} | {int(size)} | {seconds:.2f} | {mibs} |")
           if not legs:
               print("| (no leg recorded a transfer) | 0 | 0.00 | 0.00 |")
           print()
@@ -674,11 +695,11 @@ jobs:
           print("| --- | ---: | ---: | ---: |")
 
           def rate(row):
-              return f"{row[2] / 1048576:.2f}" if row else "n/a"
+              return f"{row[2] / 1048576:.2f}" if row and row[0] == 10000000 and row[3] == 0 else "n/a"
 
           for label in ("socks", "http", "socks warm"):
               native, reference = leg(f"native {label}"), leg(f"reference {label}")
-              ratio = f"{native[2] / reference[2]:.2f}x" if native and reference and reference[2] > 0 else "n/a"
+              ratio = f"{native[2] / reference[2]:.2f}x" if native and reference and native[0] == 10000000 and reference[0] == 10000000 and native[3] == 0 and reference[3] == 0 and reference[2] > 0 else "n/a"
               print(f"| {label} MiB/s | {rate(native)} | {rate(reference)} | {ratio} |")
           native, reference = leg("native ready"), leg("reference ready")
           ratio = f"{reference[1] / native[1]:.2f}x" if native and reference and native[1] > 0 else "n/a"
@@ -694,7 +715,13 @@ jobs:
               print(f"| RSS KiB after the legs | {rss_native} | {rss_reference} | {rss_reference / rss_native:.2f}x |")
           else:
               print("| RSS KiB after the legs | n/a | n/a | n/a |")
-          if cpu_native is not None and cpu_reference is not None and cpu_native > 0:
+          measured = [
+              leg(f"{lane} {label}")
+              for lane in ("native", "reference")
+              for label in ("socks", "http", "socks warm")
+          ]
+          complete = all(row and row[0] == 10000000 and row[3] == 0 for row in measured)
+          if complete and cpu_native is not None and cpu_reference is not None and cpu_native > 0:
               print(f"| CPU s for 30 MB | {cpu_native:.2f} | {cpu_reference:.2f} | {cpu_reference / cpu_native:.2f}x |")
           else:
               print("| CPU s for 30 MB | n/a | n/a | n/a |")
