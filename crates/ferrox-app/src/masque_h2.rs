@@ -314,6 +314,7 @@ fn connection(
     };
     if wire.preface() {
         Session::new(shared, spec, stop).run(&mut wire);
+        wire.quiet();
     }
 }
 
@@ -382,6 +383,7 @@ fn connection_cleartext(
     drop(cap);
     if ready {
         Session::new(shared, spec, stop).run(&mut wire);
+        wire.quiet();
     }
 }
 
@@ -2030,6 +2032,7 @@ mod tests {
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2721,7 +2724,7 @@ mod tests {
     fn headers_on_stream_zero_refuse_the_connection() {
         let out = Arc::new(Mutex::new(Vec::new()));
         let writes = Arc::new(AtomicUsize::new(0));
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         let mut wire = Wire {
             stream: Box::new(Recorder {
                 out: Arc::clone(&out),
