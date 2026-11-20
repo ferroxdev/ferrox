@@ -2455,13 +2455,10 @@ fn staged_sibling(listed: &str, path: &std::path::Path) -> bool {
 #[cfg(target_os = "macos")]
 fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
     const HEADER: usize = 24;
-    const CONN_OFFSET: usize = 52;
+    const VNODE_OFFSET: usize = 36;
     const PATH_OFFSET: usize = 106;
     const OPTIONS_OFFSET: usize = 630;
-    const STATE_OFFSET: usize = 634;
-    const RECORD: usize = STATE_OFFSET + 2;
-    // An accepted connection keeps its bound address; only a never-connected bound PCB can still be a listener.
-    const CONNECTION_STATE: u16 = 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0020 | 0x2000;
+    const RECORD: usize = OPTIONS_OFFSET + 2;
     let mut at = HEADER;
     let mut unknown_staged = false;
     while at + 4 <= table.len() {
@@ -2472,14 +2469,14 @@ fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
         }
         if len >= RECORD {
             let record = &table[at..at + len];
-            let conn = u64::from_le_bytes(record[CONN_OFFSET..CONN_OFFSET + 8].try_into().ok()?);
             let options = u16::from_le_bytes([record[OPTIONS_OFFSET], record[OPTIONS_OFFSET + 1]]);
-            let state = u16::from_le_bytes([record[STATE_OFFSET], record[STATE_OFFSET + 1]]);
-            if conn != 0 || state & CONNECTION_STATE != 0 {
+            let listening = options & 0x0002 != 0;
+            // An accepted connection inherits its bound address without owning a vnode, so only a vnode-bearing row can be the path's owner.
+            let vnode = u64::from_le_bytes(record[VNODE_OFFSET..VNODE_OFFSET + 8].try_into().ok()?);
+            if vnode == 0 {
                 at += len;
                 continue;
             }
-            let listening = options & 0x0002 != 0;
             let raw = &record[PATH_OFFSET..];
             if let Some(end) = raw.iter().position(|byte| *byte == 0) {
                 if let Ok(listed) = std::str::from_utf8(&raw[..end]) {
@@ -2488,8 +2485,14 @@ fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
                         StagedClaim::Other => {}
                         StagedClaim::Unknown => {
                             // A current name lookup cannot prove the PCB's bind identity, so a matching row is inconclusive rather than live.
-                            if same_socket_object(std::path::Path::new(listed), path)
+                            let row = std::path::Path::new(listed);
+                            let moved = row
+                                .file_name()
+                                .is_some_and(|name| Some(name) == path.file_name())
+                                && std::fs::symlink_metadata(row).is_err();
+                            if same_socket_object(row, path)
                                 || (listening && staged_sibling(listed, path))
+                                || moved
                             {
                                 unknown_staged = true;
                             }
@@ -5126,6 +5129,86 @@ mod tests {
         drop(listener);
         drop(clients);
         std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stream client that bounds its own name before connecting keeps that name, so the probe must not take it for an accepted copy.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_unix_bound_client_keeps_its_own_path() {
+        use socket2::{Domain, Socket, Type};
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-client-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let server_path = dir.join("server");
+        let client_path = dir.join("client");
+        let server =
+            std::os::unix::net::UnixListener::bind(&server_path).expect("binds a live socket");
+        let client = Socket::new(Domain::UNIX, Type::STREAM, None).expect("opens a client");
+        client
+            .bind(&socket2::SockAddr::unix(&client_path).expect("names the client"))
+            .expect("binds the client name");
+        client
+            .connect(&socket2::SockAddr::unix(&server_path).expect("names the server"))
+            .expect("connects the client");
+        let accepted = server.accept().expect("accepts the client");
+        assert_ne!(
+            socket_table_names(&client_path),
+            Some(false),
+            "the connected client still owns its bound name"
+        );
+        let target =
+            parse_target(&format!("unix:{}", client_path.display())).expect("parses the path");
+        assert!(
+            Listener::bind(&target).is_err(),
+            "a live client name is not free"
+        );
+        assert!(
+            std::fs::symlink_metadata(&client_path).is_ok(),
+            "the client name stays"
+        );
+        drop(accepted);
+        drop(client);
+        drop(server);
+        std::fs::remove_file(&client_path).ok();
+        std::fs::remove_file(&server_path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A listener keeps its entry when its directory moves and the old bind name no longer resolves.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_unix_moved_listener_keeps_its_path() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-moved-{}-{id}", std::process::id()));
+        let old_dir = dir.join("old");
+        std::fs::create_dir_all(&old_dir).expect("scratch dir");
+        let old_path = old_dir.join("sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&old_path).expect("binds a live socket");
+        let new_dir = dir.join("new");
+        std::fs::rename(&old_dir, &new_dir).expect("moves the directory");
+        let new_path = new_dir.join("sock");
+        assert_ne!(
+            socket_table_names(&new_path),
+            Some(false),
+            "the moved listener still owns its entry"
+        );
+        let target = parse_target(&format!("unix:{}", new_path.display())).expect("parses");
+        assert!(
+            Listener::bind(&target).is_err(),
+            "a live moved listener keeps its name"
+        );
+        assert!(
+            std::fs::symlink_metadata(&new_path).is_ok(),
+            "the moved entry stays"
+        );
+        drop(listener);
+        std::fs::remove_file(&new_path).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -688,6 +688,9 @@ fn serve_inbounds_counted(
                             portals,
                             handler_stop.as_ref(),
                         ) {
+                            if !wake.is_empty() {
+                                wake_address = wake.clone();
+                            }
                             if let Some(stop) = recorded_stop {
                                 handler_stops.push((Arc::clone(stop), wake));
                             }
@@ -18078,6 +18081,9 @@ fn serve_shadowsocks_inbound(
                 if let Some(listeners) =
                     serve_ss_tls_front(address, inbound, carrier, accounts, freedom, stop)
                 {
+                    if listeners == 0 && FALLIBLE_BIND.with(std::cell::Cell::get) {
+                        return 0;
+                    }
                     served += listeners;
                 } else if FALLIBLE_BIND.with(std::cell::Cell::get) {
                     return 0;
@@ -18107,6 +18113,8 @@ fn serve_shadowsocks_inbound(
                     stop.cloned(),
                 ) {
                     served += 1;
+                } else if FALLIBLE_BIND.with(std::cell::Cell::get) {
+                    return 0;
                 }
             }
         }

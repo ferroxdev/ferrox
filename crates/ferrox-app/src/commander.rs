@@ -3225,9 +3225,14 @@ mod tests {
             routing: false,
         });
         api.set_runtime(std::sync::Arc::new(crate::proxy::test_runtime(&root)));
-        let first = free_port();
         let held = TcpListener::bind(("127.0.0.1", 0)).expect("holds a port");
         let second = held.local_addr().expect("addr").port();
+        let first = loop {
+            let port = free_port();
+            if port != second {
+                break port;
+            }
+        };
         let raw = dokodemo_inbound(&[first, second]);
         let mut add = Vec::new();
         field_bytes(&mut add, 1, &raw);
