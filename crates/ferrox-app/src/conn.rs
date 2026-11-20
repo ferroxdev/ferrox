@@ -2419,7 +2419,7 @@ fn staged_claim(listed: &[u8], path: &std::path::Path) -> StagedClaim {
             continue;
         }
         // The registration claims only the object it published, so a re-created path or an alias name still points at that object.
-        let current = std::fs::symlink_metadata(path)
+        let current = std::fs::metadata(path)
             .ok()
             .map(|meta| (meta.dev(), meta.ino()));
         return if binding.identity.is_some() && binding.identity == current {
@@ -5012,10 +5012,17 @@ mod tests {
         let path = dir.join("sock");
         let target = parse_target(&format!("unix:{},0750", path.display())).expect("parses");
         let listener = Listener::bind(&target).expect("binds under the staged mode");
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&path, &alias).expect("aliases the published path");
         assert_eq!(
             socket_table_names(&path),
             Some(true),
             "the staged name still names the published listener"
+        );
+        assert_eq!(
+            socket_table_names(&alias),
+            Some(true),
+            "an alias still names the published listener"
         );
         assert!(
             probe_unix(&path).is_err(),
