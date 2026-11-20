@@ -33,6 +33,7 @@ pub(crate) struct Bridge {
 }
 
 impl Bridge {
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn new(name: &str, addresses: Vec<IpAddr>, proxy: bool) -> Self {
         Self {
             local: local_address(name),
@@ -177,6 +178,7 @@ impl Bridge {
 
 /// A locally administered unicast address derived from the interface name, so a restart claims the
 /// same address; the host's neighbour cache follows this answer, not the feth's own address.
+#[cfg(any(target_os = "macos", test))]
 fn local_address(seed: &str) -> [u8; 6] {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in seed.bytes() {

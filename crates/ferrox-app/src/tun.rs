@@ -202,6 +202,7 @@ impl Spec {
         self.tap
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn peer(&self) -> Option<&str> {
         self.peer.as_deref()
     }
