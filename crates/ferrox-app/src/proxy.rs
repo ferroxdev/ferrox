@@ -35133,6 +35133,8 @@ pub(crate) mod lane_pool {
     /// A muxed stream's handshake: queued behind the accept path's setup lanes instead of taking a
     /// thread of its own for every stream the peer opens.
     pub(crate) fn submit_stream_setup(body: impl FnOnce() + Send + 'static) {
+        #[cfg(test)]
+        let body = crate::budgets::carrying(body);
         let mut body = Some(body);
         let step: Step = Box::new(move || {
             if let Some(body) = body.take() {

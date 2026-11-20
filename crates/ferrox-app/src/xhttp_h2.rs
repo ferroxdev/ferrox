@@ -3109,7 +3109,7 @@ fn serve_stream(
     );
 }
 
-/// Opens one H2 request stream and hands its body to the session, choosing the frame window when the request carries no sequence.
+/// Opens one H2 request stream and hands its body to the session, choosing the frame window when the request carries no sequence. The handshake rides the setup pool, so eight streams peak at its lanes instead of one thread each.
 #[allow(clippy::too_many_lines)]
 fn open_stream(
     conn: &Arc<H2Conn>,
@@ -3205,7 +3205,7 @@ fn open_stream(
     };
     let settings = settings.clone();
     let decryption = conn.decryption.clone();
-    crate::budgets::spawn(move || {
+    crate::proxy::lane_pool::submit_stream_setup(move || {
         match crate::xhttp::accept_core(
             &head,
             Vec::new(),
@@ -3216,9 +3216,12 @@ fn open_stream(
             None,
         ) {
             crate::xhttp::Served::Session(ureader, xwriter) => {
-                serve(ureader, xwriter, decryption);
+                // The handshake rode the setup lane; the served session is long-lived and takes its own thread, so a companion stream's handshake is not queued behind it.
+                let serve = Arc::clone(&serve);
+                crate::budgets::spawn(move || serve(ureader, xwriter, decryption));
             }
             crate::xhttp::Served::Refused => h2out.reset(),
+            crate::xhttp::Served::Deferred => {}
             _ => h2out.end(),
         }
     });
@@ -4994,6 +4997,139 @@ mod tests {
         server.join().expect("joins");
     }
 
+    /// Eight stream handshakes ride the setup pool, but a served session takes its own thread: every
+    /// served body parks, and a ninth handshake still runs while all eight are parked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn eight_stream_setups_ride_the_setup_pool() {
+        if !crate::conn::in_a_quiet_process(
+            "xhttp_h2::tests::eight_stream_setups_ride_the_setup_pool",
+        ) {
+            return;
+        }
+        let (conn, _state, _written) = reading_conn(Box::new(std::io::Cursor::new(Vec::new())));
+        let settings = test_settings("stream-up");
+        let pad = padding();
+        let parked = Arc::new((AtomicUsize::new(0), Mutex::new(false), Condvar::new()));
+        let seen = Arc::clone(&parked);
+        let serve: Arc<SessionServe> = Arc::new(move |_reader, _writer, _decryption| {
+            seen.0.fetch_add(1, Ordering::SeqCst);
+            let (_, open, cv) = &*seen;
+            let mut open = open.lock().expect("lock");
+            while !*open {
+                open = cv.wait(open).expect("waits");
+            }
+        });
+        let open = |sid: u32| {
+            let path = format!("/up/pool-{sid:04}");
+            let block = block_encode(&[
+                (":method", "GET"),
+                (":path", path.as_str()),
+                (":scheme", "http"),
+                (":authority", "127.0.0.1"),
+                ("referer", pad.as_str()),
+            ]);
+            open_stream(&conn, &settings, Arc::clone(&serve), sid, &block, true)
+        };
+        for sid in 2..=9u32 {
+            assert!(open(sid), "stream {sid} was not opened");
+        }
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while parked.0.load(Ordering::SeqCst) < 8 && std::time::Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            parked.0.load(Ordering::SeqCst),
+            8,
+            "the setup lanes held the served sessions"
+        );
+        assert!(open(10), "the ninth stream was not opened");
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while parked.0.load(Ordering::SeqCst) < 9 && std::time::Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            parked.0.load(Ordering::SeqCst),
+            9,
+            "the ninth handshake waited behind the parked sessions"
+        );
+        let (_, open, cv) = &*parked;
+        *open.lock().expect("lock") = true;
+        cv.notify_all();
+        conn.kill();
+    }
+
+    /// A stream-up POST waits for its session to end; that wait must not hold the setup lane its
+    /// companion GET needs. Two uploads queued before their GETs would otherwise take both lanes
+    /// and leave neither session started until the stall. Auto mode resolves a no-sequence POST to
+    /// packet-up, so the same deferred wait keeps that shape off the lane too.
+    #[test]
+    fn an_upload_does_not_starve_its_companion_get() {
+        if !crate::conn::in_a_quiet_process(
+            "xhttp_h2::tests::an_upload_does_not_starve_its_companion_get",
+        ) {
+            return;
+        }
+        for mode in ["stream-up", "auto"] {
+            let (conn, _state, _written) = reading_conn(Box::new(std::io::Cursor::new(Vec::new())));
+            let settings = test_settings(mode);
+            let pad = padding();
+            let started = Arc::new((AtomicUsize::new(0), Mutex::new(false), Condvar::new()));
+            let seen = Arc::clone(&started);
+            let serve: Arc<SessionServe> = Arc::new(move |_reader, _writer, _decryption| {
+                seen.0.fetch_add(1, Ordering::SeqCst);
+                let (_, open, cv) = &*seen;
+                let mut open = open.lock().expect("lock");
+                while !*open {
+                    open = cv.wait(open).expect("waits");
+                }
+            });
+            let request = |method: &str, sid: &str| {
+                let path = format!("/up/{sid}");
+                block_encode(&[
+                    (":method", method),
+                    (":path", path.as_str()),
+                    (":scheme", "http"),
+                    (":authority", "127.0.0.1"),
+                    ("referer", pad.as_str()),
+                ])
+            };
+            let (post_a, get_a) = (request("POST", "sess-0002"), request("GET", "sess-0002"));
+            let (post_b, get_b) = (request("POST", "sess-0004"), request("GET", "sess-0004"));
+            assert!(
+                open_stream(&conn, &settings, Arc::clone(&serve), 2, &post_a, false),
+                "{mode}: the first upload was not opened"
+            );
+            assert!(
+                open_stream(&conn, &settings, Arc::clone(&serve), 4, &post_b, false),
+                "{mode}: the second upload was not opened"
+            );
+            assert!(
+                open_stream(&conn, &settings, Arc::clone(&serve), 3, &get_a, true),
+                "{mode}: the first download was not opened"
+            );
+            assert!(
+                open_stream(&conn, &settings, Arc::clone(&serve), 5, &get_b, true),
+                "{mode}: the second download was not opened"
+            );
+            let until = std::time::Instant::now() + Duration::from_secs(2);
+            while started.0.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < until {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let entered = started.0.load(Ordering::SeqCst);
+            let (_, open, cv) = &*started;
+            *open.lock().expect("lock") = true;
+            cv.notify_all();
+            crate::xhttp::end_session("sess-0002");
+            crate::xhttp::end_session("sess-0004");
+            conn.kill();
+            assert_eq!(
+                entered, 2,
+                "{mode}: two uploads held the setup lanes their companion GETs needed"
+            );
+        }
+    }
+
     /// The h2 body is selected by the request's shape, not its method: a hub configured for a PUT uplink still hands a POST stream-up body over as a window instead of chunk-framing it.
     #[test]
     fn a_stream_up_post_under_a_put_uplink_method_keeps_its_body() {
@@ -6374,6 +6510,7 @@ mod tests {
             Some(&opened),
         ));
         assert!(!opened.load(Ordering::SeqCst), "a gRPC head opened");
+        conn.kill();
     }
 
     /// A refused request must not clear the clock: the reply is the last thing the peer sends, then
