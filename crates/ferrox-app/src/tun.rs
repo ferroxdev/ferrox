@@ -106,6 +106,7 @@ pub(crate) struct Spec {
     route_address: Vec<(IpAddr, u8)>,
     route_exclude: Vec<(IpAddr, u8)>,
     dns_hijack: Option<IpAddr>,
+    fd: Option<i32>,
 }
 
 impl Spec {
@@ -145,6 +146,7 @@ impl Spec {
             route_address: Vec::new(),
             route_exclude: Vec::new(),
             dns_hijack: None,
+            fd: None,
         }
     }
 
@@ -179,6 +181,12 @@ impl Spec {
         self
     }
 
+    /// An inherited descriptor: the VpnService or utun the app already opened, duplicated and served instead of a platform open.
+    pub(crate) fn with_fd(mut self, fd: Option<i32>) -> Self {
+        self.fd = fd;
+        self
+    }
+
     /// `dns_mode: hijack`: every port-53 query rides this server while its answer keeps the address the device asked.
     pub(crate) fn with_dns_hijack(mut self, dns: Option<IpAddr>) -> Self {
         self.dns_hijack = dns;
@@ -199,6 +207,10 @@ impl Spec {
 
     pub(crate) fn dns_hijack(&self) -> Option<IpAddr> {
         self.dns_hijack
+    }
+
+    pub(crate) fn fd(&self) -> Option<i32> {
+        self.fd
     }
 
     pub(crate) fn udp_idle(&self) -> std::time::Duration {
@@ -856,6 +868,10 @@ impl Device {
     /// One device per configured queue; every handler reads its own queue and passes the same flow table, so a segment that lands on another queue still finds its flow.
     pub(crate) fn open_all(spec: &Spec) -> io::Result<Vec<Self>> {
         #[cfg(unix)]
+        if let Some(fd) = spec.fd() {
+            return Ok(vec![Self::from_host_fd(fd, spec.mtu)?]);
+        }
+        #[cfg(unix)]
         if let Some(handle) = inherited_handle() {
             let framing = inherited_framing(&handle);
             return Ok(vec![Self {
@@ -901,6 +917,13 @@ impl Device {
                 framing: Framing::Utun,
                 gso: false,
             }])
+        }
+        #[cfg(windows)]
+        if spec.fd().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "an inherited descriptor needs a Unix host; a Windows TUN opens by name",
+            ));
         }
         #[cfg(windows)]
         {
@@ -985,6 +1008,15 @@ impl Device {
 
     /// A packet tunnel's descriptor: the reference dups it, closes it on exec, and makes it nonblocking.
     pub(crate) fn from_inherited(fd: i32, mtu: usize) -> io::Result<Self> {
+        Self::dup_fd(fd, mtu, true)
+    }
+
+    /// A host's descriptor for the blocking handler: duplicated and close-on-exec, with the flags the host set kept.
+    pub(crate) fn from_host_fd(fd: i32, mtu: usize) -> io::Result<Self> {
+        Self::dup_fd(fd, mtu, false)
+    }
+
+    fn dup_fd(fd: i32, mtu: usize, nonblocking: bool) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::fd::FromRawFd;
@@ -993,9 +1025,11 @@ impl Device {
                 return Err(io::Error::last_os_error());
             }
             unsafe { libc::fcntl(duplicated, libc::F_SETFD, libc::FD_CLOEXEC) };
-            let flags = unsafe { libc::fcntl(duplicated, libc::F_GETFL) };
-            if flags >= 0 {
-                unsafe { libc::fcntl(duplicated, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            if nonblocking {
+                let flags = unsafe { libc::fcntl(duplicated, libc::F_GETFL) };
+                if flags >= 0 {
+                    unsafe { libc::fcntl(duplicated, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+                }
             }
             let handle = unsafe { std::fs::File::from_raw_fd(duplicated) };
             Ok(Self {
@@ -1008,7 +1042,7 @@ impl Device {
         }
         #[cfg(not(unix))]
         {
-            let _ = (fd, mtu);
+            let _ = (fd, mtu, nonblocking);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "packet tunnel needs a Unix descriptor",
@@ -3020,6 +3054,22 @@ mod tests {
         assert!(Spec::with(None, None, None, Some(0), None)
             .validate()
             .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spec_fd_opens_the_inherited_descriptor_once() {
+        use std::os::fd::IntoRawFd;
+        let (held, _peer) = UnixStream::pair().expect("pair");
+        let fd = held.into_raw_fd();
+        let spec = Spec::new(None, None).with_fd(Some(fd));
+        let devices = Device::open_all(&spec).expect("the descriptor opens");
+        assert_eq!(devices.len(), 1, "one descriptor is one queue");
+        assert_eq!(devices[0].name(), "");
+        assert_ne!(devices[0].raw_fd(), fd, "the descriptor is duplicated");
+        let flags = unsafe { libc::fcntl(devices[0].raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, 0, "the handler reads blocking");
+        unsafe { libc::close(fd) };
     }
 
     #[test]

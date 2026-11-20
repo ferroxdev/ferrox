@@ -17624,6 +17624,22 @@ fn tun_duration(text: &str) -> Option<std::time::Duration> {
     seen.then_some(total)
 }
 
+/// The inherited descriptor a mobile host hands its VpnService or utun: `fd`, `file_descriptor` or the dashed spelling, duplicated by the open so the host keeps its own.
+fn tun_fd(inbound: &Json) -> Result<Option<i32>, String> {
+    let Some(value) = tun_field(inbound, "fd")
+        .or_else(|| tun_field(inbound, "file_descriptor"))
+        .or_else(|| tun_field(inbound, "file-descriptor"))
+    else {
+        return Ok(None);
+    };
+    let fd = value
+        .as_i64()
+        .and_then(|fd| i32::try_from(fd).ok())
+        .filter(|fd| *fd > 2)
+        .ok_or_else(|| "`fd` must be a descriptor above 2".to_owned())?;
+    Ok(Some(fd))
+}
+
 /// The reference's `udp_timeout`: seconds as a number, or a duration string (`500ms`, `1m30s`).
 fn tun_udp_timeout(inbound: &Json) -> Result<Option<std::time::Duration>, String> {
     let Some(value) = tun_field(inbound, "udp_timeout") else {
@@ -17817,6 +17833,7 @@ fn tun_spec(inbound: &Json) -> Result<crate::tun::Spec, String> {
     )?;
     spec = spec.with_routes(auto_route, routes, exclude);
     spec = spec.with_dns_hijack(tun_dns_hijack(inbound)?);
+    spec = spec.with_fd(tun_fd(inbound)?);
     spec.validate().map_err(|error| error.to_string())?;
     Ok(spec)
 }
@@ -17904,8 +17921,14 @@ fn serve_tun_inbound(
     stop: Option<&Arc<Stop>>,
 ) -> bool {
     let stack = tun_stack(inbound);
-    warn_unapplied_tun_options(inbound, tun_native(stack));
-    if !tun_native(stack) {
+    let native = tun_native(stack) || spec.fd().is_some();
+    if spec.fd().is_some() && !tun_native(stack) {
+        eprintln!(
+            "tun inbound: an inherited descriptor rides the native handler, so the `{stack}` stack is not applied"
+        );
+    }
+    warn_unapplied_tun_options(inbound, native);
+    if !native {
         if spec.dns_hijack().is_some()
             && matches!(
                 tun_mode(stack),
@@ -17930,6 +17953,9 @@ fn serve_tun_inbound(
                 false
             }
         };
+    }
+    if spec.fd().is_some() && spec.queues() > 1 {
+        eprintln!("tun inbound: an inherited descriptor carries one queue, so `queues` is ignored");
     }
     let Ok(devices) = crate::tun::Device::open_all(spec) else {
         eprintln!("tun inbound: {}", crate::tun::refusal_reason(spec));
@@ -44173,12 +44199,27 @@ mod tests {
             r#"{"address":["10.0.0.1/30","fd00::1/129"]}"#,
             r#"{"udp_timeout":"5x"}"#,
             r#"{"udp_timeout":"1m30x"}"#,
+            r#"{"fd":2}"#,
+            r#"{"fd":"three"}"#,
         ] {
             let parsed = crate::json::parse(config).expect("config");
             assert!(tun_spec(&parsed).is_err(), "{config}");
         }
         let parsed = crate::json::parse(r#"{"address":"198.18.0.1","prefix":24}"#).expect("config");
         assert!(tun_spec(&parsed).is_ok());
+    }
+
+    #[test]
+    fn a_tun_inbound_reads_an_inherited_descriptor() {
+        let spec = |config: &str| {
+            let parsed = crate::json::parse(config).expect("config");
+            tun_spec(&parsed)
+        };
+        for key in ["fd", "file_descriptor", "file-descriptor"] {
+            let wanted = spec(&format!(r#"{{"{key}":7}}"#)).expect("a descriptor");
+            assert_eq!(wanted.fd(), Some(7), "{key}");
+        }
+        assert_eq!(spec(r#"{"address":"198.18.0.1"}"#).expect("no fd").fd(), None);
     }
 
     #[test]
