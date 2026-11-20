@@ -103,6 +103,14 @@ jobs:
             esac
           fi
           case "$tier" in smoke | standard | full) ;; *) echo "::error::unknown tier $tier" >&2; exit 2 ;; esac
+          if [[ -n "$WANT_REPEATS" && ! "$WANT_REPEATS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::repeats must be a positive integer, got: $WANT_REPEATS" >&2
+            exit 2
+          fi
+          if [[ -n "$WANT_ENGINES" && ! "$WANT_ENGINES" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
+            echo "::error::engines must be a comma-separated list of engine names, got: $WANT_ENGINES" >&2
+            exit 2
+          fi
           source scripts/lib-matrix.sh
           ids="$(scenarios "$tier" | awk '{print $1}')"
           if [[ -n "$WANT_ONLY" ]]; then
