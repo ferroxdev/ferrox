@@ -2837,7 +2837,7 @@ impl ListenerDone {
         }
     }
 
-    fn finish(&self) {
+    pub(crate) fn finish(&self) {
         if self.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
             if let Some(stop) = &self.stop {
                 stop.mark_closed();
@@ -5417,7 +5417,7 @@ mod tests {
             tunnels.insert(open, TunnelQueue::new(open_tx, None));
         }
         let (stack, from_stack) = mpsc::channel();
-        let dispatcher = std::thread::spawn(move || dispatch(&shared, from_stack));
+        let dispatcher = std::thread::spawn(move || dispatch(&shared, from_stack, None));
         stack
             .send(ipv4_packet([10, 14, 0, 2], [10, 14, 0, 3]))
             .expect("a packet for the full tunnel");
