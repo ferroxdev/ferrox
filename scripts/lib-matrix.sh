@@ -72,6 +72,16 @@ matrix_warp_needs_external_reference() {
   [[ "$1" == warp-* ]]
 }
 
+# The external engine a cell's ratio is read against; xray-core is the default reference, while the
+# standalone protocols name the engine that carries them at this pin.
+matrix_reference_engine() {
+  case "$1" in
+    hysteria-v1-* | anytls-* | tuic-*) printf '%s\n' sing-box ;;
+    warp-*) printf '%s\n' aether ;;
+    *) printf '%s\n' xray-core ;;
+  esac
+}
+
 # A filter names a whole rung: the id itself or a `-`-separated child of it, so
 # `vless-raw-down-1` never selects `vless-raw-down-16`.
 scenario_matches() {
