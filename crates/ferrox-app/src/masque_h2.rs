@@ -428,8 +428,7 @@ impl Wire {
 
     fn send(&mut self, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
         let head = h2::frame_head(body.len(), kind, flags, id);
-        // A control frame is small enough to leave as one TLS record and one write, head and body
-        // already side by side; a larger one keeps the two writes rather than staging its body.
+        // A control body rides the head in one TLS record; a larger one keeps the two writes.
         let sent = if body.len() <= CONTROL_ROOM {
             let mut frame = [0u8; FRAME_HEAD + CONTROL_ROOM];
             frame[..FRAME_HEAD].copy_from_slice(&head);
@@ -2734,7 +2733,7 @@ mod tests {
     impl Write for Gate {
         /// Wait out the clock before the ping answer, then record every write.
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if buf.len() == 9 && buf[3] == h2::T_PING && buf[4] == h2::F_ACK {
+            if buf.starts_with(&h2::frame_head(8, h2::T_PING, h2::F_ACK, 0)) {
                 let wait = self.deadline.saturating_duration_since(Instant::now());
                 if !wait.is_zero() {
                     std::thread::sleep(wait + Duration::from_millis(1));
