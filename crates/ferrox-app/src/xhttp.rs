@@ -3428,8 +3428,8 @@ pub(crate) fn accept_core<
             if let Some(h2) = h2.as_ref() {
                 h2.bind_upload(sid, &SessionHandle::of(&session));
             }
-            // Go writes the 200 only when the handler returns; a stream-up POST hands that answer to its session so no accepted thread waits out the download, and the other shapes keep the inline wait.
-            if settings.mode == XhttpMode::StreamUp {
+            // Go writes the 200 only when the handler returns; a stream-up POST, and an H2 POST with no sequence number, hand that answer to its session so no accepted thread waits out the download, and the other shapes keep the inline wait.
+            if settings.mode == XhttpMode::StreamUp || h2.is_some() {
                 match h2 {
                     None => {
                         let settings = settings.clone();

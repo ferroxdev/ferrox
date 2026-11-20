@@ -5061,7 +5061,8 @@ mod tests {
 
     /// A stream-up POST waits for its session to end; that wait must not hold the setup lane its
     /// companion GET needs. Two uploads queued before their GETs would otherwise take both lanes
-    /// and leave neither session started until the stall.
+    /// and leave neither session started until the stall. Auto mode resolves a no-sequence POST to
+    /// packet-up, so the same deferred wait keeps that shape off the lane too.
     #[test]
     fn an_upload_does_not_starve_its_companion_get() {
         if !crate::conn::in_a_quiet_process(
@@ -5069,77 +5070,64 @@ mod tests {
         ) {
             return;
         }
-        let (conn, _state, _written) = reading_conn(Box::new(std::io::Cursor::new(Vec::new())));
-        let settings = test_settings("stream-up");
-        let pad = padding();
-        let started = Arc::new((AtomicUsize::new(0), Mutex::new(false), Condvar::new()));
-        let seen = Arc::clone(&started);
-        let serve: Arc<SessionServe> = Arc::new(move |_reader, _writer, _decryption| {
-            seen.0.fetch_add(1, Ordering::SeqCst);
-            let (_, open, cv) = &*seen;
-            let mut open = open.lock().expect("lock");
-            while !*open {
-                open = cv.wait(open).expect("waits");
+        for mode in ["stream-up", "auto"] {
+            let (conn, _state, _written) = reading_conn(Box::new(std::io::Cursor::new(Vec::new())));
+            let settings = test_settings(mode);
+            let pad = padding();
+            let started = Arc::new((AtomicUsize::new(0), Mutex::new(false), Condvar::new()));
+            let seen = Arc::clone(&started);
+            let serve: Arc<SessionServe> = Arc::new(move |_reader, _writer, _decryption| {
+                seen.0.fetch_add(1, Ordering::SeqCst);
+                let (_, open, cv) = &*seen;
+                let mut open = open.lock().expect("lock");
+                while !*open {
+                    open = cv.wait(open).expect("waits");
+                }
+            });
+            let request = |method: &str, sid: &str| {
+                let path = format!("/up/{sid}");
+                block_encode(&[
+                    (":method", method),
+                    (":path", path.as_str()),
+                    (":scheme", "http"),
+                    (":authority", "127.0.0.1"),
+                    ("referer", pad.as_str()),
+                ])
+            };
+            let (post_a, get_a) = (request("POST", "sess-0002"), request("GET", "sess-0002"));
+            let (post_b, get_b) = (request("POST", "sess-0004"), request("GET", "sess-0004"));
+            assert!(
+                open_stream(&conn, &settings, Arc::clone(&serve), 2, &post_a, false),
+                "{mode}: the first upload was not opened"
+            );
+            assert!(
+                open_stream(&conn, &settings, Arc::clone(&serve), 4, &post_b, false),
+                "{mode}: the second upload was not opened"
+            );
+            assert!(
+                open_stream(&conn, &settings, Arc::clone(&serve), 3, &get_a, true),
+                "{mode}: the first download was not opened"
+            );
+            assert!(
+                open_stream(&conn, &settings, Arc::clone(&serve), 5, &get_b, true),
+                "{mode}: the second download was not opened"
+            );
+            let until = std::time::Instant::now() + Duration::from_secs(2);
+            while started.0.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < until {
+                thread::sleep(Duration::from_millis(1));
             }
-        });
-        let request = |method: &str, sid: &str| {
-            let path = format!("/up/{sid}");
-            block_encode(&[
-                (":method", method),
-                (":path", path.as_str()),
-                (":scheme", "http"),
-                (":authority", "127.0.0.1"),
-                ("referer", pad.as_str()),
-            ])
-        };
-        let (post_a, get_a) = (request("POST", "sess-0002"), request("GET", "sess-0002"));
-        let (post_b, get_b) = (request("POST", "sess-0004"), request("GET", "sess-0004"));
-        assert!(open_stream(
-            &conn,
-            &settings,
-            Arc::clone(&serve),
-            2,
-            &post_a,
-            false
-        ));
-        assert!(open_stream(
-            &conn,
-            &settings,
-            Arc::clone(&serve),
-            4,
-            &post_b,
-            false
-        ));
-        assert!(open_stream(
-            &conn,
-            &settings,
-            Arc::clone(&serve),
-            3,
-            &get_a,
-            true
-        ));
-        assert!(open_stream(
-            &conn,
-            &settings,
-            Arc::clone(&serve),
-            5,
-            &get_b,
-            true
-        ));
-        let until = std::time::Instant::now() + Duration::from_secs(2);
-        while started.0.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < until {
-            thread::sleep(Duration::from_millis(1));
+            let entered = started.0.load(Ordering::SeqCst);
+            let (_, open, cv) = &*started;
+            *open.lock().expect("lock") = true;
+            cv.notify_all();
+            crate::xhttp::end_session("sess-0002");
+            crate::xhttp::end_session("sess-0004");
+            conn.kill();
+            assert_eq!(
+                entered, 2,
+                "{mode}: two uploads held the setup lanes their companion GETs needed"
+            );
         }
-        let entered = started.0.load(Ordering::SeqCst);
-        let (_, open, cv) = &*started;
-        *open.lock().expect("lock") = true;
-        cv.notify_all();
-        crate::xhttp::end_session("sess-0002");
-        crate::xhttp::end_session("sess-0004");
-        assert_eq!(
-            entered, 2,
-            "two uploads held the setup lanes their companion GETs needed"
-        );
     }
 
     /// The h2 body is selected by the request's shape, not its method: a hub configured for a PUT uplink still hands a POST stream-up body over as a window instead of chunk-framing it.
