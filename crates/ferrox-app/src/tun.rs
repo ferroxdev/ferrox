@@ -2451,11 +2451,10 @@ impl Handler {
                 .rcv_nxt
                 .load(Relaxed)
                 .wrapping_sub(flow.last_acked.load(Relaxed));
-            let due = fin || !payload.is_empty() || unacked > 0;
             if let Served::Ack(ack) = served {
                 // The response carried this segment's ack, so the standalone one would only repeat it, and the cursor stored is the one that left rather than whatever another queue advanced meanwhile.
                 flow.last_acked.store(ack, Relaxed);
-            } else if due {
+            } else if fin || !payload.is_empty() || unacked > 0 {
                 let snd = flow.snd_nxt.load(Relaxed);
                 let rcv = flow.rcv_nxt.load(Relaxed);
                 let mut emit = std::mem::take(&mut self.emit);
