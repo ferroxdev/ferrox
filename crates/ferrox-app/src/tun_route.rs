@@ -348,15 +348,12 @@ mod tests {
             ],
             &keep,
         );
-        assert!(
-            plan.routes()
-                .contains(&(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16))
-        );
-        assert!(
-            !plan
-                .routes()
-                .contains(&(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16))
-        );
+        assert!(plan
+            .routes()
+            .contains(&(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16)));
+        assert!(!plan
+            .routes()
+            .contains(&(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16)));
     }
 
     #[test]

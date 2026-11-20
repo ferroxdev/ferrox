@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, UdpSocket};
 #[cfg(any(not(unix), test))]
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -27,9 +27,8 @@ use std::os::unix::net::UnixStream;
 use crate::budgets;
 use crate::conn::Connection;
 use ferrox_core::foxy::connectip::{
-    IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP, UDP_HEADER, UdpDatagram, icmp_echo_reply,
-    ipv4_checksum, ipv4_head, ipv6_head, pseudo_header_checksum, tcp_checksum, udp_datagram,
-    udp_head,
+    icmp_echo_reply, ipv4_checksum, ipv4_head, ipv6_head, pseudo_header_checksum, tcp_checksum,
+    udp_datagram, udp_head, UdpDatagram, IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP, UDP_HEADER,
 };
 
 const DEFAULT_MTU: usize = 1500;
@@ -669,7 +668,11 @@ fn path_mss(mtu: u32, ipv6: bool) -> u32 {
 
 /// How much a response read may take: one segment without offload, the whole buffer when the descriptor can split a GSO packet.
 fn read_limit(gso: bool, mss: usize, room: usize) -> usize {
-    if gso { room } else { mss.min(room) }
+    if gso {
+        room
+    } else {
+        mss.min(room)
+    }
 }
 
 /// How long a queue waits for an answer that follows its own upload: an echo replies inside this window on this bench's own p50, and past it the response thread's read is the cheaper waiter, so a queue that carries a second flow holds it for less.
@@ -2445,15 +2448,16 @@ impl Handler {
                 self.retire(&flow, Some(FLAG_RST | FLAG_ACK));
                 return Ok(());
             }
-            // A push, a finish, a duplicate or two segments of new data earn an ACK: a full segment without PSH waits for the one after it, and a duplicate through the gap still stops the retransmit.
+            // A push, a finish, a short or duplicate segment, or two full segments of new data earn an ACK: a full segment without PSH waits for the one after it, and a duplicate through the gap still stops the retransmit.
             let unacked = flow
                 .rcv_nxt
                 .load(Relaxed)
                 .wrapping_sub(flow.last_acked.load(Relaxed));
             let limit = 2 * flow.mss.load(Relaxed).max(1);
+            let short = payload.len() < flow.mss.load(Relaxed).max(1) as usize;
             let due = fin
                 || tcp.flags & FLAG_PSH != 0
-                || (!payload.is_empty() && (!advanced || unacked >= limit))
+                || (!payload.is_empty() && (!advanced || short || unacked >= limit))
                 || (payload.is_empty() && unacked > 0);
             if let Served::Ack(ack) = served {
                 // The response carried this segment's ack, so the standalone one would only repeat it, and the cursor stored is the one that left rather than whatever another queue advanced meanwhile.
@@ -3174,31 +3178,21 @@ mod tests {
     fn the_tun_spec_defaults_ipv6_and_bounds_its_values() {
         let spec = Spec::with(None, None, Some("2001:db8::1".parse().unwrap()), None, None);
         assert_eq!(spec.prefix(), 64);
-        assert!(
-            Spec::with(None, Some(65_536), None, None, None)
-                .validate()
-                .is_err()
-        );
-        assert!(
-            Spec::with(None, None, None, Some(33), None)
-                .validate()
-                .is_err()
-        );
-        assert!(
-            Spec::with(None, None, None, None, Some(0))
-                .validate()
-                .is_err()
-        );
-        assert!(
-            Spec::with(None, None, None, None, Some(5))
-                .validate()
-                .is_err()
-        );
-        assert!(
-            Spec::with(None, None, None, Some(0), None)
-                .validate()
-                .is_ok()
-        );
+        assert!(Spec::with(None, Some(65_536), None, None, None)
+            .validate()
+            .is_err());
+        assert!(Spec::with(None, None, None, Some(33), None)
+            .validate()
+            .is_err());
+        assert!(Spec::with(None, None, None, None, Some(0))
+            .validate()
+            .is_err());
+        assert!(Spec::with(None, None, None, None, Some(5))
+            .validate()
+            .is_err());
+        assert!(Spec::with(None, None, None, Some(0), None)
+            .validate()
+            .is_ok());
     }
 
     #[cfg(unix)]
