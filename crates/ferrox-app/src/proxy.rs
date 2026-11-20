@@ -27125,25 +27125,31 @@ fn serve_connect_freedom(
     }
     if !prefix.is_empty() && !http_head_has_body(prefix) {
         let until = std::time::Instant::now() + budgets::head_arrival();
+        let saved = client.write_timeout().unwrap_or(None);
         loop {
             let left = until.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
+                let _ = client.set_write_timeout(saved);
                 return;
             }
             let Some((mut head, at)) = read_http_head_kept(&mut upstream, HTTP_HEAD_LIMIT, left)
             else {
+                let _ = client.set_write_timeout(saved);
                 return;
             };
             let tail = head.split_off(at);
             let interim = http_head_is_interim(&head);
             drop_invalid_header_names(&mut head);
+            let _ = client.set_write_timeout(Some(left));
             if client.write_all(&head).is_err() || client.write_all(&tail).is_err() {
+                let _ = client.set_write_timeout(saved);
                 return;
             }
             if !interim {
                 break;
             }
         }
+        let _ = client.set_write_timeout(saved);
     }
     relay_handoff(client, &upstream);
 }

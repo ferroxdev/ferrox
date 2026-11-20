@@ -1839,6 +1839,21 @@ impl Connection {
         }
     }
 
+    /// Read back the armed write bound, so a caller can save and restore it around a stage that
+    /// tightens it the same way `read_timeout` does for reads.
+    pub(crate) fn write_timeout(&self) -> io::Result<Option<Duration>> {
+        match self {
+            Connection::Tcp(stream) => stream.write_timeout(),
+            Connection::Masked(masked) => masked.stream.write_timeout(),
+            Connection::Metered(metered) => metered.inner.write_timeout(),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.write_timeout()
+            }
+            #[cfg(any(unix, windows))]
+            Connection::Unix(stream) => get_socket_timeout(stream, SO_SNDTIMEO),
+        }
+    }
+
     /// Turn Nagle off, matching `TcpStream::set_nodelay(bool)` so the `no_delay` wrapper's call
     /// is unchanged. Meaningful only on TCP; a Unix stream needs no analogue — there is no
     /// internetwork to delay on — so the request is accepted and does nothing rather than
