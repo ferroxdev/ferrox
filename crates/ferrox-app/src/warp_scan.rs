@@ -200,18 +200,18 @@ pub(crate) fn masque_candidates(mode: ScanMode) -> Vec<SocketAddr> {
     };
     let sampled = sample_prefixes(&MASQUE_PREFIXES_V4, strategy.full_subnet, strategy.sample);
     for (index, seed) in seeds.iter().enumerate() {
+        push(*seed, MASQUE_PORTS[0]);
         if let Some(ip) = sampled.get(index) {
             push(*ip, MASQUE_PORTS[0]);
         }
-        push(*seed, MASQUE_PORTS[0]);
-    }
-    for ip in sampled.iter().skip(seeds.len()) {
-        push(*ip, MASQUE_PORTS[0]);
     }
     for seed in &seeds {
         for &port in &MASQUE_PORTS[1..] {
             push(*seed, port);
         }
+    }
+    for ip in sampled.iter().skip(seeds.len()) {
+        push(*ip, MASQUE_PORTS[0]);
     }
     out
 }
@@ -660,25 +660,30 @@ mod tests {
     }
 
     #[test]
-    fn the_masque_sweep_tries_every_443_before_a_seed_fallback_port() {
-        let candidates = masque_candidates(ScanMode::Turbo);
-        let split = candidates
+    fn the_masque_sweep_samples_before_falling_back_inside_both_budgets() {
+        let seeds: HashSet<SocketAddr> = MASQUE_SEEDS
             .iter()
-            .position(|edge| edge.port() != MASQUE_PORTS[0])
-            .unwrap_or(candidates.len());
-        assert!(split > 0);
-        assert!(
-            candidates[..split]
-                .iter()
-                .all(|edge| edge.port() == MASQUE_PORTS[0]),
-            "a non-443 candidate was tried before a 443 candidate"
-        );
-        assert!(
-            candidates[split..]
-                .iter()
-                .all(|edge| edge.port() != MASQUE_PORTS[0]),
-            "443 candidates were split around the fallback ports"
-        );
+            .filter_map(|text| text.parse::<Ipv4Addr>().ok())
+            .map(|ip| SocketAddr::from((ip, MASQUE_PORTS[0])))
+            .collect();
+        for mode in [ScanMode::Turbo, ScanMode::Ironclad] {
+            let strategy = mode.strategy();
+            let budget = strategy.concurrency
+                * (strategy.deadline.as_secs() / strategy.timeout.as_secs()) as usize;
+            let candidates = masque_candidates(mode);
+            assert!(
+                candidates[..budget]
+                    .iter()
+                    .any(|edge| edge.port() == MASQUE_PORTS[0] && !seeds.contains(edge)),
+                "{mode:?} spent its probe budget without reaching a sampled 443 edge"
+            );
+            assert!(
+                candidates[..budget]
+                    .iter()
+                    .any(|edge| edge.port() != MASQUE_PORTS[0]),
+                "{mode:?} spent its probe budget without reaching a seed fallback port"
+            );
+        }
     }
 
     #[test]
