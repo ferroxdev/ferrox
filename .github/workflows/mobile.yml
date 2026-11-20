@@ -1,7 +1,6 @@
 name: mobile
 
 on:
-  pull_request:
   workflow_dispatch:
 
 concurrency:
