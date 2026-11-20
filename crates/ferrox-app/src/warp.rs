@@ -2955,9 +2955,9 @@ impl Slot {
         match self {
             Self::WireGuard => paths.wireguard.clone(),
             Self::WireGuardInner => derive_sibling_path(&paths.wireguard, "secondary"),
-            Self::Masque => paths.masque.clone(),
-            Self::MasqueInner => derive_sibling_path(&paths.masque, "secondary"),
-            Self::Gool => derive_sibling_path(&paths.masque, "gool"),
+            Self::Masque => paths.masque_path(),
+            Self::MasqueInner => paths.masque_sibling("secondary"),
+            Self::Gool => paths.masque_sibling("gool"),
         }
     }
 }
@@ -2967,23 +2967,53 @@ impl Slot {
 struct KeyPaths {
     wireguard: PathBuf,
     masque: PathBuf,
+    /// The file the old "always derive beside the base" rule wrote when the base already named the
+    /// MASQUE half; kept so an identity enrolled before `named_slot` is still found and reused.
+    legacy_masque: Option<PathBuf>,
 }
 
 impl KeyPaths {
     fn new(base: &Path, wireguard: Option<&Path>, masque: Option<&Path>) -> Self {
+        let derived = || {
+            if named_slot(base, "masque") {
+                base.to_path_buf()
+            } else {
+                derive_sibling_path(base, "masque")
+            }
+        };
+        let legacy_masque = (masque.is_none() && named_slot(base, "masque"))
+            .then(|| derive_sibling_path(base, "masque"));
         Self {
             wireguard: wireguard.map_or_else(|| base.to_path_buf(), Path::to_path_buf),
-            masque: masque.map_or_else(
-                || {
-                    if named_slot(base, "masque") {
-                        base.to_path_buf()
-                    } else {
-                        derive_sibling_path(base, "masque")
-                    }
-                },
-                Path::to_path_buf,
-            ),
+            masque: masque.map_or_else(derived, Path::to_path_buf),
+            legacy_masque,
         }
+    }
+
+    /// The MASQUE identity to load: the named file, then the one the old derivation wrote, then the
+    /// named file again so a fresh registration saves where the new rule expects.
+    fn masque_path(&self) -> PathBuf {
+        if self.masque.exists() {
+            return self.masque.clone();
+        }
+        if let Some(legacy) = self.legacy_masque.as_ref().filter(|path| path.exists()) {
+            return legacy.clone();
+        }
+        self.masque.clone()
+    }
+
+    fn masque_sibling(&self, suffix: &str) -> PathBuf {
+        let current = derive_sibling_path(&self.masque, suffix);
+        if current.exists() {
+            return current;
+        }
+        if let Some(legacy) = self.legacy_masque.as_ref() {
+            let old = derive_sibling_path(legacy, suffix);
+            if old.exists() {
+                return old;
+            }
+        }
+        current
     }
 }
 
@@ -3155,7 +3185,7 @@ pub(crate) fn one_tap(
     if resumed {
         // The outer device was already created; a failed inner enrollment must be able to finish on the next run instead of minting a second device.
         let saved = Identity::load(&path).map_err(LoadError::into_message)?;
-        if !matches!(mode, Mode::WireGuard | Mode::GoolClassic) && saved.masque.is_none() {
+        if matches!(mode, Mode::Masque | Mode::Gool | Mode::Mim) && saved.masque.is_none() {
             return Err(format!(
                 "warp: `{}` has no MASQUE key for mode `{mode:?}`; remove it to register a new device",
                 path.display()
@@ -3962,6 +3992,59 @@ mod tests {
             Path::new("/tmp/account-masquerade.json"),
             "masque"
         ));
+    }
+
+    /// `auto` can serve a WireGuard-only device, so resuming one must not demand a MASQUE key that
+    /// only the explicit MASQUE lanes need.
+    #[test]
+    fn auto_resume_accepts_a_wireguard_only_identity() {
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-warp-auto-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        sample_identity().save(&path).expect("saves the identity");
+        let out = one_tap(
+            &path.to_string_lossy(),
+            "auto",
+            None,
+            None,
+            &ForcedPeers {
+                wiw_outer: None,
+                wiw_inner: None,
+                mim_outer: None,
+                mim_inner: None,
+                noize: None,
+                no_profile_retry: false,
+                no_quic_v2: false,
+            },
+        );
+        std::fs::remove_file(&path).ok();
+        assert!(out.is_ok(), "{out:?}");
+    }
+
+    /// The old rule derived beside a base that already named the MASQUE half; an identity enrolled
+    /// then must still be the one a later run loads, both for the outer hop and its inner hops.
+    #[test]
+    fn a_legacy_named_masque_slot_keeps_its_inner_identities() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-warp-legacy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let base = dir.join("account-masque.json");
+        let legacy = dir.join("account-masque-masque.json");
+        let legacy_inner = dir.join("account-masque-masque-secondary.json");
+        let legacy_gool = dir.join("account-masque-masque-gool.json");
+        for path in [&legacy, &legacy_inner, &legacy_gool] {
+            std::fs::write(path, b"{}").expect("a legacy identity file");
+        }
+        let paths = KeyPaths::new(&base, None, None);
+        assert_eq!(Slot::Masque.path(&paths), legacy);
+        assert_eq!(Slot::MasqueInner.path(&paths), legacy_inner);
+        assert_eq!(Slot::Gool.path(&paths), legacy_gool);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

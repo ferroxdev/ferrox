@@ -588,16 +588,16 @@ impl StreamOut {
         }
     }
 
-    pub(crate) fn bind_session(&self, sid: &str) {
+    pub(crate) fn bind_session(&self, sid: &str, handle: &SessionHandle) {
         match self {
-            Self::H2(out) => out.bind_session(sid),
+            Self::H2(out) => out.bind_session(sid, handle),
             Self::H3(_) => {}
         }
     }
 
-    pub(crate) fn bind_upload(&self, sid: &str) {
+    pub(crate) fn bind_upload(&self, sid: &str, handle: &SessionHandle) {
         match self {
-            Self::H2(out) => out.bind_upload(sid),
+            Self::H2(out) => out.bind_upload(sid, handle),
             Self::H3(_) => {}
         }
     }
@@ -2370,6 +2370,17 @@ fn remove_session_if_owned(id: &str, session: &Session) {
 #[derive(Clone)]
 pub(crate) struct SessionHandle(Arc<Session>);
 
+impl SessionHandle {
+    pub(crate) fn of(session: &Arc<Session>) -> Self {
+        Self(Arc::clone(session))
+    }
+
+    /// Whether two holds name the same session, not merely the same id a peer may have reused.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 pub(crate) fn session_handle(id: &str) -> SessionHandle {
     SessionHandle(get_or_create_session(id))
 }
@@ -2451,10 +2462,11 @@ fn bound_session(sid: &str, stream: Option<&StreamOut>, downlink: bool) -> Optio
         if !stream.claim(&session, sid) {
             return None;
         }
+        let handle = SessionHandle::of(&session);
         if downlink {
-            stream.bind_session(sid);
+            stream.bind_session(sid, &handle);
         } else {
-            stream.bind_upload(sid);
+            stream.bind_upload(sid, &handle);
         }
     }
     if downlink {
@@ -3410,7 +3422,7 @@ pub(crate) fn accept_core<
                 return Served::Closed;
             }
             if let Some(h2) = h2.as_ref() {
-                h2.bind_upload(sid);
+                h2.bind_upload(sid, &SessionHandle::of(&session));
             }
             // Go writes the 200 only when the handler returns; a stream-up POST hands that answer to its session so no accepted thread waits out the download, and the other shapes keep the inline wait.
             if h2.is_none() && settings.mode == XhttpMode::StreamUp {

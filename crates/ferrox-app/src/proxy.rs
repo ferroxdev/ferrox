@@ -8821,6 +8821,8 @@ const RESOLVE_WORKERS: usize = 8;
 const RESOLVE_QUEUE: usize = 512;
 const RESOLVE_STACK: usize = 256 * 1024;
 static RESOLVE_POOL: Mutex<Option<ResolvePool>> = Mutex::new(None);
+/// Latency probes resolve here, so their fan-out cannot take the workers a flow's dial waits on.
+static PROBE_POOL: Mutex<Option<ResolvePool>> = Mutex::new(None);
 
 impl ResolvePool {
     /// Start one set of long-lived workers; a resolver that hangs parks a worker, not a flow's thread.
@@ -8887,6 +8889,33 @@ pub(crate) fn resolve_bounded<F>(
 where
     F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
 {
+    resolve_on(&RESOLVE_POOL, host, port, budget, lookup)
+}
+
+/// A latency probe's lookup rides its own pool: a probe fan-out that stalls answers expires there
+/// rather than holding the workers a proxy dial's resolution needs.
+pub(crate) fn resolve_probe<F>(
+    host: &str,
+    port: u16,
+    budget: Duration,
+    lookup: F,
+) -> Option<Vec<SocketAddr>>
+where
+    F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    resolve_on(&PROBE_POOL, host, port, budget, lookup)
+}
+
+fn resolve_on<F>(
+    pool: &Mutex<Option<ResolvePool>>,
+    host: &str,
+    port: u16,
+    budget: Duration,
+    lookup: F,
+) -> Option<Vec<SocketAddr>>
+where
+    F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+{
     let (sender, receiver) = sync_channel(1);
     let job = ResolveJob {
         host: host.to_owned(),
@@ -8897,21 +8926,21 @@ where
         lookup: Box::new(lookup),
         reply: sender,
     };
-    let mut pool = RESOLVE_POOL
+    let mut held = pool
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let result = if let Some(active) = pool.as_ref() {
+    let result = if let Some(active) = held.as_ref() {
         active.submit(job)
     } else {
-        *pool = ResolvePool::new();
-        let active = pool.as_ref()?;
+        *held = ResolvePool::new();
+        let active = held.as_ref()?;
         active.submit(job)
     };
     if matches!(result, Err(SubmitError::Closed)) {
-        *pool = None;
+        *held = None;
     }
     result.ok()?;
-    drop(pool);
+    drop(held);
     match receiver.recv_timeout(budget) {
         Ok(Ok(addrs)) => Some(addrs),
         Ok(Err(_)) | Err(_) => None,
@@ -84482,7 +84511,7 @@ mod foxy_split_tests {
 
 #[cfg(test)]
 mod resolve_tests {
-    use super::resolve_bounded;
+    use super::{resolve_bounded, resolve_probe};
     use std::time::{Duration, Instant};
 
     /// `getaddrinfo` has no deadline of its own: a resolver that never answers must not park the
@@ -84531,6 +84560,33 @@ mod resolve_tests {
             "spawned {workers} resolver threads for {} lookups",
             super::RESOLVE_WORKERS * 2
         );
+    }
+
+    /// A probe fan-out must not take a worker the next dial waits on, so the two lookups land on
+    /// different sets of long-lived resolver threads.
+    #[test]
+    fn probe_lookups_use_their_own_workers() {
+        let dial = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let probe = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = std::sync::Arc::clone(&dial);
+        assert!(
+            resolve_bounded("dial.invalid", 443, Duration::from_secs(1), move |_, _| {
+                *seen.lock().expect("dial worker") = Some(std::thread::current().id());
+                Ok(Vec::new())
+            })
+            .is_some()
+        );
+        let seen = std::sync::Arc::clone(&probe);
+        assert!(
+            resolve_probe("probe.invalid", 443, Duration::from_secs(1), move |_, _| {
+                *seen.lock().expect("probe worker") = Some(std::thread::current().id());
+                Ok(Vec::new())
+            })
+            .is_some()
+        );
+        let dial = dial.lock().expect("dial worker").expect("dial ran");
+        let probe = probe.lock().expect("probe worker").expect("probe ran");
+        assert_ne!(dial, probe, "a probe shared the dial resolver pool");
     }
 
     /// A timeout or a resolver error has no answer; a genuine empty answer is still an answer the

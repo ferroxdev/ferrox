@@ -4042,6 +4042,9 @@ fn rebind_if_moved(
 
 /// How long a downlink write may sit against a client that is not reading; the pump's other streams keep moving because this is a per-stream buffer, not a hold on the lane.
 const PUMP_WRITE: Duration = Duration::from_millis(1);
+/// While a stream still owes bytes, the pump must come back sooner than the connection's own timer so
+/// a client that starts reading again is not made to wait out `PUMP_POLL`.
+const PUMP_RETRY: Duration = Duration::from_millis(5);
 
 /// Bytes a client has not taken yet: one chunk per stream, because the pump does not read that stream again until this drains.
 struct PendingWrite {
@@ -4058,10 +4061,15 @@ fn flush_downlink(
     table: &Arc<Mutex<PooledState>>,
     conn: &Arc<Mutex<quiche::Connection>>,
     sock: &Datagram,
+    only: Option<u64>,
 ) {
     let mut at = 0;
     while at < pending.len() {
         let write = &mut pending[at];
+        if only.is_some_and(|id| write.id != id) {
+            at += 1;
+            continue;
+        }
         let mut up = &*write.up;
         match up.write(&write.bytes[write.at..]) {
             Ok(0) => {
@@ -4120,7 +4128,7 @@ fn pump(
     let mut pending: Vec<PendingWrite> = Vec::new();
     let mut exit = PumpExit { table, armed: true };
     loop {
-        flush_downlink(&mut pending, table, shared, sock);
+        flush_downlink(&mut pending, table, shared, sock, None);
         let before = *local;
         if !rebind_if_moved(shared, sock, peer, net, local) {
             return;
@@ -4140,9 +4148,15 @@ fn pump(
             }
             // The previous pass read streams after its flush, so the window updates and ACKs that reading produced are still queued: send them before waiting, or the peer stalls on a closed window.
             flush_egress(&mut conn, sock);
-            conn.timeout()
+            let wait = conn
+                .timeout()
                 .map_or(PUMP_POLL, |left| left.min(PUMP_POLL))
-                .max(Duration::from_millis(1))
+                .max(Duration::from_millis(1));
+            if pending.is_empty() {
+                wait
+            } else {
+                wait.min(PUMP_RETRY)
+            }
         };
         if !sock.refresh_read_timeout(timeout) {
             return;
@@ -4243,7 +4257,7 @@ fn pump(
                         at: 0,
                         fin,
                     });
-                    flush_downlink(&mut pending, table, shared, sock);
+                    flush_downlink(&mut pending, table, shared, sock, Some(id));
                     if fin || pending.iter().any(|write| write.id == id) {
                         break;
                     }

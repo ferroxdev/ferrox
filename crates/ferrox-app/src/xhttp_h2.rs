@@ -7,9 +7,9 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::h2::{
-    block_encode, frame_head, write_frame, Decoder, E_FRAME_SIZE, E_PROTOCOL, E_REFUSED, F_ACK,
-    F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_FRAME, S_WINDOW, T_CONT,
-    T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW,
+    block_encode, frame_head, write_frame, Decoder, E_COMPRESSION, E_FRAME_SIZE, E_PROTOCOL,
+    E_REFUSED, F_ACK, F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_FRAME,
+    S_WINDOW, T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW,
 };
 use crate::proxy::{VlessUser, VlessUsers};
 use crate::xhttp::XhttpSettings;
@@ -304,12 +304,12 @@ impl H2StreamOut {
         self.conn.settle()
     }
 
-    pub(crate) fn bind_session(&self, sid: &str) {
-        self.conn.bind_session(sid, self.stream, true);
+    pub(crate) fn bind_session(&self, sid: &str, handle: &crate::xhttp::SessionHandle) {
+        self.conn.bind_session(sid, self.stream, true, handle);
     }
 
-    pub(crate) fn bind_upload(&self, sid: &str) {
-        self.conn.bind_session(sid, self.stream, false);
+    pub(crate) fn bind_upload(&self, sid: &str, handle: &crate::xhttp::SessionHandle) {
+        self.conn.bind_session(sid, self.stream, false, handle);
     }
 
     pub(crate) fn end(&self) {
@@ -552,9 +552,13 @@ pub(crate) struct H2Conn {
     write: SharedWriter,
     control: Control,
     streams: Mutex<HashMap<u32, Arc<H2Stream>>>,
-    sessions: Mutex<HashMap<String, crate::xhttp::SessionHandle>>,
-    session_of: Mutex<HashMap<u32, String>>,
-    upload_of: Mutex<HashMap<u32, String>>,
+    /// Every session a stream of this connection binds, in bind order; one id may name more than
+    /// one session when a peer reuses it, so a release ends only the handle it bound.
+    sessions: Mutex<Vec<(String, crate::xhttp::SessionHandle)>>,
+    session_of: Mutex<HashMap<u32, (String, crate::xhttp::SessionHandle)>>,
+    upload_of: Mutex<HashMap<u32, (String, crate::xhttp::SessionHandle)>>,
+    /// Serializes bind, release and the dead-connection drain of the three maps above.
+    session_gate: Mutex<()>,
     send_conn: Mutex<u64>,
     /// Held across a reserved batch write so a SETTINGS window change cannot land before it.
     batch_gate: Mutex<()>,
@@ -1700,7 +1704,7 @@ impl H2Conn {
             .sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .drain()
+            .drain(..)
             .collect();
         for (session, handle) in sessions {
             crate::xhttp::end_session_handle(&session, &handle);
@@ -1708,12 +1712,23 @@ impl H2Conn {
     }
 
     /// The session a stream of this connection waits on dies with the connection: past `dead` there is no frame left to post, so a waiter would park on a sequence no peer can ever send.
-    fn bind_session(&self, sid: &str, stream: u32, downlink: bool) {
-        let handle = crate::xhttp::session_handle(sid);
-        self.sessions
+    fn bind_session(
+        &self,
+        sid: &str,
+        stream: u32,
+        downlink: bool,
+        handle: &crate::xhttp::SessionHandle,
+    ) {
+        let _gate = self
+            .session_gate
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(sid.to_owned(), handle.clone());
+            .unwrap_or_else(PoisonError::into_inner);
+        {
+            let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            if !sessions.iter().any(|(_, held)| held.same(handle)) {
+                sessions.push((sid.to_owned(), handle.clone()));
+            }
+        }
         let owner = if downlink {
             &self.session_of
         } else {
@@ -1722,23 +1737,35 @@ impl H2Conn {
         owner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(stream, sid.to_owned());
-        // `kill` sets `dead` before it drains this map, so a bind that raced the drain ends its own session.
+            .insert(stream, (sid.to_owned(), handle.clone()));
+        // `kill` sets `dead` before it drains the sessions, so a bind that raced the drain ends its own.
         if self.dead.load(Ordering::SeqCst) {
-            crate::xhttp::end_session_handle(sid, &handle);
+            self.sessions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(_, held)| !held.same(handle));
+            crate::xhttp::end_session_handle(sid, handle);
         }
     }
 
     fn forget_upload(&self, stream: u32) {
-        self.upload_of
+        let _gate = self
+            .session_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let removed = self
+            .upload_of
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&stream);
+        if let Some((sid, handle)) = removed {
+            self.release_session(&sid, &handle);
+        }
     }
 
     /// The session is over, so the uploads that shared it wake, but the stream stays in the table: a
     /// stream-up POST still owes its deferred 200, and a reset here would discard it.
-    fn end_uploads(&self, sid: &str) {
+    fn end_uploads(&self, sid: &str, handle: &crate::xhttp::SessionHandle) {
         let streams: Vec<u32> = {
             let mut uploads = self
                 .upload_of
@@ -1746,7 +1773,7 @@ impl H2Conn {
                 .unwrap_or_else(PoisonError::into_inner);
             let owned: Vec<u32> = uploads
                 .iter()
-                .filter(|(_, owner)| owner.as_str() == sid)
+                .filter(|(_, (owner, held))| owner == sid && held.same(handle))
                 .map(|(stream, _)| *stream)
                 .collect();
             for stream in &owned {
@@ -1770,23 +1797,49 @@ impl H2Conn {
         }
     }
 
+    /// End the handle once no stream on this connection still binds it. An upload-only caller may
+    /// have released it before its downlink half retires, so the last binding is the one that closes.
+    fn release_session(&self, sid: &str, handle: &crate::xhttp::SessionHandle) {
+        let bound = {
+            let down = self
+                .session_of
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .values()
+                .any(|(_, held)| held.same(handle));
+            down || self
+                .upload_of
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .values()
+                .any(|(_, held)| held.same(handle))
+        };
+        if bound {
+            return;
+        }
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        let at = sessions.iter().position(|(_, held)| held.same(handle));
+        if let Some(at) = at {
+            sessions.swap_remove(at);
+            drop(sessions);
+            crate::xhttp::end_session_handle(sid, handle);
+        }
+    }
+
     /// A finished downlink ends the session its uploads wait on, so a packet-up POST parked in `wait_ended` is not left for the connection's death.
     fn end_session_of(&self, stream: u32) {
-        let sid = self
+        let _gate = self
+            .session_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let removed = self
             .session_of
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&stream);
-        if let Some(sid) = sid {
-            self.end_uploads(&sid);
-            let handle = self
-                .sessions
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&sid);
-            if let Some(handle) = handle {
-                crate::xhttp::end_session_handle(&sid, &handle);
-            }
+        if let Some((sid, handle)) = removed {
+            self.end_uploads(&sid, &handle);
+            self.release_session(&sid, &handle);
         }
     }
 }
@@ -2207,9 +2260,10 @@ impl H2Client {
             control: Control::threaded(Arc::clone(&write), Arc::clone(&dead)),
             write,
             streams: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(Vec::new()),
             session_of: Mutex::new(HashMap::new()),
             upload_of: Mutex::new(HashMap::new()),
+            session_gate: Mutex::new(()),
             send_conn: Mutex::new(65_535),
             batch_gate: Mutex::new(()),
             wake: Condvar::new(),
@@ -3149,9 +3203,10 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     control: Control::threaded(Arc::clone(&write), Arc::clone(&dead)),
                     write,
                     streams: Mutex::new(HashMap::new()),
-                    sessions: Mutex::new(HashMap::new()),
+                    sessions: Mutex::new(Vec::new()),
                     session_of: Mutex::new(HashMap::new()),
                     upload_of: Mutex::new(HashMap::new()),
+                    session_gate: Mutex::new(()),
                     send_conn: Mutex::new(65_535),
                     batch_gate: Mutex::new(()),
                     wake: Condvar::new(),
@@ -3430,8 +3485,8 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
 /// A trailing HEADERS block on a stream already open: decode it in wire order to keep HPACK in step, then apply its `END_STREAM` to the waiting reader.
 fn apply_trailers(conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool) -> bool {
     if !conn.decode_block(block, |_, _| {}) {
-        conn.reset_stream(sid);
-        return true;
+        conn.refuse(E_COMPRESSION);
+        return false;
     }
     let state = conn
         .streams
@@ -3541,9 +3596,9 @@ fn pump_frame(
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .contains_key(&sid);
-                    if attached {
-                        apply_trailers(conn, sid, &gathered, end_stream);
-                    } else if service.open(conn, sid, &gathered, end_stream) {
+                    if attached && !apply_trailers(conn, sid, &gathered, end_stream) {
+                        return false;
+                    } else if !attached && service.open(conn, sid, &gathered, end_stream) {
                         if let Some(opened) = opened {
                             opened.store(true, Ordering::Relaxed);
                         }
@@ -5082,11 +5137,35 @@ mod tests {
             _owner: None,
             client: false,
         };
-        out.bind_session(sid);
+        out.bind_session(sid, &crate::xhttp::session_handle(sid));
         out.end();
         assert!(
             !crate::xhttp::session_is_carried(sid),
             "the finished downlink leaves no session parked"
+        );
+    }
+
+    /// A peer may reuse a stream id's session name after it ends; a later stream that binds the new
+    /// session must survive the old stream's retirement, and only its own handle may end it.
+    #[test]
+    fn a_reused_session_id_is_ended_only_by_the_handle_it_bound() {
+        let sid = "h2-reused-session";
+        crate::xhttp::start_session_for_probe(sid);
+        let (conn, _written, _slices) = bare_conn();
+        let first = crate::xhttp::session_handle(sid);
+        conn.bind_session(sid, 1, true, &first);
+        crate::xhttp::end_session_handle(sid, &first);
+        let second = crate::xhttp::session_handle(sid);
+        conn.bind_session(sid, 2, true, &second);
+        conn.end_session_of(1);
+        assert!(
+            crate::xhttp::session_is_carried(sid),
+            "the old stream ended the replacement session it never bound"
+        );
+        conn.end_session_of(2);
+        assert!(
+            !crate::xhttp::session_is_carried(sid),
+            "the replacement's own retirement ends it"
         );
     }
 
@@ -5177,14 +5256,14 @@ mod tests {
             _owner: None,
             client: false,
         };
-        downlink.bind_session(sid);
+        downlink.bind_session(sid, &crate::xhttp::session_handle(sid));
         let upload = H2StreamOut {
             conn: Arc::clone(&conn),
             stream: 2,
             _owner: None,
             client: false,
         };
-        upload.bind_upload(sid);
+        upload.bind_upload(sid, &crate::xhttp::session_handle(sid));
         let mut reader = H2StreamReader {
             conn,
             stream: state,
@@ -5255,14 +5334,14 @@ mod tests {
             _owner: None,
             client: false,
         };
-        downlink.bind_session(sid);
+        downlink.bind_session(sid, &crate::xhttp::session_handle(sid));
         let upload = H2StreamOut {
             conn: Arc::clone(&conn),
             stream: 2,
             _owner: None,
             client: false,
         };
-        upload.bind_upload(sid);
+        upload.bind_upload(sid, &crate::xhttp::session_handle(sid));
         downlink.end();
         assert!(
             !crate::xhttp::session_is_carried(sid),
@@ -5510,9 +5589,10 @@ mod tests {
             write,
             control: Control::Inline,
             streams: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(Vec::new()),
             session_of: Mutex::new(HashMap::new()),
             upload_of: Mutex::new(HashMap::new()),
+            session_gate: Mutex::new(()),
             send_conn: Mutex::new(65_535),
             batch_gate: Mutex::new(()),
             wake: Condvar::new(),
@@ -5627,6 +5707,18 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .contains_key(&1),
             "both halves are done, so the stream retires"
+        );
+    }
+
+    /// A trailer block that does not decode is a connection-level compression failure: resetting
+    /// only the stream leaves the shared HPACK state out of step with the peer.
+    #[test]
+    fn a_bad_trailer_block_refuses_the_connection() {
+        let (conn, _written, _slices) = bare_conn();
+        assert!(!apply_trailers(&conn, 1, &[0x80], true));
+        assert!(
+            conn.refused.load(Ordering::SeqCst),
+            "the shared decoder is no longer in step, so the connection must end"
         );
     }
 
@@ -6038,9 +6130,10 @@ mod tests {
             write,
             control,
             streams: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(Vec::new()),
             session_of: Mutex::new(HashMap::new()),
             upload_of: Mutex::new(HashMap::new()),
+            session_gate: Mutex::new(()),
             send_conn: Mutex::new(65_535),
             batch_gate: Mutex::new(()),
             wake: Condvar::new(),
