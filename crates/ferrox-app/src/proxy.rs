@@ -17398,7 +17398,7 @@ fn serve_dokodemo(
             };
             let worker_stop = stop.cloned();
             thread::spawn(move || {
-                dokodemo_transparent_udp_door(&socket, &door, listen, worker_stop);
+                dokodemo_transparent_udp_door(&socket, &door, listen, worker_stop.as_ref());
             });
         } else {
             let dest = if follow_redirect {
@@ -17414,7 +17414,7 @@ fn serve_dokodemo(
                 return (armed, workers);
             };
             let worker_stop = stop.cloned();
-            thread::spawn(move || dokodemo_udp_door(&socket, &dest, &door, worker_stop));
+            thread::spawn(move || dokodemo_udp_door(&socket, &dest, &door, worker_stop.as_ref()));
         }
         armed += 1;
         workers += 1;
@@ -29835,9 +29835,9 @@ fn dokodemo_udp_door(
     socket: &UdpSocket,
     dest: &Destination,
     out: &Outbound,
-    stop: Option<Arc<Stop>>,
+    stop: Option<&Arc<Stop>>,
 ) {
-    let _done = WorkerDone(stop.clone());
+    let _done = WorkerDone(stop.cloned());
     let Some(target) = dest.socket() else {
         eprintln!("dokodemo-door udp: rewrite target unusable, refused");
         return;
@@ -29927,10 +29927,10 @@ fn dokodemo_transparent_udp_door(
     socket: &UdpSocket,
     out: &Outbound,
     listen: SocketAddr,
-    stop: Option<Arc<Stop>>,
+    stop: Option<&Arc<Stop>>,
 ) {
-    let _done = WorkerDone(stop.clone());
     type Flow = (SocketAddr, SocketAddr);
+    let _done = WorkerDone(stop.cloned());
     let mut legs: HashMap<Flow, (UdpSocket, Connection, Arc<AtomicBool>)> = HashMap::new();
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
@@ -76475,7 +76475,7 @@ mod tests {
         let door = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let port = door.local_addr().expect("addr").port();
         let dest = Destination::Address(target_addr);
-        thread::spawn(move || dokodemo_udp_door(&door, &dest, &freedom()));
+        thread::spawn(move || dokodemo_udp_door(&door, &dest, &freedom(), None));
         let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
         client
             .connect(SocketAddr::from(([127, 0, 0, 1], port)))
@@ -76549,7 +76549,7 @@ mod tests {
         let door = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let port = door.local_addr().expect("addr").port();
         let dest = Destination::Address(target_addr);
-        thread::spawn(move || dokodemo_udp_door(&door, &dest, &out));
+        thread::spawn(move || dokodemo_udp_door(&door, &dest, &out, None));
         let door_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let second = UdpSocket::bind("127.0.0.1:0").expect("binds");

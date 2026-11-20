@@ -2223,9 +2223,7 @@ fn unix_socket_is_live(path: &std::path::Path) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
             Ok(!refused_socket_is_stale(path))
         }
-        // Linux checks write permission before it checks for a listener, so a socket another
-        // owner abandoned refuses the connect; the kernel table still answers whether a
-        // listener is bound there.
+        // Linux checks write permission before it checks for a listener, so a refused socket asks the kernel table.
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             Ok(!refused_socket_is_stale(path))
         }
@@ -2255,8 +2253,7 @@ fn socket_table_names(path: &std::path::Path) -> Option<bool> {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::MetadataExt as _;
         let wanted = path.as_os_str().as_bytes();
-        // A listener can stay open after its path is unlinked, so the table row that names this
-        // path is only this socket when the inode matches the entry on disk.
+        // A listener can stay open after its path is unlinked, so only a matching inode names this socket.
         let inode = std::fs::symlink_metadata(path).ok().map(|meta| meta.ino());
         let table = std::fs::read("/proc/net/unix").ok()?;
         let mut unknown_staged = false;
@@ -3293,8 +3290,7 @@ fn windows_socket_state(path: &std::path::Path) -> WindowsSocket {
     }
 }
 
-/// Delete the abandoned socket through the handle that verified its tag and identity, so a
-/// replacement that arrived after the refused connect is never the object removed.
+/// Delete the abandoned socket through the handle that verified its tag and identity.
 #[cfg(windows)]
 fn windows_delete_stale(
     path: &std::path::Path,
