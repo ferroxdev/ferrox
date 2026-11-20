@@ -1610,6 +1610,14 @@ mod tests {
             wide.allocs, narrow.allocs,
             "a frame pays for its packet, not for a copy of the scheme"
         );
+        // The same record with seven more around it: the frame the first packet writes is byte-for-byte the same shape, so a scheme-sized buffer would show up as a byte difference.
+        let big = cost(
+            Padding::new(b"stop=8\n1=100-100\n2=100-100\n3=100-100\n4=100-100\n5=100-100\n6=100-100\n7=100-100")
+                .expect("parses"),
+        );
+        let small = cost(Padding::new(b"stop=8\n1=100-100").expect("parses"));
+        assert_eq!(big.allocs, small.allocs, "the eight records cost no calls");
+        assert_eq!(big.bytes, small.bytes, "the eight records cost no bytes");
     }
 
     #[test]
