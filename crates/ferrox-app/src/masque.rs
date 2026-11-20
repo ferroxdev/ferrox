@@ -2823,7 +2823,12 @@ fn lane_udp_bind(address: &str) -> std::io::Result<UdpSocket> {
 
 /// Open a server inbound's socket and spawn its demultiplexer, stack and forwarder.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Result<u16, String> {
+pub(crate) fn serve_inbound(
+    inbound: &Json,
+    out: &Outbound,
+    address: &str,
+    stop: Option<&Arc<crate::proxy::Stop>>,
+) -> Result<u16, String> {
     let spec = Arc::new(ServerSpec::from(inbound)?);
     let security = inbound
         .get("streamSettings")
@@ -2831,7 +2836,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         .and_then(Json::as_str)
         .unwrap_or_default();
     if security.eq_ignore_ascii_case("none") {
-        return serve_cleartext_inbound(&spec, out, address);
+        return serve_cleartext_inbound(&spec, out, address, stop);
     }
     let identity = crate::proxy::quic_inbound_identity(inbound)
         .ok_or("masque inbound requires security tls or none")?;
@@ -2896,6 +2901,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     };
     let sock = sock.with_options(spec.sockopt.clone());
     let sock = Arc::new(sock.with_gso(spec.quic.is_none_or(|params| !params.disable_gso)));
+    let _ = sock.set_read_timeout(Some(crate::quic::SERVER_POLL));
     let (packets, packets_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
         pool: Mutex::new(spec.pool.clone()),
@@ -2912,6 +2918,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
             Arc::clone(&shared),
             Arc::clone(&spec),
             listener,
+            stop.map(|stop| stop.shared()),
         );
     }
     let device = DeviceConfig {
@@ -2933,8 +2940,20 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     let demux_sock = Arc::clone(&sock);
     let demux_shared = Arc::clone(&shared);
     let demux_spec = Arc::clone(&spec);
+    let demux_stop = stop.map(|stop| stop.shared());
+    let demux_done = stop.cloned();
     std::thread::spawn(move || {
-        demux(demux_sock, local, demux_config, demux_shared, demux_spec);
+        demux(
+            demux_sock,
+            local,
+            demux_config,
+            demux_shared,
+            demux_spec,
+            demux_stop,
+        );
+        if let Some(stop) = demux_done {
+            stop.mark_closed();
+        }
     });
     Ok(local.port())
 }
@@ -2944,6 +2963,7 @@ fn serve_cleartext_inbound(
     spec: &Arc<ServerSpec>,
     out: &Outbound,
     address: &str,
+    stop: Option<&Arc<crate::proxy::Stop>>,
 ) -> Result<u16, String> {
     let listener = TcpListener::bind(address)
         .map_err(|error| format!("cannot bind masque `{address}`: {error}"))?;
@@ -2965,7 +2985,15 @@ fn serve_cleartext_inbound(
     let (to_tunnel, from_stack) = mpsc::sync_channel(QUEUE);
     let dispatcher = Arc::clone(&shared);
     std::thread::spawn(move || dispatch(&dispatcher, from_stack));
-    crate::masque_h2::serve_cleartext(Arc::clone(&shared), Arc::clone(spec), listener);
+    let clear_stop = stop.map(|stop| stop.shared());
+    let clear_done = stop.cloned();
+    crate::masque_h2::serve_cleartext(
+        Arc::clone(&shared),
+        Arc::clone(spec),
+        listener,
+        clear_stop,
+        clear_done,
+    );
     let device = DeviceConfig {
         secret: [0u8; 32],
         addresses: spec.pool.server.clone(),
@@ -3583,11 +3611,18 @@ fn demux(
     config: Arc<Mutex<quiche::Config>>,
     shared: Arc<Shared>,
     spec: Arc<ServerSpec>,
+    stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
     let live = Arc::new(AtomicUsize::new(0));
     let mut buf = vec![0u8; 65535];
     loop {
+        if stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return;
+        }
         let Ok((n, from)) = sock.recv_from(&mut buf) else {
             continue;
         };
@@ -5225,7 +5260,8 @@ mod tests {
         let inbound = inbound(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/30"]}"#,
         );
-        let port = serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0").expect("serve");
+        let port =
+            serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0", None).expect("serve");
         let first = MasqueOut::new(&outbound(port)).expect("the first tunnel");
         first.ensure().expect("the first tunnel opens");
         let second = MasqueOut::new(&outbound(port)).expect("the second tunnel");
@@ -5683,7 +5719,7 @@ mod tests {
         let inbound = inbound_h1(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
         );
-        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0", None).expect("serve");
         (inbound, port)
     }
 
@@ -5701,7 +5737,7 @@ mod tests {
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]}"#,
         );
         let served =
-            serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0").expect("serve");
+            serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0", None).expect("serve");
         let tcp = TcpStream::connect(("127.0.0.1", served)).expect("tcp");
         tcp.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
@@ -5814,7 +5850,7 @@ mod tests {
         let inbound = inbound(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]}"#,
         );
-        let served = serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0")?;
+        let served = serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0", None)?;
         let spec = ClientSpec {
             address: "127.0.0.1".to_owned(),
             port: served,
@@ -5918,7 +5954,7 @@ mod tests {
         let inbound = inbound_h2c(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
         );
-        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0", None).expect("serve");
         (inbound, port)
     }
 
@@ -5926,7 +5962,7 @@ mod tests {
         let inbound = inbound_h2(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
         );
-        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0", None).expect("serve");
         (inbound, port)
     }
 
@@ -5938,7 +5974,7 @@ mod tests {
         let inbound = inbound_h2(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
         );
-        let _port = serve_inbound(&inbound, &freedom("127.0.0.1:0"), "127.0.0.1:0")
+        let _port = serve_inbound(&inbound, &freedom("127.0.0.1:0"), "127.0.0.1:0", None)
             .expect("h3 survives the pair failing to converge");
     }
 
@@ -5958,7 +5994,7 @@ mod tests {
         let inbound = inbound(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
         );
-        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0", None).expect("serve");
         (inbound, port)
     }
 

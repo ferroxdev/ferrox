@@ -4797,6 +4797,7 @@ mod tests {
             &masque_inbound,
             &freedom_outbound(Some(&redirect)),
             "127.0.0.1:0",
+            None,
         )
         .expect("the masque server serves");
 
@@ -4894,9 +4895,13 @@ mod tests {
         let inner_inbound = tls_masque_inbound(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.15.0.1/24"]}"#,
         );
-        let inner_port =
-            crate::masque::serve_inbound(&inner_inbound, &freedom_outbound(None), "127.0.0.1:0")
-                .expect("the inner masque server serves");
+        let inner_port = crate::masque::serve_inbound(
+            &inner_inbound,
+            &freedom_outbound(None),
+            "127.0.0.1:0",
+            None,
+        )
+        .expect("the inner masque server serves");
         let outer_inbound = tls_masque_inbound(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]}"#,
         );
@@ -4905,6 +4910,7 @@ mod tests {
             &outer_inbound,
             &freedom_outbound(Some(&redirect)),
             "127.0.0.1:0",
+            None,
         )
         .expect("the outer masque server serves");
 

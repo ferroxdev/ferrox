@@ -936,8 +936,18 @@ fn serve_inbounds_counted(
                             }
                             continue;
                         };
-                        match crate::masque::serve_inbound(inbound, &out, address) {
-                            Ok(_) => inbounds += 1,
+                        match crate::masque::serve_inbound(
+                            inbound,
+                            &out,
+                            address,
+                            handler_stop.as_ref(),
+                        ) {
+                            Ok(_) => {
+                                inbounds += 1;
+                                if let Some(stop) = &handler_stop {
+                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                }
+                            }
                             Err(reason) => eprintln!("masque inbound {address}: {reason}"),
                         }
                     }

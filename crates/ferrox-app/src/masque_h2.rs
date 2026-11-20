@@ -221,10 +221,17 @@ pub(crate) fn serve(
     shared: Arc<Shared>,
     spec: Arc<ServerSpec>,
     listener: TcpListener,
+    stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let slots = H2Slots::new(H2_CONNECTIONS);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
+            if stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                break;
+            }
             let Ok(stream) = stream else {
                 continue;
             };
@@ -306,10 +313,22 @@ fn connection(
 
 /// The cleartext half of a MASQUE inbound: prior-knowledge HTTP/2 over a bare
 /// TCP socket, for a config that explicitly names `security: none`.
-pub(crate) fn serve_cleartext(shared: Arc<Shared>, spec: Arc<ServerSpec>, listener: TcpListener) {
+pub(crate) fn serve_cleartext(
+    shared: Arc<Shared>,
+    spec: Arc<ServerSpec>,
+    listener: TcpListener,
+    stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    done: Option<Arc<crate::proxy::Stop>>,
+) {
     let slots = H2Slots::new(H2_CONNECTIONS);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
+            if stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                break;
+            }
             let Ok(stream) = stream else {
                 continue;
             };
@@ -333,6 +352,9 @@ pub(crate) fn serve_cleartext(shared: Arc<Shared>, spec: Arc<ServerSpec>, listen
             {
                 eprintln!("masque: cannot spawn HTTP/2 cleartext handler: {error}");
             }
+        }
+        if let Some(stop) = done {
+            stop.mark_closed();
         }
     });
 }
