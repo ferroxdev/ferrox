@@ -2481,27 +2481,36 @@ impl Handler {
                 flow.mss.load(Relaxed),
                 unacked,
             ) {
-                let snd = flow.snd_nxt.load(Relaxed);
-                let rcv = flow.rcv_nxt.load(Relaxed);
-                let mut emit = std::mem::take(&mut self.emit);
-                render_tcp_packet_ip(
+                self.emit_ack(
+                    &flow,
                     (ip.destination, tcp.destination_port),
                     (ip.source, tcp.source_port),
-                    snd,
-                    rcv,
-                    FLAG_ACK,
-                    65535,
-                    &[],
-                    &[],
-                    false,
-                    &mut emit,
                 );
-                let _ = self.device.write_packet(&emit);
-                self.emit = emit;
-                flow.last_acked.store(rcv, Relaxed);
             }
         }
         Ok(())
+    }
+
+    /// Answer the bytes a segment left in the flow, carrying the cursor the flow holds for its own download.
+    fn emit_ack(&mut self, flow: &Flow, src: (IpAddr, u16), dst: (IpAddr, u16)) {
+        let snd = flow.snd_nxt.load(Relaxed);
+        let rcv = flow.rcv_nxt.load(Relaxed);
+        let mut emit = std::mem::take(&mut self.emit);
+        render_tcp_packet_ip(
+            src,
+            dst,
+            snd,
+            rcv,
+            FLAG_ACK,
+            65535,
+            &[],
+            &[],
+            false,
+            &mut emit,
+        );
+        let _ = self.device.write_packet(&emit);
+        self.emit = emit;
+        flow.last_acked.store(rcv, Relaxed);
     }
 
     /// Take the answer a request-and-reply earns, on the queue thread that still holds the flow, so the transaction costs no response-thread wake. A non-blocking read never waits and the stream hands each byte to exactly one reader, so a flow thread parked in its own read keeps what this leaves. A flow learns whether an answer is due: it waits one exchange window while answers have been landing, and a bulk upload's four misses cost a millisecond once and leave it one non-blocking read per segment.
