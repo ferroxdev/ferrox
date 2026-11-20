@@ -452,6 +452,7 @@ pub(crate) fn connect_split<R: Read + crate::proxy::RelayPoll, W: crate::proxy::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     #[test]
@@ -829,6 +830,51 @@ mod tests {
         }
         let mut byte = [0u8; 1];
         assert!(read_within(&mut Refused, &mut byte, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn a_framed_body_arms_only_the_time_the_head_left() {
+        struct BodyRead {
+            armed: Arc<Mutex<Option<std::time::Duration>>>,
+        }
+        impl Read for BodyRead {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    self.armed.lock().expect("armed lock").is_some(),
+                    "the body was read without a timeout"
+                );
+                Ok(0)
+            }
+        }
+        impl crate::proxy::RelayPoll for BodyRead {
+            fn arm_relay_poll(&mut self) {}
+
+            fn arm_head_poll_for(&mut self, left: std::time::Duration) {
+                *self.armed.lock().expect("armed lock") = Some(left);
+            }
+        }
+        let armed = Arc::new(Mutex::new(None));
+        let full = std::time::Duration::from_secs(10);
+        let until = Instant::now() + full;
+        let head = b"HTTP/1.1 404 Not Found\r\nContent-Length: 1\r\n\r\n";
+        thread::sleep(std::time::Duration::from_millis(100));
+        assert!(read_response(
+            BodyRead {
+                armed: Arc::clone(&armed),
+            },
+            Vec::from(&head[..]),
+            head.len(),
+            until,
+        )
+        .is_none());
+        let armed = armed
+            .lock()
+            .expect("armed lock")
+            .expect("an armed body read");
+        assert!(
+            armed <= full.saturating_sub(std::time::Duration::from_millis(50)),
+            "the body armed {armed:?} of a {full:?} budget after the head delay"
+        );
     }
 
     #[test]

@@ -434,6 +434,7 @@ impl Wire {
     }
 
     fn quiet_until(&mut self, until: Instant) {
+        self.deadline.arm(until);
         let mut room = [0u8; READ_ROOM];
         let mut got = false;
         loop {
@@ -2541,6 +2542,26 @@ mod tests {
             reads.load(Ordering::Relaxed),
             2,
             "the byte behind the reply is read before the socket closes"
+        );
+    }
+
+    #[test]
+    fn a_quiet_wire_puts_the_drain_under_the_shared_clock() {
+        let mut wire = Wire {
+            stream: Box::new(Behind {
+                reads: Arc::new(AtomicUsize::new(0)),
+                left: 0,
+            }),
+            pending: Vec::new(),
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        let until = Instant::now() + std::time::Duration::from_millis(25);
+        wire.quiet_until(until);
+        let left = wire.deadline.remaining().expect("the drain clock is armed");
+        assert!(
+            left <= std::time::Duration::from_millis(25),
+            "the TLS reads behind the drain are not bounded: {left:?}"
         );
     }
 
