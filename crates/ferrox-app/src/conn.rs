@@ -2223,10 +2223,8 @@ fn unix_socket_is_live(path: &std::path::Path) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
             Ok(!refused_socket_is_stale(path))
         }
-        // Linux checks write permission before it checks for a listener, so a refused socket asks the kernel table.
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            Ok(!refused_socket_is_stale(path))
-        }
+        // A binder that may not connect still owns a live socket, so a permission refusal is not evidence of staleness.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(true),
         Err(error)
             if matches!(
                 error.kind(),
@@ -2258,22 +2256,20 @@ fn socket_table_names(path: &std::path::Path) -> Option<bool> {
         let table = std::fs::read("/proc/net/unix").ok()?;
         let mut unknown_staged = false;
         for line in table.split(|byte| *byte == b'\n').skip(1) {
-            let Some((listed, true, listed_inode)) = proc_unix_entry(line) else {
+            let Some((listed, _listening, listed_inode)) = proc_unix_entry(line) else {
                 continue;
             };
             if listed == wanted {
+                // An accepted connection keeps a copied address, so only the socket's own inode names a live binder.
                 if inode == Some(listed_inode) {
                     return Some(true);
                 }
                 continue;
             }
-            match staged_owner(listed) {
-                Some(owner) => {
-                    if owner == path {
-                        return Some(true);
-                    }
-                }
-                None => {
+            match staged_claim(listed, path) {
+                StagedClaim::Owned => return Some(true),
+                StagedClaim::Other => {}
+                StagedClaim::Unknown => {
                     if let Ok(listed) = std::str::from_utf8(listed) {
                         if staged_sibling(listed, path) {
                             unknown_staged = true;
@@ -2332,17 +2328,32 @@ fn trim_ascii_start(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
+/// One staged bind: the private address, the published path, and the object that path named at publication.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+struct StagedBinding {
+    inner: std::path::PathBuf,
+    published: std::path::PathBuf,
+    identity: Option<(u64, u64)>,
+}
+
 /// A bind records the private staging address it bound, so a copied staging name is never mistaken for another path's listener.
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-static STAGED_BINDINGS: std::sync::Mutex<Vec<(std::path::PathBuf, std::path::PathBuf)>> =
-    std::sync::Mutex::new(Vec::new());
+static STAGED_BINDINGS: std::sync::Mutex<Vec<StagedBinding>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 fn register_staged(inner: &std::path::Path, published: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt as _;
+    let identity = std::fs::symlink_metadata(published)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()));
     STAGED_BINDINGS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((inner.to_path_buf(), published.to_path_buf()));
+        .push(StagedBinding {
+            inner: inner.to_path_buf(),
+            published: published.to_path_buf(),
+            identity,
+        });
 }
 
 /// One staged bind's registry entry, released when its listener closes so repeated adds do not grow the table.
@@ -2380,18 +2391,39 @@ impl Drop for StagedRegistration {
         STAGED_BINDINGS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|(inner, published)| inner != &self.inner || published != &self.published);
+            .retain(|binding| binding.inner != self.inner || binding.published != self.published);
     }
 }
 
+/// Whether a table row's staging name is this path's published listener, a sibling's, or unknown.
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-fn staged_owner(listed: &[u8]) -> Option<std::path::PathBuf> {
-    STAGED_BINDINGS
+enum StagedClaim {
+    Owned,
+    Other,
+    Unknown,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn staged_claim(listed: &[u8], path: &std::path::Path) -> StagedClaim {
+    use std::os::unix::fs::MetadataExt as _;
+    let bindings = STAGED_BINDINGS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .find(|(inner, _)| inner.as_os_str().as_encoded_bytes() == listed)
-        .map(|(_, published)| published.clone())
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for binding in bindings.iter() {
+        if binding.inner.as_os_str().as_encoded_bytes() != listed {
+            continue;
+        }
+        // The published name can be re-created independently, so the registration only claims the object it published.
+        let current = std::fs::symlink_metadata(path)
+            .ok()
+            .map(|meta| (meta.dev(), meta.ino()));
+        return if binding.published == path && binding.identity == current {
+            StagedClaim::Owned
+        } else {
+            StagedClaim::Other
+        };
+    }
+    StagedClaim::Unknown
 }
 
 /// A `.ferrox-*/s` address in this path's own directory is the shape a staged bind leaves, whether or not this process recorded it.
@@ -2436,17 +2468,16 @@ fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
                 let raw = &record[PATH_OFFSET..];
                 if let Some(end) = raw.iter().position(|byte| *byte == 0) {
                     if let Ok(listed) = std::str::from_utf8(&raw[..end]) {
-                        if std::path::Path::new(listed) == path {
+                        if same_socket_object(std::path::Path::new(listed), path) {
                             return Some(true);
                         }
-                        match staged_owner(listed.as_bytes()) {
-                            Some(owner) => {
-                                if owner == path {
-                                    return Some(true);
-                                }
+                        match staged_claim(listed.as_bytes(), path) {
+                            StagedClaim::Owned => return Some(true),
+                            StagedClaim::Other => {}
+                            StagedClaim::Unknown if staged_sibling(listed, path) => {
+                                unknown_staged = true;
                             }
-                            None if staged_sibling(listed, path) => unknown_staged = true,
-                            None => {}
+                            StagedClaim::Unknown => {}
                         }
                     }
                 }
@@ -2458,6 +2489,18 @@ fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
         at += len;
     }
     (!unknown_staged).then_some(false)
+}
+
+/// Two names denote one socket when the filesystem gives them one identity, so an alternate spelling on a case-insensitive volume still matches.
+#[cfg(target_os = "macos")]
+fn same_socket_object(listed: &std::path::Path, path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let identity = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|meta| (meta.dev(), meta.ino()))
+    };
+    identity(listed).is_some_and(|listed| Some(listed) == identity(path))
 }
 
 #[cfg(target_os = "macos")]
@@ -3293,43 +3336,58 @@ fn windows_socket_state(path: &std::path::Path) -> WindowsSocket {
 /// Delete the abandoned socket through the handle that verified its tag and identity.
 /// The volume and file identity a handle names, so a replacement is not mistaken for the socket checked.
 #[cfg(windows)]
-fn windows_file_id_handle(file: &std::fs::File) -> io::Result<(u64, [u8; 16])> {
+fn windows_file_id_handle(file: &std::fs::File) -> io::Result<(u32, u64)> {
     use std::os::windows::io::AsRawHandle as _;
     #[repr(C)]
-    struct FileIdInfo {
-        volume_serial_number: u64,
-        file_id: [u8; 16],
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        creation: FileTime,
+        accessed: FileTime,
+        written: FileTime,
+        volume: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
     }
     #[link(name = "kernel32")]
     extern "system" {
-        fn GetFileInformationByHandleEx(
+        fn GetFileInformationByHandle(
             handle: *mut core::ffi::c_void,
-            class: i32,
-            info: *mut core::ffi::c_void,
-            size: u32,
+            info: *mut ByHandleFileInformation,
         ) -> i32;
     }
-    let mut info = FileIdInfo {
-        volume_serial_number: 0,
-        file_id: [0; 16],
+    let mut info = ByHandleFileInformation {
+        attributes: 0,
+        creation: FileTime { low: 0, high: 0 },
+        accessed: FileTime { low: 0, high: 0 },
+        written: FileTime { low: 0, high: 0 },
+        volume: 0,
+        size_high: 0,
+        size_low: 0,
+        links: 0,
+        index_high: 0,
+        index_low: 0,
     };
-    // SAFETY: the handle is live and `info` is the class's structure.
-    let ok = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            18,
-            (&raw mut info).cast(),
-            std::mem::size_of::<FileIdInfo>() as u32,
-        )
-    };
+    // SAFETY: the handle is live and `info` is the structure the call fills.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((info.volume_serial_number, info.file_id))
+    Ok((
+        info.volume,
+        u64::from(info.index_high) << 32 | u64::from(info.index_low),
+    ))
 }
 
 #[cfg(windows)]
-fn windows_file_id(path: &std::path::Path) -> io::Result<(u64, [u8; 16])> {
+fn windows_file_id(path: &std::path::Path) -> io::Result<(u32, u64)> {
     use std::os::windows::fs::OpenOptionsExt as _;
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
     const FILE_SHARE_ALL: u32 = 0x7;
@@ -3344,10 +3402,7 @@ fn windows_file_id(path: &std::path::Path) -> io::Result<(u64, [u8; 16])> {
 }
 
 #[cfg(windows)]
-fn windows_delete_stale(
-    path: &std::path::Path,
-    before: Option<&(u64, [u8; 16])>,
-) -> io::Result<()> {
+fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsRawHandle as _;
     const DELETE: u32 = 0x0001_0000;
@@ -3390,13 +3445,20 @@ fn windows_delete_stale(
             "a unix listen path was replaced by a file that is not a socket",
         ));
     }
-    if before
-        .is_some_and(|before| windows_file_id_handle(&file).is_ok_and(|current| current != *before))
-    {
+    let Some(before) = before else {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
-            "a unix listen path was replaced while binding",
+            "a unix listen path could not be identified before binding",
         ));
+    };
+    match windows_file_id_handle(&file) {
+        Ok(current) if current == *before => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "a unix listen path was replaced while binding",
+            ))
+        }
     }
     let disposition = FileDispositionInfo { delete_file: 1 };
     // SAFETY: the handle is live and `disposition` is the class's structure.
@@ -4904,7 +4966,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter()
-                .filter(|(_, published)| published == path)
+                .filter(|binding| binding.published == path)
                 .count()
         };
         for _ in 0..32 {

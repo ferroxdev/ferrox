@@ -680,7 +680,7 @@ fn serve_inbounds_counted(
                 let wake_stream = inbound_sockets(inbound, protocol).0;
                 match protocol {
                     "vless" => {
-                        if serve_vless_inbound(
+                        if let Some(wake) = serve_vless_inbound_wake(
                             address,
                             inbound,
                             freedom,
@@ -689,7 +689,7 @@ fn serve_inbounds_counted(
                             handler_stop.as_ref(),
                         ) {
                             if let Some(stop) = recorded_stop {
-                                handler_stops.push((Arc::clone(stop), address.clone()));
+                                handler_stops.push((Arc::clone(stop), wake));
                             }
                             inbounds += 1;
                         }
@@ -774,6 +774,7 @@ fn serve_inbounds_counted(
                             );
                             if fallible {
                                 bind_failed();
+                                bind_failure = true;
                                 break;
                             }
                             continue;
@@ -783,6 +784,7 @@ fn serve_inbounds_counted(
                             eprintln!("inbound `{protocol}` in {label} asks for a finalmask tcp chain it cannot arm");
                             if fallible {
                                 bind_failed();
+                                bind_failure = true;
                                 break;
                             }
                             continue;
@@ -811,7 +813,7 @@ fn serve_inbounds_counted(
                     }
                     "dokodemo-door" => {
                         if let Some(out) = routed(inbound, true) {
-                            let (armed, workers) = serve_dokodemo(
+                            let (armed, workers, wake) = serve_dokodemo(
                                 address,
                                 inbound,
                                 &out,
@@ -822,12 +824,13 @@ fn serve_inbounds_counted(
                             inbounds += armed;
                             if workers > 0 {
                                 if let Some(stop) = &handler_stop {
-                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                    handler_stops.push((Arc::clone(stop), wake));
                                 }
                                 extra_threads += workers - 1;
                             }
                         } else if fallible {
                             bind_failed();
+                            bind_failure = true;
                             break;
                         }
                     }
@@ -859,6 +862,7 @@ fn serve_inbounds_counted(
                         if refuse_source(route, inbound, label, "tun", prove) {
                             if fallible {
                                 bind_failed();
+                                bind_failure = true;
                                 break;
                             }
                             continue;
@@ -866,6 +870,7 @@ fn serve_inbounds_counted(
                         let Some(out) = routed(inbound, false) else {
                             if fallible {
                                 bind_failed();
+                                bind_failure = true;
                                 break;
                             }
                             continue;
@@ -876,6 +881,7 @@ fn serve_inbounds_counted(
                                 eprintln!("tun inbound: {error}");
                                 if fallible {
                                     bind_failed();
+                                    bind_failure = true;
                                     break;
                                 }
                                 continue;
@@ -888,6 +894,7 @@ fn serve_inbounds_counted(
                                 eprintln!("tun inbound: the system tun stack is Linux-only");
                                 if fallible {
                                     bind_failed();
+                                    bind_failure = true;
                                     break;
                                 }
                                 continue;
@@ -901,6 +908,7 @@ fn serve_inbounds_counted(
                         if refuse_source(route, inbound, label, "tunnel", prove) {
                             if fallible {
                                 bind_failed();
+                                bind_failure = true;
                                 break;
                             }
                             continue;
@@ -908,6 +916,7 @@ fn serve_inbounds_counted(
                         let Some(out) = routed(inbound, false) else {
                             if fallible {
                                 bind_failed();
+                                bind_failure = true;
                                 break;
                             }
                             continue;
@@ -931,6 +940,7 @@ fn serve_inbounds_counted(
                         if refuse_source(route, inbound, label, "MASQUE", prove) {
                             if fallible {
                                 bind_failed();
+                                bind_failure = true;
                                 break;
                             }
                             continue;
@@ -938,6 +948,7 @@ fn serve_inbounds_counted(
                         let Some(out) = routed(inbound, false) else {
                             if fallible {
                                 bind_failed();
+                                bind_failure = true;
                                 break;
                             }
                             continue;
@@ -1382,18 +1393,32 @@ fn spawn_role_stopped(
     tag: Option<String>,
     stop: Option<std::sync::Arc<Stop>>,
 ) -> bool {
+    spawn_role_wake(address, role, tag, stop).is_some()
+}
+
+/// The same bind, returning the address a removal must dial: an ephemeral port is replaced by the one the socket took.
+fn spawn_role_wake(
+    address: &str,
+    role: Role,
+    tag: Option<String>,
+    stop: Option<std::sync::Arc<Stop>>,
+) -> Option<String> {
     let listener = match bind_listener(address, &role) {
         Ok(listener) => listener,
         Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
             bind_failed();
             eprintln!("cannot listen on {address}: {error}");
-            return false;
+            return None;
         }
         Err(error) => exit(&format!("cannot listen on {address}: {error}")),
     };
+    let wake = listener.local_addr().map_or_else(
+        |_| address.to_owned(),
+        |bound| swapped_port(address, bound.port()),
+    );
     let address = address.to_owned();
     thread::spawn(move || accept_listener(listener, &address, &role, tag.as_deref(), stop));
-    true
+    Some(wake)
 }
 
 fn try_spawn_role_stopped(
@@ -1425,43 +1450,55 @@ fn serve_vless_inbound(
     portals: &crate::reverse::Portals,
     stop: Option<&Arc<Stop>>,
 ) -> bool {
+    serve_vless_inbound_wake(address, inbound, freedom, path, portals, stop).is_some()
+}
+
+fn serve_vless_inbound_wake(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    path: &str,
+    portals: &crate::reverse::Portals,
+    stop: Option<&Arc<Stop>>,
+) -> Option<String> {
     let users = inbound_users(inbound, portals);
     let carrier = inbound_carrier(inbound);
     let sec = stream_security(inbound);
     // QUIC arrives on UDP with its own handshake, so it never reaches the TCP accept loop.
     if matches!(carrier, Carrier::Quic) {
-        return serve_vless_quic_inbound(address, inbound, &users, freedom, path, stop);
+        return serve_vless_quic_inbound(address, inbound, &users, freedom, path, stop)
+            .then(String::new);
     }
     if let Carrier::Unknown { network } = &carrier {
         eprintln!("unsupported network `{network}` in {path}: refused, not served");
-        return false;
+        return None;
     }
     // An xdrive inbound has no socket: its `security` belongs to the store's lanes, so the stream is served as it arrives from the log.
     if let Carrier::Xdrive { settings } = &carrier {
         serve_vless_xdrive_inbound(address, inbound, &users, settings, freedom);
-        return true;
+        return Some(String::new());
     }
     match sec {
         // Hysteria carries its own QUIC TLS, so xray's `security: tls` names that handshake rather than a second layer above it.
         _ if matches!(carrier, Carrier::Hysteria(_)) => {
             let Carrier::Hysteria(config) = carrier else {
-                return false;
+                return None;
             };
             if config.version != 2 {
                 eprintln!(
                     "hysteria v{} carrier in {path} is not the v2 serve `hysteria` names: serves nothing",
                     config.version
                 );
-                return false;
+                return None;
             }
             let owned = address.to_owned();
             let Some(settings) = inbound.get("streamSettings") else {
                 eprintln!("unreadable hysteria identity in {path}: serves nothing");
-                return false;
+                return None;
             };
             let Some(identity) = crate::config::tls_identity_from_settings(settings) else {
                 eprintln!("unreadable hysteria identity in {path}: serves nothing");
-                return false;
+                return None;
             };
             let masq = crate::config::masquerade_from_stream(Some(settings));
             let users = Arc::clone(&users);
@@ -1469,7 +1506,8 @@ fn serve_vless_inbound(
             let serve: crate::hysteria::Serve = Arc::new(move |flow| {
                 serve_vless_hysteria(flow.with_meter(meter.clone()), &users, freedom);
             });
-            serve_hysteria_thread(&owned, &config, &identity, &masq, &serve, stop)
+            return serve_hysteria_thread(&owned, &config, &identity, &masq, &serve, stop)
+                .then(String::new);
         }
         "tls" => serve_vless_tls_inbound(address, inbound, &users, &carrier, freedom, path, stop),
         "reality" => {
@@ -1477,7 +1515,7 @@ fn serve_vless_inbound(
         }
         _ if !vless_security_supported(sec) => {
             eprintln!("unsupported vless security `{sec}` in {path}: serves raw TCP only");
-            false
+            None
         }
         _ => {
             let owned = address.to_owned();
@@ -1488,27 +1526,27 @@ fn serve_vless_inbound(
                     let _flow = crate::accesslog::flow(Some(conn.remote_addr()), "", 0);
                     serve_vless_kcp(conn, &users, freedom, meter.clone());
                 });
-                return serve_kcp_bound(&owned, config, &serve, inbound, stop);
+                return serve_kcp_bound(&owned, config, &serve, inbound, stop).then(String::new);
             }
             let fallbacks = match server_fallbacks(inbound) {
                 Ok(fallbacks) => fallbacks.map(Arc::from),
                 Err(error) => {
                     eprintln!("{error} in {path}: inbound refused");
-                    return false;
+                    return None;
                 }
             };
             let decryption = match crate::config::server_decryption(inbound) {
                 Ok(decryption) => decryption,
                 Err(error) => {
                     eprintln!("{error} in {path}: inbound refused");
-                    return false;
+                    return None;
                 }
             };
             if decryption.is_some() && fallbacks.is_some() {
                 eprintln!(
                     r#"VLESS settings: "fallbacks" can not be used together with "decryption" in {path}: inbound refused"#
                 );
-                return false;
+                return None;
             }
             let role = inbound_role(
                 inbound,
@@ -1520,7 +1558,7 @@ fn serve_vless_inbound(
                     decryption,
                 },
             );
-            spawn_role_stopped(&owned, role, inbound_tag(inbound), stop.cloned())
+            spawn_role_wake(&owned, role, inbound_tag(inbound), stop.cloned())
         }
     }
 }
@@ -11005,30 +11043,30 @@ fn serve_vless_tls_inbound(
     freedom: bool,
     path: &str,
     stop: Option<&Arc<Stop>>,
-) -> bool {
+) -> Option<String> {
     let Some(server) = inbound_tls_identity(inbound) else {
         eprintln!("unreadable vless tls identity in {path}: serves raw TCP only");
-        return false;
+        return None;
     };
     let fallbacks = match server_fallbacks(inbound) {
         Ok(fallbacks) => fallbacks.map(Arc::from),
         Err(error) => {
             eprintln!("{error} in {path}: inbound refused");
-            return false;
+            return None;
         }
     };
     let decryption = match crate::config::server_decryption(inbound) {
         Ok(decryption) => decryption,
         Err(error) => {
             eprintln!("{error} in {path}: inbound refused");
-            return false;
+            return None;
         }
     };
     if decryption.is_some() && fallbacks.is_some() {
         eprintln!(
             r#"VLESS settings: "fallbacks" can not be used together with "decryption" in {path}: inbound refused"#
         );
-        return false;
+        return None;
     }
     if let Carrier::Xhttp { settings } = carrier {
         if crate::xhttp_h3::is_h3(&server.alpn) {
@@ -11041,7 +11079,8 @@ fn serve_vless_tls_inbound(
                 service,
                 stop,
                 &format!("xhttp h3 in {path}"),
-            );
+            )
+            .then(String::new);
         }
     }
     let owned = address.to_owned();
@@ -11053,7 +11092,7 @@ fn serve_vless_tls_inbound(
             let _flow = crate::accesslog::flow(Some(conn.remote_addr()), "", 0);
             serve_vless_kcp_tls(conn, &users, freedom, &server, meter.clone());
         });
-        return serve_kcp_bound(&owned, config, &serve, inbound, stop);
+        return serve_kcp_bound(&owned, config, &serve, inbound, stop).then(String::new);
     }
     let role = inbound_role(
         inbound,
@@ -11066,7 +11105,7 @@ fn serve_vless_tls_inbound(
             decryption,
         },
     );
-    spawn_role_stopped(&owned, role, inbound_tag(inbound), stop.cloned())
+    spawn_role_wake(&owned, role, inbound_tag(inbound), stop.cloned())
 }
 
 fn serve_vless_reality_inbound(
@@ -11116,7 +11155,7 @@ fn serve_vless_reality_inbound(
             let _flow = crate::accesslog::flow(Some(conn.remote_addr()), "", 0);
             serve_vless_kcp_reality(conn, &users, freedom, &server, meter.clone());
         });
-        return serve_kcp_bound(&owned, config, &serve, inbound, stop);
+        return serve_kcp_bound(&owned, config, &serve, inbound, stop).then(String::new);
     }
     let role = inbound_role(
         inbound,
@@ -11129,7 +11168,7 @@ fn serve_vless_reality_inbound(
             decryption,
         },
     );
-    spawn_role_stopped(&owned, role, inbound_tag(inbound), stop.cloned())
+    spawn_role_wake(&owned, role, inbound_tag(inbound), stop.cloned())
 }
 
 fn serve_session_ws<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'static>(
@@ -17249,7 +17288,7 @@ fn serve_dokodemo(
     label: &str,
     stop: Option<&Arc<Stop>>,
     fallible: bool,
-) -> (usize, usize) {
+) -> (usize, usize, String) {
     let follow_redirect = inbound
         .get("settings")
         .and_then(|settings| settings.get("followRedirect"))
@@ -17264,13 +17303,13 @@ fn serve_dokodemo(
     let networks = dokodemo_networks(inbound);
     if !dokodemo_has(&networks, "tcp") && !dokodemo_has(&networks, "udp") {
         eprintln!("dokodemo-door without tcp or udp in {label}: no flow to serve");
-        return (0, 0);
+        return (0, 0, String::new());
     }
     let mode = match crate::sockopt::inbound_tproxy(inbound.get("streamSettings")) {
         Ok(mode) => mode,
         Err(reason) => {
             eprintln!("dokodemo-door sockopt in {label}: {reason}");
-            return (0, 0);
+            return (0, 0, String::new());
         }
     };
     let requested = dokodemo_transparent(receive_original_destination, mode);
@@ -17290,14 +17329,14 @@ fn serve_dokodemo(
         Some(_) => None,
         None => {
             eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");
-            return (0, 0);
+            return (0, 0, String::new());
         }
     };
     let port_map = match dokodemo_port_map(inbound) {
         Ok(map) => map,
         Err(reason) => {
             eprintln!("dokodemo-door portMap in {label}: {reason}");
-            return (0, 0);
+            return (0, 0, String::new());
         }
     };
     let listen = match parse_target(address) {
@@ -17349,8 +17388,13 @@ fn serve_dokodemo(
         }
     }
     let mut workers = tcp_armed as usize;
+    let wake = if tcp_armed {
+        address.to_owned()
+    } else {
+        String::new()
+    };
     if fallible && dokodemo_has(&networks, "tcp") && !tcp_armed {
-        return (armed, workers);
+        return (armed, workers, wake.clone());
     }
     if dokodemo_has(&networks, "udp") {
         // The door's own socket is bound before the inbound is armed: a port nobody holds answers a datagram with a refusal.
@@ -17359,7 +17403,7 @@ fn serve_dokodemo(
             let Ok(crate::conn::Target::Ip(bound)) = parse_target(address) else {
                 bind_failed();
                 eprintln!("dokodemo-door udp: {address} names no IP in {label}");
-                return (armed, workers);
+                return (armed, workers, wake.clone());
             };
             listen = Some(bound);
             crate::transparent::bind_udp(bound)
@@ -17379,14 +17423,14 @@ fn serve_dokodemo(
                 let Ok(socket) = UdpSocket::bind(address) else {
                     bind_failed();
                     eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
-                    return (armed, workers);
+                    return (armed, workers, wake.clone());
                 };
                 (socket, false)
             }
             Err(_) => {
                 bind_failed();
                 eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
-                return (armed, workers);
+                return (armed, workers, wake.clone());
             }
         };
         let door = out.clone();
@@ -17394,7 +17438,7 @@ fn serve_dokodemo(
             let Some(listen) = socket.local_addr().ok().or(listen) else {
                 bind_failed();
                 eprintln!("dokodemo-door udp: cannot read the bound address in {label}");
-                return (armed, workers);
+                return (armed, workers, wake.clone());
             };
             let worker_stop = stop.cloned();
             thread::spawn(move || {
@@ -17411,7 +17455,21 @@ fn serve_dokodemo(
                 eprintln!(
                     "dokodemo-door udp: followRedirect needs a rewrite address in {label}; no UDP flow is served"
                 );
-                return (armed, workers);
+                return (armed, workers, wake.clone());
+            };
+            let dest = if fallible && matches!(&dest, Destination::Name(..)) {
+                match dest.socket() {
+                    Some(address) => Destination::Address(address),
+                    None => {
+                        bind_failed();
+                        eprintln!(
+                            "dokodemo-door udp: the rewrite address does not resolve in {label}"
+                        );
+                        return (armed, workers, wake.clone());
+                    }
+                }
+            } else {
+                dest
             };
             let worker_stop = stop.cloned();
             thread::spawn(move || dokodemo_udp_door(&socket, &dest, &door, worker_stop.as_ref()));
@@ -17419,7 +17477,7 @@ fn serve_dokodemo(
         armed += 1;
         workers += 1;
     }
-    (armed, workers)
+    (armed, workers, wake)
 }
 
 fn dokodemo_original_destination(
