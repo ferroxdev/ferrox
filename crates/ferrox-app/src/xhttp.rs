@@ -2404,6 +2404,7 @@ pub(crate) fn end_session_handle(id: &str, handle: &SessionHandle) {
 }
 
 // Drop is the only other way a session ends, and a waiter parked before a reader exists has no Drop to run.
+#[cfg(test)]
 pub(crate) fn end_session(id: &str) {
     let carried = sessions().lock().expect("sessions lock").remove(id);
     if let Some(carried) = carried {
@@ -3533,7 +3534,7 @@ pub(crate) fn accept_core<
             }
             if !session.push_packet(seq_num, payload, settings.sc_max_buffered) {
                 // A refused packet is a lost one — the reader waits on strict sequence — so the session is over; keeping it alive would park its reader on a sequence that can never arrive.
-                end_session(sid);
+                end_session_handle(sid, &SessionHandle::of(&session));
                 emit_500(&mut write);
                 return Served::Closed;
             }
@@ -7265,6 +7266,85 @@ mod tests {
             !session_is_carried("overflowed"),
             "the overflowed session stayed alive with its parked reader"
         );
+    }
+
+    /// A refusal runs after the body read, so the id may have been rebound: closing by the selected handle must leave the replacement carried.
+    #[test]
+    fn a_refused_packet_leaves_a_reused_session_id_carried() {
+        struct Gated {
+            blocked: std::sync::mpsc::Receiver<u8>,
+            entered: Option<std::sync::mpsc::Sender<()>>,
+        }
+        impl Read for Gated {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                }
+                let byte = self.blocked.recv().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "released")
+                })?;
+                buf[0] = byte;
+                Ok(1)
+            }
+        }
+
+        let node = crate::json::parse(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {
+                "path": "/up/", "mode": "packet-up"}}}"#,
+        )
+        .expect("parses");
+        let settings = XhttpSettings::from_json(node.get("streamSettings")).expect("settings");
+        let id = "overflow-reused";
+        let old = get_or_create_session(id);
+        for seq in 0..30u64 {
+            assert!(
+                old.push_packet(seq, vec![seq as u8], 30),
+                "thirty fit before the refusal"
+            );
+        }
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (entered, selected) = std::sync::mpsc::channel();
+        let head = format!(
+            "POST /up/{id}/30 HTTP/1.1\r\nHost: h\r\nReferer: {}\r\nContent-Length: 1\r\n\r\n",
+            "http://127.0.0.1/up/?x_padding=".to_owned() + &"X".repeat(128)
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let served = {
+            let seen = Arc::clone(&seen);
+            thread::spawn(move || {
+                accept_core(
+                    head.as_bytes(),
+                    Vec::new(),
+                    Upload::Read(Gated {
+                        blocked,
+                        entered: Some(entered),
+                    }),
+                    Sink(seen),
+                    &settings,
+                    None,
+                    None,
+                )
+            })
+        };
+        selected
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the body read started");
+        end_session(id);
+        let replacement = get_or_create_session(id);
+        release.send(30).expect("releases the body");
+        assert!(
+            matches!(served.join().expect("the accept joins"), Served::Closed),
+            "a refused packet must not hand the caller a session to read"
+        );
+        assert!(
+            session_is_carried(id),
+            "the refusal closed the replacement session under the reused id"
+        );
+        assert!(
+            Arc::ptr_eq(&get_or_create_session(id), &replacement),
+            "the carried session is not the replacement"
+        );
+        end_session(id);
     }
 
     #[test]
