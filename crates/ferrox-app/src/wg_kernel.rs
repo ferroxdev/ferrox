@@ -90,6 +90,10 @@ const SOCKET_BUFFER: usize = 7 << 20;
 
 /// An address this host owns: the kernel's local table answers it before a marked rule can send it through the device, so the kernel path must decline it rather than let it bypass the tunnel.
 pub(crate) fn host_local(ip: IpAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    };
     if ip.is_loopback() || ip.is_unspecified() {
         return true;
     }
@@ -965,6 +969,7 @@ mod tests {
     fn a_host_local_target_is_declined() {
         assert!(host_local("127.0.0.1".parse().unwrap()));
         assert!(host_local("::1".parse().unwrap()));
+        assert!(host_local("::ffff:127.0.0.1".parse().unwrap()));
         assert!(!host_local("192.0.2.1".parse().unwrap()));
     }
 

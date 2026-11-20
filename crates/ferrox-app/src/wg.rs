@@ -441,7 +441,7 @@ impl WireGuardOut {
             .collect();
         if destinations.is_empty() {
             eprintln!(
-                "wireguard: kernel mode cannot carry host-local `{asked:?}`; set `noKernelTun` for the userspace stack"
+                "wireguard: kernel mode cannot carry host-local `{asked:?}`; set `kernelMode: false` for the userspace stack"
             );
             return;
         }
@@ -545,7 +545,7 @@ impl WireGuardOut {
             if targets.is_empty() {
                 if !local_warned {
                     eprintln!(
-                        "wireguard: kernel mode cannot carry host-local `{dest:?}`; set `noKernelTun` for the userspace stack"
+                        "wireguard: kernel mode cannot carry host-local `{dest:?}`; set `kernelMode: false` for the userspace stack"
                     );
                     local_warned = true;
                 }

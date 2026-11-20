@@ -1647,7 +1647,7 @@ impl H2Conn {
     }
 
     fn reset_stream(&self, stream: u32) {
-        self.forget_upload(stream);
+        self.reset_session(stream);
         // The credit lock orders the death with a writer's check-then-wait, so the wake cannot be lost.
         let credit = self
             .send_conn
@@ -1673,9 +1673,32 @@ impl H2Conn {
         if pending > 0 {
             self.replenish_connection(pending as usize);
         }
-        self.end_session_of(stream);
         // Queued: a refusal is the demux's answer, so it must not wait on a write the peer has not read.
         let _ = self.send_control(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
+    }
+
+    /// A reset ends both local halves at once: unlike a finished upload, an aborted POST has no
+    /// packets a later GET could fetch, so its session must not wait for the timeout.
+    fn reset_session(&self, stream: u32) {
+        let _gate = self
+            .session_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let upload = self
+            .upload_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&stream);
+        let downlink = self
+            .session_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&stream);
+        for (sid, handle) in upload.into_iter().chain(downlink) {
+            self.end_uploads(&sid, &handle);
+            self.release_session(&sid, &handle);
+            crate::xhttp::end_session_handle(&sid, &handle);
+        }
     }
 
     fn kill(&self) {
@@ -1700,13 +1723,26 @@ impl H2Conn {
             st.dead = true;
             state.cv.notify_all();
         }
-        let sessions: Vec<(String, crate::xhttp::SessionHandle)> = self
-            .sessions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .drain(..)
-            .collect();
-        for (session, handle) in sessions {
+        let detached = {
+            let _gate = self
+                .session_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.session_of
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+            self.upload_of
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+            self.sessions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .drain(..)
+                .collect::<Vec<_>>()
+        };
+        for (session, handle) in detached {
             crate::xhttp::end_session_handle(&session, &handle);
         }
     }
@@ -1740,6 +1776,10 @@ impl H2Conn {
             .insert(stream, (sid.to_owned(), handle.clone()));
         // `kill` sets `dead` before it drains the sessions, so a bind that raced the drain ends its own.
         if self.dead.load(Ordering::SeqCst) {
+            owner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&stream);
             self.sessions
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -1797,9 +1837,9 @@ impl H2Conn {
         }
     }
 
-    /// End the handle once no stream on this connection still binds it. An upload-only caller may
-    /// have released it before its downlink half retires, so the last binding is the one that closes.
-    fn release_session(&self, sid: &str, handle: &crate::xhttp::SessionHandle) {
+    /// Drop this connection's handle once no stream here binds it. A POST-before-GET upload may
+    /// finish first, so the session itself stays for its downlink or its timeout instead of closing.
+    fn release_session(&self, _sid: &str, handle: &crate::xhttp::SessionHandle) {
         let bound = {
             let down = self
                 .session_of
@@ -1818,11 +1858,8 @@ impl H2Conn {
             return;
         }
         let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-        let at = sessions.iter().position(|(_, held)| held.same(handle));
-        if let Some(at) = at {
+        if let Some(at) = sessions.iter().position(|(_, held)| held.same(handle)) {
             sessions.swap_remove(at);
-            drop(sessions);
-            crate::xhttp::end_session_handle(sid, handle);
         }
     }
 
@@ -1840,6 +1877,7 @@ impl H2Conn {
         if let Some((sid, handle)) = removed {
             self.end_uploads(&sid, &handle);
             self.release_session(&sid, &handle);
+            crate::xhttp::end_session_handle(&sid, &handle);
         }
     }
 }
@@ -5143,6 +5181,64 @@ mod tests {
             !crate::xhttp::session_is_carried(sid),
             "the finished downlink leaves no session parked"
         );
+    }
+
+    /// A stream-up POST can finish before its GET arrives; retiring its local upload handle must
+    /// not close the session that still holds the packets the GET is about to fetch.
+    #[test]
+    fn an_upload_that_finishes_first_keeps_its_session_for_the_downlink() {
+        let sid = "h2-post-before-get";
+        crate::xhttp::start_session_for_probe(sid);
+        let (conn, _written, _slices) = bare_conn();
+        let handle = crate::xhttp::session_handle(sid);
+        conn.bind_session(sid, 1, false, &handle);
+        conn.forget_upload(1);
+        assert!(
+            crate::xhttp::session_is_carried(sid),
+            "the finished upload closed the session its downlink still needs"
+        );
+        conn.bind_session(sid, 2, true, &handle);
+        conn.end_session_of(2);
+        assert!(
+            !crate::xhttp::session_is_carried(sid),
+            "the downlink still ends the session"
+        );
+    }
+
+    /// An aborted upload has no packets a later GET could fetch, so its session ends immediately
+    /// rather than waiting for the timeout that a normally completed POST may still need.
+    #[test]
+    fn a_reset_upload_ends_its_session() {
+        let sid = "h2-reset-upload";
+        crate::xhttp::start_session_for_probe(sid);
+        let (conn, _written, _slices) = bare_conn();
+        let handle = crate::xhttp::session_handle(sid);
+        conn.bind_session(sid, 1, false, &handle);
+        conn.reset_session(1);
+        assert!(!crate::xhttp::session_is_carried(sid));
+    }
+
+    /// A killed connection detaches every binding, not only the session vector, so an upload
+    /// reader cannot keep the dead connection and its session alive through the map.
+    #[test]
+    fn a_killed_connection_releases_its_session_bindings() {
+        let sid = "h2-killed-bindings";
+        crate::xhttp::start_session_for_probe(sid);
+        let (conn, _written, _slices) = bare_conn();
+        let handle = crate::xhttp::session_handle(sid);
+        conn.bind_session(sid, 1, false, &handle);
+        conn.kill();
+        assert!(!crate::xhttp::session_is_carried(sid));
+        assert!(conn
+            .session_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty());
+        assert!(conn
+            .upload_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty());
     }
 
     /// A peer may reuse a stream id's session name after it ends; a later stream that binds the new

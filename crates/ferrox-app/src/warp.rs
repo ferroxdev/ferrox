@@ -2960,55 +2960,66 @@ impl Slot {
             Self::Gool => paths.masque_sibling("gool"),
         }
     }
+
+    /// Where registration writes this slot: the allocated file, not the runtime fallback, so a base
+    /// that already names the MASQUE half still gives WireGuard and MASQUE distinct files.
+    fn allocation(self, paths: &KeyPaths) -> PathBuf {
+        match self {
+            Self::WireGuard => paths.wireguard.clone(),
+            Self::WireGuardInner => derive_sibling_path(&paths.wireguard, "secondary"),
+            Self::Masque => paths.masque.clone(),
+            Self::MasqueInner => derive_sibling_path(&paths.masque, "secondary"),
+            Self::Gool => derive_sibling_path(&paths.masque, "gool"),
+        }
+    }
 }
 
 /// Where each transport keeps its identity: the `WireGuard` file as named, the
 /// MASQUE file beside it, and every second hop derived from its own first.
 struct KeyPaths {
     wireguard: PathBuf,
+    /// The file a multi-slot registration allocates for the MASQUE half.
     masque: PathBuf,
-    /// The file the old "always derive beside the base" rule wrote when the base already named the
-    /// MASQUE half; kept so an identity enrolled before `named_slot` is still found and reused.
-    legacy_masque: Option<PathBuf>,
+    /// The base when it already names the MASQUE half: runtime lookup prefers it, registration does not.
+    named_masque: Option<PathBuf>,
 }
 
 impl KeyPaths {
     fn new(base: &Path, wireguard: Option<&Path>, masque: Option<&Path>) -> Self {
-        let derived = || {
-            if named_slot(base, "masque") {
-                base.to_path_buf()
-            } else {
-                derive_sibling_path(base, "masque")
-            }
-        };
-        let legacy_masque = (masque.is_none() && named_slot(base, "masque"))
-            .then(|| derive_sibling_path(base, "masque"));
         Self {
             wireguard: wireguard.map_or_else(|| base.to_path_buf(), Path::to_path_buf),
-            masque: masque.map_or_else(derived, Path::to_path_buf),
-            legacy_masque,
+            masque: masque.map_or_else(|| derive_sibling_path(base, "masque"), Path::to_path_buf),
+            named_masque: (masque.is_none() && named_slot(base, "masque"))
+                .then(|| base.to_path_buf()),
         }
     }
 
-    /// The MASQUE identity to load: the named file, then the one the old derivation wrote, then the
-    /// named file again so a fresh registration saves where the new rule expects.
+    /// The MASQUE identity to load: the named file, then the derived one, then the named path again
+    /// so a runtime pointed at `account-masque.json` keeps using it.
     fn masque_path(&self) -> PathBuf {
+        if let Some(named) = self.named_masque.as_ref().filter(|path| path.exists()) {
+            return named.clone();
+        }
         if self.masque.exists() {
             return self.masque.clone();
         }
-        if let Some(legacy) = self.legacy_masque.as_ref().filter(|path| path.exists()) {
-            return legacy.clone();
-        }
-        self.masque.clone()
+        self.named_masque
+            .clone()
+            .unwrap_or_else(|| self.masque.clone())
     }
 
     fn masque_sibling(&self, suffix: &str) -> PathBuf {
-        let current = derive_sibling_path(&self.masque, suffix);
+        let effective = self.masque_path();
+        let current = derive_sibling_path(&effective, suffix);
         if current.exists() {
             return current;
         }
-        if let Some(legacy) = self.legacy_masque.as_ref() {
-            let old = derive_sibling_path(legacy, suffix);
+        let allocated = derive_sibling_path(&self.masque, suffix);
+        if allocated.exists() {
+            return allocated;
+        }
+        if let Some(named) = self.named_masque.as_ref() {
+            let old = derive_sibling_path(named, suffix);
             if old.exists() {
                 return old;
             }
@@ -3045,7 +3056,7 @@ fn derive_sibling_path(base: &Path, suffix: &str) -> PathBuf {
 fn planned_slots(kind: KeyKind, paths: &KeyPaths) -> Result<Vec<(Slot, PathBuf)>, String> {
     let mut planned: Vec<(Slot, PathBuf)> = Vec::new();
     for &slot in kind.slots() {
-        let path = slot.path(paths);
+        let path = slot.allocation(paths);
         if planned.iter().any(|(_, other)| *other == path) {
             return Err(format!(
                 "warp-register: the {} identity would share {}; give each slot its own file",
@@ -3992,6 +4003,24 @@ mod tests {
             Path::new("/tmp/account-masquerade.json"),
             "masque"
         ));
+    }
+
+    /// A base that already names the MASQUE half still has to register both slots: runtime reuses
+    /// the base, but allocation derives the old distinct file or `planned_slots` sees a collision.
+    #[test]
+    fn a_named_masque_base_allocates_a_distinct_registration_file() {
+        let base = Path::new("/tmp/account-masque.json");
+        let paths = KeyPaths::new(base, None, None);
+        assert_eq!(Slot::WireGuard.allocation(&paths), base);
+        assert_eq!(
+            Slot::Masque.allocation(&paths),
+            Path::new("/tmp/account-masque-masque.json")
+        );
+        assert_eq!(
+            Slot::MasqueInner.allocation(&paths),
+            Path::new("/tmp/account-masque-masque-secondary.json")
+        );
+        assert!(planned_slots(KeyKind::All, &paths).is_ok());
     }
 
     /// `auto` can serve a WireGuard-only device, so resuming one must not demand a MASQUE key that
