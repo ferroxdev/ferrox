@@ -204,12 +204,14 @@ pub(crate) fn masque_candidates(mode: ScanMode) -> Vec<SocketAddr> {
             push(*ip, MASQUE_PORTS[0]);
         }
         push(*seed, MASQUE_PORTS[0]);
-        for &port in &MASQUE_PORTS[1..] {
-            push(*seed, port);
-        }
     }
     for ip in sampled.iter().skip(seeds.len()) {
         push(*ip, MASQUE_PORTS[0]);
+    }
+    for seed in &seeds {
+        for &port in &MASQUE_PORTS[1..] {
+            push(*seed, port);
+        }
     }
     out
 }
@@ -654,6 +656,28 @@ mod tests {
         assert_eq!(
             candidates[0],
             "162.159.196.1:443".parse().expect("the first seed")
+        );
+    }
+
+    #[test]
+    fn the_masque_sweep_tries_every_443_before_a_seed_fallback_port() {
+        let candidates = masque_candidates(ScanMode::Turbo);
+        let split = candidates
+            .iter()
+            .position(|edge| edge.port() != MASQUE_PORTS[0])
+            .unwrap_or(candidates.len());
+        assert!(split > 0);
+        assert!(
+            candidates[..split]
+                .iter()
+                .all(|edge| edge.port() == MASQUE_PORTS[0]),
+            "a non-443 candidate was tried before a 443 candidate"
+        );
+        assert!(
+            candidates[split..]
+                .iter()
+                .all(|edge| edge.port() != MASQUE_PORTS[0]),
+            "443 candidates were split around the fallback ports"
         );
     }
 

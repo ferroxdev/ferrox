@@ -1396,11 +1396,7 @@ impl Session {
             }
             h2::T_DATA => {
                 if id == 0 {
-                    let mut goaway = [0u8; 8];
-                    goaway[..4].copy_from_slice(&self.last_stream.to_be_bytes());
-                    goaway[4..].copy_from_slice(&1u32.to_be_bytes());
-                    wire.send(h2::T_GOAWAY, 0, 0, &goaway);
-                    self.end = true;
+                    self.protocol_error(wire);
                     return;
                 }
                 if Some(id) != self.request {
@@ -1431,6 +1427,10 @@ impl Session {
 
     /// A field block after the request head is a trailer: decode it to keep HPACK state, and end the request when it closes.
     fn headers(&mut self, wire: &mut Wire, flags: u8, id: u32, body: &[u8]) {
+        if id == 0 {
+            self.protocol_error(wire);
+            return;
+        }
         self.last_stream = self.last_stream.max(id);
         if let Some(active) = self.request {
             if id != active {
@@ -1609,6 +1609,14 @@ impl Session {
         }
         let block = h2::block_encode(&fields);
         wire.send(h2::T_HEADERS, h2::F_END_HEADERS | h2::F_END, id, &block);
+        self.end = true;
+    }
+
+    fn protocol_error(&mut self, wire: &mut Wire) {
+        let mut goaway = [0u8; 8];
+        goaway[..4].copy_from_slice(&self.last_stream.to_be_bytes());
+        goaway[4..].copy_from_slice(&1u32.to_be_bytes());
+        wire.send(h2::T_GOAWAY, 0, 0, &goaway);
         self.end = true;
     }
 
@@ -2614,6 +2622,33 @@ mod tests {
         assert!(session.continuation.is_some(), "the header block is open");
         session.on(&mut wire, h2::T_CONT, 0, 1, &half);
         assert!(session.end, "the accumulated block is capped");
+    }
+
+    #[test]
+    fn headers_on_stream_zero_refuse_the_connection() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut wire = Wire {
+            stream: Box::new(Recorder {
+                out: Arc::clone(&out),
+                writes,
+            }),
+            pending: Vec::new(),
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        let block = h2::block_encode(&[(":method", "CONNECT")]);
+        session.on(&mut wire, h2::T_HEADERS, h2::F_END_HEADERS, 0, &block);
+        assert!(session.end, "stream zero is a connection error");
+        assert!(session.request.is_none(), "no request was accepted");
+        let written = out.lock().expect("the recorded frames");
+        assert_eq!(written[3], h2::T_GOAWAY, "the refusal is a GOAWAY");
+        assert_eq!(
+            u32::from_be_bytes(written[13..17].try_into().expect("the error code")),
+            1,
+            "PROTOCOL_ERROR"
+        );
     }
 
     struct Recorder {
