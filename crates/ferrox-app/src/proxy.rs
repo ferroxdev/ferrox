@@ -9206,7 +9206,20 @@ pub(crate) fn resolve_bounded<F>(
 where
     F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
 {
-    resolve_on(&RESOLVE_POOL, host, port, budget, lookup)
+    resolve_bounded_watching(host, port, budget, None, lookup)
+}
+
+fn resolve_bounded_watching<F>(
+    host: &str,
+    port: u16,
+    budget: Duration,
+    stop: Option<&AtomicBool>,
+    lookup: F,
+) -> Option<Vec<SocketAddr>>
+where
+    F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    resolve_on(&RESOLVE_POOL, host, port, budget, stop, lookup)
 }
 
 /// A latency probe's lookup rides its own pool: a probe fan-out that stalls answers expires there
@@ -9220,7 +9233,7 @@ pub(crate) fn resolve_probe<F>(
 where
     F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
 {
-    resolve_on(&PROBE_POOL, host, port, budget, lookup)
+    resolve_on(&PROBE_POOL, host, port, budget, None, lookup)
 }
 
 fn resolve_on<F>(
@@ -9228,6 +9241,7 @@ fn resolve_on<F>(
     host: &str,
     port: u16,
     budget: Duration,
+    stop: Option<&AtomicBool>,
     lookup: F,
 ) -> Option<Vec<SocketAddr>>
 where
@@ -9258,9 +9272,28 @@ where
     }
     result.ok()?;
     drop(held);
-    match receiver.recv_timeout(budget) {
-        Ok(Ok(addrs)) => Some(addrs),
-        Ok(Err(_)) | Err(_) => None,
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .unwrap_or_else(Instant::now);
+    loop {
+        if stopped(stop) {
+            return None;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        let slice = if stop.is_some() {
+            left.min(Duration::from_millis(100))
+        } else {
+            left
+        };
+        match receiver.recv_timeout(slice) {
+            Ok(Ok(addrs)) => return (!stopped(stop)).then_some(addrs),
+            Ok(Err(_)) => return None,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if slice < left => continue,
+            Err(_) => return None,
+        }
     }
 }
 
@@ -9517,12 +9550,51 @@ pub(crate) fn resolve_endpoint(host: &str, port: u16) -> Option<SocketAddr> {
     resolve_name(host, port, false)
 }
 
+/// A shutdown-aware lookup: the caller's stop ends the wait, so a listener close is not held by a slow resolver.
+pub(crate) fn resolve_endpoint_watching(
+    host: &str,
+    port: u16,
+    stop: Option<&AtomicBool>,
+) -> Option<SocketAddr> {
+    resolve_name_watching(host, port, false, stop)
+}
+
 fn resolve_name(host: &str, port: u16, local: bool) -> Option<SocketAddr> {
+    resolve_name_watching(host, port, local, None)
+}
+
+fn resolve_name_watching(
+    host: &str,
+    port: u16,
+    local: bool,
+    stop: Option<&AtomicBool>,
+) -> Option<SocketAddr> {
     // An address literal parses straight to an address: no cache key and no resolver iterator.
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Some(SocketAddr::new(ip, port));
     }
+    if stopped(stop) {
+        return None;
+    }
     if let Some(resolver) = crate::dnsapp::installed() {
+        if stop.is_some() {
+            let addrs =
+                resolve_bounded_watching(host, port, budgets::dial(), stop, move |host, port| {
+                    let answer = if local {
+                        resolver.lookup_local(host)
+                    } else {
+                        resolver.lookup(host)
+                    };
+                    answer
+                        .map(|(ips, _)| {
+                            ips.into_iter()
+                                .map(|ip| SocketAddr::new(ip, port))
+                                .collect()
+                        })
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+                })?;
+            return addrs.first().copied();
+        }
         let (ips, _) = if local {
             resolver.lookup_local(host)?
         } else {
@@ -9534,7 +9606,7 @@ fn resolve_name(host: &str, port: u16, local: bool) -> Option<SocketAddr> {
         addrs
     } else {
         // The tuple asks the resolver for host and port directly: no `host:port` re-serialisation, no String, no port re-scan.
-        let addrs = resolve_bounded(host, port, budgets::dial(), |host, port| {
+        let addrs = resolve_bounded_watching(host, port, budgets::dial(), stop, |host, port| {
             (host, port)
                 .to_socket_addrs()
                 .map(std::iter::Iterator::collect)
@@ -9542,6 +9614,10 @@ fn resolve_name(host: &str, port: u16, local: bool) -> Option<SocketAddr> {
         remember_lookup(host, port, &addrs)
     };
     addrs.first().copied()
+}
+
+fn stopped(stop: Option<&AtomicBool>) -> bool {
+    stop.is_some_and(|stop| stop.load(Ordering::SeqCst))
 }
 
 fn mux_target_of(addr: SocketAddr) -> ferrox_core::mux::Target<'static> {

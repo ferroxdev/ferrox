@@ -1582,7 +1582,7 @@ fn serve_udp_stream(
             Ok((n, src)) => {
                 let datagram = &mut buf[SEAL_ROOM..SEAL_ROOM + n];
                 if let Some((dest, payload)) =
-                    open_datagram(&user.master, user.method, datagram, &mut hop)
+                    open_datagram_watching(&user.master, user.method, datagram, &mut hop, stop)
                 {
                     if by_dest.len() >= SS_UDP_DESTS {
                         by_dest.clear();
@@ -1689,6 +1689,9 @@ fn serve_udp_aead(
                 }
                 let Some((src, is_v6)) = *owner else {
                     for _ in 0..UDP_DRAIN {
+                        if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst)) {
+                            break;
+                        }
                         let Ok((n, src)) =
                             clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF])
                         else {
@@ -1699,9 +1702,13 @@ fn serve_udp_aead(
                         let mut bound = false;
                         if let Some(source) = sources.get_mut(&src) {
                             let user = &users[source.user];
-                            if let Some((dest, payload)) =
-                                open_datagram(&user.master, user.method, datagram, &mut source.hop)
-                            {
+                            if let Some((dest, payload)) = open_datagram_watching(
+                                &user.master,
+                                user.method,
+                                datagram,
+                                &mut source.hop,
+                                stop,
+                            ) {
                                 source.last = now;
                                 let uplink = if dest.is_ipv6() {
                                     source.v6.as_ref()
@@ -1718,7 +1725,7 @@ fn serve_udp_aead(
                             continue;
                         }
                         let Some((which, dest, payload)) =
-                            open_datagram_any(users, datagram, &mut probes)
+                            open_datagram_any_watching(users, datagram, &mut probes, stop)
                         else {
                             continue;
                         };
@@ -2138,6 +2145,16 @@ pub(crate) fn open_datagram<'a>(
     packet: &'a mut [u8],
     hop: &mut Option<Cipher>,
 ) -> Option<(SocketAddr, &'a [u8])> {
+    open_datagram_watching(master, method, packet, hop, None)
+}
+
+fn open_datagram_watching<'a>(
+    master: &MasterKey,
+    method: Method,
+    packet: &'a mut [u8],
+    hop: &mut Option<Cipher>,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<(SocketAddr, &'a [u8])> {
     if method.is_stream() {
         if packet.len() < IV_LEN + 1 {
             return None;
@@ -2147,7 +2164,7 @@ pub(crate) fn open_datagram<'a>(
         let key = rc4_md5_key(master.as_bytes(), &iv)?;
         let mut rc4 = Rc4::new(&key)?;
         rc4.crypt(&mut packet[IV_LEN..]);
-        let (target, used) = parse_addr_header(&packet[IV_LEN..])?;
+        let (target, used) = parse_addr_header_watching(&packet[IV_LEN..], stop)?;
         return Some((target, &packet[IV_LEN + used..]));
     }
     let salt_len = method.key_len();
@@ -2168,7 +2185,7 @@ pub(crate) fn open_datagram<'a>(
     };
     let body = &mut packet[salt_len..];
     let len = cipher.open_in_place(body)?;
-    let (target, used) = parse_addr_header(&body[..len])?;
+    let (target, used) = parse_addr_header_watching(&body[..len], stop)?;
     Some((target, &body[used..len]))
 }
 
@@ -2178,11 +2195,24 @@ pub(crate) fn open_datagram_any(
     packet: &mut [u8],
     hops: &mut [Option<Cipher>],
 ) -> Option<(usize, SocketAddr, std::ops::Range<usize>)> {
+    open_datagram_any_watching(users, packet, hops, None)
+}
+
+fn open_datagram_any_watching(
+    users: &[SsUser],
+    packet: &mut [u8],
+    hops: &mut [Option<Cipher>],
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<(usize, SocketAddr, std::ops::Range<usize>)> {
     let base = packet.as_ptr() as usize;
     for (which, user) in users.iter().enumerate() {
-        if let Some((target, payload)) =
-            open_datagram(&user.master, user.method, &mut *packet, &mut hops[which])
-        {
+        if let Some((target, payload)) = open_datagram_watching(
+            &user.master,
+            user.method,
+            &mut *packet,
+            &mut hops[which],
+            stop,
+        ) {
             let start = payload.as_ptr() as usize - base;
             return Some((which, target, start..start + payload.len()));
         }
@@ -2191,6 +2221,13 @@ pub(crate) fn open_datagram_any(
 }
 
 fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
+    parse_addr_header_watching(buf, None)
+}
+
+fn parse_addr_header_watching(
+    buf: &[u8],
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<(SocketAddr, usize)> {
     let kind = match buf.first()? {
         1 => crate::proxy::AddrKind::V4,
         4 => crate::proxy::AddrKind::V6,
@@ -2203,7 +2240,9 @@ fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
     let target = match body {
         crate::proxy::AddrBody::V4(ip) => SocketAddr::new(std::net::IpAddr::V4(ip.into()), port),
         crate::proxy::AddrBody::V6(ip) => SocketAddr::new(std::net::IpAddr::V6(ip.into()), port),
-        crate::proxy::AddrBody::Domain(host) => crate::proxy::resolve_endpoint(host, port)?,
+        crate::proxy::AddrBody::Domain(host) => {
+            crate::proxy::resolve_endpoint_watching(host, port, stop)?
+        }
     };
     Some((target, used))
 }
