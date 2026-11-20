@@ -41,6 +41,7 @@ jobs:
           echo "AR_aarch64_linux_android=$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> "$GITHUB_ENV"
           echo "CLANG_PATH=$clang" >> "$GITHUB_ENV"
           echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--target=aarch64-linux-android24" >> "$GITHUB_ENV"
+          echo "CMAKE_TOOLCHAIN_FILE_aarch64_linux_android=$ndk/build/cmake/android.toolchain.cmake" >> "$GITHUB_ENV"
       - name: compile the app for a VpnService host
         run: cargo check --locked -p ferrox-app --target aarch64-linux-android
 
