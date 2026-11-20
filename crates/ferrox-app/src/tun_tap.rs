@@ -55,7 +55,7 @@ impl Bridge {
 
     /// One Ethernet frame: an IP packet the handler may take, an ARP or neighbour answer to write
     /// back, or a frame the bridge drops.
-    pub(crate) fn accept(&self, frame: &[u8]) -> Accepted<'_> {
+    pub(crate) fn accept<'a>(&self, frame: &'a [u8]) -> Accepted<'a> {
         if frame.len() < HEADER_LEN {
             return Accepted::Ignore;
         }
