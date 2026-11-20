@@ -419,8 +419,7 @@ jobs:
           fetch_mb socks 10808 psiphon-socks-warm.bin "native socks warmup" || FAILED="$FAILED native(socks warm)"
           # A cold first fetch and a slow-start connection make an early leg
           # read lower than the lane carries. One warm-up fetch warms both
-          # sides of the tunnel before the measured pair, so the measured
-          # legs carry steady-state traffic.
+          # sides of the tunnel before the measured warm repeat.
           fetch_mb socks 10808 psiphon-socks-warm2.bin "native socks warm" || FAILED="$FAILED native(socks warm)"
           if [ -n "${PSIPHON_LIGHT_ENTRY:-}" ] && ! grep -q 'light proxy carried speed.cloudflare.com:443' psiphon-windows.log; then
             echo "native light FAILED: the ten-megabyte legs did not use the light proxy" >&2
@@ -509,8 +508,8 @@ jobs:
               REF_FAILED="$REF_FAILED http(unbound)"
             fi
             fetch_mb socks 10808 reference-socks-warm.bin "reference socks warmup" || REF_FAILED="$REF_FAILED socks(warm)"
-            # Same warm-up as the native lane, so both measured legs carry
-            # steady-state traffic.
+            # Same warm-up as the native lane, so the measured warm repeat
+            # carries steady-state traffic.
             fetch_mb socks 10808 reference-socks-warm2.bin "reference socks warm" || REF_FAILED="$REF_FAILED socks(warm)"
             sample_native "reference done" "$REFERENCE_ENGINE"
             if [ -n "$REF_FAILED" ]; then
@@ -628,8 +627,8 @@ jobs:
               print()
           print("The native lane and the engine `psiphon-windows` ships run back to")
           print("back on the same runner and the same ports; each carries 10 MB")
-          print("through its socks front, its HTTP front and a warm repeat after")
-          print("a warm-up fetch, so the measured legs carry steady-state traffic.")
+          print("through its socks front, its HTTP front and a measured warm")
+          print("repeat after a warm-up fetch.")
           print("The engine is pinned to the server and SSH/OSSH protocol the native")
           print("lane chose, so the ratio is the implementation and not a")
           print("different carrier. The route is the no-lane control in this run:")
@@ -690,7 +689,13 @@ jobs:
               print(f"| RSS KiB after the legs | {rss_native} | {rss_reference} | {rss_reference / rss_native:.2f}x |")
           else:
               print("| RSS KiB after the legs | n/a | n/a | n/a |")
-          if cpu_native is not None and cpu_reference is not None and cpu_native > 0:
+          measured = [
+              leg(f"{lane} {label}")
+              for lane in ("native", "reference")
+              for label in ("socks", "http", "socks warmup", "socks warm")
+          ]
+          complete = all(row and row[0] == 10000000 for row in measured)
+          if complete and cpu_native is not None and cpu_reference is not None and cpu_native > 0:
               print(f"| CPU s for 40 MB | {cpu_native:.2f} | {cpu_reference:.2f} | {cpu_reference / cpu_native:.2f}x |")
           else:
               print("| CPU s for 40 MB | n/a | n/a | n/a |")

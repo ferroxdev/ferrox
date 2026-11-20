@@ -270,6 +270,7 @@ jobs:
               "${previous[@]}"
             cp "$bundle/manifest.txt" "$results/"
             cp "$results/matrix-results.json" "$dest/"
+            cp "$bundle/table.md" "$bundle/table.csv" "$bundle/distribution.csv" "$dest/"
             cp "$bundle/table.md" "$bundle/table.csv" "$bundle/distribution.csv" "$results/"
             cp -R "$charts"/. "$dest/charts/"
             python3 scripts/validate-benchmark-matrix.py \
@@ -336,4 +337,4 @@ jobs:
         with:
           title: benchmark-matrix
           needs: ${{ toJSON(needs) }}
-          artifacts: benchmark-matrix-tables-*
+          artifacts: benchmark-matrix-tables-${{ github.run_id }}
