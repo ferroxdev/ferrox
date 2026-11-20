@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2146,7 +2146,7 @@ struct SessionState {
     upload_attached: bool,
     upload_done: bool,
     upload_fd: Option<crate::proxy::WaitFd>,
-    packets: BTreeMap<u64, Vec<u8>>,
+    packets: HashMap<u64, Vec<u8>>,
     next_seq: u64,
     ended: bool,
     downlink: bool,
@@ -2323,7 +2323,7 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
                     upload_attached: false,
                     upload_done: false,
                     upload_fd: None,
-                    packets: BTreeMap::new(),
+                    packets: HashMap::new(),
                     next_seq: 0,
                     ended: false,
                     downlink: false,
@@ -6766,6 +6766,39 @@ mod tests {
         declared.join().expect("joins the downlink service");
     }
 
+    /// The pending-packet map keeps its table, so a warm push-and-drain round reaches the allocator
+    /// not at all where a tree took a node per packet in every round.
+    #[test]
+    fn a_pending_packet_map_reuses_its_table_across_rounds() {
+        const PENDING: usize = 64;
+        let session = get_or_create_session("packet-map-reuse");
+        let mut payloads: Vec<Vec<u8>> = (0..PENDING).map(|_| vec![0u8; 32]).collect();
+        let mut cycle = |payloads: &mut Vec<Vec<u8>>| {
+            let mut seq = session.state.lock().expect("session lock").next_seq;
+            for payload in payloads.drain(..) {
+                assert!(
+                    session.push_packet(seq, payload, PENDING),
+                    "the map has room for the packet"
+                );
+                seq += 1;
+            }
+            let mut st = session.state.lock().expect("session lock");
+            for _ in 0..PENDING {
+                let next = st.next_seq;
+                let packet = st.packets.remove(&next).expect("the head packet");
+                st.next_seq += 1;
+                payloads.push(packet);
+            }
+        };
+        cycle(&mut payloads);
+        let ((), counts) = ferrox_core::alloc_count::measure(|| cycle(&mut payloads));
+        end_session("packet-map-reuse");
+        assert_eq!(
+            counts.allocs, 0,
+            "a warm pending-packet round reaches the allocator"
+        );
+    }
+
     /// A packet-up session whose downlink never arrives holds its packets forever; a later bind must start fresh rather than read a sequence from a flow that already stalled.
     #[test]
     fn a_packet_up_session_with_no_downlink_is_replaced_after_the_stall() {
@@ -7731,7 +7764,7 @@ mod tests {
                 upload_attached: false,
                 upload_done: false,
                 upload_fd: None,
-                packets: BTreeMap::new(),
+                packets: HashMap::new(),
                 next_seq: 0,
                 ended: true,
                 downlink: false,
@@ -7756,7 +7789,7 @@ mod tests {
                 upload_attached: false,
                 upload_done: false,
                 upload_fd: None,
-                packets: BTreeMap::new(),
+                packets: HashMap::new(),
                 next_seq: 0,
                 ended: true,
                 downlink: false,
@@ -7785,7 +7818,7 @@ mod tests {
                 upload_attached: false,
                 upload_done: false,
                 upload_fd: None,
-                packets: BTreeMap::new(),
+                packets: HashMap::new(),
                 next_seq: 0,
                 ended: false,
                 downlink: false,
@@ -7817,7 +7850,7 @@ mod tests {
                 upload_attached: false,
                 upload_done: false,
                 upload_fd: None,
-                packets: BTreeMap::new(),
+                packets: HashMap::new(),
                 next_seq: 0,
                 ended: false,
                 downlink: false,

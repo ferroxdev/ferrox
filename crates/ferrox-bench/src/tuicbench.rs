@@ -221,6 +221,96 @@ fn sink_section(out: &mut String) {
     let _ = writeln!(out, "| association map | {map_best:.1} |");
 }
 
+/// The xHTTP packet-up session's pending-packet map, priced as the session drives it: a push behind
+/// the window and the read that takes the head, at the pending depth the session caps itself at.
+const PENDING: u64 = 64;
+
+fn btree_cycle(
+    map: &mut std::collections::BTreeMap<u64, Vec<u8>>,
+    pool: &mut Vec<Vec<u8>>,
+    next: &mut u64,
+) -> usize {
+    let mut seq = *next;
+    for payload in pool.drain(..) {
+        map.insert(seq, payload);
+        seq += 1;
+    }
+    for _ in 0..PENDING {
+        let payload = map.remove(&*next).expect("the head packet");
+        *next += 1;
+        pool.push(payload);
+    }
+    usize::try_from(PENDING).expect("a pending depth")
+}
+
+fn hash_cycle(
+    map: &mut std::collections::HashMap<u64, Vec<u8>>,
+    pool: &mut Vec<Vec<u8>>,
+    next: &mut u64,
+) -> usize {
+    let mut seq = *next;
+    for payload in pool.drain(..) {
+        map.insert(seq, payload);
+        seq += 1;
+    }
+    for _ in 0..PENDING {
+        let payload = map.remove(&*next).expect("the head packet");
+        *next += 1;
+        pool.push(payload);
+    }
+    usize::try_from(PENDING).expect("a pending depth")
+}
+
+fn time_packet_map(mut run: impl FnMut() -> usize) -> f64 {
+    let start = Instant::now();
+    let packets = run();
+    start.elapsed().as_nanos() as f64 / packets as f64
+}
+
+fn packet_map_section(out: &mut String) {
+    let depth = usize::try_from(PENDING).expect("a pending depth");
+    let mut btree_pool: Vec<Vec<u8>> = (0..depth)
+        .map(|at| vec![u8::try_from(at).expect("a packet tag"); 32])
+        .collect();
+    let mut hash_pool = btree_pool.clone();
+    let mut btree = std::collections::BTreeMap::new();
+    let mut hashed = std::collections::HashMap::new();
+    let mut btree_next = 0u64;
+    let mut hash_next = 0u64;
+    let read_btree = btree_cycle(&mut btree, &mut btree_pool, &mut btree_next);
+    let read_hash = hash_cycle(&mut hashed, &mut hash_pool, &mut hash_next);
+    assert_eq!(read_btree, read_hash, "both drain the round whole");
+    assert_eq!(
+        btree_pool.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        hash_pool.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        "both hand the same payloads back in sequence order"
+    );
+    let mut btree_best = f64::MAX;
+    let mut hash_best = f64::MAX;
+    for round in 0..ROUNDS {
+        if round % 2 == 0 {
+            btree_best = btree_best.min(time_packet_map(|| {
+                btree_cycle(&mut btree, &mut btree_pool, &mut btree_next)
+            }));
+            hash_best = hash_best.min(time_packet_map(|| {
+                hash_cycle(&mut hashed, &mut hash_pool, &mut hash_next)
+            }));
+        } else {
+            hash_best = hash_best.min(time_packet_map(|| {
+                hash_cycle(&mut hashed, &mut hash_pool, &mut hash_next)
+            }));
+            btree_best = btree_best.min(time_packet_map(|| {
+                btree_cycle(&mut btree, &mut btree_pool, &mut btree_next)
+            }));
+        }
+    }
+    let _ = writeln!(out, "\n## xHTTP pending-packet map\n");
+    let _ = writeln!(out, "| path | ns/packet |");
+    let _ = writeln!(out, "|---|---:|");
+    let _ = writeln!(out, "| BTreeMap, {PENDING} pending | {btree_best:.1} |");
+    let _ = writeln!(out, "| HashMap, {PENDING} pending | {hash_best:.1} |");
+}
+
 pub(crate) fn report() -> String {
     let address = ferrox_core::tuic::address_port("example.com", 443).expect("an address");
     let payload = [7u8; 1200];
@@ -291,5 +381,6 @@ pub(crate) fn report() -> String {
     );
     sweep_section(&mut out);
     sink_section(&mut out);
+    packet_map_section(&mut out);
     out
 }
