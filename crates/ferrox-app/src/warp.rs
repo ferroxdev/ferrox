@@ -1034,14 +1034,10 @@ where
     let body = registration_body(&public, &tos, &serial);
     let headers = registration_headers(None);
     let headers = borrow_headers(&headers);
-    let reply = call("POST", "/reg", &headers, &body)
-        .map_err(|error| RegisterError::retryable(error.reason))?;
-    // A 2xx that names the device it made is not posted again: another host would mint a second.
+    let reply = call("POST", "/reg", &headers, &body)?;
+    // A 2xx is not posted again, even when its body is unreadable: another host would mint a second device.
     let registered = parse_registration(&reply).map_err(|error| {
-        let minted = (200..300).contains(&reply.status)
-            && crate::json::parse(&String::from_utf8_lossy(&reply.body))
-                .is_ok_and(|root| root.get("id").is_some() || root.get("token").is_some());
-        if minted {
+        if (200..300).contains(&reply.status) {
             RegisterError::fatal(error.reason)
         } else {
             error
@@ -4327,7 +4323,19 @@ mod tests {
             })
         };
         let error = register_with(&spec, false, &page).expect_err("not the API");
-        assert!(!error.fatal, "{}", error.reason);
+        assert!(error.fatal, "{}", error.reason);
+    }
+
+    /// A POST that may have created the device stops host fallback even when its response was lost.
+    #[test]
+    fn a_lost_registration_response_stops_host_fallback() {
+        let spec = WarpSpec::for_command(Mode::Auto, None, None);
+        let lost = |_: &str, _: &str, _: &[(&str, &str)], _: &[u8]| {
+            Err::<Reply, _>(RegisterError::fatal("the response was lost"))
+        };
+        let error = register_with(&spec, false, &lost).expect_err("the response is lost");
+        assert!(error.fatal, "{}", error.reason);
+        assert!(error.reason.contains("lost"), "{}", error.reason);
     }
 
     #[test]

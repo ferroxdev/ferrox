@@ -705,8 +705,17 @@ impl WireGuardOut {
 
     #[cfg(target_os = "linux")]
     fn query_kernel(&self, host: &str) -> Option<(Vec<IpAddr>, u32)> {
+        static LOCAL_DNS_WARNED: AtomicBool = AtomicBool::new(false);
         let kernel = self.kernel.as_ref()?;
         self.query_with(host, &|_source, server, name, qtype| {
+            if crate::wg_kernel::host_local(server) {
+                if !LOCAL_DNS_WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "wireguard: kernel mode cannot carry the host-local DNS server `{server}`; set `kernelMode: false` for the userspace stack"
+                    );
+                }
+                return None;
+            }
             self.exchange_kernel(kernel, server, name, qtype)
         })
     }

@@ -1475,7 +1475,8 @@ impl GrpcWriter {
                 crate::proxy::Push::Lost
             };
         }
-        let payload = message_payload(max.saturating_sub(1)).max(1);
+        let cap = usize::try_from(self.opening_cap()).unwrap_or(usize::MAX);
+        let payload = message_payload(max.saturating_sub(1).min(cap)).max(1);
         if self.multi {
             return self.try_send_multi(data, payload);
         }
@@ -5146,6 +5147,23 @@ mod tests {
         let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, 64);
         assert_eq!(writer.opening_cap(), 64);
         assert_eq!(writer.hunk_cap(), u64::MAX, "a plain batch is not cut");
+    }
+
+    /// The retrying half takes the same cap: a relay push must fit the opening window, or it parks
+    /// on credit the peer only grants for bytes it has already received.
+    #[test]
+    fn a_plain_try_send_fits_the_opening_window() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, 64);
+        let data: Vec<u8> = (0..100).map(|i| (i % 251) as u8).collect();
+        assert!(matches!(
+            writer.try_send(&data),
+            crate::proxy::Push::Took(n) if n > 0
+        ));
+        let peer = peer.lock().unwrap();
+        let body = data_body(&peer.writes[0]);
+        let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+        assert!(5 + len <= 64, "the message fits the peer's window");
     }
 
     /// The same batch driven over a real socket, where the only thing a loopback test can assert is
