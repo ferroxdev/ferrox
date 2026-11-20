@@ -23,9 +23,9 @@ on:
   workflow_dispatch:
     inputs:
       country:
-        description: country code to pin the dial at
+        description: country code to pin the dial at; empty uses the repository variable, then US
         required: false
-        default: US
+        default: ""
 
 # One account: a relay that downloads while the allowance probe brackets a
 # transfer charges the same counter, and the bracket would name the relay's

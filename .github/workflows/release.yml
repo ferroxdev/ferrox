@@ -356,13 +356,15 @@ jobs:
             `SHA256SUMS` lists every package; compare it with the matching line. Linux:
 
             ```bash
-            grep 'ferrox-VERSION_PLACEHOLDER-.*-linux-gnu.tar.gz' SHA256SUMS | sha256sum --check -
+            arch="$(uname -m)"
+            grep "ferrox-VERSION_PLACEHOLDER-$arch-linux-gnu.tar.gz" SHA256SUMS | sha256sum --check -
             ```
 
             macOS:
 
             ```bash
-            grep 'ferrox-VERSION_PLACEHOLDER-.*-apple-darwin.tar.gz' SHA256SUMS | shasum -a 256 -c -
+            arch="$(uname -m)"; [ "$arch" = arm64 ] && arch=aarch64
+            grep "ferrox-VERSION_PLACEHOLDER-$arch-apple-darwin.tar.gz" SHA256SUMS | shasum -a 256 -c -
             ```
 
             Windows:

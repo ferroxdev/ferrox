@@ -539,17 +539,21 @@ jobs:
             tail -n 60 psiphon-reference.log >&2 || true
             echo "reference failed 0 0 0" >> psiphon-legs.tsv
           else
-            printf 'reference ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
-            sample_process "reference ready" "$LANE_PID"
             REF_FAILED=""
-            trace_front socks 10808 "reference socks" || REF_FAILED="$REF_FAILED socks(trace)"
-            fetch_mb socks 10808 reference-socks.bin "reference socks" || REF_FAILED="$REF_FAILED socks"
+            REF_HTTP=""
             if wait_front http 10809 120; then
-              trace_front http 10809 "reference http" || REF_FAILED="$REF_FAILED http(trace)"
-              fetch_mb http 10809 reference-http.bin "reference http" || REF_FAILED="$REF_FAILED http"
+              REF_HTTP=1
             else
               echo "::warning::the console client's HTTP proxy carried no trace in 120s"
               REF_FAILED="$REF_FAILED http(unbound)"
+            fi
+            printf 'reference ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
+            sample_process "reference ready" "$LANE_PID"
+            trace_front socks 10808 "reference socks" || REF_FAILED="$REF_FAILED socks(trace)"
+            fetch_mb socks 10808 reference-socks.bin "reference socks" || REF_FAILED="$REF_FAILED socks"
+            if [ -n "$REF_HTTP" ]; then
+              trace_front http 10809 "reference http" || REF_FAILED="$REF_FAILED http(trace)"
+              fetch_mb http 10809 reference-http.bin "reference http" || REF_FAILED="$REF_FAILED http"
             fi
             fetch_mb socks 10808 reference-socks-warm.bin "reference socks warm" || REF_FAILED="$REF_FAILED socks(warm)"
             sample_process "reference done" "$LANE_PID"
@@ -674,11 +678,11 @@ jobs:
           print("| --- | ---: | ---: | ---: |")
 
           def rate(row):
-              return f"{row[2] / 1048576:.2f}" if row else "n/a"
+              return f"{row[2] / 1048576:.2f}" if row and row[0] == 10000000 else "n/a"
 
           for label in ("socks", "http", "socks warm"):
               native, reference = leg(f"native {label}"), leg(f"reference {label}")
-              ratio = f"{native[2] / reference[2]:.2f}x" if native and reference and reference[2] > 0 else "n/a"
+              ratio = f"{native[2] / reference[2]:.2f}x" if native and reference and native[0] == 10000000 and reference[0] == 10000000 and reference[2] > 0 else "n/a"
               print(f"| {label} MiB/s | {rate(native)} | {rate(reference)} | {ratio} |")
           native, reference = leg("native ready"), leg("reference ready")
           ratio = f"{reference[1] / native[1]:.2f}x" if native and reference and native[1] > 0 else "n/a"

@@ -43,9 +43,9 @@ on:
   workflow_dispatch:
     inputs:
       country:
-        description: country code to pin the dial at
+        description: country code to pin the dial at; empty uses the repository variable, then US
         required: false
-        default: US
+        default: ""
       ref:
         description: commit or branch to test (empty means the dispatched ref)
         required: false
@@ -139,7 +139,7 @@ jobs:
           FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
           FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
           FOXY_CODE: ${{ secrets.FOXY_CODE }}
-          FOXY_COUNTRY: ${{ inputs.country || 'US' }}
+          FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
         run: |
           BIN=target/debug/ferrox-app
           if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
@@ -184,7 +184,7 @@ jobs:
       - name: Download 1 MB through every carrier
         if: steps.secrets.outputs.present == 'true'
         env:
-          FOXY_COUNTRY: ${{ inputs.country || 'US' }}
+          FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
           FOXY_DEBUG: 1
         run: |
           BIN=target/debug/ferrox-app
@@ -213,7 +213,7 @@ jobs:
           # A lane that died is named at once: the old pid-file read could only say the file
           # existed, then polled a port nothing was going to open for three minutes.
           wait_port() {
-            local pid="$1" want="$2" stop_at=$((SECONDS + 30))
+            local pid="$1" want="$2" stop_at=$((SECONDS + $(cap 30)))
             while ((SECONDS < stop_at)); do
               kill -0 "$pid" 2>/dev/null || return 1
               WANT="$want" python3 -c 'import os, socket; socket.create_connection(("127.0.0.1", int(os.environ["WANT"])), timeout=1).close()' 2>/dev/null && return 0
@@ -223,6 +223,11 @@ jobs:
           }
           sha_of() {
             python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"
+          }
+          cap() {
+            local left=$((LEG_END - SECONDS))
+            (( left > 0 )) || left=1
+            (( left < $1 )) && printf '%s' "$left" || printf '%s' "$1"
           }
           : > ferrox-relay.log
           # Every carrier is attempted even when one fails, so one bad method cannot hide
@@ -236,8 +241,8 @@ jobs:
           reserve=45
           for carrier in h1 h2 h3 auto; do
             leg=$((leg + 1))
-            leg_end=$((DEADLINE - (legs - leg) * reserve))
-            if ((leg_end <= SECONDS)); then
+            LEG_END=$((DEADLINE - (legs - leg) * reserve))
+            if ((LEG_END <= SECONDS)); then
               echo "carrier $carrier skipped: the step's budget is spent" >&2
               FAILED="$FAILED $carrier(budget)"
               continue
@@ -245,7 +250,7 @@ jobs:
             # A port per carrier, because a lane that outlives its stop still holds the
             # listener its successor would bind.
             PORT=$((SOCKS_PORT + leg - 1))
-            echo "== carrier $carrier on $PORT, $((leg_end - SECONDS))s =="
+            echo "== carrier $carrier on $PORT, $((LEG_END - SECONDS))s =="
             CARRIER="$carrier" PORT="$PORT" python3 -c 'import json,os; token=json.load(open("foxy-pass.json"))["pass"]; json.dump({"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"pass":token,"country":os.environ["FOXY_COUNTRY"],"carrier":os.environ["CARRIER"],"exitProbe":"www.cloudflare.com/cdn-cgi/trace"}}]}, open("foxy-relay.json","w"))'
             chmod 600 foxy-relay.json
             "$BIN" run -c foxy-relay.json >> ferrox-relay.log 2>&1 &
@@ -267,7 +272,7 @@ jobs:
             # lane behind a second attempt's cached answer, so a stall fails this
             # leg by name instead of scrolling past in a green job.
             code=0
-            trace_timing=$(curl -sS --fail --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
+            trace_timing=$(curl -sS --fail --max-time "$(cap 15)" --socks5-hostname "127.0.0.1:$PORT" \
               -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
               https://www.cloudflare.com/cdn-cgi/trace -o trace.txt) || code=$?
             echo "trace $carrier ${trace_timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
@@ -281,7 +286,7 @@ jobs:
             grep -E '^(loc|ip)=' trace.txt || true
             code=0
             : > "file-$carrier.bin"
-            timing=$(curl -sS --fail --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
+            timing=$(curl -sS --fail --max-time "$(cap 60)" --socks5-hostname "127.0.0.1:$PORT" \
               -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
               'https://speed.cloudflare.com/__down?bytes=1000000' -o "file-$carrier.bin") || code=$?
             echo "carrier $carrier ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
@@ -299,7 +304,7 @@ jobs:
               for flow in 2 3; do
                 code=0
                 : > "file-$carrier-w$flow.bin"
-                timing=$(curl -sS --fail --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
+                timing=$(curl -sS --fail --max-time "$(cap 60)" --socks5-hostname "127.0.0.1:$PORT" \
                   -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                   'https://speed.cloudflare.com/__down?bytes=200000' -o "file-$carrier-w$flow.bin") || code=$?
                 echo "carrier $carrier warm$flow ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
@@ -324,7 +329,7 @@ jobs:
               if [ "${{ matrix.os }}" = "ubuntu-latest" ] && { [ "$carrier" = h3 ] || [ "$carrier" = h2 ]; }; then
                 code=0
                 : > "bulk-$carrier.bin"
-                timing=$(curl -sS --fail --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
+                timing=$(curl -sS --fail --max-time "$(cap 120)" --socks5-hostname "127.0.0.1:$PORT" \
                   -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                   'https://speed.cloudflare.com/__down?bytes=10485760' -o "bulk-$carrier.bin") || code=$?
                 echo "carrier $carrier bulk ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
@@ -408,7 +413,7 @@ jobs:
       - name: Every front and chained edge dial carries 1 MB
         if: steps.secrets.outputs.present == 'true'
         env:
-          FOXY_COUNTRY: ${{ inputs.country || 'US' }}
+          FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
           FOXY_DEBUG: 1
         run: |
           BIN=target/debug/ferrox-app
@@ -429,13 +434,18 @@ jobs:
           stop_lane() { stop_pid "$LANE_PID"; LANE_PID=""; rm -f ferrox-relay.pid; }
           stop_hop() { stop_pid "$HOP_PID"; HOP_PID=""; rm -f foxy-hop.pid; }
           wait_port() {
-            local pid="$1" want="$2" stop_at=$((SECONDS + 30))
+            local pid="$1" want="$2" stop_at=$((SECONDS + $(cap 30)))
             while ((SECONDS < stop_at)); do
               kill -0 "$pid" 2>/dev/null || return 1
               WANT="$want" python3 -c 'import os, socket; socket.create_connection(("127.0.0.1", int(os.environ["WANT"])), timeout=1).close()' 2>/dev/null && return 0
               sleep 0.5
             done
             return 1
+          }
+          cap() {
+            local left=$((LEG_END - SECONDS))
+            (( left > 0 )) || left=1
+            (( left < $1 )) && printf '%s' "$left" || printf '%s' "$1"
           }
           legs=6
           leg=0
@@ -455,11 +465,11 @@ jobs:
             : > trace-lane.txt
             code=0
             if [ "$FRONT" = http ]; then
-              timing=$(curl -sS --fail --max-time 15 -x "http://127.0.0.1:$PORT" \
+              timing=$(curl -sS --fail --max-time "$(cap 15)" -x "http://127.0.0.1:$PORT" \
                 -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                 https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt) || code=$?
             else
-              timing=$(curl -sS --fail --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
+              timing=$(curl -sS --fail --max-time "$(cap 15)" --socks5-hostname "127.0.0.1:$PORT" \
                 -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                 https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt) || code=$?
             fi
@@ -475,11 +485,11 @@ jobs:
             code=0
             : > "$FILE"
             if [ "$FRONT" = http ]; then
-              timing=$(curl -sS --fail --max-time 60 -x "http://127.0.0.1:$PORT" \
+              timing=$(curl -sS --fail --max-time "$(cap 60)" -x "http://127.0.0.1:$PORT" \
                 -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                 'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE") || code=$?
             else
-              timing=$(curl -sS --fail --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
+              timing=$(curl -sS --fail --max-time "$(cap 60)" --socks5-hostname "127.0.0.1:$PORT" \
                 -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                 'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE") || code=$?
             fi
@@ -589,7 +599,7 @@ jobs:
         # restarts the lane on its own port, so a failure names its leg.
         if: steps.secrets.outputs.present == 'true' && matrix.os == 'ubuntu-latest'
         env:
-          FOXY_COUNTRY: ${{ inputs.country || 'US' }}
+          FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
           FOXY_DEBUG: 1
         run: |
           BIN=target/debug/ferrox-app
@@ -609,7 +619,7 @@ jobs:
             rm -f ferrox-relay.pid
           }
           wait_port() {
-            local pid="$1" want="$2" stop_at=$((SECONDS + 30))
+            local pid="$1" want="$2" stop_at=$((SECONDS + $(cap 30)))
             while ((SECONDS < stop_at)); do
               kill -0 "$pid" 2>/dev/null || return 1
               WANT="$want" python3 -c 'import os, socket; socket.create_connection(("127.0.0.1", int(os.environ["WANT"])), timeout=1).close()' 2>/dev/null && return 0
@@ -638,6 +648,11 @@ jobs:
             leg=$((leg + 1))
             LEG_END=$((DEADLINE - (legs - leg) * reserve))
           }
+          cap() {
+            local left=$((LEG_END - SECONDS))
+            (( left > 0 )) || left=1
+            (( left < $1 )) && printf '%s' "$left" || printf '%s' "$1"
+          }
           # One attempt, timed, its curl exit taken at face value: a retry here
           # would hide a stalling lane behind a cached second answer.
           trace_socks() {
@@ -646,7 +661,7 @@ jobs:
             # answered must fail on its own trace, not grep the previous step's.
             : > trace-lane.txt
             code=0
-            timing=$(curl -sS --fail --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
+            timing=$(curl -sS --fail --max-time "$(cap 15)" --socks5-hostname "127.0.0.1:$PORT" \
               -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
               https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt) || code=$?
             echo "$LABEL trace ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
@@ -665,7 +680,7 @@ jobs:
             trace_socks "$PORT" DE "second country DE" || FAILED="$FAILED de(trace)"
             de_code=0
             : > file-de.bin
-            de_timing=$(curl -sS --fail --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
+            de_timing=$(curl -sS --fail --max-time "$(cap 120)" --socks5-hostname "127.0.0.1:$PORT" \
               -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
               'https://speed.cloudflare.com/__down?bytes=1000000' -o file-de.bin) || de_code=$?
             echo "second country DE ${de_timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
@@ -808,7 +823,7 @@ jobs:
             # A fast connect proves egress; a refusal proves the target, and any
             # UDP verdict below must be read against this line. Names only, no
             # literals: the fixture gate forbids routable addresses in the tree.
-            curl -v --max-time 12 --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
+            curl -v --max-time "$(cap 12)" --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
             SOCKS_PORT="$PORT" python3 udp-probe.py || FAILED="$FAILED udp-auto(datagram)"
           else
             echo "udp auto FAILED: the lane never listened" >&2
@@ -823,7 +838,7 @@ jobs:
           PORT=10819
           if start_lane socks "$PORT" h2 "$COUNTRY"; then
             trace_socks "$PORT" "$COUNTRY" "udp h2" || FAILED="$FAILED udp-h2(trace)"
-            curl -v --max-time 12 --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
+            curl -v --max-time "$(cap 12)" --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
             SOCKS_PORT="$PORT" python3 udp-probe.py || FAILED="$FAILED udp-h2(datagram)"
           else
             echo "udp h2 FAILED: the lane never listened" >&2

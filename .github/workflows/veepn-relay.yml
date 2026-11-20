@@ -84,6 +84,7 @@ jobs:
       - name: Egress control - 1 MB with no lane
         run: |
           : > veepn-legs.tsv
+          : > control.bin
           code=0
           timing=$(curl -sS --noproxy '*' --max-time 300 \
             -w '%{size_download} %{time_total} %{speed_download}' \

@@ -33,7 +33,7 @@ jobs:
           manifest-path: Cargo.toml
           deny-path: deny.toml
           command: check advisories bans licenses sources
-          use-lockfile: true
+          arguments: --all-features --locked
 
   result:
     name: result

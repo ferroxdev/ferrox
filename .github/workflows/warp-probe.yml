@@ -126,13 +126,14 @@ jobs:
                           if reply:
                               self.conn.send_headers(sid, [(":status", str(status)), ("content-type", "application/json")])
                               self.conn.send_data(sid, payload, True)
-                      relay("orig", body)
-                      if method == "PATCH":
+                          relay("orig", body)
+                          self.flush()
+                          if method == "PATCH":
                           try:
                               parsed = json.loads(body)
                               keypem = subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout"], capture_output=True, check=True).stdout
                               pubpem = subprocess.run(["openssl", "pkey", "-pubout"], input=keypem, capture_output=True, check=True).stdout
-                              fresh = pubpem.decode().splitlines()[1]
+                              fresh = "".join(pubpem.decode().splitlines()[1:-1])
                               parsed["key"] = fresh
                               relay("mutated-key", json.dumps(parsed, separators=(",", ":")).encode(), reply=False)
                           except Exception as e:
@@ -198,6 +199,7 @@ jobs:
           cargo build --locked --release -p ferrox-app
           bin=target/release/ferrox-app
           echo "---- ours over the local echo ----"
+          rm -f warp-identity.json
           "$bin" warp-register --api https://127.0.0.1:8443/v0a4471 2>&1 | tail -3 || true
           sleep 1
           echo "---- the reference over the local echo ----"
