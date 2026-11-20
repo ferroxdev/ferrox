@@ -2269,7 +2269,7 @@ fn socket_table_names(path: &std::path::Path) -> Option<bool> {
             }
             match staged_owner(listed) {
                 Some(owner) => {
-                    if owner == path && inode == Some(listed_inode) {
+                    if owner == path {
                         return Some(true);
                     }
                 }
@@ -2439,7 +2439,7 @@ fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
                         if std::path::Path::new(listed) == path {
                             return Some(true);
                         }
-                        match staged_owner(listed) {
+                        match staged_owner(listed.as_bytes()) {
                             Some(owner) => {
                                 if owner == path {
                                     return Some(true);
@@ -3223,7 +3223,7 @@ fn staged_name(path: &std::path::Path) -> std::path::PathBuf {
 
 #[cfg(windows)]
 fn bind_unix(path: &std::path::Path) -> io::Result<Listener> {
-    let before = std::fs::symlink_metadata(path).ok();
+    let before = windows_file_id(path).ok();
     match std::fs::symlink_metadata(path) {
         Ok(_) if !is_unix_socket(path)? => {
             return Err(io::Error::new(
@@ -3291,12 +3291,64 @@ fn windows_socket_state(path: &std::path::Path) -> WindowsSocket {
 }
 
 /// Delete the abandoned socket through the handle that verified its tag and identity.
+/// The volume and file identity a handle names, so a replacement is not mistaken for the socket checked.
+#[cfg(windows)]
+fn windows_file_id_handle(file: &std::fs::File) -> io::Result<(u64, [u8; 16])> {
+    use std::os::windows::io::AsRawHandle as _;
+    #[repr(C)]
+    struct FileIdInfo {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandleEx(
+            handle: *mut core::ffi::c_void,
+            class: i32,
+            info: *mut core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    let mut info = FileIdInfo {
+        volume_serial_number: 0,
+        file_id: [0; 16],
+    };
+    // SAFETY: the handle is live and `info` is the class's structure.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            18,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FileIdInfo>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((info.volume_serial_number, info.file_id))
+}
+
+#[cfg(windows)]
+fn windows_file_id(path: &std::path::Path) -> io::Result<(u64, [u8; 16])> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_SHARE_ALL: u32 = 0x7;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    windows_file_id_handle(&file)
+}
+
 #[cfg(windows)]
 fn windows_delete_stale(
     path: &std::path::Path,
-    before: Option<&std::fs::Metadata>,
+    before: Option<&(u64, [u8; 16])>,
 ) -> io::Result<()> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsRawHandle as _;
     const DELETE: u32 = 0x0001_0000;
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
@@ -3338,11 +3390,9 @@ fn windows_delete_stale(
             "a unix listen path was replaced by a file that is not a socket",
         ));
     }
-    let meta = file.metadata()?;
-    if before.is_some_and(|before| {
-        before.volume_serial_number() != meta.volume_serial_number()
-            || before.file_index() != meta.file_index()
-    }) {
+    if before
+        .is_some_and(|before| windows_file_id_handle(&file).is_ok_and(|current| current != *before))
+    {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             "a unix listen path was replaced while binding",
