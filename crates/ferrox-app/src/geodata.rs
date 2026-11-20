@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const IDLE: Duration = Duration::from_secs(30);
-const MAX_DOWNLOAD: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_DOWNLOAD: u64 = 256 * 1024 * 1024;
 /// One decompressed asset is written in chunks of this size, never as one buffer.
 const COPY_BUFFER: usize = 64 * 1024;
 const MAX_HEAD_LINE: usize = 8192;
@@ -880,6 +880,29 @@ fn fetch(url: &str, outbound: &Outbound, writer: &mut impl Write) -> Result<(), 
     Err("stopped after 20 redirects".to_owned())
 }
 
+/// A remote rule set's bytes, dialled directly rather than through an outbound: the routing block
+/// is parsed before the outbound registry exists, so the fetch cannot name a lane yet.
+pub(crate) fn fetch_remote(url: &str) -> Result<Vec<u8>, String> {
+    let mut current = url.to_owned();
+    for _ in 0..20 {
+        let response = request_any(&current, None)?;
+        if (300..400).contains(&response.status) {
+            let location = response
+                .header("location")
+                .ok_or_else(|| "redirected without a Location header".to_owned())?;
+            current = resolve_location(&current, location)?;
+            continue;
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(format!("unexpected status code: {}", response.status));
+        }
+        let mut body = Vec::new();
+        write_body(&response, &mut body)?;
+        return Ok(body);
+    }
+    Err("stopped after 20 redirects".to_owned())
+}
+
 #[derive(Debug)]
 struct Response {
     status: u16,
@@ -897,13 +920,25 @@ impl Response {
 }
 
 fn request(url: &str, outbound: &Outbound) -> Result<Response, String> {
+    request_any(url, Some(outbound))
+}
+
+fn request_any(url: &str, outbound: Option<&Outbound>) -> Result<Response, String> {
     let url = HttpUrl::parse(url)?;
-    if !url.tls {
+    if outbound.is_some() && !url.tls {
         return Err("geodata asset url must be https".to_owned());
     }
-    let destination = Destination::Name(url.host.clone(), url.port);
-    let stream = crate::proxy::probe_stream(outbound, &destination, IDLE)
-        .ok_or_else(|| format!("cannot dial {}", url.authority))?;
+    let stream = match outbound {
+        Some(outbound) => {
+            let destination = Destination::Name(url.host.clone(), url.port);
+            crate::proxy::probe_stream(outbound, &destination, IDLE)
+                .ok_or_else(|| format!("cannot dial {}", url.authority))?
+        }
+        None => direct_stream(&url)?,
+    };
+    if !url.tls {
+        return exchange(&url, stream);
+    }
     let config = ferrox_core::tls::TlsConfig {
         server_name: url.host.clone(),
         alpn: vec![b"http/1.1".to_vec()].into(),
@@ -914,15 +949,45 @@ fn request(url: &str, outbound: &Outbound) -> Result<Response, String> {
     let mut session = ferrox_core::tls::RustlsProvider::connect(&config, stream)
         .map_err(|error| error.to_string())?;
     session.handshake().map_err(|error| error.to_string())?;
+    exchange(&url, session)
+}
+
+fn direct_stream(url: &HttpUrl) -> Result<crate::conn::Connection, String> {
+    use std::net::ToSocketAddrs as _;
+    let mut last = None;
+    for address in (url.host.as_str(), url.port)
+        .to_socket_addrs()
+        .map_err(|error| format!("cannot resolve {}: {error}", url.authority))?
+    {
+        match std::net::TcpStream::connect_timeout(&address, IDLE) {
+            Ok(stream) => {
+                stream
+                    .set_read_timeout(Some(IDLE))
+                    .map_err(|error| error.to_string())?;
+                stream
+                    .set_write_timeout(Some(IDLE))
+                    .map_err(|error| error.to_string())?;
+                return Ok(crate::conn::Connection::Tcp(stream));
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(match last {
+        Some(error) => format!("cannot dial {}: {error}", url.authority),
+        None => format!("cannot resolve {}", url.authority),
+    })
+}
+
+fn exchange<S: Read + Write>(url: &HttpUrl, mut stream: S) -> Result<Response, String> {
     let head = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
         url.path, url.authority
     );
-    session
+    stream
         .write_all(head.as_bytes())
         .map_err(|error| error.to_string())?;
-    session.flush().map_err(|error| error.to_string())?;
-    read_response(&mut session)
+    stream.flush().map_err(|error| error.to_string())?;
+    read_response(&mut stream)
 }
 
 /// One head line, bounded: `read_line` grows a `String` without limit, so a malicious
