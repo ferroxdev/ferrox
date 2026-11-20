@@ -2241,7 +2241,7 @@ fn refused_socket_is_stale(path: &std::path::Path) -> bool {
     socket_table_names(path) == Some(false)
 }
 
-/// Whether the kernel still has a unix socket bound to `path`, in the evidence each host offers.
+/// Whether the kernel still has a listening unix socket bound to `path`, in the evidence each host offers.
 #[cfg(unix)]
 fn socket_table_names(path: &std::path::Path) -> Option<bool> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2252,17 +2252,15 @@ fn socket_table_names(path: &std::path::Path) -> Option<bool> {
             table
                 .lines()
                 .skip(1)
-                .filter_map(proc_unix_path)
-                .any(|listed| listed == text),
+                .filter_map(proc_unix_entry)
+                .any(|(listed, listening)| {
+                    listening && (listed == text || staged_path_matches(listed, path))
+                }),
         )
     }
     #[cfg(target_os = "macos")]
     {
-        macos_socket_table().map(|table| {
-            let mut needle = path.as_os_str().as_encoded_bytes().to_vec();
-            needle.push(0);
-            table.windows(needle.len()).any(|window| window == needle)
-        })
+        macos_socket_table().is_some_and(|table| macos_table_names(&table, path))
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
@@ -2271,19 +2269,82 @@ fn socket_table_names(path: &std::path::Path) -> Option<bool> {
     }
 }
 
+/// A row's path and whether the socket is still accepting, so an accepted connection's copied address is not mistaken for a listener.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn proc_unix_path(line: &str) -> Option<&str> {
-    let mut rest = line.trim_start();
-    for _ in 0..7 {
-        let at = rest.find(char::is_whitespace)?;
-        rest = rest[at..].trim_start();
+fn proc_unix_entry(line: &str) -> Option<(&str, bool)> {
+    let mut fields = line.split_whitespace();
+    let _num = fields.next()?;
+    let _ref_count = fields.next()?;
+    let _protocol = fields.next()?;
+    let flags = fields.next()?;
+    let _kind = fields.next()?;
+    let _state = fields.next()?;
+    let _inode = fields.next()?;
+    let listed = fields.next()?;
+    let listening = u32::from_str_radix(flags, 16).ok()? & 0x0001_0000 != 0;
+    Some((listed, listening))
+}
+
+/// A staged bind's PCB keeps the private `.ferrox-*/s` name, so a matching sibling still names this path.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn staged_path_matches(listed: &str, path: &std::path::Path) -> bool {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return false;
+    };
+    let listed = std::path::Path::new(listed);
+    let Some(dir) = listed.parent() else {
+        return false;
+    };
+    let Some(name) = dir.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return false;
+    };
+    listed.file_name().is_some_and(|file| file == "s")
+        && dir.parent() == Some(parent)
+        && name.starts_with(".ferrox-")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_table_names(table: &[u8], path: &std::path::Path) -> bool {
+    const HEADER: usize = 24;
+    const PATH_OFFSET: usize = 106;
+    const OPTIONS_OFFSET: usize = 630;
+    const RECORD: usize = OPTIONS_OFFSET + 2;
+    let mut at = HEADER;
+    while at + 4 <= table.len() {
+        let len =
+            u32::from_le_bytes([table[at], table[at + 1], table[at + 2], table[at + 3]]) as usize;
+        if len < 4 || at + len > table.len() {
+            return false;
+        }
+        if len >= RECORD {
+            let record = &table[at..at + len];
+            let options = u16::from_le_bytes([record[OPTIONS_OFFSET], record[OPTIONS_OFFSET + 1]]);
+            if options & 0x0002 != 0 {
+                let raw = &record[PATH_OFFSET..];
+                if let Some(end) = raw.iter().position(|byte| *byte == 0) {
+                    if let Ok(listed) = std::str::from_utf8(&raw[..end]) {
+                        if std::path::Path::new(listed) == path || staged_path_matches(listed, path)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        if len == HEADER {
+            return false;
+        }
+        at += len;
     }
-    (!rest.is_empty()).then_some(rest)
+    false
 }
 
 #[cfg(target_os = "macos")]
 fn macos_socket_table() -> Option<Vec<u8>> {
-    let name = c"net.local.stream.pcblist";
+    let name = c"net.local.stream.pcblist64";
     let mut len = 0usize;
     // SAFETY: the name is NUL-terminated and the null pointers ask only for the required size.
     let asked = unsafe {
@@ -2299,7 +2360,7 @@ fn macos_socket_table() -> Option<Vec<u8>> {
         return None;
     }
     let mut table = vec![0u8; len];
-    // SAFETY: `table` is writable for `len` bytes and `len` is the same length the probe found.
+    // SAFETY: `table` is writable for `len` bytes and `len` is a little over what the probe found.
     let read = unsafe {
         sysctlbyname(
             name.as_ptr(),
@@ -4473,6 +4534,58 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("binds a socket");
         drop(listener);
         assert!(probe_unix(&path).is_ok(), "an abandoned socket is stale");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An accepted connection keeps the listener's name in the kernel table, but only a listening socket makes the path live.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_probe_recovers_after_its_listener_closes_with_a_connection_open() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-accepted-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("binds a socket");
+        let client = std::os::unix::net::UnixStream::connect(&path).expect("connects a client");
+        let (accepted, _) = listener.accept().expect("accepts the client");
+        drop(listener);
+        assert_eq!(
+            socket_table_names(&path),
+            Some(false),
+            "an accepted connection is not a listener"
+        );
+        assert!(probe_unix(&path).is_ok(), "the path is stale and reusable");
+        drop(accepted);
+        drop(client);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A mode publishes the path by hard link, but the PCB keeps the private `.ferrox-*/s` name, which still names the live listener.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_table_keeps_a_live_staged_listener() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-staged-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let target = parse_target(&format!("unix:{},0750", path.display())).expect("parses");
+        let listener = Listener::bind(&target).expect("binds under the staged mode");
+        assert_eq!(
+            socket_table_names(&path),
+            Some(true),
+            "the staged name still names the published listener"
+        );
+        assert!(
+            probe_unix(&path).is_err(),
+            "the live listener keeps its path"
+        );
+        drop(listener);
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
