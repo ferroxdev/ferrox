@@ -1482,15 +1482,14 @@ impl GrpcWriter {
                 crate::proxy::Push::Lost
             };
         }
-        let opening = usize::try_from(self.opening_cap()).unwrap_or(usize::MAX);
-        let payload = message_payload(max.saturating_sub(1).min(opening)).max(1);
+        let cap = usize::try_from(self.opening_cap()).unwrap_or(usize::MAX);
+        let payload = message_payload(max.saturating_sub(1).min(cap)).max(1);
         if self.multi {
             return self.try_send_multi(data, payload);
         }
-        // A read the window covers now leaves as one Hunk spanning frames; a read past it splits into frame-sized messages as the credit returns.
-        let room = usize::try_from(self.window_now()).unwrap_or(usize::MAX);
-        let step = if room > max {
-            message_cap(room).max(payload)
+        // A read the opening window pays for leaves as one Hunk spanning frames; a write past it splits at the cap.
+        let step = if cap > max {
+            message_cap(cap).max(payload)
         } else {
             payload
         };
@@ -1547,22 +1546,26 @@ impl GrpcWriter {
         }
     }
 
-    /// The most bytes one relay read should hand this writer: a read the window covers leaves as
-    /// one message the peer can pay for, sized so its envelope and tag fit the credit exactly. A
-    /// window too small for that message reads the whole relay grain, so an exhausted window keeps
-    /// the read ahead of it and the writer splits into frame-sized messages as the credit returns.
+    /// The most bytes one relay read should hand this writer: a write reads no more than the credit
+    /// the peer has left, so the read leaves as one message the peer can pay for rather than one it
+    /// parks on. The envelopes and tags of a four-element `64 KiB` read cost at most `64` bytes; one
+    /// `Hunk` costs at most `16`, and the same `16` leaves a `64 KiB` read one message.
     pub(crate) fn read_window(&self) -> usize {
-        let available = usize::try_from(self.window_now()).unwrap_or(usize::MAX);
-        if !self.multi {
-            let fits = message_cap(available).max(1);
-            return if fits >= crate::proxy::RELAY_SMALL_BUFFER {
-                fits.min(crate::proxy::RELAY_BUFFER)
-            } else {
-                crate::proxy::RELAY_BUFFER
-            };
-        }
-        let margin = if available > 16_375 { 64 } else { 16 };
-        available
+        let init = self.opening_cap();
+        let send = self
+            .shared
+            .send
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let stream = u64::try_from(send.stream.max(0)).unwrap_or(0);
+        let available = init.min(send.conn).min(stream);
+        let margin = if self.multi && available > 16_375 {
+            64
+        } else {
+            16
+        };
+        let limit = usize::try_from(available).unwrap_or(usize::MAX);
+        limit
             .saturating_sub(margin)
             .clamp(1, crate::proxy::RELAY_BUFFER)
     }
@@ -1874,18 +1877,6 @@ impl GrpcWriter {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         (*init).clamp(1, 65_535)
-    }
-
-    /// What the peer's window covers now, capped at the opening window it granted.
-    fn window_now(&self) -> u64 {
-        let init = self.opening_cap();
-        let send = self
-            .shared
-            .send
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let stream = u64::try_from(send.stream.max(0)).unwrap_or(0);
-        init.min(send.conn).min(stream)
     }
 
     /// The batch-flush ceiling a muxed peer's opening window sets; a plain stream keeps the whole
@@ -4617,7 +4608,7 @@ mod tests {
         let peer = Arc::new(Mutex::new(Peer::default()));
         let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, u64::MAX);
         let read = writer.read_window();
-        assert_eq!(read, 65_526, "the opening window's read, less the envelope");
+        assert_eq!(read, 65_519, "the opening window's read, less the envelope");
         let data: Vec<u8> = (0..read).map(|i| (i % 251) as u8).collect();
         let body = message(&data);
         let hunks = body.len().div_ceil(HUNK);
@@ -5179,12 +5170,6 @@ mod tests {
         let body = data_body(&peer.writes[0]);
         let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
         assert!(5 + len <= 64, "the message fits the peer's window");
-        drop(peer);
-        assert_eq!(
-            writer.read_window(),
-            crate::proxy::RELAY_BUFFER,
-            "a window too small for one Hunk reads the whole relay grain"
-        );
     }
 
     /// A plain stream's opening window is the same ceiling: a message past it would wait for credit
@@ -5212,12 +5197,6 @@ mod tests {
         let body = data_body(&peer.writes[0]);
         let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
         assert!(5 + len <= 64, "the message fits the peer's window");
-        drop(peer);
-        assert_eq!(
-            writer.read_window(),
-            crate::proxy::RELAY_BUFFER,
-            "a window too small for one Hunk reads the whole relay grain"
-        );
     }
 
     /// The same batch driven over a real socket, where the only thing a loopback test can assert is
