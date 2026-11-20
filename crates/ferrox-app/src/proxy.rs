@@ -46827,7 +46827,7 @@ mod tests {
             }),
             Box::new(|| {}),
         );
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + crate::budgets::handshake() + Duration::from_secs(5);
         while !ran.load(Ordering::SeqCst) && Instant::now() < until {
             thread::sleep(Duration::from_millis(1));
         }
