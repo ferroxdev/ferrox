@@ -63,6 +63,7 @@ fn walk_drain(mut buf: Vec<u8>) -> usize {
     }
 }
 
+/// The worker's `MAX_SESSIONS`, so the sweep prices a map that can exist.
 const SESSIONS: usize = 1024;
 
 fn sweep_list(ids: &[usize], seen: &mut Vec<usize>) -> usize {
