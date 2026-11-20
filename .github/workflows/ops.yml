@@ -97,12 +97,14 @@ jobs:
         if: steps.provision.outcome == 'success'
         env:
           RUSTFLAGS: -C debuginfo=line-tables-only
+          METHODS: ${{ needs.plan.outputs.methods }}
+          REASON: ${{ needs.plan.outputs.reason }}
         run: |
           mkdir -p target
           {
             echo '# per-method retired instructions, informational'
             echo
-            echo "Scope: ${{ needs.plan.outputs.methods || 'the whole tree' }} -- ${{ needs.plan.outputs.reason }}"
+            echo "Scope: ${METHODS:-the whole tree} -- $REASON"
           } > target/method-ops.md
           python3 scripts/ci-scope.py rows > .ferrox/scope-rows.txt
           # One call, so one build of the two test binaries serves every row: the
@@ -126,6 +128,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/result
         with:
           title: ops
