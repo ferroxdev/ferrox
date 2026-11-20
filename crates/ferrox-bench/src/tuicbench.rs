@@ -165,6 +165,62 @@ fn sweep_section(out: &mut String) {
     );
 }
 
+/// The tap lookup a received datagram makes, priced at the 256 associations the serving side caps a
+/// session at: scanned against a list, or found in a map.
+const SINKS: usize = 256;
+
+fn sink_scan(taps: &[(u16, usize)], association: u16) -> Option<usize> {
+    for &(tap, at) in taps {
+        if tap == association {
+            return Some(at);
+        }
+    }
+    None
+}
+
+fn time_sink(mut lookup: impl FnMut(usize) -> Option<usize>) -> f64 {
+    let start = Instant::now();
+    for index in 0..PACKETS {
+        let _ = black_box(lookup(black_box(index % SINKS)));
+    }
+    start.elapsed().as_nanos() as f64 / PACKETS as f64
+}
+
+fn sink_section(out: &mut String) {
+    let taps: Vec<(u16, usize)> = (0..SINKS)
+        .map(|at| (u16::try_from(at).expect("a tap") * 3, at))
+        .collect();
+    let map: std::collections::HashMap<u16, usize> = taps.iter().copied().collect();
+    for at in [0usize, SINKS / 2, SINKS - 1] {
+        assert_eq!(
+            sink_scan(&taps, taps[at].0),
+            map.get(&taps[at].0).copied(),
+            "both find the same tap"
+        );
+    }
+    assert_eq!(
+        sink_scan(&taps, u16::MAX),
+        None,
+        "a stray association is not a tap"
+    );
+    let mut scan_best = f64::MAX;
+    let mut map_best = f64::MAX;
+    for round in 0..ROUNDS {
+        if round % 2 == 0 {
+            scan_best = scan_best.min(time_sink(|at| sink_scan(&taps, taps[at].0)));
+            map_best = map_best.min(time_sink(|at| map.get(&taps[at].0).copied()));
+        } else {
+            map_best = map_best.min(time_sink(|at| map.get(&taps[at].0).copied()));
+            scan_best = scan_best.min(time_sink(|at| sink_scan(&taps, taps[at].0)));
+        }
+    }
+    let _ = writeln!(out, "\n## TUIC sink lookup\n");
+    let _ = writeln!(out, "| path | ns/datagram |");
+    let _ = writeln!(out, "|---|---:|");
+    let _ = writeln!(out, "| list scan, {SINKS} taps | {scan_best:.1} |");
+    let _ = writeln!(out, "| association map | {map_best:.1} |");
+}
+
 pub(crate) fn report() -> String {
     let address = ferrox_core::tuic::address_port("example.com", 443).expect("an address");
     let payload = [7u8; 1200];
@@ -234,5 +290,6 @@ pub(crate) fn report() -> String {
         offset_best / BURST as f64
     );
     sweep_section(&mut out);
+    sink_section(&mut out);
     out
 }

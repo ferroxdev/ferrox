@@ -113,7 +113,7 @@ struct Lane {
     next_uni: AtomicU64,
     next_assoc: AtomicU16,
     stop: Arc<AtomicBool>,
-    sinks: Mutex<Vec<Arc<UdpSink>>>,
+    sinks: Mutex<HashMap<u16, Arc<UdpSink>>>,
     pending: Mutex<Vec<Pending>>,
     session: Arc<Mutex<Option<Vec<u8>>>>,
     heartbeat: thread::Thread,
@@ -399,7 +399,7 @@ impl TuicOut {
             next_uni: AtomicU64::new(6),
             next_assoc: AtomicU16::new(0),
             stop,
-            sinks: Mutex::new(Vec::new()),
+            sinks: Mutex::new(HashMap::new()),
             pending: Mutex::new(Vec::new()),
             session: Arc::clone(&self.session),
             heartbeat,
@@ -521,7 +521,7 @@ impl TuicOut {
         let mut tries = 0usize;
         let association = loop {
             let candidate = lane.next_assoc.fetch_add(1, Ordering::Relaxed);
-            if !sinks.iter().any(|sink| sink.association == candidate) {
+            if !sinks.contains_key(&candidate) {
                 break candidate;
             }
             tries += 1;
@@ -535,7 +535,7 @@ impl TuicOut {
             source: Mutex::new(None),
             last: Mutex::new(Instant::now()),
         });
-        sinks.push(Arc::clone(&sink));
+        sinks.insert(association, Arc::clone(&sink));
         drop(sinks);
         let cancelled = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
@@ -626,7 +626,7 @@ impl TuicOut {
             }
         }
         if let Ok(mut sinks) = lane.sinks.lock() {
-            sinks.retain(|held| !Arc::ptr_eq(held, &sink));
+            sinks.remove(&sink.association);
         }
         finished.store(true, Ordering::Relaxed);
         if let Some(watcher) = watcher {
@@ -1149,22 +1149,22 @@ fn dispatch_client(
     let Ok(packet) = wire::parse_packet(data) else {
         return;
     };
-    let Ok(sinks) = lane.sinks.lock() else {
+    let sink = lane
+        .sinks
+        .lock()
+        .ok()
+        .and_then(|sinks| sinks.get(&packet.association).cloned());
+    let Some(sink) = sink else {
         return;
     };
-    for sink in sinks.iter() {
-        if sink.association != packet.association {
-            continue;
-        }
-        client_reply(
-            &packet,
-            reassembly,
-            &sink.source,
-            &sink.last,
-            &sink.reply,
-            head,
-        );
-    }
+    client_reply(
+        &packet,
+        reassembly,
+        &sink.source,
+        &sink.last,
+        &sink.reply,
+        head,
+    );
 }
 
 fn client_reply(
