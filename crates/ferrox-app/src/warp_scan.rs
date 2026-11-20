@@ -373,18 +373,25 @@ where
                 if done.load(Ordering::Relaxed) || Instant::now() >= deadline {
                     break;
                 }
-                let next = if early_lane {
+                let edge = if early_lane {
                     early
                         .get(early_index.fetch_add(1, Ordering::Relaxed))
                         .copied()
+                        .or_else(|| {
+                            candidates
+                                .get(index.fetch_add(1, Ordering::Relaxed))
+                                .copied()
+                        })
                 } else {
-                    None
-                };
-                let edge = next.or_else(|| {
                     candidates
                         .get(index.fetch_add(1, Ordering::Relaxed))
                         .copied()
-                });
+                        .or_else(|| {
+                            early
+                                .get(early_index.fetch_add(1, Ordering::Relaxed))
+                                .copied()
+                        })
+                };
                 let Some(edge) = edge else {
                     break;
                 };
@@ -759,6 +766,49 @@ mod tests {
             .collect();
         assert_eq!(hosts, ["192.0.2.1", "192.0.2.2"]);
         assert_eq!(enumerate_cidr("10.0.0.0/8"), Vec::<Ipv4Addr>::new());
+    }
+
+    #[test]
+    fn an_idle_worker_picks_up_a_fallback_edge() {
+        let first: SocketAddr = "192.0.2.1:500".parse().expect("an early edge");
+        let second: SocketAddr = "192.0.2.2:500".parse().expect("an early edge");
+        let primary: Vec<SocketAddr> = (1..=19)
+            .map(|host| {
+                format!("198.51.100.{host}:443")
+                    .parse()
+                    .expect("a primary edge")
+            })
+            .collect();
+        let started = AtomicBool::new(false);
+        let caught = AtomicBool::new(false);
+        let found = hunt_with_early(
+            primary,
+            vec![first, second],
+            ScanMode::Turbo,
+            &HashSet::new(),
+            |edge| {
+                if edge == first {
+                    started.store(true, Ordering::SeqCst);
+                    let wait = Instant::now();
+                    while !caught.load(Ordering::SeqCst) && wait.elapsed() < Duration::from_secs(2)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    None
+                } else if edge == second {
+                    caught.store(true, Ordering::SeqCst);
+                    Some(Duration::from_millis(1))
+                } else {
+                    let wait = Instant::now();
+                    while !started.load(Ordering::SeqCst) && wait.elapsed() < Duration::from_secs(2)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    None
+                }
+            },
+        );
+        assert_eq!(found, vec![(second, Duration::from_millis(1))]);
     }
 
     #[test]
