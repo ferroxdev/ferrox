@@ -1012,6 +1012,7 @@ impl Device {
     }
 
     /// A host's descriptor for the blocking handler: duplicated and close-on-exec, with the flags the host set kept.
+    #[cfg(unix)]
     pub(crate) fn from_host_fd(fd: i32, mtu: usize) -> io::Result<Self> {
         Self::dup_fd(fd, mtu, false)
     }

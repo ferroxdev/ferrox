@@ -44219,7 +44219,10 @@ mod tests {
             let wanted = spec(&format!(r#"{{"{key}":7}}"#)).expect("a descriptor");
             assert_eq!(wanted.fd(), Some(7), "{key}");
         }
-        assert_eq!(spec(r#"{"address":"198.18.0.1"}"#).expect("no fd").fd(), None);
+        assert_eq!(
+            spec(r#"{"address":"198.18.0.1"}"#).expect("no fd").fd(),
+            None
+        );
     }
 
     #[test]
