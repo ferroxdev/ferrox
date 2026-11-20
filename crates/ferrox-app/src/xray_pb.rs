@@ -3785,7 +3785,8 @@ fn strategy_weight(bytes: &[u8]) -> Result<Json, String> {
 }
 
 /// `RoutingService.AddRule`'s request: the router Config a call carries and whether its rules
-/// append to the live table or replace it. The reference reads only `Rule` from that config.
+/// append to the live table or replace it. A balancer cannot be built from the live table, so a
+/// request carrying one is refused before any rule changes.
 pub(crate) fn add_rule_request(bytes: &[u8]) -> Result<(Vec<Json>, bool), String> {
     let mut reader = Reader::new(bytes, "xray.app.router.command.AddRuleRequest");
     let mut config = None;
@@ -3804,6 +3805,9 @@ pub(crate) fn add_rule_request(bytes: &[u8]) -> Result<(Vec<Json>, bool), String
         }
     }
     let config = config.ok_or_else(|| "AddRule: config type error".to_owned())?;
+    if config.get("balancers").is_some() {
+        return Err("AddRule: balancers are not carried".to_owned());
+    }
     let rules = match config.get("rules") {
         Some(Json::Arr(rules)) => rules.clone(),
         _ => Vec::new(),
@@ -3816,7 +3820,8 @@ pub(crate) fn add_rule_request(bytes: &[u8]) -> Result<(Vec<Json>, bool), String
 #[allow(clippy::too_many_lines)]
 fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.app.router.RoutingRule");
-    let mut target = None;
+    let mut outbound = None;
+    let mut balancer = None;
     let mut rule_tag = None;
     let mut domains = Vec::new();
     let mut ips = Vec::new();
@@ -3836,14 +3841,14 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     let mut webhook = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 2) => target = Some(("outboundTag", account_text(&mut reader)?)),
+            (1, 2) => outbound = Some(account_text(&mut reader)?),
             (2, 2) => domains.push(Json::Str(domain_rule(reader.bytes()?)?)),
             (7, 2) => users.push(Json::Str(account_text(&mut reader)?)),
             (8, 2) => inbound_tags.push(Json::Str(account_text(&mut reader)?)),
             (9, 2) => protocols.push(Json::Str(account_text(&mut reader)?)),
             (10, 2) => ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
             (11, 2) => source_ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
-            (12, 2) => target = Some(("balancerTag", account_text(&mut reader)?)),
+            (12, 2) => balancer = Some(account_text(&mut reader)?),
             (13, 0) => networks.push(Json::Str(network_name(reader.varint()?)?.to_owned())),
             (13, 2) => {
                 let mut packed = Reader::new(reader.bytes()?, "xray.common.net.Network");
@@ -3864,8 +3869,15 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let (key, tag) =
-        target.ok_or("xray.app.router.RoutingRule: names neither an outbound nor a balancer")?;
+    let (key, tag) = match (outbound, balancer) {
+        (Some(tag), _) => ("outboundTag", tag),
+        (None, Some(tag)) => ("balancerTag", tag),
+        (None, None) => {
+            return Err(
+                "xray.app.router.RoutingRule: names neither an outbound nor a balancer".to_owned(),
+            )
+        }
+    };
     let mut pairs = vec![(key, Json::Str(tag))];
     if let Some(rule_tag) = rule_tag {
         pairs.push(("ruleTag", Json::Str(rule_tag)));
@@ -8917,6 +8929,33 @@ mod tests {
             process: None,
         };
         assert_eq!(routing.route(&flow), Some("blocked"));
+    }
+
+    /// Both target fields are not a well-formed oneof, but wire order must not
+    /// choose the lane: the outbound wins as it does in the JSON spelling.
+    #[test]
+    fn a_pb_rule_with_both_targets_uses_the_outbound() {
+        for rule in [
+            message(&[bytes_field(1, b"node"), bytes_field(12, b"pool")]),
+            message(&[bytes_field(12, b"pool"), bytes_field(1, b"node")]),
+        ] {
+            let json = router_rule(&rule).expect("decodes");
+            assert_eq!(json.get("outboundTag").and_then(Json::as_str), Some("node"));
+            assert!(json.get("balancerTag").is_none());
+        }
+    }
+
+    /// A management rule update cannot install a balancer, so it refuses the call instead of
+    /// resetting the table and dropping the requested balancer.
+    #[test]
+    fn an_add_rule_request_with_a_balancer_is_refused() {
+        let balancer = message(&[bytes_field(1, b"pool"), bytes_field(2, b"node")]);
+        let config = message(&[bytes_field(3, &balancer)]);
+        let request = message(&[bytes_field(1, &typed("xray.app.router.Config", &config))]);
+        assert_eq!(
+            add_rule_request(&request).expect_err("refused"),
+            "AddRule: balancers are not carried"
+        );
     }
 
     /// A pb balancer reaches the same table the JSON spelling does: the rule's
