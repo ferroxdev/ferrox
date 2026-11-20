@@ -675,6 +675,7 @@ fn serve_inbounds_counted(
             for address in bind {
                 BIND_FAILED.with(|failed| failed.set(false));
                 let was = inbounds;
+                let mut wake_address = address.clone();
                 match protocol {
                     "vless" => {
                         if serve_vless_inbound(
@@ -942,10 +943,11 @@ fn serve_inbounds_counted(
                             address,
                             handler_stop.as_ref(),
                         ) {
-                            Ok(_) => {
+                            Ok(port) => {
                                 inbounds += 1;
+                                wake_address = swapped_port(address, port);
                                 if let Some(stop) = &handler_stop {
-                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                    handler_stops.push((Arc::clone(stop), wake_address.clone()));
                                 }
                             }
                             Err(reason) => eprintln!("masque inbound {address}: {reason}"),
@@ -954,7 +956,7 @@ fn serve_inbounds_counted(
                     _ => eprintln!("unsupported inbound protocol `{protocol}` in {label}"),
                 }
                 if inbounds > was {
-                    armed_addresses.push(address.clone());
+                    armed_addresses.push(wake_address);
                 }
                 if fallible && (BIND_FAILED.with(std::cell::Cell::get) || inbounds == was) {
                     bind_failure = true;
@@ -1305,6 +1307,14 @@ impl Stop {
             closed = next.0;
         }
         true
+    }
+}
+
+/// Replace an ephemeral port with the one the listener actually bound, so a wake can reach it.
+fn swapped_port(address: &str, port: u16) -> String {
+    match address.rsplit_once(':') {
+        Some((host, _)) => format!("{host}:{port}"),
+        None => address.to_owned(),
     }
 }
 

@@ -544,11 +544,14 @@ fn fragments_udp_allowing_empty<'a>(
     if message.frags != 1 {
         return Err(RequestError::Invalid);
     }
-    let capacity = max
+    let room = max
         .checked_sub(message.header_len())
-        .filter(|room| *room > 0)
         .ok_or(RequestError::Invalid)?;
     let empty = message.payload.is_empty();
+    let capacity = if empty { room.max(1) } else { room };
+    if capacity == 0 {
+        return Err(RequestError::Invalid);
+    }
     let total = if empty {
         1
     } else {
@@ -1564,6 +1567,10 @@ mod tests {
             .expect("fragments")
             .collect();
         assert_eq!(frags, vec![message]);
+        let exact: Vec<_> = fragments_udp_allow_empty(&message, message.header_len())
+            .expect("a head-sized datagram carries the empty payload")
+            .collect();
+        assert_eq!(exact, vec![message]);
         let mut wire = Vec::new();
         encode_udp_unchecked(&message, &mut wire);
         assert_eq!(decode_udp(&wire), Err(RequestError::Invalid));
