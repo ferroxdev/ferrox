@@ -3873,6 +3873,34 @@ mod tests {
         assert!(asked.contains(&"203.0.113.8".parse().unwrap()));
     }
 
+    /// The stream half of `dns_mode: hijack` on this stack: `handoff` dials `hijack`, which moves only a port-53 destination to the resolver and leaves every other port where it was.
+    #[test]
+    fn a_hijacked_stream_dial_moves_only_a_port_53_destination() {
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.1".parse().unwrap()],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(false),
+            no_kernel_tun: true,
+            large_segments: false,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, _replies) = std::sync::mpsc::channel();
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let stack = ServerStack::new(&config, to_tunnel, out, 0)
+            .with_dns_hijack(Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(
+            stack.hijack("203.0.113.7:53".parse().expect("asked")),
+            "127.0.0.1:53".parse().expect("resolver")
+        );
+        assert_eq!(
+            stack.hijack("203.0.113.7:443".parse().expect("asked")),
+            "203.0.113.7:443".parse().expect("asked")
+        );
+    }
+
     /// A server datagram lane carries its payload through the freedom outbound.
     #[test]
     fn a_server_datagram_lane_echoes_through_freedom() {
