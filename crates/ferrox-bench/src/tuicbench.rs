@@ -63,6 +63,33 @@ fn walk_drain(mut buf: Vec<u8>) -> usize {
     }
 }
 
+const SESSIONS: usize = 4096;
+
+fn sweep_list(ids: &[usize]) -> usize {
+    let mut seen: Vec<usize> = Vec::new();
+    let mut visited = 0;
+    for &id in ids {
+        if seen.iter().any(|held| *held == id) {
+            continue;
+        }
+        seen.push(id);
+        visited += 1;
+    }
+    visited
+}
+
+fn sweep_set(ids: &[usize]) -> usize {
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    let mut visited = 0;
+    for &id in ids {
+        if !seen.insert(id) {
+            continue;
+        }
+        visited += 1;
+    }
+    visited
+}
+
 fn measure<A, B>(
     mut first: impl FnMut(&[u8]) -> A,
     mut second: impl FnMut(&[u8]) -> B,
@@ -151,6 +178,43 @@ pub(crate) fn report() -> String {
         "| offset, one drain | {:.1} | {:.1} |",
         offset_best / 1000.0,
         offset_best / BURST as f64
+    );
+    let ids: Vec<usize> = (0..SESSIONS).map(|n| n * 64 + 1).collect();
+    let mut list_best = f64::MAX;
+    let mut set_best = f64::MAX;
+    for round in 0..ROUNDS {
+        if round % 2 == 0 {
+            let start = Instant::now();
+            let listed = black_box(sweep_list(black_box(&ids)));
+            list_best = list_best.min(start.elapsed().as_nanos() as f64);
+            let start = Instant::now();
+            let hashed = black_box(sweep_set(black_box(&ids)));
+            set_best = set_best.min(start.elapsed().as_nanos() as f64);
+            assert_eq!(listed, hashed, "both sweeps visit every session once");
+        } else {
+            let start = Instant::now();
+            let hashed = black_box(sweep_set(black_box(&ids)));
+            set_best = set_best.min(start.elapsed().as_nanos() as f64);
+            let start = Instant::now();
+            let listed = black_box(sweep_list(black_box(&ids)));
+            list_best = list_best.min(start.elapsed().as_nanos() as f64);
+            assert_eq!(listed, hashed, "both sweeps visit every session once");
+        }
+    }
+    let _ = writeln!(out, "\n## TUIC sweep dedupe\n");
+    let _ = writeln!(out, "| path | ms/sweep | ns/session |");
+    let _ = writeln!(out, "|---|---:|---:|");
+    let _ = writeln!(
+        out,
+        "| list scan | {:.3} | {:.1} |",
+        list_best / 1_000_000.0,
+        list_best / SESSIONS as f64
+    );
+    let _ = writeln!(
+        out,
+        "| identity set | {:.3} | {:.1} |",
+        set_best / 1_000_000.0,
+        set_best / SESSIONS as f64
     );
     out
 }

@@ -364,7 +364,7 @@ struct Shared {
     next_id: AtomicU32,
     settings_received: AtomicBool,
     peer_version: AtomicU32,
-    padding: Mutex<Padding>,
+    padding: Mutex<Arc<Padding>>,
     pending: Mutex<Option<Vec<u8>>>,
     packet_count: AtomicU32,
     send_padding: AtomicBool,
@@ -390,7 +390,7 @@ impl Shared {
             next_id: AtomicU32::new(1),
             settings_received: AtomicBool::new(false),
             peer_version: AtomicU32::new(0),
-            padding: Mutex::new(padding),
+            padding: Mutex::new(Arc::new(padding)),
             pending: Mutex::new(None),
             packet_count: AtomicU32::new(0),
             send_padding: AtomicBool::new(!server),
@@ -459,11 +459,10 @@ impl Shared {
             return writer.flush();
         }
         let count = self.packet_count.fetch_add(1, Ordering::Relaxed) + 1;
-        let padding = self
-            .padding
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        let padding = {
+            let held = self.padding.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(&held)
+        };
         if count >= padding.stop {
             self.send_padding.store(false, Ordering::Relaxed);
             writer.write_all(packet)?;
@@ -1254,7 +1253,7 @@ fn read_loop(reader: &mut dyn Read, shared: &Arc<Shared>) {
                     *shared
                         .padding
                         .lock()
-                        .unwrap_or_else(PoisonError::into_inner) = padding;
+                        .unwrap_or_else(PoisonError::into_inner) = Arc::new(padding);
                 }
             }
             ALERT => {
@@ -1588,6 +1587,33 @@ mod tests {
         assert_eq!(bytes[10], WASTE);
         assert_eq!(u16::from_be_bytes([bytes[15], bytes[16]]), 83);
         assert!(bytes[17..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn a_frame_does_not_copy_the_padding_scheme() {
+        struct Null;
+        impl Write for Null {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        fn cost(padding: Padding) -> ferrox_core::alloc_count::Counts {
+            let shared = Shared::new(Box::new(Null), padding, false);
+            let ((), counts) = ferrox_core::alloc_count::measure(|| {
+                shared.write_frame(PSH, 1, b"abc").expect("writes");
+            });
+            counts
+        }
+        let _ = a_size(1, 2);
+        let wide = cost(Padding::default_scheme());
+        let narrow = cost(Padding::new(b"stop=8\n1=100-100").expect("parses"));
+        assert_eq!(
+            wide.allocs, narrow.allocs,
+            "a frame pays for its packet, not for a copy of the scheme"
+        );
     }
 
     #[test]
