@@ -675,20 +675,6 @@ fn read_limit(gso: bool, mss: usize, room: usize) -> usize {
     }
 }
 
-/// Whether this segment earns a standalone ACK. A full segment in a run waits for the next one, so a bulk upload answers one ACK per two segments; a short, trimmed or refused segment, a FIN, a duplicate and any pending bytes still get one at once, because a peer waiting on one of those has nothing else to send.
-fn ack_due(fin: bool, payload: usize, sent: usize, skip: usize, mss: u32, unacked: u32) -> bool {
-    let remaining = payload.saturating_sub(skip);
-    let fresh = remaining > 0;
-    fin || (payload > 0 && !fresh)
-        || skip > 0
-        || (fresh
-            && (sent == 0
-                || sent < remaining
-                || remaining < mss as usize
-                || unacked >= 2 * mss.max(1)))
-        || (!fresh && unacked > 0)
-}
-
 /// How long a queue waits for an answer that follows its own upload: an echo replies inside this window on this bench's own p50, and past it the response thread's read is the cheaper waiter, so a queue that carries a second flow holds it for less.
 const PING_PONG_SPIN: std::time::Duration = std::time::Duration::from_micros(40);
 
@@ -2424,8 +2410,6 @@ impl Handler {
             let len = payload.len() as u32;
             // What the queue served behind the upload: an answer already carries this segment's ack, a refused one ends the flow.
             let mut served = Served::None;
-            let mut sent = 0;
-            let mut skip = 0;
             // A pure ACK only moves the window: it never touches the upload half, so it takes no pipe lock.
             if !payload.is_empty() || fin {
                 let mut guard = flow
@@ -2439,7 +2423,7 @@ impl Handler {
                 // A device retransmits and can reorder, so only the bytes past `rcv_nxt` reach the proxy: a duplicate is dropped and an overlapping segment is trimmed, never written twice. The trim and the store sit inside the pipe's lock because a second queue can be handed the same flow at the same time.
                 let rcv = flow.rcv_nxt.load(Relaxed);
                 let gap = rcv.wrapping_sub(tcp.seq);
-                skip = if i32::try_from(gap).is_ok() {
+                let skip = if i32::try_from(gap).is_ok() {
                     gap as usize
                 } else {
                     usize::MAX
@@ -2448,7 +2432,7 @@ impl Handler {
                 if skip < payload.len() {
                     flow.busy.store(true, Relaxed);
                     // The cursor moves by what the pipe accepted, so a short or refused write is the device's to retransmit; the read leg still delivers what the relay wrote before it closed.
-                    sent = half.write(&payload[skip..]).unwrap_or(0);
+                    let sent = half.write(&payload[skip..]).unwrap_or(0);
                     end = rcv.wrapping_add(sent as u32);
                     flow.rcv_nxt.store(end, Relaxed);
                     if sent > 0 && !fin {
@@ -2465,7 +2449,7 @@ impl Handler {
                 self.retire(&flow, Some(FLAG_RST | FLAG_ACK));
                 return Ok(());
             }
-            // A full segment in a run waits for the next one; a duplicate, a short tail or a FIN cannot wait, or the peer has nothing left to send that would carry the ACK.
+            // Every data segment or FIN gets an ACK: a segment without PSH must not wait for a later one that may never come, and a duplicate still has to stop a retransmit.
             let unacked = flow
                 .rcv_nxt
                 .load(Relaxed)
@@ -2473,14 +2457,7 @@ impl Handler {
             if let Served::Ack(ack) = served {
                 // The response carried this segment's ack, so the standalone one would only repeat it, and the cursor stored is the one that left rather than whatever another queue advanced meanwhile.
                 flow.last_acked.store(ack, Relaxed);
-            } else if ack_due(
-                fin,
-                payload.len(),
-                sent,
-                skip,
-                flow.mss.load(Relaxed),
-                unacked,
-            ) {
+            } else if fin || !payload.is_empty() || unacked > 0 {
                 self.emit_ack(
                     &flow,
                     (ip.destination, tcp.destination_port),
@@ -4270,31 +4247,6 @@ mod tests {
             read_gate: Mutex::new(()),
             upload_finished: UploadFinished::default(),
         }
-    }
-
-    #[test]
-    fn a_full_segment_in_a_run_waits_for_the_one_after_it() {
-        assert!(!ack_due(false, 1460, 1460, 0, 1460, 1460));
-        assert!(ack_due(false, 1460, 1460, 0, 1460, 2920));
-        assert!(ack_due(false, 4, 4, 0, 1460, 4), "a short tail is answered");
-        assert!(
-            ack_due(false, 1460, 0, 0, 1460, 1460),
-            "a refused write is answered"
-        );
-        assert!(
-            ack_due(false, 1460, 0, 1460, 1460, 0),
-            "a duplicate is answered"
-        );
-        assert!(
-            ack_due(false, 1460, 10, 1450, 1460, 0),
-            "an overlap is answered"
-        );
-        assert!(ack_due(true, 0, 0, 0, 1460, 0), "a FIN is answered");
-        assert!(
-            ack_due(false, 0, 0, 0, 1460, 1460),
-            "pending bytes are answered"
-        );
-        assert!(!ack_due(false, 0, 0, 0, 1460, 0), "a pure ACK owes nothing");
     }
 
     /// The queue takes the answer its own upload earned: bytes already sitting in the lane leave as one segment that carries the request's ack and the cursor moves by what it carried, and a caller that expects no answer is handed nothing rather than waited on.
