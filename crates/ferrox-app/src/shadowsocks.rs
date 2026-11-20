@@ -2190,14 +2190,6 @@ fn open_datagram_watching<'a>(
 }
 
 /// Open one wire datagram against every client: the first whose tag verifies names the flow and seals its replies, and a failed probe leaves the buffer untouched because the tag is checked before the body opens.
-pub(crate) fn open_datagram_any(
-    users: &[SsUser],
-    packet: &mut [u8],
-    hops: &mut [Option<Cipher>],
-) -> Option<(usize, SocketAddr, std::ops::Range<usize>)> {
-    open_datagram_any_watching(users, packet, hops, None)
-}
-
 fn open_datagram_any_watching(
     users: &[SsUser],
     packet: &mut [u8],
@@ -2802,7 +2794,7 @@ mod tests {
         .collect();
         let mut hops: Vec<Option<Cipher>> = users.iter().map(|_| None).collect();
         let mut wire = seal_to_wire(&users[1].master, users[1].method, &target, b"ping");
-        let (which, got, payload) = open_datagram_any(&users, &mut wire, &mut hops)
+        let (which, got, payload) = open_datagram_any_watching(&users, &mut wire, &mut hops, None)
             .expect("the second client's datagram opens");
         assert_eq!(which, 1, "the matched client names the flow");
         assert_eq!(got, target);
@@ -2834,7 +2826,7 @@ mod tests {
             b"ping",
         );
         let mut wire = stranger;
-        assert!(open_datagram_any(&users, &mut wire, &mut hops).is_none());
+        assert!(open_datagram_any_watching(&users, &mut wire, &mut hops, None).is_none());
     }
 
     /// Each source answers on its own association: two clients naming one destination reach the

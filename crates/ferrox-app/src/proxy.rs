@@ -9290,9 +9290,12 @@ where
         };
         match receiver.recv_timeout(slice) {
             Ok(Ok(addrs)) => return (!stopped(stop)).then_some(addrs),
-            Ok(Err(_)) => return None,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if slice < left => continue,
-            Err(_) => return None,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if slice >= left {
+                    return None;
+                }
+            }
+            Ok(Err(_)) | Err(_) => return None,
         }
     }
 }
