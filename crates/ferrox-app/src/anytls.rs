@@ -123,19 +123,14 @@ impl Padding {
         }
     }
 
-    fn steps(&self, packet: u32) -> Vec<PaddingSize> {
-        self.records
-            .get(&packet)
-            .map(|steps| {
-                steps
-                    .iter()
-                    .map(|step| match step {
-                        PaddingStep::Check => PaddingSize::Check,
-                        PaddingStep::Range(low, high) => PaddingSize::Bytes(a_size(*low, *high)),
-                    })
-                    .collect()
+    /// The record's steps, each length drawn as the packet reaches it: a short packet never draws the ranges it does not consume.
+    fn steps(&self, packet: u32) -> impl Iterator<Item = PaddingSize> + '_ {
+        self.records.get(&packet).into_iter().flat_map(|steps| {
+            steps.iter().map(|step| match step {
+                PaddingStep::Check => PaddingSize::Check,
+                PaddingStep::Range(low, high) => PaddingSize::Bytes(a_size(*low, *high)),
             })
-            .unwrap_or_default()
+        })
     }
 }
 
@@ -1617,6 +1612,15 @@ mod tests {
     }
 
     #[test]
+    fn a_step_list_is_walked_not_collected() {
+        let padding = Padding::new(b"stop=8\n2=10-20,c,30-30").expect("parses");
+        let _ = a_size(1, 2);
+        let (steps, counts) = ferrox_core::alloc_count::measure(|| padding.steps(2).count());
+        assert_eq!(steps, 3);
+        assert_eq!(counts.allocs, 0, "the walk holds no list of its own");
+    }
+
+    #[test]
     fn a_duplicate_holds_the_stream_open() {
         let written = Arc::new(Mutex::new(Vec::new()));
         let shared = Arc::new(Shared::new(
@@ -1713,12 +1717,12 @@ mod tests {
         let padding =
             Padding::new(b"stop=8\n0=30-30\n2=10-20,c,30-30\n3=9-9,500-1000").expect("parses");
         assert_eq!(padding.handshake_padding(), 30);
-        let steps = padding.steps(2);
+        let steps: Vec<PaddingSize> = padding.steps(2).collect();
         assert_eq!(steps.len(), 3);
         assert!(matches!(&steps[0], PaddingSize::Bytes(size) if (10..20).contains(size)));
         assert!(matches!(steps[1], PaddingSize::Check));
         assert!(matches!(steps[2], PaddingSize::Bytes(30)));
-        assert_eq!(padding.steps(9).len(), 0);
+        assert_eq!(padding.steps(9).count(), 0);
     }
 
     #[test]
