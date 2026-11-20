@@ -547,7 +547,9 @@ jobs:
               echo "::warning::the console client's HTTP proxy carried no trace in 120s"
               REF_FAILED="$REF_FAILED http(unbound)"
             fi
-            printf 'reference ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
+            if [ -n "$REF_HTTP" ]; then
+              printf 'reference ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
+            fi
             sample_process "reference ready" "$LANE_PID"
             trace_front socks 10808 "reference socks" || REF_FAILED="$REF_FAILED socks(trace)"
             fetch_mb socks 10808 reference-socks.bin "reference socks" || REF_FAILED="$REF_FAILED socks"

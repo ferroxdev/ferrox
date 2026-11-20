@@ -126,9 +126,9 @@ jobs:
                           if reply:
                               self.conn.send_headers(sid, [(":status", str(status)), ("content-type", "application/json")])
                               self.conn.send_data(sid, payload, True)
-                          relay("orig", body)
-                          self.flush()
-                          if method == "PATCH":
+                      relay("orig", body)
+                      self.flush()
+                      if method == "PATCH":
                           try:
                               parsed = json.loads(body)
                               keypem = subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout"], capture_output=True, check=True).stdout

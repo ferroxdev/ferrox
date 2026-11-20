@@ -506,7 +506,9 @@ jobs:
               echo "::warning::the shipped engine's HTTP proxy carried no trace in 120s"
               REF_FAILED="$REF_FAILED http(unbound)"
             fi
-            printf 'reference ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
+            if [ -n "$REF_HTTP" ]; then
+              printf 'reference ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
+            fi
             REFERENCE_ENGINE=$(winpid "$LANE_PID")
             sample_native "reference ready" "$REFERENCE_ENGINE"
             trace_front socks 10808 "reference socks" || REF_FAILED="$REF_FAILED socks(trace)"
@@ -661,8 +663,9 @@ jobs:
           print("| leg | bytes | seconds | MiB/s | ÷control |")
           print("| --- | --- | --- | --- | --- |")
           for label, size, seconds, speed in legs:
+              mibs = f"{speed / 1048576:.2f}" if size == 10000000 else "n/a"
               div = f"{(speed / 1048576) / (control_speed / 1048576):.2f}" if control_speed and size == 10000000 else "n/a"
-              print(f"| {label} | {int(size)} | {seconds:.2f} | {speed / 1048576:.2f} | {div} |")
+              print(f"| {label} | {int(size)} | {seconds:.2f} | {mibs} | {div} |")
           if not legs:
               print("| (no leg recorded a transfer) | 0 | 0.00 | 0.00 | n/a |")
           print()
