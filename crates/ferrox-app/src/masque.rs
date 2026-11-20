@@ -2895,11 +2895,15 @@ pub(crate) fn serve_inbound(
             .local_addr()
             .map_err(|error| format!("masque `{address}` has no local address: {error}"))?;
         let h2_listener = if tcp {
-            if let Ok(listener) = TcpListener::bind(local) {
-                Some(listener)
-            } else {
-                eprintln!("masque: no TCP listener on {local}; h3 still serves");
-                None
+            match TcpListener::bind(local) {
+                Ok(listener) => Some(listener),
+                Err(error) if crate::proxy::binding_is_fallible() => {
+                    return Err(format!("cannot bind masque tcp `{local}`: {error}"));
+                }
+                Err(_) => {
+                    eprintln!("masque: no TCP listener on {local}; h3 still serves");
+                    None
+                }
             }
         } else {
             None

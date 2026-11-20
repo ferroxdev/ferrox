@@ -2508,6 +2508,8 @@ struct Router<'a> {
     by_initial_dcid: HashMap<Vec<u8>, Vec<u8>>,
     /// Readers whose association was reaped, kept so shutdown can join them before the listener closes.
     retired: Vec<std::thread::JoinHandle<()>>,
+    /// Accepted stream workers, kept so shutdown can join them before the listener socket is released.
+    streams: Vec<std::thread::JoinHandle<()>>,
 }
 
 /// A stateless reset token belongs to one connection, so the shared template is minted afresh before each accept; a failed mint refuses the connection rather than sharing one.
@@ -2752,6 +2754,7 @@ impl Router<'_> {
             masq,
             local,
             retired,
+            streams,
             ..
         } = self;
         let Some(inbound) = routes.get_mut(dcid) else {
@@ -2819,7 +2822,7 @@ impl Router<'_> {
                 let thread_masq = Arc::clone(masq);
                 let local = *local;
                 let peer = from;
-                std::thread::spawn(move || {
+                streams.push(std::thread::spawn(move || {
                     let _slot = slot;
                     serve_stream(
                         &thread_shared,
@@ -2831,7 +2834,7 @@ impl Router<'_> {
                         &thread_masq,
                         wake,
                     );
-                });
+                }));
             }
             relay_datagrams(inbound, sock, &shared, &mut conn, retired);
         }
@@ -2861,10 +2864,12 @@ impl Router<'_> {
             sock,
             udp_idle,
             retired,
+            streams,
             ..
         } = self;
         let now = Instant::now();
         retired.retain(|reader| !reader.is_finished());
+        streams.retain(|stream| !stream.is_finished());
         // One pass, one lock per route: the dead are dropped where they are found, the living take their turn of the wheel, and a datagram association idle past the timeout is told to stop so its reader ends within one poll.
         routes.retain(|key, inbound| {
             let Ok(mut conn) = inbound.conn.lock() else {
@@ -3067,6 +3072,7 @@ pub(crate) fn serve_prepared(
         by_client_cid: HashMap::new(),
         by_initial_dcid: HashMap::new(),
         retired: Vec::new(),
+        streams: Vec::new(),
     };
     let mut buf = Unfilled::<RECV_ROOM>::new();
     if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
@@ -3160,6 +3166,9 @@ pub(crate) fn serve_prepared(
     readers.append(&mut router.retired);
     for reader in readers {
         let _ = reader.join();
+    }
+    for stream in router.streams.drain(..) {
+        let _ = stream.join();
     }
     if let Some(worker) = realm_worker {
         let _ = worker.join();

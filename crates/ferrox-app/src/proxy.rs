@@ -676,7 +676,7 @@ fn serve_inbounds_counted(
                 BIND_FAILED.with(|failed| failed.set(false));
                 let was = inbounds;
                 let mut wake_address = address.clone();
-                let wake_stream = inbound_wakes_stream(inbound, protocol);
+                let wake_stream = inbound_sockets(inbound, protocol).0;
                 match protocol {
                     "vless" => {
                         if serve_vless_inbound(
@@ -1074,7 +1074,17 @@ fn inbound_sockets(inbound: &Json, protocol: &str) -> (bool, bool) {
                 .and_then(|settings| settings.get("security"))
                 .and_then(Json::as_str)
                 .unwrap_or_default();
-            (security.eq_ignore_ascii_case("none"), false)
+            if security.eq_ignore_ascii_case("none") {
+                (true, false)
+            } else {
+                let tcp = quic_inbound_identity(inbound).is_some_and(|identity| {
+                    identity
+                        .alpn
+                        .iter()
+                        .any(|alpn| alpn == b"h2" || alpn == b"http/1.1")
+                });
+                (tcp, false)
+            }
         }
         "dokodemo-door" => (
             dokodemo_has(&dokodemo_networks(inbound), "tcp"),
@@ -1099,26 +1109,6 @@ fn inbound_sockets(inbound: &Json, protocol: &str) -> (bool, bool) {
         },
         _ => (false, false),
     }
-}
-
-/// Whether this inbound opens a stream listener whose blocked accept needs a wake; masque's TLS
-/// path binds TCP only when its ALPN carries h2 or HTTP/1.1, which `inbound_sockets` cannot see.
-fn inbound_wakes_stream(inbound: &Json, protocol: &str) -> bool {
-    if protocol != "masque" {
-        return inbound_sockets(inbound, protocol).0;
-    }
-    let security = inbound
-        .get("streamSettings")
-        .and_then(|settings| settings.get("security"))
-        .and_then(Json::as_str)
-        .unwrap_or_default();
-    security.eq_ignore_ascii_case("none")
-        || quic_inbound_identity(inbound).is_some_and(|identity| {
-            identity
-                .alpn
-                .iter()
-                .any(|alpn| alpn == b"h2" || alpn == b"http/1.1")
-        })
 }
 
 #[allow(dead_code)]
@@ -1272,6 +1262,10 @@ static CLOSING: std::sync::Mutex<Vec<Arc<Stop>>> = std::sync::Mutex::new(Vec::ne
 
 fn bind_failed() {
     BIND_FAILED.with(|failed| failed.set(true));
+}
+
+pub(crate) fn binding_is_fallible() -> bool {
+    FALLIBLE_BIND.with(std::cell::Cell::get)
 }
 
 /// A listener's stop flag: removal sets it and dials the address, so a blocked accept wakes, sees
@@ -74819,6 +74813,77 @@ mod tests {
         let mut back = [0u8; 2];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"v2");
+    }
+
+    #[test]
+    fn a_stopped_hysteria_listener_waits_for_an_active_stream_before_closing() {
+        let _serial = quic_serial();
+        let (identity, roots) = minted_tls_identity("localhost");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        let prepared = crate::hysteria::prepare(
+            &address,
+            &identity,
+            ferrox_core::hysteria::Congestion::Bbr,
+            "",
+            None,
+        )
+        .expect("prepares");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+            drop(flow);
+        });
+        let stop = Arc::new(Stop::default());
+        stop.expect_listeners(1);
+        let worker_stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let cancel = worker_stop.shared();
+            crate::hysteria::serve_prepared(
+                prepared,
+                &["auth".to_owned()],
+                &ferrox_core::hysteria::Masquerade::NotFound,
+                &serve,
+                std::time::Duration::from_secs(60),
+                None,
+                None,
+                Some(&cancel),
+            );
+            worker_stop.mark_closed();
+        });
+        let dial = crate::hysteria::Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port,
+            config: ferrox_core::hysteria::Config {
+                version: 2,
+                auth: "auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                ..ferrox_core::hysteria::Config::default()
+            },
+            roots: Some(roots.into()),
+        };
+        let flow = crate::hysteria::open(&dial, b"", 0).expect("opens a stream");
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the stream worker starts");
+        stop.stop();
+        thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            !stop.is_closed(),
+            "the listener closed while an active stream still held its socket"
+        );
+        release_tx.send(()).expect("releases the stream");
+        assert!(
+            stop.wait_closed(),
+            "the listener closes after the stream ends"
+        );
+        drop(flow);
+        UdpSocket::bind(format!("127.0.0.1:{port}")).expect("the port is free to bind");
     }
 
     #[test]
