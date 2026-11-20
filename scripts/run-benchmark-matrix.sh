@@ -148,6 +148,9 @@ selftest_gaps() {
     || { echo "selftest: WARP lost its Aether reference" >&2; failed=1; }
   [[ "$(matrix_reference_engine vless-vision-reality-android-down-8)" == xray-core ]] \
     || { echo "selftest: the Android cell stopped requiring xray-core" >&2; failed=1; }
+  [[ "$(matrix_reference_first sing-box xray-core=a ferrox=b xray-core-rust=c sing-box=d)" \
+    == $'sing-box=d\nxray-core=a\nferrox=b\nxray-core-rust=c' ]] \
+    || { echo "selftest: the selected reference is not first" >&2; failed=1; }
   matrix_engine_skip_reason xray-core warp-masque-down-8 server \
     | grep -q "CONNECT-IP" \
     || { echo "selftest: the xray-core WARP server skip lost its reason" >&2; failed=1; }
@@ -633,6 +636,11 @@ while read -r id traffic connections iterations payload duration_ms; do
     cell_engines=("sing-box=$(engine_path sing-box)" "ferrox=$(engine_path ferrox)")
   fi
   reference_engine="$(matrix_reference_engine "$id")"
+  reference_first=()
+  while IFS= read -r have; do
+    reference_first+=("$have")
+  done < <(matrix_reference_first "$reference_engine" "${cell_engines[@]}")
+  cell_engines=("${reference_first[@]}")
   build_engine_args "${cell_engines[@]}"
   for server in "${servers[@]}"; do
     matrix_server_serves "$server" "$id" || continue

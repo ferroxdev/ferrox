@@ -82,6 +82,19 @@ matrix_reference_engine() {
   esac
 }
 
+# The harness reads the first external engine as its reference; keep the cell's selected
+# reference first so the CPU and RSS gates price the engine the ratio names.
+matrix_reference_first() {
+  local reference="$1" have
+  shift
+  for have in "$@"; do
+    [[ "${have%%=*}" == "$reference" ]] && printf '%s\n' "$have"
+  done
+  for have in "$@"; do
+    [[ "${have%%=*}" == "$reference" ]] || printf '%s\n' "$have"
+  done
+}
+
 # A filter names a whole rung: the id itself or a `-`-separated child of it, so
 # `vless-raw-down-1` never selects `vless-raw-down-16`.
 scenario_matches() {
