@@ -123,19 +123,14 @@ impl Padding {
         }
     }
 
-    fn steps(&self, packet: u32) -> Vec<PaddingSize> {
-        self.records
-            .get(&packet)
-            .map(|steps| {
-                steps
-                    .iter()
-                    .map(|step| match step {
-                        PaddingStep::Check => PaddingSize::Check,
-                        PaddingStep::Range(low, high) => PaddingSize::Bytes(a_size(*low, *high)),
-                    })
-                    .collect()
+    /// The record's steps, each length drawn as the packet reaches it: a short packet never draws the ranges it does not consume.
+    fn steps(&self, packet: u32) -> impl Iterator<Item = PaddingSize> + '_ {
+        self.records.get(&packet).into_iter().flat_map(|steps| {
+            steps.iter().map(|step| match step {
+                PaddingStep::Check => PaddingSize::Check,
+                PaddingStep::Range(low, high) => PaddingSize::Bytes(a_size(*low, *high)),
             })
-            .unwrap_or_default()
+        })
     }
 }
 
@@ -364,7 +359,7 @@ struct Shared {
     next_id: AtomicU32,
     settings_received: AtomicBool,
     peer_version: AtomicU32,
-    padding: Mutex<Padding>,
+    padding: Mutex<Arc<Padding>>,
     pending: Mutex<Option<Vec<u8>>>,
     packet_count: AtomicU32,
     send_padding: AtomicBool,
@@ -390,7 +385,7 @@ impl Shared {
             next_id: AtomicU32::new(1),
             settings_received: AtomicBool::new(false),
             peer_version: AtomicU32::new(0),
-            padding: Mutex::new(padding),
+            padding: Mutex::new(Arc::new(padding)),
             pending: Mutex::new(None),
             packet_count: AtomicU32::new(0),
             send_padding: AtomicBool::new(!server),
@@ -459,11 +454,10 @@ impl Shared {
             return writer.flush();
         }
         let count = self.packet_count.fetch_add(1, Ordering::Relaxed) + 1;
-        let padding = self
-            .padding
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        let padding = {
+            let held = self.padding.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(&held)
+        };
         if count >= padding.stop {
             self.send_padding.store(false, Ordering::Relaxed);
             writer.write_all(packet)?;
@@ -1152,11 +1146,12 @@ fn read_server(reader: &mut dyn Read, session: &Arc<Session>, context: &Arc<Serv
                 }
                 let settings = parse_settings(&frame.payload);
                 shared.settings_received.store(true, Ordering::Relaxed);
-                let padding = shared
-                    .padding
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone();
+                let padding = Arc::clone(
+                    &shared
+                        .padding
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
                 if settings.get("padding-md5").map(String::as_str) != Some(padding.md5.as_str())
                     && padding.raw.len() <= MAX_FRAME
                 {
@@ -1254,7 +1249,7 @@ fn read_loop(reader: &mut dyn Read, shared: &Arc<Shared>) {
                     *shared
                         .padding
                         .lock()
-                        .unwrap_or_else(PoisonError::into_inner) = padding;
+                        .unwrap_or_else(PoisonError::into_inner) = Arc::new(padding);
                 }
             }
             ALERT => {
@@ -1591,6 +1586,50 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_does_not_copy_the_padding_scheme() {
+        struct Null;
+        impl Write for Null {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        fn cost(padding: Padding) -> ferrox_core::alloc_count::Counts {
+            let shared = Shared::new(Box::new(Null), padding, false);
+            let ((), counts) = ferrox_core::alloc_count::measure(|| {
+                shared.write_frame(PSH, 1, b"abc").expect("writes");
+            });
+            counts
+        }
+        let _ = a_size(1, 2);
+        let wide = cost(Padding::default_scheme());
+        let narrow = cost(Padding::new(b"stop=8\n1=100-100").expect("parses"));
+        assert_eq!(
+            wide.allocs, narrow.allocs,
+            "a frame pays for its packet, not for a copy of the scheme"
+        );
+        // The same record with seven more around it: the frame the first packet writes is byte-for-byte the same shape, so a scheme-sized buffer would show up as a byte difference.
+        let big = cost(
+            Padding::new(b"stop=8\n1=100-100\n2=100-100\n3=100-100\n4=100-100\n5=100-100\n6=100-100\n7=100-100")
+                .expect("parses"),
+        );
+        let small = cost(Padding::new(b"stop=8\n1=100-100").expect("parses"));
+        assert_eq!(big.allocs, small.allocs, "the eight records cost no calls");
+        assert_eq!(big.bytes, small.bytes, "the eight records cost no bytes");
+    }
+
+    #[test]
+    fn a_step_list_is_walked_not_collected() {
+        let padding = Padding::new(b"stop=8\n2=10-20,c,30-30").expect("parses");
+        let _ = a_size(1, 2);
+        let (steps, counts) = ferrox_core::alloc_count::measure(|| padding.steps(2).count());
+        assert_eq!(steps, 3);
+        assert_eq!(counts.allocs, 0, "the walk holds no list of its own");
+    }
+
+    #[test]
     fn a_duplicate_holds_the_stream_open() {
         let written = Arc::new(Mutex::new(Vec::new()));
         let shared = Arc::new(Shared::new(
@@ -1687,12 +1726,12 @@ mod tests {
         let padding =
             Padding::new(b"stop=8\n0=30-30\n2=10-20,c,30-30\n3=9-9,500-1000").expect("parses");
         assert_eq!(padding.handshake_padding(), 30);
-        let steps = padding.steps(2);
+        let steps: Vec<PaddingSize> = padding.steps(2).collect();
         assert_eq!(steps.len(), 3);
         assert!(matches!(&steps[0], PaddingSize::Bytes(size) if (10..20).contains(size)));
         assert!(matches!(steps[1], PaddingSize::Check));
         assert!(matches!(steps[2], PaddingSize::Bytes(30)));
-        assert_eq!(padding.steps(9).len(), 0);
+        assert_eq!(padding.steps(9).count(), 0);
     }
 
     #[test]
