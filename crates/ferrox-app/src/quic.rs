@@ -2046,6 +2046,7 @@ pub(crate) fn network_generation() -> u64 {
     NETWORK
         .get_or_init(|| {
             let generation = Arc::new(AtomicU64::new(1));
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             let bump = Arc::clone(&generation);
             let poll = Arc::clone(&generation);
             let _ = std::thread::Builder::new()
@@ -2054,6 +2055,7 @@ pub(crate) fn network_generation() -> u64 {
                     std::thread::sleep(Duration::from_secs(10));
                     poll.fetch_add(1, Ordering::Relaxed);
                 });
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             let _ = std::thread::Builder::new()
                 .name("ferrox-routes".to_owned())
                 .spawn(move || loop {

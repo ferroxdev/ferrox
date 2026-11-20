@@ -15,7 +15,15 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
 
-use tun_rs::{DeviceBuilder, SyncDevice};
+use tun_rs::SyncDevice;
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+)))]
+use tun_rs::DeviceBuilder;
 
 #[cfg(target_os = "linux")]
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
@@ -74,7 +82,22 @@ pub(crate) fn serve(spec: &Spec, out: &Outbound, mode: Mode) -> io::Result<Strin
 
 fn serve_userspace(spec: &Spec, out: &Outbound) -> io::Result<String> {
     let (first, offload, queues) = open(spec)?;
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+    )))]
     let name = first.name().unwrap_or_default();
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+    ))]
+    let name = String::new();
     let first = Arc::new(first);
     spawn_queue(Arc::clone(&first), spec, offload, out.clone());
     #[cfg(target_os = "linux")]
@@ -118,6 +141,13 @@ fn open(spec: &Spec) -> io::Result<(SyncDevice, bool, usize)> {
     }
 }
 
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+)))]
 pub(crate) fn build(
     spec: &Spec,
     multi: bool,
@@ -161,13 +191,42 @@ pub(crate) fn build(
     Ok((device, offload, multi))
 }
 
+/// A mobile host already owns the device its VpnService or utun opened, so the userspace stack adopts that descriptor instead of opening one by name.
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+))]
+pub(crate) fn build(
+    spec: &Spec,
+    _multi: bool,
+    _offload: bool,
+) -> io::Result<(SyncDevice, bool, bool)> {
+    spec.validate()?;
+    let fd = spec.fd().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the userspace stack needs the host's `fd` on this platform",
+        )
+    })?;
+    // SAFETY: `dup` reads a live descriptor and returns a fresh one this process owns.
+    let duplicated = unsafe { libc::dup(fd) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { libc::fcntl(duplicated, libc::F_SETFD, libc::FD_CLOEXEC) };
+    // SAFETY: the duplicate is an owned TUN descriptor and closes with the device.
+    let device = unsafe { SyncDevice::from_fd(duplicated)? };
+    Ok((device, false, false))
+}
+
 /// Attach the addresses the builder's single IPv4 slot cannot carry: the device is already up with its primary address, so a platform that refuses one says so in a line rather than taking the inbound down.
 fn attach_addresses(device: &SyncDevice, extra: &[(IpAddr, u8)]) {
     #[cfg(any(
         target_os = "linux",
         target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd"
@@ -186,8 +245,6 @@ fn attach_addresses(device: &SyncDevice, extra: &[(IpAddr, u8)]) {
     #[cfg(not(any(
         target_os = "linux",
         target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd"

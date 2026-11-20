@@ -1260,14 +1260,7 @@ fn sendmsg_ready<S: std::os::fd::AsRawFd>(stream: &S, parts: &[&[u8]]) -> io::Re
     // SAFETY: a zeroed `msghdr` names no address, control or segment, and the caller's slices outlive the call.
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = made.as_mut_ptr();
-    #[cfg(target_os = "linux")]
-    {
-        message.msg_iovlen = count;
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        message.msg_iovlen = i32::try_from(count).unwrap_or(i32::MAX);
-    }
+    message.msg_iovlen = count as _;
     let fd = stream.as_raw_fd();
     #[cfg(target_os = "linux")]
     let sent = unsafe {

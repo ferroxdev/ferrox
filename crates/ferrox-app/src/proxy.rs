@@ -17921,14 +17921,8 @@ fn serve_tun_inbound(
     stop: Option<&Arc<Stop>>,
 ) -> bool {
     let stack = tun_stack(inbound);
-    let native = tun_native(stack) || spec.fd().is_some();
-    if spec.fd().is_some() && !tun_native(stack) {
-        eprintln!(
-            "tun inbound: an inherited descriptor rides the native handler, so the `{stack}` stack is not applied"
-        );
-    }
-    warn_unapplied_tun_options(inbound, native);
-    if !native {
+    warn_unapplied_tun_options(inbound, tun_native(stack));
+    if !tun_native(stack) {
         if spec.dns_hijack().is_some()
             && matches!(
                 tun_mode(stack),
@@ -38407,11 +38401,7 @@ fn send_parts(
         }
         msg.msg_iov = parts.as_mut_ptr();
         // glibc sizes `msg_iovlen` as a `usize`, every other unix in scope as a 32-bit count.
-        #[cfg(target_os = "linux")]
-        let count = parts.len();
-        #[cfg(not(target_os = "linux"))]
-        let count: libc::c_int = parts.len().try_into().expect("two iovecs fit the field");
-        msg.msg_iovlen = count;
+        msg.msg_iovlen = parts.len() as _;
         loop {
             // SAFETY: `msg` names `parts` and the `sockaddr` storage, both live and sized as the call reads them.
             let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const msg, 0) };
