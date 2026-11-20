@@ -2664,6 +2664,7 @@ mod tests {
                 writes,
             }),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
