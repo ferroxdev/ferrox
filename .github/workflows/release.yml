@@ -386,8 +386,22 @@ jobs:
           COMMIT: ${{ needs.plan.outputs.commit }}
           EVENT: ${{ github.event_name }}
         run: |
-          tag_path="repos/$GH_REPO/commits/$VERSION"
-          tag_commit="$(gh api "$tag_path" --jq .sha 2>/dev/null || true)"
+          tag_path="repos/$GH_REPO/git/ref/tags/$VERSION"
+          tag_err="$RUNNER_TEMP/tag.err"
+          if tag_ref="$(gh api "$tag_path" --jq '.object.type + " " + .object.sha' 2>"$tag_err")"; then
+            read -r tag_type tag_sha <<< "$tag_ref"
+            if [ "$tag_type" = tag ]; then
+              tag_api="repos/$GH_REPO/git/tags/$tag_sha"
+              tag_commit="$(gh api "$tag_api" --jq .object.sha)" || exit 1
+            else
+              tag_commit="$tag_sha"
+            fi
+          elif grep -q '404' "$tag_err"; then
+            tag_commit=""
+          else
+            cat "$tag_err" >&2
+            exit 1
+          fi
           if [ -n "$tag_commit" ] && [ "$tag_commit" != "$COMMIT" ]; then
             echo "::error::$VERSION already points at $tag_commit, not $COMMIT"
             exit 1
@@ -395,7 +409,7 @@ jobs:
           if gh release view "$VERSION" >/dev/null 2>&1; then
             gh release edit "$VERSION" --notes-file RELEASE-BODY.md
           elif [ -n "$tag_commit" ]; then
-            gh release create "$VERSION" --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" \
+            gh release create "$VERSION" --verify-tag --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" \
               --notes-file RELEASE-BODY.md
           elif [ "$EVENT" = workflow_dispatch ]; then
             # A dispatched release of a version with no tag yet: cut the tag at
