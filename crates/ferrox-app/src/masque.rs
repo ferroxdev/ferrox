@@ -3210,6 +3210,7 @@ impl ServerSpec {
 pub(crate) enum Arrival {
     Datagram(Vec<u8>, SocketAddr),
     Ready,
+    Stop,
 }
 
 /// One tunnel's inbox and the handle that wakes its worker. `pending` keeps at
@@ -3622,6 +3623,15 @@ fn demux(
             .as_ref()
             .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
         {
+            if let Ok(table) = routes.lock() {
+                for (_, tx) in table.values() {
+                    let _ = tx.send(Arrival::Stop);
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while live.load(Ordering::Relaxed) != 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             return;
         }
         let Ok((n, from)) = sock.recv_from(&mut buf) else {
@@ -3793,6 +3803,7 @@ fn worker(
                 let _ = conn.recv(&mut bytes, info);
             }
             Ok(Arrival::Ready) => tunnel.queue.pending.store(false, Ordering::Release),
+            Ok(Arrival::Stop) => return,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }

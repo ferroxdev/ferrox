@@ -1062,7 +1062,15 @@ fn serve_addresses(inbound: &Json, protocol: &str) -> Option<Vec<String>> {
 fn inbound_sockets(inbound: &Json, protocol: &str) -> (bool, bool) {
     match protocol {
         "socks" | "http" | "mixed" | "anytls" | "hc" | "blackhole" => (true, false),
-        "hysteria" | "tuic" | "wireguard" | "masque" => (false, true),
+        "hysteria" | "tuic" | "wireguard" => (false, true),
+        "masque" => {
+            let security = inbound
+                .get("streamSettings")
+                .and_then(|settings| settings.get("security"))
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            (security.eq_ignore_ascii_case("none"), false)
+        }
         "dokodemo-door" => (
             dokodemo_has(&dokodemo_networks(inbound), "tcp"),
             dokodemo_has(&dokodemo_networks(inbound), "udp"),
