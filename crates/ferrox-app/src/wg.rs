@@ -522,6 +522,11 @@ impl WireGuardOut {
                 }
                 Err(_) => break,
             };
+            let answered_now = replies.load(Ordering::Relaxed);
+            if answered_now != seen {
+                seen = answered_now;
+                quiet = Instant::now();
+            }
             if !crate::proxy::source_ip_ok(peer, src) {
                 if quiet.elapsed() >= crate::budgets::udp_idle() {
                     break;
