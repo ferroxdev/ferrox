@@ -55401,6 +55401,7 @@ mod tests {
         filler.join().expect("joins");
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn a_pipelined_vision_xudp_frame_reaches_the_mux_reader() {
         use ferrox_core::tls::TlsProvider as _;
