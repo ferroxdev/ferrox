@@ -27,7 +27,7 @@ on:
         default: ""
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-run-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
   queue: max
 
@@ -225,6 +225,10 @@ jobs:
     needs: [plan]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: release-tag-${{ needs.plan.outputs.version }}
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: write
     steps:
@@ -382,16 +386,25 @@ jobs:
           COMMIT: ${{ needs.plan.outputs.commit }}
           EVENT: ${{ github.event_name }}
         run: |
+          tag_path="repos/$GH_REPO/commits/$VERSION"
+          tag_commit="$(gh api "$tag_path" --jq .sha 2>/dev/null || true)"
+          if [ -n "$tag_commit" ] && [ "$tag_commit" != "$COMMIT" ]; then
+            echo "::error::$VERSION already points at $tag_commit, not $COMMIT"
+            exit 1
+          fi
           if gh release view "$VERSION" >/dev/null 2>&1; then
             gh release edit "$VERSION" --notes-file RELEASE-BODY.md
+          elif [ -n "$tag_commit" ]; then
+            gh release create "$VERSION" --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" \
+              --notes-file RELEASE-BODY.md
           elif [ "$EVENT" = workflow_dispatch ]; then
             # A dispatched release of a version with no tag yet: cut the tag at
             # the commit the plan resolved, before any build is waited on.
             gh release create "$VERSION" --target "$COMMIT" \
               --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" --notes-file RELEASE-BODY.md
           else
-            gh release create "$VERSION" --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" \
-              --notes-file RELEASE-BODY.md
+            echo "::error::tag $VERSION does not exist for a push event"
+            exit 1
           fi
           gh release view "$VERSION" --json tagName,assets \
             --jq '.tagName + ": " + ([.assets[].name] | join(", "))'

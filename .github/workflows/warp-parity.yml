@@ -64,7 +64,7 @@ jobs:
           WARP_PARITY_URL: ${{ inputs.target_url }}
           REPEATS: ${{ inputs.repeats || '3' }}
         run: |
-          [[ "$REPEATS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::repeats must be a positive integer, got '$REPEATS'"; exit 1; }
+          [[ "$REPEATS" =~ ^0*[1-9][0-9]*$ ]] || { echo "::error::repeats must be a positive integer, got '$REPEATS'"; exit 1; }
           args=(--aether upstream/aether/aether/target/release/aether
                 --repeats "$REPEATS")
           if test -n "${WARP_MASQUE_EDGE:-}"; then args+=(--edge "$WARP_MASQUE_EDGE"); fi
