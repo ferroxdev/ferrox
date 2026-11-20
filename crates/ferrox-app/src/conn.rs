@@ -2219,13 +2219,9 @@ pub(crate) fn parse_target(address: &str) -> io::Result<Target> {
 fn unix_socket_is_live(path: &std::path::Path) -> io::Result<bool> {
     match unix_connect(path, Duration::from_millis(50)) {
         Ok(_) => Ok(true),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            Ok(false)
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            Ok(!refused_socket_is_stale(path))
         }
         Err(error)
             if matches!(
@@ -2236,6 +2232,32 @@ fn unix_socket_is_live(path: &std::path::Path) -> io::Result<bool> {
             Ok(true)
         }
         Err(error) => Err(error),
+    }
+}
+
+/// A refusal means stale only where the kernel still lists the path's inode; macOS refuses a live full queue, so there it means live.
+#[cfg(unix)]
+fn refused_socket_is_stale(path: &std::path::Path) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        let Ok(table) = std::fs::read_to_string("/proc/net/unix") else {
+            return false;
+        };
+        !table.lines().skip(1).any(|line| {
+            line.split_whitespace()
+                .nth(6)
+                .and_then(|ino| ino.parse::<u64>().ok())
+                == Some(meta.ino())
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = path;
+        false
     }
 }
 
@@ -4368,6 +4390,40 @@ mod tests {
             "the live socket keeps its path"
         );
         drop(listener);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On macOS a full accept queue also refuses, so the probe must not unlink the live listener.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_unix_probe_keeps_a_live_socket_with_a_full_accept_queue() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-full-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("binds a live socket");
+        let mut clients = Vec::new();
+        while clients.len() < 4096 {
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(client) => clients.push(client),
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => break,
+                Err(error) => panic!("fills the accept queue: {error}"),
+            }
+        }
+        assert!(!clients.is_empty(), "the queue filled");
+        assert!(
+            probe_unix(&path).is_err(),
+            "a full live queue keeps its path"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "the live socket keeps its path"
+        );
+        drop(listener);
+        drop(clients);
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
