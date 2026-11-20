@@ -1913,7 +1913,6 @@ impl Server {
                 quic::flush_egress(&mut conn, &self.sock);
             }
         }
-        seen.clear();
         self.seen = seen;
         self.conns.clear();
         self.sessions = 0;

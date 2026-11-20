@@ -1146,11 +1146,12 @@ fn read_server(reader: &mut dyn Read, session: &Arc<Session>, context: &Arc<Serv
                 }
                 let settings = parse_settings(&frame.payload);
                 shared.settings_received.store(true, Ordering::Relaxed);
-                let padding = shared
-                    .padding
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone();
+                let padding = Arc::clone(
+                    &shared
+                        .padding
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
                 if settings.get("padding-md5").map(String::as_str) != Some(padding.md5.as_str())
                     && padding.raw.len() <= MAX_FRAME
                 {
