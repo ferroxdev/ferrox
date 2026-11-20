@@ -44275,6 +44275,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn the_tun_spec_accepts_the_reference_spellings() {
         let spec = |config: &str| {
             let parsed = crate::json::parse(config).expect("config");

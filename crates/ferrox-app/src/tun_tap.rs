@@ -283,13 +283,12 @@ mod tests {
     fn a_tap_answers_an_arp_request_for_an_address_it_carries_and_ignores_another() {
         let bridge = Bridge::new("feth0", vec!["10.0.0.1".parse().unwrap()], false);
         let peer = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
-        let reply = match bridge.accept(&arp_request(
+        let Accepted::Reply(reply) = bridge.accept(&arp_request(
             peer,
             "10.0.0.1".parse().unwrap(),
             "10.0.0.9".parse().unwrap(),
-        )) {
-            Accepted::Reply(reply) => reply,
-            _ => panic!("its own address is answered"),
+        )) else {
+            panic!("its own address is answered");
         };
         assert_eq!(&reply[..6], &peer);
         assert_eq!(&reply[6..12], &bridge.local);
@@ -343,9 +342,8 @@ mod tests {
         frame.extend_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         frame.extend_from_slice(&[NEIGHBOR_SOLICITATION, 0, 0, 0, 0, 0, 0, 0]);
         frame.extend_from_slice(&target.octets());
-        let reply = match bridge.accept(&frame) {
-            Accepted::Reply(reply) => reply,
-            _ => panic!("a solicitation for its address is answered"),
+        let Accepted::Reply(reply) = bridge.accept(&frame) else {
+            panic!("a solicitation for its address is answered");
         };
         assert_eq!(&reply[..6], &peer);
         assert_eq!(&reply[6..12], &bridge.local);
@@ -418,9 +416,9 @@ mod tests {
         let bridge = Bridge::new("feth0", vec!["2001:db8::1".parse().unwrap()], false);
         let peer = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
         let target: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        let reply = match bridge.accept(&ns_frame(peer, Ipv6Addr::UNSPECIFIED, target)) {
-            Accepted::Reply(reply) => reply,
-            _ => panic!("an unspecified source is still a solicitation"),
+        let Accepted::Reply(reply) = bridge.accept(&ns_frame(peer, Ipv6Addr::UNSPECIFIED, target))
+        else {
+            panic!("an unspecified source is still a solicitation");
         };
         assert_eq!(
             &reply[..6],
