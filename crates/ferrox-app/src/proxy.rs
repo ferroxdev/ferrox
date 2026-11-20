@@ -17830,7 +17830,7 @@ fn serve_shadowsocks_inbound(
                 if let Some(listeners) =
                     serve_ss_tls_front(address, inbound, carrier, accounts, freedom, stop)
                 {
-                    return listeners;
+                    served += listeners;
                 }
             }
             _ if !matches!(stream_security(inbound), "" | "none") => {
