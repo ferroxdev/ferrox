@@ -249,11 +249,12 @@ pub(crate) fn serve(
             let shared = Arc::clone(&shared);
             let spec = Arc::clone(&spec);
             let identity = Arc::clone(&identity);
+            let handler_stop = stop.clone();
             if let Err(error) = std::thread::Builder::new()
                 .name("ferrox-masque-h2".into())
                 .spawn(move || {
                     let _slot = slot;
-                    connection(stream, &identity, shared, spec);
+                    connection(stream, &identity, shared, spec, handler_stop);
                 })
             {
                 eprintln!("masque: cannot spawn HTTP/2 connection handler: {error}");
@@ -276,6 +277,7 @@ fn connection(
     identity: &TlsServerConfig,
     shared: Arc<Shared>,
     spec: Arc<ServerSpec>,
+    stop: Option<Arc<AtomicBool>>,
 ) {
     let deadline = Deadline::default();
     deadline.arm(Instant::now() + HANDSHAKE);
@@ -296,7 +298,7 @@ fn connection(
     if tls.alpn() == Some(b"http/1.1") {
         deadline.clear();
         tls.get_ref().get_ref().set_read_timeout(Some(READ_WAIT));
-        crate::masque_h1::serve(tls, shared, spec);
+        crate::masque_h1::serve(tls, shared, spec, stop);
         return;
     }
     if tls.alpn() != Some(b"h2") {
@@ -311,8 +313,7 @@ fn connection(
         deadline,
     };
     if wire.preface() {
-        Session::new(shared, spec).run(&mut wire);
-        wire.quiet();
+        Session::new(shared, spec, stop).run(&mut wire);
     }
 }
 
@@ -348,11 +349,12 @@ pub(crate) fn serve_cleartext(
             let _ = stream.set_write_timeout(Some(HANDSHAKE));
             let shared = Arc::clone(&shared);
             let spec = Arc::clone(&spec);
+            let handler_stop = stop.clone();
             if let Err(error) = std::thread::Builder::new()
                 .name("ferrox-masque-h2c".into())
                 .spawn(move || {
                     let _slot = slot;
-                    connection_cleartext(stream, shared, spec);
+                    connection_cleartext(stream, shared, spec, handler_stop);
                 })
             {
                 eprintln!("masque: cannot spawn HTTP/2 cleartext handler: {error}");
@@ -364,7 +366,12 @@ pub(crate) fn serve_cleartext(
 }
 
 /// Serve one prior-knowledge h2c connection over bare TCP.
-fn connection_cleartext(stream: TcpStream, shared: Arc<Shared>, spec: Arc<ServerSpec>) {
+fn connection_cleartext(
+    stream: TcpStream,
+    shared: Arc<Shared>,
+    spec: Arc<ServerSpec>,
+    stop: Option<Arc<AtomicBool>>,
+) {
     let stream = Connection::from(stream).with_mask_role(
         spec.tcp_mask.as_ref(),
         ferrox_core::finalmask::MaskRole::Server,
@@ -374,8 +381,7 @@ fn connection_cleartext(stream: TcpStream, shared: Arc<Shared>, spec: Arc<Server
     let ready = wire.preface();
     drop(cap);
     if ready {
-        Session::new(shared, spec).run(&mut wire);
-        wire.quiet();
+        Session::new(shared, spec, stop).run(&mut wire);
     }
 }
 
@@ -1247,6 +1253,7 @@ impl Client {
 struct Session {
     shared: Arc<Shared>,
     spec: Arc<ServerSpec>,
+    stop: Option<Arc<AtomicBool>>,
     decoder: Decoder,
     capsules: Vec<u8>,
     capsule_at: usize,
@@ -1270,10 +1277,11 @@ struct Session {
 }
 
 impl Session {
-    fn new(shared: Arc<Shared>, spec: Arc<ServerSpec>) -> Self {
+    fn new(shared: Arc<Shared>, spec: Arc<ServerSpec>, stop: Option<Arc<AtomicBool>>) -> Self {
         Self {
             shared,
             spec,
+            stop,
             decoder: Decoder::default(),
             capsules: Vec::new(),
             capsule_at: 0,
@@ -1331,6 +1339,14 @@ impl Session {
         settings.extend_from_slice(&1u32.to_be_bytes());
         wire.send(h2::T_SETTINGS, 0, 0, &settings);
         while !wire.closed && !self.end {
+            if self
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::Relaxed))
+            {
+                self.end = true;
+                break;
+            }
             let mut pending = std::mem::take(&mut wire.pending);
             let mut at = 0;
             loop {
@@ -2004,6 +2020,24 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_h2_session_stops_relaying_before_its_next_read() {
+        let stop = Arc::new(AtomicBool::new(true));
+        let mut session = Session::new(
+            masque::test_shared(),
+            Arc::new(masque::test_spec()),
+            Some(stop),
+        );
+        let mut wire = Wire {
+            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            pending: Vec::new(),
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        session.run(&mut wire);
+        assert!(session.end, "a stopped session keeps serving");
+    }
+
+    #[test]
     fn an_rfc_request_names_its_protocol_in_a_pseudo_header() {
         let fields = request_fields("edge", "/.well-known/masque/ip/*/*/", &[], false, "https");
         assert!(fields.contains(&(":protocol", "connect-ip")));
@@ -2187,7 +2221,7 @@ mod tests {
 
     #[test]
     fn a_stalled_send_window_bounds_the_queued_capsules() {
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         session.request = Some(1);
         session.send_window = 0;
         session.connection_window = 0;
@@ -2259,7 +2293,7 @@ mod tests {
                 Ok(())
             }
         }
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         session.request = Some(1);
         let (sender, outgoing) = mpsc::sync_channel(masque::QUEUE);
         session.outgoing = Some(outgoing);
@@ -2290,7 +2324,7 @@ mod tests {
     /// A burst leaves as one DATA frame: the peer reads one head per burst instead of one per datagram.
     #[test]
     fn a_burst_leaves_as_one_data_frame() {
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         session.request = Some(1);
         let (sender, outgoing) = mpsc::sync_channel(masque::QUEUE);
         session.outgoing = Some(outgoing);
@@ -2328,7 +2362,7 @@ mod tests {
     /// A burst past a batch leaves several frames, and no body passes h2's default frame limit.
     #[test]
     fn a_burst_keeps_every_body_inside_the_frame_limit() {
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         session.request = Some(1);
         session.send_window = 1 << 20;
         session.connection_window = 1 << 20;
@@ -2399,7 +2433,7 @@ mod tests {
 
     #[test]
     fn connect_keeps_the_peer_initial_window() {
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
@@ -2479,7 +2513,7 @@ mod tests {
 
     #[test]
     fn a_changed_initial_window_keeps_the_server_credit() {
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
@@ -2651,7 +2685,7 @@ mod tests {
 
     #[test]
     fn a_silent_peer_is_ended_after_the_handshake() {
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         let mut wire = Wire {
             stream: Box::new(Quiet { reads: 1_000 }),
             pending: Vec::new(),
@@ -2668,7 +2702,7 @@ mod tests {
 
     #[test]
     fn a_continuation_block_cannot_grow_past_the_frame_cap() {
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
@@ -2797,7 +2831,7 @@ mod tests {
             closed: false,
             deadline: Deadline::default(),
         };
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         let past = Instant::now()
             .checked_sub(Duration::from_millis(1))
             .expect("a past instant");
@@ -2830,7 +2864,7 @@ mod tests {
             closed: false,
             deadline: Deadline::default(),
         };
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         session.run_until(&mut wire, gate);
         assert!(session.end, "the handshake clock ended the session");
         assert_eq!(
@@ -2857,7 +2891,7 @@ mod tests {
 
     #[test]
     fn a_refused_stream_still_advances_the_hpack_table() {
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         session.request = Some(3);
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
@@ -2879,7 +2913,7 @@ mod tests {
 
     #[test]
     fn a_near_cap_block_is_rejected_without_growing() {
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         let half = FRAME_CAP / 2 + 1;
         session.continuation = Some((1, vec![0u8; half], 0, false));
         let body = vec![0u8; half];
@@ -2902,7 +2936,7 @@ mod tests {
 
     #[test]
     fn an_empty_data_frame_sends_no_window_update() {
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         session.request = Some(1);
         let out = Arc::new(Mutex::new(Vec::new()));
         let mut wire = Wire {
@@ -2933,7 +2967,7 @@ mod tests {
         let mut client = bare_client();
         client.send_window = 0;
         client.connection_window = 0;
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         session.request = Some(1);
         session.send_window = 0;
         session.connection_window = 0;
@@ -2990,7 +3024,7 @@ mod tests {
     #[test]
     fn a_partially_credited_capsule_leaves_one_write_per_frame() {
         let capsule = [0, 2, 0, 42];
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         session.request = Some(1);
         session.send_window = 0;
         session.connection_window = 0;
@@ -3079,7 +3113,7 @@ mod tests {
             "no packet is pulled while the queue is full"
         );
 
-        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
         session.request = Some(1);
         session.send_window = 0;
         let (sender, receiver) = mpsc::sync_channel(masque::QUEUE);
@@ -3173,7 +3207,8 @@ mod tests {
             assert_eq!(client.queued.len(), 1, "no flush after termination");
             assert_eq!(client.send_window, DEFAULT_WINDOW);
 
-            let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+            let mut session =
+                Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
             session.request = Some(1);
             session.send_window = 0;
             let mut wire = bare_client().wire;

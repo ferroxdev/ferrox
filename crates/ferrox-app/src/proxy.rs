@@ -676,6 +676,7 @@ fn serve_inbounds_counted(
                 BIND_FAILED.with(|failed| failed.set(false));
                 let was = inbounds;
                 let mut wake_address = address.clone();
+                let mut wake_stream = true;
                 match protocol {
                     "vless" => {
                         if serve_vless_inbound(
@@ -716,6 +717,7 @@ fn serve_inbounds_counted(
                         }
                     }
                     "shadowsocks" => {
+                        wake_stream = inbound_ss_networks(inbound).0;
                         let listeners = serve_shadowsocks_inbound(
                             address,
                             inbound,
@@ -957,7 +959,7 @@ fn serve_inbounds_counted(
                     }
                     _ => eprintln!("unsupported inbound protocol `{protocol}` in {label}"),
                 }
-                if inbounds > was {
+                if inbounds > was && wake_stream {
                     armed_addresses.push(wake_address);
                 }
                 if fallible && (BIND_FAILED.with(std::cell::Cell::get) || inbounds == was) {

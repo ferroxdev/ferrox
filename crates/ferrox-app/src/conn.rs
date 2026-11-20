@@ -2282,15 +2282,20 @@ fn socket_table_names(path: &std::path::Path) -> Option<bool> {
 /// A row's path and whether the socket is still accepting, so an accepted connection's copied address is not mistaken for a listener.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn proc_unix_entry(line: &str) -> Option<(&str, bool)> {
-    let mut fields = line.split_whitespace();
-    let _num = fields.next()?;
-    let _ref_count = fields.next()?;
-    let _protocol = fields.next()?;
-    let flags = fields.next()?;
-    let _kind = fields.next()?;
-    let _state = fields.next()?;
-    let _inode = fields.next()?;
-    let listed = fields.next()?;
+    let mut rest = line;
+    let mut flags = "";
+    for field in 0..7 {
+        rest = rest.trim_start();
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        if field == 3 {
+            flags = &rest[..end];
+        }
+        rest = &rest[end..];
+    }
+    let listed = rest.strip_prefix(' ').unwrap_or(rest);
+    if listed.is_empty() {
+        return None;
+    }
     let listening = u32::from_str_radix(flags, 16).ok()? & 0x0001_0000 != 0;
     Some((listed, listening))
 }
@@ -4602,7 +4607,13 @@ mod tests {
         let path = dir.join("sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("binds a socket");
         drop(listener);
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
         assert!(probe_unix(&path).is_ok(), "an abandoned socket is stale");
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        assert!(
+            probe_unix(&path).is_err(),
+            "without a socket table a refusal preserves the path"
+        );
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4631,6 +4642,18 @@ mod tests {
         drop(client);
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Linux writes pathname spaces unescaped, so a parser that splits on whitespace would turn `/tmp/a b` into `/tmp/a`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_proc_row_keeps_the_whole_pathname() {
+        let row = "0000000000000000: 00000002 00000000 00010000 0001 01   123 /tmp/a b";
+        assert_eq!(
+            proc_unix_entry(row),
+            Some(("/tmp/a b", true)),
+            "a pathname with a space was truncated"
+        );
     }
 
     /// A mode publishes the path by hard link, but the PCB keeps the private `.ferrox-*/s` name, which still names the live listener.

@@ -3071,6 +3071,9 @@ pub(crate) fn serve_prepared(
     let mut buf = Unfilled::<RECV_ROOM>::new();
     if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
         realm_stop.store(true, Ordering::SeqCst);
+        if let Some(state) = router.realm_state.as_ref() {
+            state.interrupt_events();
+        }
         if let Some(worker) = realm_worker.take() {
             let _ = worker.join();
         }

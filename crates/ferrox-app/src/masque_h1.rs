@@ -459,6 +459,7 @@ pub(crate) fn serve(
     stream: impl Read + Write + Send + 'static,
     shared: Arc<Shared>,
     spec: Arc<ServerSpec>,
+    stop: Option<Arc<AtomicBool>>,
 ) {
     let mut wire = Wire {
         stream: Box::new(stream),
@@ -530,12 +531,19 @@ pub(crate) fn serve(
         return;
     }
     match target {
-        Some((host, port)) => serve_udp(&mut wire, shared, spec, &host, port),
-        None => serve_ip(&mut wire, shared, spec),
+        Some((host, port)) => serve_udp(&mut wire, shared, spec, &host, port, stop),
+        None => serve_ip(&mut wire, shared, spec, stop),
     }
 }
 
-fn serve_udp(wire: &mut Wire, shared: Arc<Shared>, spec: Arc<ServerSpec>, host: &str, port: u16) {
+fn serve_udp(
+    wire: &mut Wire,
+    shared: Arc<Shared>,
+    spec: Arc<ServerSpec>,
+    host: &str,
+    port: u16,
+    stop: Option<Arc<AtomicBool>>,
+) {
     let Ok(lane) = masque::UdpLane::open(host, port) else {
         wire.send(&refusal_proxy(503));
         return;
@@ -546,6 +554,7 @@ fn serve_udp(wire: &mut Wire, shared: Arc<Shared>, spec: Arc<ServerSpec>, host: 
     let mut session = Session {
         shared,
         spec,
+        stop,
         addrs: Vec::new(),
         outgoing: None,
         udp: Some(lane),
@@ -556,7 +565,12 @@ fn serve_udp(wire: &mut Wire, shared: Arc<Shared>, spec: Arc<ServerSpec>, host: 
     session.run(wire);
 }
 
-fn serve_ip(wire: &mut Wire, shared: Arc<Shared>, spec: Arc<ServerSpec>) {
+fn serve_ip(
+    wire: &mut Wire,
+    shared: Arc<Shared>,
+    spec: Arc<ServerSpec>,
+    stop: Option<Arc<AtomicBool>>,
+) {
     let Some(addrs) = masque::assign(&shared) else {
         wire.send(&refusal(503));
         return;
@@ -584,6 +598,7 @@ fn serve_ip(wire: &mut Wire, shared: Arc<Shared>, spec: Arc<ServerSpec>) {
     let mut session = Session {
         shared,
         spec,
+        stop,
         addrs,
         outgoing: Some(outgoing),
         udp: None,
@@ -597,6 +612,7 @@ fn serve_ip(wire: &mut Wire, shared: Arc<Shared>, spec: Arc<ServerSpec>) {
 struct Session {
     shared: Arc<Shared>,
     spec: Arc<ServerSpec>,
+    stop: Option<Arc<AtomicBool>>,
     addrs: Vec<IpAddr>,
     outgoing: Option<Receiver<Vec<u8>>>,
     udp: Option<masque::UdpLane>,
@@ -610,6 +626,14 @@ impl Session {
     fn run(&mut self, wire: &mut Wire) {
         let mut capsule = Vec::new();
         while !wire.closed && !self.end {
+            if self
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::Relaxed))
+            {
+                self.end = true;
+                break;
+            }
             self.pump(wire);
             if wire.closed || self.end {
                 break;
@@ -681,6 +705,28 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stopped_h1_session_stops_relaying_before_its_next_read() {
+        let mut session = Session {
+            shared: masque::test_shared(),
+            spec: Arc::new(masque::test_spec()),
+            stop: Some(Arc::new(AtomicBool::new(true))),
+            addrs: Vec::new(),
+            outgoing: None,
+            udp: None,
+            capsules: Vec::new(),
+            capsule_at: 0,
+            end: false,
+        };
+        let mut wire = Wire {
+            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            pending: Vec::new(),
+            closed: false,
+        };
+        session.run(&mut wire);
+        assert!(session.end, "a stopped session keeps serving");
+    }
 
     #[test]
     fn an_h1_request_is_the_rfc_upgrade() {
