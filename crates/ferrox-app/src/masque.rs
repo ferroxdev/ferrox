@@ -596,7 +596,12 @@ impl MasqueOut {
         .is_some()
     }
 
-    pub(crate) fn serve_udp(&self, relay: &UdpSocket, associate: Option<&Connection>) {
+    pub(crate) fn serve_udp(
+        &self,
+        relay: &UdpSocket,
+        associate: Option<&Connection>,
+        peer: Option<IpAddr>,
+    ) {
         match self.ensure_leased() {
             Ok((inner, _lease)) => {
                 let remote = self.spec.remote_dns.as_slice();
@@ -606,6 +611,7 @@ impl MasqueOut {
                     &inner.to_tunnel,
                     &inner.routes,
                     associate,
+                    peer,
                     &|host, port| {
                         if let Some(answer) = wg_stack::resolve_over_tunnel(
                             &inner.config,
@@ -6219,7 +6225,7 @@ mod tests {
         let relay = std::net::UdpSocket::bind("127.0.0.1:0").expect("relay");
         let relay_address = relay.local_addr().expect("relay address");
         let thread_relay = relay.try_clone().expect("clone");
-        std::thread::spawn(move || masque.serve_udp(&thread_relay, None));
+        std::thread::spawn(move || masque.serve_udp(&thread_relay, None, None));
         std::thread::sleep(Duration::from_secs(1));
         let app = std::net::UdpSocket::bind("127.0.0.1:0").expect("app");
         app.set_read_timeout(Some(Duration::from_secs(20)))
@@ -6252,7 +6258,7 @@ mod tests {
         let relay = std::net::UdpSocket::bind("127.0.0.1:0").expect("relay");
         let relay_address = relay.local_addr().expect("relay address");
         let thread_relay = relay.try_clone().expect("clone");
-        std::thread::spawn(move || masque.serve_udp(&thread_relay, None));
+        std::thread::spawn(move || masque.serve_udp(&thread_relay, None, None));
         std::thread::sleep(Duration::from_secs(1));
         let app = std::net::UdpSocket::bind("127.0.0.1:0").expect("app");
         app.set_read_timeout(Some(Duration::from_secs(20)))

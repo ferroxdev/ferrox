@@ -2781,6 +2781,7 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     to_tunnel: &T,
     routes: &UdpRoutes,
     associate: Option<&Connection>,
+    peer: Option<IpAddr>,
     resolve: &dyn Fn(&str, u16) -> Vec<SocketAddr>,
     headroom: usize,
 ) -> bool {
@@ -2798,7 +2799,6 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     }
     let mut buf = crate::proxy::udp_buffer();
     let mut frame = Vec::new();
-    let peer = crate::proxy::control_peer(associate);
     let mut app: Option<SocketAddr> = None;
     let mut winners: HashMap<(String, u16), (SocketAddr, StdInstant)> = HashMap::new();
     let mut sources: HashMap<(String, u16), u16> = HashMap::new();
@@ -5134,6 +5134,7 @@ mod client_tests {
                 &to_tunnel,
                 &thread_routes,
                 Some(&associate),
+                crate::proxy::control_peer(Some(&associate)),
                 &resolve_one,
                 0,
             );
@@ -5166,6 +5167,7 @@ mod client_tests {
                 &to_tunnel,
                 &thread_routes,
                 None,
+                None,
                 &resolve_one,
                 0,
             );
@@ -5195,6 +5197,7 @@ mod client_tests {
                 &thread_config,
                 &to_tunnel,
                 &thread_routes,
+                None,
                 None,
                 &resolve_one,
                 0,
@@ -5348,6 +5351,7 @@ mod client_tests {
                 &to_tunnel,
                 &thread_routes,
                 None,
+                None,
                 &|host, port| {
                     if host == "other.test" {
                         assert_eq!(port, 54);
@@ -5421,6 +5425,7 @@ mod client_tests {
                 &thread_config,
                 &to_tunnel,
                 &thread_routes,
+                None,
                 None,
                 &|host, port| {
                     if host == "other.test" {

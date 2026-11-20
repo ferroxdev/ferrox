@@ -367,10 +367,15 @@ impl WireGuardOut {
         }
     }
 
-    pub(crate) fn serve_udp(&self, relay: &UdpSocket, associate: Option<&Connection>) {
+    pub(crate) fn serve_udp(
+        &self,
+        relay: &UdpSocket,
+        associate: Option<&Connection>,
+        peer: Option<IpAddr>,
+    ) {
         #[cfg(target_os = "linux")]
         if let Some(kernel) = &self.kernel {
-            self.serve_udp_kernel(kernel, relay, associate);
+            self.serve_udp_kernel(kernel, relay, associate, peer);
             return;
         }
         if !wg_stack::client_udp(
@@ -379,6 +384,7 @@ impl WireGuardOut {
             &self.to_tunnel,
             &self.routes,
             associate,
+            peer,
             &|host, port| self.destinations(&Destination::Name(host.to_owned(), port)),
             WG_HEADER_SIZE,
         ) {
@@ -478,6 +484,7 @@ impl WireGuardOut {
         kernel: &KernelWireGuard,
         relay: &UdpSocket,
         associate: Option<&Connection>,
+        peer: Option<IpAddr>,
     ) {
         let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
         let winner: Arc<Mutex<HashMap<KernelLaneKey, (SocketAddr, Instant)>>> =
@@ -486,7 +493,6 @@ impl WireGuardOut {
         let (closed, closed_rx) = mpsc::channel();
         let mut uplinks: HashMap<(Option<KernelLaneKey>, SocketAddr), UdpSocket> = HashMap::new();
         let mut buf = crate::proxy::udp_buffer();
-        let peer = crate::proxy::control_peer(associate);
         let mut app = None;
         let mut seen = 0u64;
         let mut local_warned = false;

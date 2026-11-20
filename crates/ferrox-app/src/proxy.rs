@@ -29546,17 +29546,17 @@ fn serve_udp_lane_with(
                 crate::hysteria::serve_udp(relay, &dial, peer);
             }
         }
-        Outbound::Tuic(tuic) => tuic.serve_udp(relay, associate),
+        Outbound::Tuic(tuic) => tuic.serve_udp(relay, associate, peer),
         Outbound::Foxy(foxy) => match foxy.carrier {
             // One tunnel for all destinations: later ones ride the first one opened.
-            crate::foxy::Carrier::H3 => serve_socks_udp_foxy_ip(relay, foxy, associate),
-            _ => serve_socks_udp_foxy(relay, foxy, associate),
+            crate::foxy::Carrier::H3 => serve_socks_udp_foxy_ip(relay, foxy, associate, peer),
+            _ => serve_socks_udp_foxy(relay, foxy, associate, peer),
         },
-        Outbound::WireGuard(wireguard) => wireguard.serve_udp(relay, associate),
-        Outbound::Masque(masque) => masque.serve_udp(relay, associate),
-        Outbound::Warp(warp) => warp.serve_udp(relay, associate),
+        Outbound::WireGuard(wireguard) => wireguard.serve_udp(relay, associate, peer),
+        Outbound::Masque(masque) => masque.serve_udp(relay, associate, peer),
+        Outbound::Warp(warp) => warp.serve_udp(relay, associate, peer),
         Outbound::Freedom(out) => {
-            serve_socks_udp_freedom(relay, out, source, sockopts, associate);
+            serve_socks_udp_freedom(relay, out, source, sockopts, associate, peer);
         }
         Outbound::Socks(socks) => {
             if socks.version == crate::socks::Version::V4 {
@@ -29566,7 +29566,14 @@ fn serve_udp_lane_with(
             let Some(server) = resolve_outbound(&socks.address, socks.port) else {
                 return;
             };
-            serve_socks_udp_client(relay, server, &socks.credential, socks.version, associate);
+            serve_socks_udp_client(
+                relay,
+                server,
+                &socks.credential,
+                socks.version,
+                associate,
+                peer,
+            );
         }
         Outbound::Psiphon(lane) => {
             serve_socks_udp_client(
@@ -29575,6 +29582,7 @@ fn serve_udp_lane_with(
                 lane.credential(),
                 lane.version(),
                 associate,
+                peer,
             );
         }
         Outbound::Dns(dns) => serve_dns_udp(relay, dns, peer),
@@ -29937,6 +29945,7 @@ fn serve_socks_udp_client(
     credential: &crate::socks::Credential,
     version: crate::socks::Version,
     associate: Option<&Connection>,
+    peer: Option<IpAddr>,
 ) {
     if version == crate::socks::Version::V4 {
         return;
@@ -29952,7 +29961,6 @@ fn serve_socks_udp_client(
         return;
     };
     let control = association.control;
-    let peer = control_peer(associate);
     let mut pinned = None;
     let poll = lane_poll(read);
     let _ = control.set_read_timeout(Some(poll));
@@ -30206,12 +30214,12 @@ fn serve_socks_udp_freedom(
     send_through: Option<SendThrough>,
     sockopts: Option<&crate::sockopt::SocketOptions>,
     associate: Option<&Connection>,
+    peer: Option<IpAddr>,
 ) {
     arm_control(associate);
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let replies = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let peer = control_peer(associate);
     let mut pinned = None;
     let mut uplinks: HashMap<SocketAddr, FreedomUplink> = HashMap::new();
     let mut buf = udp_buffer();
@@ -30755,7 +30763,12 @@ fn serve_dns_udp(relay: &UdpSocket, dns: &DnsOut, peer: Option<IpAddr>) {
 }
 
 /// Foxy UDP: one CONNECT-UDP stream per destination, HTTP/2 then HTTP/3; the configured carrier does not apply.
-fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: Option<&Connection>) {
+fn serve_socks_udp_foxy(
+    relay: &UdpSocket,
+    foxy: &FoxyOut,
+    associate: Option<&Connection>,
+    peer: Option<IpAddr>,
+) {
     let _ = relay.set_read_timeout(Some(UDP_POLL));
     if let Some(associate) = associate {
         let _ = associate.set_read_timeout(Some(budgets::SESSION_POLL));
@@ -30764,7 +30777,6 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: Option<&Co
     let mut buf = udp_buffer();
     let mut datagram = udp_buffer();
     let mut reply = Vec::with_capacity(UDP_BUF);
-    let peer = control_peer(associate);
     let mut pinned = None;
     let mut client = None;
     let mut quiet = Instant::now();
@@ -30852,7 +30864,12 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: Option<&Co
 
 /// CONNECT-IP UDP: one tunnel shared by every destination, so later targets cost a map row, not a dial.
 #[allow(clippy::too_many_lines)]
-fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: Option<&Connection>) {
+fn serve_socks_udp_foxy_ip(
+    relay: &UdpSocket,
+    foxy: &FoxyOut,
+    associate: Option<&Connection>,
+    peer: Option<IpAddr>,
+) {
     let _ = relay.set_read_timeout(Some(UDP_POLL));
     if let Some(associate) = associate {
         let _ = associate.set_read_timeout(Some(budgets::SESSION_POLL));
@@ -30864,7 +30881,6 @@ fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: Option<
     let mut buf = udp_buffer();
     let mut reply = Vec::with_capacity(UDP_BUF);
     let mut packet = Vec::with_capacity(UDP_BUF);
-    let peer = control_peer(associate);
     let mut pinned = None;
     let mut client = None;
     // One port per destination so a reply lands where it was sent from: the address is shared, the port is not.
@@ -63233,7 +63249,7 @@ mod tests {
         let (associate, _peer) = association_pair();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = crate::budgets::spawn(move || {
-            serve_socks_udp_foxy(&relay, &foxy_without_edges(), Some(&associate));
+            serve_socks_udp_foxy(&relay, &foxy_without_edges(), Some(&associate), None);
             let _ = done_tx.send(());
         });
         let returned = done_rx.recv_timeout(Duration::from_millis(250) + Duration::from_secs(5));
@@ -63253,7 +63269,7 @@ mod tests {
         let (associate, peer) = association_pair();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = crate::budgets::spawn(move || {
-            serve_socks_udp_foxy(&relay, &foxy_without_edges(), Some(&associate));
+            serve_socks_udp_foxy(&relay, &foxy_without_edges(), Some(&associate), None);
             let _ = done_tx.send(());
         });
         drop(peer);
@@ -63274,7 +63290,7 @@ mod tests {
         let (associate, _peer) = association_pair();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = crate::budgets::spawn(move || {
-            serve_socks_udp_foxy_ip(&relay, &foxy_without_edges(), Some(&associate));
+            serve_socks_udp_foxy_ip(&relay, &foxy_without_edges(), Some(&associate), None);
             let _ = done_tx.send(());
         });
         let returned = done_rx.recv_timeout(Duration::from_millis(250) + Duration::from_secs(5));
@@ -63294,7 +63310,7 @@ mod tests {
         let (associate, peer) = association_pair();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = crate::budgets::spawn(move || {
-            serve_socks_udp_foxy_ip(&relay, &foxy_without_edges(), Some(&associate));
+            serve_socks_udp_foxy_ip(&relay, &foxy_without_edges(), Some(&associate), None);
             let _ = done_tx.send(());
         });
         drop(peer);
@@ -79741,7 +79757,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(300)))
             .expect("timeout");
         let _serving = std::thread::spawn(move || {
-            serve_socks_udp_freedom(&relay, &FreedomOut::default(), None, None, None);
+            serve_socks_udp_freedom(&relay, &FreedomOut::default(), None, None, None, None);
         });
         let client = UdpSocket::bind("127.0.0.1:0").expect("client");
         client
@@ -81042,6 +81058,64 @@ end
             ended,
             "the split association outlived its control under a datagram stream"
         );
+    }
+
+    /// An inner split lane is spoken to by the splitter's relay address, not the remote control
+    /// peer: the handler must validate the peer the dispatcher passes, or a remote client's valid
+    /// datagrams die at the lane's source check.
+    #[test]
+    fn a_split_udp_lane_accepts_its_own_relay_sender() {
+        let Ok(front) = crate::conn::test_bind("127.0.0.2:0") else {
+            return;
+        };
+        let port = front.local_addr().expect("addr").port();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","port":1,"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let out = route_outbound(config, Some("in"), true);
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let Ok(mut client) = Connection::connect(("127.0.0.2", port)) else {
+            return;
+        };
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+        assert_eq!(
+            reply[3], 1,
+            "the relay answer is an IPv4 address: {reply:?}"
+        );
+        let relay = SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::new(
+                reply[4], reply[5], reply[6], reply[7],
+            )),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let allowed = udp_echo_loop();
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut frame = vec![0u8, 0, 0];
+        push_socks_addr(
+            &mut frame,
+            &format!("127.0.0.1:{allowed}").parse().expect("addr"),
+        );
+        frame.extend_from_slice(b"ping");
+        assert!(
+            udp_roundtrip_within(&udp, relay, &frame, b"ping", Duration::from_secs(2)).is_some(),
+            "the lane rejected the splitter's own relay address"
+        );
+        drop(client);
     }
 
     /// Silence past the budget is death here too: a sniffed association with no traffic hands its

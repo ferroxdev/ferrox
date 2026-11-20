@@ -500,7 +500,12 @@ impl TuicOut {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn serve_udp(&self, relay: &UdpSocket, associate: Option<&Connection>) {
+    pub(crate) fn serve_udp(
+        &self,
+        relay: &UdpSocket,
+        associate: Option<&Connection>,
+        peer: Option<IpAddr>,
+    ) {
         let Some(lane) = self.lane() else {
             return;
         };
@@ -551,7 +556,6 @@ impl TuicOut {
                 .ok()
         });
         let watch_started = watcher.is_some();
-        let peer = proxy::control_peer(associate);
         let mut buf = vec![0u8; UDP_BUFFER];
         let mut packet = 0u16;
         let mut frame = Vec::new();
