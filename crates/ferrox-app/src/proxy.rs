@@ -55502,16 +55502,28 @@ mod tests {
 
         let mut vision = crate::vision::Link::new(tls, None, &id);
         let mut reply = vec![0u8; 128];
-        let n = loop {
-            match vision.read(&mut reply) {
-                Ok(n) => break n,
+        let mut filled = 0;
+        let incoming = loop {
+            match vision.read(&mut reply[filled..]) {
+                Ok(0) => panic!("the reply closed after {filled} bytes"),
+                Ok(n) => {
+                    filled += n;
+                    match ferrox_core::mux::decode(
+                        &reply[..filled],
+                        ferrox_core::mux::NewTail::Forward,
+                    ) {
+                        Ok((incoming, _)) => break incoming,
+                        Err(
+                            ferrox_core::mux::Error::Short { .. }
+                            | ferrox_core::mux::Error::Truncated,
+                        ) => {}
+                        Err(error) => panic!("decodes the reply: {error:?}"),
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => panic!("reads the reply: {error:?}"),
             }
         };
-        let (incoming, _) =
-            ferrox_core::mux::decode(&reply[..n], ferrox_core::mux::NewTail::Forward)
-                .expect("decodes the reply");
         assert_eq!(incoming.status, ferrox_core::mux::Status::Keep);
         assert_eq!(incoming.data, Some(&b"ping"[..]));
         drop(vision);
