@@ -3100,6 +3100,7 @@ fn bind_staged(
             std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(mode))?;
             take_stale(path, stale)?;
             std::fs::hard_link(&inner, path)?;
+            #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
             register_staged(&inner, path);
             Ok(listener)
         })();
@@ -4582,7 +4583,7 @@ mod tests {
     }
 
     /// An accepted connection keeps the listener's name in the kernel table, but only a listening socket makes the path live.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn a_unix_probe_recovers_after_its_listener_closes_with_a_connection_open() {
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -4608,7 +4609,7 @@ mod tests {
     }
 
     /// A mode publishes the path by hard link, but the PCB keeps the private `.ferrox-*/s` name, which still names the live listener.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn a_unix_table_keeps_a_live_staged_listener() {
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -4634,7 +4635,7 @@ mod tests {
     }
 
     /// One live staged listener's copied name must not keep a dead sibling's path alive: ownership follows the bind, not the directory.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn a_unix_staged_listener_does_not_own_a_dead_siblings_path() {
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
