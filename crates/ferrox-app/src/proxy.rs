@@ -55501,7 +55501,7 @@ mod tests {
         assert_eq!(answer, [0, 0]);
 
         let mut vision = crate::vision::Link::new(tls, None, &id);
-        let mut reply = vec![0u8; 128];
+        let mut reply = [0u8; 128];
         let mut filled = 0;
         let incoming = loop {
             match vision.read(&mut reply[filled..]) {
