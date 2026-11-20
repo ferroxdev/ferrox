@@ -2962,7 +2962,7 @@ impl Slot {
     }
 
     /// Where registration writes this slot: the allocated file, not the runtime fallback, so a base
-    /// that already names the MASQUE half still gives WireGuard and MASQUE distinct files.
+    /// that already names the MASQUE half still gives `WireGuard` and MASQUE distinct files.
     fn allocation(self, paths: &KeyPaths) -> PathBuf {
         match self {
             Self::WireGuard => paths.wireguard.clone(),
