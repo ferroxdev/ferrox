@@ -2471,13 +2471,16 @@ pub(crate) fn probe_unix(path: &std::path::Path) -> io::Result<()> {
                     io::ErrorKind::AddrInUse,
                     "a unix listen path names a live socket",
                 )),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                    ) =>
-                {
-                    Ok(())
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                    if windows_socket_is_stale(path) == Some(true) {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::AddrInUse,
+                            "a unix listen path refused but may still be live",
+                        ))
+                    }
                 }
                 Err(error) => Err(error),
             },
@@ -3144,12 +3147,14 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
                     "a unix listen path names a live socket",
                 ))
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) =>
-            {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                if windows_socket_is_stale(path) != Some(true) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "a unix listen path refused but may still be live",
+                    ));
+                }
                 // The refused probe and unlink are not atomic across processes, so a replacement can slip between them.
                 std::fs::remove_file(path)?
             }
@@ -3160,6 +3165,26 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
     }
     let listener = UnixListener::bind(path)?;
     Ok(listener)
+}
+
+/// A refused Windows probe is not proof the listener is gone; only a handle free of other owners is.
+#[cfg(windows)]
+fn windows_socket_is_stale(path: &std::path::Path) -> Option<bool> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    match std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+    {
+        Ok(_) => Some(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(true),
+        Err(error) if matches!(error.raw_os_error(), Some(5) | Some(32)) => Some(false),
+        Err(_) => None,
+    }
 }
 
 #[cfg(windows)]

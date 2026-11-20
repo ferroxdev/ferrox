@@ -829,10 +829,12 @@ fn serve_inbounds_counted(
                         }
                     }
                     "hc" => {
-                        if serve_hc_inbound(address, inbound, handler_stop.clone()) {
+                        if let Some(wake) = serve_hc_inbound(address, inbound, handler_stop.clone())
+                        {
                             if let Some(stop) = &handler_stop {
-                                handler_stops.push((Arc::clone(stop), address.clone()));
+                                handler_stops.push((Arc::clone(stop), wake.clone()));
                             }
+                            wake_address = wake;
                             inbounds += 1;
                         }
                     }
@@ -16072,25 +16074,25 @@ fn serve_blackhole_inbound(
 
 /// Leaf's healthcheck door: one exact request line and, for `POST`, one exact body answer a
 /// fixed `200` body. A mismatch closes without an answer.
-fn serve_hc_inbound(address: &str, inbound: &Json, stop: Option<Arc<Stop>>) -> bool {
+fn serve_hc_inbound(address: &str, inbound: &Json, stop: Option<Arc<Stop>>) -> Option<String> {
     let Some(settings) = inbound.get("settings") else {
         eprintln!("inbound `hc` names no settings");
-        return false;
+        return None;
     };
     let Some(path) = settings.get("path").and_then(Json::as_str) else {
         eprintln!("inbound `hc` names no path");
-        return false;
+        return None;
     };
     let Some(response) = settings.get("response").and_then(Json::as_str) else {
         eprintln!("inbound `hc` names no response");
-        return false;
+        return None;
     };
     let request = match settings.get("request") {
         None | Some(Json::Null) => String::new(),
         Some(Json::Str(request)) => request.clone(),
         Some(_) => {
             eprintln!("inbound `hc` request is not a string");
-            return false;
+            return None;
         }
     };
     let handler = std::sync::Arc::new(HcHandler::new(path, request, response));
@@ -16099,7 +16101,7 @@ fn serve_hc_inbound(address: &str, inbound: &Json, stop: Option<Arc<Stop>>) -> b
         Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
             bind_failed();
             eprintln!("cannot resolve {address}: {error}");
-            return false;
+            return None;
         }
         Err(error) => exit(&format!("cannot resolve {address}: {error}")),
     };
@@ -16108,10 +16110,14 @@ fn serve_hc_inbound(address: &str, inbound: &Json, stop: Option<Arc<Stop>>) -> b
         Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
             bind_failed();
             eprintln!("cannot listen on {address}: {error}");
-            return false;
+            return None;
         }
         Err(error) => exit(&format!("cannot listen on {address}: {error}")),
     };
+    let wake = listener.local_addr().map_or_else(
+        |_| address.to_owned(),
+        |bound| swapped_port(address, bound.port()),
+    );
     thread::spawn(move || {
         for stream in listener.incoming() {
             if stop.as_ref().is_some_and(|stop| stop.stopped()) {
@@ -16127,7 +16133,7 @@ fn serve_hc_inbound(address: &str, inbound: &Json, stop: Option<Arc<Stop>>) -> b
             stop.mark_closed();
         }
     });
-    true
+    Some(wake)
 }
 
 /// The `hc` request's head and the octets behind it, one window at a time: the terminator scan resumes three octets before the bytes that just arrived, so a head that arrives in pieces is walked once rather than once per piece, and it reaches the tree's one `\r\n\r\n` scan rather than reopening the four-byte window.
@@ -86972,6 +86978,25 @@ mod hc_tests {
         let mut answer = Vec::new();
         client.read_to_end(&mut answer).expect("reads");
         answer
+    }
+
+    #[test]
+    fn an_hc_wake_names_the_ephemeral_port_it_bound() {
+        let inbound = crate::json::parse(r#"{"settings":{"path":"/health","response":"ok"}}"#)
+            .expect("parses");
+        let stop = Arc::new(Stop::new());
+        let wake = serve_hc_inbound("127.0.0.1:0", &inbound, Some(Arc::clone(&stop)))
+            .expect("binds an ephemeral port");
+        let port: u16 = wake
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse().ok())
+            .expect("the wake names a port");
+        assert_ne!(
+            port, 0,
+            "the wake names the port the listener actually bound"
+        );
+        stop.stop();
+        wake_listener(&stop, &wake);
     }
 
     #[test]
