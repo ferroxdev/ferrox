@@ -399,8 +399,8 @@ mod tests {
     #[test]
     #[ignore = "needs CAP_NET_ADMIN; ci.yml runs it as root"]
     fn a_real_guard_installs_pins_and_retires_a_route() {
-        let target: IpAddr = "192.0.2.1".parse().unwrap();
-        let captured = "192.0.2.0".parse().unwrap();
+        let target: IpAddr = "203.0.113.1".parse().unwrap();
+        let captured = "203.0.113.0".parse().unwrap();
         let first = Guard::install("lo", &Plan::new(false, false, &[(captured, 24)], &[]))
             .expect("install a route on loopback");
         let mut manager = RouteManager::new().expect("route table");

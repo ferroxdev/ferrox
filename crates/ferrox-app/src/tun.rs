@@ -2407,7 +2407,6 @@ impl Handler {
             let len = payload.len() as u32;
             // What the queue served behind the upload: an answer already carries this segment's ack, a refused one ends the flow.
             let mut served = Served::None;
-            let mut advanced = false;
             // A pure ACK only moves the window: it never touches the upload half, so it takes no pipe lock.
             if !payload.is_empty() || fin {
                 let mut guard = flow
@@ -2432,7 +2431,6 @@ impl Handler {
                     // The cursor moves by what the pipe accepted, so a short or refused write is the device's to retransmit; the read leg still delivers what the relay wrote before it closed.
                     let sent = half.write(&payload[skip..]).unwrap_or(0);
                     end = rcv.wrapping_add(sent as u32);
-                    advanced = sent > 0;
                     flow.rcv_nxt.store(end, Relaxed);
                     if sent > 0 && !fin {
                         served = self.serve_inline(half, &flow);
@@ -2448,17 +2446,12 @@ impl Handler {
                 self.retire(&flow, Some(FLAG_RST | FLAG_ACK));
                 return Ok(());
             }
-            // A push, a finish, a short or duplicate segment, or two full segments of new data earn an ACK: a full segment without PSH waits for the one after it, and a duplicate through the gap still stops the retransmit.
+            // Every data segment or FIN gets an ACK: a segment without PSH must not wait for a later one that may never come, and a duplicate still has to stop a retransmit.
             let unacked = flow
                 .rcv_nxt
                 .load(Relaxed)
                 .wrapping_sub(flow.last_acked.load(Relaxed));
-            let limit = 2 * flow.mss.load(Relaxed).max(1);
-            let short = payload.len() < flow.mss.load(Relaxed).max(1) as usize;
-            let due = fin
-                || tcp.flags & FLAG_PSH != 0
-                || (!payload.is_empty() && (!advanced || short || unacked >= limit))
-                || (payload.is_empty() && unacked > 0);
+            let due = fin || !payload.is_empty() || unacked > 0;
             if let Served::Ack(ack) = served {
                 // The response carried this segment's ack, so the standalone one would only repeat it, and the cursor stored is the one that left rather than whatever another queue advanced meanwhile.
                 flow.last_acked.store(ack, Relaxed);
@@ -3235,10 +3228,15 @@ mod tests {
         assert_eq!(device.name().expect("the kernel names the device"), name);
         device.set_nonblocking(true).expect("poll the device");
         let mut buf = [0u8; 2048];
-        match device.recv(&mut buf) {
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => panic!("read the idle device: {error}"),
-            Ok(n) => panic!("an idle device carries no packet, read {n}"),
+        // The kernel may emit neighbour discovery for the fresh address; drain it until the queue is empty.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match device.recv(&mut buf) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("read the idle device: {error}"),
+                Ok(_) if std::time::Instant::now() < deadline => {}
+                Ok(_) => break,
+            }
         }
     }
 

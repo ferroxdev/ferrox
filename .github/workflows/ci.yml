@@ -227,7 +227,7 @@ jobs:
               except ValueError: continue
               if message.get("reason") == "compiler-artifact" and message.get("target", {}).get("kind") == ["bin"] and message.get("executable"): print(message["executable"])')
           test -n "$bin"
-          sudo --preserve-env=PATH "$bin" --ignored --nocapture "$filter"
+          sudo --preserve-env=PATH "$bin" --ignored --nocapture --test-threads=1 "$filter"
 
       - name: publish the log the stall was cut from
         if: always()
