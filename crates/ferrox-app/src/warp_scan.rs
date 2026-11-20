@@ -781,6 +781,7 @@ mod tests {
             .collect();
         let started = AtomicBool::new(false);
         let caught = AtomicBool::new(false);
+        let assisted = AtomicBool::new(false);
         let found = hunt_with_early(
             primary,
             vec![first, second],
@@ -790,10 +791,12 @@ mod tests {
                 if edge == first {
                     started.store(true, Ordering::SeqCst);
                     let wait = Instant::now();
-                    while !caught.load(Ordering::SeqCst) && wait.elapsed() < Duration::from_secs(2)
-                    {
+                    let mut saw_helper = caught.load(Ordering::SeqCst);
+                    while !saw_helper && wait.elapsed() < Duration::from_secs(2) {
                         std::thread::sleep(Duration::from_millis(1));
+                        saw_helper = caught.load(Ordering::SeqCst);
                     }
+                    assisted.store(saw_helper, Ordering::SeqCst);
                     None
                 } else if edge == second {
                     caught.store(true, Ordering::SeqCst);
@@ -809,6 +812,10 @@ mod tests {
             },
         );
         assert_eq!(found, vec![(second, Duration::from_millis(1))]);
+        assert!(
+            assisted.load(Ordering::SeqCst),
+            "the first fallback timed out instead of another worker taking the second"
+        );
     }
 
     #[test]
