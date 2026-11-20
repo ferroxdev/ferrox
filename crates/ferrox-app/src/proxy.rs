@@ -27114,7 +27114,7 @@ fn write_all_within(conn: &Connection, mut bytes: &[u8], until: Instant) -> std:
 /// Nothing carries the destination onward, so this lane is the one that has to redirect it,
 /// resolve it by the configured strategy, and add the header or fragment the config asks for.
 fn serve_connect_freedom(
-    mut client: &Connection,
+    client: &Connection,
     freedom: &FreedomOut,
     asked: &Destination,
     prefix: &[u8],
