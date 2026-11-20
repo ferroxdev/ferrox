@@ -676,7 +676,7 @@ fn serve_inbounds_counted(
                 BIND_FAILED.with(|failed| failed.set(false));
                 let was = inbounds;
                 let mut wake_address = address.clone();
-                let mut wake_stream = true;
+                let wake_stream = inbound_wakes_stream(inbound, protocol);
                 match protocol {
                     "vless" => {
                         if serve_vless_inbound(
@@ -717,7 +717,6 @@ fn serve_inbounds_counted(
                         }
                     }
                     "shadowsocks" => {
-                        wake_stream = inbound_ss_networks(inbound).0;
                         let listeners = serve_shadowsocks_inbound(
                             address,
                             inbound,
@@ -1100,6 +1099,26 @@ fn inbound_sockets(inbound: &Json, protocol: &str) -> (bool, bool) {
         },
         _ => (false, false),
     }
+}
+
+/// Whether this inbound opens a stream listener whose blocked accept needs a wake; masque's TLS
+/// path binds TCP only when its ALPN carries h2 or HTTP/1.1, which `inbound_sockets` cannot see.
+fn inbound_wakes_stream(inbound: &Json, protocol: &str) -> bool {
+    if protocol != "masque" {
+        return inbound_sockets(inbound, protocol).0;
+    }
+    let security = inbound
+        .get("streamSettings")
+        .and_then(|settings| settings.get("security"))
+        .and_then(Json::as_str)
+        .unwrap_or_default();
+    security.eq_ignore_ascii_case("none")
+        || quic_inbound_identity(inbound).is_some_and(|identity| {
+            identity
+                .alpn
+                .iter()
+                .any(|alpn| alpn == b"h2" || alpn == b"http/1.1")
+        })
 }
 
 #[allow(dead_code)]
@@ -17977,6 +17996,10 @@ fn serve_shadowsocks_inbound(
             _ if !matches!(stream_security(inbound), "" | "none") => {
                 let security = stream_security(inbound);
                 eprintln!("shadowsocks security `{security}` on {address}: refused, not served");
+                if FALLIBLE_BIND.with(std::cell::Cell::get) {
+                    bind_failed();
+                    return 0;
+                }
             }
             other => {
                 if spawn_role_stopped(
