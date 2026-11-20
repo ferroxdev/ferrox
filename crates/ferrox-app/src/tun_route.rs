@@ -4,17 +4,24 @@
 //! stops.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::net::IpAddr;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use std::sync::{Mutex, OnceLock, Weak};
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use route_manager::{Route, RouteManager};
 
 /// The capture in force, shared with the dial path so an address resolved after the routes landed is pinned before it is dialled.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn capture() -> &'static Mutex<Option<Weak<Guard>>> {
     static CAPTURE: OnceLock<Mutex<Option<Weak<Guard>>>> = OnceLock::new();
     CAPTURE.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) fn pin_dialled(address: IpAddr) {
     let guard = capture()
         .lock()
@@ -24,6 +31,9 @@ pub(crate) fn pin_dialled(address: IpAddr) {
         guard.pin(address);
     }
 }
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub(crate) fn pin_dialled(_address: IpAddr) {}
 
 /// What one open device captures: the half-default of each family it carries,
 /// the prefixes the config names, and the prefixes it must not capture.
@@ -93,6 +103,7 @@ impl Plan {
 }
 
 /// The routes one device holds; dropping the guard puts the table back.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) struct Guard {
     manager: Mutex<RouteManager>,
     added: Mutex<Vec<Route>>,
@@ -102,6 +113,7 @@ pub(crate) struct Guard {
     default_v6: Option<Route>,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl Guard {
     /// Pin every kept prefix where it already resolves, then capture the plan's
     /// prefixes on `interface`. A prefix whose current route cannot be found is
@@ -223,6 +235,7 @@ impl Guard {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl Drop for Guard {
     fn drop(&mut self) {
         if let Ok(mut slot) = capture().lock() {
@@ -242,6 +255,20 @@ impl Drop for Guard {
         for route in added.drain(..).rev() {
             let _ = manager.delete(&route);
         }
+    }
+}
+
+/// A mobile host routes in its own VpnService, so `auto_route` names the platform it needs instead of capturing the table twice.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub(crate) struct Guard;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+impl Guard {
+    pub(crate) fn install(_interface: &str, _plan: &Plan) -> io::Result<Arc<Self>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "`auto_route` needs a platform routing table; the host routes its own VpnService",
+        ))
     }
 }
 
