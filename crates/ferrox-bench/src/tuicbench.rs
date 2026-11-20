@@ -63,7 +63,7 @@ fn walk_drain(mut buf: Vec<u8>) -> usize {
     }
 }
 
-const SESSIONS: usize = 4096;
+const SESSIONS: usize = 1024;
 
 fn sweep_list(ids: &[usize], seen: &mut Vec<usize>) -> usize {
     seen.clear();
