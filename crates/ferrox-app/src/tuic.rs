@@ -975,6 +975,7 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
     let mut buf = vec![0u8; 65535];
     let mut ids = Vec::new();
     let mut uni: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut batch = quic::Batch::new();
     while let Some(lane) = weak.upgrade() {
         if lane.stop.load(Ordering::Relaxed) {
             break;
@@ -982,9 +983,38 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
         if lane.sock.set_read_timeout(Some(POLL)).is_err() {
             break;
         }
-        match lane.sock.recv_from(&mut buf) {
-            Ok((n, from)) => {
-                {
+        let alive = match quic::recv_batch(&lane.sock, &mut batch) {
+            quic::Drain::Read => {
+                let taken = batch.len();
+                let Ok(mut conn) = lane.conn.lock() else {
+                    break;
+                };
+                for at in 0..taken {
+                    let Some((bytes, from)) = batch.at(at) else {
+                        continue;
+                    };
+                    let _ = conn.recv(
+                        bytes,
+                        quiche::RecvInfo {
+                            from,
+                            to: lane.local,
+                        },
+                    );
+                }
+                lane.finish_handshake()
+                    && client_turn(&mut conn, &lane, &mut buf, &replies, &mut uni, &mut ids)
+            }
+            quic::Drain::Empty => {
+                if !lane.finish_handshake() {
+                    break;
+                }
+                let Ok(mut conn) = lane.conn.lock() else {
+                    break;
+                };
+                service(&mut conn, &lane)
+            }
+            quic::Drain::Unbatchable => match lane.sock.recv_from(&mut buf) {
+                Ok((n, from)) => {
                     let Ok(mut conn) = lane.conn.lock() else {
                         break;
                     };
@@ -995,80 +1025,89 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                             to: lane.local,
                         },
                     );
+                    lane.finish_handshake()
+                        && client_turn(&mut conn, &lane, &mut buf, &replies, &mut uni, &mut ids)
                 }
-                if !lane.finish_handshake() {
-                    break;
-                }
-                let Ok(mut conn) = lane.conn.lock() else {
-                    break;
-                };
-                remember_session(&conn, &lane.session);
-                while let Ok(data) = conn.dgram_recv_buf() {
-                    let _ = replies.try_send(data);
-                }
-                ids.clear();
-                ids.extend(conn.readable());
-                for &id in &ids {
-                    if id % 4 != 3 {
-                        continue;
+                Err(error) if is_wait(&error) => {
+                    if !lane.finish_handshake() {
+                        break;
                     }
-                    let mut data = uni.remove(&id).unwrap_or_default();
-                    while let Ok((read, _)) = conn.stream_recv(id, &mut buf) {
-                        if read == 0 {
-                            break;
-                        }
-                        if data.len() + read > MAX_UNI_COMMAND {
-                            let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-                            break;
-                        }
-                        data.extend_from_slice(&buf[..read]);
-                    }
-                    if data.get(1) == Some(&wire::PACKET) {
-                        loop {
-                            match wire::parse_packet_prefix(&data) {
-                                Ok((_, used)) => {
-                                    let _ = replies.try_send(data[..used].to_vec());
-                                    data.drain(..used);
-                                }
-                                Err(wire::FrameError::Short) => break,
-                                Err(_) => {
-                                    let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-                                    data.clear();
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if !conn.stream_finished(id) {
-                        if data.is_empty() {
-                            uni.remove(&id);
-                        } else {
-                            uni.insert(id, data);
-                        }
-                    }
+                    let Ok(mut conn) = lane.conn.lock() else {
+                        break;
+                    };
+                    service(&mut conn, &lane)
                 }
-                if !service(&mut conn, &lane) {
-                    break;
-                }
-            }
-            Err(error) if is_wait(&error) => {
-                if !lane.finish_handshake() {
-                    break;
-                }
-                let Ok(mut conn) = lane.conn.lock() else {
-                    break;
-                };
-                if !service(&mut conn, &lane) {
-                    break;
-                }
-            }
-            Err(_) => break,
+                Err(_) => break,
+            },
+            quic::Drain::Unreadable => break,
+        };
+        if !alive {
+            break;
         }
     }
     if let Some(lane) = weak.upgrade() {
         lane.stop.store(true, Ordering::Relaxed);
         lane.heartbeat.unpark();
     }
+}
+
+/// The work one received batch owes: the datagrams it queued, the streams it made readable, and
+/// the timers behind them. The lock, the readable sweep and the egress flush are each paid once
+/// per batch instead of once per packet.
+fn client_turn(
+    conn: &mut quiche::Connection,
+    lane: &Lane,
+    buf: &mut [u8],
+    replies: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    uni: &mut HashMap<u64, Vec<u8>>,
+    ids: &mut Vec<u64>,
+) -> bool {
+    remember_session(conn, &lane.session);
+    while let Ok(data) = conn.dgram_recv_buf() {
+        let _ = replies.try_send(data);
+    }
+    ids.clear();
+    ids.extend(conn.readable());
+    for &id in ids.iter() {
+        if id % 4 != 3 {
+            continue;
+        }
+        let mut data = uni.remove(&id).unwrap_or_default();
+        while let Ok((read, _)) = conn.stream_recv(id, buf) {
+            if read == 0 {
+                break;
+            }
+            if data.len() + read > MAX_UNI_COMMAND {
+                let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
+                break;
+            }
+            data.extend_from_slice(&buf[..read]);
+        }
+        if data.get(1) == Some(&wire::PACKET) {
+            loop {
+                match wire::parse_packet_prefix(&data) {
+                    Ok((_, used)) => {
+                        let _ = replies.try_send(data[..used].to_vec());
+                        data.drain(..used);
+                    }
+                    Err(wire::FrameError::Short) => break,
+                    Err(_) => {
+                        let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
+                        data.clear();
+                        break;
+                    }
+                }
+            }
+        }
+        if !conn.stream_finished(id) {
+            if data.is_empty() {
+                uni.remove(&id);
+            } else {
+                uni.insert(id, data);
+            }
+        }
+    }
+    service(conn, lane)
 }
 
 fn flush_lane(lane: &Lane, conn: &mut quiche::Connection) {
