@@ -30,7 +30,7 @@ const MAX_FRAME: usize = 0xffff;
 const PASSWORD_LEN: usize = 32;
 const POLL: Duration = Duration::from_millis(100);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
-const STREAM_QUEUE_LIMIT: usize = 64 * 1024;
+const STREAM_QUEUE_LIMIT: usize = 512 * 1024;
 const QUEUE_CHUNKS: usize = 16;
 const SESSION_QUEUE_LIMIT: usize = 8 * 1024 * 1024;
 
