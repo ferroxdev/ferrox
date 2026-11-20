@@ -44301,7 +44301,7 @@ mod tests {
             "the device is opened with every address the config names"
         );
         let xray = spec(
-            r#"{"name":"xr0","gateway":["198.18.0.1/15"],"DNS":["1.1.1.1"],"auto_system_routing_table":["main"]}"#,
+            r#"{"name":"xr0","gateway":["198.18.0.1/15"],"DNS":["192.0.2.53"],"auto_system_routing_table":["main"]}"#,
         )
         .expect("xray's own tun spelling");
         assert_eq!(xray.name(), "xr0");
@@ -44313,7 +44313,7 @@ mod tests {
         assert_eq!(xray.prefix(), 15);
         assert_eq!(
             xray.dns_hijack(),
-            Some("1.1.1.1".parse().unwrap()),
+            Some("192.0.2.53".parse().unwrap()),
             "xray's first `DNS` address answers a hijacked query"
         );
         assert!(
