@@ -2781,13 +2781,14 @@ pub(crate) fn claim_udp_route(routes: &UdpRoutes, port: u16) -> Result<UdpRouteC
 /// inner UDP packet, and the reply the tunnel returns is framed back to the last
 /// app that spoke. Each name gets its own inner source port, so a reply pins
 /// only the name that raced it, and the relay port serves a literal address.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     relay: &UdpSocket,
     config: &DeviceConfig,
     to_tunnel: &T,
     routes: &UdpRoutes,
     associate: Option<&Connection>,
+    peer: Option<IpAddr>,
     resolve: &dyn Fn(&str, u16) -> Vec<SocketAddr>,
     headroom: usize,
 ) -> bool {
@@ -2835,14 +2836,23 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
         }
         match relay.recv_from(&mut buf) {
             Ok((n, sender)) => {
-                quiet = StdInstant::now();
+                if !crate::proxy::source_ip_ok(peer, sender) {
+                    if lane_over(associate, quiet) {
+                        break;
+                    }
+                    continue;
+                }
+                if app.is_some_and(|bound| bound != sender) {
+                    if lane_over(associate, quiet) {
+                        break;
+                    }
+                    continue;
+                }
                 let Some((destination, payload)) = crate::proxy::parse_socks_udp_dest(&buf[..n])
                 else {
                     continue;
                 };
-                if app.is_some_and(|bound| bound != sender) {
-                    continue;
-                }
+                quiet = StdInstant::now();
                 app = Some(sender);
                 let key = match &destination {
                     Destination::Name(host, port) => Some((host.clone(), *port)),
@@ -3004,9 +3014,10 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
         other => other.clone(),
     };
     let _ = relay.set_read_timeout(Some(crate::budgets::udp_idle()));
+
     let stop = Arc::new(AtomicBool::new(false));
     let relay_stop = Arc::clone(&stop);
-    std::thread::spawn(move || serve_udp_lane(&relay, &outbound, None, Some(&relay_stop)));
+    std::thread::spawn(move || serve_udp_lane(&relay, &outbound, None, None, Some(&relay_stop)));
 
     let reader_stop = Arc::clone(&stop);
     let reader_activity = Arc::clone(last_used);
@@ -5132,6 +5143,7 @@ mod client_tests {
                 &to_tunnel,
                 &thread_routes,
                 Some(&associate),
+                crate::proxy::control_peer(Some(&associate)),
                 &resolve_one,
                 0,
             );
@@ -5164,6 +5176,7 @@ mod client_tests {
                 &to_tunnel,
                 &thread_routes,
                 None,
+                None,
                 &resolve_one,
                 0,
             );
@@ -5193,6 +5206,7 @@ mod client_tests {
                 &thread_config,
                 &to_tunnel,
                 &thread_routes,
+                None,
                 None,
                 &resolve_one,
                 0,
@@ -5346,6 +5360,7 @@ mod client_tests {
                 &to_tunnel,
                 &thread_routes,
                 None,
+                None,
                 &|host, port| {
                     if host == "other.test" {
                         assert_eq!(port, 54);
@@ -5419,6 +5434,7 @@ mod client_tests {
                 &thread_config,
                 &to_tunnel,
                 &thread_routes,
+                None,
                 None,
                 &|host, port| {
                     if host == "other.test" {

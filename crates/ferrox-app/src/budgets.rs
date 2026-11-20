@@ -265,8 +265,20 @@ pub(crate) fn clear() {
 pub(crate) fn carrying<F: FnOnce() -> T + Send, T: Send>(body: F) -> impl FnOnce() -> T + Send {
     let armed = MINE.with(std::cell::Cell::get);
     move || {
-        MINE.with(|cell| cell.set(armed));
+        let _restore = RestoreArm(MINE.with(|cell| cell.replace(armed)));
         body()
+    }
+}
+
+/// A pooled worker outlives the lane that armed it, so the arm it found is put back when the lane ends.
+#[cfg(test)]
+struct RestoreArm([Option<Duration>; 11]);
+
+#[cfg(test)]
+impl Drop for RestoreArm {
+    fn drop(&mut self) {
+        let prior = self.0;
+        MINE.with(|cell| cell.set(prior));
     }
 }
 

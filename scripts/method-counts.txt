@@ -33,11 +33,14 @@ tuic syscalls-per-connect UNBLESSED scripts/count-ops.sh
 tuic single-fragment-payload-copies-per-packet 0 ferrox-app-tuic::tests::a_single_fragment_packet_payload_is_not_copied
 tuic nanoseconds-per-packet 13.8 .github/workflows/bench.yml
 tuic burst-walk-ns-per-frame 9.7 .github/workflows/bench.yml
+tuic sweep-dedupe-ns-per-session 15.6 .github/workflows/bench.yml
 tuic address-families 3 ferrox-core-tuic::tests::the_three_address_families_match_the_wire
 tuic outbound-spellings-parsed 1 ferrox-app-tuic::tests::a_tuic_outbound_reads_the_reference_spellings
 anytls ops-retired-instructions UNBLESSED scripts/count-ops.sh
 anytls syscalls-per-connect UNBLESSED scripts/count-ops.sh
 anytls payload-copies-per-frame UNBLESSED scripts/count-ops.sh
+anytls frame-scheme-copies 0 ferrox-app-anytls::tests::a_frame_does_not_copy_the_padding_scheme
+anytls step-list-walk-allocations 0 ferrox-app-anytls::tests::a_step_list_is_walked_not_collected
 anytls nanoseconds-per-frame UNBLESSED .github/workflows/bench.yml
 anytls address-families 3 ferrox-app-anytls::tests::addresses_round_trip
 anytls padding-scheme-md5 75cff2ad89aadf5e257059ee571ebe11 ferrox-app-anytls::tests::the_default_padding_md5_is_the_reference_one

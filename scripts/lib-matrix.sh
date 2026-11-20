@@ -72,6 +72,28 @@ matrix_warp_needs_external_reference() {
   [[ "$1" == warp-* ]]
 }
 
+# The external engine a cell's ratio is read against; xray-core is the default reference, while the
+# standalone protocols name the engine that carries them at this pin.
+matrix_reference_engine() {
+  case "$1" in
+    hysteria-v1-* | anytls-* | tuic-*) printf '%s\n' sing-box ;;
+    warp-*) printf '%s\n' aether ;;
+    *) printf '%s\n' xray-core ;;
+  esac
+}
+
+# The harness reads the first external engine as its reference; keep the selected one first.
+matrix_reference_first() {
+  local reference="$1" have
+  shift
+  for have in "$@"; do
+    [[ "${have%%=*}" == "$reference" ]] && printf '%s\n' "$have"
+  done
+  for have in "$@"; do
+    [[ "${have%%=*}" == "$reference" ]] || printf '%s\n' "$have"
+  done
+}
+
 # A filter names a whole rung: the id itself or a `-`-separated child of it, so
 # `vless-raw-down-1` never selects `vless-raw-down-16`.
 scenario_matches() {
@@ -184,6 +206,14 @@ matrix_engine_skip_reason() {
     case "$engine" in
       xray-core | xray-core-rust | sing-box | zeronet)
         printf '%s\n' "android's uTLS preset has no TLS 1.3 suites or key share, so REALITY cannot establish"
+        return 0
+        ;;
+    esac
+  fi
+  if [[ "$role" == server && "$engine" == xray-core ]]; then
+    case "$id" in
+      vless-vision-reality-edge-* | vless-vision-reality-ios-* | vless-vision-reality-random-*)
+        printf '%s\n' "xray-core at this pin refuses the edge, ios and random uTLS hellos, so REALITY cannot establish"
         return 0
         ;;
     esac

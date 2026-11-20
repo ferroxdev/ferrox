@@ -2561,31 +2561,32 @@ impl WarpOut {
         &self,
         relay: &std::net::UdpSocket,
         associate: Option<&crate::conn::Connection>,
+        peer: Option<IpAddr>,
     ) {
         match self.lane() {
             Lane::WireGuard => {
                 if let Some(wireguard) = &self.wireguard {
-                    wireguard.serve_udp(relay, associate);
+                    wireguard.serve_udp(relay, associate, peer);
                 }
             }
             Lane::Masque => {
                 if let Some(masque) = &self.masque {
-                    masque.serve_udp(relay, associate);
+                    masque.serve_udp(relay, associate, peer);
                 }
             }
             Lane::Gool => {
                 if let Some(gool) = &self.gool {
-                    gool.inner.serve_udp(relay, associate);
+                    gool.inner.serve_udp(relay, associate, peer);
                 }
             }
             Lane::GoolClassic => {
                 if let Some(classic) = &self.gool_classic {
-                    classic.inner.serve_udp(relay, associate);
+                    classic.inner.serve_udp(relay, associate, peer);
                 }
             }
             Lane::Mim => {
                 if let Some(mim) = &self.mim {
-                    mim.inner.serve_udp(relay, associate);
+                    mim.inner.serve_udp(relay, associate, peer);
                 }
             }
         }

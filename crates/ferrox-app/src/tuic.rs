@@ -500,7 +500,12 @@ impl TuicOut {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn serve_udp(&self, relay: &UdpSocket, associate: Option<&Connection>) {
+    pub(crate) fn serve_udp(
+        &self,
+        relay: &UdpSocket,
+        associate: Option<&Connection>,
+        peer: Option<IpAddr>,
+    ) {
         let Some(lane) = self.lane() else {
             return;
         };
@@ -566,6 +571,9 @@ impl TuicOut {
             }
             match relay.recv_from(&mut buf) {
                 Ok((n, client)) => {
+                    if !proxy::source_ip_ok(peer, client) {
+                        continue;
+                    }
                     let Some((destination, payload)) = proxy::parse_socks_udp_dest(&buf[..n])
                     else {
                         continue;
@@ -1578,8 +1586,9 @@ fn run(
         udp_sockets: Arc::new(AtomicUsize::new(0)),
         retry_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &retry_secret),
         touched: Vec::new(),
-        dead: Vec::new(),
-        seen: Vec::new(),
+        touched_ids: HashSet::new(),
+        dead: HashSet::new(),
+        seen: HashSet::new(),
     };
     let mut buf = vec![0u8; UDP_BUFFER];
     let mut last_tick = Instant::now();
@@ -1626,9 +1635,11 @@ struct Server {
     retry_key: ring::hmac::Key,
     /// Sessions this worker owed a turn at the end of a batch, kept so each batch reuses one capacity.
     touched: Vec<Arc<Session>>,
-    /// The same for the periodic sweep: the dead sessions it found and the ones it already visited.
-    dead: Vec<Arc<Session>>,
-    seen: Vec<Arc<Session>>,
+    /// The identities in `touched`, so a burst's repeat visit is one hash, not a walk of the list.
+    touched_ids: HashSet<usize>,
+    /// The periodic sweep's findings: the dead sessions' identities and the ones it already visited.
+    dead: HashSet<usize>,
+    seen: HashSet<usize>,
 }
 
 /// A worker's claim on the listener's socket, returned even when the flow panics.
@@ -1767,7 +1778,9 @@ impl Server {
     fn route_batch(&mut self, batch: &mut quic::Batch) {
         let taken = batch.len();
         let mut touched = std::mem::take(&mut self.touched);
+        let mut touched_ids = std::mem::take(&mut self.touched_ids);
         touched.clear();
+        touched_ids.clear();
         for at in 0..taken {
             let Some((bytes, from)) = batch.at(at) else {
                 continue;
@@ -1776,7 +1789,7 @@ impl Server {
                 continue;
             };
             self.feed(&session, bytes, from);
-            if !touched.iter().any(|held| Arc::ptr_eq(held, &session)) {
+            if touched_ids.insert(Arc::as_ptr(&session) as usize) {
                 touched.push(session);
             }
         }
@@ -1784,6 +1797,7 @@ impl Server {
             self.turn(&session);
         }
         self.touched = touched;
+        self.touched_ids = touched_ids;
     }
 
     fn session_for(&mut self, bytes: &mut [u8], from: SocketAddr) -> Option<Arc<Session>> {
@@ -1896,17 +1910,18 @@ impl Server {
 
     fn close(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let mut seen: Vec<Arc<Session>> = Vec::new();
+        let mut seen = std::mem::take(&mut self.seen);
+        seen.clear();
         for session in self.conns.values() {
-            if seen.iter().any(|seen| Arc::ptr_eq(seen, session)) {
+            if !seen.insert(Arc::as_ptr(session) as usize) {
                 continue;
             }
-            seen.push(Arc::clone(session));
             if let Ok(mut conn) = session.conn.lock() {
                 let _ = conn.close(true, 0, b"closed");
                 quic::flush_egress(&mut conn, &self.sock);
             }
         }
+        self.seen = seen;
         self.conns.clear();
         self.sessions = 0;
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2041,10 +2056,9 @@ impl Server {
         dead.clear();
         seen.clear();
         for session in self.conns.values() {
-            if seen.iter().any(|seen| Arc::ptr_eq(seen, session)) {
+            if !seen.insert(Arc::as_ptr(session) as usize) {
                 continue;
             }
-            seen.push(Arc::clone(session));
             let Ok(mut conn) = session.conn.lock() else {
                 continue;
             };
@@ -2060,7 +2074,7 @@ impl Server {
                     let _ = conn.close(true, 0, b"timeout");
                     quic::flush_egress(&mut conn, &self.sock);
                 }
-                dead.push(Arc::clone(session));
+                dead.insert(Arc::as_ptr(session) as usize);
                 continue;
             }
             if !conn.is_established() {
@@ -2093,7 +2107,7 @@ impl Server {
         }
         if !dead.is_empty() {
             self.conns
-                .retain(|_, session| !dead.iter().any(|dead| Arc::ptr_eq(dead, session)));
+                .retain(|_, session| !dead.contains(&(Arc::as_ptr(session) as usize)));
             self.sessions = self.sessions.saturating_sub(dead.len());
         }
         dead.clear();

@@ -63,6 +63,34 @@ fn walk_drain(mut buf: Vec<u8>) -> usize {
     }
 }
 
+/// The worker's `MAX_SESSIONS`, so the sweep prices a map that can exist.
+const SESSIONS: usize = 1024;
+
+fn sweep_list(ids: &[usize], seen: &mut Vec<usize>) -> usize {
+    seen.clear();
+    let mut visited = 0;
+    for &id in ids {
+        if seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        visited += 1;
+    }
+    visited
+}
+
+fn sweep_set(ids: &[usize], seen: &mut std::collections::HashSet<usize>) -> usize {
+    seen.clear();
+    let mut visited = 0;
+    for &id in ids {
+        if !seen.insert(id) {
+            continue;
+        }
+        visited += 1;
+    }
+    visited
+}
+
 fn measure<A, B>(
     mut first: impl FnMut(&[u8]) -> A,
     mut second: impl FnMut(&[u8]) -> B,
@@ -82,6 +110,59 @@ fn measure<A, B>(
         second_best = second_best.min(second_ns);
     }
     (first_best, second_best)
+}
+
+fn sweep_section(out: &mut String) {
+    let ids: Vec<usize> = (0..SESSIONS).map(|n| n * 64 + 1).collect();
+    let mut listed_seen: Vec<usize> = Vec::with_capacity(SESSIONS);
+    let mut hashed_seen = std::collections::HashSet::with_capacity(SESSIONS);
+    let aliases = [65usize, 129, 65, 193, 129];
+    assert_eq!(
+        sweep_list(&aliases, &mut listed_seen),
+        3,
+        "an alias is one visit"
+    );
+    assert_eq!(
+        sweep_set(&aliases, &mut hashed_seen),
+        3,
+        "an alias is one visit"
+    );
+    let mut list_best = f64::MAX;
+    let mut set_best = f64::MAX;
+    for round in 0..ROUNDS {
+        if round % 2 == 0 {
+            let start = Instant::now();
+            let listed = black_box(sweep_list(black_box(&ids), black_box(&mut listed_seen)));
+            list_best = list_best.min(start.elapsed().as_nanos() as f64);
+            let start = Instant::now();
+            let hashed = black_box(sweep_set(black_box(&ids), black_box(&mut hashed_seen)));
+            set_best = set_best.min(start.elapsed().as_nanos() as f64);
+            assert_eq!(listed, hashed, "both sweeps visit every session once");
+        } else {
+            let start = Instant::now();
+            let hashed = black_box(sweep_set(black_box(&ids), black_box(&mut hashed_seen)));
+            set_best = set_best.min(start.elapsed().as_nanos() as f64);
+            let start = Instant::now();
+            let listed = black_box(sweep_list(black_box(&ids), black_box(&mut listed_seen)));
+            list_best = list_best.min(start.elapsed().as_nanos() as f64);
+            assert_eq!(listed, hashed, "both sweeps visit every session once");
+        }
+    }
+    let _ = writeln!(out, "\n## TUIC sweep dedupe\n");
+    let _ = writeln!(out, "| path | ms/sweep | ns/session |");
+    let _ = writeln!(out, "|---|---:|---:|");
+    let _ = writeln!(
+        out,
+        "| list scan | {:.3} | {:.1} |",
+        list_best / 1_000_000.0,
+        list_best / SESSIONS as f64
+    );
+    let _ = writeln!(
+        out,
+        "| identity set | {:.3} | {:.1} |",
+        set_best / 1_000_000.0,
+        set_best / SESSIONS as f64
+    );
 }
 
 pub(crate) fn report() -> String {
@@ -152,5 +233,6 @@ pub(crate) fn report() -> String {
         offset_best / 1000.0,
         offset_best / BURST as f64
     );
+    sweep_section(&mut out);
     out
 }

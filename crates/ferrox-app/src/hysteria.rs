@@ -2286,7 +2286,7 @@ fn rotate(
 }
 
 /// The client's UDP uplink over the hysteria carrier: read the relay socket, put every datagram on the connection's datagram lane, and let a companion thread drive the connection and carry replies back. One destination at a time — a change rotates the association, stamping a fresh session id that the connection has never used, over a connection of its own: the pool is a TCP instrument, its staleness caught by a flow's reply deadline a datagram send has no answer to, so a lane dials fresh and is live from the first packet. The relay's read timeout, `budgets::udp_idle()`, is already armed where the front was raised, so silence ends the loop and retires the association with its reader; a server that refused the lane in auth is answered in silence, as the references do. Salamander obfuscation, when the outbound names it, is already wrapped at the `quic::Datagram` seam by `connect`, so no byte of this path changes when the password is set.
-pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
+pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::IpAddr>) {
     let Some(session) = connect(dial) else {
         return;
     };
@@ -2318,11 +2318,17 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
     // The flow now relayed, cached off the rotation: the id it stamps, the destination compared per packet, and the string the wire's address field borrows — so no steady packet re-formats the address or takes the flow lock.
     let mut relayed: Option<(u32, SocketAddr, String)> = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
+        if !crate::proxy::source_ip_ok(peer, src) {
+            continue;
+        }
+        let pinned = lane.source.lock().ok().and_then(|slot| *slot);
+        if pinned.is_some_and(|held| held != src) {
+            continue;
+        }
         let Some((dest, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
             continue;
         };
-        let pinned = lane.source.lock().ok().and_then(|slot| *slot);
-        if pinned.is_some_and(|held| held != src) {
+        if payload.is_empty() {
             continue;
         }
         let Ok(mut conn) = session.shared.lock() else {

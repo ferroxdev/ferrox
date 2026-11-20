@@ -367,10 +367,15 @@ impl WireGuardOut {
         }
     }
 
-    pub(crate) fn serve_udp(&self, relay: &UdpSocket, associate: Option<&Connection>) {
+    pub(crate) fn serve_udp(
+        &self,
+        relay: &UdpSocket,
+        associate: Option<&Connection>,
+        peer: Option<IpAddr>,
+    ) {
         #[cfg(target_os = "linux")]
         if let Some(kernel) = &self.kernel {
-            self.serve_udp_kernel(kernel, relay, associate);
+            self.serve_udp_kernel(kernel, relay, associate, peer);
             return;
         }
         if !wg_stack::client_udp(
@@ -379,6 +384,7 @@ impl WireGuardOut {
             &self.to_tunnel,
             &self.routes,
             associate,
+            peer,
             &|host, port| self.destinations(&Destination::Name(host.to_owned(), port)),
             WG_HEADER_SIZE,
         ) {
@@ -478,6 +484,7 @@ impl WireGuardOut {
         kernel: &KernelWireGuard,
         relay: &UdpSocket,
         associate: Option<&Connection>,
+        peer: Option<IpAddr>,
     ) {
         let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
         let winner: Arc<Mutex<HashMap<KernelLaneKey, (SocketAddr, Instant)>>> =
@@ -521,14 +528,28 @@ impl WireGuardOut {
                 }
                 Err(_) => break,
             };
-            quiet = Instant::now();
-            seen = replies.load(Ordering::Relaxed);
+            let answered_now = replies.load(Ordering::Relaxed);
+            if answered_now != seen {
+                seen = answered_now;
+                quiet = Instant::now();
+            }
+            if !crate::proxy::source_ip_ok(peer, src) {
+                if quiet.elapsed() >= crate::budgets::udp_idle() {
+                    break;
+                }
+                continue;
+            }
+            if app.is_some_and(|bound| bound != src) {
+                if quiet.elapsed() >= crate::budgets::udp_idle() {
+                    break;
+                }
+                continue;
+            }
             let Some((dest, payload)) = crate::proxy::parse_socks_udp_dest(&buf[..n]) else {
                 continue;
             };
-            if app.is_some_and(|bound| bound != src) {
-                continue;
-            }
+            quiet = Instant::now();
+            seen = replies.load(Ordering::Relaxed);
             app = Some(src);
             if let Ok(mut slot) = source.lock() {
                 *slot = Some(src);
