@@ -29589,10 +29589,9 @@ fn serve_socks_udp_portal(
     // The map answers a datagram's key in one probe; `order` keeps insertion order for the teardown ends.
     let mut lanes: HashMap<SocketAddr, Lane> = HashMap::new();
     let mut order: Vec<SocketAddr> = Vec::new();
-    let mut pinned = None;
     let mut buf = udp_buffer();
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
-        if !pin_datagram(peer, &mut pinned, src) {
+        if !source_ip_ok(peer, src) {
             continue;
         }
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -31476,11 +31475,10 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut, peer: Opt
         return;
     };
     let mut buf = vec![0; crate::shadowsocks::DATAGRAM_MAX];
-    let mut pinned = None;
     while let Ok((n, src)) = relay
         .recv_from(&mut buf[crate::shadowsocks::SEAL_ROOM..crate::shadowsocks::SEAL_ROOM + UDP_BUF])
     {
-        if !pin_datagram(peer, &mut pinned, src) {
+        if !source_ip_ok(peer, src) {
             continue;
         }
         let Some((dest, payload)) =
