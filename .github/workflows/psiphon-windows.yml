@@ -257,7 +257,7 @@ jobs:
             # tunnel the log named. With a pool above one the two can belong
             # to different sessions, so a multi-server run is marked mixed.
             servers=$(grep 'psiphon: tunnel up via' psiphon-windows.log 2>/dev/null | \
-              sed -n 's/.*tunnel up via \([^ ]*\) \([^ ]*\).*/\1/p' | sort -u)
+              sed -n 's/.*tunnel up via \([^ ]*\) \([^ ]*\).*/\1/p' | sort -u || true)
             count=$(printf '%s\n' "$servers" | grep -c . || true)
             server="${servers:-none}"
             [ "$count" -gt 1 ] && server="mixed"
