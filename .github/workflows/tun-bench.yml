@@ -134,7 +134,7 @@ jobs:
           {
             printf '| component | revision |\n|---|---|\n'
             printf '| ferrox | `%s` |\n' "$(git rev-parse HEAD)"
-            printf '| hev-socks5-tunnel | `%s` (`%s`) |\n' "$HEV_TUNNEL_REV" '${{ inputs.hev_ref }}' 
+            printf '| hev-socks5-tunnel | `%s` (`%s`) |\n' "$HEV_TUNNEL_REV" '${{ inputs.hev_ref }}'
             printf '| hev-socks5-server | `%s` |\n' "$HEV_SERVER_REV"
             printf '| sing-box | `v%s` |\n' "$SINGBOX_VERSION"
             printf '| sing-tun | sing-box v%s tun inbound (`gvisor`, `system` stacks) |\n' "$SINGBOX_VERSION"
