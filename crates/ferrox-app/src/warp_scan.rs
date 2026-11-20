@@ -710,19 +710,25 @@ mod tests {
     #[test]
     fn the_masque_sweep_samples_every_443_edge_before_falling_back() {
         for mode in [ScanMode::Turbo, ScanMode::Ironclad] {
+            let strategy = mode.strategy();
             let candidates = masque_candidates(mode);
             let fallback = candidates
                 .iter()
                 .position(|edge| edge.port() != MASQUE_PORTS[0])
                 .expect("a seed fallback port");
-            for prefix in MASQUE_PREFIXES_V4 {
-                let edge = SocketAddr::from((
-                    sample_cidr(prefix, 1).first().copied().expect("one host"),
-                    MASQUE_PORTS[0],
-                ));
+            let sampled =
+                sample_prefixes(&MASQUE_PREFIXES_V4, strategy.full_subnet, strategy.sample)
+                    .into_iter()
+                    .map(|ip| SocketAddr::from((ip, MASQUE_PORTS[0])));
+            let seeds = MASQUE_SEEDS
+                .iter()
+                .filter_map(|text| text.parse::<Ipv4Addr>().ok())
+                .map(|ip| SocketAddr::from((ip, MASQUE_PORTS[0])));
+            let before: HashSet<SocketAddr> = candidates[..fallback].iter().copied().collect();
+            for edge in sampled.chain(seeds) {
                 assert!(
-                    candidates[..fallback].contains(&edge),
-                    "{mode:?} fell back before trying the edge of {prefix}"
+                    before.contains(&edge),
+                    "{mode:?} fell back before trying {edge}"
                 );
             }
             assert!(
