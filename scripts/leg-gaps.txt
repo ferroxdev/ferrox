@@ -38,6 +38,8 @@ vless-tls-grpc-down-8|server-threads|1.21|696
 vless-tls-grpc-up-1|rust|0.54|704
 vless-reality-xhttp-down-8|rust|0.64|704
 vless-vision-reality-raw-down-8|server-threads|1.54|696
+# The XUDP association adds a mux thread and its UDP reader on top of the relay lanes; the reference serves the same shape from its own dispatcher.
+vless-vision-reality-udp-8|server-threads|1.27|77
 vless-tls-raw-up-1|client|0.67|683
 vless-tls-raw-up-1|rust|0.64|683
 vless-vision-tls-raw-up-1|client|0.63|683

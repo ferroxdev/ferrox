@@ -12265,9 +12265,12 @@ fn relay_vless_reply<S>(
         let close = raw
             .as_ref()
             .map_or_else(|| Arc::new(|| {}), connection_closer);
+        let mut carried = carried;
         let (reader, writer): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
             if header.1 == Flow::Vision {
-                vision_stream(session, raw, &header.0)
+                let stream = vision_stream(session, raw, &header.0, &mut carried);
+                carried.clear();
+                stream
             } else {
                 match driven_halves(session, RELAY_POLL) {
                     Ok(Half::Split { read, write }) => (
@@ -22749,16 +22752,19 @@ fn vision_stream<S>(
     session: S,
     raw: Option<Connection>,
     uuid: &[u8; 16],
+    prefix: &mut Vec<u8>,
 ) -> (Box<dyn Read + Send>, Box<dyn Write + Send>)
 where
     S: Read + Write + Send + ferrox_core::tls::RecordAlignment + Drivable + CipherOpen + 'static,
 {
-    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL, &mut Vec::new()) {
+    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL, prefix) {
         Ok(vision) => split_stream(vision),
         Err(session) => {
             let transport = session.transport();
+            let mut link = crate::vision::Link::new(session, raw, uuid);
+            link.preload(std::mem::take(prefix));
             split_stream(Half::shared_armed_capped(
-                crate::vision::Link::new(session, raw, uuid),
+                link,
                 move |link, grain| {
                     link.arm_read_timeout(grain)?;
                     match &transport {
@@ -55493,6 +55499,135 @@ mod tests {
         drop(session);
         proxy.join().expect("joins");
         filler.join().expect("joins");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn a_pipelined_vision_xudp_frame_reaches_the_mux_reader() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+
+        impl Read for Sink {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl ferrox_core::tls::RecordAlignment for Sink {}
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x57u8; 16];
+        let echo_port = udp_echo_loop();
+        let echo_addr: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &[VlessUser {
+                    id,
+                    flow: Flow::Vision,
+                    email: String::new(),
+                    level: 0,
+                    reverse: None,
+                }],
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+                None,
+                None,
+            );
+        });
+        let conn = Connection::connect(("127.0.0.1", port)).expect("connects");
+        conn.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut tls =
+            ferrox_core::tls::RustlsProvider::connect(&client_config, conn).expect("opens");
+        tls.handshake().expect("handshakes");
+
+        let new = ferrox_core::mux::Outgoing {
+            id: 1,
+            status: ferrox_core::mux::Status::New,
+            options: ferrox_core::mux::DATA,
+            target: Some(mux_target_of(echo_addr)),
+            global_id: Some([7u8; ferrox_core::mux::GLOBAL_ID]),
+        };
+        let mut frame = vec![0u8; new.frame_len(4)];
+        let written = new.encode_into(Some(b"ping"), &mut frame);
+        frame.truncate(written);
+
+        let framed = Arc::new(Mutex::new(Vec::new()));
+        let (_, mut vision) = crate::vision::Link::split(
+            Sink(Arc::clone(&framed)),
+            Sink(Arc::clone(&framed)),
+            None,
+            None,
+            &id,
+        );
+        vision.write_all(&frame).expect("frames");
+        vision.flush().expect("flushes");
+
+        let mut head = vec![0u8];
+        head.extend_from_slice(&id);
+        head.push(VLESS_VISION_ADDONS.len() as u8);
+        head.extend_from_slice(VLESS_VISION_ADDONS);
+        head.push(3);
+        let framed = framed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        head.extend_from_slice(&framed);
+        tls.write_all(&head).expect("writes");
+        tls.flush().expect("flushes");
+
+        let mut answer = [0u8; 2];
+        tls.read_exact(&mut answer).expect("reads the answer");
+        assert_eq!(answer, [0, 0]);
+
+        let mut vision = crate::vision::Link::new(tls, None, &id);
+        let mut reply = [0u8; 128];
+        let mut filled = 0;
+        let incoming = loop {
+            match vision.read(&mut reply[filled..]) {
+                Ok(0) => panic!("the reply closed after {filled} bytes"),
+                Ok(n) => {
+                    filled += n;
+                    match ferrox_core::mux::decode(
+                        &reply[..filled],
+                        ferrox_core::mux::NewTail::Forward,
+                    ) {
+                        Ok((incoming, _)) => break incoming,
+                        Err(
+                            ferrox_core::mux::Error::Short { .. }
+                            | ferrox_core::mux::Error::Truncated,
+                        ) => {}
+                        Err(error) => panic!("decodes the reply: {error:?}"),
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("reads the reply: {error:?}"),
+            }
+        };
+        assert_eq!(incoming.status, ferrox_core::mux::Status::Keep);
+        assert_eq!(incoming.data, Some(&b"ping"[..]));
+        drop(vision);
+        server.join().expect("joins");
     }
 
     #[test]

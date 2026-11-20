@@ -413,11 +413,10 @@ impl Comparison {
     }
 
     fn reference(&self) -> Option<&'static str> {
-        // The reference is the first external engine that landed a run; none falls back to the pinned order, where the empty-runs check reports the missing data.
+        // The caller puts the selected reference first; a later engine with runs does not substitute.
         self.by_engine
             .iter()
-            .filter(|e| e.engine != "ferrox")
-            .find(|e| !e.runs.is_empty())
+            .find(|e| e.engine != "ferrox")
             .or_else(|| self.by_engine.first())
             .map(|e| e.engine)
     }
@@ -2585,6 +2584,52 @@ mod tests {
         assert!(
             line.contains("exit status: 23") && line.contains("3 failure(s)"),
             "the line carries why the reference never ran: {line}"
+        );
+    }
+
+    /// The selected reference is the first external engine even when it landed no run: a later
+    /// engine must not become the baseline just because it has data.
+    #[test]
+    fn a_later_engine_does_not_substitute_for_an_empty_reference() {
+        let comparison = Comparison {
+            workload: workload(),
+            repeats: 3,
+            by_engine: vec![
+                EngineRuns {
+                    engine: "sing-box",
+                    dialect: parity::Dialect::Xray,
+                    runs: Vec::new(),
+                },
+                synth_engine(
+                    "xray-core-rust",
+                    [(100, 6000, 20480), (110, 6200, 20500), (120, 6400, 20600)],
+                ),
+                synth_engine(
+                    "ferrox",
+                    [(200, 3000, 10240), (220, 3100, 10250), (240, 3200, 10260)],
+                ),
+            ],
+            ceilings_mib_s: vec![900.0, 950.0, 1000.0],
+            gated: Some("ferrox"),
+            failures: Vec::new(),
+            skipped: Vec::new(),
+            ceiling_failures: Vec::new(),
+            machine: "test".into(),
+        };
+        let gate = comparison.gate();
+        assert!(
+            !gate.passed,
+            "an empty reference cannot pass on another engine's runs"
+        );
+        let missing = gate
+            .lines
+            .iter()
+            .find(|line| line.contains("no reference"))
+            .expect("the missing reference is named");
+        assert!(missing.contains("sing-box"), "{missing}");
+        assert!(
+            !missing.contains("xray-core-rust"),
+            "a later engine substituted for the reference: {missing}"
         );
     }
 
