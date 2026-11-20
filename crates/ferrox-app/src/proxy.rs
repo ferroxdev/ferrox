@@ -1135,8 +1135,8 @@ fn dokodemo_transparent_mode(inbound: &Json) -> Option<crate::sockopt::Tproxy> {
         .and_then(|settings| settings.get("followRedirect"))
         .and_then(Json::as_bool)
         .unwrap_or(false);
-    let receive = settings
-        .and_then(|settings| settings.get("receiveOriginalDestination"))
+    let receive = inbound
+        .get("receiveOriginalDestination")
         .and_then(Json::as_bool)
         .unwrap_or(follow);
     let mode = crate::sockopt::inbound_tproxy(inbound.get("streamSettings")).ok()?;
@@ -1166,7 +1166,25 @@ fn preflight_inbound(inbound: &Json, protocol: &str, addresses: &[String]) -> Re
                 held.push(reservation);
             }
         }
-        if udp && !transparent_door {
+        if udp && transparent_door {
+            let follow = inbound
+                .get("settings")
+                .and_then(|settings| settings.get("followRedirect"))
+                .and_then(Json::as_bool)
+                .unwrap_or(false);
+            let rewrite = DokodemoRewrite::from_config(inbound);
+            let target = parse_target(address).map_err(|error| format!("{address}: {error}"))?;
+            let crate::conn::Target::Ip(bound) = target else {
+                return Err(format!("{address} names no IP for a transparent udp door"));
+            };
+            let socket = match crate::transparent::bind_udp(bound) {
+                Ok(socket) => socket,
+                Err(_) if !follow || rewrite.configured().is_some() => UdpSocket::bind(address)
+                    .map_err(|error| format!("cannot bind {address}: {error}"))?,
+                Err(error) => return Err(format!("cannot bind {address}: {error}")),
+            };
+            held.push(Reservation::Udp(socket));
+        } else if udp {
             let socket = UdpSocket::bind(address)
                 .map_err(|error| format!("cannot bind {address}: {error}"))?;
             held.push(Reservation::Udp(socket));
@@ -2064,7 +2082,7 @@ pub(crate) fn dial_udp_through_proxy(
             let _source = SendThroughGuard::enter(source);
             let _target = TargetStrategyGuard::enter(strategy);
             let _tag = OutboundTag::enter(Some(&name));
-            serve_udp_lane_with(&relay, &out, None, source, sockopts.as_ref());
+            serve_udp_lane_with(&relay, &out, None, source, sockopts.as_ref(), None);
             relay_stop.store(true, Ordering::Relaxed);
         })
         .is_err()
@@ -17852,8 +17870,11 @@ fn serve_ss_tls_front(
     stop: Option<&Arc<Stop>>,
 ) -> Option<usize> {
     let Some(server) = inbound_tls_identity(inbound) else {
-        // A refused identity takes only the stream half: a udp relay this config asked for still opens.
+        // A refused identity takes only the stream half unless this binary owns the add, where the requested front must not silently disappear.
         eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
+        if FALLIBLE_BIND.with(std::cell::Cell::get) {
+            bind_failed();
+        }
         return None;
     };
     if let Carrier::Xhttp { settings } = &carrier {
@@ -17949,6 +17970,8 @@ fn serve_shadowsocks_inbound(
                     serve_ss_tls_front(address, inbound, carrier, accounts, freedom, stop)
                 {
                     served += listeners;
+                } else if FALLIBLE_BIND.with(std::cell::Cell::get) {
+                    return 0;
                 }
             }
             _ if !matches!(stream_security(inbound), "" | "none") => {
@@ -30026,7 +30049,7 @@ fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
 pub(crate) fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Option<&Connection>) {
     let source = SEND_THROUGH.with(std::cell::Cell::take);
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
-    serve_udp_lane_with(relay, out, associate, source, sockopts.as_ref());
+    serve_udp_lane_with(relay, out, associate, source, sockopts.as_ref(), None);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -30036,6 +30059,7 @@ fn serve_udp_lane_with(
     associate: Option<&Connection>,
     source: Option<SendThrough>,
     sockopts: Option<&Arc<crate::sockopt::SocketOptions>>,
+    relay_peer: Option<IpAddr>,
 ) {
     let _source = SendThroughGuard::enter(source);
     let _sockopts = DialSockoptsGuard::enter(sockopts.cloned());
@@ -30044,7 +30068,7 @@ fn serve_udp_lane_with(
         // Loopback is TCP-only in the reference; a routed front tag has no datagram lane.
         Outbound::Loopback(loopback) => {
             if let Some(dial) = &loopback.dial {
-                serve_udp_lane_with(relay, dial, associate, None, None);
+                serve_udp_lane_with(relay, dial, associate, None, None, relay_peer);
             }
         }
         // Every carrier whose mux pool is open takes the same datagram lane: one XUDP flow per destination, framed by the carrier the opener dialled.
@@ -30086,7 +30110,11 @@ fn serve_udp_lane_with(
         Outbound::Hysteria(hy) => {
             let dial = hy.dial();
             if dial.config.version == 1 {
-                crate::hysteria_v1::serve_udp(relay, &dial, control_peer(associate));
+                crate::hysteria_v1::serve_udp(
+                    relay,
+                    &dial,
+                    relay_peer.or_else(|| control_peer(associate)),
+                );
             } else {
                 crate::hysteria::serve_udp(relay, &dial);
             }
@@ -30236,6 +30264,7 @@ fn serve_socks_udp_split(
     let mut lanes: HashMap<String, UdpLane> = HashMap::new();
     let mut default_lane: Option<UdpLane> = None;
     let mut replies: HashSet<SocketAddr> = HashSet::new();
+    let owner = control_peer(Some(&client));
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
@@ -30257,6 +30286,9 @@ fn serve_socks_udp_split(
                     if let Some(client) = client_addr {
                         let _ = relay.send_to(&buf[..n], client);
                     }
+                    continue;
+                }
+                if owner.is_some_and(|owner| owner != src.ip().to_canonical()) {
                     continue;
                 }
                 let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
@@ -30419,7 +30451,16 @@ fn spawn_udp_lane(
         // The lane's own thread starts with the settings the pick left on this one.
         SEND_THROUGH.with(|cell| cell.set(source));
         DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
-        serve_udp_lane(&socket, &out, associate.as_ref());
+        let source = SEND_THROUGH.with(std::cell::Cell::take);
+        let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
+        serve_udp_lane_with(
+            &socket,
+            &out,
+            associate.as_ref(),
+            source,
+            sockopts.as_ref(),
+            Some(local),
+        );
     });
     Some(UdpLane {
         address,

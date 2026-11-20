@@ -2313,6 +2313,45 @@ fn register_staged(inner: &std::path::Path, published: &std::path::Path) {
         .push((inner.to_path_buf(), published.to_path_buf()));
 }
 
+/// One staged bind's registry entry, released when its listener closes so repeated adds do not grow the table.
+#[cfg(unix)]
+struct StagedRegistration {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    inner: std::path::PathBuf,
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    published: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl StagedRegistration {
+    fn new(inner: &std::path::Path, published: &std::path::Path) -> Self {
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        {
+            register_staged(inner, published);
+            Self {
+                inner: inner.to_path_buf(),
+                published: published.to_path_buf(),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        {
+            let _ = (inner, published);
+            Self {}
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StagedRegistration {
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        STAGED_BINDINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(inner, published)| inner != &self.inner || published != &self.published);
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 fn staged_owner(listed: &str) -> Option<std::path::PathBuf> {
     STAGED_BINDINGS
@@ -2640,7 +2679,11 @@ impl HttpUrl {
 pub(crate) enum Listener {
     Tcp(std::net::TcpListener),
     #[cfg(any(unix, windows))]
-    Unix(UnixListener),
+    Unix {
+        listener: UnixListener,
+        #[cfg(unix)]
+        staged: Option<StagedRegistration>,
+    },
 }
 
 impl Listener {
@@ -2654,7 +2697,7 @@ impl Listener {
         match target {
             Target::Ip(addr) => std::net::TcpListener::bind(addr).map(Listener::Tcp),
             #[cfg(any(unix, windows))]
-            Target::Unix(path) => bind_unix(path).map(Listener::Unix),
+            Target::Unix(path) => bind_unix(path),
         }
     }
 
@@ -2687,7 +2730,7 @@ impl Listener {
         match self {
             Listener::Tcp(listener) => listener.local_addr(),
             #[cfg(any(unix, windows))]
-            Listener::Unix(_) => Err(io::Error::new(
+            Listener::Unix { .. } => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "a unix listener reports no socket address",
             )),
@@ -2713,7 +2756,7 @@ impl Iterator for Incoming<'_> {
                 .map(|stream| stream.map(Connection::Tcp))
                 .next(),
             #[cfg(any(unix, windows))]
-            Listener::Unix(listener) => listener
+            Listener::Unix { listener, .. } => listener
                 .incoming()
                 .map(|stream| stream.map(Connection::from))
                 .next(),
@@ -2818,7 +2861,7 @@ impl Listener {
                 .accept()
                 .map(|(stream, addr)| (Connection::Tcp(stream), addr)),
             #[cfg(any(unix, windows))]
-            Listener::Unix(listener) => listener.accept().map(|(stream, _addr)| {
+            Listener::Unix { listener, .. } => listener.accept().map(|(stream, _addr)| {
                 (
                     Connection::from(stream),
                     SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -2831,7 +2874,7 @@ impl Listener {
         match self {
             Listener::Tcp(listener) => listener.set_nonblocking(nonblocking),
             #[cfg(any(unix, windows))]
-            Listener::Unix(listener) => listener.set_nonblocking(nonblocking),
+            Listener::Unix { listener, .. } => listener.set_nonblocking(nonblocking),
         }
     }
 }
@@ -2897,11 +2940,14 @@ fn split_permission(path: &std::path::Path) -> (&std::path::Path, Option<u32>) {
 static UNIX_BIND: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(unix)]
-fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
+fn bind_unix(path: &std::path::Path) -> io::Result<Listener> {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some((name, padded)) = abstract_name(path) {
-        return abstract_listener(name, padded);
+        return abstract_listener(name, padded).map(|listener| Listener::Unix {
+            listener,
+            staged: None,
+        });
     }
     let _guard = UNIX_BIND
         .lock()
@@ -2926,10 +2972,16 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
     }
     let Some(mode) = perm else {
         take_stale(path, stale)?;
-        return UnixListener::bind(path);
+        return UnixListener::bind(path).map(|listener| Listener::Unix {
+            listener,
+            staged: None,
+        });
     };
-    if let Some(listener) = bind_staged(path, mode, stale)? {
-        return Ok(listener);
+    if let Some((listener, staged)) = bind_staged(path, mode, stale)? {
+        return Ok(Listener::Unix {
+            listener,
+            staged: Some(staged),
+        });
     }
     // The directory leaves no room for a staged name, so the mode goes on the path itself.
     take_stale(path, stale)?;
@@ -2942,7 +2994,10 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
         ));
     }
     apply_socket_mode(&listener, path, mode, (bound.dev(), bound.ino()))?;
-    Ok(listener)
+    Ok(Listener::Unix {
+        listener,
+        staged: None,
+    })
 }
 
 /// Apply the mode to the socket inode itself, then re-check that the path still names it.
@@ -3088,7 +3143,7 @@ fn bind_staged(
     path: &std::path::Path,
     mode: u32,
     stale: Option<(u64, u64)>,
-) -> io::Result<Option<UnixListener>> {
+) -> io::Result<Option<(UnixListener, StagedRegistration)>> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     for _ in 0..8 {
         let dir = staged_name(path);
@@ -3108,9 +3163,7 @@ fn bind_staged(
             std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(mode))?;
             take_stale(path, stale)?;
             std::fs::hard_link(&inner, path)?;
-            #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-            register_staged(&inner, path);
-            Ok(listener)
+            Ok((listener, StagedRegistration::new(&inner, path)))
         })();
         let _ = std::fs::remove_file(&inner);
         let _ = std::fs::remove_dir(&dir);
@@ -3137,7 +3190,7 @@ fn staged_name(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[cfg(windows)]
-fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
+fn bind_unix(path: &std::path::Path) -> io::Result<Listener> {
     match std::fs::symlink_metadata(path) {
         Ok(_) if !is_unix_socket(path)? => {
             return Err(io::Error::new(
@@ -3169,7 +3222,7 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
         Err(error) => return Err(error),
     }
     let listener = UnixListener::bind(path)?;
-    Ok(listener)
+    Ok(Listener::Unix { listener })
 }
 
 /// A refused Windows probe is not proof the listener is gone; only a handle free of other owners is.
@@ -4654,6 +4707,36 @@ mod tests {
             Some(("/tmp/a b", true)),
             "a pathname with a space was truncated"
         );
+    }
+
+    /// Repeated add and removal of a mode-bearing listener must not leave the staging registry growing.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn a_closed_staged_listener_is_released_from_the_registry() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-registry-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let staged = |path: &std::path::Path| {
+            STAGED_BINDINGS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|(_, published)| published == path)
+                .count()
+        };
+        for _ in 0..32 {
+            let target =
+                parse_target(&format!("unix:{},0750", path.display())).expect("parses a mode");
+            let listener = Listener::bind(&target).expect("binds under the staged mode");
+            assert_eq!(staged(&path), 1, "one live staged listener owns one entry");
+            drop(listener);
+        }
+        assert_eq!(staged(&path), 0, "closed listeners left entries behind");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A mode publishes the path by hard link, but the PCB keeps the private `.ferrox-*/s` name, which still names the live listener.
