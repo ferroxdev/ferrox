@@ -204,7 +204,10 @@ jobs:
           sleep 1
           echo "---- the reference over the local echo ----"
           /tmp/aether --register masque --masque-config "target/probe/identities2.toml" --api-host echo.example --api-sni echo.example --api-address 127.0.0.1:8443 2>&1 | tail -6 || true
-          sleep 1
+          for _ in $(seq 1 30); do
+            grep -q 'FORWARDED\[mutated-key\]\|mutation failed' /tmp/capture.log 2>/dev/null && break
+            sleep 1
+          done
           kill %1 2>/dev/null || true
           echo "captured requests:"
           cat /tmp/capture.log || true
