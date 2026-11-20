@@ -2580,7 +2580,7 @@ fn read_srs_item(
         2 => {
             let set = read_succinct(reader)?;
             let matcher = rule.domains.get_or_insert_with(DomainMatcher::new);
-            for key in set.keys() {
+            for key in set.keys()? {
                 let original = reverse_domain(&key);
                 match original.as_bytes().first() {
                     Some(&PREFIX_LABEL) => {
@@ -3320,7 +3320,8 @@ impl SetRule {
                 && self.ports.is_none()
                 && self.source_ports.is_none()
                 && self.ips.is_none()
-                && self.source_ips.is_none();
+                && self.source_ips.is_none()
+                && self.process.is_none();
             if network_only {
                 if let Some(networks) = &self.networks {
                     return !networks.contains(&network);
@@ -3393,6 +3394,7 @@ const PREFIX_LABEL: u8 = b'\r';
 const ROOT_LABEL: u8 = b'\n';
 const SUFFIX_LABEL: u8 = 0x08;
 const ANY_LABEL: u8 = b'*';
+const MAX_DOMAIN_KEY: usize = 4096;
 
 /// A `sing-box` succinct domain trie, kept only for `AdGuard` rule items; ordinary domain items are
 /// flattened into the hash tables above so a match never walks a trie.
@@ -3539,33 +3541,42 @@ impl SuccinctSet {
         }
     }
 
-    fn keys(&self) -> Vec<String> {
+    fn keys(&self) -> Result<Vec<String>, String> {
         let mut out = Vec::new();
         if Self::get_bit(&self.leaves, 0) {
             out.push(String::new());
         }
-        self.walk(0, 0, &mut Vec::new(), &mut out);
-        out
+        self.walk(0, 0, &mut Vec::new(), &mut out)?;
+        Ok(out)
     }
 
-    fn walk(&self, node: usize, bit: usize, current: &mut Vec<u8>, out: &mut Vec<String>) {
+    fn walk(
+        &self,
+        node: usize,
+        bit: usize,
+        current: &mut Vec<u8>,
+        out: &mut Vec<String>,
+    ) -> Result<(), String> {
         let mut bit = bit;
         loop {
             if Self::get_bit(&self.label_bitmap, bit) {
-                return;
+                return Ok(());
             }
             let Some(&label) = self.labels.get(bit - node) else {
-                return;
+                return Ok(());
             };
             current.push(label);
+            if current.len() > MAX_DOMAIN_KEY {
+                return Err("SRS domain key is too long".to_owned());
+            }
             let next = self.count_zeros(bit + 1);
             let Some(next_bit) = self.select(next - 1).map(|value| value + 1) else {
-                return;
+                return Ok(());
             };
             if Self::get_bit(&self.leaves, next) {
                 out.push(String::from_utf8_lossy(current).into_owned());
             }
-            self.walk(next, next_bit, current, out);
+            self.walk(next, next_bit, current, out)?;
             current.pop();
             bit += 1;
         }
@@ -8548,5 +8559,26 @@ mod tests {
             vec!["192.0.2.7".parse::<IpAddr>().expect("ipv4")],
             "a failed family is not an authoritative empty answer"
         );
+    }
+
+    #[test]
+    fn an_inverted_process_rule_reaches_every_network() {
+        let rule = SetRule {
+            invert: true,
+            logical: None,
+            networks: Some(vec![Network::Tcp]),
+            domains: None,
+            ports: None,
+            source_ports: None,
+            ips: None,
+            source_ips: None,
+            process: Some(SetProcess {
+                names: vec!["x".to_owned()],
+                paths: Vec::new(),
+                patterns: Vec::new(),
+            }),
+        };
+        assert!(rule.can_reach_on(Network::Tcp));
+        assert!(rule.can_reach_on(Network::Udp));
     }
 }

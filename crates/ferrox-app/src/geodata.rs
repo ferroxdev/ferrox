@@ -890,7 +890,7 @@ pub(crate) fn fetch_remote(url: &str) -> Result<Vec<u8>, String> {
             let location = response
                 .header("location")
                 .ok_or_else(|| "redirected without a Location header".to_owned())?;
-            current = resolve_location(&current, location)?;
+            current = resolve_remote_location(&current, location)?;
             continue;
         }
         if !(200..300).contains(&response.status) {
@@ -1179,27 +1179,39 @@ fn read_chunked(reader: &mut impl BufRead, body: &mut Vec<u8>) -> Result<(), Str
 }
 
 fn resolve_location(base: &str, location: &str) -> Result<String, String> {
+    resolve_location_any(base, location, false)
+}
+
+fn resolve_remote_location(base: &str, location: &str) -> Result<String, String> {
+    resolve_location_any(base, location, true)
+}
+
+fn resolve_location_any(base: &str, location: &str, allow_http: bool) -> Result<String, String> {
     let prefix = location.get(..8).unwrap_or(location).to_ascii_lowercase();
     if prefix.starts_with("https://") {
         return Ok(location.to_owned());
     }
     if prefix.starts_with("http://") {
+        if allow_http {
+            return Ok(location.to_owned());
+        }
         return Err("redirected to non-https URL".to_owned());
     }
-    if let Some(rest) = location.strip_prefix("//") {
-        return Ok(format!("https://{rest}"));
-    }
     let url = HttpUrl::parse(base)?;
+    let scheme = if url.tls { "https" } else { "http" };
+    if let Some(rest) = location.strip_prefix("//") {
+        return Ok(format!("{scheme}://{rest}"));
+    }
     let (path, query) = match url.path.split_once('?') {
         Some((path, query)) => (path, format!("?{query}")),
         None => (url.path.as_str(), String::new()),
     };
     if location.starts_with('?') {
-        return Ok(format!("https://{}{}{}", url.authority, path, location));
+        return Ok(format!("{scheme}://{}{}{}", url.authority, path, location));
     }
     if location.starts_with('#') {
         return Ok(format!(
-            "https://{}{}{}{}",
+            "{scheme}://{}{}{}{}",
             url.authority, path, query, location
         ));
     }
@@ -1212,7 +1224,7 @@ fn resolve_location(base: &str, location: &str) -> Result<String, String> {
             .map_or("/", |(directory, _)| directory);
         format!("{directory}/{location}")
     };
-    Ok(format!("https://{}{}", url.authority, path))
+    Ok(format!("{scheme}://{}{}", url.authority, path))
 }
 
 #[cfg(test)]
@@ -1606,6 +1618,18 @@ mod tests {
         assert_eq!(
             resolve_location("https://example.test/a", "#part").expect("joined"),
             "https://example.test/a#part"
+        );
+    }
+
+    #[test]
+    fn a_remote_redirect_keeps_the_scheme_it_started_with() {
+        assert_eq!(
+            resolve_remote_location("http://example.test/a/b", "c").expect("joined"),
+            "http://example.test/a/c"
+        );
+        assert_eq!(
+            resolve_remote_location("https://example.test/a/b", "//cdn.test/c").expect("joined"),
+            "https://cdn.test/c"
         );
     }
 
