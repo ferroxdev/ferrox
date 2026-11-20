@@ -27,6 +27,7 @@ jobs:
         with:
           shared-key: mobile
           cache-on-failure: true
+          cache-targets: false
       - name: point the cross build at the NDK
         run: |
           ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
@@ -58,5 +59,6 @@ jobs:
         with:
           shared-key: mobile
           cache-on-failure: true
+          cache-targets: false
       - name: compile the app for a utun host
         run: cargo check --locked -p ferrox-app --target aarch64-apple-ios
