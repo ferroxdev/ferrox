@@ -351,7 +351,7 @@ carrier-xhttp h3-data-window-copies 0 ferrox-app-xhttp_h3::tests::a_data_frame_w
 carrier-xhttp session-upload-window-copies 0 ferrox-app-xhttp::tests::a_windowed_upload_reads_without_a_copy
 carrier-xhttp packet-window-copies 0 ferrox-app-xhttp::tests::a_packet_window_is_the_sessions_own_buffer
 carrier-xhttp packet-map-allocations-per-pending-round 0 ferrox-app-xhttp::tests::a_pending_packet_map_reuses_its_table_across_rounds
-carrier-xhttp packet-map-lookup-ns-per-packet UNBLESSED .github/workflows/bench.yml
+carrier-xhttp packet-map-lookup-ns-per-packet 27.4 .github/workflows/bench.yml
 carrier-xhttp chunk-bodies-per-window 8 ferrox-app-xhttp::tests::a_window_gathers_every_chunk_one_read_brought
 carrier-xhttp requests-served-per-connection 2 ferrox-app-xhttp::tests::one_connection_carries_the_packet_up_uplink
 carrier-xhttp requests-served-before-a-close 1 ferrox-app-xhttp::tests::a_request_that_says_close_takes_the_connection_with_it
