@@ -112,6 +112,7 @@ impl<'a> DataBatch<'a> {
         self.used += 1;
     }
 
+    #[allow(clippy::too_many_lines)]
     fn flush(&mut self, conn: &H2Conn) -> bool {
         if self.used == 0 {
             return true;
