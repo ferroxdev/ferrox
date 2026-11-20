@@ -30,6 +30,39 @@ fn elapsed<R>(run: &mut impl FnMut(&[u8]) -> R, frame: &[u8]) -> f64 {
     start.elapsed().as_nanos() as f64 / PACKETS as f64
 }
 
+const BURST: usize = 512;
+
+fn walk_offset(mut buf: Vec<u8>) -> usize {
+    let mut at = 0usize;
+    let mut frames = 0usize;
+    loop {
+        match ferrox_core::tuic::parse_packet_prefix(&buf[at..]) {
+            Ok((_, used)) if used > 0 => {
+                at += used;
+                frames += 1;
+            }
+            _ => break,
+        }
+    }
+    if at > 0 {
+        buf.drain(..at);
+    }
+    frames
+}
+
+fn walk_drain(mut buf: Vec<u8>) -> usize {
+    let mut frames = 0usize;
+    loop {
+        match ferrox_core::tuic::parse_packet_prefix(&buf) {
+            Ok((_, used)) if used > 0 => {
+                buf.drain(..used);
+                frames += 1;
+            }
+            _ => return frames,
+        }
+    }
+}
+
 fn measure<A, B>(
     mut first: impl FnMut(&[u8]) -> A,
     mut second: impl FnMut(&[u8]) -> B,
@@ -73,5 +106,51 @@ pub(crate) fn report() -> String {
     let _ = writeln!(out, "| one parse | {once:.1} |");
     let _ = writeln!(out, "| two parses | {twice:.1} |");
     let _ = writeln!(out, "| saved | {:.1} |", twice - once);
+    let mut burst = Vec::with_capacity(frame.len() * BURST);
+    for _ in 0..BURST {
+        burst.extend_from_slice(&frame);
+    }
+    let mut drain_best = f64::MAX;
+    let mut offset_best = f64::MAX;
+    for round in 0..ROUNDS {
+        if round % 2 == 0 {
+            let fresh = burst.clone();
+            let start = Instant::now();
+            let drained = black_box(walk_drain(black_box(fresh)));
+            drain_best = drain_best.min(start.elapsed().as_nanos() as f64);
+            let fresh = burst.clone();
+            let start = Instant::now();
+            let walked = black_box(walk_offset(black_box(fresh)));
+            offset_best = offset_best.min(start.elapsed().as_nanos() as f64);
+            assert_eq!(drained, walked, "both walks take every frame");
+            assert_eq!(walked, BURST, "the burst is every frame it holds");
+        } else {
+            let fresh = burst.clone();
+            let start = Instant::now();
+            let walked = black_box(walk_offset(black_box(fresh)));
+            offset_best = offset_best.min(start.elapsed().as_nanos() as f64);
+            let fresh = burst.clone();
+            let start = Instant::now();
+            let drained = black_box(walk_drain(black_box(fresh)));
+            drain_best = drain_best.min(start.elapsed().as_nanos() as f64);
+            assert_eq!(drained, walked, "both walks take every frame");
+            assert_eq!(walked, BURST, "the burst is every frame it holds");
+        }
+    }
+    let _ = writeln!(out, "\n## TUIC burst walk\n");
+    let _ = writeln!(out, "| path | us/burst | ns/frame |");
+    let _ = writeln!(out, "|---|---:|---:|");
+    let _ = writeln!(
+        out,
+        "| drain per frame | {:.1} | {:.1} |",
+        drain_best / 1000.0,
+        drain_best / BURST as f64
+    );
+    let _ = writeln!(
+        out,
+        "| offset, one drain | {:.1} | {:.1} |",
+        offset_best / 1000.0,
+        offset_best / BURST as f64
+    );
     out
 }

@@ -1097,27 +1097,28 @@ fn client_turn(
             data.extend_from_slice(&buf[..read]);
         }
         if data.get(1) == Some(&wire::PACKET) {
+            let mut at = 0usize;
             loop {
-                match wire::parse_packet_prefix(&data) {
+                match wire::parse_packet_prefix(&data[at..]) {
                     Ok((_, used)) => {
-                        let _ = replies.try_send(data[..used].to_vec());
-                        data.drain(..used);
+                        let _ = replies.try_send(data[at..at + used].to_vec());
+                        at += used;
                     }
                     Err(wire::FrameError::Short) => break,
                     Err(_) => {
                         let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
                         data.clear();
+                        at = 0;
                         break;
                     }
                 }
             }
-        }
-        if !conn.stream_finished(id) {
-            if data.is_empty() {
-                uni.remove(&id);
-            } else {
-                uni.insert(id, data);
+            if at > 0 {
+                data.drain(..at);
             }
+        }
+        if !conn.stream_finished(id) && !data.is_empty() {
+            uni.insert(id, data);
         }
     }
     service(conn, lane)
@@ -1576,6 +1577,9 @@ fn run(
         sessions: 0,
         udp_sockets: Arc::new(AtomicUsize::new(0)),
         retry_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &retry_secret),
+        touched: Vec::new(),
+        dead: Vec::new(),
+        seen: Vec::new(),
     };
     let mut buf = vec![0u8; UDP_BUFFER];
     let mut last_tick = Instant::now();
@@ -1620,6 +1624,11 @@ struct Server {
     sessions: usize,
     udp_sockets: Arc<AtomicUsize>,
     retry_key: ring::hmac::Key,
+    /// Sessions this worker owed a turn at the end of a batch, kept so each batch reuses one capacity.
+    touched: Vec<Arc<Session>>,
+    /// The same for the periodic sweep: the dead sessions it found and the ones it already visited.
+    dead: Vec<Arc<Session>>,
+    seen: Vec<Arc<Session>>,
 }
 
 /// A worker's claim on the listener's socket, returned even when the flow panics.
@@ -1757,7 +1766,8 @@ impl Server {
     /// carried takes one turn over them instead of one per datagram.
     fn route_batch(&mut self, batch: &mut quic::Batch) {
         let taken = batch.len();
-        let mut touched: Vec<Arc<Session>> = Vec::new();
+        let mut touched = std::mem::take(&mut self.touched);
+        touched.clear();
         for at in 0..taken {
             let Some((bytes, from)) = batch.at(at) else {
                 continue;
@@ -1770,9 +1780,10 @@ impl Server {
                 touched.push(session);
             }
         }
-        for session in touched {
+        for session in touched.drain(..) {
             self.turn(&session);
         }
+        self.touched = touched;
     }
 
     fn session_for(&mut self, bytes: &mut [u8], from: SocketAddr) -> Option<Arc<Session>> {
@@ -1922,9 +1933,9 @@ impl Server {
             },
         );
         for id in conn.source_ids() {
-            self.conns
-                .entry(id.as_ref().to_vec())
-                .or_insert_with(|| Arc::clone(session));
+            if !self.conns.contains_key(id.as_ref()) {
+                self.conns.insert(id.as_ref().to_vec(), Arc::clone(session));
+            }
         }
     }
 
@@ -2025,8 +2036,10 @@ impl Server {
 
     fn tick(&mut self) {
         let now = Instant::now();
-        let mut dead: Vec<Arc<Session>> = Vec::new();
-        let mut seen: Vec<Arc<Session>> = Vec::new();
+        let mut dead = std::mem::take(&mut self.dead);
+        let mut seen = std::mem::take(&mut self.seen);
+        dead.clear();
+        seen.clear();
         for session in self.conns.values() {
             if seen.iter().any(|seen| Arc::ptr_eq(seen, session)) {
                 continue;
@@ -2083,6 +2096,10 @@ impl Server {
                 .retain(|_, session| !dead.iter().any(|dead| Arc::ptr_eq(dead, session)));
             self.sessions = self.sessions.saturating_sub(dead.len());
         }
+        dead.clear();
+        seen.clear();
+        self.dead = dead;
+        self.seen = seen;
     }
 }
 
@@ -2411,11 +2428,12 @@ fn read_uni_with(
         data.extend_from_slice(&room[..n]);
     }
     if freedom && data.get(1) == Some(&wire::PACKET) {
+        let mut at = 0usize;
         loop {
-            match wire::parse_packet_prefix(&data) {
+            match wire::parse_packet_prefix(&data[at..]) {
                 Ok((packet, used)) => {
                     accept_packet(inner, &packet, true);
-                    data.drain(..used);
+                    at += used;
                 }
                 Err(wire::FrameError::Short) => break,
                 Err(_) => {
@@ -2423,6 +2441,9 @@ fn read_uni_with(
                     return;
                 }
             }
+        }
+        if at > 0 {
+            data.drain(..at);
         }
     }
     if !conn.stream_finished(id) {

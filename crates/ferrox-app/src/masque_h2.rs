@@ -1893,16 +1893,20 @@ fn strip_padding(flags: u8, body: &[u8], headers: bool) -> &[u8] {
 }
 
 fn datagram(packet: &[u8], out: &mut Vec<u8>) {
-    frames::quic_varint(out, 0);
-    frames::quic_varint(out, (packet.len() + 1) as u64);
-    out.push(0);
+    let mut head = [0u8; 10];
+    let mut at = frames::quic_varint_into(&mut head, 0);
+    at += frames::quic_varint_into(&mut head[at..], (packet.len() + 1) as u64);
+    head[at] = 0;
+    out.extend_from_slice(&head[..=at]);
     out.extend_from_slice(packet);
 }
 
 /// The WARP HTTP/2 body carries a bare packet with no context byte.
 fn bare_datagram(packet: &[u8], out: &mut Vec<u8>) {
-    frames::quic_varint(out, 0);
-    frames::quic_varint(out, packet.len() as u64);
+    let mut head = [0u8; 9];
+    let mut at = frames::quic_varint_into(&mut head, 0);
+    at += frames::quic_varint_into(&mut head[at..], packet.len() as u64);
+    out.extend_from_slice(&head[..at]);
     out.extend_from_slice(packet);
 }
 
