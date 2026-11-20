@@ -363,6 +363,8 @@ pub(crate) struct Routing {
     /// A `shouldAppend=false` write replaced the whole table, so a reload must keep that replacement
     /// instead of bringing the startup rules back.
     added_replaced: bool,
+    /// Startup-rule tags `RemoveRule` deleted; a reparse must not bring them back.
+    removed_tags: HashSet<String>,
 }
 
 /// One server inbound's fixed direct dial, checked against the rules that can reach it — at startup,
@@ -976,6 +978,8 @@ pub(crate) struct Rule {
     sets: Option<Vec<Arc<RuleSet>>>,
     /// Set by `AddRule`; a geodata reload keeps these and replaces only the startup rules.
     added: bool,
+    /// The management API's source JSON, kept so a reload can rebuild geodata and rule-set bindings.
+    raw: Option<Json>,
 }
 
 impl Rule {
@@ -1090,6 +1094,7 @@ impl Routing {
             wants_attrs: false,
             wants_process: false,
             added_replaced: false,
+            removed_tags: HashSet::new(),
         }
     }
 
@@ -1231,6 +1236,7 @@ impl Routing {
             wants_attrs,
             wants_process,
             added_replaced: false,
+            removed_tags: HashSet::new(),
         }))
     }
 
@@ -1284,19 +1290,38 @@ impl Routing {
     /// contain them, so replacing the table wholesale would make a later `AddRule` rule vanish.
     pub(crate) fn adopt_added_rules(&mut self, old: &mut Self) {
         let replaced = old.added_replaced;
+        let removed = std::mem::take(&mut old.removed_tags);
         let added: Vec<Rule> = std::mem::take(&mut old.rules)
             .into_iter()
             .filter(|rule| rule.added)
             .collect();
+        let mut assets = Assets::new(self.asset_dirs.clone());
+        let mut kept = Vec::with_capacity(added.len());
+        for mut rule in added {
+            let Some(raw) = rule.raw.take() else {
+                kept.push(rule);
+                continue;
+            };
+            match Rule::parse(&raw, &mut assets, &self.rule_sets) {
+                Ok(Some(mut fresh)) => {
+                    fresh.added = true;
+                    fresh.raw = Some(raw);
+                    kept.push(fresh);
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("routing rule set: {error}"),
+            }
+        }
         if replaced {
-            self.rules = added;
+            self.rules = kept;
             self.balancers.clear();
             self.added_replaced = true;
-        } else if !added.is_empty() {
-            self.rules.extend(added);
         } else {
-            return;
+            self.rules
+                .retain(|rule| !rule.tag.as_ref().is_some_and(|tag| removed.contains(tag)));
+            self.rules.extend(kept);
         }
+        self.removed_tags = removed;
         self.refresh();
     }
 
@@ -1326,6 +1351,7 @@ impl Routing {
                 continue;
             };
             rule.added = true;
+            rule.raw = Some(item.clone());
             if let Some(tag) = &rule.tag {
                 if !tags.insert(tag.clone()) {
                     return Err(format!("duplicate ruleTag `{tag}`"));
@@ -1374,6 +1400,7 @@ impl Routing {
         } else {
             self.rules = rules;
             self.added_replaced = true;
+            self.removed_tags.clear();
             // The reference rebuilds its balancer map from the same config, which carries none.
             self.balancers.clear();
         }
@@ -1402,6 +1429,7 @@ impl Routing {
             )?;
         }
         self.rules.retain(|rule| rule.tag.as_deref() != Some(tag));
+        self.removed_tags.insert(tag.to_owned());
         self.refresh();
         Ok(())
     }
@@ -2035,6 +2063,7 @@ impl Rule {
             webhook,
             sets: rule_sets,
             added: false,
+            raw: None,
         }))
     }
 
@@ -2609,8 +2638,8 @@ fn read_srs_item(
         2 => {
             let set = read_succinct(reader)?;
             let matcher = rule.domains.get_or_insert_with(DomainMatcher::new);
-            for key in set.keys()? {
-                let original = reverse_domain(&key);
+            set.walk_keys(&mut |key| {
+                let original = reverse_domain(&String::from_utf8_lossy(key));
                 match original.as_bytes().first() {
                     Some(&PREFIX_LABEL) => {
                         let domain = original[1..].trim_start_matches('.');
@@ -2627,7 +2656,8 @@ fn read_srs_item(
                     Some(_) => matcher.add(DomainKind::Full, lower_arc(&original)),
                     None => {}
                 }
-            }
+                Ok(())
+            })?;
         }
         3 => {
             let matcher = rule.domains.get_or_insert_with(DomainMatcher::new);
@@ -2938,6 +2968,7 @@ impl RuleSet {
                             "routing rule set `{tag}`: {error}; using {}",
                             file.display()
                         );
+                        cache = None;
                         bytes = Some(std::fs::read(&file).map_err(|error| {
                             format!("routing rule set `{tag}` cannot be read: {error}")
                         })?);
@@ -3667,13 +3698,11 @@ impl SuccinctSet {
         }
     }
 
-    fn keys(&self) -> Result<Vec<String>, String> {
-        let mut out = Vec::new();
+    fn walk_keys(&self, visit: &mut impl FnMut(&[u8]) -> Result<(), String>) -> Result<(), String> {
         if Self::get_bit(&self.leaves, 0) {
-            out.push(String::new());
+            visit(b"")?;
         }
-        self.walk(0, 0, &mut Vec::new(), &mut out)?;
-        Ok(out)
+        self.walk(0, 0, &mut Vec::new(), visit)
     }
 
     fn walk(
@@ -3681,7 +3710,7 @@ impl SuccinctSet {
         node: usize,
         bit: usize,
         current: &mut Vec<u8>,
-        out: &mut Vec<String>,
+        visit: &mut impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         #[derive(Clone, Copy)]
         struct Frame {
@@ -3718,7 +3747,7 @@ impl SuccinctSet {
                 continue;
             };
             if Self::get_bit(&self.leaves, next) {
-                out.push(String::from_utf8_lossy(current).into_owned());
+                visit(current)?;
             }
             if let Some(parent) = stack.last_mut() {
                 parent.bit += 1;
@@ -6456,6 +6485,136 @@ mod tests {
     }
 
     #[test]
+    fn a_removed_startup_rule_stays_removed_after_a_reparse() {
+        let root = object(vec![(
+            "routing",
+            object(vec![(
+                "rules",
+                array(vec![rule(
+                    "block",
+                    vec![
+                        ("ruleTag", text("policy")),
+                        ("domain", array(vec![text("startup.test")])),
+                    ],
+                )]),
+            )]),
+        )]);
+        let mut routing = Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        routing.remove_rules("policy", &[]).expect("removes");
+        routing
+            .add_rules(
+                &[rule(
+                    "block",
+                    vec![
+                        ("ruleTag", text("policy")),
+                        ("domain", array(vec![text("added.test")])),
+                    ],
+                )],
+                true,
+                |tag| tag == "block",
+                &[],
+            )
+            .expect("adds");
+        let mut next = Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        next.adopt_added_rules(&mut routing);
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("added.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        assert_eq!(next.route(&flow), Some("block"));
+        assert_eq!(
+            next.route(&Flow {
+                domain: Some("startup.test"),
+                ..flow
+            }),
+            None,
+            "the removed startup rule is not restored"
+        );
+    }
+
+    #[test]
+    fn an_added_rule_set_rule_rebinds_to_the_reloaded_set() {
+        let root = |domain: &str| {
+            object(vec![(
+                "routing",
+                object(vec![(
+                    "ruleSets",
+                    array(vec![object(vec![
+                        ("tag", text("set")),
+                        ("type", text("inline")),
+                        (
+                            "rules",
+                            array(vec![object(vec![("domain", array(vec![text(domain)]))])]),
+                        ),
+                    ])]),
+                )]),
+            )])
+        };
+        let mut routing = Routing::parse_in(&root("old.test"), Vec::new())
+            .expect("parses")
+            .expect("routing");
+        routing
+            .add_rules(
+                &[rule(
+                    "block",
+                    vec![
+                        ("ruleTag", text("managed")),
+                        ("ruleSet", array(vec![text("set")])),
+                    ],
+                )],
+                true,
+                |tag| tag == "block",
+                &[],
+            )
+            .expect("adds");
+        let mut next = Routing::parse_in(&root("new.test"), Vec::new())
+            .expect("parses")
+            .expect("routing");
+        next.adopt_added_rules(&mut routing);
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("new.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        assert_eq!(next.route(&flow), Some("block"));
+        assert_eq!(
+            next.route(&Flow {
+                domain: Some("old.test"),
+                ..flow
+            }),
+            None,
+            "the managed rule uses the reloaded set contents"
+        );
+    }
+
+    #[test]
     fn a_replacement_add_rule_table_survives_a_reparse() {
         let root = object(vec![(
             "routing",
@@ -7036,6 +7195,8 @@ mod tests {
             stream.write_all(&payload).expect("body");
         });
         let url = format!("http://127.0.0.1:{port}/rules.srs");
+        let cache = dir.join("cache.srs");
+        let cache_text = cache.to_string_lossy();
         let root = object(vec![(
             "routing",
             object(vec![
@@ -7045,7 +7206,7 @@ mod tests {
                         ("tag", text("remote")),
                         ("type", text("remote")),
                         ("url", text(&url)),
-                        ("path", text("cache.srs")),
+                        ("path", text(&cache_text)),
                     ])]),
                 ),
                 (
@@ -7062,7 +7223,7 @@ mod tests {
             .expect("routing");
         server.join().expect("server");
         assert_eq!(
-            std::fs::read(dir.join("cache.srs")).expect("cache"),
+            std::fs::read(&cache).expect("cache"),
             srs,
             "a successful fetch writes the path the fallback will read"
         );

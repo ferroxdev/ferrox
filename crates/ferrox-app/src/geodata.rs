@@ -920,6 +920,9 @@ pub(crate) fn fetch_remote(url: &str) -> Result<Vec<u8>, String> {
 /// Publish a cache only after its bytes have been validated, and never leave a half-written file:
 /// the temp lives beside the target and the previous file is moved aside only after the write ends.
 pub(crate) fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    if target.is_dir() {
+        return Err(format!("{} is a directory", target.display()));
+    }
     let temp = unique_path(target, ".tmp")?;
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
@@ -934,11 +937,46 @@ pub(crate) fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
         let _ = std::fs::remove_file(&temp);
         return Err(reason);
     }
-    let transaction = swap_all(&[Stage {
-        target: target.to_owned(),
-        temp,
-    }])?;
-    transaction.commit()
+    if let Err(error) = replace_file(&temp, target) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("cannot replace {}: {error}", target.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(temp: &Path, target: &Path) -> io::Result<()> {
+    std::fs::rename(temp, target)
+}
+
+#[cfg(windows)]
+fn replace_file(temp: &Path, target: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let from: Vec<u16> = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let to: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let replaced = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1775,13 +1813,37 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_target_that_is_a_directory_is_refused() {
+        let dir = asset_dir();
+        let target = dir.join("cache");
+        std::fs::create_dir(&target).expect("directory");
+        let error = write_atomic(&target, b"rules").expect_err("refused");
+        assert!(error.contains("directory"), "{error}");
+        assert!(target.is_dir());
+    }
+
+    #[test]
     fn a_remote_fetch_follows_twenty_redirects_and_refuses_the_next() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = std::thread::spawn(move || {
-            use std::io::{Read as _, Write as _};
-            for at in 0..21 {
-                let (mut stream, _) = listener.accept().expect("accepts");
+            use std::io::{ErrorKind, Read as _, Write as _};
+            use std::time::{Duration, Instant};
+            listener.set_nonblocking(true).expect("nonblocking");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut at = 0;
+            while at < 21 && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("accepts: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .expect("read timeout");
                 let mut request = [0u8; 1024];
                 let _ = stream.read(&mut request);
                 let response = format!(
@@ -1789,6 +1851,7 @@ mod tests {
                     at + 1
                 );
                 stream.write_all(response.as_bytes()).expect("redirect");
+                at += 1;
             }
         });
         let error = fetch_remote(&format!("http://127.0.0.1:{port}/0")).expect_err("refused");
