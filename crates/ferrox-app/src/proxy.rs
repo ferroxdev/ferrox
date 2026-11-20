@@ -12938,11 +12938,7 @@ fn copy_stream<R: Read, W: Write>(
 }
 
 pub(crate) fn resize_scratch(buf: &mut Vec<u8>, len: usize) {
-    buf.clear();
-    if buf.capacity() < len {
-        buf.reserve(len);
-    }
-    unsafe { buf.set_len(len) }
+    buf.resize(len, 0);
 }
 
 /// Room for a buffer whose writer fills every byte before any code observes it: an encoder,
@@ -47209,6 +47205,9 @@ mod tests {
             buf.fill(0x5A);
             assert!(buf.iter().all(|&byte| byte == 0x5A), "len {len}");
         }
+        let mut fresh = Vec::new();
+        resize_scratch(&mut fresh, 32);
+        assert_eq!(fresh, [0u8; 32]);
     }
 
     struct Broken;
