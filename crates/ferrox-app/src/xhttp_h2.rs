@@ -150,10 +150,22 @@ impl<'a> DataBatch<'a> {
                         .send_conn
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
-                    if conn.dead.load(Ordering::SeqCst)
-                        || !matches!(self.reserved_fits(conn), Some(false))
-                    {
+                    let fits = self.reserved_fits(conn);
+                    if conn.dead.load(Ordering::SeqCst) || fits.is_none() || fits == Some(true) {
                         continue;
+                    }
+                    if self.fitting_prefix(conn) {
+                        drop(credit);
+                        if self.send_fitting(conn) {
+                            continue;
+                        }
+                        credit = conn
+                            .send_conn
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        if conn.dead.load(Ordering::SeqCst) || self.reserved_fits(conn).is_none() {
+                            continue;
+                        }
                     }
                 }
                 None => {
@@ -243,6 +255,17 @@ impl<'a> DataBatch<'a> {
             return false;
         }
         self.write_fitting(conn, &fit, &heads, included)
+    }
+
+    /// Whether a reduced window leaves any whole or partial frame sendable now.
+    fn fitting_prefix(&self, conn: &H2Conn) -> bool {
+        let Some((mut budgets, streams)) = self.fitting_budgets(conn) else {
+            return false;
+        };
+        matches!(
+            self.fitting_plan(&mut budgets, streams),
+            Some((_, _, included)) if included > 0
+        )
     }
 
     /// What each stream's reduced window still allows out of this batch's reservation.
