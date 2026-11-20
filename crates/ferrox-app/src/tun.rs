@@ -1899,6 +1899,13 @@ impl Legs {
     }
 }
 
+/// Which lane a datagram leg frames at, or that a direct lane still opening holds it.
+enum Lane {
+    Direct(SocketAddr),
+    Front,
+    Hold,
+}
+
 /// The TUN handler: reads packets, relays each TCP flow and each UDP flow through the proxy outbound.
 pub(crate) struct Handler {
     device: Device,
@@ -2050,15 +2057,11 @@ impl Handler {
             self.datagram_retry = Some(std::time::Instant::now() + budgets::handshake());
         }
         self.poll_datagram_lane();
-        if self.direct_datagram.is_none() && self.opening.is_none() {
-            let direct_due = self
-                .datagram_retry
-                .is_none_or(|at| std::time::Instant::now() >= at);
-            if self.datagram.as_ref().is_some_and(Datagram::ready) && direct_due {
-                self.open_datagram_lane();
-            }
-        }
-        let direct_relay = self.direct_datagram.as_ref().map(|direct| direct.relay);
+        let direct_relay = match self.leg_lane() {
+            Lane::Hold => return Ok(()),
+            Lane::Direct(relay) => Some(relay),
+            Lane::Front => None,
+        };
         let target = SocketAddr::new(
             self.hijack(ip.destination, udp.destination_port),
             udp.destination_port,
@@ -2141,6 +2144,29 @@ impl Handler {
             }
         }
         Ok(())
+    }
+
+    /// Which lane a new leg frames at: the open direct relay, the front lane when the config
+    /// names no direct lane or its refusal is waiting out the retry budget, and `None` while a
+    /// direct lane is opening, so the datagram is held rather than sent down the wrong lane.
+    fn leg_lane(&mut self) -> Lane {
+        let direct_due = self
+            .datagram_retry
+            .is_none_or(|at| std::time::Instant::now() >= at);
+        if self.direct_datagram.is_none()
+            && self.opening.is_none()
+            && self.datagram.is_some()
+            && direct_due
+        {
+            self.open_datagram_lane();
+        }
+        if let Some(direct) = self.direct_datagram.as_ref() {
+            return Lane::Direct(direct.relay);
+        }
+        if self.datagram.is_none() || !direct_due {
+            return Lane::Front;
+        }
+        Lane::Hold
     }
 
     /// Start the direct datagram lane's association on a worker: the dial and the server's SOCKS
