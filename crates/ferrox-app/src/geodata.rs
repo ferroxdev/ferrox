@@ -5,12 +5,15 @@ use crate::conn::HttpUrl;
 use crate::json::Json;
 use crate::proxy::{Destination, Outbound, RouteShared};
 use ferrox_core::tls::TlsProvider as _;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const IDLE: Duration = Duration::from_secs(30);
+/// One budget covers a remote rule set from lookup to the last body byte, so a server that drips
+/// below the idle timeout cannot hold startup open.
+const FETCH_BUDGET: Duration = Duration::from_secs(60);
 pub(crate) const MAX_DOWNLOAD: u64 = 256 * 1024 * 1024;
 /// One decompressed asset is written in chunks of this size, never as one buffer.
 const COPY_BUFFER: usize = 64 * 1024;
@@ -862,9 +865,14 @@ impl Transaction {
 
 fn fetch(url: &str, outbound: &Outbound, writer: &mut impl Write) -> Result<(), String> {
     let mut current = url.to_owned();
-    for _ in 0..20 {
+    let mut redirects = 0;
+    loop {
         let response = request(&current, outbound)?;
         if (300..400).contains(&response.status) {
+            if redirects >= 20 {
+                return Err("stopped after 20 redirects".to_owned());
+            }
+            redirects += 1;
             let location = response
                 .header("location")
                 .ok_or_else(|| "redirected without a Location header".to_owned())?;
@@ -877,16 +885,23 @@ fn fetch(url: &str, outbound: &Outbound, writer: &mut impl Write) -> Result<(), 
         write_body(&response, writer)?;
         return Ok(());
     }
-    Err("stopped after 20 redirects".to_owned())
 }
 
 /// A remote rule set's bytes, dialled directly rather than through an outbound: the routing block
 /// is parsed before the outbound registry exists, so the fetch cannot name a lane yet.
 pub(crate) fn fetch_remote(url: &str) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now()
+        .checked_add(FETCH_BUDGET)
+        .ok_or_else(|| "remote fetch budget overflows".to_owned())?;
     let mut current = url.to_owned();
-    for _ in 0..20 {
-        let response = request_any(&current, None)?;
+    let mut redirects = 0;
+    loop {
+        let response = request_any(&current, None, Some(deadline))?;
         if (300..400).contains(&response.status) {
+            if redirects >= 20 {
+                return Err("stopped after 20 redirects".to_owned());
+            }
+            redirects += 1;
             let location = response
                 .header("location")
                 .ok_or_else(|| "redirected without a Location header".to_owned())?;
@@ -900,7 +915,30 @@ pub(crate) fn fetch_remote(url: &str) -> Result<Vec<u8>, String> {
         write_body(&response, &mut body)?;
         return Ok(body);
     }
-    Err("stopped after 20 redirects".to_owned())
+}
+
+/// Publish a cache only after its bytes have been validated, and never leave a half-written file:
+/// the temp lives beside the target and the previous file is moved aside only after the write ends.
+pub(crate) fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    let temp = unique_path(target, ".tmp")?;
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|error| format!("cannot create {}: {error}", temp.display()))?;
+        file.write_all(bytes).map_err(|error| error.to_string())?;
+        file.flush().map_err(|error| error.to_string())
+    })();
+    if let Err(reason) = result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(reason);
+    }
+    let transaction = swap_all(&[Stage {
+        target: target.to_owned(),
+        temp,
+    }])?;
+    transaction.commit()
 }
 
 #[derive(Debug)]
@@ -920,10 +958,14 @@ impl Response {
 }
 
 fn request(url: &str, outbound: &Outbound) -> Result<Response, String> {
-    request_any(url, Some(outbound))
+    request_any(url, Some(outbound), None)
 }
 
-fn request_any(url: &str, outbound: Option<&Outbound>) -> Result<Response, String> {
+fn request_any(
+    url: &str,
+    outbound: Option<&Outbound>,
+    deadline: Option<Instant>,
+) -> Result<Response, String> {
     let url = HttpUrl::parse(url)?;
     if outbound.is_some() && !url.tls {
         return Err("geodata asset url must be https".to_owned());
@@ -931,11 +973,12 @@ fn request_any(url: &str, outbound: Option<&Outbound>) -> Result<Response, Strin
     let stream = match outbound {
         Some(outbound) => {
             let destination = Destination::Name(url.host.clone(), url.port);
-            crate::proxy::probe_stream(outbound, &destination, IDLE)
+            crate::proxy::probe_stream(outbound, &destination, fetch_budget(deadline)?)
                 .ok_or_else(|| format!("cannot dial {}", url.authority))?
         }
-        None => direct_stream(&url)?,
+        None => direct_stream(&url, deadline)?,
     };
+    let stream = DeadlineIo::new(stream, deadline);
     if !url.tls {
         return exchange(&url, stream);
     }
@@ -952,20 +995,111 @@ fn request_any(url: &str, outbound: Option<&Outbound>) -> Result<Response, Strin
     exchange(&url, session)
 }
 
-fn direct_stream(url: &HttpUrl) -> Result<crate::conn::Connection, String> {
+fn fetch_budget(deadline: Option<Instant>) -> Result<Duration, String> {
+    let Some(deadline) = deadline else {
+        return Ok(IDLE);
+    };
+    let now = Instant::now();
+    if now >= deadline {
+        return Err("remote fetch outlasted its budget".to_owned());
+    }
+    Ok(deadline - now)
+}
+
+fn fetch_timeout() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "remote fetch outlasted its budget")
+}
+
+/// The dial's socket with one absolute deadline over every read and write, so a peer that keeps
+/// trickling below the idle timeout still runs out of the fetch's budget.
+struct DeadlineIo {
+    inner: crate::conn::Connection,
+    deadline: Option<Instant>,
+}
+
+impl DeadlineIo {
+    fn new(inner: crate::conn::Connection, deadline: Option<Instant>) -> Self {
+        Self { inner, deadline }
+    }
+
+    fn remaining(&self) -> io::Result<Duration> {
+        let Some(deadline) = self.deadline else {
+            return Ok(IDLE);
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(fetch_timeout());
+        }
+        Ok(deadline - now)
+    }
+
+    fn expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+
+impl Read for DeadlineIo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.deadline.is_some() {
+            let left = self.remaining()?;
+            self.inner
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
+            self.inner.set_read_until(self.deadline);
+        }
+        let read = self.inner.read(buf)?;
+        if self.expired() {
+            return Err(fetch_timeout());
+        }
+        Ok(read)
+    }
+}
+
+impl Write for DeadlineIo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.deadline.is_some() {
+            let left = self.remaining()?;
+            self.inner
+                .set_write_timeout(Some(left.max(Duration::from_millis(1))))?;
+        }
+        let written = self.inner.write(buf)?;
+        if self.expired() {
+            return Err(fetch_timeout());
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()?;
+        if self.expired() {
+            return Err(fetch_timeout());
+        }
+        Ok(())
+    }
+}
+
+fn direct_stream(
+    url: &HttpUrl,
+    deadline: Option<Instant>,
+) -> Result<crate::conn::Connection, String> {
     use std::net::ToSocketAddrs as _;
+    let budget = fetch_budget(deadline)?;
+    let addresses = crate::proxy::resolve_bounded(&url.host, url.port, budget, |host, port| {
+        (host, port)
+            .to_socket_addrs()
+            .map(std::iter::Iterator::collect)
+    })
+    .ok_or_else(|| format!("cannot resolve {} within its budget", url.authority))?;
     let mut last = None;
-    for address in (url.host.as_str(), url.port)
-        .to_socket_addrs()
-        .map_err(|error| format!("cannot resolve {}: {error}", url.authority))?
-    {
-        match std::net::TcpStream::connect_timeout(&address, IDLE) {
+    for address in addresses {
+        let left = fetch_budget(deadline)?.min(IDLE);
+        match std::net::TcpStream::connect_timeout(&address, left) {
             Ok(stream) => {
                 stream
-                    .set_read_timeout(Some(IDLE))
+                    .set_read_timeout(Some(left))
                     .map_err(|error| error.to_string())?;
                 stream
-                    .set_write_timeout(Some(IDLE))
+                    .set_write_timeout(Some(left))
                     .map_err(|error| error.to_string())?;
                 return Ok(crate::conn::Connection::Tcp(stream));
             }
@@ -1631,6 +1765,28 @@ mod tests {
             resolve_remote_location("https://example.test/a/b", "//cdn.test/c").expect("joined"),
             "https://cdn.test/c"
         );
+    }
+
+    #[test]
+    fn a_remote_fetch_follows_twenty_redirects_and_refuses_the_next() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for at in 0..21 {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: /{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    at + 1
+                );
+                stream.write_all(response.as_bytes()).expect("redirect");
+            }
+        });
+        let error = fetch_remote(&format!("http://127.0.0.1:{port}/0")).expect_err("refused");
+        server.join().expect("server");
+        assert!(error.contains("20 redirects"), "{error}");
     }
 
     #[test]

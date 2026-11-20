@@ -349,6 +349,7 @@ pub(crate) struct ListedRule {
 }
 
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Routing {
     strategy: DomainStrategy,
     rules: Vec<Rule>,
@@ -359,6 +360,9 @@ pub(crate) struct Routing {
     has_domains: bool,
     wants_attrs: bool,
     wants_process: bool,
+    /// A `shouldAppend=false` write replaced the whole table, so a reload must keep that replacement
+    /// instead of bringing the startup rules back.
+    added_replaced: bool,
 }
 
 /// One server inbound's fixed direct dial, checked against the rules that can reach it — at startup,
@@ -970,6 +974,8 @@ pub(crate) struct Rule {
     process: Option<ProcessSelector>,
     webhook: Option<Arc<crate::webhook::Webhook>>,
     sets: Option<Vec<Arc<RuleSet>>>,
+    /// Set by `AddRule`; a geodata reload keeps these and replaces only the startup rules.
+    added: bool,
 }
 
 impl Rule {
@@ -1047,12 +1053,13 @@ impl SetProcess {
         let Some(owner) = owner else {
             return false;
         };
-        self.names.iter().any(|name| name == &owner.name)
-            || self.paths.iter().any(|path| path == &owner.path)
-            || self
-                .patterns
-                .iter()
-                .any(|pattern| pattern.is_match(&owner.path))
+        (self.names.is_empty() || self.names.iter().any(|name| name == &owner.name))
+            && (self.paths.is_empty() || self.paths.iter().any(|path| path == &owner.path))
+            && (self.patterns.is_empty()
+                || self
+                    .patterns
+                    .iter()
+                    .any(|pattern| pattern.is_match(&owner.path)))
     }
 }
 
@@ -1082,6 +1089,7 @@ impl Routing {
             has_domains: false,
             wants_attrs: false,
             wants_process: false,
+            added_replaced: false,
         }
     }
 
@@ -1222,6 +1230,7 @@ impl Routing {
             has_domains,
             wants_attrs,
             wants_process,
+            added_replaced: false,
         }))
     }
 
@@ -1271,6 +1280,26 @@ impl Routing {
         }
     }
 
+    /// Carry rules the management API added across a geodata reparse. The startup config does not
+    /// contain them, so replacing the table wholesale would make a later `AddRule` rule vanish.
+    pub(crate) fn adopt_added_rules(&mut self, old: &mut Self) {
+        let replaced = old.added_replaced;
+        let added: Vec<Rule> = std::mem::take(&mut old.rules)
+            .into_iter()
+            .filter(|rule| rule.added)
+            .collect();
+        if replaced {
+            self.rules = added;
+            self.balancers.clear();
+            self.added_replaced = true;
+        } else if !added.is_empty() {
+            self.rules.extend(added);
+        } else {
+            return;
+        }
+        self.refresh();
+    }
+
     /// Append a decoded `AddRule` rule list, or replace the table with it when `append` is false.
     /// Rule tags stay unique across the whole table, as the reference's `AddRule` refuses a repeat,
     /// and every server inbound proves the candidate table before the write so a rule the inbound
@@ -1293,9 +1322,10 @@ impl Routing {
         };
         let mut rules = Vec::with_capacity(raw.len());
         for item in raw {
-            let Some(rule) = Rule::parse(item, &mut assets, &self.rule_sets)? else {
+            let Some(mut rule) = Rule::parse(item, &mut assets, &self.rule_sets)? else {
                 continue;
             };
+            rule.added = true;
             if let Some(tag) = &rule.tag {
                 if !tags.insert(tag.clone()) {
                     return Err(format!("duplicate ruleTag `{tag}`"));
@@ -1343,6 +1373,7 @@ impl Routing {
             self.rules.extend(rules);
         } else {
             self.rules = rules;
+            self.added_replaced = true;
             // The reference rebuilds its balancer map from the same config, which carries none.
             self.balancers.clear();
         }
@@ -2003,6 +2034,7 @@ impl Rule {
             process,
             webhook,
             sets: rule_sets,
+            added: false,
         }))
     }
 
@@ -2560,9 +2592,6 @@ fn read_srs_item(
     tag: &str,
 ) -> Result<(), String> {
     match item {
-        0 => {
-            let _ = reader.u16s()?;
-        }
         1 => {
             let networks = rule.networks.get_or_insert_with(Vec::new);
             for network in reader.strings()? {
@@ -2650,23 +2679,42 @@ fn read_srs_item(
                         .ok_or_else(|| {
                             format!("routing rule set `{tag}` port range `{part}` is not a range")
                         })?;
-                    let start = start.trim().parse::<u16>().map_err(|_| {
-                        format!("routing rule set `{tag}` port range `{part}` is not a range")
-                    })?;
-                    let end = end.trim().parse::<u16>().map_err(|_| {
-                        format!("routing rule set `{tag}` port range `{part}` is not a range")
-                    })?;
+                    let start = start.trim();
+                    let start = if start.is_empty() {
+                        0
+                    } else {
+                        start.parse::<u16>().map_err(|_| {
+                            format!("routing rule set `{tag}` port range `{part}` is not a range")
+                        })?
+                    };
+                    let end = end.trim();
+                    let end = if end.is_empty() {
+                        u16::MAX
+                    } else {
+                        end.parse::<u16>().map_err(|_| {
+                            format!("routing rule set `{tag}` port range `{part}` is not a range")
+                        })?
+                    };
+                    if end < start {
+                        return Err(format!(
+                            "routing rule set `{tag}` port range `{part}` is not a range"
+                        ));
+                    }
                     ports.ranges.push((start, end));
                 }
             }
         }
         11 | 12 | 17 => {
+            let values = reader.strings()?;
+            if values.is_empty() {
+                return Ok(());
+            }
             let process = rule.process.get_or_insert_with(|| SetProcess {
                 names: Vec::new(),
                 paths: Vec::new(),
                 patterns: Vec::new(),
             });
-            for value in reader.strings()? {
+            for value in values {
                 match item {
                     11 => process.names.push(value),
                     12 => process.paths.push(value),
@@ -2685,7 +2733,7 @@ fn read_srs_item(
                 .adguard
                 .push(set);
         }
-        13 | 14 | 15 | 18 | 19 | 20 | 21 | 22 | 23 => {
+        0 | 13 | 14 | 15 | 18 | 19 | 20 | 21 | 22 | 23 => {
             return Err(format!(
                 "routing rule set `{tag}` item {} is not carried",
                 srs_item_name(item)
@@ -2702,6 +2750,7 @@ fn read_srs_item(
 
 fn srs_item_name(item: u8) -> &'static str {
     match item {
+        0 => "query_type",
         13 => "package_name",
         14 => "wifi_ssid",
         15 => "wifi_bssid",
@@ -2736,10 +2785,22 @@ fn read_ip_set(reader: &mut SrsReader<'_>, tag: &str) -> Result<RangeSet, String
         }
         match (from, to) {
             (IpAddr::V4(from), IpAddr::V4(to)) => {
-                set.v4.push((u32::from(from), u32::from(to)));
+                let (from, to) = (u32::from(from), u32::from(to));
+                if to < from {
+                    return Err(format!(
+                        "routing rule set `{tag}` IP set range is not a range"
+                    ));
+                }
+                set.v4.push((from, to));
             }
             (IpAddr::V6(from), IpAddr::V6(to)) => {
-                set.v6.push((u128::from(from), u128::from(to)));
+                let (from, to) = (u128::from(from), u128::from(to));
+                if to < from {
+                    return Err(format!(
+                        "routing rule set `{tag}` IP set range is not a range"
+                    ));
+                }
+                set.v6.push((from, to));
             }
             _ => {
                 return Err(format!(
@@ -2815,8 +2876,16 @@ impl RuleSet {
                 "local".to_owned()
             }
         });
+        if let Some(format) = format.as_deref() {
+            if !matches!(format, "binary" | "srs" | "source" | "json") {
+                return Err(format!(
+                    "routing rule set `{tag}` format `{format}` is not carried"
+                ));
+            }
+        }
         let mut body = None;
         let mut bytes = None;
+        let mut cache = None;
         match kind.as_str() {
             "inline" => {
                 if format
@@ -2849,17 +2918,17 @@ impl RuleSet {
                             .map(str::to_owned)
                     })
                     .ok_or_else(|| format!("routing rule set `{tag}` has no url"))?;
+                let fallback = path
+                    .as_deref()
+                    .and_then(|path| resolve_asset_path(path, dirs));
+                cache = fallback
+                    .clone()
+                    .or_else(|| cache_path(path.as_deref(), dirs));
                 match crate::geodata::fetch_remote(&url) {
                     Ok(fetched) => {
-                        if let Some(cache) = cache_path(path.as_deref(), dirs) {
-                            let _ = std::fs::write(&cache, &fetched);
-                        }
                         bytes = Some(fetched);
                     }
                     Err(error) => {
-                        let fallback = path
-                            .as_deref()
-                            .and_then(|path| resolve_asset_path(path, dirs));
                         let Some(file) = fallback else {
                             return Err(format!(
                                 "routing rule set `{tag}` remote `{url}`: {error}"
@@ -2884,7 +2953,7 @@ impl RuleSet {
         let rules = if let Some(body) = body {
             parse_source_rules(&body, &tag, assets)?
         } else {
-            let bytes = bytes.unwrap_or_default();
+            let bytes = bytes.as_deref().unwrap_or_default();
             let binary = match format.as_deref() {
                 Some("binary" | "srs") => true,
                 Some("source" | "json") => false,
@@ -2896,15 +2965,20 @@ impl RuleSet {
                 None => bytes.starts_with(b"SRS"),
             };
             if binary {
-                parse_srs(&bytes, &tag)?
+                parse_srs(bytes, &tag)?
             } else {
-                let text = String::from_utf8(bytes)
+                let text = std::str::from_utf8(bytes)
                     .map_err(|_| format!("routing rule set `{tag}` is not UTF-8 JSON"))?;
                 let body = crate::json::parse(text.trim())
                     .map_err(|error| format!("routing rule set `{tag}` is not JSON: {error}"))?;
                 parse_source_rules(&body, &tag, assets)?
             }
         };
+        if let (Some(cache), Some(bytes)) = (cache, bytes.as_deref()) {
+            if let Err(error) = crate::geodata::write_atomic(&cache, bytes) {
+                eprintln!("routing rule set `{tag}` cache: {error}");
+            }
+        }
         Ok(Self { tag, rules })
     }
 
@@ -3016,36 +3090,45 @@ impl SetRule {
                     }
                 }
                 "process_name" | "processName" => {
-                    let process = process.get_or_insert_with(|| SetProcess {
-                        names: Vec::new(),
-                        paths: Vec::new(),
-                        patterns: Vec::new(),
-                    });
-                    process
-                        .names
-                        .extend(string_list(value, "process_name")?.unwrap_or_default());
+                    let names = string_list(value, "process_name")?.unwrap_or_default();
+                    if !names.is_empty() {
+                        process
+                            .get_or_insert_with(|| SetProcess {
+                                names: Vec::new(),
+                                paths: Vec::new(),
+                                patterns: Vec::new(),
+                            })
+                            .names
+                            .extend(names);
+                    }
                 }
                 "process_path" | "processPath" => {
-                    let process = process.get_or_insert_with(|| SetProcess {
-                        names: Vec::new(),
-                        paths: Vec::new(),
-                        patterns: Vec::new(),
-                    });
-                    process
-                        .paths
-                        .extend(string_list(value, "process_path")?.unwrap_or_default());
+                    let paths = string_list(value, "process_path")?.unwrap_or_default();
+                    if !paths.is_empty() {
+                        process
+                            .get_or_insert_with(|| SetProcess {
+                                names: Vec::new(),
+                                paths: Vec::new(),
+                                patterns: Vec::new(),
+                            })
+                            .paths
+                            .extend(paths);
+                    }
                 }
                 "process_path_regex" | "processPathRegex" => {
-                    let process = process.get_or_insert_with(|| SetProcess {
-                        names: Vec::new(),
-                        paths: Vec::new(),
-                        patterns: Vec::new(),
-                    });
-                    for pattern in string_list(value, "process_path_regex")?.unwrap_or_default() {
-                        process.patterns.push(
-                            regex::Regex::new(&pattern)
-                                .map_err(|error| format!("process path regex: {error}"))?,
-                        );
+                    let patterns = string_list(value, "process_path_regex")?.unwrap_or_default();
+                    if !patterns.is_empty() {
+                        let process = process.get_or_insert_with(|| SetProcess {
+                            names: Vec::new(),
+                            paths: Vec::new(),
+                            patterns: Vec::new(),
+                        });
+                        for pattern in patterns {
+                            process.patterns.push(
+                                regex::Regex::new(&pattern)
+                                    .map_err(|error| format!("process path regex: {error}"))?,
+                            );
+                        }
                     }
                 }
                 "port" => ports = port_set(value, "port")?,
@@ -3249,11 +3332,35 @@ impl SetRule {
                 return Verdict::No;
             }
         }
-        if let Some(matcher) = &self.domains {
-            let Some(names) = names else {
-                return Verdict::No;
-            };
-            if !matcher.matches(names.raw, names.lower()) {
+        let mut destination_unknown = false;
+        if self.domains.is_some() || self.ips.is_some() {
+            let mut matched = false;
+            if let Some(matcher) = &self.domains {
+                match names {
+                    Some(names) => {
+                        if matcher.matches(names.raw, names.lower()) {
+                            matched = true;
+                        }
+                    }
+                    None => destination_unknown = true,
+                }
+            }
+            if !matched {
+                if let Some(matcher) = &self.ips {
+                    match flow.ip {
+                        Some(ip) => matched = matcher.matches(ip),
+                        None => match addrs {
+                            Some(addrs) => {
+                                matched = addrs.iter().any(|ip| matcher.matches(*ip));
+                            }
+                            None => destination_unknown = true,
+                        },
+                    }
+                }
+            }
+            if matched {
+                destination_unknown = false;
+            } else if !destination_unknown {
                 return Verdict::No;
             }
         }
@@ -3267,24 +3374,10 @@ impl SetRule {
                 return Verdict::No;
             }
         }
-        let Some(matcher) = &self.ips else {
-            return Verdict::Yes;
-        };
-        if let Some(ip) = flow.ip {
-            return if matcher.matches(ip) {
-                Verdict::Yes
-            } else {
-                Verdict::No
-            };
-        }
-        let Some(addrs) = addrs else {
+        if destination_unknown {
             return Verdict::Unknown;
-        };
-        if addrs.iter().any(|ip| matcher.matches(*ip)) {
-            Verdict::Yes
-        } else {
-            Verdict::No
         }
+        Verdict::Yes
     }
 
     fn matches_network(&self, network: Network) -> bool {
@@ -3449,12 +3542,45 @@ impl SuccinctSet {
     }
 
     fn has_adguard(&self, key: &[u8], node: usize, bit: usize, depth: usize) -> bool {
+        let mut failed = std::collections::HashSet::new();
+        self.has_adguard_at(key, 0, node, bit, depth, &mut failed)
+    }
+
+    fn has_adguard_at(
+        &self,
+        key: &[u8],
+        offset: usize,
+        node: usize,
+        bit: usize,
+        depth: usize,
+        failed: &mut std::collections::HashSet<(usize, usize, usize, usize)>,
+    ) -> bool {
+        let state = (offset, node, bit, depth);
+        if failed.contains(&state) {
+            return false;
+        }
+        let found = self.has_adguard_step(key, offset, node, bit, depth, failed);
+        if !found {
+            failed.insert(state);
+        }
+        found
+    }
+
+    fn has_adguard_step(
+        &self,
+        key: &[u8],
+        offset: usize,
+        node: usize,
+        bit: usize,
+        depth: usize,
+        failed: &mut std::collections::HashSet<(usize, usize, usize, usize)>,
+    ) -> bool {
         if depth > 100 {
             return false;
         }
         let mut node = node;
         let mut bit = bit;
-        for at in 0..key.len() {
+        for at in offset..key.len() {
             let current = key[at];
             loop {
                 if Self::get_bit(&self.label_bitmap, bit) {
@@ -3480,11 +3606,11 @@ impl SuccinctSet {
                     let Some(next_bit) = self.select(next - 1).map(|value| value + 1) else {
                         return false;
                     };
-                    if self.has_adguard(&key[at..], next, next_bit, depth + 1) {
+                    if self.has_adguard_at(key, at, next, next_bit, depth + 1, failed) {
                         return true;
                     }
                     for end in at + 1..=key.len() {
-                        if self.has_adguard(&key[end..], next, next_bit, depth + 1) {
+                        if self.has_adguard_at(key, end, next, next_bit, depth + 1, failed) {
                             return true;
                         }
                     }
@@ -3515,14 +3641,14 @@ impl SuccinctSet {
                 let Some(next_bit) = self.select(next - 1).map(|value| value + 1) else {
                     return false;
                 };
-                return self.has_adguard(&[], next, next_bit, depth + 1);
+                return self.has_adguard_at(key, key.len(), next, next_bit, depth + 1, failed);
             }
             bit += 1;
         }
     }
 
     fn matches_adguard(&self, domain: &str) -> bool {
-        let key: Vec<u8> = domain.bytes().rev().collect();
+        let key: Vec<u8> = reverse_domain(domain).into_bytes();
         if self.has_adguard(&key, 0, 0, 0) {
             return true;
         }
@@ -3557,13 +3683,27 @@ impl SuccinctSet {
         current: &mut Vec<u8>,
         out: &mut Vec<String>,
     ) -> Result<(), String> {
-        let mut bit = bit;
-        loop {
+        #[derive(Clone, Copy)]
+        struct Frame {
+            node: usize,
+            bit: usize,
+        }
+        let mut stack = vec![Frame { node, bit }];
+        while let Some(frame) = stack.last().copied() {
+            let bit = frame.bit;
             if Self::get_bit(&self.label_bitmap, bit) {
-                return Ok(());
+                stack.pop();
+                if !stack.is_empty() {
+                    current.pop();
+                }
+                continue;
             }
-            let Some(&label) = self.labels.get(bit - node) else {
-                return Ok(());
+            let Some(&label) = self.labels.get(bit - frame.node) else {
+                stack.pop();
+                if !stack.is_empty() {
+                    current.pop();
+                }
+                continue;
             };
             current.push(label);
             if current.len() > MAX_DOMAIN_KEY {
@@ -3571,15 +3711,24 @@ impl SuccinctSet {
             }
             let next = self.count_zeros(bit + 1);
             let Some(next_bit) = self.select(next - 1).map(|value| value + 1) else {
-                return Ok(());
+                current.pop();
+                if let Some(parent) = stack.last_mut() {
+                    parent.bit += 1;
+                }
+                continue;
             };
             if Self::get_bit(&self.leaves, next) {
                 out.push(String::from_utf8_lossy(current).into_owned());
             }
-            self.walk(next, next_bit, current, out)?;
-            current.pop();
-            bit += 1;
+            if let Some(parent) = stack.last_mut() {
+                parent.bit += 1;
+            }
+            stack.push(Frame {
+                node: next,
+                bit: next_bit,
+            });
         }
+        Ok(())
     }
 }
 
@@ -6279,10 +6428,346 @@ mod tests {
         );
         assert_eq!(
             routing.route(&Flow {
+                domain: Some("exact.test"),
+                ip: Some("192.0.2.2".parse().expect("address")),
+                source: Some("192.0.2.9".parse().expect("address")),
+                ..flow
+            }),
+            Some("block"),
+            "the destination domain is an alternative to the destination address"
+        );
+        assert_eq!(
+            routing.route(&Flow {
+                domain: Some("other.test"),
+                ip: Some("192.0.2.1".parse().expect("address")),
+                source: Some("192.0.2.9".parse().expect("address")),
+                ..flow
+            }),
+            Some("block"),
+            "the destination address is an alternative to the destination domain"
+        );
+        assert_eq!(
+            routing.route(&Flow {
                 domain: Some("other.test"),
                 ..flow
             }),
             None
+        );
+    }
+
+    #[test]
+    fn a_replacement_add_rule_table_survives_a_reparse() {
+        let root = object(vec![(
+            "routing",
+            object(vec![(
+                "rules",
+                array(vec![rule(
+                    "block",
+                    vec![("domain", array(vec![text("startup.test")]))],
+                )]),
+            )]),
+        )]);
+        let mut routing = Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        routing
+            .add_rules(
+                &[rule(
+                    "block",
+                    vec![("domain", array(vec![text("replacement.test")]))],
+                )],
+                false,
+                |tag| tag == "block",
+                &[],
+            )
+            .expect("replaces");
+        let mut next = Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        next.adopt_added_rules(&mut routing);
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("replacement.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        assert_eq!(next.route(&flow), Some("block"));
+        assert_eq!(
+            next.route(&Flow {
+                domain: Some("startup.test"),
+                ..flow
+            }),
+            None,
+            "a replacement table does not resurrect the startup rules"
+        );
+    }
+
+    #[test]
+    fn a_binary_rule_set_process_selectors_are_all_required() {
+        let mut body = Vec::new();
+        body.extend(varint(1));
+        body.push(0);
+        body.push(11);
+        put_strings(&mut body, &["curl"]);
+        body.push(12);
+        put_strings(&mut body, &["/usr/bin/other"]);
+        body.push(0xff);
+        body.push(0);
+        let dir = dir();
+        std::fs::write(dir.join("rules.srs"), wrap_srs(&body)).expect("write");
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                (
+                    "ruleSets",
+                    array(vec![object(vec![
+                        ("tag", text("proc")),
+                        ("type", text("local")),
+                        ("path", text("rules.srs")),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "block",
+                        vec![("ruleSet", array(vec![text("proc")]))],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("process.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        let named = crate::process::Owner {
+            pid: 1,
+            name: "curl".to_owned(),
+            path: "/usr/bin/curl".to_owned(),
+        };
+        assert_eq!(
+            routing.route(&Flow {
+                process: Some(&named),
+                ..flow
+            }),
+            None,
+            "a name and a path selector are both required"
+        );
+        let matched = crate::process::Owner {
+            path: "/usr/bin/other".to_owned(),
+            ..named
+        };
+        assert_eq!(
+            routing.route(&Flow {
+                process: Some(&matched),
+                ..flow
+            }),
+            Some("block")
+        );
+    }
+
+    #[test]
+    fn a_binary_rule_set_reads_open_ended_port_ranges() {
+        let mut body = Vec::new();
+        body.extend(varint(1));
+        body.push(0);
+        body.push(10);
+        put_strings(&mut body, &["4000:", ":3000"]);
+        body.push(0xff);
+        body.push(0);
+        let dir = dir();
+        std::fs::write(dir.join("rules.srs"), wrap_srs(&body)).expect("write");
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                (
+                    "ruleSets",
+                    array(vec![object(vec![
+                        ("tag", text("ports")),
+                        ("type", text("local")),
+                        ("path", text("rules.srs")),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "block",
+                        vec![("ruleSet", array(vec![text("ports")]))],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("ports.test"),
+            ip: None,
+            port: Some(5000),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        assert_eq!(routing.route(&flow), Some("block"));
+        assert_eq!(
+            routing.route(&Flow {
+                port: Some(80),
+                ..flow
+            }),
+            Some("block")
+        );
+        assert_eq!(
+            routing.route(&Flow {
+                port: Some(3500),
+                ..flow
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_binary_rule_set_refuses_a_descending_ip_range() {
+        let mut body = Vec::new();
+        body.extend(varint(1));
+        body.push(0);
+        body.push(6);
+        put_ip_set(
+            &mut body,
+            &[(
+                "192.0.2.2".parse().expect("address"),
+                "192.0.2.1".parse().expect("address"),
+            )],
+        );
+        body.push(0xff);
+        body.push(0);
+        let dir = dir();
+        std::fs::write(dir.join("rules.srs"), wrap_srs(&body)).expect("write");
+        let root = object(vec![(
+            "routing",
+            object(vec![(
+                "ruleSets",
+                array(vec![object(vec![
+                    ("tag", text("bad")),
+                    ("type", text("local")),
+                    ("path", text("rules.srs")),
+                ])]),
+            )]),
+        )]);
+        let error = Routing::parse_in(&root, vec![dir]).expect_err("refused");
+        assert!(error.contains("not a range"), "{error}");
+    }
+
+    #[test]
+    fn a_binary_rule_set_refuses_query_type_by_name() {
+        let mut body = Vec::new();
+        body.extend(varint(1));
+        body.push(0);
+        body.push(0);
+        put_u16s(&mut body, &[1]);
+        body.push(0xff);
+        body.push(0);
+        let dir = dir();
+        std::fs::write(dir.join("rules.srs"), wrap_srs(&body)).expect("write");
+        let root = object(vec![(
+            "routing",
+            object(vec![(
+                "ruleSets",
+                array(vec![object(vec![
+                    ("tag", text("queries")),
+                    ("type", text("local")),
+                    ("path", text("rules.srs")),
+                ])]),
+            )]),
+        )]);
+        let error = Routing::parse_in(&root, vec![dir]).expect_err("refused");
+        assert!(error.contains("query_type"), "{error}");
+    }
+
+    #[test]
+    fn added_rules_survive_a_reparse() {
+        let root = object(vec![(
+            "routing",
+            object(vec![(
+                "rules",
+                array(vec![rule(
+                    "block",
+                    vec![("domain", array(vec![text("startup.test")]))],
+                )]),
+            )]),
+        )]);
+        let mut routing = Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        routing
+            .add_rules(
+                &[rule(
+                    "block",
+                    vec![("domain", array(vec![text("added.test")]))],
+                )],
+                true,
+                |tag| tag == "block",
+                &[],
+            )
+            .expect("adds");
+        let mut next = Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        next.adopt_added_rules(&mut routing);
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("startup.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        assert_eq!(next.route(&flow), Some("block"));
+        assert_eq!(
+            next.route(&Flow {
+                domain: Some("added.test"),
+                ..flow
+            }),
+            Some("block")
         );
     }
 
@@ -6297,6 +6782,7 @@ mod tests {
             &[
                 domain_key(ROOT_LABEL, "ads.test"),
                 domain_key(0, "exact.test"),
+                domain_key(0, "例子.test"),
             ],
         );
         body.push(0xff);
@@ -6367,6 +6853,21 @@ mod tests {
         assert_eq!(
             routing.route(&Flow {
                 domain: Some("ads.test.evil"),
+                ..flow
+            }),
+            None
+        );
+        assert_eq!(
+            routing.route(&Flow {
+                domain: Some("例子.test"),
+                ..flow
+            }),
+            Some("block"),
+            "an AdGuard key reverses characters, not bytes"
+        );
+        assert_eq!(
+            routing.route(&Flow {
+                domain: Some("x.例子.test"),
                 ..flow
             }),
             None
@@ -6510,6 +7011,7 @@ mod tests {
 
     #[test]
     fn a_remote_rule_set_is_fetched_over_http() {
+        let dir = dir();
         let mut body = Vec::new();
         body.extend(varint(1));
         body.push(0);
@@ -6543,6 +7045,7 @@ mod tests {
                         ("tag", text("remote")),
                         ("type", text("remote")),
                         ("url", text(&url)),
+                        ("path", text("cache.srs")),
                     ])]),
                 ),
                 (
@@ -6554,10 +7057,15 @@ mod tests {
                 ),
             ]),
         )]);
-        let routing = Routing::parse_in(&root, vec![dir()])
+        let routing = Routing::parse_in(&root, vec![dir.clone()])
             .expect("parses")
             .expect("routing");
         server.join().expect("server");
+        assert_eq!(
+            std::fs::read(dir.join("cache.srs")).expect("cache"),
+            srs,
+            "a successful fetch writes the path the fallback will read"
+        );
         let flow = Flow {
             network: Network::Tcp,
             domain: Some("remote.test"),
