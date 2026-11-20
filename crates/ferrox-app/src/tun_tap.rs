@@ -26,14 +26,18 @@ pub(crate) enum Accepted<'a> {
 pub(crate) struct Bridge {
     local: [u8; 6],
     addresses: Vec<IpAddr>,
+    /// A captured route with no gateway treats every destination as on-link, so the bridge answers
+    /// ARP and neighbour solicitation for the addresses it does not carry too.
+    proxy: bool,
     peer: Mutex<Option<[u8; 6]>>,
 }
 
 impl Bridge {
-    pub(crate) fn new(name: &str, addresses: Vec<IpAddr>) -> Self {
+    pub(crate) fn new(name: &str, addresses: Vec<IpAddr>, proxy: bool) -> Self {
         Self {
             local: local_address(name),
             addresses,
+            proxy,
             peer: Mutex::new(None),
         }
     }
@@ -68,9 +72,10 @@ impl Bridge {
         let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
         let body = &frame[HEADER_LEN..];
         match ethertype {
-            IPV4 | IPV6 if destination == self.local => Accepted::Ip(body),
+            IPV4 if destination == self.local => Accepted::Ip(body),
             IPV6 => match self.neighbour_advertisement(body, source) {
                 Some(reply) => Accepted::Reply(reply),
+                None if destination == self.local => Accepted::Ip(body),
                 None => Accepted::Ignore,
             },
             ARP if destination[0] & 1 == 1 || destination == self.local => {
@@ -110,10 +115,11 @@ impl Bridge {
             return None;
         }
         let asked = Ipv4Addr::new(body[24], body[25], body[26], body[27]);
-        if !self
-            .addresses
-            .iter()
-            .any(|address| matches!(address, IpAddr::V4(v4) if *v4 == asked))
+        if !self.proxy
+            && !self
+                .addresses
+                .iter()
+                .any(|address| matches!(address, IpAddr::V4(v4) if *v4 == asked))
         {
             return None;
         }
@@ -138,23 +144,34 @@ impl Bridge {
             return None;
         }
         let target = Ipv6Addr::from(<[u8; 16]>::try_from(&message[8..24]).ok()?);
-        if !self
-            .addresses
-            .iter()
-            .any(|address| matches!(address, IpAddr::V6(v6) if *v6 == target))
+        if !self.proxy
+            && !self
+                .addresses
+                .iter()
+                .any(|address| matches!(address, IpAddr::V6(v6) if *v6 == target))
         {
             return None;
         }
         let source = Ipv6Addr::from(<[u8; 16]>::try_from(&body[8..24]).ok()?);
+        // RFC 4861: a solicitation from the unspecified source is answered to all-nodes with the solicited flag clear.
+        let (destination, destination_mac, flags) = if source.is_unspecified() {
+            (
+                Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1),
+                [0x33, 0x33, 0, 0, 0, 1],
+                [0x20, 0, 0, 0],
+            )
+        } else {
+            (source, peer, [0x60, 0, 0, 0])
+        };
         let mut answer = Vec::with_capacity(32);
         answer.extend_from_slice(&[NEIGHBOR_ADVERTISEMENT, 0, 0, 0]);
-        answer.extend_from_slice(&[0x60, 0, 0, 0]);
+        answer.extend_from_slice(&flags);
         answer.extend_from_slice(&target.octets());
         answer.extend_from_slice(&[2, 1]);
         answer.extend_from_slice(&self.local);
-        let checksum = icmpv6_checksum(&target, &source, &answer);
+        let checksum = icmpv6_checksum(&target, &destination, &answer);
         answer[2..4].copy_from_slice(&checksum.to_be_bytes());
-        frame_ipv6(peer, self.local, target, source, &answer)
+        frame_ipv6(destination_mac, self.local, target, destination, &answer)
     }
 }
 
@@ -243,7 +260,7 @@ mod tests {
 
     #[test]
     fn a_tap_reads_an_ip_packet_and_frames_the_answer_for_the_peer_it_learned() {
-        let bridge = Bridge::new("feth0", vec!["10.0.0.1".parse().unwrap()]);
+        let bridge = Bridge::new("feth0", vec!["10.0.0.1".parse().unwrap()], false);
         let peer = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
         let payload = [0x45, 0, 0, 20];
         let frame = ipv4_frame(bridge.local, peer, &payload);
@@ -261,7 +278,7 @@ mod tests {
 
     #[test]
     fn a_tap_answers_an_arp_request_for_an_address_it_carries_and_ignores_another() {
-        let bridge = Bridge::new("feth0", vec!["10.0.0.1".parse().unwrap()]);
+        let bridge = Bridge::new("feth0", vec!["10.0.0.1".parse().unwrap()], false);
         let peer = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
         let reply = match bridge.accept(&arp_request(
             peer,
@@ -307,6 +324,7 @@ mod tests {
         let bridge = Bridge::new(
             "feth0",
             vec!["2001:db8::1".parse().unwrap(), "10.0.0.1".parse().unwrap()],
+            false,
         );
         let peer = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
         let target: Ipv6Addr = "2001:db8::1".parse().unwrap();
@@ -347,9 +365,78 @@ mod tests {
         );
     }
 
+    fn ns_frame(peer: [u8; 6], source: Ipv6Addr, target: Ipv6Addr) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0x33, 0x33, 0xff, 0, 0, 1]);
+        frame.extend_from_slice(&peer);
+        frame.extend_from_slice(&IPV6.to_be_bytes());
+        frame.extend_from_slice(&[0x60, 0, 0, 0]);
+        frame.extend_from_slice(&24u16.to_be_bytes());
+        frame.extend_from_slice(&[ICMPV6, 255]);
+        frame.extend_from_slice(&source.octets());
+        frame.extend_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        frame.extend_from_slice(&[NEIGHBOR_SOLICITATION, 0, 0, 0, 0, 0, 0, 0]);
+        frame.extend_from_slice(&target.octets());
+        frame
+    }
+
+    #[test]
+    fn a_tap_answers_a_unicast_solicitation_and_a_proxy_one_for_an_address_it_does_not_carry() {
+        let peer = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+        let own: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let asker: Ipv6Addr = "fe80::9".parse().unwrap();
+        let bridge = Bridge::new("feth0", vec![IpAddr::V6(own)], true);
+        assert!(
+            matches!(
+                bridge.accept(&ns_frame(peer, asker, own)),
+                Accepted::Reply(_)
+            ),
+            "a solicitation addressed to the device's own address is still answered"
+        );
+        assert!(
+            matches!(
+                bridge.accept(&ns_frame(peer, asker, "2001:db8::2".parse().unwrap())),
+                Accepted::Reply(_)
+            ),
+            "a captured route makes every destination on-link, so the proxy answers for it"
+        );
+        let single = Bridge::new("feth0", vec![IpAddr::V6(own)], false);
+        assert!(
+            matches!(
+                single.accept(&ns_frame(peer, asker, "2001:db8::2".parse().unwrap())),
+                Accepted::Ignore
+            ),
+            "without capture an address the device does not carry is left alone"
+        );
+    }
+
+    #[test]
+    fn a_tap_answers_an_unspecified_solicitation_to_all_nodes_with_the_flag_clear() {
+        let bridge = Bridge::new("feth0", vec!["2001:db8::1".parse().unwrap()], false);
+        let peer = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+        let target: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let reply = match bridge.accept(&ns_frame(peer, Ipv6Addr::UNSPECIFIED, target)) {
+            Accepted::Reply(reply) => reply,
+            _ => panic!("an unspecified source is still a solicitation"),
+        };
+        assert_eq!(
+            &reply[..6],
+            &[0x33, 0x33, 0, 0, 0, 1],
+            "the answer is multicast"
+        );
+        let all_nodes: Ipv6Addr = "ff02::1".parse().unwrap();
+        assert_eq!(&reply[38..54], &all_nodes.octets());
+        assert_eq!(&reply[54..58], &[NEIGHBOR_ADVERTISEMENT, 0, 0, 0]);
+        assert_eq!(
+            &reply[58..62],
+            &[0x20, 0, 0, 0],
+            "the solicited flag is clear"
+        );
+    }
+
     #[test]
     fn a_tap_leaves_a_frame_for_another_address_alone() {
-        let bridge = Bridge::new("feth0", vec!["10.0.0.1".parse().unwrap()]);
+        let bridge = Bridge::new("feth0", vec!["10.0.0.1".parse().unwrap()], false);
         let peer = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
         let frame = ipv4_frame([0x02, 0, 0, 0, 0, 1], peer, &[0x45, 0, 0, 20]);
         assert!(matches!(bridge.accept(&frame), Accepted::Ignore));

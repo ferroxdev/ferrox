@@ -241,17 +241,38 @@ impl Guard {
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Ok(mut slot) = capture().lock() {
-            slot.retain(|weak| !std::ptr::eq(weak.as_ptr(), self));
-        }
+        let others: Vec<Arc<Self>> = capture()
+            .lock()
+            .map(|mut slot| {
+                slot.retain(|weak| weak.strong_count() > 0 && !std::ptr::eq(weak.as_ptr(), self));
+                slot.iter().filter_map(Weak::upgrade).collect()
+            })
+            .unwrap_or_default();
         let Ok(mut added) = self.added.lock() else {
             return;
         };
+        let routes: Vec<Route> = added.drain(..).collect();
+        drop(added);
         let Ok(mut manager) = self.manager.lock() else {
             return;
         };
-        for route in added.drain(..).rev() {
-            let _ = manager.delete(&route);
+        for route in routes.into_iter().rev() {
+            // Two live captures can add the same destination; the kernel keeps one entry, so the last one to close removes it.
+            let shared = others.iter().any(|guard| {
+                guard
+                    .added
+                    .lock()
+                    .map(|held| {
+                        held.iter().any(|other| {
+                            other.destination() == route.destination()
+                                && other.prefix() == route.prefix()
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            if !shared {
+                let _ = manager.delete(&route);
+            }
         }
     }
 }

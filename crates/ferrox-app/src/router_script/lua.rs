@@ -124,7 +124,7 @@ impl ScriptRouter {
     /// Load the script xray names: a path resolved as `ResolveLuaFile` does, with a syntax error
     /// reported before any socket opens.
     pub(crate) fn parse_in(path: &str, dirs: Vec<PathBuf>) -> Result<Self, String> {
-        let name = resolve(path, &dirs)?;
+        let name = super::resolve(path, &dirs)?;
         let source =
             std::fs::read(&name).map_err(|error| format!("routing script `{path}`: {error}"))?;
         let router = Self {
@@ -332,65 +332,6 @@ fn call(lua: &Lua, context: ScriptContext) -> Result<Option<String>, String> {
         return Err("routing script ruleTag must be a string".into());
     }
     Ok(outbound)
-}
-
-fn resolve(path: &str, dirs: &[PathBuf]) -> Result<PathBuf, String> {
-    let named = PathBuf::from(path);
-    let mut candidates = Vec::new();
-    if named.is_absolute() {
-        candidates.push(named);
-    } else {
-        for name in [
-            "xray.location.confdir",
-            "XRAY_LOCATION_CONFDIR",
-            "xray.location.config",
-            "XRAY_LOCATION_CONFIG",
-        ] {
-            if let Some(dir) = std::env::var_os(name) {
-                candidates.push(PathBuf::from(dir).join(path));
-            }
-        }
-        if let Ok(cwd) = std::env::current_dir() {
-            candidates.push(cwd.join(path));
-        }
-        if let Some(parent) = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(PathBuf::from))
-        {
-            candidates.push(parent.join(path));
-        }
-        for dir in dirs {
-            candidates.push(dir.join(path));
-        }
-    }
-    for candidate in &candidates {
-        let candidate = std::path::absolute(candidate)
-            .map_err(|error| format!("routing script `{path}`: {error}"))?;
-        let metadata = match std::fs::metadata(&candidate) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(format!("routing script `{path}`: {error}")),
-        };
-        if !metadata.is_file() {
-            return Err(format!(
-                "routing script `{path}` is not a regular file: {}",
-                candidate.display()
-            ));
-        }
-        let resolved = std::fs::canonicalize(&candidate)
-            .map_err(|error| format!("routing script `{path}`: {error}"))?;
-        if resolved.extension() != Some(std::ffi::OsStr::new("lua")) {
-            return Err(format!(
-                "routing script `{path}` must have a .lua extension: {}",
-                resolved.display()
-            ));
-        }
-        return Ok(resolved);
-    }
-    Err(format!(
-        "routing script `{path}` was not found in {} locations",
-        candidates.len()
-    ))
 }
 
 fn dns_answer(

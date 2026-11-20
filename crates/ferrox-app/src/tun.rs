@@ -951,7 +951,9 @@ impl Device {
                     framing: Framing::Raw,
                     gso: false,
                     bridge: Some(std::sync::Arc::new(crate::tun_tap::Bridge::new(
-                        &name, addresses,
+                        &name,
+                        addresses,
+                        spec.auto_route(),
                     ))),
                     frame: Vec::with_capacity(spec.mtu + crate::tun_tap::HEADER_LEN + 64),
                 }]);
@@ -1091,16 +1093,10 @@ impl Device {
                 return Err(io::Error::last_os_error());
             }
             unsafe { libc::fcntl(duplicated, libc::F_SETFD, libc::FD_CLOEXEC) };
-            let flags = unsafe { libc::fcntl(duplicated, libc::F_GETFL) };
-            if flags >= 0 {
-                let want = if nonblocking {
-                    flags | libc::O_NONBLOCK
-                } else {
-                    // Android's `VpnService` hands back a nonblocking descriptor, and this handler reads in a blocking loop.
-                    flags & !libc::O_NONBLOCK
-                };
-                if want != flags {
-                    unsafe { libc::fcntl(duplicated, libc::F_SETFL, want) };
+            if nonblocking {
+                let flags = unsafe { libc::fcntl(duplicated, libc::F_GETFL) };
+                if flags >= 0 {
+                    unsafe { libc::fcntl(duplicated, libc::F_SETFL, flags | libc::O_NONBLOCK) };
                 }
             }
             let handle = unsafe { std::fs::File::from_raw_fd(duplicated) };
@@ -2171,7 +2167,15 @@ impl Handler {
     pub(crate) fn serve(&mut self) -> io::Result<()> {
         let mut buf = vec![0u8; MAX_PACKET + 64];
         loop {
-            let n = self.device.read_packet(&mut buf)?;
+            let n = match self.device.read_packet(&mut buf) {
+                Ok(n) => n,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    // Android's `VpnService` hands back a nonblocking descriptor; the queue keeps its thread and reads again.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if n == 0 {
                 return Ok(());
             }
@@ -3187,13 +3191,18 @@ mod tests {
         let (held, _peer) = UnixStream::pair().expect("pair");
         held.set_nonblocking(true).expect("nonblocking");
         let fd = held.into_raw_fd();
+        // `dup` shares the file-status flags, so the host's mode is left as it is: an Android descriptor stays nonblocking and the serve loop retries `WouldBlock`.
         let spec = Spec::new(None, None).with_fd(Some(fd));
         let devices = Device::open_all(&spec).expect("the descriptor opens");
         assert_eq!(devices.len(), 1, "one descriptor is one queue");
         assert_eq!(devices[0].name(), "");
         assert_ne!(devices[0].raw_fd(), fd, "the descriptor is duplicated");
         let flags = unsafe { libc::fcntl(devices[0].raw_fd(), libc::F_GETFL) };
-        assert_eq!(flags & libc::O_NONBLOCK, 0, "the handler reads blocking");
+        assert_ne!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "the shared mode is not changed on either descriptor"
+        );
         let host = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         assert_ne!(
             host & libc::O_NONBLOCK,

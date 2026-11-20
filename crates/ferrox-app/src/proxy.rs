@@ -27220,6 +27220,8 @@ fn open_direct_datagram(socks: &SocksOut) -> Option<DirectDatagram> {
     let _ = stream.set_read_timeout(Some(budgets::handshake()));
     let _ = stream.set_write_timeout(Some(budgets::handshake()));
     let association = crate::socks::associate(stream, &socks.credential)?;
+    // The negotiated relay can differ from the server the config names, so it is pinned here rather than left to the capture.
+    crate::tun_route::pin_dialled(association.relay.ip());
     let _ = association.control.set_read_timeout(None);
     let _ = association.control.set_write_timeout(None);
     Some(DirectDatagram {

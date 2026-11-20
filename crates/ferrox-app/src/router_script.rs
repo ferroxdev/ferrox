@@ -4,7 +4,6 @@
 //! `require` are rebuilt here from this tree's matchers, not linked from a Lua runtime.
 
 use std::net::IpAddr;
-#[cfg(target_os = "ios")]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -25,6 +24,65 @@ impl std::fmt::Debug for ScriptCallbacks {
     }
 }
 
+pub(crate) fn resolve(path: &str, dirs: &[PathBuf]) -> Result<PathBuf, String> {
+    let named = PathBuf::from(path);
+    let mut candidates = Vec::new();
+    if named.is_absolute() {
+        candidates.push(named);
+    } else {
+        for name in [
+            "xray.location.confdir",
+            "XRAY_LOCATION_CONFDIR",
+            "xray.location.config",
+            "XRAY_LOCATION_CONFIG",
+        ] {
+            if let Some(dir) = std::env::var_os(name) {
+                candidates.push(PathBuf::from(dir).join(path));
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd.join(path));
+        }
+        if let Some(parent) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(PathBuf::from))
+        {
+            candidates.push(parent.join(path));
+        }
+        for dir in dirs {
+            candidates.push(dir.join(path));
+        }
+    }
+    for candidate in &candidates {
+        let candidate = std::path::absolute(candidate)
+            .map_err(|error| format!("routing script `{path}`: {error}"))?;
+        let metadata = match std::fs::metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("routing script `{path}`: {error}")),
+        };
+        if !metadata.is_file() {
+            return Err(format!(
+                "routing script `{path}` is not a regular file: {}",
+                candidate.display()
+            ));
+        }
+        let resolved = std::fs::canonicalize(&candidate)
+            .map_err(|error| format!("routing script `{path}`: {error}"))?;
+        if resolved.extension() != Some(std::ffi::OsStr::new("lua")) {
+            return Err(format!(
+                "routing script `{path}` must have a .lua extension: {}",
+                resolved.display()
+            ));
+        }
+        return Ok(resolved);
+    }
+    Err(format!(
+        "routing script `{path}` was not found in {} locations",
+        candidates.len()
+    ))
+}
+
 #[cfg(not(target_os = "ios"))]
 mod lua;
 #[cfg(not(target_os = "ios"))]
@@ -43,9 +101,11 @@ impl std::fmt::Debug for ScriptRouter {
 
 #[cfg(target_os = "ios")]
 impl ScriptRouter {
-    pub(crate) fn parse_in(path: &str, _dirs: Vec<PathBuf>) -> Result<Self, String> {
+    pub(crate) fn parse_in(path: &str, dirs: Vec<PathBuf>) -> Result<Self, String> {
+        let resolved = super::resolve(path, &dirs)?;
         eprintln!(
-            "routing script `{path}`: this platform has no Lua runtime, so the script is not run"
+            "routing script `{}`: this platform has no Lua runtime, so the script is not run",
+            resolved.display()
         );
         Ok(Self)
     }
