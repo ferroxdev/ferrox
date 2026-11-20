@@ -11116,34 +11116,34 @@ fn serve_vless_reality_inbound(
     freedom: bool,
     path: &str,
     stop: Option<&Arc<Stop>>,
-) -> bool {
+) -> Option<String> {
     let Some(server) = inbound_reality_config(inbound) else {
         eprintln!("unreadable vless reality settings in {path}: serves nothing");
-        return false;
+        return None;
     };
     if let Err(error) = crate::config::reality_mldsa(inbound, true) {
         eprintln!("{error} in {path}: inbound refused");
-        return false;
+        return None;
     }
     let fallbacks = match server_fallbacks(inbound) {
         Ok(fallbacks) => fallbacks.map(Arc::from),
         Err(error) => {
             eprintln!("{error} in {path}: inbound refused");
-            return false;
+            return None;
         }
     };
     let decryption = match crate::config::server_decryption(inbound) {
         Ok(decryption) => decryption,
         Err(error) => {
             eprintln!("{error} in {path}: inbound refused");
-            return false;
+            return None;
         }
     };
     if decryption.is_some() && fallbacks.is_some() {
         eprintln!(
             r#"VLESS settings: "fallbacks" can not be used together with "decryption" in {path}: inbound refused"#
         );
-        return false;
+        return None;
     }
     let owned = address.to_owned();
     if let Carrier::Kcp(config) = carrier {
