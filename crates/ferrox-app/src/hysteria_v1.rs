@@ -365,6 +365,7 @@ struct Lane {
 }
 
 /// The client's UDP uplink over Hysteria v1: one connection and one datagram session per association, with a companion reader driving replies back into the socks frame.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::IpAddr>) {
     let Some(session) = connect(dial) else {
         return;

@@ -30043,12 +30043,11 @@ fn pin_datagram(
     if !source_ip_ok(peer, datagram) {
         return false;
     }
-    match *pinned {
-        Some(allowed) => allowed == datagram,
-        None => {
-            *pinned = Some(datagram);
-            true
-        }
+    if let Some(allowed) = *pinned {
+        allowed == datagram
+    } else {
+        *pinned = Some(datagram);
+        true
     }
 }
 
@@ -31558,20 +31557,6 @@ fn spawn_ss_udp_sources(
     }))
 }
 
-/// The reply destination is the peer that first sent on this association; a later sender from another address is dropped, as the reference's `TempUDPConn` pins the ASSOCIATE peer.
-fn pin_udp_source(source: &Arc<Mutex<Option<SocketAddr>>>, src: SocketAddr) -> bool {
-    let Ok(mut slot) = source.lock() else {
-        return false;
-    };
-    match *slot {
-        None => {
-            *slot = Some(src);
-            true
-        }
-        Some(seen) => seen == src,
-    }
-}
-
 fn serve_socks_udp_shadowsocks2022(
     relay: &UdpSocket,
     ss: &ShadowsocksOut,
@@ -31867,6 +31852,7 @@ pub(crate) fn socks_udp_parts<'a>(
 
 /// One association's datagrams over the outbound's shared XUDP carrier: one flow per destination
 /// whose replies land on this association's own relay, and the 443 policy applied before the mux.
+#[allow(clippy::too_many_arguments)]
 fn serve_socks_udp_pool<F, G>(
     relay: &UdpSocket,
     pool: &Arc<MuxPool>,
@@ -63017,7 +63003,7 @@ mod tests {
             .expect("timeout");
         echo.set_read_timeout(Some(Duration::from_millis(50)))
             .expect("timeout");
-        let out = Outbound::Freedom(FreedomOut::default());
+        let out = Outbound::Freedom(Arc::new(FreedomOut::default()));
         let serving = thread::spawn(move || serve_udp_lane(&relay, &out, Some(&associate)));
         let mut head = Vec::new();
         let frame = socks_udp_frame(&mut head, &echo_addr, b"spoof");
@@ -81554,16 +81540,17 @@ end
         let first: SocketAddr = "127.0.0.1:5001".parse().expect("addr");
         let other: SocketAddr = "127.0.0.1:5002".parse().expect("addr");
         let slot: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        let mut pinned = None;
         assert!(
-            pin_udp_source(&slot, first),
+            source_allowed(None, &mut pinned, &slot, first),
             "the first sender opens the association"
         );
         assert!(
-            pin_udp_source(&slot, first),
+            source_allowed(None, &mut pinned, &slot, first),
             "a repeat from the pinned peer keeps"
         );
         assert!(
-            !pin_udp_source(&slot, other),
+            !source_allowed(None, &mut pinned, &slot, other),
             "a different address does not rebind the reply destination"
         );
         assert_eq!(
