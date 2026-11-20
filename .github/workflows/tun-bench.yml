@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       hev_ref:
-        description: hev-socks5-tunnel revision; `latest` resolves refs/heads/master at dispatch and the sha is recorded in the run identity
+        description: hev-socks5-tunnel revision; `latest` resolves the default branch HEAD at dispatch and the sha is recorded in the run identity
         type: string
         default: "latest"
       engines:
@@ -80,9 +80,9 @@ jobs:
         run: |
           ref="${{ inputs.hev_ref }}"
           if [ "$ref" = latest ]; then
-            ref="$(git ls-remote https://github.com/heiher/hev-socks5-tunnel refs/heads/master | cut -f1)"
-            [ -n "$ref" ] || { echo "::error::hev-socks5-tunnel master did not resolve"; exit 1; }
-            echo "hev-socks5-tunnel master resolved to $ref"
+            ref="$(git ls-remote https://github.com/heiher/hev-socks5-tunnel HEAD | cut -f1)"
+            [ -n "$ref" ] || { echo "::error::hev-socks5-tunnel HEAD did not resolve"; exit 1; }
+            echo "hev-socks5-tunnel HEAD resolved to $ref"
           fi
           echo "HEV_TUNNEL_REV=$ref" >> "$GITHUB_ENV"
 
