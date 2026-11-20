@@ -1851,7 +1851,7 @@ struct Leg {
     id: u64,
     socket: Arc<UdpSocket>,
     relay: Option<SocketAddr>,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
     association: Option<Association>,
 }
 
