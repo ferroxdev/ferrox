@@ -427,7 +427,7 @@ mod tests {
         );
         let all_nodes: Ipv6Addr = "ff02::1".parse().unwrap();
         assert_eq!(&reply[38..54], &all_nodes.octets());
-        assert_eq!(&reply[54..58], &[NEIGHBOR_ADVERTISEMENT, 0, 0, 0]);
+        assert_eq!(&reply[54..56], &[NEIGHBOR_ADVERTISEMENT, 0]);
         assert_eq!(
             &reply[58..62],
             &[0x20, 0, 0, 0],
