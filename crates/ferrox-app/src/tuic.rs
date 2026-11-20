@@ -2447,9 +2447,7 @@ fn read_uni_with(
         }
     }
     if !conn.stream_finished(id) {
-        if data.is_empty() {
-            inner.uni.remove(&id);
-        } else {
+        if !data.is_empty() {
             inner.uni.insert(id, data);
         }
         return;
