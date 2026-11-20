@@ -69,7 +69,7 @@ fn sweep_list(ids: &[usize]) -> usize {
     let mut seen: Vec<usize> = Vec::new();
     let mut visited = 0;
     for &id in ids {
-        if seen.iter().any(|held| *held == id) {
+        if seen.contains(&id) {
             continue;
         }
         seen.push(id);
@@ -111,6 +111,7 @@ fn measure<A, B>(
     (first_best, second_best)
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn report() -> String {
     let address = ferrox_core::tuic::address_port("example.com", 443).expect("an address");
     let payload = [7u8; 1200];
