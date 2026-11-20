@@ -1266,6 +1266,8 @@ if conduit_mode in ("private", "public"):
     settings["protocolSelection"] = "conduit"
 if shape == "cdn":
     settings["protocolSelection"] = "cdn_fronting"
+if shape == "auto":
+    settings["protocolSelection"] = "auto"
 if ready:
     settings["readySeconds"] = int(ready)
 if base:
@@ -1286,14 +1288,18 @@ if password:
 if pool.isdigit():
     settings["tunnelPoolSize"] = int(pool)
 if workers.isdigit():
-    settings["connectionWorkerPoolSize"] = int(workers)
+    settings["ConnectionWorkerPoolSize"] = int(workers)
 if aggressive:
     settings["aggressiveEstablishment"] = aggressive == "1"
 listed = [value.strip() for value in features.split(",") if value.strip()]
+if unsafe_alerts == "1" and "unsafe-traffic-alerts" not in listed:
+    listed.append("unsafe-traffic-alerts")
+if location_precision.isdigit() and int(location_precision) > 0 and "coarse-location" not in listed:
+    listed.append("coarse-location")
 if listed:
-    settings["clientFeatures"] = listed
+    settings["ClientFeatures"] = listed
 if latency:
-    settings["networkLatencyMultiplier"] = float(latency)
+    settings["NetworkLatencyMultiplier"] = float(latency)
 if cdn_profile:
     settings["cdnProfile"] = cdn_profile
 for key, value in (
@@ -1304,16 +1310,12 @@ for key, value in (
     listed = [item.strip() for item in value.split(",") if item.strip()]
     if listed:
         settings[key] = listed
-if unsafe_alerts == "1":
-    settings["unsafeTrafficAlerts"] = True
-if location_precision.isdigit():
-    settings["deviceLocationPrecision"] = int(location_precision)
 if share_port.isdigit():
     settings["shareProxyOnNetworkSocksPort"] = int(share_port)
 if share_http.isdigit():
     settings["shareProxyOnNetworkHttpPort"] = int(share_http)
 if geoip:
-    settings["geoIp"] = geoip
+    settings["GeoIPDatabasePath"] = geoip
 if reject_censored == "1":
     settings["rejectCensoredProxies"] = True
 listed = [value.strip() for value in reject_countries.split(",") if value.strip()]
@@ -1322,10 +1324,10 @@ if listed:
 if compartment:
     settings["inproxyCompartment"] = compartment
 if disable_timeouts == "1":
-    settings["disableTimeouts"] = True
+    settings["DisableTimeouts"] = True
 listed = [value.strip() for value in dns_alternate.split(",") if value.strip()]
 if listed:
-    settings["dnsResolverAlternateServers"] = listed
+    settings["DNSResolverAlternateServers"] = listed
 if device_location:
     settings["deviceLocation"] = device_location
 if device_region:
@@ -1335,28 +1337,28 @@ if network_id:
 if additional_params:
     settings["additionalParameters"] = additional_params
 if establish_timeout.isdigit():
-    settings["establishTunnelTimeoutSeconds"] = int(establish_timeout)
+    settings["EstablishTunnelTimeoutSeconds"] = int(establish_timeout)
 if emit_bytes == "1":
     settings["emitBytesTransferred"] = True
 if conduit_mode:
     settings["conduitMode"] = conduit_mode
 if conduit_timeout.isdigit():
-    settings["conduitTimeoutSeconds"] = int(conduit_timeout)
+    settings["conduitTimeout"] = int(conduit_timeout)
 if share == "1":
     settings["shareProxyOnNetwork"] = True
 for key, value in (
     ("serverListURLs", server_lists),
-    ("obfuscatedServerListRootUrls", osl),
+    ("ObfuscatedServerListRootURLs", osl),
 ):
     listed = [item.strip() for item in value.split(",") if item.strip()]
     if listed:
         settings[key] = listed
 if entry_key:
-    settings["serverEntrySignaturePublicKey"] = entry_key
+    settings["ServerEntrySignaturePublicKey"] = entry_key
 if list_key:
     settings["serverListSignaturePublicKey"] = list_key
 if exchange_key:
-    settings["exchangeObfuscationKey"] = exchange_key
+    settings["ExchangeObfuscationKey"] = exchange_key
 print(json.dumps({"protocol": "psiphon", "settings": settings}))
 PY
 }
@@ -3095,22 +3097,22 @@ other_lanes() {
 # One trace through the first front: a lane that listens but cannot dial is not
 # connected, and saying so here is cheaper than a browser that times out.
 probe_front() {
-  local front="$1" port="$2"
+  local front="$1" port="$2" wait="${3:-$PROBE_TIMEOUT}"
   if [ "$front" = socks ]; then
-    curl -s --noproxy '' --max-time "$PROBE_TIMEOUT" --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null
+    curl -s --noproxy '' --max-time "$wait" --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null
   else
-    curl -s --noproxy '' --max-time "$PROBE_TIMEOUT" -x "http://127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null
+    curl -s --noproxy '' --max-time "$wait" -x "http://127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null
   fi
 }
 
 # A VeePN edge is a free pool with its own blocklist, so a refused trace host is
 # not proof about the lane: a plain 200 is what says the flow got through.
 probe_plain() {
-  local front="$1" port="$2"
+  local front="$1" port="$2" wait="${3:-$PROBE_TIMEOUT}"
   if [ "$front" = socks ]; then
-    curl -s --noproxy '' --max-time "$PROBE_TIMEOUT" --socks5-hostname "127.0.0.1:$port" http://example.com/ 2>/dev/null
+    curl -s --noproxy '' --max-time "$wait" --socks5-hostname "127.0.0.1:$port" http://example.com/ 2>/dev/null
   else
-    curl -s --noproxy '' --max-time "$PROBE_TIMEOUT" -x "http://127.0.0.1:$port" http://example.com/ 2>/dev/null
+    curl -s --noproxy '' --max-time "$wait" -x "http://127.0.0.1:$port" http://example.com/ 2>/dev/null
   fi
 }
 
@@ -3223,15 +3225,26 @@ front_port_of() {
 }
 
 verify_flow() {
-  local front port answer got want
+  local front port answer got want deadline step
   front="${FRONTS%%,*}"
   port="$(front_port_of "$front")"
-  answer="$(probe_front "$front" "$port")"
-  if ! printf '%s\n' "$answer" | grep -qE '^(ip|loc)='; then
-    if [ "$OUTBOUND" = veepn ] && probe_plain "$front" "$port" | grep -q 'Example Domain'; then
+  # The front listens before a carrier finishes dialling; re-ask within the
+  # budget instead of calling a lane that is about to answer dead.
+  step=20
+  [ "$PROBE_TIMEOUT" -lt "$step" ] && step="$PROBE_TIMEOUT"
+  deadline=$(( $(date +%s) + PROBE_TIMEOUT ))
+  while :; do
+    answer="$(probe_front "$front" "$port" "$step")"
+    printf '%s\n' "$answer" | grep -qE '^(ip|loc)=' && break
+    if [ "$OUTBOUND" = veepn ] && probe_plain "$front" "$port" "$step" | grep -q 'Example Domain'; then
       say "exit through $front: a plain HTTP flow answered."
       return 0
     fi
+    lane_running || break
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep 3
+  done
+  if ! printf '%s\n' "$answer" | grep -qE '^(ip|loc)='; then
     say "NOT CONNECTED: the fronts are up, but no flow got through them."
     diagnose
     return 1
@@ -3689,6 +3702,11 @@ if [ "$UDP_VIA" = psiphon-cdn ]; then
   [ -z "$PSIPHON_CDN_PROFILE" ] && PSIPHON_CDN_PROFILE=fronted
   [ "$PSIPHON_AGGRESSIVE_SET" = 0 ] && PSIPHON_AGGRESSIVE=1
   [ -z "$PSIPHON_SHAPE" ] && PSIPHON_SHAPE=cdn
+fi
+if [ "$OUTBOUND" = psiphon ] || [ "$UDP_VIA" = psiphon ]; then
+  [ -z "$PSIPHON_SHAPE" ] && PSIPHON_SHAPE=auto
+  [ "$PSIPHON_AGGRESSIVE_SET" = 0 ] && PSIPHON_AGGRESSIVE=1
+  [ -z "$PSIPHON_DNS_ALTERNATE" ] && PSIPHON_DNS_ALTERNATE="1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4"
 fi
 
 if [ "$ALL" = 1 ]; then

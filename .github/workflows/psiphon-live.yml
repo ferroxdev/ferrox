@@ -39,11 +39,12 @@ on:
         required: false
         default: ""
       protocol:
-        description: direct SSH/OSSH or CDN fronted meek
+        description: direct SSH/OSSH, auto, or CDN fronted meek
         required: false
         type: choice
         options:
           - direct
+          - auto
           - cdn
         default: direct
       light_proxy_entry:
@@ -281,6 +282,10 @@ jobs:
               settings["SSHChannelWindowSize"] = int(os.environ["PSIPHON_WINDOW"])
           if os.environ.get("PSIPHON_PROTOCOL") == "cdn":
               settings["protocolSelection"] = "cdn_fronting"
+          elif os.environ.get("PSIPHON_PROTOCOL") == "auto":
+              settings["protocolSelection"] = "auto"
+              settings["AggressiveEstablishment"] = True
+              settings["DNSResolverAlternateServers"] = ["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4"]
           else:
               settings["LimitTunnelProtocols"] = ["SSH", "OSSH"]
           if os.environ.get("PSIPHON_LIGHT_ENTRY"):
@@ -398,6 +403,11 @@ jobs:
               'tunnel up via \S+ FRONTED-MEEK(-CDN)?(-HTTP|-QUIC)?-OSSH' psiphon-live.log; then
               echo "::error::the CDN leg established no fronted tunnel" >&2
               FAILED="$FAILED native(cdn)"
+            fi
+          elif [ "${PSIPHON_PROTOCOL:-direct}" = auto ]; then
+            if ! grep -Eq 'tunnel up via \S+ ' psiphon-live.log; then
+              echo "::error::the auto leg established no tunnel" >&2
+              FAILED="$FAILED native(auto)"
             fi
           elif ! grep -Eq 'tunnel up via \S+ (SSH|OSSH)' psiphon-live.log; then
             echo "::error::the direct leg established no SSH/OSSH tunnel" >&2
