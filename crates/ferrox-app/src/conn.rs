@@ -2455,9 +2455,13 @@ fn staged_sibling(listed: &str, path: &std::path::Path) -> bool {
 #[cfg(target_os = "macos")]
 fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
     const HEADER: usize = 24;
+    const CONN_OFFSET: usize = 52;
     const PATH_OFFSET: usize = 106;
     const OPTIONS_OFFSET: usize = 630;
-    const RECORD: usize = OPTIONS_OFFSET + 2;
+    const STATE_OFFSET: usize = 634;
+    const RECORD: usize = STATE_OFFSET + 2;
+    // An accepted connection keeps its bound address; only a never-connected bound PCB can still be a listener.
+    const CONNECTION_STATE: u16 = 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0020 | 0x2000;
     let mut at = HEADER;
     let mut unknown_staged = false;
     while at + 4 <= table.len() {
@@ -2468,7 +2472,13 @@ fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
         }
         if len >= RECORD {
             let record = &table[at..at + len];
+            let conn = u64::from_le_bytes(record[CONN_OFFSET..CONN_OFFSET + 8].try_into().ok()?);
             let options = u16::from_le_bytes([record[OPTIONS_OFFSET], record[OPTIONS_OFFSET + 1]]);
+            let state = u16::from_le_bytes([record[STATE_OFFSET], record[STATE_OFFSET + 1]]);
+            if conn != 0 || state & CONNECTION_STATE != 0 {
+                at += len;
+                continue;
+            }
             let listening = options & 0x0002 != 0;
             let raw = &record[PATH_OFFSET..];
             if let Some(end) = raw.iter().position(|byte| *byte == 0) {
@@ -5033,7 +5043,7 @@ mod tests {
         let client = std::os::unix::net::UnixStream::connect(&path).expect("connects a client");
         let accepted = match &listener {
             Listener::Unix { listener, .. } => listener.accept().expect("accepts the client").0,
-            _ => panic!("a unix target binds a unix listener"),
+            Listener::Tcp(_) => panic!("a unix target binds a unix listener"),
         };
         drop(listener);
         assert_eq!(
