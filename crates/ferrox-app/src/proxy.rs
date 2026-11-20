@@ -17906,9 +17906,14 @@ fn serve_tun_inbound(
     let stack = tun_stack(inbound);
     warn_unapplied_tun_options(inbound, tun_native(stack));
     if !tun_native(stack) {
-        if spec.dns_hijack().is_some() {
+        if spec.dns_hijack().is_some()
+            && matches!(
+                tun_mode(stack),
+                crate::tun_stack::Mode::System | crate::tun_stack::Mode::Hybrid
+            )
+        {
             eprintln!(
-                "tun inbound: the `{stack}` stack does not hijack DNS, so `dns_mode` is not applied"
+                "tun inbound: the `{stack}` stack hands TCP to the kernel, so `dns_mode` reaches only the flows that stay in userspace"
             );
         }
         return match crate::tun_stack::serve(spec, out, tun_mode(stack)) {
@@ -80055,6 +80060,7 @@ mod tests {
         let last_used = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let (uplink, _) = crate::wg_stack::server_udp(
             ([0x11; 32], source, target),
+            target,
             std::time::Instant::now(),
             &last_used,
             &plan,

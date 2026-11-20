@@ -240,6 +240,7 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             stack_out,
             Some(recycle),
             headroom,
+            spec.dns_hijack(),
             wake_read,
             stack_failed,
         );
@@ -251,6 +252,7 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             stack_out,
             Some(recycle),
             headroom,
+            spec.dns_hijack(),
             stack_failed,
         );
     });
