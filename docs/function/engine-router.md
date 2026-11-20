@@ -123,7 +123,7 @@ No duration is claimed here. Benchmarks are CI-only in this tree, and the pinned
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
 
 <!-- scope:begin -->
-- paths: crates/ferrox-app/src/router.rs, crates/ferrox-app/src/router_script.rs, crates/ferrox-app/src/geodata.rs
+- paths: crates/ferrox-app/src/router.rs, crates/ferrox-app/src/router_script.rs, crates/ferrox-app/src/router_script/lua.rs, crates/ferrox-app/src/geodata.rs
 - symbols: router, router_script, router_settings, router_rule, network_name, balancing_rule, least_load_settings, strategy_weight, skip, Outbound, RouteShared, RoutePlan, Association, inbound_tag, build_outbound, route_shared, prove_server_route, serve_root, serve_socks, serve_connect, serve_socks_udp, serve_dokodemo, serve_tun_inbound, dial_socks_outbound
 - scenarios: vless-raw, vmess-raw, trojan-raw, shadowsocks-raw
 <!-- scope:end -->

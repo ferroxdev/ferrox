@@ -1331,12 +1331,15 @@ fn inherited_framing(handle: &std::fs::File) -> Framing {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn inherited_framing(_handle: &std::fs::File) -> Framing {
     Framing::Utun
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "ios"))
+))]
 fn inherited_framing(_handle: &std::fs::File) -> Framing {
     Framing::Raw
 }

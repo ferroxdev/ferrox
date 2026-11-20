@@ -396,7 +396,11 @@ mod tests {
         );
         assert!(
             matches!(
-                bridge.accept(&ns_frame(peer, asker, "2001:db8::2".parse().unwrap())),
+                bridge.accept(&ns_frame(
+                    peer,
+                    asker,
+                    "2001:4860:4860::8888".parse().unwrap()
+                )),
                 Accepted::Reply(_)
             ),
             "a captured route makes every destination on-link, so the proxy answers for it"

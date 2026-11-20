@@ -86,6 +86,9 @@ jobs:
             [ -n "$ref" ] || { echo "::error::hev-socks5-tunnel HEAD did not resolve"; exit 1; }
             echo "hev-socks5-tunnel HEAD resolved to $ref"
           fi
+          case "$ref" in
+            *[[:space:]]*|*..*|/*) echo "::error::hev_ref is not a single ref"; exit 1 ;;
+          esac
           echo "HEV_TUNNEL_REV=$ref" >> "$GITHUB_ENV"
 
       - name: allow unprivileged namespaces
