@@ -2486,10 +2486,14 @@ fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
                         StagedClaim::Unknown => {
                             // A current name lookup cannot prove the PCB's bind identity, so a matching row is inconclusive rather than live.
                             let row = std::path::Path::new(listed);
-                            let moved = row
-                                .file_name()
-                                .is_some_and(|name| Some(name) == path.file_name())
-                                && std::fs::symlink_metadata(row).is_err();
+                            // A case-insensitive volume reaches a moved entry through a different spelling, so compare names folded.
+                            let same_name = row.file_name().is_some_and(|name| {
+                                path.file_name().is_some_and(|path_name| {
+                                    name.to_string_lossy().to_lowercase()
+                                        == path_name.to_string_lossy().to_lowercase()
+                                })
+                            });
+                            let moved = same_name && std::fs::symlink_metadata(row).is_err();
                             if same_socket_object(row, path)
                                 || (listening && staged_sibling(listed, path))
                                 || moved
@@ -5193,12 +5197,26 @@ mod tests {
         let new_dir = dir.join("new");
         std::fs::rename(&old_dir, &new_dir).expect("moves the directory");
         let new_path = new_dir.join("sock");
+        let alt_path = new_dir.join("SOCK");
+        let mut clients = Vec::new();
+        while clients.len() < 4096 {
+            match std::os::unix::net::UnixStream::connect(&alt_path) {
+                Ok(client) => clients.push(client),
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => break,
+                Err(error) => panic!("fills the moved queue: {error}"),
+            }
+        }
+        assert!(!clients.is_empty(), "the moved queue filled");
         assert_ne!(
-            socket_table_names(&new_path),
+            socket_table_names(&alt_path),
             Some(false),
-            "the moved listener still owns its entry"
+            "an alternate spelling still names the moved listener"
         );
-        let target = parse_target(&format!("unix:{}", new_path.display())).expect("parses");
+        assert!(
+            probe_unix(&alt_path).is_err(),
+            "a full queue behind the alternate spelling keeps its path"
+        );
+        let target = parse_target(&format!("unix:{}", alt_path.display())).expect("parses");
         assert!(
             Listener::bind(&target).is_err(),
             "a live moved listener keeps its name"
@@ -5207,6 +5225,7 @@ mod tests {
             std::fs::symlink_metadata(&new_path).is_ok(),
             "the moved entry stays"
         );
+        drop(clients);
         drop(listener);
         std::fs::remove_file(&new_path).ok();
         std::fs::remove_dir_all(&dir).ok();
