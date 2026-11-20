@@ -2798,6 +2798,7 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     }
     let mut buf = crate::proxy::udp_buffer();
     let mut frame = Vec::new();
+    let peer = crate::proxy::control_peer(associate);
     let mut app: Option<SocketAddr> = None;
     let mut winners: HashMap<(String, u16), (SocketAddr, StdInstant)> = HashMap::new();
     let mut sources: HashMap<(String, u16), u16> = HashMap::new();
@@ -2829,6 +2830,9 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
         match relay.recv_from(&mut buf) {
             Ok((n, sender)) => {
                 quiet = StdInstant::now();
+                if !crate::proxy::source_ip_ok(peer, sender) {
+                    continue;
+                }
                 let Some((destination, payload)) = crate::proxy::parse_socks_udp_dest(&buf[..n])
                 else {
                     continue;

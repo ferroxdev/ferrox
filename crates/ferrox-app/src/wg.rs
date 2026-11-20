@@ -486,6 +486,7 @@ impl WireGuardOut {
         let (closed, closed_rx) = mpsc::channel();
         let mut uplinks: HashMap<(Option<KernelLaneKey>, SocketAddr), UdpSocket> = HashMap::new();
         let mut buf = crate::proxy::udp_buffer();
+        let peer = crate::proxy::control_peer(associate);
         let mut app = None;
         let mut seen = 0u64;
         let mut local_warned = false;
@@ -523,6 +524,9 @@ impl WireGuardOut {
             };
             quiet = Instant::now();
             seen = replies.load(Ordering::Relaxed);
+            if !crate::proxy::source_ip_ok(peer, src) {
+                continue;
+            }
             let Some((dest, payload)) = crate::proxy::parse_socks_udp_dest(&buf[..n]) else {
                 continue;
             };

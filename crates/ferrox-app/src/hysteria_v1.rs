@@ -365,7 +365,7 @@ struct Lane {
 }
 
 /// The client's UDP uplink over Hysteria v1: one connection and one datagram session per association, with a companion reader driving replies back into the socks frame.
-pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
+pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::IpAddr>) {
     let Some(session) = connect(dial) else {
         return;
     };
@@ -391,6 +391,9 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
     let mut packet = 0u16;
     let mut stream: Option<Flow> = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
+        if !crate::proxy::source_ip_ok(peer, src) {
+            continue;
+        }
         let Some((dest, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
             continue;
         };

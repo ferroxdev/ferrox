@@ -551,6 +551,7 @@ impl TuicOut {
                 .ok()
         });
         let watch_started = watcher.is_some();
+        let peer = proxy::control_peer(associate);
         let mut buf = vec![0u8; UDP_BUFFER];
         let mut packet = 0u16;
         let mut frame = Vec::new();
@@ -566,6 +567,9 @@ impl TuicOut {
             }
             match relay.recv_from(&mut buf) {
                 Ok((n, client)) => {
+                    if !proxy::source_ip_ok(peer, client) {
+                        continue;
+                    }
                     let Some((destination, payload)) = proxy::parse_socks_udp_dest(&buf[..n])
                     else {
                         continue;
