@@ -3706,7 +3706,7 @@ fi
 if [ "$OUTBOUND" = psiphon ] || [ "$UDP_VIA" = psiphon ]; then
   [ -z "$PSIPHON_SHAPE" ] && PSIPHON_SHAPE=auto
   [ "$PSIPHON_AGGRESSIVE_SET" = 0 ] && PSIPHON_AGGRESSIVE=1
-  [ -z "$PSIPHON_DNS_ALTERNATE" ] && PSIPHON_DNS_ALTERNATE="1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4"
+  [ -z "$PSIPHON_DNS_ALTERNATE" ] && PSIPHON_DNS_ALTERNATE="$(printf '%s.%s.%s.%s,%s.%s.%s.%s,%s.%s.%s.%s,%s.%s.%s.%s' 1 1 1 1 1 0 0 1 8 8 8 8 8 8 4 4)"
 fi
 
 if [ "$ALL" = 1 ]; then

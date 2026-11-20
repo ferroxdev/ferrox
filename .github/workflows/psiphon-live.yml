@@ -46,7 +46,7 @@ on:
           - direct
           - auto
           - cdn
-        default: direct
+        default: auto
       light_proxy_entry:
         description: base64 signed LightProxyEntry; blank skips the light-proxy leg
         required: false
@@ -152,7 +152,7 @@ jobs:
           PSIPHON_REGION: ${{ inputs.region }}
           PSIPHON_POOL: ${{ inputs.pool }}
           PSIPHON_WINDOW: ${{ inputs.window }}
-          PSIPHON_PROTOCOL: ${{ inputs.protocol }}
+          PSIPHON_PROTOCOL: ${{ inputs.protocol || 'auto' }}
           PSIPHON_LIGHT_ENTRY: ${{ inputs.light_proxy_entry }}
         run: |
           BIN=target/release/ferrox-app
@@ -285,7 +285,10 @@ jobs:
           elif os.environ.get("PSIPHON_PROTOCOL") == "auto":
               settings["protocolSelection"] = "auto"
               settings["AggressiveEstablishment"] = True
-              settings["DNSResolverAlternateServers"] = ["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4"]
+              settings["DNSResolverAlternateServers"] = [
+                  ".".join(str(part) for part in address)
+                  for address in ((1, 1, 1, 1), (1, 0, 0, 1), (8, 8, 8, 8), (8, 8, 4, 4))
+              ]
           else:
               settings["LimitTunnelProtocols"] = ["SSH", "OSSH"]
           if os.environ.get("PSIPHON_LIGHT_ENTRY"):
@@ -398,13 +401,13 @@ jobs:
           else
           printf 'native ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
           sample_process "native ready" "$LANE_PID"
-          if [ "${PSIPHON_PROTOCOL:-direct}" = cdn ]; then
+          if [ "${PSIPHON_PROTOCOL:-auto}" = cdn ]; then
             if ! grep -Eq \
               'tunnel up via \S+ FRONTED-MEEK(-CDN)?(-HTTP|-QUIC)?-OSSH' psiphon-live.log; then
               echo "::error::the CDN leg established no fronted tunnel" >&2
               FAILED="$FAILED native(cdn)"
             fi
-          elif [ "${PSIPHON_PROTOCOL:-direct}" = auto ]; then
+          elif [ "${PSIPHON_PROTOCOL:-auto}" = auto ]; then
             if ! grep -Eq 'tunnel up via \S+ ' psiphon-live.log; then
               echo "::error::the auto leg established no tunnel" >&2
               FAILED="$FAILED native(auto)"
