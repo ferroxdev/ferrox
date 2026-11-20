@@ -27087,6 +27087,30 @@ fn serve_reverse_tcp(client: &Connection, portal: &crate::reverse::Portal, asked
     let _ = reader.join();
 }
 
+/// A copy bounded by one absolute deadline: each syscall gets the time left, never a fresh full window, and no progress past the deadline is accepted.
+fn write_all_within(conn: &Connection, mut bytes: &[u8], until: Instant) -> std::io::Result<()> {
+    let mut conn = conn;
+    while !bytes.is_empty() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "interim response deadline expired",
+            ));
+        }
+        conn.set_write_timeout(Some(left.max(Duration::from_millis(1))))?;
+        let written = conn.write(bytes)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "interim response made no progress",
+            ));
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
 /// Nothing carries the destination onward, so this lane is the one that has to redirect it,
 /// resolve it by the configured strategy, and add the header or fragment the config asks for.
 fn serve_connect_freedom(
@@ -27124,10 +27148,10 @@ fn serve_connect_freedom(
         return;
     }
     if !prefix.is_empty() && !http_head_has_body(prefix) {
-        let until = std::time::Instant::now() + budgets::head_arrival();
+        let until = Instant::now() + budgets::head_arrival();
         let saved = client.write_timeout().unwrap_or(None);
         loop {
-            let left = until.saturating_duration_since(std::time::Instant::now());
+            let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 let _ = client.set_write_timeout(saved);
                 return;
@@ -27140,8 +27164,9 @@ fn serve_connect_freedom(
             let tail = head.split_off(at);
             let interim = http_head_is_interim(&head);
             drop_invalid_header_names(&mut head);
-            let _ = client.set_write_timeout(Some(left));
-            if client.write_all(&head).is_err() || client.write_all(&tail).is_err() {
+            if write_all_within(client, &head, until).is_err()
+                || write_all_within(client, &tail, until).is_err()
+            {
                 let _ = client.set_write_timeout(saved);
                 return;
             }
