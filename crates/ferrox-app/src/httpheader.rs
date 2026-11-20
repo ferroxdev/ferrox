@@ -1205,7 +1205,9 @@ mod tests {
                 Some(()),
                 "a line split into {most}-byte reads"
             );
-            assert_eq!(chunks.take_remainder(), b"next");
+            let mut leftover = chunks.take_remainder();
+            leftover.extend_from_slice(&read.body[read.at..]);
+            assert_eq!(leftover, b"next", "a line split into {most}-byte reads");
         }
     }
 
