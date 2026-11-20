@@ -1362,8 +1362,15 @@ impl GrpcWriter {
         if self.multi {
             return self.send_multi(data, payload);
         }
+        // A message spans frames only when the opening window is wider than one.
+        let step = if cap > max {
+            message_cap(cap).max(payload)
+        } else {
+            payload
+        };
+        let step = if data.len() <= step { data.len() } else { step };
         let mut batch = Gather::new();
-        for piece in data.chunks(payload) {
+        for piece in data.chunks(step) {
             if !self.message(piece, max, false, &mut batch) {
                 return false;
             }
@@ -1480,11 +1487,18 @@ impl GrpcWriter {
         if self.multi {
             return self.try_send_multi(data, payload);
         }
+        // A read the opening window pays for leaves as one Hunk spanning frames; a write past it splits at the cap.
+        let step = if cap > max {
+            message_cap(cap).max(payload)
+        } else {
+            payload
+        };
+        let step = if data.len() <= step { data.len() } else { step };
         let mut batch = Gather::new();
         let mut flushed = 0usize;
         let mut held = 0usize;
         let mut room = self.send_room();
-        for piece in data.chunks(payload) {
+        for piece in data.chunks(step) {
             let mut prefix = [0u8; 16];
             let plen = frame_prefix(piece.len(), &mut prefix);
             let total = plen + piece.len();
@@ -1532,27 +1546,24 @@ impl GrpcWriter {
         }
     }
 
-    /// The most bytes one relay read should hand this writer: a multi-mode write reads no more than
-    /// the credit the peer has left, so the read leaves as one `MultiHunk` the peer can pay for
-    /// rather than one it parks on. The envelope and tags of a four-element `64 KiB` read cost at
-    /// most `64` bytes; a read that fits one element costs at most `16`.
+    /// The most bytes one relay read should hand this writer: a write reads no more than the credit
+    /// the peer has left, so the read leaves as one message the peer can pay for rather than one it
+    /// parks on. The envelopes and tags of a four-element `64 KiB` read cost at most `64` bytes; one
+    /// `Hunk` costs at most `16`, and the same `16` leaves a `64 KiB` read one message.
     pub(crate) fn read_window(&self) -> Option<usize> {
-        if !self.multi {
-            return None;
-        }
-        let init = self
-            .shared
-            .init
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let init = self.opening_cap();
         let send = self
             .shared
             .send
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let stream = u64::try_from(send.stream.max(0)).unwrap_or(0);
-        let available = (*init).min(send.conn).min(stream);
-        let margin = if available > 16_375 { 64 } else { 16 };
+        let available = init.min(send.conn).min(stream);
+        let margin = if self.multi && available > 16_375 {
+            64
+        } else {
+            16
+        };
         let limit = usize::try_from(available).unwrap_or(usize::MAX);
         Some(
             limit
@@ -1953,6 +1964,24 @@ impl std::io::Write for GrpcWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// The largest payload a message of `cap` bytes pays for — envelope, `Hunk` tag and length
+/// included — so a read the peer's window covers leaves as one message spanning frames rather
+/// than one message per frame. The envelope's varint grows with the payload, so the fixed point is
+/// reached from above in a couple of steps.
+fn message_cap(cap: usize) -> usize {
+    if cap < 8 {
+        return 1;
+    }
+    let mut payload = cap.saturating_sub(6);
+    loop {
+        let next = cap.saturating_sub(6 + varint_len(payload as u64));
+        if next >= payload {
+            return payload;
+        }
+        payload = next;
     }
 }
 
@@ -4575,22 +4604,32 @@ mod tests {
         );
     }
 
-    /// The witnesses for `carrier-grpc writes-per-relay-read 1`, `carrier-grpc segments-per-socket-write 10` and `carrier-grpc payload-runs-per-socket-write 5`: a relay read of four `HUNK`s is five DATA frames, one whole message each, and leaves as one write of ten segments whose bytes are those frames in order, with five of them still runs of the caller's own buffer — a gather holds heads and envelopes apart, it does not stage a byte of payload.
+    /// The witnesses for `carrier-grpc writes-per-relay-read 1`, `carrier-grpc segments-per-socket-write 8` and `carrier-grpc payload-runs-per-socket-write 4`: a relay read of the window the writer pays for is one `Hunk` spanning four DATA frames and leaves as one write of eight segments whose bytes are those frames in order, with four of them still runs of the caller's own buffer — a gather holds heads and envelopes apart, it does not stage a byte of payload.
     #[test]
     fn a_relay_read_gathers_its_frames_into_one_write() {
-        let data: Vec<u8> = (0..FRAMES_PER_WRITE / 2 * HUNK)
-            .map(|i| (i % 251) as u8)
-            .collect();
-        let hunks = data.len().div_ceil(message_payload(HUNK - 1));
-        assert_eq!(hunks, 5, "five Hunk messages for this relay read");
-        let base = data.as_ptr() as usize;
-        let capacity = data.capacity();
         let peer = Arc::new(Mutex::new(Peer::default()));
         let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, u64::MAX);
+        let read = writer.read_window().expect("the window pays for a read");
+        assert_eq!(read, 65_519, "the opening window's read, less the envelope");
+        let data: Vec<u8> = (0..read).map(|i| (i % 251) as u8).collect();
+        let body = message(&data);
+        let hunks = body.len().div_ceil(HUNK);
+        assert_eq!(hunks, 4, "four DATA frames for this relay read");
+        let want: Vec<u8> = body
+            .chunks(HUNK)
+            .flat_map(|piece| frame(T_DATA, 0, 1, piece))
+            .collect();
+        let base = data.as_ptr() as usize;
+        let capacity = data.capacity();
         assert!(writer.send(&data));
         let peer = peer.lock().unwrap();
         assert_eq!(peer.writes.len(), 1, "one write for a relay read");
-        assert_eq!(peer.writes[0], frames(&data), "the same frames, in order");
+        assert_eq!(peer.writes[0], want, "the same frames, in order");
+        assert_eq!(
+            message_count(&data_body(&peer.writes[0])),
+            1,
+            "one Hunk message for the read"
+        );
         assert_eq!(
             peer.parts.len(),
             2 * hunks,
@@ -5167,15 +5206,23 @@ mod tests {
     }
 
     /// The same batch driven over a real socket, where the only thing a loopback test can assert is
-    /// its bytes: ten segments is the widest list this carrier hands `writev` or `WSASend`, so a
+    /// its bytes: one list of eight segments, a head slot and a payload run for each frame, so a
     /// platform that split the list or refused its width would answer with missing or reordered
     /// frames rather than with a count.
     #[test]
     fn a_wide_batch_reaches_a_real_socket_whole() {
-        let data: Vec<u8> = (0..FRAMES_PER_WRITE / 2 * HUNK)
-            .map(|i| (i % 251) as u8)
+        let probe = writer_over(
+            Recorder(Arc::new(Mutex::new(Peer::default()))),
+            HUNK,
+            u64::MAX,
+        );
+        let read = probe.read_window().expect("the window pays for a read");
+        let data: Vec<u8> = (0..read).map(|i| (i % 251) as u8).collect();
+        let body = message(&data);
+        let want: Vec<u8> = body
+            .chunks(HUNK)
+            .flat_map(|piece| frame(T_DATA, 0, 1, piece))
             .collect();
-        let want = frames(&data);
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let handle = thread::spawn(move || {
@@ -6291,9 +6338,10 @@ mod tests {
         while reader.read(&mut buf).unwrap_or(0) != 0 {}
     }
 
-    /// A hunk is one frame: the envelope and the payload its length announces fit the DATA frame
-    /// the peer advertised, so a peer parses the message where it landed instead of reassembling it
-    /// from a frame of its own. The reference's client reassembles every message that crosses one.
+    /// A frame-sized hunk is what a window no wider than one frame pays for: the envelope and the
+    /// payload its length announces fit the DATA frame the peer advertised, so eight bytes of spill
+    /// never cost a frame of their own. A wider window's message spans frames instead, and this
+    /// test walks the stream either way, so the fixed point and the payload bytes are both held.
     #[test]
     fn a_hunk_fits_the_frame_that_carries_it() {
         const _: () = assert!(4 * (HUNK - 1) <= 65_535);
@@ -6311,7 +6359,7 @@ mod tests {
         let wire = peer.lock().unwrap().writes.concat();
         let mut at = 0;
         let mut frames = 0;
-        let mut got = Vec::new();
+        let mut body_stream = Vec::new();
         while at < wire.len() {
             assert!(wire.len() - at >= 9, "a frame head was cut short");
             let len = usize::from(wire[at]) << 16
@@ -6320,18 +6368,37 @@ mod tests {
             assert_eq!(wire[at + 3], T_DATA, "only DATA frames carry a hunk");
             assert!(wire.len() - at - 9 >= len, "a frame body was cut short");
             let body = &wire[at + 9..at + 9 + len];
-            assert!(body.len() >= 5, "a DATA frame opens no message");
-            assert!(body.len() < HUNK, "a hunk is wider than the window packs");
-            let announced = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
-            assert_eq!(announced + 5, body.len(), "a hunk crossed a frame boundary");
-            let (_, payload) = hunk_decode::<true>(&body[5..]).expect("the hunk decodes");
-            got.extend_from_slice(payload);
+            assert!(body.len() <= HUNK, "a frame body is wider than the frame");
+            body_stream.extend_from_slice(body);
             frames += 1;
             at += 9 + len;
         }
         assert_eq!(at, wire.len(), "a frame was cut short");
+        let mut cursor = 0;
+        let mut messages = 0;
+        let mut got = Vec::new();
+        while cursor < body_stream.len() {
+            assert!(
+                body_stream.len() - cursor >= 5,
+                "a DATA frame opens no message"
+            );
+            let announced =
+                u32::from_be_bytes(body_stream[cursor + 1..cursor + 5].try_into().unwrap())
+                    as usize;
+            let end = cursor + 5 + announced;
+            assert!(end <= body_stream.len(), "a message was cut short");
+            let (_, payload) =
+                hunk_decode::<true>(&body_stream[cursor + 5..end]).expect("the hunk decodes");
+            got.extend_from_slice(payload);
+            messages += 1;
+            cursor = end;
+        }
         assert_eq!(got, data, "the payload is unchanged");
-        assert_eq!(frames, 5, "64 KiB at 16 KiB frames is five hunks");
+        assert_eq!(frames, 5, "64 KiB at 16 KiB frames is five DATA frames");
+        assert_eq!(
+            messages, 2,
+            "a 64 KiB write is two Hunks, not one per frame"
+        );
     }
 
     #[test]
