@@ -2153,17 +2153,14 @@ impl Handler {
         let direct_due = self
             .datagram_retry
             .is_none_or(|at| std::time::Instant::now() >= at);
-        if self.direct_datagram.is_none()
-            && self.opening.is_none()
-            && self.datagram.is_some()
-            && direct_due
-        {
+        let ready = self.datagram.as_ref().is_some_and(Datagram::ready);
+        if self.direct_datagram.is_none() && self.opening.is_none() && ready && direct_due {
             self.open_datagram_lane();
         }
         if let Some(direct) = self.direct_datagram.as_ref() {
             return Lane::Direct(direct.relay);
         }
-        if self.datagram.is_none() || !direct_due {
+        if !ready || !direct_due {
             return Lane::Front;
         }
         Lane::Hold
