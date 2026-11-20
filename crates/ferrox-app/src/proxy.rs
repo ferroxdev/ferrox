@@ -30851,6 +30851,7 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: Option<&Co
 }
 
 /// CONNECT-IP UDP: one tunnel shared by every destination, so later targets cost a map row, not a dial.
+#[allow(clippy::too_many_lines)]
 fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: Option<&Connection>) {
     let _ = relay.set_read_timeout(Some(UDP_POLL));
     if let Some(associate) = associate {
@@ -63052,7 +63053,7 @@ mod tests {
                 &out,
                 Some(&associate),
                 Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-            )
+            );
         });
         let mut head = Vec::new();
         let frame = socks_udp_frame(&mut head, &echo_addr, b"spoof");
