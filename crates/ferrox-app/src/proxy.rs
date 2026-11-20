@@ -27124,9 +27124,13 @@ fn serve_connect_freedom(
         return;
     }
     if !prefix.is_empty() && !http_head_has_body(prefix) {
+        let until = std::time::Instant::now() + budgets::head_arrival();
         loop {
-            let Some((mut head, at)) =
-                read_http_head_kept(&mut upstream, HTTP_HEAD_LIMIT, budgets::head_arrival())
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            let Some((mut head, at)) = read_http_head_kept(&mut upstream, HTTP_HEAD_LIMIT, left)
             else {
                 return;
             };

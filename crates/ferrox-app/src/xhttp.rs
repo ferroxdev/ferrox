@@ -3533,7 +3533,7 @@ pub(crate) fn accept_core<
             }
             if !session.push_packet(seq_num, payload, settings.sc_max_buffered) {
                 // A refused packet is a lost one — the reader waits on strict sequence — so the session is over; keeping it alive would park its reader on a sequence that can never arrive.
-                end_session(sid);
+                end_session_handle(sid, &SessionHandle::of(&session));
                 emit_500(&mut write);
                 return Served::Closed;
             }

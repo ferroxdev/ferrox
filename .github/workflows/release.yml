@@ -93,7 +93,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
