@@ -438,16 +438,15 @@ impl Wire {
     fn quiet_until(&mut self, until: Instant) {
         self.deadline.arm(until);
         let mut room = [0u8; READ_ROOM];
-        let mut got = false;
         loop {
             if Instant::now() >= until {
                 return;
             }
             match self.stream.read(&mut room) {
                 Ok(0) => return,
-                Ok(_) => got = true,
+                Ok(_) => {}
                 Err(error) if ferrox_core::tls::TlsError::is_timeout(&error) => {
-                    if got || Instant::now() >= until {
+                    if Instant::now() >= until {
                         return;
                     }
                 }
@@ -2506,14 +2505,12 @@ mod tests {
     impl Read for Behind {
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
             self.reads.fetch_add(1, Ordering::Relaxed);
-            if self.left == 0 {
-                return Ok(0);
+            if self.left > 0 {
+                self.left -= 1;
+                return Ok(1);
             }
-            self.left -= 1;
-            if self.left == 0 {
-                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
-            }
-            Ok(1)
+            std::thread::sleep(Duration::from_millis(1));
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
         }
     }
 
@@ -2539,11 +2536,11 @@ mod tests {
             closed: false,
             deadline: Deadline::default(),
         };
-        wire.quiet_until(Instant::now() + Duration::from_secs(60));
-        assert_eq!(
-            reads.load(Ordering::Relaxed),
-            2,
-            "the byte behind the reply is read before the socket closes"
+        wire.quiet_until(Instant::now() + Duration::from_millis(25));
+        let read = reads.load(Ordering::Relaxed);
+        assert!(
+            read > 2,
+            "a byte behind the reply does not end the drain: {read} reads"
         );
     }
 

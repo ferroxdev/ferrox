@@ -135,6 +135,7 @@ impl SniState {
 struct XmcState {
     config: ferrox_core::finalmask::xmc::Config,
     role: ferrox_core::finalmask::MaskRole,
+    deadline: HandshakeDeadline,
     session: XmcSlot,
 }
 
@@ -179,16 +180,14 @@ impl ReadClock for TcpStream {
 struct HandshakeDeadline(std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>);
 
 impl HandshakeDeadline {
-    fn begin(budget: Duration) -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(
-            std::time::Instant::now() + budget,
-        ))))
-    }
-
     fn gate(&self) -> std::sync::MutexGuard<'_, Option<std::time::Instant>> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn arm(&self, until: Instant) {
+        *self.gate() = Some(until);
     }
 
     fn end(&self) {
@@ -275,8 +274,8 @@ impl XmcState {
             let _ = stream.set_read_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
             let _ = stream.set_write_timeout(Some(XMC_HANDSHAKE_TIMEOUT));
             let result = (|| {
-                let deadline =
-                    HandshakeDeadline::begin(xmc_deadline(crate::budgets::handshake_cap()));
+                let deadline = self.deadline.clone();
+                deadline.arm(Instant::now() + xmc_deadline(crate::budgets::handshake_cap()));
                 let reader = DeadlineReader::new(stream.try_clone()?, deadline.clone());
                 let writer = XmcWriter {
                     stream: stream.try_clone()?,
@@ -316,6 +315,18 @@ impl Masked {
         match &self.xmc {
             Some(state) => state.session(&self.stream, &self.chain).map(Some),
             None => Ok(None),
+        }
+    }
+
+    /// The XMC packet loop can consume control packet after control packet inside one read, so
+    /// the outer deadline has to reach the source it reads, not just the socket timeout.
+    fn arm_xmc(&self, until: Option<Instant>) {
+        let Some(state) = &self.xmc else {
+            return;
+        };
+        match until {
+            Some(until) => state.deadline.arm(until),
+            None => state.deadline.end(),
         }
     }
 }
@@ -577,6 +588,11 @@ impl Masked {
     /// A read through the codec chain, or the socket itself when no stage transforms bytes.
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         if let Some(session) = self.xmc_session()? {
+            let until = *self
+                .read_until
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.arm_xmc(until);
             return (&*session).read(buf);
         }
         self.ensure_header()?;
@@ -829,6 +845,7 @@ impl Connection {
                     std::sync::Arc::new(XmcState {
                         config: config.clone(),
                         role,
+                        deadline: HandshakeDeadline::default(),
                         session: std::sync::OnceLock::new(),
                     })
                 });
@@ -1776,6 +1793,7 @@ impl Connection {
                     .read_until
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = until;
+                masked.arm_xmc(until);
             }
             Connection::Metered(metered) => metered.inner.set_read_until(until),
             Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
@@ -4458,7 +4476,8 @@ mod tests {
     #[test]
     fn a_read_past_the_handshake_deadline_never_arms_another_clock() {
         let armed = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let deadline = HandshakeDeadline::begin(Duration::from_millis(30));
+        let deadline = HandshakeDeadline::default();
+        deadline.arm(Instant::now() + Duration::from_millis(30));
         let mut reader = DeadlineReader::new(
             StalledReader {
                 armed: std::sync::Arc::clone(&armed),
@@ -4482,6 +4501,16 @@ mod tests {
         deadline.end();
         let after = reader.read(&mut byte).expect_err("nothing arrives");
         assert_eq!(after.kind(), io::ErrorKind::WouldBlock);
+
+        deadline.arm(Instant::now() + Duration::from_millis(30));
+        let rearmed = reader.read(&mut byte).expect_err("nothing arrives");
+        assert_eq!(rearmed.kind(), io::ErrorKind::WouldBlock);
+        let clock = armed.lock().expect("the clock").expect("a clock is armed");
+        assert!(clock <= Duration::from_millis(30));
+
+        deadline.arm(Instant::now());
+        let expired = reader.read(&mut byte).expect_err("the deadline passed");
+        assert_eq!(expired.kind(), io::ErrorKind::TimedOut);
     }
 
     /// A peer that dribbles a byte before each clock cannot hold a handshake open: the reads run to
@@ -4526,6 +4555,38 @@ mod tests {
             "the handshake outlived its one deadline"
         );
         peer.join().expect("joins");
+    }
+
+    /// The XMC packet loop reads through the same deadline the drain arms, so a control packet
+    /// cannot outlive it inside one logical read.
+    #[test]
+    fn an_armed_read_deadline_reaches_the_xmc_packet_source() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connects");
+        let _ = listener.accept().expect("accepts");
+        let state = std::sync::Arc::new(XmcState {
+            config: ferrox_core::finalmask::xmc::Config {
+                profiles: Vec::new(),
+                password: String::new(),
+                hostname: String::new(),
+                private_key_der: Vec::new(),
+                public_key_der: Vec::new(),
+            },
+            role: ferrox_core::finalmask::MaskRole::Server,
+            deadline: HandshakeDeadline::default(),
+            session: std::sync::OnceLock::new(),
+        });
+        let mut masked = masked_with(client, ferrox_core::evasion::SniShape::Record);
+        masked.xmc = Some(std::sync::Arc::clone(&state));
+        let connection = Connection::Masked(masked);
+
+        let until = Instant::now() + Duration::from_secs(1);
+        connection.set_read_until(Some(until));
+        assert_eq!(*state.deadline.gate(), Some(until));
+
+        connection.set_read_until(None);
+        assert_eq!(*state.deadline.gate(), None);
     }
 
     /// The login keeps the reference's two minutes on a dial, and an admission shortens it to the
