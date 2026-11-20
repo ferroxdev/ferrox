@@ -674,6 +674,12 @@ mod tests {
                     "{mode:?} fell back before trying the edge of {prefix}"
                 );
             }
+            assert!(
+                candidates[fallback..]
+                    .iter()
+                    .all(|edge| edge.port() != MASQUE_PORTS[0]),
+                "{mode:?} sampled a 443 edge after the first fallback port"
+            );
         }
     }
 
