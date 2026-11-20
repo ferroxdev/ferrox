@@ -59,6 +59,30 @@ struct DataBatch<'a> {
     used: usize,
 }
 
+/// The suffix of a frame after the first `skip` bytes, with its head length and part count corrected.
+fn trim_frame<'a>(
+    head: &[u8; 9],
+    bodies: &[&'a [u8]; 4],
+    count: u8,
+    skip: usize,
+) -> ([u8; 9], [&'a [u8]; 4], u8) {
+    let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+    let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+    let mut left = skip;
+    let mut kept = [NO_PART; 4];
+    let mut used = 0;
+    for body in bodies.iter().take(count as usize) {
+        if left >= body.len() {
+            left -= body.len();
+            continue;
+        }
+        kept[used] = &body[left..];
+        used += 1;
+        left = 0;
+    }
+    (frame_head(len - skip, T_DATA, 0, id), kept, used as u8)
+}
+
 impl<'a> DataBatch<'a> {
     fn new() -> Self {
         Self {
@@ -114,7 +138,19 @@ impl<'a> DataBatch<'a> {
                     };
                     return self.flush_locked(conn, &mut **write);
                 }
-                Some(false) => {}
+                Some(false) => {
+                    drop(credit);
+                    if self.send_fitting(conn) {
+                        continue;
+                    }
+                    if conn.dead.load(Ordering::SeqCst) || self.reserved_fits(conn).is_none() {
+                        continue;
+                    }
+                    credit = conn
+                        .send_conn
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
                 None => {
                     drop(credit);
                     self.refund_reserved(conn);
@@ -186,6 +222,138 @@ impl<'a> DataBatch<'a> {
         Some(fits)
     }
 
+    /// Writes the prefix a reduced window still covers, keeping the rest of the reservation for
+    /// the peer's next credit grant.
+    fn send_fitting(&mut self, conn: &H2Conn) -> bool {
+        if self.used == 0 {
+            return false;
+        }
+        let mut budgets = [(0u32, 0i64); DATA_FRAMES_PER_WRITE];
+        let mut streams = 0;
+        {
+            let table = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
+            for head in self.heads.iter().take(self.used) {
+                let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+                if budgets[..streams].iter().any(|(known, _)| *known == id) {
+                    continue;
+                }
+                let Some(state) = table.get(&id) else {
+                    return false;
+                };
+                let window = *state
+                    .send_window
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let reserved: i64 = self
+                    .heads
+                    .iter()
+                    .take(self.used)
+                    .filter(|head| u32::from_be_bytes([head[5], head[6], head[7], head[8]]) == id)
+                    .map(|head| i64::from(u32::from_be_bytes([0, head[0], head[1], head[2]])))
+                    .sum();
+                budgets[streams] = (
+                    id,
+                    if window < 0 {
+                        reserved.saturating_add(window).max(0)
+                    } else {
+                        reserved
+                    },
+                );
+                streams += 1;
+            }
+        }
+        let mut fit = [0usize; DATA_FRAMES_PER_WRITE];
+        let mut heads = [[0u8; 9]; DATA_FRAMES_PER_WRITE];
+        let mut included = 0;
+        for at in 0..self.used {
+            let head = &self.heads[at];
+            let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+            let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+            let Some(slot) = budgets[..streams]
+                .iter_mut()
+                .find(|(known, _)| *known == id)
+            else {
+                return false;
+            };
+            let budget = usize::try_from(slot.1.max(0)).unwrap_or(usize::MAX);
+            let take = if len == 0 { 0 } else { len.min(budget) };
+            if len > 0 && take == 0 {
+                break;
+            }
+            fit[at] = take;
+            heads[at] = frame_head(take, T_DATA, 0, id);
+            included = at + 1;
+            if take == len {
+                if len > 0 {
+                    slot.1 -= take as i64;
+                }
+                continue;
+            }
+            break;
+        }
+        if included == 0 {
+            return false;
+        }
+        let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
+        let mut pieces = 0;
+        for at in 0..included {
+            parts[pieces] = &heads[at];
+            pieces += 1;
+            let mut left = fit[at];
+            for body in &self.bodies[at][..self.counts[at] as usize] {
+                if left == 0 {
+                    break;
+                }
+                let part = &body[..body.len().min(left)];
+                if !part.is_empty() {
+                    parts[pieces] = part;
+                    pieces += 1;
+                }
+                left -= part.len();
+            }
+        }
+        if pieces == 0 {
+            return false;
+        }
+        let Ok(mut write) = conn.write.lock() else {
+            return false;
+        };
+        if !write.write_slices(&parts[..pieces]) {
+            conn.dead.store(true, Ordering::SeqCst);
+            return false;
+        }
+        drop(write);
+        let mut new_heads = self.heads;
+        let mut new_bodies = self.bodies;
+        let mut new_counts = self.counts;
+        let mut used = 0;
+        for at in 0..included {
+            let len =
+                u32::from_be_bytes([0, self.heads[at][0], self.heads[at][1], self.heads[at][2]])
+                    as usize;
+            if fit[at] == len {
+                continue;
+            }
+            let (head, bodies, count) =
+                trim_frame(&self.heads[at], &self.bodies[at], self.counts[at], fit[at]);
+            new_heads[used] = head;
+            new_bodies[used] = bodies;
+            new_counts[used] = count;
+            used += 1;
+        }
+        for at in included..self.used {
+            new_heads[used] = self.heads[at];
+            new_bodies[used] = self.bodies[at];
+            new_counts[used] = self.counts[at];
+            used += 1;
+        }
+        self.heads = new_heads;
+        self.bodies = new_bodies;
+        self.counts = new_counts;
+        self.used = used;
+        true
+    }
+
     /// Return the credit a batch that will never be written took from the connection and its stream.
     fn refund_reserved(&self, conn: &H2Conn) {
         let total: u64 = self
@@ -197,13 +365,11 @@ impl<'a> DataBatch<'a> {
         if total == 0 {
             return;
         }
-        {
-            let mut credit = conn
-                .send_conn
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            *credit = credit.saturating_add(total).min((1 << 31) - 1);
-        }
+        let mut credit = conn
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *credit = credit.saturating_add(total).min((1 << 31) - 1);
         let streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
         for head in self.heads.iter().take(self.used) {
             let len = i64::from(u32::from_be_bytes([0, head[0], head[1], head[2]]));
@@ -4352,6 +4518,59 @@ mod tests {
             batch.reserved_fits(&conn),
             Some(true),
             "the reservation fits again once the window is back at zero"
+        );
+    }
+
+    /// A reduced window sends the part of its reservation the peer still allows, then waits for
+    /// the rest instead of failing the whole batch.
+    #[test]
+    fn a_reduced_window_sends_the_part_the_peer_allows() {
+        let (conn, written, _) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                credit: VecDeque::new(),
+                queued_bytes: 0,
+                ended: false,
+                finished: false,
+                request_ended: false,
+                stopped: false,
+                abandoned: false,
+                status: None,
+                dead: false,
+                pending_credit: 0,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(-8_192),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        let payload = vec![7u8; 16_384];
+        let mut batch = DataBatch::new();
+        batch.add(1, &payload);
+        assert!(batch.send_fitting(&conn), "the allowed prefix is written");
+        assert!(!batch.send_fitting(&conn), "the rest waits for credit");
+        assert_eq!(
+            *written.lock().unwrap_or_else(PoisonError::into_inner),
+            [&frame_head(8_192, T_DATA, 0, 1)[..], &payload[..8_192]].concat()
+        );
+        *state
+            .send_window
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = 0;
+        assert!(batch.flush(&conn), "the granted window sends the remainder");
+        assert_eq!(
+            *written.lock().unwrap_or_else(PoisonError::into_inner),
+            [
+                &frame_head(8_192, T_DATA, 0, 1)[..],
+                &payload[..8_192],
+                &frame_head(8_192, T_DATA, 0, 1)[..],
+                &payload[8_192..],
+            ]
+            .concat()
         );
     }
 

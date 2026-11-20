@@ -1665,6 +1665,42 @@ impl Session {
         }
     }
 
+    /// Sends as much of the queued capsules as the peer's credit and frame limit allow.
+    fn drain_queued(&mut self, wire: &mut Wire, frame: &mut Vec<u8>) {
+        while let Some(answer) = self.queued.pop_front() {
+            let Some(id) = self.request else {
+                self.queued.push_front(answer);
+                return;
+            };
+            let start = self.queued_at;
+            let room = self.send_window.min(self.connection_window);
+            if room <= 0 {
+                self.queued.push_front(answer);
+                break;
+            }
+            let take = (answer.len() - start)
+                .min(usize::try_from(room).unwrap_or(usize::MAX))
+                .min(MAX_FRAME_BODY);
+            // A queued body leaves in one write: its head and the credited slice share a frame.
+            frame.clear();
+            frame.resize(FRAME_HEAD, 0);
+            frame.extend_from_slice(&answer[start..start + take]);
+            frame[..FRAME_HEAD].copy_from_slice(&h2::frame_head(take, h2::T_DATA, 0, id));
+            if !wire.send_frame(frame) {
+                return;
+            }
+            let sent = i64::try_from(take).unwrap_or(i64::MAX);
+            self.send_window -= sent;
+            self.connection_window -= sent;
+            self.queued_at = start + take;
+            if self.queued_at < answer.len() {
+                self.queued.push_front(answer);
+            } else {
+                self.queued_at = 0;
+            }
+        }
+    }
+
     /// Gathers the queued packets into DATA frames, one per batch and never past the peer's frame limit.
     fn gather(&mut self, wire: &mut Wire, frame: &mut Vec<u8>) -> bool {
         let mut origin_closed = false;
@@ -1776,46 +1812,16 @@ impl Session {
             return;
         }
         let mut frame = std::mem::take(&mut self.frame);
-        while let Some(answer) = self.queued.pop_front() {
-            let Some(id) = self.request else {
-                self.queued.push_front(answer);
-                self.frame = frame;
-                return;
-            };
-            let start = self.queued_at;
-            let room = self.send_window.min(self.connection_window);
-            if room <= 0 {
-                self.queued.push_front(answer);
-                break;
-            }
-            let take = (answer.len() - start)
-                .min(usize::try_from(room).unwrap_or(usize::MAX))
-                .min(MAX_FRAME_BODY);
-            // A queued body leaves in one write: its head and the credited slice share a frame.
-            frame.clear();
-            frame.resize(FRAME_HEAD, 0);
-            frame.extend_from_slice(&answer[start..start + take]);
-            frame[..FRAME_HEAD].copy_from_slice(&h2::frame_head(take, h2::T_DATA, 0, id));
-            if !wire.send_frame(&frame) {
-                self.frame = frame;
-                return;
-            }
-            let sent = i64::try_from(take).unwrap_or(i64::MAX);
-            self.send_window -= sent;
-            self.connection_window -= sent;
-            self.queued_at = start + take;
-            if self.queued_at < answer.len() {
-                self.queued.push_front(answer);
-            } else {
-                self.queued_at = 0;
-            }
-        }
+        self.drain_queued(wire, &mut frame);
         // CONNECT-IP keeps its grant and sender alive, so waiting for `outgoing` to disconnect is a wait it never reaches; both datagram modes drain on a quiet window instead.
         let drainable = self.warp || self.udp.is_some();
         if self.half_closed && drainable && self.udp_quiet.is_none() {
             self.udp_quiet = Some(Instant::now());
         }
         let origin_closed = self.gather(wire, &mut frame);
+        if !self.end && !wire.closed {
+            self.drain_queued(wire, &mut frame);
+        }
         self.frame = frame;
         let udp_drained = self.half_closed
             && drainable

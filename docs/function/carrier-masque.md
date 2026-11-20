@@ -108,7 +108,7 @@ graph TD
 | h2-capsule-staging-allocations | 0 | ferrox-app-masque-h2::tests::a_whole_capsule_is_read_where_it_landed |
 | h2-datagram-packet-queue-copies | 0 | ferrox-app-masque-h2::tests::a_datagram_capsule_goes_straight_to_its_lane |
 | h2-queued-capsule-cap | 64 | ferrox-app-masque-h2::tests::a_stalled_send_window_bounds_the_queued_capsules |
-| h2-capsules-per-downlink-frame | 4 | ferrox-app-masque-h2::tests::a_burst_leaves_as_one_data_frame |
+| h2-capsules-in-a-four-packet-burst | 4 | ferrox-app-masque-h2::tests::a_burst_leaves_as_one_data_frame |
 | h2-downlink-frame-body-cap | 16384 | ferrox-app-masque-h2::tests::a_burst_keeps_every_body_inside_the_frame_limit |
 | h2-writes-per-immediate-data-frame | 1 | ferrox-app-masque-h2::tests::a_data_frame_leaves_the_wire_in_one_write |
 | h2-writes-per-queued-data-frame | 1 | ferrox-app-masque-h2::tests::a_partially_credited_capsule_leaves_one_write_per_frame |
