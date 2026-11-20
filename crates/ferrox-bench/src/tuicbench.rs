@@ -230,10 +230,8 @@ fn btree_cycle(
     pool: &mut Vec<Vec<u8>>,
     next: &mut u64,
 ) -> usize {
-    let mut seq = *next;
-    for payload in pool.drain(..) {
+    for (seq, payload) in (*next..).zip(pool.drain(..)) {
         map.insert(seq, payload);
-        seq += 1;
     }
     for _ in 0..PENDING {
         let payload = map.remove(&*next).expect("the head packet");
@@ -248,10 +246,8 @@ fn hash_cycle(
     pool: &mut Vec<Vec<u8>>,
     next: &mut u64,
 ) -> usize {
-    let mut seq = *next;
-    for payload in pool.drain(..) {
+    for (seq, payload) in (*next..).zip(pool.drain(..)) {
         map.insert(seq, payload);
-        seq += 1;
     }
     for _ in 0..PENDING {
         let payload = map.remove(&*next).expect("the head packet");

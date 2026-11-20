@@ -6774,13 +6774,12 @@ mod tests {
         let session = get_or_create_session("packet-map-reuse");
         let mut payloads: Vec<Vec<u8>> = (0..PENDING).map(|_| vec![0u8; 32]).collect();
         let cycle = |payloads: &mut Vec<Vec<u8>>| {
-            let mut seq = session.state.lock().expect("session lock").next_seq;
-            for payload in payloads.drain(..) {
+            let base = session.state.lock().expect("session lock").next_seq;
+            for (seq, payload) in (base..).zip(payloads.drain(..)) {
                 assert!(
                     session.push_packet(seq, payload, PENDING),
                     "the map has room for the packet"
                 );
-                seq += 1;
             }
             let mut st = session.state.lock().expect("session lock");
             for _ in 0..PENDING {
