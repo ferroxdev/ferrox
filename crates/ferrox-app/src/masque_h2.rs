@@ -106,12 +106,14 @@ impl DeadlineStream {
         match self.deadline.remaining() {
             None => {
                 if self.read_tight.replace(false) {
+                    self.io.set_read_until(None);
                     let _ = self.io.set_read_timeout(Some(self.read_wait.get()));
                 }
                 Ok(())
             }
             Some(left) if left.is_zero() => Err(std::io::ErrorKind::TimedOut.into()),
             Some(left) => {
+                self.io.set_read_until(Some(Instant::now() + left));
                 self.io
                     .set_read_timeout(Some(left.min(self.read_wait.get())))?;
                 self.read_tight.set(true);

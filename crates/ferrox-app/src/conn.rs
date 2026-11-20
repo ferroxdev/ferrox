@@ -85,6 +85,8 @@ pub(crate) struct Masked {
     /// The bytes this side has read, for the server's read-past-mark window; `None` leaves reads
     /// untouched.
     mark: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// The absolute instant a masked read must stop, carried under a chain that may loop inside one call.
+    read_until: std::sync::Mutex<Option<Instant>>,
 }
 
 /// The first-write rewrite an outbound's `sniSpoof` arms, shared by every handle of one stream
@@ -585,7 +587,14 @@ impl Masked {
         let Ok(mut chain) = chain.lock() else {
             return Err(io::Error::other("the mask chain is gone"));
         };
-        let mut source = &self.stream;
+        let until = *self
+            .read_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut source = BoundedRead {
+            stream: &self.stream,
+            until,
+        };
         chain.read(&mut source, buf)
     }
 
@@ -749,16 +758,43 @@ impl std::io::Read for HeaderWire<'_> {
                 "the header handshake deadline passed",
             ));
         }
-        self.stream
-            .set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
         let Some(chain) = self.read_chain else {
+            self.stream
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
             return (&*self.stream).read(buf);
         };
         let Ok(mut chain) = chain.lock() else {
-            return Err(std::io::Error::other("the mask chain is gone"));
+            return Err(io::Error::other("the mask chain is gone"));
         };
-        let mut source = self.stream;
+        let mut source = BoundedRead {
+            stream: self.stream,
+            until: Some(self.until),
+        };
         chain.read(&mut source, buf)
+    }
+}
+
+/// A masked read's inner source: each socket read stops at the absolute deadline a chain would
+/// otherwise pass through while it keeps consuming wire octets that decode to no plaintext.
+struct BoundedRead<'a> {
+    stream: &'a TcpStream,
+    until: Option<Instant>,
+}
+
+impl Read for BoundedRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(until) = self.until {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the masked read deadline passed",
+                ));
+            }
+            self.stream
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
+        }
+        (&*self.stream).read(buf)
     }
 }
 
@@ -806,6 +842,7 @@ impl Connection {
                     xmc,
                     sni: None,
                     mark: None,
+                    read_until: std::sync::Mutex::new(None),
                 })
             }
             (Connection::Metered(metered), mask) => Connection::Metered(Metered {
@@ -845,6 +882,7 @@ impl Connection {
                 xmc: None,
                 sni: Some(state()),
                 mark: None,
+                read_until: std::sync::Mutex::new(None),
             }),
             Connection::Masked(mut masked) => {
                 masked.sni = Some(state());
@@ -881,6 +919,7 @@ impl Connection {
                 xmc: None,
                 sni: None,
                 mark: Some(mark),
+                read_until: std::sync::Mutex::new(None),
             }),
             Connection::Masked(mut masked) => {
                 masked.mark = Some(mark);
@@ -1531,6 +1570,7 @@ impl Connection {
                     xmc: masked.xmc.as_ref().map(std::sync::Arc::clone),
                     sni: masked.sni.as_ref().map(std::sync::Arc::clone),
                     mark: masked.mark.as_ref().map(std::sync::Arc::clone),
+                    read_until: std::sync::Mutex::new(None),
                 })
             }),
             Connection::Metered(metered) => metered.inner.try_clone().map(|inner| {
@@ -1725,6 +1765,23 @@ impl Connection {
             }
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => set_socket_timeout(stream, SO_RCVTIMEO, timeout),
+        }
+    }
+
+    /// Arm an absolute read deadline under a mask that may loop inside one `read`.
+    pub(crate) fn set_read_until(&self, until: Option<Instant>) {
+        match self {
+            Connection::Masked(masked) => {
+                *masked
+                    .read_until
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = until;
+            }
+            Connection::Metered(metered) => metered.inner.set_read_until(until),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.set_read_until(until);
+            }
+            _ => {}
         }
     }
 
@@ -4524,7 +4581,53 @@ mod tests {
                 written: std::sync::atomic::AtomicU8::new(0),
             })),
             mark: None,
+            read_until: std::sync::Mutex::new(None),
         }
+    }
+
+    #[test]
+    fn a_masked_read_stops_at_its_absolute_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let mut peer = TcpStream::connect(addr).expect("connects");
+        let (server, _) = listener.accept().expect("accepts");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writing = std::sync::Arc::clone(&stop);
+        let trickle = std::thread::spawn(move || {
+            while !writing.load(std::sync::atomic::Ordering::Relaxed) {
+                if peer.write_all(&[0x80]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let deadline = Duration::from_millis(30);
+        let mut bounded = BoundedRead {
+            stream: &server,
+            until: Some(Instant::now() + deadline),
+        };
+        let started = Instant::now();
+        let mut buf = [0u8; 64];
+        loop {
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "a trickling peer held the masked read past its absolute deadline"
+            );
+            match bounded.read(&mut buf) {
+                Ok(_) => {}
+                Err(error)
+                    if error.kind() == io::ErrorKind::TimedOut
+                        || error.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    if started.elapsed() >= deadline {
+                        break;
+                    }
+                }
+                Err(error) => panic!("the masked read failed before its deadline: {error}"),
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        trickle.join().expect("joins");
     }
 
     /// The record shape rewrites the first hello's record version and leaves every other write
