@@ -3607,6 +3607,7 @@ fn admit_worker(live: &Arc<AtomicUsize>, cap: usize) -> Option<WorkerSlot> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines)]
 fn demux(
     sock: Arc<Datagram>,
     local: SocketAddr,
@@ -3803,9 +3804,8 @@ fn worker(
                 let _ = conn.recv(&mut bytes, info);
             }
             Ok(Arrival::Ready) => tunnel.queue.pending.store(false, Ordering::Release),
-            Ok(Arrival::Stop) => return,
+            Ok(Arrival::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
         sweep_due_timer(&mut conn);
         if conn.is_closed() {
