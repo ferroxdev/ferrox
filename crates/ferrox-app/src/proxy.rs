@@ -81827,6 +81827,70 @@ end
         );
     }
 
+    /// One flow's network picks its own lane, and a domain rule beats both: the device dial asks
+    /// this same table, so a config can split TCP and UDP across servers and name a site for a third.
+    #[test]
+    fn a_rule_splits_tcp_and_udp_and_a_named_site_across_lanes() {
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"tcp-lane","protocol":"freedom"},{"tag":"udp-lane","protocol":"blackhole"},{"tag":"site-lane","protocol":"blackhole"}],
+                "routing":{"rules":[
+                    {"type":"field","domain":["full:site.test"],"outboundTag":"site-lane"},
+                    {"type":"field","network":"tcp","outboundTag":"tcp-lane"},
+                    {"type":"field","network":"udp","outboundTag":"udp-lane"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        let other = Destination::Name("other.test".to_owned(), 443);
+        assert!(
+            matches!(
+                &*plan.pick(&other, crate::router::Network::Tcp, None, None),
+                Outbound::Freedom(_)
+            ),
+            "tcp takes its own lane"
+        );
+        assert!(
+            matches!(
+                &*plan.pick(&other, crate::router::Network::Udp, None, None),
+                Outbound::Block(_)
+            ),
+            "udp takes a different one"
+        );
+        let site = Destination::Name("site.test".to_owned(), 443);
+        for network in [crate::router::Network::Tcp, crate::router::Network::Udp] {
+            assert!(
+                matches!(&*plan.pick(&site, network, None, None), Outbound::Block(_)),
+                "the named site keeps its lane on both networks"
+            );
+        }
+    }
+
+    /// Every lane a route plan can dial is an edge, so `auto_route` pins each server — including
+    /// every candidate a balancer draws — before the device captures the default route.
+    #[test]
+    fn a_route_plan_names_an_edge_for_every_lane_it_can_dial() {
+        let out = route_outbound(
+            r#"{"outbounds":[
+                    {"tag":"lane-a","protocol":"socks","settings":{"servers":[{"address":"192.0.2.10","port":1080}]}},
+                    {"tag":"lane-b","protocol":"socks","settings":{"servers":[{"address":"192.0.2.11","port":1080}]}}],
+                "routing":{"balancers":[{"tag":"pool","selector":["lane-"],"strategy":"roundRobin"}],
+                    "rules":[{"type":"field","balancerTag":"pool"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let mut edges = out.edges();
+        edges.sort_unstable();
+        assert_eq!(
+            edges,
+            vec![
+                "192.0.2.10:1080".parse().expect("address"),
+                "192.0.2.11:1080".parse().expect("address"),
+            ]
+        );
+    }
+
     /// A balancer tag and an outbound tag may be the same name; an `outboundTag` rule still takes
     /// that outbound, where a `balancerTag` rule takes the drawing.
     #[test]
