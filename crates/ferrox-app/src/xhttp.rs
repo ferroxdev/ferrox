@@ -6773,7 +6773,7 @@ mod tests {
         const PENDING: usize = 64;
         let session = get_or_create_session("packet-map-reuse");
         let mut payloads: Vec<Vec<u8>> = (0..PENDING).map(|_| vec![0u8; 32]).collect();
-        let mut cycle = |payloads: &mut Vec<Vec<u8>>| {
+        let cycle = |payloads: &mut Vec<Vec<u8>>| {
             let mut seq = session.state.lock().expect("session lock").next_seq;
             for payload in payloads.drain(..) {
                 assert!(
