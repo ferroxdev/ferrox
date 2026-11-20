@@ -31,6 +31,8 @@ const SETTINGS_INITIAL_WINDOW: u16 = 0x4;
 const SETTINGS_ENABLE_CONNECT: u16 = 0x8;
 const FRAME_CAP: usize = 1 << 20;
 const FRAME_HEAD: usize = 9;
+/// The largest control body written head-and-body in one call; a DATA body never takes this path.
+const CONTROL_ROOM: usize = 512;
 const QUEUED_CAP: usize = 64;
 /// h2's default `SETTINGS_MAX_FRAME_SIZE`: a DATA body past it is a connection error for a peer that keeps the default.
 const MAX_FRAME_BODY: usize = 16 * 1024;
@@ -426,10 +428,18 @@ impl Wire {
 
     fn send(&mut self, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
         let head = h2::frame_head(body.len(), kind, flags, id);
-        let sent = self
-            .stream
-            .write_all(&head)
-            .and_then(|()| self.stream.write_all(body));
+        // A control frame is small enough to leave as one TLS record and one write, head and body
+        // already side by side; a larger one keeps the two writes rather than staging its body.
+        let sent = if body.len() <= CONTROL_ROOM {
+            let mut frame = [0u8; FRAME_HEAD + CONTROL_ROOM];
+            frame[..FRAME_HEAD].copy_from_slice(&head);
+            frame[FRAME_HEAD..FRAME_HEAD + body.len()].copy_from_slice(body);
+            self.stream.write_all(&frame[..FRAME_HEAD + body.len()])
+        } else {
+            self.stream
+                .write_all(&head)
+                .and_then(|()| self.stream.write_all(body))
+        };
         if sent.is_err() {
             self.closed = true;
             return false;
