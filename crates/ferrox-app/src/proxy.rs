@@ -29847,7 +29847,7 @@ fn dokodemo_udp_door(
     let mut buf = udp_buffer();
     // The door's frame is the door's: the address it rewrites to is the same for every datagram.
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-    let _ = socket.set_read_timeout(Some(door_idle(stop.as_ref())));
+    let _ = socket.set_read_timeout(Some(door_idle(stop)));
     loop {
         if stop.as_ref().is_some_and(|stop| stop.stopped()) {
             return;
@@ -29934,7 +29934,7 @@ fn dokodemo_transparent_udp_door(
     let mut legs: HashMap<Flow, (UdpSocket, Connection, Arc<AtomicBool>)> = HashMap::new();
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-    let _ = socket.set_read_timeout(Some(door_idle(stop.as_ref())));
+    let _ = socket.set_read_timeout(Some(door_idle(stop)));
     loop {
         if stop.as_ref().is_some_and(|stop| stop.stopped()) {
             return;
