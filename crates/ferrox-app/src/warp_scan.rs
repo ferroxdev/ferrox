@@ -202,17 +202,13 @@ pub(crate) fn masque_candidates(mode: ScanMode) -> Vec<SocketAddr> {
     for seed in &seeds {
         push(*seed, MASQUE_PORTS[0]);
     }
-    let wave = MASQUE_PREFIXES_V4.len();
-    for ip in sampled.iter().take(wave) {
+    for ip in &sampled {
         push(*ip, MASQUE_PORTS[0]);
     }
-    for seed in &seeds {
-        for &port in &MASQUE_PORTS[1..] {
+    for &port in &MASQUE_PORTS[1..] {
+        for seed in &seeds {
             push(*seed, port);
         }
-    }
-    for ip in sampled.iter().skip(wave) {
-        push(*ip, MASQUE_PORTS[0]);
     }
     out
 }
@@ -313,32 +309,90 @@ pub(crate) fn hunt<F>(
 where
     F: Fn(SocketAddr) -> Option<Duration> + Sync,
 {
+    hunt_with_early(candidates, Vec::new(), mode, excluded, verify)
+}
+
+pub(crate) fn masque_hunt<F>(
+    mode: ScanMode,
+    excluded: &HashSet<SocketAddr>,
+    verify: F,
+) -> Vec<(SocketAddr, Duration)>
+where
+    F: Fn(SocketAddr) -> Option<Duration> + Sync,
+{
+    let candidates = masque_candidates(mode);
+    let fallback = candidates
+        .iter()
+        .position(|edge| edge.port() != MASQUE_PORTS[0])
+        .unwrap_or(candidates.len());
+    let (edges, fallbacks) = candidates.split_at(fallback);
+    hunt_with_early(edges.to_vec(), fallbacks.to_vec(), mode, excluded, verify)
+}
+
+fn hunt_with_early<F>(
+    candidates: Vec<SocketAddr>,
+    early: Vec<SocketAddr>,
+    mode: ScanMode,
+    excluded: &HashSet<SocketAddr>,
+    verify: F,
+) -> Vec<(SocketAddr, Duration)>
+where
+    F: Fn(SocketAddr) -> Option<Duration> + Sync,
+{
     let strategy = mode.strategy();
     let candidates: Vec<SocketAddr> = candidates
         .into_iter()
         .filter(|edge| !excluded.contains(edge))
         .collect();
-    if candidates.is_empty() {
+    let early: Vec<SocketAddr> = early
+        .into_iter()
+        .filter(|edge| !excluded.contains(edge))
+        .collect();
+    if candidates.is_empty() && early.is_empty() {
         return Vec::new();
     }
     let index = AtomicUsize::new(0);
+    let early_index = AtomicUsize::new(0);
     let done = AtomicBool::new(false);
     let deadline = Instant::now() + strategy.deadline;
     let (sender, receiver) = mpsc::channel();
     let mut found = Vec::new();
     std::thread::scope(|scope| {
-        for _ in 0..strategy.concurrency.min(candidates.len()) {
+        let workers = strategy.concurrency.min(candidates.len() + early.len());
+        for worker in 0..workers {
             let sender = sender.clone();
             let index = &index;
+            let early_index = &early_index;
+            // One worker keeps the seed fallbacks from waiting behind every sampled 443 edge.
+            let early_lane = worker == 0 && !early.is_empty();
             let done = &done;
             let candidates = &candidates;
+            let early = &early;
             let verify = &verify;
             scope.spawn(move || loop {
                 if done.load(Ordering::Relaxed) || Instant::now() >= deadline {
                     break;
                 }
-                let at = index.fetch_add(1, Ordering::Relaxed);
-                let Some(&edge) = candidates.get(at) else {
+                let edge = if early_lane {
+                    early
+                        .get(early_index.fetch_add(1, Ordering::Relaxed))
+                        .copied()
+                        .or_else(|| {
+                            candidates
+                                .get(index.fetch_add(1, Ordering::Relaxed))
+                                .copied()
+                        })
+                } else {
+                    candidates
+                        .get(index.fetch_add(1, Ordering::Relaxed))
+                        .copied()
+                        .or_else(|| {
+                            early
+                                .get(early_index.fetch_add(1, Ordering::Relaxed))
+                                .copied()
+                        })
+                };
+                let Some(edge) = edge else {
                     break;
                 };
                 let result = verify(edge);
@@ -661,41 +715,35 @@ mod tests {
     }
 
     #[test]
-    fn the_masque_sweep_samples_before_falling_back_inside_both_budgets() {
-        let seeds: HashSet<SocketAddr> = MASQUE_SEEDS
-            .iter()
-            .filter_map(|text| text.parse::<Ipv4Addr>().ok())
-            .map(|ip| SocketAddr::from((ip, MASQUE_PORTS[0])))
-            .collect();
+    fn the_masque_sweep_samples_every_443_edge_before_falling_back() {
         for mode in [ScanMode::Turbo, ScanMode::Ironclad] {
             let strategy = mode.strategy();
-            let budget = strategy.concurrency
-                * (strategy.deadline.as_secs() / strategy.timeout.as_secs()) as usize;
             let candidates = masque_candidates(mode);
-            assert!(
-                candidates[..budget]
-                    .iter()
-                    .any(|edge| edge.port() == MASQUE_PORTS[0] && !seeds.contains(edge)),
-                "{mode:?} spent its probe budget without reaching a sampled 443 edge"
-            );
             let fallback = candidates
                 .iter()
                 .position(|edge| edge.port() != MASQUE_PORTS[0])
                 .expect("a seed fallback port");
-            assert!(
-                fallback < budget,
-                "{mode:?} never reached a seed fallback port"
-            );
-            for prefix in MASQUE_PREFIXES_V4 {
-                let edge = SocketAddr::from((
-                    sample_cidr(prefix, 1).first().copied().expect("one host"),
-                    MASQUE_PORTS[0],
-                ));
+            let sampled =
+                sample_prefixes(&MASQUE_PREFIXES_V4, strategy.full_subnet, strategy.sample)
+                    .into_iter()
+                    .map(|ip| SocketAddr::from((ip, MASQUE_PORTS[0])));
+            let seeds = MASQUE_SEEDS
+                .iter()
+                .filter_map(|text| text.parse::<Ipv4Addr>().ok())
+                .map(|ip| SocketAddr::from((ip, MASQUE_PORTS[0])));
+            let before: HashSet<SocketAddr> = candidates[..fallback].iter().copied().collect();
+            for edge in sampled.chain(seeds) {
                 assert!(
-                    candidates[..fallback].contains(&edge),
-                    "{mode:?} fell back before trying the edge of {prefix}"
+                    before.contains(&edge),
+                    "{mode:?} fell back before trying {edge}"
                 );
             }
+            assert!(
+                candidates[fallback..]
+                    .iter()
+                    .all(|edge| edge.port() != MASQUE_PORTS[0]),
+                "{mode:?} sampled a 443 edge after the first fallback port"
+            );
         }
     }
 
@@ -718,6 +766,56 @@ mod tests {
             .collect();
         assert_eq!(hosts, ["192.0.2.1", "192.0.2.2"]);
         assert_eq!(enumerate_cidr("10.0.0.0/8"), Vec::<Ipv4Addr>::new());
+    }
+
+    #[test]
+    fn an_idle_worker_picks_up_a_fallback_edge() {
+        let first: SocketAddr = "192.0.2.1:500".parse().expect("an early edge");
+        let second: SocketAddr = "192.0.2.2:500".parse().expect("an early edge");
+        let primary: Vec<SocketAddr> = (1..=19)
+            .map(|host| {
+                format!("198.51.100.{host}:443")
+                    .parse()
+                    .expect("a primary edge")
+            })
+            .collect();
+        let started = AtomicBool::new(false);
+        let caught = AtomicBool::new(false);
+        let assisted = AtomicBool::new(false);
+        let found = hunt_with_early(
+            primary,
+            vec![first, second],
+            ScanMode::Turbo,
+            &HashSet::new(),
+            |edge| {
+                if edge == first {
+                    started.store(true, Ordering::SeqCst);
+                    let wait = Instant::now();
+                    let mut saw_helper = caught.load(Ordering::SeqCst);
+                    while !saw_helper && wait.elapsed() < Duration::from_secs(2) {
+                        std::thread::sleep(Duration::from_millis(1));
+                        saw_helper = caught.load(Ordering::SeqCst);
+                    }
+                    assisted.store(saw_helper, Ordering::SeqCst);
+                    None
+                } else if edge == second {
+                    caught.store(true, Ordering::SeqCst);
+                    Some(Duration::from_millis(1))
+                } else {
+                    let wait = Instant::now();
+                    while !started.load(Ordering::SeqCst) && wait.elapsed() < Duration::from_secs(2)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    None
+                }
+            },
+        );
+        assert_eq!(found, vec![(second, Duration::from_millis(1))]);
+        assert!(
+            assisted.load(Ordering::SeqCst),
+            "the first fallback timed out instead of another worker taking the second"
+        );
     }
 
     #[test]

@@ -1998,7 +1998,7 @@ fn scan_masque(
     excluded: &HashSet<SocketAddr>,
 ) -> Option<SocketAddr> {
     let ironclad = mode == ScanMode::Ironclad;
-    warp_scan::hunt(warp_scan::masque_candidates(mode), mode, excluded, |edge| {
+    warp_scan::masque_hunt(mode, excluded, |edge| {
         let mut edge_spec = spec.clone();
         set_masque_edge(&mut edge_spec, edge);
         let out = build_masque(identity, &edge_spec).ok()?;
