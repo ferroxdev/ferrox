@@ -395,6 +395,10 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
         if !crate::proxy::source_ip_ok(peer, src) {
             continue;
         }
+        let pinned = lane.client.lock().ok().and_then(|slot| *slot);
+        if pinned.is_some_and(|held| held != src) {
+            continue;
+        }
         let Some((dest, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
             continue;
         };

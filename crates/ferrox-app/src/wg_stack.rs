@@ -2829,17 +2829,23 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
         }
         match relay.recv_from(&mut buf) {
             Ok((n, sender)) => {
-                quiet = StdInstant::now();
                 if !crate::proxy::source_ip_ok(peer, sender) {
+                    if lane_over(associate, quiet) {
+                        break;
+                    }
+                    continue;
+                }
+                if app.is_some_and(|bound| bound != sender) {
+                    if lane_over(associate, quiet) {
+                        break;
+                    }
                     continue;
                 }
                 let Some((destination, payload)) = crate::proxy::parse_socks_udp_dest(&buf[..n])
                 else {
                     continue;
                 };
-                if app.is_some_and(|bound| bound != sender) {
-                    continue;
-                }
+                quiet = StdInstant::now();
                 app = Some(sender);
                 let key = match &destination {
                     Destination::Name(host, port) => Some((host.clone(), *port)),
@@ -3001,7 +3007,7 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
         other => other.clone(),
     };
     let _ = relay.set_read_timeout(Some(crate::budgets::udp_idle()));
-    std::thread::spawn(move || serve_udp_lane(&relay, &outbound, None));
+    std::thread::spawn(move || serve_udp_lane(&relay, &outbound, None, None));
 
     let stop = Arc::new(AtomicBool::new(false));
     let reader_stop = Arc::clone(&stop);

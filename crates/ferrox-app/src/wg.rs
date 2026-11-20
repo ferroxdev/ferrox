@@ -522,17 +522,23 @@ impl WireGuardOut {
                 }
                 Err(_) => break,
             };
-            quiet = Instant::now();
-            seen = replies.load(Ordering::Relaxed);
             if !crate::proxy::source_ip_ok(peer, src) {
+                if quiet.elapsed() >= crate::budgets::udp_idle() {
+                    break;
+                }
+                continue;
+            }
+            if app.is_some_and(|bound| bound != src) {
+                if quiet.elapsed() >= crate::budgets::udp_idle() {
+                    break;
+                }
                 continue;
             }
             let Some((dest, payload)) = crate::proxy::parse_socks_udp_dest(&buf[..n]) else {
                 continue;
             };
-            if app.is_some_and(|bound| bound != src) {
-                continue;
-            }
+            quiet = Instant::now();
+            seen = replies.load(Ordering::Relaxed);
             app = Some(src);
             if let Ok(mut slot) = source.lock() {
                 *slot = Some(src);

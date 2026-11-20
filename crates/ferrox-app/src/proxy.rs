@@ -1764,7 +1764,7 @@ pub(crate) fn dial_udp_through_proxy(
             let _source = SendThroughGuard::enter(source);
             let _target = TargetStrategyGuard::enter(strategy);
             let _tag = OutboundTag::enter(Some(&name));
-            serve_udp_lane_with(&relay, &out, None, source, sockopts.as_ref());
+            serve_udp_lane_with(&relay, &out, None, None, source, sockopts.as_ref());
             relay_stop.store(true, Ordering::Relaxed);
         })
         .is_err()
@@ -9184,7 +9184,7 @@ fn dns_udp_with(
         .name("ferrox-dns".to_owned())
         .spawn({
             let out = out.clone();
-            move || serve_udp_lane(&lane, &out, None)
+            move || serve_udp_lane(&lane, &out, None, None)
         })
         .ok()?;
     let mut framed = Vec::with_capacity(3 + 1 + 4 + 2 + query.len());
@@ -29393,7 +29393,7 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
         .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
             addr.ip()
         });
-    let Some(lane) = spawn_udp_lane(out, local, None) else {
+    let Some(lane) = spawn_udp_lane(out, local, None, Some(local)) else {
         return;
     };
     let lane_address = lane.address;
@@ -29412,10 +29412,7 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
             }
         }
         let (n, src) = match relay.recv_from(&mut buf) {
-            Ok(read) => {
-                quiet = Instant::now();
-                read
-            }
+            Ok(read) => read,
             Err(error) => {
                 if !is_timeout(&error) || quiet.elapsed() >= budgets::udp_idle() {
                     break;
@@ -29424,17 +29421,23 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
             }
         };
         if src == lane_address {
+            quiet = Instant::now();
             if let Some(client) = client_addr {
                 let _ = relay.send_to(&buf[..n], client);
             }
             continue;
         }
-        if !pin_datagram(peer, &mut pinned, src) {
+        if !source_admitted(peer, pinned, src) {
+            if quiet.elapsed() >= budgets::udp_idle() {
+                break;
+            }
             continue;
         }
         let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
             continue;
         };
+        quiet = Instant::now();
+        pin_address(&mut pinned, src);
         client_addr = Some(src);
         let mut dial = None;
         if let Some(sniffing) = crate::sniff::current().filter(|sniffing| sniffing.enabled()) {
@@ -29463,15 +29466,21 @@ fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
-    serve_udp_lane(&relay, out, Some(&client));
+    let peer = control_peer(Some(&client));
+    serve_udp_lane(&relay, out, Some(&client), peer);
 }
 
-/// One outbound's datagram lane over a relay socket. The association is `None` when the lane is
-/// itself an inner relay of a split association, whose control socket the splitter owns.
-pub(crate) fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Option<&Connection>) {
+/// One outbound's datagram lane over a relay socket. `peer` is where the relay's datagrams must
+/// come from: the control peer directly, or the splitter's own address for an inner lane.
+pub(crate) fn serve_udp_lane(
+    relay: &UdpSocket,
+    out: &Outbound,
+    associate: Option<&Connection>,
+    peer: Option<IpAddr>,
+) {
     let source = SEND_THROUGH.with(std::cell::Cell::take);
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
-    serve_udp_lane_with(relay, out, associate, source, sockopts.as_ref());
+    serve_udp_lane_with(relay, out, associate, peer, source, sockopts.as_ref());
 }
 
 #[allow(clippy::too_many_lines)]
@@ -29479,18 +29488,18 @@ fn serve_udp_lane_with(
     relay: &UdpSocket,
     out: &Outbound,
     associate: Option<&Connection>,
+    peer: Option<IpAddr>,
     source: Option<SendThrough>,
     sockopts: Option<&Arc<crate::sockopt::SocketOptions>>,
 ) {
     let _source = SendThroughGuard::enter(source);
     let _sockopts = DialSockoptsGuard::enter(sockopts.cloned());
     let sockopts = sockopts.map(Arc::as_ref);
-    let peer = control_peer(associate);
     match out {
         // Loopback is TCP-only in the reference; a routed front tag has no datagram lane.
         Outbound::Loopback(loopback) => {
             if let Some(dial) = &loopback.dial {
-                serve_udp_lane_with(relay, dial, associate, None, None);
+                serve_udp_lane_with(relay, dial, associate, peer, None, None);
             }
         }
         // Every carrier whose mux pool is open takes the same datagram lane: one XUDP flow per destination, framed by the carrier the opener dialled.
@@ -29707,19 +29716,24 @@ fn serve_socks_udp_split(
         }
         match relay.recv_from(&mut buf) {
             Ok((n, src)) => {
-                quiet = Instant::now();
                 if replies.contains(&src) {
+                    quiet = Instant::now();
                     if let Some(client) = client_addr {
                         let _ = relay.send_to(&buf[..n], client);
                     }
                     continue;
                 }
-                if !pin_datagram(peer, &mut pinned, src) {
+                if !source_admitted(peer, pinned, src) {
+                    if quiet.elapsed() >= budgets::udp_idle() {
+                        break;
+                    }
                     continue;
                 }
                 let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
                     continue;
                 };
+                quiet = Instant::now();
+                pin_address(&mut pinned, src);
                 let mut overridden = None;
                 let mut dial = None;
                 let mut protocol = None;
@@ -29769,12 +29783,13 @@ fn serve_socks_udp_split(
                 let lane_address = if let Some(tag) = key.as_deref() {
                     match retire_finished_lane(&mut lanes, &mut replies, tag) {
                         Some(address) => Some(address),
-                        None => spawn_udp_lane(&out, local, client.try_clone().ok()).map(|lane| {
-                            replies.insert(lane.address);
-                            let address = lane.address;
-                            lanes.insert(tag.to_owned(), lane);
-                            address
-                        }),
+                        None => spawn_udp_lane(&out, local, client.try_clone().ok(), Some(local))
+                            .map(|lane| {
+                                replies.insert(lane.address);
+                                let address = lane.address;
+                                lanes.insert(tag.to_owned(), lane);
+                                address
+                            }),
                     }
                 } else {
                     default_udp_lane(
@@ -29783,6 +29798,7 @@ fn serve_socks_udp_split(
                         &out,
                         local,
                         client.try_clone().ok(),
+                        Some(local),
                     )
                 };
                 if let Some(lane_address) = lane_address {
@@ -29840,6 +29856,7 @@ fn default_udp_lane(
     out: &Outbound,
     local: std::net::IpAddr,
     associate: Option<Connection>,
+    peer: Option<IpAddr>,
 ) -> Option<SocketAddr> {
     if let Some(running) = lane.as_ref().filter(|lane| !lane.handle.is_finished()) {
         return Some(running.address);
@@ -29847,7 +29864,7 @@ fn default_udp_lane(
     if let Some(finished) = lane.take() {
         replies.remove(&finished.address);
     }
-    let spawned = spawn_udp_lane(out, local, associate)?;
+    let spawned = spawn_udp_lane(out, local, associate, peer)?;
     replies.insert(spawned.address);
     let address = spawned.address;
     *lane = Some(spawned);
@@ -29864,6 +29881,7 @@ fn spawn_udp_lane(
     out: &Outbound,
     local: std::net::IpAddr,
     associate: Option<Connection>,
+    peer: Option<IpAddr>,
 ) -> Option<UdpLane> {
     let socket = UdpSocket::bind(SocketAddr::new(local, 0)).ok()?;
     let address = socket.local_addr().ok()?;
@@ -29877,7 +29895,7 @@ fn spawn_udp_lane(
         // The lane's own thread starts with the settings the pick left on this one.
         SEND_THROUGH.with(|cell| cell.set(source));
         DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
-        serve_udp_lane(&socket, &out, associate.as_ref());
+        serve_udp_lane(&socket, &out, associate.as_ref(), peer);
     });
     Some(UdpLane {
         address,
@@ -29982,7 +30000,7 @@ fn serve_socks_udp_client(
     loop {
         match relay.recv_from(&mut buf) {
             Ok((n, src)) => {
-                if !source_allowed(peer, &mut pinned, &source, src) {
+                if !source_admitted(peer, pinned, src) {
                     continue;
                 }
                 let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -29991,6 +30009,7 @@ fn serve_socks_udp_client(
                 if payload.is_empty() {
                     continue;
                 }
+                pin_source(&mut pinned, &source, src);
                 touch(&activity);
                 let forwarded = socks_udp_forwarded(&buf[..n], &dest, payload);
                 let sent = if let Some(whole) = forwarded {
@@ -30023,9 +30042,15 @@ fn serve_socks_udp_client(
 
 /// The peer of the association's control socket: a datagram from any other IP is not this client.
 pub(crate) fn control_peer(associate: Option<&Connection>) -> Option<IpAddr> {
-    associate
-        .and_then(|client| client.peer_addr().ok())
-        .map(|address| address.ip().to_canonical())
+    let client = associate?;
+    if let Ok(address) = client.peer_addr() {
+        return Some(address.ip().to_canonical());
+    }
+    // A unix control stream has no IP tuple; its UDP relay is bound to loopback.
+    client
+        .local_addr()
+        .is_err()
+        .then_some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
 }
 
 /// A datagram from any IP but the association's control peer is not this client.
@@ -30033,40 +30058,30 @@ pub(crate) fn source_ip_ok(peer: Option<IpAddr>, datagram: SocketAddr) -> bool {
     peer.is_none_or(|peer| datagram.ip().to_canonical() == peer)
 }
 
-/// A datagram belongs to the association only if it comes from the control peer IP and, after the first, from the same UDP source the client pinned.
-fn pin_datagram(
-    peer: Option<IpAddr>,
-    pinned: &mut Option<SocketAddr>,
-    datagram: SocketAddr,
-) -> bool {
-    if !source_ip_ok(peer, datagram) {
-        return false;
-    }
-    if let Some(allowed) = *pinned {
-        allowed == datagram
-    } else {
-        *pinned = Some(datagram);
-        true
-    }
+/// A datagram is admitted before parsing when it comes from the control peer and, after the first, from the same UDP source the client pinned.
+fn source_admitted(peer: Option<IpAddr>, pinned: Option<SocketAddr>, datagram: SocketAddr) -> bool {
+    source_ip_ok(peer, datagram) && pinned.is_none_or(|held| held == datagram)
 }
 
-/// A datagram belongs to the association only if it comes from the control peer and, after the first, from the same UDP source the client pinned.
-fn source_allowed(
-    peer: Option<IpAddr>,
+/// The first frame that parses pins the association's reply source.
+fn pin_source(
     pinned: &mut Option<SocketAddr>,
     source: &Mutex<Option<SocketAddr>>,
     datagram: SocketAddr,
-) -> bool {
-    let first = pinned.is_none();
-    if !pin_datagram(peer, pinned, datagram) {
-        return false;
-    }
-    if first {
+) {
+    if pinned.is_none() {
+        *pinned = Some(datagram);
         if let Ok(mut slot) = source.lock() {
             *slot = Some(datagram);
         }
     }
-    true
+}
+
+/// The first frame that parses pins the address its answers go to.
+fn pin_address(pinned: &mut Option<SocketAddr>, datagram: SocketAddr) {
+    if pinned.is_none() {
+        *pinned = Some(datagram);
+    }
 }
 
 /// The lane's idle is measured from the last datagram in either direction.
@@ -30221,7 +30236,7 @@ fn serve_socks_udp_freedom(
         };
         seen = replies.load(Ordering::Relaxed);
         // Only the control peer, then its first UDP source, may name a destination.
-        if !source_allowed(peer, &mut pinned, &source, src) {
+        if !source_admitted(peer, pinned, src) {
             continue;
         }
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -30234,6 +30249,7 @@ fn serve_socks_udp_freedom(
             continue;
         };
         let blocked = freedom.blocks(crate::router::Network::Udp, dest.ip(), dest.port());
+        pin_source(&mut pinned, &source, src);
         if let Some((socket, _, gate, _)) = uplinks.get(&dest) {
             if blocked {
                 continue;
@@ -30640,12 +30656,13 @@ fn serve_dns_udp(relay: &UdpSocket, dns: &DnsOut, peer: Option<IpAddr>) {
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
     let mut pinned = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
-        if !source_allowed(peer, &mut pinned, &source, src) {
+        if !source_admitted(peer, pinned, src) {
             continue;
         }
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
         };
+        pin_source(&mut pinned, &source, src);
         match ferrox_core::dns::decide(payload, &dns.rules, &dns_lookup) {
             ferrox_core::dns::Step::Quiet => {}
             ferrox_core::dns::Step::Reply(answer) => {
@@ -30757,17 +30774,22 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: Option<&Co
         for _ in 0..UDP_BURST {
             match relay.recv_from(&mut buf) {
                 Ok((n, src)) => {
-                    quiet = Instant::now();
-                    if !pin_datagram(peer, &mut pinned, src) {
+                    if !source_admitted(peer, pinned, src) {
+                        if quiet.elapsed() >= budgets::udp_idle() {
+                            ended = true;
+                            break;
+                        }
                         continue;
                     }
-                    client = Some(src);
                     let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
                         continue;
                     };
                     if payload.is_empty() {
                         continue;
                     }
+                    quiet = Instant::now();
+                    pin_address(&mut pinned, src);
+                    client = Some(src);
                     if let std::collections::hash_map::Entry::Vacant(slot) = streams.entry(dest) {
                         if let Some(lane) = foxy_udp_dial(foxy, &dest) {
                             slot.insert(lane);
@@ -30854,17 +30876,22 @@ fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: Option<
         for _ in 0..UDP_BURST {
             match relay.recv_from(&mut buf) {
                 Ok((n, src)) => {
-                    quiet = Instant::now();
-                    if !pin_datagram(peer, &mut pinned, src) {
+                    if !source_admitted(peer, pinned, src) {
+                        if quiet.elapsed() >= budgets::udp_idle() {
+                            ended = true;
+                            break;
+                        }
                         continue;
                     }
-                    client = Some(src);
                     let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
                         continue;
                     };
                     if payload.is_empty() {
                         continue;
                     }
+                    quiet = Instant::now();
+                    pin_address(&mut pinned, src);
+                    client = Some(src);
                     if width == 0
                         && !open_foxy_ip_tunnel(foxy, &mut tunnel, &mut source, &mut width)
                     {
@@ -31606,7 +31633,7 @@ fn serve_socks_udp_shadowsocks2022(
     let mut pinned = None;
     let multi = !method.is_chacha() && list.len() > 1;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
-        if !source_allowed(peer, &mut pinned, &source, src) {
+        if !source_admitted(peer, pinned, src) {
             continue;
         }
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -31615,6 +31642,7 @@ fn serve_socks_udp_shadowsocks2022(
         if payload.is_empty() {
             continue;
         }
+        pin_source(&mut pinned, &source, src);
         if multi {
             if let Some(packet) = datagrams.seal_list(method, &list, &dest, payload) {
                 let _ = uplink.send(packet);
@@ -31713,7 +31741,7 @@ fn serve_socks_udp_vmess(relay: &UdpSocket, vmess: &VmessOut, peer: Option<IpAdd
     let mut buf = udp_buffer();
     let mut pinned = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
-        if !source_allowed(peer, &mut pinned, &source, src) {
+        if !source_admitted(peer, pinned, src) {
             continue;
         }
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -31722,6 +31750,7 @@ fn serve_socks_udp_vmess(relay: &UdpSocket, vmess: &VmessOut, peer: Option<IpAdd
         if payload.is_empty() {
             continue;
         }
+        pin_source(&mut pinned, &source, src);
         // A reader that ended carries no more replies, so its carrier is discarded before this datagram rather than dropping the answer.
         let redial = match &uplink {
             Some(up) => {
@@ -31781,7 +31810,7 @@ fn serve_socks_udp_vless(relay: &UdpSocket, vless: &VlessOut, peer: Option<IpAdd
     let mut buf = udp_buffer();
     let mut pinned = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
-        if !source_allowed(peer, &mut pinned, &source, src) {
+        if !source_admitted(peer, pinned, src) {
             continue;
         }
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -31790,6 +31819,7 @@ fn serve_socks_udp_vless(relay: &UdpSocket, vless: &VlessOut, peer: Option<IpAdd
         if payload.is_empty() || !vless_udp_target_allowed(vless, &dest) {
             continue;
         }
+        pin_source(&mut pinned, &source, src);
         // A reader that ended carries no more replies, so its socket is discarded before this datagram rather than dropping the answer.
         let redial = match &uplink {
             Some(up) => {
@@ -31876,7 +31906,7 @@ fn serve_socks_udp_pool<F, G>(
     let mut said_reject = false;
     let mut said_skip = false;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
-        if !source_allowed(peer, &mut pinned, &source, src) {
+        if !source_admitted(peer, pinned, src) {
             continue;
         }
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -31896,6 +31926,7 @@ fn serve_socks_udp_pool<F, G>(
                 continue;
             }
             Udp443::Skip => {
+                pin_source(&mut pinned, &source, src);
                 if !skip(relay, src, dest, &mut buf, at, len) && !said_skip {
                     said_skip = true;
                 }
@@ -31911,6 +31942,7 @@ fn serve_socks_udp_pool<F, G>(
         if len > limit {
             continue;
         }
+        pin_source(&mut pinned, &source, src);
         let id = if nat {
             Some(*identity.get_or_insert_with(|| xudp_identity(src)))
         } else {
@@ -32076,7 +32108,7 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut, peer: Option<Ip
     let mut trojan_head = Vec::with_capacity(32);
     let mut pinned = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
-        if !source_allowed(peer, &mut pinned, &source, src) {
+        if !source_admitted(peer, pinned, src) {
             continue;
         }
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -32088,6 +32120,7 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut, peer: Option<Ip
         if matches!(trojan.mux.udp_443(dest), Udp443::Reject) {
             continue;
         }
+        pin_source(&mut pinned, &source, src);
         if uplink.is_none() {
             uplink = dial_trojan_udp_uplink(trojan, &dest, relay, Arc::clone(&source));
         }
@@ -58934,7 +58967,7 @@ mod tests {
         let echo_port = udp_echo_loop();
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let relay_addr = relay.local_addr().expect("addr");
-        thread::spawn(move || serve_udp_lane(&relay, &out, None));
+        thread::spawn(move || serve_udp_lane(&relay, &out, None, None));
         let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
         source
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -59033,7 +59066,7 @@ mod tests {
         let out = Outbound::Vless(vless);
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let relay_addr = relay.local_addr().expect("addr");
-        thread::spawn(move || serve_udp_lane(&relay, &out, None));
+        thread::spawn(move || serve_udp_lane(&relay, &out, None, None));
         let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
         source
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -62964,23 +62997,34 @@ mod tests {
         let client = SocketAddr::from(([127, 0, 0, 1], 4000));
         let slot = Mutex::new(None);
         let mut pinned = None;
-        assert!(source_allowed(peer, &mut pinned, &slot, client));
+        assert!(source_admitted(peer, pinned, client));
+        pin_source(&mut pinned, &slot, client);
         assert_eq!(pinned, Some(client));
         assert_eq!(*slot.lock().expect("slot"), Some(client));
-        assert!(!source_allowed(
+        assert!(!source_admitted(
             peer,
-            &mut pinned,
-            &slot,
+            pinned,
             SocketAddr::from(([127, 0, 0, 1], 4001))
         ));
-        assert!(!source_allowed(
+        assert!(!source_admitted(
             peer,
-            &mut pinned,
-            &slot,
+            pinned,
             SocketAddr::from(([127, 0, 0, 2], 4000))
         ));
         let mut unpinned = None;
-        assert!(source_allowed(None, &mut unpinned, &slot, client));
+        assert!(source_admitted(None, unpinned, client));
+        pin_source(&mut unpinned, &slot, client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_control_peer_falls_back_to_loopback() {
+        let (side, _peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let control = Connection::Unix(side.into());
+        assert_eq!(
+            control_peer(Some(&control)),
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
     }
 
     #[test]
@@ -63002,7 +63046,14 @@ mod tests {
         echo.set_read_timeout(Some(Duration::from_millis(50)))
             .expect("timeout");
         let out = Outbound::Freedom(Arc::new(FreedomOut::default()));
-        let serving = thread::spawn(move || serve_udp_lane(&relay, &out, Some(&associate)));
+        let serving = thread::spawn(move || {
+            serve_udp_lane(
+                &relay,
+                &out,
+                Some(&associate),
+                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            )
+        });
         let mut head = Vec::new();
         let frame = socks_udp_frame(&mut head, &echo_addr, b"spoof");
         attacker.send_to(frame, relay_addr).expect("sends");
@@ -74155,7 +74206,7 @@ mod tests {
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let relay_addr = relay.local_addr().expect("addr");
         let out = out;
-        thread::spawn(move || serve_udp_lane(&relay, &out, None));
+        thread::spawn(move || serve_udp_lane(&relay, &out, None, None));
         let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
         source
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -74210,7 +74261,7 @@ mod tests {
         });
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let relay_addr = relay.local_addr().expect("addr");
-        thread::spawn(move || serve_udp_lane(&relay, &out, None));
+        thread::spawn(move || serve_udp_lane(&relay, &out, None, None));
         let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
         source
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -78947,7 +78998,8 @@ mod tests {
         let plan = RoutePlan::new(shared, None, None, false);
         let lane = plan.udp_out(&Association::Default).expect("a lane");
         let out = Outbound::clone(&lane);
-        let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None).expect("a lane");
+        let lane =
+            spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None, None).expect("a lane");
         let client = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("client");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -79263,7 +79315,7 @@ mod tests {
         let picked = plan.udp_out(&Association::Default).expect("a lane");
         let out = Outbound::clone(&picked);
         let lane =
-            spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None).expect("a udp lane");
+            spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None, None).expect("a udp lane");
         let client = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("client");
         client
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -79758,7 +79810,7 @@ mod tests {
             });
             let out = Outbound::clone(&lane);
             let lane =
-                spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None).expect("a lane");
+                spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None, None).expect("a lane");
             let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
             client
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -79792,7 +79844,8 @@ mod tests {
             }
         });
         let out = Outbound::Freedom(Arc::new(FreedomOut::default()));
-        let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None).expect("a lane");
+        let lane =
+            spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None, None).expect("a lane");
         let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -79829,7 +79882,7 @@ mod tests {
                 }
             });
             let lane =
-                spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None).expect("a lane");
+                spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None, None).expect("a lane");
             let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
             client
                 .set_read_timeout(Some(Duration::from_secs(1)))
@@ -81540,15 +81593,16 @@ end
         let slot: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
         let mut pinned = None;
         assert!(
-            source_allowed(None, &mut pinned, &slot, first),
+            source_admitted(None, pinned, first),
             "the first sender opens the association"
         );
+        pin_source(&mut pinned, &slot, first);
         assert!(
-            source_allowed(None, &mut pinned, &slot, first),
+            source_admitted(None, pinned, first),
             "a repeat from the pinned peer keeps"
         );
         assert!(
-            !source_allowed(None, &mut pinned, &slot, other),
+            !source_admitted(None, pinned, other),
             "a different address does not rebind the reply destination"
         );
         assert_eq!(
