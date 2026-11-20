@@ -3,9 +3,9 @@
 //! The script reads the same context a rule does and returns an outbound tag; the modules it can
 //! `require` are rebuilt here from this tree's matchers, not linked from a Lua runtime.
 
+use super::{Picker, Resolver, ScriptCallbacks};
 use crate::json::Json;
 use crate::router::{add_domain, ip_matcher, Assets, DomainMatcher, Flow, IpMatcher, Network};
-use super::{Picker, Resolver, ScriptCallbacks};
 use mlua::{
     AnyUserData, Error as LuaError, HookTriggers, Lua, LuaOptions, MetaMethod, Result as LuaResult,
     StdLib, Table, UserData, UserDataMethods, Value, Variadic, VmState,

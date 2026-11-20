@@ -15,7 +15,6 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
 
-use tun_rs::SyncDevice;
 #[cfg(not(any(
     target_os = "android",
     target_os = "ios",
@@ -24,6 +23,7 @@ use tun_rs::SyncDevice;
     target_os = "visionos",
 )))]
 use tun_rs::DeviceBuilder;
+use tun_rs::SyncDevice;
 
 #[cfg(target_os = "linux")]
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};

@@ -4,6 +4,7 @@
 //! `require` are rebuilt here from this tree's matchers, not linked from a Lua runtime.
 
 use std::net::IpAddr;
+#[cfg(target_os = "ios")]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -43,7 +44,9 @@ impl std::fmt::Debug for ScriptRouter {
 #[cfg(target_os = "ios")]
 impl ScriptRouter {
     pub(crate) fn parse_in(path: &str, _dirs: Vec<PathBuf>) -> Result<Self, String> {
-        eprintln!("routing script `{path}`: this platform has no Lua runtime, so the script is not run");
+        eprintln!(
+            "routing script `{path}`: this platform has no Lua runtime, so the script is not run"
+        );
         Ok(Self)
     }
 
