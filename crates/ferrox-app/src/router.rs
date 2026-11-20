@@ -1287,29 +1287,45 @@ impl Routing {
     }
 
     /// Carry rules the management API added across a geodata reparse. The startup config does not
-    /// contain them, so replacing the table wholesale would make a later `AddRule` rule vanish.
-    pub(crate) fn adopt_added_rules(&mut self, old: &mut Self) {
+    /// contain them, so replacing the table wholesale would make a later `AddRule` rule vanish. A
+    /// managed rule that no longer parses fails the reload before `old` is touched.
+    pub(crate) fn adopt_added_rules(&mut self, old: &mut Self) -> Result<(), String> {
+        struct Managed {
+            rule: Option<Rule>,
+            original: bool,
+        }
         let replaced = old.added_replaced;
-        let removed = std::mem::take(&mut old.removed_tags);
+        let mut assets = Assets::new(self.asset_dirs.clone());
+        let mut managed = Vec::new();
+        for rule in old.rules.iter().filter(|rule| rule.added) {
+            let Some(raw) = &rule.raw else {
+                managed.push(Managed {
+                    rule: None,
+                    original: true,
+                });
+                continue;
+            };
+            let fresh = Rule::parse(raw, &mut assets, &self.rule_sets)?.map(|mut fresh| {
+                fresh.added = true;
+                fresh.raw = Some(raw.clone());
+                fresh
+            });
+            managed.push(Managed {
+                rule: fresh,
+                original: false,
+            });
+        }
+        let removed = old.removed_tags.clone();
         let added: Vec<Rule> = std::mem::take(&mut old.rules)
             .into_iter()
             .filter(|rule| rule.added)
             .collect();
-        let mut assets = Assets::new(self.asset_dirs.clone());
         let mut kept = Vec::with_capacity(added.len());
-        for mut rule in added {
-            let Some(raw) = rule.raw.take() else {
+        for (rule, managed) in added.into_iter().zip(managed) {
+            if managed.original {
                 kept.push(rule);
-                continue;
-            };
-            match Rule::parse(&raw, &mut assets, &self.rule_sets) {
-                Ok(Some(mut fresh)) => {
-                    fresh.added = true;
-                    fresh.raw = Some(raw);
-                    kept.push(fresh);
-                }
-                Ok(None) => {}
-                Err(error) => eprintln!("routing rule set: {error}"),
+            } else if let Some(fresh) = managed.rule {
+                kept.push(fresh);
             }
         }
         if replaced {
@@ -1323,6 +1339,7 @@ impl Routing {
         }
         self.removed_tags = removed;
         self.refresh();
+        Ok(())
     }
 
     /// Append a decoded `AddRule` rule list, or replace the table with it when `append` is false.
@@ -6520,7 +6537,7 @@ mod tests {
         let mut next = Routing::parse_in(&root, Vec::new())
             .expect("parses")
             .expect("routing");
-        next.adopt_added_rules(&mut routing);
+        next.adopt_added_rules(&mut routing).expect("adopts");
         let flow = Flow {
             network: Network::Tcp,
             domain: Some("added.test"),
@@ -6586,7 +6603,7 @@ mod tests {
         let mut next = Routing::parse_in(&root("new.test"), Vec::new())
             .expect("parses")
             .expect("routing");
-        next.adopt_added_rules(&mut routing);
+        next.adopt_added_rules(&mut routing).expect("adopts");
         let flow = Flow {
             network: Network::Tcp,
             domain: Some("new.test"),
@@ -6612,6 +6629,66 @@ mod tests {
             None,
             "the managed rule uses the reloaded set contents"
         );
+    }
+
+    #[test]
+    fn a_managed_rule_that_no_longer_parses_keeps_the_old_table() {
+        let with_set = object(vec![(
+            "routing",
+            object(vec![(
+                "ruleSets",
+                array(vec![object(vec![
+                    ("tag", text("set")),
+                    ("type", text("inline")),
+                    (
+                        "rules",
+                        array(vec![object(vec![(
+                            "domain",
+                            array(vec![text("old.test")]),
+                        )])]),
+                    ),
+                ])]),
+            )]),
+        )]);
+        let without_set = object(vec![("routing", object(vec![]))]);
+        let mut routing = Routing::parse_in(&with_set, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        routing
+            .add_rules(
+                &[rule(
+                    "block",
+                    vec![
+                        ("ruleTag", text("managed")),
+                        ("ruleSet", array(vec![text("set")])),
+                    ],
+                )],
+                true,
+                |tag| tag == "block",
+                &[],
+            )
+            .expect("adds");
+        let mut next = Routing::parse_in(&without_set, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        assert!(next.adopt_added_rules(&mut routing).is_err());
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("old.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        assert_eq!(routing.route(&flow), Some("block"));
     }
 
     #[test]
@@ -6643,7 +6720,7 @@ mod tests {
         let mut next = Routing::parse_in(&root, Vec::new())
             .expect("parses")
             .expect("routing");
-        next.adopt_added_rules(&mut routing);
+        next.adopt_added_rules(&mut routing).expect("adopts");
         let flow = Flow {
             network: Network::Tcp,
             domain: Some("replacement.test"),
@@ -6903,7 +6980,7 @@ mod tests {
         let mut next = Routing::parse_in(&root, Vec::new())
             .expect("parses")
             .expect("routing");
-        next.adopt_added_rules(&mut routing);
+        next.adopt_added_rules(&mut routing).expect("adopts");
         let flow = Flow {
             network: Network::Tcp,
             domain: Some("startup.test"),

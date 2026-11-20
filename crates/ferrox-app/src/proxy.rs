@@ -2766,8 +2766,8 @@ impl RouteShared {
             .routing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        next.adopt_added_rules(&mut current)?;
         next.adopt_balancer_state(&mut current);
-        next.adopt_added_rules(&mut current);
         *current = next;
         Ok(())
     }
