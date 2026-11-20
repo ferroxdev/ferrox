@@ -196,6 +196,7 @@ jobs:
     concurrency:
       group: release-publish-${{ needs.plan.outputs.version }}
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: write
     steps:
@@ -431,6 +432,7 @@ jobs:
     concurrency:
       group: release-publish-${{ needs.plan.outputs.version }}
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: write
     steps:

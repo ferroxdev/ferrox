@@ -337,4 +337,4 @@ jobs:
         with:
           title: benchmark-matrix
           needs: ${{ toJSON(needs) }}
-          artifacts: benchmark-matrix-tables-${{ github.run_id }}
+          artifacts: ${{ needs.refresh.result == 'success' && format('benchmark-matrix-tables-{0}', github.run_id) || '' }}
