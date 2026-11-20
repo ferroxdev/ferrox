@@ -292,6 +292,7 @@ fn connection(
     let mut wire = Wire {
         stream: Box::new(tls),
         pending: Vec::new(),
+        init: 0,
         closed: false,
         deadline,
     };
@@ -357,6 +358,7 @@ fn cleartext_wire(stream: Connection) -> Wire {
     Wire {
         stream: Box::new(io),
         pending: Vec::new(),
+        init: 0,
         closed: false,
         deadline,
     }
@@ -365,6 +367,7 @@ fn cleartext_wire(stream: Connection) -> Wire {
 struct Wire {
     stream: Box<dyn ReadWrite + Send>,
     pending: Vec<u8>,
+    init: usize,
     closed: bool,
     deadline: Deadline,
 }
@@ -392,16 +395,20 @@ impl Wire {
     /// One read: the caller's wait is the socket's timeout, so a quiet peer
     /// parks here rather than spinning.
     fn fill(&mut self) -> bool {
-        let mut room = [0u8; READ_ROOM];
-        match self.stream.read(&mut room) {
+        // SAFETY: `init` is the first byte no earlier read initialised, and every byte below it is zeroed or was written by a read that kept its length.
+        match unsafe {
+            crate::proxy::read_into_tail_room(
+                &mut self.stream,
+                &mut self.pending,
+                &mut self.init,
+                READ_ROOM,
+            )
+        } {
             Ok(0) => {
                 self.closed = true;
                 false
             }
-            Ok(n) => {
-                self.pending.extend_from_slice(&room[..n]);
-                true
-            }
+            Ok(_) => true,
             Err(error) if ferrox_core::tls::TlsError::is_timeout(&error) => {
                 if self.deadline.remaining().is_some_and(|left| left.is_zero()) {
                     self.closed = true;
@@ -611,6 +618,7 @@ fn handshake(
         wire: Wire {
             stream,
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline,
         },
@@ -1986,6 +1994,7 @@ mod tests {
             wire: Wire {
                 stream: Box::new(std::io::Cursor::new(Vec::new())),
                 pending: Vec::new(),
+                init: 0,
                 closed: false,
                 deadline: Deadline::default(),
             },
@@ -2151,6 +2160,7 @@ mod tests {
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2220,6 +2230,7 @@ mod tests {
         let mut wire = Wire {
             stream: Box::new(Counting(Arc::clone(&out), Arc::clone(&writes))),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2257,6 +2268,7 @@ mod tests {
                 writes: Arc::clone(&writes),
             }),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2295,6 +2307,7 @@ mod tests {
                 writes: Arc::clone(&writes),
             }),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2351,6 +2364,7 @@ mod tests {
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2430,6 +2444,7 @@ mod tests {
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2547,6 +2562,7 @@ mod tests {
                 left: 2,
             }),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2566,6 +2582,7 @@ mod tests {
                 left: 0,
             }),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2585,6 +2602,7 @@ mod tests {
         let mut wire = Wire {
             stream: Box::new(Quiet { reads: 1_000 }),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline,
         };
@@ -2598,6 +2616,7 @@ mod tests {
         let mut wire = Wire {
             stream: Box::new(Quiet { reads: 1_000 }),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2614,6 +2633,7 @@ mod tests {
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2800,6 +2820,7 @@ mod tests {
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2823,6 +2844,7 @@ mod tests {
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2847,6 +2869,7 @@ mod tests {
                 writes: Arc::new(AtomicUsize::new(0)),
             }),
             pending: Vec::new(),
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };

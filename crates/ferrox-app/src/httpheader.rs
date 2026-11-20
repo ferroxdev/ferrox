@@ -137,9 +137,9 @@ fn decode_path(path: &str) -> Option<std::borrow::Cow<'_, [u8]>> {
             at += 1;
             continue;
         }
-        let high = (*bytes.get(at + 1)? as char).to_digit(16)?;
-        let low = (*bytes.get(at + 2)? as char).to_digit(16)?;
-        out.push((high * 16 + low) as u8);
+        let high = hex_digit(*bytes.get(at + 1)?)?;
+        let low = hex_digit(*bytes.get(at + 2)?)?;
+        out.push(high * 16 + low);
         at += 3;
     }
     Some(std::borrow::Cow::Owned(out))
@@ -248,8 +248,7 @@ fn response_body(head: &[u8], status: u16) -> Option<Body> {
         let (name, value) = line.split_at(colon);
         let value = trim_ows(&value[1..]);
         if name.eq_ignore_ascii_case(b"content-length") {
-            let value = std::str::from_utf8(value).ok()?;
-            let parsed = value.parse::<usize>().ok()?;
+            let parsed = parse_decimal(value)?;
             if length.is_some_and(|held| held != parsed) {
                 return None;
             }
@@ -269,6 +268,46 @@ fn response_body(head: &[u8], status: u16) -> Option<Body> {
         Some(Body::None)
     } else {
         Some(Body::Close)
+    }
+}
+
+/// The decimal integer `str::parse::<usize>` would read, without the UTF-8 validation and
+/// the generic parser: an optional `+`, at least one digit, and a checked widening.
+fn parse_decimal(value: &[u8]) -> Option<usize> {
+    let value = value.strip_prefix(b"+").unwrap_or(value);
+    let digits = value.first().filter(|byte| byte.is_ascii_digit())?;
+    let mut number = usize::from(*digits - b'0');
+    for byte in &value[1..] {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        number = number
+            .checked_mul(10)?
+            .checked_add(usize::from(*byte - b'0'))?;
+    }
+    Some(number)
+}
+
+/// The hexadecimal integer `usize::from_str_radix(_, 16)` would read, over the same accepted
+/// alphabet, for a chunk size line that has already had its extension cut.
+fn parse_hex(value: &[u8]) -> Option<usize> {
+    let value = value.strip_prefix(b"+").unwrap_or(value);
+    let digits = value.first().filter(|byte| byte.is_ascii_hexdigit())?;
+    let mut number = usize::from(hex_digit(*digits)?);
+    for byte in &value[1..] {
+        number = number
+            .checked_mul(16)?
+            .checked_add(usize::from(hex_digit(*byte)?))?;
+    }
+    Some(number)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -540,7 +579,7 @@ fn skip_chunked_body<R: Read + crate::proxy::RelayPoll>(
     loop {
         let line = chunks.line(until)?;
         let size = trim_ows(line.split(|byte| *byte == b';').next()?);
-        let size = usize::from_str_radix(std::str::from_utf8(size).ok()?, 16).ok()?;
+        let size = parse_hex(size)?;
         if size == 0 {
             loop {
                 let line = chunks.line(until)?;
@@ -1180,5 +1219,50 @@ mod tests {
             .expect("writes");
         server.join().expect("joins");
         drop(stream);
+    }
+
+    #[test]
+    fn the_narrow_decimal_reader_is_the_standard_one() {
+        for text in [
+            "",
+            "+",
+            "-1",
+            "0",
+            "+0",
+            "007",
+            "42",
+            " 42",
+            "42 ",
+            "4x",
+            "٣",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            let standard = text.parse::<usize>().ok();
+            assert_eq!(parse_decimal(text.as_bytes()), standard, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_narrow_hex_reader_is_the_standard_one() {
+        for text in [
+            "",
+            "+",
+            "-1",
+            "0",
+            "+0",
+            "00ff",
+            "FF",
+            "a",
+            "g",
+            " 10",
+            "10 ",
+            "0x10",
+            "ffffffffffffffff",
+            "10000000000000000",
+        ] {
+            let standard = usize::from_str_radix(text, 16).ok();
+            assert_eq!(parse_hex(text.as_bytes()), standard, "{text:?}");
+        }
     }
 }
