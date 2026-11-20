@@ -2256,7 +2256,7 @@ fn socket_table_names(path: &std::path::Path) -> Option<bool> {
         let table = std::fs::read("/proc/net/unix").ok()?;
         let mut unknown_staged = false;
         for line in table.split(|byte| *byte == b'\n').skip(1) {
-            let Some((listed, _listening, listed_inode)) = proc_unix_entry(line) else {
+            let Some((listed, listening, listed_inode)) = proc_unix_entry(line) else {
                 continue;
             };
             if listed == wanted {
@@ -2270,10 +2270,11 @@ fn socket_table_names(path: &std::path::Path) -> Option<bool> {
                 StagedClaim::Owned => return Some(true),
                 StagedClaim::Other => {}
                 StagedClaim::Unknown => {
-                    if let Ok(listed) = std::str::from_utf8(listed) {
-                        if staged_sibling(listed, path) {
-                            unknown_staged = true;
-                        }
+                    if listening
+                        && std::str::from_utf8(listed)
+                            .is_ok_and(|listed| staged_sibling(listed, path))
+                    {
+                        unknown_staged = true;
                     }
                 }
             }
@@ -2341,11 +2342,11 @@ struct StagedBinding {
 static STAGED_BINDINGS: std::sync::Mutex<Vec<StagedBinding>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-fn register_staged(inner: &std::path::Path, published: &std::path::Path) {
-    use std::os::unix::fs::MetadataExt as _;
-    let identity = std::fs::symlink_metadata(published)
-        .ok()
-        .map(|meta| (meta.dev(), meta.ino()));
+fn register_staged(
+    inner: &std::path::Path,
+    published: &std::path::Path,
+    identity: Option<(u64, u64)>,
+) {
     STAGED_BINDINGS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2367,10 +2368,14 @@ pub(crate) struct StagedRegistration {
 
 #[cfg(unix)]
 impl StagedRegistration {
-    fn new(inner: &std::path::Path, published: &std::path::Path) -> Self {
+    fn new(
+        inner: &std::path::Path,
+        published: &std::path::Path,
+        identity: Option<(u64, u64)>,
+    ) -> Self {
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
         {
-            register_staged(inner, published);
+            register_staged(inner, published, identity);
             Self {
                 inner: inner.to_path_buf(),
                 published: published.to_path_buf(),
@@ -2378,7 +2383,7 @@ impl StagedRegistration {
         }
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         {
-            let _ = (inner, published);
+            let _ = (inner, published, identity);
             Self {}
         }
     }
@@ -2413,11 +2418,11 @@ fn staged_claim(listed: &[u8], path: &std::path::Path) -> StagedClaim {
         if binding.inner.as_os_str().as_encoded_bytes() != listed {
             continue;
         }
-        // The published name can be re-created independently, so the registration only claims the object it published.
+        // The registration claims only the object it published, so a re-created path or an alias name still points at that object.
         let current = std::fs::symlink_metadata(path)
             .ok()
             .map(|meta| (meta.dev(), meta.ino()));
-        return if binding.published == path && binding.identity == current {
+        return if binding.identity.is_some() && binding.identity == current {
             StagedClaim::Owned
         } else {
             StagedClaim::Other
@@ -2464,20 +2469,20 @@ fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
         if len >= RECORD {
             let record = &table[at..at + len];
             let options = u16::from_le_bytes([record[OPTIONS_OFFSET], record[OPTIONS_OFFSET + 1]]);
-            if options & 0x0002 != 0 {
-                let raw = &record[PATH_OFFSET..];
-                if let Some(end) = raw.iter().position(|byte| *byte == 0) {
-                    if let Ok(listed) = std::str::from_utf8(&raw[..end]) {
-                        if same_socket_object(std::path::Path::new(listed), path) {
-                            return Some(true);
-                        }
-                        match staged_claim(listed.as_bytes(), path) {
-                            StagedClaim::Owned => return Some(true),
-                            StagedClaim::Other => {}
-                            StagedClaim::Unknown if staged_sibling(listed, path) => {
+            let listening = options & 0x0002 != 0;
+            let raw = &record[PATH_OFFSET..];
+            if let Some(end) = raw.iter().position(|byte| *byte == 0) {
+                if let Ok(listed) = std::str::from_utf8(&raw[..end]) {
+                    match staged_claim(listed.as_bytes(), path) {
+                        StagedClaim::Owned => return Some(true),
+                        StagedClaim::Other => {}
+                        StagedClaim::Unknown => {
+                            // A current name lookup cannot prove the PCB's bind identity, so a matching row is inconclusive rather than live.
+                            if same_socket_object(std::path::Path::new(listed), path)
+                                || (listening && staged_sibling(listed, path))
+                            {
                                 unknown_staged = true;
                             }
-                            StagedClaim::Unknown => {}
                         }
                     }
                 }
@@ -3234,11 +3239,15 @@ fn bind_staged(
             Err(error) => return Err(error),
         }
         let published = (|| {
+            use std::os::unix::fs::MetadataExt as _;
             let listener = UnixListener::bind(&inner)?;
             std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(mode))?;
+            let identity = std::fs::symlink_metadata(&inner)
+                .ok()
+                .map(|meta| (meta.dev(), meta.ino()));
             take_stale(path, stale)?;
             std::fs::hard_link(&inner, path)?;
-            Ok((listener, StagedRegistration::new(&inner, path)))
+            Ok((listener, StagedRegistration::new(&inner, path, identity)))
         })();
         let _ = std::fs::remove_file(&inner);
         let _ = std::fs::remove_dir(&dir);
@@ -5003,6 +5012,39 @@ mod tests {
             "the live listener keeps its path"
         );
         drop(listener);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A mode-bearing path recovers once its listener closes even while an accepted connection still holds the private staging name.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn a_unix_staged_path_recovers_while_an_accepted_connection_stays_open() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-unix-staged-accepted-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let target = parse_target(&format!("unix:{},0750", path.display())).expect("parses");
+        let listener = Listener::bind(&target).expect("binds under the staged mode");
+        let client = std::os::unix::net::UnixStream::connect(&path).expect("connects a client");
+        let accepted = match &listener {
+            Listener::Unix { listener, .. } => listener.accept().expect("accepts the client").0,
+            _ => panic!("a unix target binds a unix listener"),
+        };
+        drop(listener);
+        assert_eq!(
+            socket_table_names(&path),
+            Some(false),
+            "the accepted connection does not own the published path"
+        );
+        let recovered = Listener::bind(&target).expect("the path is free again");
+        drop(recovered);
+        drop(accepted);
+        drop(client);
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
