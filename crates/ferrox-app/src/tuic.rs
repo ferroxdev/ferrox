@@ -3110,7 +3110,9 @@ mod tests {
         let address = Some((wire::Address::V4([192, 0, 2, 1]), 53));
         let payload = vec![7u8; 32];
         let mut reassembly = HashMap::new();
-        let stale = Instant::now() - REASSEMBLY_TTL - Duration::from_secs(1);
+        let stale = Instant::now()
+            .checked_sub(REASSEMBLY_TTL + Duration::from_secs(1))
+            .expect("the process has run for six seconds");
         for index in 0..MAX_REASSEMBLIES as u16 {
             reassembly.insert(
                 (1, index),
