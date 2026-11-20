@@ -3920,6 +3920,7 @@ mod tests {
                 by_client_cid: HashMap::new(),
                 by_initial_dcid: HashMap::new(),
                 retired: Vec::new(),
+                streams: Vec::new(),
             };
             router.idle();
             stop.load(Ordering::Relaxed)
@@ -3959,6 +3960,7 @@ mod tests {
             by_client_cid: HashMap::new(),
             by_initial_dcid: HashMap::new(),
             retired: Vec::new(),
+            streams: Vec::new(),
         };
         let mut template = server_template(&hysteria::Config::default());
         let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
@@ -4094,6 +4096,7 @@ mod tests {
             by_client_cid: HashMap::from([(client, key.clone())]),
             by_initial_dcid: HashMap::from([(initial, key)]),
             retired: Vec::new(),
+            streams: Vec::new(),
         };
         router.idle();
         assert!(router.routes.is_empty());

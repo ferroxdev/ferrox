@@ -74833,9 +74833,13 @@ mod tests {
         .expect("prepares");
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
         let serve: crate::hysteria::Serve = Arc::new(move |flow| {
             let _ = entered_tx.send(());
-            let _ = release_rx.recv();
+            let _ = release_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv();
             drop(flow);
         });
         let stop = Arc::new(Stop::default());
