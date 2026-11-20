@@ -1550,7 +1550,7 @@ impl GrpcWriter {
     /// the peer has left, so the read leaves as one message the peer can pay for rather than one it
     /// parks on. The envelopes and tags of a four-element `64 KiB` read cost at most `64` bytes; one
     /// `Hunk` costs at most `16`, and the same `16` leaves a `64 KiB` read one message.
-    pub(crate) fn read_window(&self) -> usize {
+    pub(crate) fn read_window(&self) -> Option<usize> {
         let init = self.opening_cap();
         let send = self
             .shared
@@ -1565,9 +1565,11 @@ impl GrpcWriter {
             16
         };
         let limit = usize::try_from(available).unwrap_or(usize::MAX);
-        limit
-            .saturating_sub(margin)
-            .clamp(1, crate::proxy::RELAY_BUFFER)
+        Some(
+            limit
+                .saturating_sub(margin)
+                .clamp(1, crate::proxy::RELAY_BUFFER),
+        )
     }
 
     /// The same offer as `try_send`, but a `MultiHunk` batch: consecutive elements are gathered
@@ -3601,7 +3603,7 @@ impl crate::proxy::CarrierSink for GrpcWriter {
     }
     #[inline]
     fn read_window(&self) -> Option<usize> {
-        Some(GrpcWriter::read_window(self))
+        GrpcWriter::read_window(self)
     }
     #[inline]
     fn settle(&self) -> Settle {
@@ -4607,7 +4609,7 @@ mod tests {
     fn a_relay_read_gathers_its_frames_into_one_write() {
         let peer = Arc::new(Mutex::new(Peer::default()));
         let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, u64::MAX);
-        let read = writer.read_window();
+        let read = writer.read_window().expect("the window pays for a read");
         assert_eq!(read, 65_519, "the opening window's read, less the envelope");
         let data: Vec<u8> = (0..read).map(|i| (i % 251) as u8).collect();
         let body = message(&data);
@@ -4829,7 +4831,9 @@ mod tests {
     fn a_multi_relay_read_at_the_peer_window_is_one_message() {
         let peer = Arc::new(Mutex::new(Peer::default()));
         let writer = multi_writer_over(Recorder(Arc::clone(&peer)), HUNK, 65_535, 65_535);
-        let len = writer.read_window();
+        let len = writer
+            .read_window()
+            .expect("multi mode limits the relay read");
         assert_eq!(len, 65_471, "the window less the envelope and tags");
         let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
         let base = data.as_ptr() as usize;
@@ -4874,7 +4878,7 @@ mod tests {
     fn a_multi_relay_read_never_asks_past_the_connection_window() {
         let peer = Arc::new(Mutex::new(Peer::default()));
         let writer = multi_writer_over(Recorder(Arc::clone(&peer)), HUNK, 65_535, 1_000_000);
-        assert_eq!(writer.read_window(), 65_471);
+        assert_eq!(writer.read_window(), Some(65_471));
     }
 
     /// A small peer window is still usable: the relay's read fits one message, and the next read
@@ -4883,7 +4887,9 @@ mod tests {
     fn a_multi_read_fits_a_small_window_and_follows_credit() {
         let peer = Arc::new(Mutex::new(Peer::default()));
         let writer = multi_writer_over(Recorder(Arc::clone(&peer)), HUNK, 10_000, 1_000_000);
-        let len = writer.read_window();
+        let len = writer
+            .read_window()
+            .expect("multi mode limits the relay read");
         assert_eq!(len, 9_984);
         assert!(matches!(
             writer.try_send(&vec![0u8; len]),
@@ -4908,7 +4914,7 @@ mod tests {
             next.try_send(&vec![0u8; 8_000]),
             crate::proxy::Push::Took(8_000)
         ));
-        assert_eq!(next.read_window(), 1_976);
+        assert_eq!(next.read_window(), Some(1_976));
     }
 
     /// A multi write splits at the connection window even when the stream starts larger, so the
@@ -5210,7 +5216,7 @@ mod tests {
             HUNK,
             u64::MAX,
         );
-        let read = probe.read_window();
+        let read = probe.read_window().expect("the window pays for a read");
         let data: Vec<u8> = (0..read).map(|i| (i % 251) as u8).collect();
         let body = message(&data);
         let want: Vec<u8> = body
