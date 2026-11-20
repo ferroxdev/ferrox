@@ -1442,6 +1442,7 @@ fn inbound_role(inbound: &Json, role: Role) -> Role {
     }
 }
 
+#[cfg(test)]
 fn serve_vless_inbound(
     address: &str,
     inbound: &Json,
@@ -1506,8 +1507,7 @@ fn serve_vless_inbound_wake(
             let serve: crate::hysteria::Serve = Arc::new(move |flow| {
                 serve_vless_hysteria(flow.with_meter(meter.clone()), &users, freedom);
             });
-            return serve_hysteria_thread(&owned, &config, &identity, &masq, &serve, stop)
-                .then(String::new);
+            serve_hysteria_thread(&owned, &config, &identity, &masq, &serve, stop).then(String::new)
         }
         "tls" => serve_vless_tls_inbound(address, inbound, &users, &carrier, freedom, path, stop),
         "reality" => {
@@ -17458,15 +17458,12 @@ fn serve_dokodemo(
                 return (armed, workers, wake.clone());
             };
             let dest = if fallible && matches!(&dest, Destination::Name(..)) {
-                match dest.socket() {
-                    Some(address) => Destination::Address(address),
-                    None => {
-                        bind_failed();
-                        eprintln!(
-                            "dokodemo-door udp: the rewrite address does not resolve in {label}"
-                        );
-                        return (armed, workers, wake.clone());
-                    }
+                if let Some(address) = dest.socket() {
+                    Destination::Address(address)
+                } else {
+                    bind_failed();
+                    eprintln!("dokodemo-door udp: the rewrite address does not resolve in {label}");
+                    return (armed, workers, wake.clone());
                 }
             } else {
                 dest
