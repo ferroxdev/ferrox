@@ -3611,6 +3611,7 @@ fn cidr_text(bytes: &[u8]) -> Result<String, String> {
 fn router_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.app.router.Config");
     let mut rules = Vec::new();
+    let mut balancers = Vec::new();
     let mut strategy = None;
     let mut script = None;
     while let Some((field, wire)) = reader.field()? {
@@ -3625,7 +3626,7 @@ fn router_settings(bytes: &[u8]) -> Result<Json, String> {
                 });
             }
             (2, 2) => rules.push(router_rule(reader.bytes()?)?),
-            (3, 2) => return Err(reader.uncarried("balancers")),
+            (3, 2) => balancers.push(balancing_rule(reader.bytes()?)?),
             (4, 2) => {
                 script = std::str::from_utf8(reader.bytes()?)
                     .map_err(|_| {
@@ -3644,8 +3645,143 @@ fn router_settings(bytes: &[u8]) -> Result<Json, String> {
     if let Some(script) = script.filter(|script| !script.is_empty()) {
         pairs.push(("script", Json::Str(script)));
     }
+    if !balancers.is_empty() {
+        pairs.push(("balancers", Json::Arr(balancers)));
+    }
     pairs.push(("rules", Json::Arr(rules)));
     Ok(object(pairs))
+}
+
+/// `xray.app.router.BalancingRule`: a tag, the outbound prefixes it draws from, its strategy and
+/// the tag an empty pick falls to, in the shape this tree's router reads.
+fn balancing_rule(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.router.BalancingRule");
+    let mut tag = None;
+    let mut selectors = Vec::new();
+    let mut strategy = None;
+    let mut settings = None;
+    let mut fallback = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => tag = Some(account_text(&mut reader)?),
+            (2, 2) => selectors.push(Json::Str(account_text(&mut reader)?)),
+            (3, 2) => strategy = Some(account_text(&mut reader)?),
+            (4, 2) => {
+                let (name, value) = typed_message(reader.bytes()?)?;
+                settings = Some((name, value));
+            }
+            (5, 2) => fallback = Some(account_text(&mut reader)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = vec![(
+        "tag",
+        Json::Str(tag.ok_or("xray.app.router.BalancingRule: no tag")?),
+    )];
+    if !selectors.is_empty() {
+        pairs.push(("selector", Json::Arr(selectors)));
+    }
+    let mut strategy_pairs = Vec::new();
+    if let Some(strategy) = strategy.as_deref().filter(|strategy| !strategy.is_empty()) {
+        strategy_pairs.push(("type", Json::Str(strategy.to_owned())));
+    }
+    if strategy
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case("leastload"))
+    {
+        if let Some((name, value)) = settings {
+            if name != "xray.app.router.StrategyLeastLoadConfig" {
+                return Err(format!(
+                    "balancer strategy settings `{name}` are not carried"
+                ));
+            }
+            strategy_pairs.push(("settings", least_load_settings(value)?));
+        }
+    }
+    if !strategy_pairs.is_empty() {
+        pairs.push(("strategy", object(strategy_pairs)));
+    }
+    if let Some(fallback) = fallback.filter(|fallback| !fallback.is_empty()) {
+        pairs.push(("fallbackTag", Json::Str(fallback)));
+    }
+    Ok(object(pairs))
+}
+
+/// `xray.app.router.StrategyLeastLoadConfig`: the weights, RTT baselines and failure tolerance
+/// the reference's leastLoad strategy reads.
+fn least_load_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.router.StrategyLeastLoadConfig");
+    let mut costs = Vec::new();
+    let mut baselines = Vec::new();
+    let mut expected = None;
+    let mut max_rtt = None;
+    let mut tolerance = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (2, 2) => costs.push(strategy_weight(reader.bytes()?)?),
+            (3, 2) => {
+                let mut packed = Reader::new(
+                    reader.bytes()?,
+                    "xray.app.router.StrategyLeastLoadConfig.baselines",
+                );
+                while packed.more() {
+                    baselines.push(packed.varint()?.cast_signed());
+                }
+            }
+            (3, 0) => baselines.push(reader.varint()?.cast_signed()),
+            (4, 0) => {
+                expected = Some(i32::try_from(reader.varint()?.cast_signed()).unwrap_or(i32::MAX));
+            }
+            (5, 0) => max_rtt = Some(reader.varint()?.cast_signed()),
+            (6, 5) => tolerance = Some(f32::from_bits(reader.fixed32()?)),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    if !costs.is_empty() {
+        pairs.push(("costs", Json::Arr(costs)));
+    }
+    if !baselines.is_empty() {
+        pairs.push((
+            "baselines",
+            Json::Arr(
+                baselines
+                    .into_iter()
+                    .map(|nanos| Json::Str(format!("{nanos}ns")))
+                    .collect(),
+            ),
+        ));
+    }
+    if let Some(expected) = expected {
+        pairs.push(("expected", Json::Num(f64::from(expected.max(0)))));
+    }
+    if let Some(max_rtt) = max_rtt {
+        pairs.push(("maxRTT", Json::Str(format!("{max_rtt}ns"))));
+    }
+    if let Some(tolerance) = tolerance {
+        pairs.push(("tolerance", Json::Num(f64::from(tolerance))));
+    }
+    Ok(object(pairs))
+}
+
+fn strategy_weight(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.router.StrategyWeight");
+    let mut regexp = false;
+    let mut find = String::new();
+    let mut value = 0.0f32;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => regexp = reader.varint()? != 0,
+            (2, 2) => find = account_text(&mut reader)?,
+            (3, 5) => value = f32::from_bits(reader.fixed32()?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(object(vec![
+        ("regexp", Json::Bool(regexp)),
+        ("match", Json::Str(find)),
+        ("value", Json::Num(f64::from(value))),
+    ]))
 }
 
 /// `RoutingService.AddRule`'s request: the router Config a call carries and whether its rules
@@ -3680,7 +3816,7 @@ pub(crate) fn add_rule_request(bytes: &[u8]) -> Result<(Vec<Json>, bool), String
 #[allow(clippy::too_many_lines)]
 fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.app.router.RoutingRule");
-    let mut tag = None;
+    let mut target = None;
     let mut rule_tag = None;
     let mut domains = Vec::new();
     let mut ips = Vec::new();
@@ -3700,22 +3836,14 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     let mut webhook = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 2) => {
-                tag = Some(
-                    std::str::from_utf8(reader.bytes()?)
-                        .map_err(|_| {
-                            "xray.app.router.RoutingRule: the tag is not utf-8".to_owned()
-                        })?
-                        .to_owned(),
-                );
-            }
+            (1, 2) => target = Some(("outboundTag", account_text(&mut reader)?)),
             (2, 2) => domains.push(Json::Str(domain_rule(reader.bytes()?)?)),
             (7, 2) => users.push(Json::Str(account_text(&mut reader)?)),
             (8, 2) => inbound_tags.push(Json::Str(account_text(&mut reader)?)),
             (9, 2) => protocols.push(Json::Str(account_text(&mut reader)?)),
             (10, 2) => ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
             (11, 2) => source_ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
-            (12, 2) => return Err(reader.uncarried("a balancer tag")),
+            (12, 2) => target = Some(("balancerTag", account_text(&mut reader)?)),
             (13, 0) => networks.push(Json::Str(network_name(reader.varint()?)?.to_owned())),
             (13, 2) => {
                 let mut packed = Reader::new(reader.bytes()?, "xray.common.net.Network");
@@ -3736,8 +3864,9 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let tag = tag.ok_or("xray.app.router.RoutingRule: no outbound tag")?;
-    let mut pairs = vec![("outboundTag", Json::Str(tag))];
+    let (key, tag) =
+        target.ok_or("xray.app.router.RoutingRule: names neither an outbound nor a balancer")?;
+    let mut pairs = vec![(key, Json::Str(tag))];
     if let Some(rule_tag) = rule_tag {
         pairs.push(("ruleTag", Json::Str(rule_tag)));
     }
@@ -3849,7 +3978,7 @@ fn network_name(value: u64) -> Result<&'static str, String> {
     match value {
         2 => Ok("tcp"),
         3 => Ok("udp"),
-        4 => Err("xray.common.net.Network: a unix network is not carried".to_owned()),
+        4 => Ok("unix"),
         other => Err(format!(
             "xray.common.net.Network: network {other} is not carried"
         )),
@@ -5479,6 +5608,22 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// A protobuf `fixed32`, the little-endian word a `float` field carries.
+    pub(crate) fn fixed32(&mut self) -> Result<u32, String> {
+        let end = self
+            .pos
+            .checked_add(4)
+            .filter(|end| *end <= self.buf.len())
+            .ok_or_else(|| format!("{}: a fixed field runs past the message", self.message))?;
+        let word = u32::from_le_bytes(
+            self.buf[self.pos..end]
+                .try_into()
+                .expect("four bytes were checked"),
+        );
+        self.pos = end;
+        Ok(word)
+    }
+
     pub(crate) fn bytes(&mut self) -> Result<&'a [u8], String> {
         let length = self.varint()?;
         let end = self
@@ -5719,6 +5864,12 @@ mod tests {
         let mut out = varint(field << 3 | 2);
         out.extend(varint(value.len() as u64));
         out.extend_from_slice(value);
+        out
+    }
+
+    fn fixed32_field(field: u64, value: f32) -> Vec<u8> {
+        let mut out = varint(field << 3 | 5);
+        out.extend_from_slice(&value.to_bits().to_le_bytes());
         out
     }
 
@@ -8721,6 +8872,175 @@ mod tests {
         };
         assert_eq!(routing.route(&flow(Some("http1"))), Some("blocked"));
         assert_eq!(routing.route(&flow(Some("h2"))), None);
+    }
+
+    /// The unix network is a routing selector, not a refusal: the reference's
+    /// `Network` enum carries it and the JSON spelling already reads `unix`.
+    #[test]
+    fn a_pb_rule_carries_the_unix_network() {
+        let rule = message(&[bytes_field(1, b"blocked"), bytes_field(13, &[4])]);
+        let router = message(&[bytes_field(2, &rule)]);
+        let outbound = message(&[
+            bytes_field(1, b"blocked"),
+            bytes_field(3, &typed("xray.proxy.blackhole.Config", &[])),
+        ]);
+        let config = message(&[
+            bytes_field(1, &socks_inbound(5000, 0, &[])),
+            bytes_field(2, &outbound),
+            bytes_field(4, &typed("xray.app.router.Config", &router)),
+        ]);
+        let json = to_json(&config).expect("decodes");
+        let rules = json
+            .get("routing")
+            .expect("routing")
+            .get("rules")
+            .and_then(Json::as_arr)
+            .expect("rules");
+        assert_eq!(rules[0].get("network").and_then(Json::as_str), Some("unix"));
+        let routing = crate::router::Routing::parse(&json)
+            .expect("parses")
+            .expect("routing");
+        let flow = crate::router::Flow {
+            network: crate::router::Network::Other(4),
+            domain: None,
+            ip: None,
+            port: Some(443),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        assert_eq!(routing.route(&flow), Some("blocked"));
+    }
+
+    /// A pb balancer reaches the same table the JSON spelling does: the rule's
+    /// `balancing_tag` is not refused, leastLoad settings decode, and a
+    /// roundRobin pick lands on the selector's outbound.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_pb_balancer_reaches_the_router() {
+        let pool = message(&[
+            bytes_field(1, b"pool"),
+            bytes_field(2, b"node"),
+            bytes_field(3, b"roundrobin"),
+            bytes_field(5, b"node"),
+        ]);
+        let mut baselines = varint(1_000_000);
+        baselines.extend(varint(2_000_000));
+        let cost = message(&[
+            varint_field(1, 1),
+            bytes_field(2, b"node"),
+            fixed32_field(3, 2.5),
+        ]);
+        let settings = message(&[
+            bytes_field(2, &cost),
+            bytes_field(3, &baselines),
+            varint_field(4, 2),
+            varint_field(5, 50_000_000),
+            fixed32_field(6, 0.25),
+        ]);
+        let load = message(&[
+            bytes_field(1, b"load"),
+            bytes_field(2, b"node"),
+            bytes_field(3, b"leastload"),
+            bytes_field(
+                4,
+                &typed("xray.app.router.StrategyLeastLoadConfig", &settings),
+            ),
+        ]);
+        let rule = message(&[bytes_field(12, b"pool")]);
+        let router = message(&[
+            bytes_field(2, &rule),
+            bytes_field(3, &pool),
+            bytes_field(3, &load),
+        ]);
+        let outbound = message(&[
+            bytes_field(1, b"node"),
+            bytes_field(
+                3,
+                &typed("xray.proxy.freedom.Config", &bytes_field(8, &Vec::new())),
+            ),
+        ]);
+        let config = message(&[
+            bytes_field(1, &socks_inbound(5000, 0, &[])),
+            bytes_field(2, &outbound),
+            bytes_field(4, &typed("xray.app.router.Config", &router)),
+        ]);
+        let json = to_json(&config).expect("decodes");
+        let routing = json.get("routing").expect("routing");
+        let balancers = routing
+            .get("balancers")
+            .and_then(Json::as_arr)
+            .expect("balancers");
+        assert_eq!(balancers.len(), 2);
+        assert_eq!(balancers[0].get("tag").and_then(Json::as_str), Some("pool"));
+        assert_eq!(
+            balancers[0].get("fallbackTag").and_then(Json::as_str),
+            Some("node")
+        );
+        let load_strategy = balancers[1].get("strategy").expect("strategy");
+        assert_eq!(
+            load_strategy.get("type").and_then(Json::as_str),
+            Some("leastload")
+        );
+        let settings = load_strategy.get("settings").expect("settings");
+        assert_eq!(settings.get("expected").and_then(Json::as_u32), Some(2));
+        assert_eq!(
+            settings.get("maxRTT").and_then(Json::as_str),
+            Some("50000000ns")
+        );
+        assert_eq!(settings.get("tolerance"), Some(&Json::Num(0.25)));
+        assert_eq!(
+            settings.get("baselines"),
+            Some(&Json::Arr(vec![
+                Json::Str("1000000ns".to_owned()),
+                Json::Str("2000000ns".to_owned()),
+            ]))
+        );
+        let cost = &settings.get("costs").and_then(Json::as_arr).expect("costs")[0];
+        assert_eq!(cost.get("regexp").and_then(Json::as_bool), Some(true));
+        assert_eq!(cost.get("match").and_then(Json::as_str), Some("node"));
+        assert_eq!(cost.get("value"), Some(&Json::Num(2.5)));
+        let rules = routing.get("rules").and_then(Json::as_arr).expect("rules");
+        assert_eq!(
+            rules[0].get("balancerTag").and_then(Json::as_str),
+            Some("pool")
+        );
+        assert!(rules[0].get("outboundTag").is_none());
+        let routing = crate::router::Routing::parse(&json)
+            .expect("parses")
+            .expect("routing");
+        let flow = crate::router::Flow {
+            network: crate::router::Network::Tcp,
+            domain: None,
+            ip: None,
+            port: Some(443),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        assert_eq!(
+            routing.route_target(&flow).map(|hit| hit.target),
+            Some(crate::router::RouteTarget::Balancer("pool"))
+        );
+        let pool = routing.balancer("pool").expect("pool");
+        assert_eq!(
+            pool.pick(&["node".to_owned()], None).as_deref(),
+            Some("node")
+        );
     }
 
     /// Every selector the JSON router reads survives the protobuf walk with the
