@@ -2753,6 +2753,7 @@ mod tests {
                 writes: Arc::new(AtomicUsize::new(0)),
             }),
             pending,
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2785,6 +2786,7 @@ mod tests {
                 deadline: gate,
             }),
             pending,
+            init: 0,
             closed: false,
             deadline: Deadline::default(),
         };
