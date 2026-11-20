@@ -107,6 +107,8 @@ pub(crate) struct Spec {
     route_exclude: Vec<(IpAddr, u8)>,
     dns_hijack: Option<IpAddr>,
     fd: Option<i32>,
+    tap: bool,
+    peer: Option<String>,
 }
 
 impl Spec {
@@ -147,6 +149,8 @@ impl Spec {
             route_exclude: Vec::new(),
             dns_hijack: None,
             fd: None,
+            tap: false,
+            peer: None,
         }
     }
 
@@ -185,6 +189,21 @@ impl Spec {
     pub(crate) fn with_fd(mut self, fd: Option<i32>) -> Self {
         self.fd = fd;
         self
+    }
+
+    /// A macOS TAP opens a `feth` pair and its `peer` names the half the kernel stack uses.
+    pub(crate) fn with_tap(mut self, tap: bool, peer: Option<&str>) -> Self {
+        self.tap = tap;
+        self.peer = peer.map(str::to_owned);
+        self
+    }
+
+    pub(crate) fn tap(&self) -> bool {
+        self.tap
+    }
+
+    pub(crate) fn peer(&self) -> Option<&str> {
+        self.peer.as_deref()
     }
 
     /// `dns_mode: hijack`: every port-53 query rides this server while its answer keeps the address the device asked.
@@ -790,22 +809,25 @@ enum Ended {
 pub(crate) enum Handle {
     #[cfg(unix)]
     File(std::fs::File),
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     Session(std::sync::Arc<tun_rs::SyncDevice>),
 }
 
 impl Handle {
     #[cfg(unix)]
     fn fd(&self) -> RawFd {
-        let Self::File(file) = self;
-        file.as_raw_fd()
+        match self {
+            Self::File(file) => file.as_raw_fd(),
+            #[cfg(target_os = "macos")]
+            Self::Session(device) => device.as_raw_fd(),
+        }
     }
 
     fn try_clone(&self) -> io::Result<Self> {
         match self {
             #[cfg(unix)]
             Self::File(file) => Ok(Self::File(file.try_clone()?)),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Self::Session(device) => Ok(Self::Session(std::sync::Arc::clone(device))),
         }
     }
@@ -816,7 +838,7 @@ impl Read for Handle {
         match self {
             #[cfg(unix)]
             Self::File(file) => file.read(buf),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Self::Session(device) => device.recv(buf),
         }
     }
@@ -827,7 +849,7 @@ impl Write for Handle {
         match self {
             #[cfg(unix)]
             Self::File(file) => file.write(buf),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Self::Session(device) => device.send(buf),
         }
     }
@@ -837,7 +859,7 @@ impl Write for Handle {
         match self {
             #[cfg(unix)]
             Self::File(file) => file.write_vectored(bufs),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Self::Session(device) => {
                 let mut joined = Vec::with_capacity(bufs.iter().map(|slice| slice.len()).sum());
                 for slice in bufs {
@@ -862,6 +884,9 @@ pub(crate) struct Device {
     framing: Framing,
     /// The builder enabled `TUN_F_TSO4|TUN_F_TSO6`; an inherited descriptor's `IFF_VNET_HDR` says nothing about that.
     gso: bool,
+    /// A macOS TAP carries Ethernet frames, so the link header is stripped and written around the IP packet.
+    bridge: Option<std::sync::Arc<crate::tun_tap::Bridge>>,
+    frame: Vec<u8>,
 }
 
 impl Device {
@@ -880,6 +905,8 @@ impl Device {
                 mtu: spec.mtu,
                 framing,
                 gso: false,
+                bridge: None,
+                frame: Vec::new(),
             }]);
         }
         #[cfg(target_os = "linux")]
@@ -901,6 +928,8 @@ impl Device {
                     mtu: spec.mtu,
                     framing,
                     gso: offload,
+                    bridge: None,
+                    frame: Vec::new(),
                 })
                 .collect())
         }
@@ -909,6 +938,24 @@ impl Device {
             use std::os::unix::io::IntoRawFd;
             let (device, _, _) = crate::tun_stack::build(spec, false, true)?;
             let name = device.name().unwrap_or_default();
+            if spec.tap() {
+                let addresses = spec
+                    .addresses()
+                    .iter()
+                    .map(|(address, _)| *address)
+                    .collect();
+                return Ok(vec![Self {
+                    handle: Handle::Session(std::sync::Arc::new(device)),
+                    name: name.clone(),
+                    mtu: spec.mtu,
+                    framing: Framing::Raw,
+                    gso: false,
+                    bridge: Some(std::sync::Arc::new(crate::tun_tap::Bridge::new(
+                        &name, addresses,
+                    ))),
+                    frame: Vec::with_capacity(spec.mtu + crate::tun_tap::HEADER_LEN + 64),
+                }]);
+            }
             let handle = unsafe { std::fs::File::from_raw_fd(device.into_raw_fd()) };
             Ok(vec![Self {
                 handle: Handle::File(handle),
@@ -916,6 +963,8 @@ impl Device {
                 mtu: spec.mtu,
                 framing: Framing::Utun,
                 gso: false,
+                bridge: None,
+                frame: Vec::new(),
             }])
         }
         #[cfg(windows)]
@@ -936,6 +985,8 @@ impl Device {
                 mtu: spec.mtu,
                 framing: Framing::Raw,
                 gso: false,
+                bridge: None,
+                frame: Vec::new(),
             }])
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -946,6 +997,12 @@ impl Device {
     }
 
     pub(crate) fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(bridge) = &self.bridge {
+            let mut frame = std::mem::take(&mut self.frame);
+            let read = read_bridged(&mut self.handle, bridge, &mut frame, buf);
+            self.frame = frame;
+            return read;
+        }
         let head = self.framing.header_len();
         if head == 0 {
             return self.handle.read(buf);
@@ -995,6 +1052,12 @@ impl Device {
     }
 
     fn write_packet(&mut self, packet: &[u8]) -> io::Result<bool> {
+        if let Some(bridge) = &self.bridge {
+            let mut frame = std::mem::take(&mut self.frame);
+            let written = write_bridged(&mut self.handle, bridge, &mut frame, packet);
+            self.frame = frame;
+            return written;
+        }
         write_framed(&mut self.handle, self.framing, None, packet)
     }
 
@@ -1003,6 +1066,8 @@ impl Device {
             handle: self.handle.try_clone()?,
             framing: self.framing,
             gso: self.gso,
+            bridge: self.bridge.clone(),
+            frame: Vec::new(),
         })
     }
 
@@ -1026,10 +1091,16 @@ impl Device {
                 return Err(io::Error::last_os_error());
             }
             unsafe { libc::fcntl(duplicated, libc::F_SETFD, libc::FD_CLOEXEC) };
-            if nonblocking {
-                let flags = unsafe { libc::fcntl(duplicated, libc::F_GETFL) };
-                if flags >= 0 {
-                    unsafe { libc::fcntl(duplicated, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            let flags = unsafe { libc::fcntl(duplicated, libc::F_GETFL) };
+            if flags >= 0 {
+                let want = if nonblocking {
+                    flags | libc::O_NONBLOCK
+                } else {
+                    // Android's `VpnService` hands back a nonblocking descriptor, and this handler reads in a blocking loop.
+                    flags & !libc::O_NONBLOCK
+                };
+                if want != flags {
+                    unsafe { libc::fcntl(duplicated, libc::F_SETFL, want) };
                 }
             }
             let handle = unsafe { std::fs::File::from_raw_fd(duplicated) };
@@ -1039,6 +1110,8 @@ impl Device {
                 name: String::new(),
                 mtu,
                 gso: false,
+                bridge: None,
+                frame: Vec::new(),
             })
         }
         #[cfg(not(unix))]
@@ -1083,6 +1156,8 @@ impl Device {
             mtu,
             framing: Framing::Raw,
             gso: false,
+            bridge: None,
+            frame: Vec::new(),
         }
     }
 }
@@ -1092,10 +1167,15 @@ pub(crate) struct PacketWriter {
     handle: Handle,
     framing: Framing,
     gso: bool,
+    bridge: Option<std::sync::Arc<crate::tun_tap::Bridge>>,
+    frame: Vec<u8>,
 }
 
 impl PacketWriter {
     pub(crate) fn write_packet(&mut self, packet: &[u8]) -> io::Result<bool> {
+        if let Some(bridge) = &self.bridge {
+            return write_bridged(&mut self.handle, bridge, &mut self.frame, packet);
+        }
         write_framed(&mut self.handle, self.framing, None, packet)
     }
 
@@ -1130,6 +1210,44 @@ fn virtio_header(packet: &[u8], gso: Option<u16>) -> [u8; VIRTIO_NET_HDR_LEN] {
     header[6..8].copy_from_slice(&(ip_header as u16).to_ne_bytes());
     header[8..10].copy_from_slice(&16u16.to_ne_bytes());
     header
+}
+
+/// One read from a TAP: an answer the bridge owes is written back, and a frame that carries no IP packet is read past.
+fn read_bridged(
+    handle: &mut Handle,
+    bridge: &crate::tun_tap::Bridge,
+    frame: &mut Vec<u8>,
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    loop {
+        if frame.len() < 65536 {
+            frame.resize(65536, 0);
+        }
+        let read = handle.read(frame)?;
+        match bridge.accept(&frame[..read]) {
+            crate::tun_tap::Accepted::Ip(packet) => {
+                let length = packet.len().min(buf.len());
+                buf[..length].copy_from_slice(&packet[..length]);
+                return Ok(length);
+            }
+            crate::tun_tap::Accepted::Reply(reply) => handle.write_all(&reply)?,
+            crate::tun_tap::Accepted::Ignore => {}
+        }
+    }
+}
+
+/// One packet write on a TAP: the link header names the peer and the device, and a packet that is not IP is dropped.
+fn write_bridged(
+    handle: &mut Handle,
+    bridge: &crate::tun_tap::Bridge,
+    frame: &mut Vec<u8>,
+    packet: &[u8],
+) -> io::Result<bool> {
+    if !bridge.frame(packet, frame) {
+        return Ok(false);
+    }
+    handle.write_all(frame)?;
+    Ok(true)
 }
 
 /// One packet write with the descriptor's framing in front of it, all-or-nothing: a full write is carried, a short or refused write is dropped.
@@ -2091,12 +2209,6 @@ impl Handler {
             }
             self.datagram_retry = Some(std::time::Instant::now() + budgets::handshake());
         }
-        self.poll_datagram_lane();
-        let direct_relay = match self.leg_lane() {
-            Lane::Hold => return Ok(()),
-            Lane::Direct(relay) => Some(relay),
-            Lane::Front => None,
-        };
         let target = SocketAddr::new(
             self.hijack(ip.destination, udp.destination_port),
             udp.destination_port,
@@ -2128,6 +2240,17 @@ impl Handler {
                 },
                 Some((ip.destination, udp.destination_port)),
             )
+        };
+        // A tuple that already has a leg keeps it while the direct lane is still opening; only a datagram that needs a new association waits.
+        let direct_relay = if self.legs.table().contains_key(&key) {
+            None
+        } else {
+            self.poll_datagram_lane();
+            match self.leg_lane() {
+                Lane::Hold => return Ok(()),
+                Lane::Direct(relay) => Some(relay),
+                Lane::Front => None,
+            }
         };
         let (id, leg) = {
             let mut table = self.legs.table();
@@ -3062,6 +3185,7 @@ mod tests {
     fn a_spec_fd_opens_the_inherited_descriptor_once() {
         use std::os::fd::IntoRawFd;
         let (held, _peer) = UnixStream::pair().expect("pair");
+        held.set_nonblocking(true).expect("nonblocking");
         let fd = held.into_raw_fd();
         let spec = Spec::new(None, None).with_fd(Some(fd));
         let devices = Device::open_all(&spec).expect("the descriptor opens");
@@ -3070,7 +3194,23 @@ mod tests {
         assert_ne!(devices[0].raw_fd(), fd, "the descriptor is duplicated");
         let flags = unsafe { libc::fcntl(devices[0].raw_fd(), libc::F_GETFL) };
         assert_eq!(flags & libc::O_NONBLOCK, 0, "the handler reads blocking");
+        let host = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_ne!(
+            host & libc::O_NONBLOCK,
+            0,
+            "the host's own flags are left alone"
+        );
         unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn a_spec_carries_the_tap_and_the_peer_half() {
+        let spec = Spec::new(None, None).with_tap(true, Some("feth9"));
+        assert!(spec.tap());
+        assert_eq!(spec.peer(), Some("feth9"));
+        let off = spec.with_tap(false, None);
+        assert!(!off.tap());
+        assert_eq!(off.peer(), None);
     }
 
     #[test]
@@ -3252,6 +3392,8 @@ mod tests {
             mtu: 100,
             framing: Framing::Virtio,
             gso: true,
+            bridge: None,
+            frame: Vec::new(),
         };
         let mut handler = Handler::new(device, relay, no_associate());
         let client = (SCRIPT_CLIENT, 51001);

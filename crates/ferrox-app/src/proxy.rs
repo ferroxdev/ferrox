@@ -17834,6 +17834,12 @@ fn tun_spec(inbound: &Json) -> Result<crate::tun::Spec, String> {
     spec = spec.with_routes(auto_route, routes, exclude);
     spec = spec.with_dns_hijack(tun_dns_hijack(inbound)?);
     spec = spec.with_fd(tun_fd(inbound)?);
+    let tap = tun_bool(inbound, "tap")?.unwrap_or(false);
+    if tap && !cfg!(target_os = "macos") {
+        eprintln!("tun inbound: `tap` opens a macOS feth pair; this host opens a TUN instead");
+    }
+    let peer = tun_string(inbound, "peer")?.or(tun_string(inbound, "peer_feth")?);
+    spec = spec.with_tap(tap && cfg!(target_os = "macos"), peer.as_deref());
     spec.validate().map_err(|error| error.to_string())?;
     Ok(spec)
 }
@@ -17921,8 +17927,14 @@ fn serve_tun_inbound(
     stop: Option<&Arc<Stop>>,
 ) -> bool {
     let stack = tun_stack(inbound);
-    warn_unapplied_tun_options(inbound, tun_native(stack));
-    if !tun_native(stack) {
+    let native = tun_native(stack) || spec.tap();
+    if spec.tap() && !tun_native(stack) {
+        eprintln!(
+            "tun inbound: `tap` carries Ethernet frames, so the native engine serves it and `stack: {stack}` is not used"
+        );
+    }
+    warn_unapplied_tun_options(inbound, native);
+    if !native {
         if spec.dns_hijack().is_some()
             && matches!(
                 tun_mode(stack),
@@ -17950,6 +17962,9 @@ fn serve_tun_inbound(
     }
     if spec.fd().is_some() && spec.queues() > 1 {
         eprintln!("tun inbound: an inherited descriptor carries one queue, so `queues` is ignored");
+    }
+    if spec.tap() && spec.queues() > 1 {
+        eprintln!("tun inbound: a `feth` pair carries one queue, so `queues` is ignored");
     }
     let Ok(devices) = crate::tun::Device::open_all(spec) else {
         eprintln!("tun inbound: {}", crate::tun::refusal_reason(spec));
@@ -29359,10 +29374,13 @@ pub(crate) fn udp_association(
     let (server, _) = listener.accept().ok()?;
     drop(listener);
     thread::spawn(move || serve(Connection::from(server)));
-    crate::socks::associate(
+    let association = crate::socks::associate(
         Connection::from(client),
         &crate::socks::Credential::default(),
-    )
+    )?;
+    // The server may name a relay no config key mentions, so its address is pinned after the handshake: a datagram sent to it would otherwise re-enter the capture.
+    crate::tun_route::pin_dialled(association.relay.ip());
+    Some(association)
 }
 
 /// A leg on a SOCKS5 UDP relay: the socket the frames go through.

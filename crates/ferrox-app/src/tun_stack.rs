@@ -180,7 +180,15 @@ pub(crate) fn build(
     }
     #[cfg(target_os = "linux")]
     let builder = builder.offload(offload).multi_queue(multi);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let builder = if spec.tap() {
+        builder
+            .layer(tun_rs::Layer::L2)
+            .peer_feth(spec.peer().unwrap_or("feth1"))
+    } else {
+        builder
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let builder = builder;
     let device = builder.build_sync()?;
     attach_addresses(&device, &extra);

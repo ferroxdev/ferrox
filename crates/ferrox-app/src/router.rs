@@ -1168,7 +1168,14 @@ impl Routing {
                 if path.is_empty() {
                     return Err("routing script is empty".into());
                 }
-                Some(Arc::new(ScriptRouter::parse_in(path, dirs.clone())?))
+                #[cfg(not(target_os = "ios"))]
+                let script = Some(Arc::new(ScriptRouter::parse_in(path, dirs.clone())?));
+                #[cfg(target_os = "ios")]
+                let script = {
+                    ScriptRouter::parse_in(path, dirs.clone())?;
+                    None
+                };
+                script
             }
             _ => None,
         };

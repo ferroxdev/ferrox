@@ -1,0 +1,361 @@
+//! A macOS TAP is a `feth` pair that carries Ethernet frames, so the IP handler keeps its packet
+//! path and this bridge answers ARP and IPv6 neighbour solicitation, strips the link header on
+//! read and writes it back on emit.
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Mutex;
+
+pub(crate) const HEADER_LEN: usize = 14;
+const IPV4: u16 = 0x0800;
+const IPV6: u16 = 0x86dd;
+const ARP: u16 = 0x0806;
+const ICMPV6: u8 = 58;
+const NEIGHBOR_SOLICITATION: u8 = 135;
+const NEIGHBOR_ADVERTISEMENT: u8 = 136;
+
+/// One frame from the device: an IP packet for the handler, an answer the bridge writes back, or
+/// a frame it drops.
+pub(crate) enum Accepted<'a> {
+    Ip(&'a [u8]),
+    Reply(Vec<u8>),
+    Ignore,
+}
+
+/// The link side of one TAP: the address this side claims, the IP addresses it answers for, and
+/// the peer's address once a frame names it.
+pub(crate) struct Bridge {
+    local: [u8; 6],
+    addresses: Vec<IpAddr>,
+    peer: Mutex<Option<[u8; 6]>>,
+}
+
+impl Bridge {
+    pub(crate) fn new(name: &str, addresses: Vec<IpAddr>) -> Self {
+        Self {
+            local: local_address(name),
+            addresses,
+            peer: Mutex::new(None),
+        }
+    }
+
+    fn peer(&self) -> Option<[u8; 6]> {
+        *self
+            .peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn learn(&self, address: [u8; 6]) {
+        let mut peer = self
+            .peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *peer = Some(address);
+    }
+
+    /// One Ethernet frame: an IP packet the handler may take, an ARP or neighbour answer to write
+    /// back, or a frame the bridge drops.
+    pub(crate) fn accept(&self, frame: &[u8]) -> Accepted<'_> {
+        if frame.len() < HEADER_LEN {
+            return Accepted::Ignore;
+        }
+        let destination = &frame[..6];
+        let mut source = [0u8; 6];
+        source.copy_from_slice(&frame[6..12]);
+        if source != self.local && source[0] & 1 == 0 {
+            self.learn(source);
+        }
+        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+        let body = &frame[HEADER_LEN..];
+        match ethertype {
+            IPV4 | IPV6 if destination == self.local => Accepted::Ip(body),
+            IPV6 => match self.neighbour_advertisement(body, source) {
+                Some(reply) => Accepted::Reply(reply),
+                None => Accepted::Ignore,
+            },
+            ARP if destination[0] & 1 == 1 || destination == self.local => {
+                match self.arp_reply(body, source) {
+                    Some(reply) => Accepted::Reply(reply),
+                    None => Accepted::Ignore,
+                }
+            }
+            _ => Accepted::Ignore,
+        }
+    }
+
+    /// Frame one IP packet for the peer the device last named, or for broadcast until a frame has
+    /// named it.
+    pub(crate) fn frame(&self, packet: &[u8], out: &mut Vec<u8>) -> bool {
+        let ethertype = match packet.first().map(|byte| byte >> 4) {
+            Some(4) => IPV4,
+            Some(6) => IPV6,
+            _ => return false,
+        };
+        out.clear();
+        out.extend_from_slice(&self.peer().unwrap_or([0xff; 6]));
+        out.extend_from_slice(&self.local);
+        out.extend_from_slice(&ethertype.to_be_bytes());
+        out.extend_from_slice(packet);
+        true
+    }
+
+    fn arp_reply(&self, body: &[u8], peer: [u8; 6]) -> Option<Vec<u8>> {
+        if body.len() < 28
+            || u16::from_be_bytes([body[0], body[1]]) != 1
+            || u16::from_be_bytes([body[2], body[3]]) != IPV4
+            || body[4] != 6
+            || body[5] != 4
+            || u16::from_be_bytes([body[6], body[7]]) != 1
+        {
+            return None;
+        }
+        let asked = Ipv4Addr::new(body[24], body[25], body[26], body[27]);
+        if !self
+            .addresses
+            .iter()
+            .any(|address| matches!(address, IpAddr::V4(v4) if *v4 == asked))
+        {
+            return None;
+        }
+        let mut out = Vec::with_capacity(HEADER_LEN + 28);
+        out.extend_from_slice(&peer);
+        out.extend_from_slice(&self.local);
+        out.extend_from_slice(&ARP.to_be_bytes());
+        out.extend_from_slice(&[0, 1, 0x08, 0x00, 6, 4, 0, 2]);
+        out.extend_from_slice(&self.local);
+        out.extend_from_slice(&asked.octets());
+        out.extend_from_slice(&peer);
+        out.extend_from_slice(&body[14..18]);
+        Some(out)
+    }
+
+    fn neighbour_advertisement(&self, body: &[u8], peer: [u8; 6]) -> Option<Vec<u8>> {
+        if body.len() < 40 + 24 || body[0] >> 4 != 6 || body[6] != ICMPV6 {
+            return None;
+        }
+        let message = &body[40..];
+        if message[0] != NEIGHBOR_SOLICITATION {
+            return None;
+        }
+        let target = Ipv6Addr::from(<[u8; 16]>::try_from(&message[8..24]).ok()?);
+        if !self
+            .addresses
+            .iter()
+            .any(|address| matches!(address, IpAddr::V6(v6) if *v6 == target))
+        {
+            return None;
+        }
+        let source = Ipv6Addr::from(<[u8; 16]>::try_from(&body[8..24]).ok()?);
+        let mut answer = Vec::with_capacity(32);
+        answer.extend_from_slice(&[NEIGHBOR_ADVERTISEMENT, 0, 0, 0]);
+        answer.extend_from_slice(&[0x60, 0, 0, 0]);
+        answer.extend_from_slice(&target.octets());
+        answer.extend_from_slice(&[2, 1]);
+        answer.extend_from_slice(&self.local);
+        let checksum = icmpv6_checksum(&target, &source, &answer);
+        answer[2..4].copy_from_slice(&checksum.to_be_bytes());
+        frame_ipv6(peer, self.local, target, source, &answer)
+    }
+}
+
+/// A locally administered unicast address derived from the interface name, so a restart claims the
+/// same address; the host's neighbour cache follows this answer, not the feth's own address.
+fn local_address(seed: &str) -> [u8; 6] {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seed.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let bytes = hash.to_be_bytes();
+    [0x02, 0xfe, bytes[0], bytes[1], bytes[2], bytes[3]]
+}
+
+fn frame_ipv6(
+    destination: [u8; 6],
+    source: [u8; 6],
+    from: Ipv6Addr,
+    to: Ipv6Addr,
+    message: &[u8],
+) -> Option<Vec<u8>> {
+    let length = u16::try_from(message.len()).ok()?;
+    let mut out = Vec::with_capacity(HEADER_LEN + 40 + message.len());
+    out.extend_from_slice(&destination);
+    out.extend_from_slice(&source);
+    out.extend_from_slice(&IPV6.to_be_bytes());
+    out.extend_from_slice(&[0x60, 0, 0, 0]);
+    out.extend_from_slice(&length.to_be_bytes());
+    out.push(ICMPV6);
+    out.push(255);
+    out.extend_from_slice(&from.octets());
+    out.extend_from_slice(&to.octets());
+    out.extend_from_slice(message);
+    Some(out)
+}
+
+/// The ICMPv6 checksum over the IPv6 pseudo-header and the message.
+fn icmpv6_checksum(source: &Ipv6Addr, destination: &Ipv6Addr, message: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for octets in [source.octets(), destination.octets()] {
+        for pair in octets.chunks_exact(2) {
+            sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+        }
+    }
+    sum += u32::from(u16::try_from(message.len()).unwrap_or(u16::MAX));
+    sum += u32::from(ICMPV6);
+    let mut words = message.chunks_exact(2);
+    for pair in &mut words {
+        sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+    }
+    if let [last] = words.remainder() {
+        sum += u32::from(u16::from_be_bytes([*last, 0]));
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ipv4_frame(destination: [u8; 6], source: [u8; 6], payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&destination);
+        frame.extend_from_slice(&source);
+        frame.extend_from_slice(&IPV4.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn arp_request(peer: [u8; 6], asked: Ipv4Addr, from: Ipv4Addr) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xff; 6]);
+        frame.extend_from_slice(&peer);
+        frame.extend_from_slice(&ARP.to_be_bytes());
+        frame.extend_from_slice(&[0, 1, 0x08, 0x00, 6, 4, 0, 1]);
+        frame.extend_from_slice(&peer);
+        frame.extend_from_slice(&from.octets());
+        frame.extend_from_slice(&[0; 6]);
+        frame.extend_from_slice(&asked.octets());
+        frame
+    }
+
+    #[test]
+    fn a_tap_reads_an_ip_packet_and_frames_the_answer_for_the_peer_it_learned() {
+        let bridge = Bridge::new("feth0", vec!["10.0.0.1".parse().unwrap()]);
+        let peer = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+        let payload = [0x45, 0, 0, 20];
+        let frame = ipv4_frame(bridge.local, peer, &payload);
+        match bridge.accept(&frame) {
+            Accepted::Ip(read) => assert_eq!(read, payload),
+            _ => panic!("an IP packet addressed to the device is read"),
+        }
+        let mut out = Vec::new();
+        assert!(bridge.frame(&payload, &mut out));
+        assert_eq!(&out[..6], &peer, "the answer goes to the peer's address");
+        assert_eq!(&out[6..12], &bridge.local, "and comes from the device's");
+        assert_eq!(&out[12..14], &IPV4.to_be_bytes());
+        assert_eq!(&out[14..], payload);
+    }
+
+    #[test]
+    fn a_tap_answers_an_arp_request_for_an_address_it_carries_and_ignores_another() {
+        let bridge = Bridge::new("feth0", vec!["10.0.0.1".parse().unwrap()]);
+        let peer = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+        let reply = match bridge.accept(&arp_request(
+            peer,
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.9".parse().unwrap(),
+        )) {
+            Accepted::Reply(reply) => reply,
+            _ => panic!("its own address is answered"),
+        };
+        assert_eq!(&reply[..6], &peer);
+        assert_eq!(&reply[6..12], &bridge.local);
+        assert_eq!(&reply[12..14], &ARP.to_be_bytes());
+        assert_eq!(&reply[14..22], &[0, 1, 0x08, 0x00, 6, 4, 0, 2]);
+        assert_eq!(
+            &reply[22..28],
+            &bridge.local,
+            "sender hardware is the device"
+        );
+        assert_eq!(
+            &reply[28..32],
+            &"10.0.0.1".parse::<Ipv4Addr>().unwrap().octets()
+        );
+        assert_eq!(&reply[32..38], &peer, "target hardware is the asker");
+        assert_eq!(
+            &reply[38..42],
+            &"10.0.0.9".parse::<Ipv4Addr>().unwrap().octets()
+        );
+        assert!(
+            matches!(
+                bridge.accept(&arp_request(
+                    peer,
+                    "10.0.0.2".parse().unwrap(),
+                    "10.0.0.9".parse().unwrap()
+                )),
+                Accepted::Ignore
+            ),
+            "an address the device does not carry is left to its owner"
+        );
+    }
+
+    #[test]
+    fn a_tap_answers_a_neighbour_solicitation_with_a_checked_advertisement() {
+        let bridge = Bridge::new(
+            "feth0",
+            vec!["2001:db8::1".parse().unwrap(), "10.0.0.1".parse().unwrap()],
+        );
+        let peer = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+        let target: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let asker: Ipv6Addr = "fe80::9".parse().unwrap();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0x33, 0x33, 0xff, 0, 0, 1]);
+        frame.extend_from_slice(&peer);
+        frame.extend_from_slice(&IPV6.to_be_bytes());
+        frame.extend_from_slice(&[0x60, 0, 0, 0]);
+        frame.extend_from_slice(&24u16.to_be_bytes());
+        frame.extend_from_slice(&[ICMPV6, 255]);
+        frame.extend_from_slice(&asker.octets());
+        frame.extend_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        frame.extend_from_slice(&[NEIGHBOR_SOLICITATION, 0, 0, 0, 0, 0, 0, 0]);
+        frame.extend_from_slice(&target.octets());
+        let reply = match bridge.accept(&frame) {
+            Accepted::Reply(reply) => reply,
+            _ => panic!("a solicitation for its address is answered"),
+        };
+        assert_eq!(&reply[..6], &peer);
+        assert_eq!(&reply[6..12], &bridge.local);
+        assert_eq!(&reply[12..14], &IPV6.to_be_bytes());
+        assert_eq!(reply[14] >> 4, 6);
+        assert_eq!(reply[20], ICMPV6);
+        assert_eq!(reply[21], 255);
+        assert_eq!(&reply[22..38], &target.octets(), "the answer names itself");
+        assert_eq!(&reply[38..54], &asker.octets());
+        let message = &reply[54..];
+        assert_eq!(message[0], NEIGHBOR_ADVERTISEMENT);
+        assert_eq!(&message[4..8], &[0x60, 0, 0, 0]);
+        assert_eq!(&message[8..24], &target.octets());
+        assert_eq!(&message[24..26], &[2, 1]);
+        assert_eq!(&message[26..32], &bridge.local);
+        let seen = icmpv6_checksum(&target, &asker, message);
+        assert_eq!(
+            seen, 0,
+            "the advertisement's checksum verifies over its own header"
+        );
+    }
+
+    #[test]
+    fn a_tap_leaves_a_frame_for_another_address_alone() {
+        let bridge = Bridge::new("feth0", vec!["10.0.0.1".parse().unwrap()]);
+        let peer = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+        let frame = ipv4_frame([0x02, 0, 0, 0, 0, 1], peer, &[0x45, 0, 0, 20]);
+        assert!(matches!(bridge.accept(&frame), Accepted::Ignore));
+        assert!(
+            !bridge.frame(&[0x88, 0, 0, 0], &mut Vec::new()),
+            "a packet that is not IP is not framed"
+        );
+    }
+}

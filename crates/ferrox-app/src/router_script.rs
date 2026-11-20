@@ -30,7 +30,7 @@ mod lua;
 #[cfg(not(target_os = "ios"))]
 pub(crate) use lua::ScriptRouter;
 
-/// iOS has no `os.execute` and marks `system` unavailable, so the vendored Lua 5.1 runtime does not build there; a config that names a script is refused in one line instead of failing to compile.
+/// iOS has no `os.execute` and marks `system` unavailable, so the vendored Lua 5.1 runtime does not build there; a config that names a script is named in one line and left unregistered, so the rule table and the default outbound decide instead of the stub.
 #[cfg(target_os = "ios")]
 pub(crate) struct ScriptRouter;
 

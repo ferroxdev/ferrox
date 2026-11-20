@@ -14,21 +14,23 @@ use std::sync::{Mutex, OnceLock, Weak};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use route_manager::{Route, RouteManager};
 
-/// The capture in force, shared with the dial path so an address resolved after the routes landed is pinned before it is dialled.
+/// The captures in force, one per open TUN inbound, shared with the dial path so an address resolved after the routes landed is pinned before it is dialled. Two inbounds each hold their own table entry, so one closing does not unpin the other's edges.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn capture() -> &'static Mutex<Option<Weak<Guard>>> {
-    static CAPTURE: OnceLock<Mutex<Option<Weak<Guard>>>> = OnceLock::new();
-    CAPTURE.get_or_init(|| Mutex::new(None))
+fn capture() -> &'static Mutex<Vec<Weak<Guard>>> {
+    static CAPTURE: OnceLock<Mutex<Vec<Weak<Guard>>>> = OnceLock::new();
+    CAPTURE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) fn pin_dialled(address: IpAddr) {
-    let guard = capture()
-        .lock()
-        .ok()
-        .and_then(|slot| slot.as_ref().and_then(Weak::upgrade));
-    if let Some(guard) = guard {
-        guard.pin(address);
+    let guards = capture().lock().map(|mut slot| {
+        slot.retain(|weak| weak.strong_count() > 0);
+        slot.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+    });
+    if let Ok(guards) = guards {
+        for guard in guards {
+            guard.pin(address);
+        }
     }
 }
 
@@ -177,7 +179,8 @@ impl Guard {
             default_v6,
         });
         if let Ok(mut slot) = capture().lock() {
-            *slot = Some(Arc::downgrade(&guard));
+            slot.retain(|weak| weak.strong_count() > 0);
+            slot.push(Arc::downgrade(&guard));
         }
         Ok(guard)
     }
@@ -239,12 +242,7 @@ impl Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         if let Ok(mut slot) = capture().lock() {
-            if slot
-                .as_ref()
-                .is_some_and(|weak| std::ptr::eq(weak.as_ptr(), self))
-            {
-                *slot = None;
-            }
+            slot.retain(|weak| !std::ptr::eq(weak.as_ptr(), self));
         }
         let Ok(mut added) = self.added.lock() else {
             return;
