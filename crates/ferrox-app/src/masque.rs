@@ -28,6 +28,7 @@ use crate::wg_stack::{self, ClientFlow, Packet, ToTunnel, UdpForwarder, UdpRoute
 use crate::wireguard::DeviceConfig;
 
 const TICK: Duration = Duration::from_millis(10);
+const DEMUX_POLL: Duration = Duration::from_millis(100);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
 /// Reconnect schedule: the first dial is immediate, a failure doubles from a second to a
 /// minute, and only a lane that lived past the stable window clears the history.
@@ -2901,7 +2902,7 @@ pub(crate) fn serve_inbound(
     };
     let sock = sock.with_options(spec.sockopt.clone());
     let sock = Arc::new(sock.with_gso(spec.quic.is_none_or(|params| !params.disable_gso)));
-    let _ = sock.set_read_timeout(Some(crate::quic::SERVER_POLL));
+    let _ = sock.set_read_timeout(Some(DEMUX_POLL));
     let (packets, packets_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
         pool: Mutex::new(spec.pool.clone()),

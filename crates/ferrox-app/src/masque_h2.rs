@@ -3328,7 +3328,7 @@ mod tests {
         };
         let config = inbound(settings);
         let port =
-            crate::masque::serve_inbound(&config, &freedom(&echo.to_string()), "127.0.0.1:0")
+            crate::masque::serve_inbound(&config, &freedom(&echo.to_string()), "127.0.0.1:0", None)
                 .expect("serve");
 
         let tcp = TcpStream::connect(("127.0.0.1", port)).expect("tcp");
@@ -3443,8 +3443,9 @@ mod tests {
         } else {
             inbound(settings)
         };
-        let served = crate::masque::serve_inbound(&config, &freedom("127.0.0.1:1"), "127.0.0.1:0")
-            .expect("serve");
+        let served =
+            crate::masque::serve_inbound(&config, &freedom("127.0.0.1:1"), "127.0.0.1:0", None)
+                .expect("serve");
         let tcp = TcpStream::connect(("127.0.0.1", served)).expect("tcp");
         tcp.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
