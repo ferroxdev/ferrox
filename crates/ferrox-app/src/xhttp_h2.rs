@@ -164,7 +164,9 @@ impl<'a> DataBatch<'a> {
                             .send_conn
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner);
-                        if conn.dead.load(Ordering::SeqCst) || self.reserved_fits(conn).is_none() {
+                        let fits = self.reserved_fits(conn);
+                        if conn.dead.load(Ordering::SeqCst) || fits.is_none() || fits == Some(true)
+                        {
                             continue;
                         }
                     }
@@ -185,7 +187,10 @@ impl<'a> DataBatch<'a> {
             if conn.client_read.is_some() && pump {
                 drop(credit);
                 let pumped = conn.pump_read(
-                    || !matches!(self.reserved_fits(conn), Some(false)),
+                    || {
+                        !matches!(self.reserved_fits(conn), Some(false))
+                            || self.fitting_prefix(conn)
+                    },
                     crate::proxy::relay_step_owns_poll(),
                 );
                 gate = conn
