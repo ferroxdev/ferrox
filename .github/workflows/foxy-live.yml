@@ -54,6 +54,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # The account lives under either spelling: FOXY_EMAIL/FOXY_PASS name what
       # it is, USERNAME/PASSWORD are the names a repository already has.
       - name: Check secrets present
@@ -69,7 +71,7 @@ jobs:
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: foxy-live
       # The runner's bundle predates the Let's Encrypt intermediates the
@@ -191,6 +193,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/result
         with:
           title: foxy-live

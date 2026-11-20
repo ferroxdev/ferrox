@@ -59,6 +59,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -103,13 +105,13 @@ jobs:
 
       - name: fetch sing-box
         run: |
-          curl -sSL "https://github.com/SagerNet/sing-box/releases/download/v$SINGBOX_VERSION/sing-box-$SINGBOX_VERSION-linux-amd64.tar.gz" \
+          curl -sSLf "https://github.com/SagerNet/sing-box/releases/download/v$SINGBOX_VERSION/sing-box-$SINGBOX_VERSION-linux-amd64.tar.gz" \
             | tar xz -C "$RUNNER_TEMP"
 
       - name: fetch tun2socks
         if: contains(inputs.engines, 'tun2socks')
         run: |
-          curl -sSL -o "$RUNNER_TEMP/t2s.zip" \
+          curl -sSLf -o "$RUNNER_TEMP/t2s.zip" \
             "https://github.com/xjasonlyu/tun2socks/releases/download/v$TUN2SOCKS_VERSION/tun2socks-linux-amd64.zip"
           unzip -q -o "$RUNNER_TEMP/t2s.zip" -d "$RUNNER_TEMP/tun2socks"
           chmod +x "$RUNNER_TEMP/tun2socks/tun2socks-linux-amd64"
@@ -173,6 +175,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 

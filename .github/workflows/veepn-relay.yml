@@ -39,6 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: plan the scope
         id: scope
@@ -69,8 +70,10 @@ jobs:
       VEEPN_REGION: ${{ inputs.region || 'nl' }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: veepn-relay-${{ matrix.os }}
       - name: Build ferrox-app
@@ -363,6 +366,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/result
         with:
           title: veepn-relay

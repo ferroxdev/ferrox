@@ -32,6 +32,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: the fetcher holds one checkout per repo and rev
         shell: bash
         run: ./scripts/fetch-upstream.sh --selftest
@@ -53,6 +55,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/result
         with:
           title: pins

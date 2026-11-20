@@ -43,6 +43,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - run: ./scripts/check-upstream-pins.sh
       - run: ./scripts/fetch-upstream.sh --only xray-core,sing-box,zeronet,xray-rust,leaf
       - uses: actions/upload-artifact@v4
@@ -73,6 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -118,6 +121,7 @@ jobs:
         run: |
           if [ ! -s target/bench-report.md ]; then
             echo "::error::no report at target/bench-report.md, so this run measured nothing"
+            exit 1
           fi
           {
             echo
@@ -150,6 +154,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/result
         with:
           title: parity

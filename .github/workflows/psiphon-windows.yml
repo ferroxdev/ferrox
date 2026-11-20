@@ -67,11 +67,13 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: psiphon-windows
       - name: Build ferrox-app
@@ -190,9 +192,9 @@ jobs:
             local front="$1" port="$2"
             shift 2
             if [ "$front" = mixed ] || [ "$front" = http ]; then
-              curl -sS "$@" -x "http://127.0.0.1:$port"
+              curl -sS --fail "$@" -x "http://127.0.0.1:$port"
             else
-              curl -sS "$@" --socks5-hostname "127.0.0.1:$port"
+              curl -sS --fail "$@" --socks5-hostname "127.0.0.1:$port"
             fi
           }
           wait_front() {
@@ -203,6 +205,7 @@ jobs:
                 lane_report
                 return 1
               fi
+              : > trace.txt
               if via "$front" "$port" --max-time 30 https://www.cloudflare.com/cdn-cgi/trace -o trace.txt 2>/dev/null && grep -q '^loc=' trace.txt; then
                 return 0
               fi
@@ -232,6 +235,7 @@ jobs:
           }
           fetch_mb() {
             local front="$1" port="$2" file="$3" label="$4" code=0 timing got
+            : > "$file"
             timing=$(via "$front" "$port" --max-time 300 \
               -w '%{size_download} %{time_total} %{speed_download}' \
               'https://speed.cloudflare.com/__down?bytes=10000000' -o "$file") || code=$?
@@ -711,6 +715,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/result
         with:
           title: psiphon-windows

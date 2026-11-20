@@ -36,6 +36,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-go@v5
         with:
@@ -67,12 +69,14 @@ jobs:
         shell: bash
         env:
           FERROX_UPSTREAM_HANDOFF: "1"
+          TIER: ${{ inputs.tier }}
+          FLAGS: ${{ inputs.flags }}
         run: >
           ./scripts/run-benchmark-matrix.sh
-          --tier "${{ inputs.tier }}"
+          --tier "$TIER"
           --out target/benchmark-matrix
           --build-only
-          ${{ inputs.flags }}
+          $FLAGS
       - uses: actions/upload-artifact@v4
         with:
           name: matrix-ferrox-${{ inputs.os }}
@@ -93,6 +97,8 @@ jobs:
         cell: ${{ fromJSON(inputs.cells) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       # No pip cache here: this job installs nothing, so setup-python's post
       # step has no cache to save and fails on the empty folder.
@@ -130,13 +136,16 @@ jobs:
         shell: bash
         env:
           FERROX_UPSTREAM_HANDOFF: "1"
+          TIER: ${{ inputs.tier }}
+          FLAGS: ${{ inputs.flags }}
+          CELL: ${{ matrix.cell }}
         run: >
           ./scripts/run-benchmark-matrix.sh
-          --tier "${{ inputs.tier }}"
+          --tier "$TIER"
           --out target/benchmark-matrix
-          --only "${{ matrix.cell }}"
+          --only "$CELL"
           --no-build
-          ${{ inputs.flags }}
+          $FLAGS
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -153,6 +162,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -167,16 +178,18 @@ jobs:
         run: pip install -r scripts/requirements-benchmark.txt
       - name: merge the cells and render once
         shell: bash
+        env:
+          OS: ${{ inputs.os }}
         run: |
           rm -rf target/benchmark-matrix
           mkdir -p target/benchmark-matrix/cells
           first=""
-          for bundle in cell-bundles/matrix-cell-${{ inputs.os }}-*/; do
+          for bundle in cell-bundles/matrix-cell-"$OS"-*/; do
             [[ -z "$first" ]] && first="$bundle"
             cp -r "$bundle"/cells/* target/benchmark-matrix/cells/
             cat "$bundle/commands.sh" >> target/benchmark-matrix/commands.sh
           done
-          [[ -n "$first" ]] || { echo "::error::no cell bundle for ${{ inputs.os }}" >&2; exit 1; }
+          [[ -n "$first" ]] || { echo "::error::no cell bundle for $OS" >&2; exit 1; }
           cp "$first/manifest.txt" target/benchmark-matrix/manifest.txt
           runner="$(grep -m1 '^runner: ' target/benchmark-matrix/manifest.txt | cut -d' ' -f2)"
           baseline=""
@@ -206,23 +219,28 @@ jobs:
         run: python3 scripts/check-comparator-rows.py --cells target/benchmark-matrix/cells --baseline scripts/comparator-gaps.txt
       - name: refuse a bundle that measured nothing
         shell: bash
+        env:
+          OS: ${{ inputs.os }}
         run: |
           cells="$(find target/benchmark-matrix/cells -name cell.json | wc -l)"
           echo "cells with a report: $cells"
           if [[ "$cells" == "0" ]]; then
-            echo "::error::no matrix cell produced a report on ${{ inputs.os }}; \
+            echo "::error::no matrix cell produced a report on $OS; \
               the run above exited 0 without measuring anything"
             exit 1
           fi
       - name: publish the text table
         if: always()
         shell: bash
+        env:
+          TIER: ${{ inputs.tier }}
+          OS: ${{ inputs.os }}
         run: |
           {
             if [[ -f target/benchmark-matrix/table.md ]]; then
               cat target/benchmark-matrix/table.md
               echo
-              echo "The text-only tables and repeat spread are the \`benchmark-matrix-table-${{ inputs.tier }}-${{ inputs.os }}\` artifact; the bundle below is the charts and images."
+              echo "The text-only tables and repeat spread are the \`benchmark-matrix-table-$TIER-$OS\` artifact; the bundle below is the charts and images."
             else
               echo "no text table written"
             fi
@@ -255,6 +273,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/result
         with:
           title: benchmark-matrix-os
