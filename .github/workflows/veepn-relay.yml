@@ -4,8 +4,8 @@ name: VeePN relay (live download check)
 # it starts `ferrox-app` with a socks/http config, lets the lane launch
 # anonymously, list a region's upstreams and dial one, downloads a real 1 MB
 # file through the tunnel and asserts the exact byte count. No account and no
-# secrets: the free pool is the whole setup, so a fork's pull request can run
-# it. The named region and the region the plane picks are gates; the rest of
+# secrets: the free pool is the whole setup, so a fork can dispatch it without
+# repository secrets. The named region and the region the plane picks are gates; the rest of
 # the free pool is a measurement, not a red leg, because a region that has left
 # the pool is a fact about the plane and not about this lane. Every front the
 # app serves is exercised on the same warm lane. A red leg is read from the
@@ -20,7 +20,7 @@ on:
 
 concurrency:
   group: veepn-relay-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -42,15 +42,7 @@ jobs:
           fetch-depth: 0
       - name: plan the scope
         id: scope
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          EVENT: ${{ github.event_name }}
-        run: |
-          if [[ "$EVENT" == pull_request ]]; then
-            python3 scripts/ci-scope.py scope --base "$BASE"
-          else
-            python3 scripts/ci-scope.py scope --wide
-          fi
+        run: python3 scripts/ci-scope.py scope --wide
 
   veepn-relay:
     name: VeePN relay live (${{ matrix.os }})
@@ -115,10 +107,11 @@ jobs:
           # is an msys pid and the lane would outlive its stop, holding the port
           # its successor binds.
           stop_lane() {
+            local limit="${1:-10}" tries=0 max=0
+            if [ "$limit" -gt 0 ]; then max=$((limit * 2)); fi
             if [ -n "$LANE_PID" ]; then
               kill -TERM "$LANE_PID" 2>/dev/null || true
-              tries=0
-              while [ "$tries" -lt 20 ] && kill -0 "$LANE_PID" 2>/dev/null; do
+              while [ "$tries" -lt "$max" ] && kill -0 "$LANE_PID" 2>/dev/null; do
                 sleep 0.5
                 tries=$((tries + 1))
               done
@@ -130,7 +123,10 @@ jobs:
           # minutes; the front binds before any upstream is dialled, so the
           # first flow pays the launch and the list.
           wait_port() {
-            local pid="$1" want="$2" stop_at=$((SECONDS + 30))
+            local pid="$1" want="$2" limit="${3:-30}" stop_at
+            if [ "$limit" -gt 30 ]; then limit=30; fi
+            if [ "$limit" -lt 1 ]; then return 1; fi
+            stop_at=$((SECONDS + limit))
             while ((SECONDS < stop_at)); do
               kill -0 "$pid" 2>/dev/null || return 1
               WANT="$want" python3 -c 'import os, socket; socket.create_connection(("127.0.0.1", int(os.environ["WANT"])), timeout=1).close()' 2>/dev/null && return 0
@@ -139,7 +135,7 @@ jobs:
             return 1
           }
           start_lane() {
-            local inbounds="$1" region="$2" first
+            local inbounds="$1" region="$2" limit="${3:-30}" first
             INBOUNDS="$inbounds" REGION="$region" UDID="$UDID" python3 -c '
           import json, os
           settings = {"udid": os.environ["UDID"]}
@@ -153,7 +149,7 @@ jobs:
             FOXY_DEBUG=1 "$BIN" run -c veepn-relay.json >> veepn-relay.log 2>&1 &
             LANE_PID=$!
             first="$(printf '%s' "$inbounds" | python3 -c 'import json, sys; print(json.load(sys.stdin)[0]["port"])')"
-            wait_port "$LANE_PID" "$first"
+            wait_port "$LANE_PID" "$first" "$limit"
           }
           # The front names the wire form the cursor speaks: an http or mixed
           # front is an HTTP CONNECT hop, a socks front is SOCKS5.
@@ -186,8 +182,8 @@ jobs:
             return 1
           }
           fetch_mb() {
-            local front="$1" port="$2" file="$3" label="$4" code=0 timing got
-            timing=$(via "$front" "$port" --max-time 180 \
+            local front="$1" port="$2" file="$3" label="$4" limit="${5:-180}" code=0 timing got
+            timing=$(via "$front" "$port" --max-time "$limit" \
               -w '%{size_download} %{time_total} %{speed_download}' \
               'https://speed.cloudflare.com/__down?bytes=1000000' -o "$file") || code=$?
             echo "$label ${timing:-0 0 0}" >> veepn-legs.tsv
@@ -226,19 +222,31 @@ jobs:
             stop_lane
           fi
           # Measurement, not a gate: which free-pool ids still carry a megabyte
-          # from this runner. A dead id is the plane's pool, not this lane.
-          SWEEP_END=$((SECONDS + 300))
+          # from this runner. A dead id is the plane's pool, not this lane. The
+          # sweep has its own budget so it cannot consume the job's backstop.
+          SWEEP_END=$((SECONDS + 240))
           for region in us-va us-or gb-lnd fr-prs sg ru-spb; do
             [ "$region" = "$VEEPN_REGION" ] && continue
-            (( SECONDS < SWEEP_END )) || { echo "sweep budget spent"; break; }
+            left=$((SWEEP_END - SECONDS))
+            if [ "$left" -le 0 ]; then
+              echo "sweep budget spent before $region" >&2
+              break
+            fi
             port=$((10812 + $(printf '%s' "$region" | cksum | cut -d' ' -f1) % 40))
-            if start_lane "[{\"protocol\":\"socks\",\"listen\":\"127.0.0.1\",\"port\":$port}]" "$region"; then
-              fetch_mb socks "$port" "sweep-$region.bin" "sweep $region" \
+            if start_lane "[{\"protocol\":\"socks\",\"listen\":\"127.0.0.1\",\"port\":$port}]" "$region" "$left"; then
+              left=$((SWEEP_END - SECONDS))
+              if [ "$left" -le 0 ]; then
+                echo "sweep budget spent during $region startup" >&2
+                stop_lane 0
+                break
+              fi
+              limit=$((left < 180 ? left : 180))
+              fetch_mb socks "$port" "sweep-$region.bin" "sweep $region" "$limit" \
                 || echo "sweep $region: no megabyte" >&2
-              stop_lane
+              stop_lane "$((SWEEP_END - SECONDS))"
             else
               echo "sweep $region: the lane never listened" >&2
-              stop_lane
+              stop_lane "$((SWEEP_END - SECONDS))"
             fi
           done
           if [ -n "$FAILED" ]; then

@@ -81,9 +81,18 @@ jobs:
         shell: bash
         run: |
           set +e
-          cargo +nightly miri test -p ${{ matrix.package }} ${{ matrix.target }} \
-            --no-fail-fast -- ${{ matrix.filters }} --test-threads 2 2>&1 | tee /tmp/miri.log
-          rc="${PIPESTATUS[0]}"
+          : > /tmp/miri.log
+          rc=0
+          filters=(${{ matrix.filters }})
+          [ "${#filters[@]}" -gt 0 ] || filters=('')
+          for filter in "${filters[@]}"; do
+            args=()
+            [ -n "$filter" ] && args=("$filter")
+            cargo +nightly miri test -p ${{ matrix.package }} ${{ matrix.target }} \
+              --no-fail-fast -- "${args[@]}" --test-threads 2 2>&1 | tee -a /tmp/miri.log
+            part="${PIPESTATUS[0]}"
+            [ "$part" -eq 0 ] || rc=1
+          done
           ran="$(grep -c ' \.\.\. ok$' /tmp/miri.log || true)"
           failed="$(grep -c ' \.\.\. FAILED$' /tmp/miri.log || true)"
           echo "### miri: ${{ matrix.shard }} — $ran ok, $failed failed" >> "$GITHUB_STEP_SUMMARY"

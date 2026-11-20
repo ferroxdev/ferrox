@@ -79,15 +79,7 @@ jobs:
           fetch-depth: 0
       - name: plan the scope
         id: scope
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          EVENT: ${{ github.event_name }}
-        run: |
-          if [[ "$EVENT" == pull_request ]]; then
-            python3 scripts/ci-scope.py scope --base "$BASE"
-          else
-            python3 scripts/ci-scope.py scope --wide
-          fi
+        run: python3 scripts/ci-scope.py scope --wide
 
   foxy-relay:
     name: Foxy relay live (${{ matrix.os }})
@@ -808,14 +800,18 @@ jobs:
           leg_share
           echo "== udp path over the auto carrier: h3, then h2 (the datagram order) =="
           PORT=10818
-          start_lane socks "$PORT" auto "$COUNTRY"
-          trace_socks "$PORT" "$COUNTRY" "udp auto" || FAILED="$FAILED udp-auto(trace)"
-          # Control first: plain TCP to the DNS port through the same tunnel.
-          # A fast connect proves egress; a refusal proves the target, and any
-          # UDP verdict below must be read against this line. Names only, no
-          # literals: the fixture gate forbids routable addresses in the tree.
-          curl -v --max-time 12 --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
-          SOCKS_PORT="$PORT" python3 udp-probe.py || FAILED="$FAILED udp-auto(datagram)"
+          if start_lane socks "$PORT" auto "$COUNTRY"; then
+            trace_socks "$PORT" "$COUNTRY" "udp auto" || FAILED="$FAILED udp-auto(trace)"
+            # Control first: plain TCP to the DNS port through the same tunnel.
+            # A fast connect proves egress; a refusal proves the target, and any
+            # UDP verdict below must be read against this line. Names only, no
+            # literals: the fixture gate forbids routable addresses in the tree.
+            curl -v --max-time 12 --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
+            SOCKS_PORT="$PORT" python3 udp-probe.py || FAILED="$FAILED udp-auto(datagram)"
+          else
+            echo "udp auto FAILED: the lane never listened" >&2
+            FAILED="$FAILED udp-auto(listen)"
+          fi
           stop_lane
           # The other form the lane speaks: the same datagram over the HTTP/2
           # edge the US MASQUE authority publishes, so a runner that never
@@ -823,10 +819,14 @@ jobs:
           leg_share
           echo "== udp path over h2 =="
           PORT=10819
-          start_lane socks "$PORT" h2 "$COUNTRY"
-          trace_socks "$PORT" "$COUNTRY" "udp h2" || FAILED="$FAILED udp-h2(trace)"
-          curl -v --max-time 12 --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
-          SOCKS_PORT="$PORT" python3 udp-probe.py || FAILED="$FAILED udp-h2(datagram)"
+          if start_lane socks "$PORT" h2 "$COUNTRY"; then
+            trace_socks "$PORT" "$COUNTRY" "udp h2" || FAILED="$FAILED udp-h2(trace)"
+            curl -v --max-time 12 --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
+            SOCKS_PORT="$PORT" python3 udp-probe.py || FAILED="$FAILED udp-h2(datagram)"
+          else
+            echo "udp h2 FAILED: the lane never listened" >&2
+            FAILED="$FAILED udp-h2(listen)"
+          fi
           stop_lane
           if [ -n "$FAILED" ]; then
             echo "failed ubuntu legs:$FAILED" >&2
