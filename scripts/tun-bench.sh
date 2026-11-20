@@ -31,6 +31,7 @@ BENCH=${BENCH:-}
 HEV=${HEV:-}
 HEV_SERVER=${HEV_SERVER:-}
 SINGBOX=${SINGBOX:-}
+XRAY=${XRAY:-}
 TUN2SOCKS=${TUN2SOCKS:-}
 
 DURATION=${DURATION:-5}
@@ -216,6 +217,18 @@ start_tun2socks() {
     TUN_NAME=t2s0
 }
 
+start_xray() {
+    [ -n "$XRAY" ] || return 1
+    printf '{"log":{"loglevel":"error"},"inbounds":[{"tag":"tun","protocol":"tun","settings":{"name":"xr0","mtu":%s,"gateway":["%s/%s"]}}],"outbounds":[{"tag":"proxy","protocol":"socks","settings":{"servers":[{"address":"%s","port":%s}]}}]}' \
+        "$MTU" "$TUN_ADDR" "$TUN_PREFIX" "$VETH_SERVER" "$SOCKS_PORT" > "$OUT_DIR/xray.json"
+    "$XRAY" run -c "$OUT_DIR/xray.json" > "$OUT_DIR/xray.log" 2>&1 &
+    ENGINE_PIDS=$!
+    wait_dev xr0 || { note "xray did not create xr0"; cat "$OUT_DIR/xray.log" >&2; return 1; }
+    wait_up xr0 || return 1
+    install_routes xr0
+    TUN_NAME=xr0
+}
+
 start_engine() {
     engine=$1
     ENGINE_PIDS=""
@@ -227,6 +240,7 @@ start_engine() {
         ferrox-system) start_ferrox system ;;
         ferrox-hybrid) start_ferrox hybrid ;;
         hev|hev-socks5-tunnel) start_hev ;;
+        xray) start_xray ;;
         singbox-system|sing-tun-system) start_singbox system ;;
         singbox-gvisor|sing-tun-gvisor) start_singbox gvisor ;;
         tun2socks) start_tun2socks ;;
@@ -456,6 +470,7 @@ while [ "$rep" -le "$REPEAT" ]; do
             ferrox|ferrox-*) [ -n "$FERROX" ] || continue ;;
             hev|hev-socks5-tunnel) [ -n "$HEV" ] || continue ;;
             singbox-*|sing-tun-*) [ -n "$SINGBOX" ] || continue ;;
+            xray) [ -n "$XRAY" ] || continue ;;
             tun2socks) [ -n "$TUN2SOCKS" ] || continue ;;
         esac
         printf 'round %s engine %s\n' "$rep" "$engine"

@@ -8,7 +8,7 @@ on:
         type: string
         default: "latest"
       engines:
-        description: Space-separated engines (`sing-tun-*` names the sing-box tun inbound, `hev` is the same engine as `hev-socks5-tunnel`; `tun2socks` is fetched and run only when named here)
+        description: Space-separated engines (`sing-tun-*` names the sing-box tun inbound, `hev` is the same engine as `hev-socks5-tunnel`; `tun2socks` and `xray` are built and run only when named here)
         type: string
         default: "hev-socks5-tunnel ferrox ferrox-native singbox-system singbox-gvisor"
       scenarios:
@@ -124,6 +124,22 @@ jobs:
           curl -sSLf "https://github.com/SagerNet/sing-box/releases/download/v$SINGBOX_VERSION/sing-box-$SINGBOX_VERSION-linux-amd64.tar.gz" \
             | tar xz -C "$RUNNER_TEMP"
 
+      - name: fetch xray-core
+        if: contains(inputs.engines, 'xray')
+        run: |
+          ./scripts/fetch-upstream.sh --only xray-core
+          echo "XRAY_SHA=$(git -C upstream/xray-core rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-go@v5
+        if: contains(inputs.engines, 'xray')
+        with:
+          go-version-file: upstream/xray-core/go.mod
+
+      - name: build xray-core
+        if: contains(inputs.engines, 'xray')
+        run: |
+          ( cd upstream/xray-core && go build -trimpath -o "$RUNNER_TEMP/xray" ./main )
+
       - name: fetch tun2socks
         if: contains(inputs.engines, 'tun2socks')
         run: |
@@ -144,6 +160,7 @@ jobs:
             printf '| sing-box | `v%s` |\n' "$SINGBOX_VERSION"
             printf '| sing-tun | sing-box v%s tun inbound (`gvisor`, `system` stacks) |\n' "$SINGBOX_VERSION"
             printf '| tun2socks | `v%s` |\n' "$TUN2SOCKS_VERSION"
+            if [ -n "${XRAY_SHA:-}" ]; then printf '| xray-core | `%s` |\n' "$XRAY_SHA"; fi
           } > "$RUNNER_TEMP/tun-bench-identity.md"
           cat "$RUNNER_TEMP/tun-bench-identity.md" >> "$GITHUB_STEP_SUMMARY"
 
@@ -154,6 +171,7 @@ jobs:
           HEV: ${{ runner.temp }}/hev-socks5-tunnel/bin/hev-socks5-tunnel
           HEV_SERVER: ${{ runner.temp }}/hev-socks5-server/bin/hev-socks5-server
           SINGBOX: ${{ runner.temp }}/sing-box-${{ env.SINGBOX_VERSION }}-linux-amd64/sing-box
+          XRAY: ${{ runner.temp }}/xray
           TUN2SOCKS: ${{ runner.temp }}/tun2socks/tun2socks-linux-amd64
           OUT_DIR: tun-bench-results
           ENGINES: ${{ inputs.engines }}
