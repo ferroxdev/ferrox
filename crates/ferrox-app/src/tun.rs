@@ -1260,7 +1260,6 @@ fn render_tcp_packet_ip(
     partial: bool,
     out: &mut Vec<u8>,
 ) {
-    out.clear();
     let Some(head) = ip_header_len(src.0, dst.0) else {
         return;
     };
