@@ -1252,7 +1252,7 @@ impl Stop {
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.closed.lock().map_or(false, |closed| *closed)
+        self.closed.lock().is_ok_and(|closed| *closed)
     }
 
     pub(crate) fn mark_closed(&self) {
