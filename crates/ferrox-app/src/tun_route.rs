@@ -145,12 +145,13 @@ impl Guard {
                     } else if let Some(index) = found.if_index() {
                         pin = pin.with_if_index(index);
                     }
-                    if manager.add(&pin).is_ok() {
-                        added.push(pin);
-                    } else {
-                        eprintln!(
+                    match manager.add(&pin) {
+                        Ok(()) => added.push(pin),
+                        // Another live capture already installed it; the last guard to close still owns the entry.
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => added.push(pin),
+                        Err(_) => eprintln!(
                             "tun inbound: could not keep {destination}/{prefix} on its own route"
-                        );
+                        ),
                     }
                 }
                 Ok(None) => eprintln!(
@@ -165,6 +166,7 @@ impl Guard {
             let route = Route::new(*destination, *prefix).with_if_name(interface.to_owned());
             match manager.add(&route) {
                 Ok(()) => added.push(route),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => added.push(route),
                 Err(error) => eprintln!(
                     "tun inbound: could not route {destination}/{prefix} into {interface}: {error}"
                 ),
@@ -228,6 +230,11 @@ impl Guard {
         };
         match manager.add(&route) {
             Ok(()) => {
+                if let Ok(mut added) = self.added.lock() {
+                    added.push(route);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 if let Ok(mut added) = self.added.lock() {
                     added.push(route);
                 }
