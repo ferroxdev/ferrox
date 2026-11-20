@@ -60,7 +60,7 @@ What is not removed: QUIC still encrypts every datagram, the sending side still 
 
 CI's `bench.yml` run `43998600542` (`23ef3f4`) measured the PACKET parse at **13.8 ns** on linux x86_64, **18.5 ns** on linux aarch64, **9.5 ns** on macos aarch64 and **24.0 ns** on windows x86_64. The same run's stream section prices the removed second pass: one parse against two read **4.1** against **14.7 ns** on linux x86_64, **6.1** against **19.4** on linux aarch64, **4.0** against **10.5** on macos aarch64 and **7.7** against **27.8** on windows, so the one-parse path saves **10.6**, **13.3**, **6.5** and **20.1 ns** per packet. These are the codec's dispatch costs, not the QUIC/TLS relay; no local duration is quoted.
 
-The same run's burst section prices the removed per-frame tail shift on a 512-frame, 1220-byte burst: the drain shape read **5179.7 ns/frame** against **9.7** for the offset walk on linux x86_64, **6992.3** against **6.4** on linux aarch64, **6487.1** against **11.9** on macos aarch64 and **2377.1** against **4.5** on windows x86_64. The offset row is the codec walk alone; the difference is the tail the old shape moved once per frame.
+CI's `bench.yml` run `44694951611` prices the removed per-frame tail shift on a 512-frame, 1220-byte burst: the drain shape read **5179.7 ns/frame** against **9.7** for the offset walk on linux x86_64, **6992.3** against **6.4** on linux aarch64, **6487.1** against **11.9** on macos aarch64 and **2377.1** against **4.5** on windows x86_64. The offset row is the codec walk alone; the difference is the tail the old shape moved once per frame.
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/tuic.rs, crates/ferrox-core/src/tuic.rs
