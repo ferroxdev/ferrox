@@ -2248,19 +2248,29 @@ fn socket_table_names(path: &std::path::Path) -> Option<bool> {
     {
         let text = path.to_str()?;
         let table = std::fs::read_to_string("/proc/net/unix").ok()?;
-        Some(
-            table
-                .lines()
-                .skip(1)
-                .filter_map(proc_unix_entry)
-                .any(|(listed, listening)| {
-                    listening && (listed == text || staged_path_matches(listed, path))
-                }),
-        )
+        let mut unknown_staged = false;
+        for (listed, listening) in table.lines().skip(1).filter_map(proc_unix_entry) {
+            if !listening {
+                continue;
+            }
+            if listed == text {
+                return Some(true);
+            }
+            match staged_owner(listed) {
+                Some(owner) => {
+                    if owner == path {
+                        return Some(true);
+                    }
+                }
+                None if staged_sibling(listed, path) => unknown_staged = true,
+                None => {}
+            }
+        }
+        (!unknown_staged).then_some(false)
     }
     #[cfg(target_os = "macos")]
     {
-        macos_socket_table().map(|table| macos_table_names(&table, path))
+        macos_socket_table().and_then(|table| macos_table_names(&table, path))
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
@@ -2285,9 +2295,32 @@ fn proc_unix_entry(line: &str) -> Option<(&str, bool)> {
     Some((listed, listening))
 }
 
-/// A staged bind's PCB keeps the private `.ferrox-*/s` name, so a matching sibling still names this path.
+/// A bind records the private staging address it bound, so a copied staging name is never mistaken for another path's listener.
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-fn staged_path_matches(listed: &str, path: &std::path::Path) -> bool {
+static STAGED_BINDINGS: std::sync::Mutex<Vec<(std::path::PathBuf, std::path::PathBuf)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn register_staged(inner: &std::path::Path, published: &std::path::Path) {
+    STAGED_BINDINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((inner.to_path_buf(), published.to_path_buf()));
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn staged_owner(listed: &str) -> Option<std::path::PathBuf> {
+    STAGED_BINDINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(inner, _)| inner.as_os_str().as_encoded_bytes() == listed.as_bytes())
+        .map(|(_, published)| published.clone())
+}
+
+/// A `.ferrox-*/s` address in this path's own directory is the shape a staged bind leaves, whether or not this process recorded it.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn staged_sibling(listed: &str, path: &std::path::Path) -> bool {
     let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -2307,17 +2340,18 @@ fn staged_path_matches(listed: &str, path: &std::path::Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_table_names(table: &[u8], path: &std::path::Path) -> bool {
+fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
     const HEADER: usize = 24;
     const PATH_OFFSET: usize = 106;
     const OPTIONS_OFFSET: usize = 630;
     const RECORD: usize = OPTIONS_OFFSET + 2;
     let mut at = HEADER;
+    let mut unknown_staged = false;
     while at + 4 <= table.len() {
         let len =
             u32::from_le_bytes([table[at], table[at + 1], table[at + 2], table[at + 3]]) as usize;
         if len < 4 || at + len > table.len() {
-            return false;
+            break;
         }
         if len >= RECORD {
             let record = &table[at..at + len];
@@ -2326,20 +2360,28 @@ fn macos_table_names(table: &[u8], path: &std::path::Path) -> bool {
                 let raw = &record[PATH_OFFSET..];
                 if let Some(end) = raw.iter().position(|byte| *byte == 0) {
                     if let Ok(listed) = std::str::from_utf8(&raw[..end]) {
-                        if std::path::Path::new(listed) == path || staged_path_matches(listed, path)
-                        {
-                            return true;
+                        if std::path::Path::new(listed) == path {
+                            return Some(true);
+                        }
+                        match staged_owner(listed) {
+                            Some(owner) => {
+                                if owner == path {
+                                    return Some(true);
+                                }
+                            }
+                            None if staged_sibling(listed, path) => unknown_staged = true,
+                            None => {}
                         }
                     }
                 }
             }
         }
         if len == HEADER {
-            return false;
+            break;
         }
         at += len;
     }
-    false
+    (!unknown_staged).then_some(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -3058,6 +3100,7 @@ fn bind_staged(
             std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(mode))?;
             take_stale(path, stale)?;
             std::fs::hard_link(&inner, path)?;
+            register_staged(&inner, path);
             Ok(listener)
         })();
         let _ = std::fs::remove_file(&inner);
@@ -4587,6 +4630,35 @@ mod tests {
         );
         drop(listener);
         std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One live staged listener's copied name must not keep a dead sibling's path alive: ownership follows the bind, not the directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_staged_listener_does_not_own_a_dead_siblings_path() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-owner-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let live = dir.join("a");
+        let dead = dir.join("b");
+        let live_target = parse_target(&format!("unix:{},0750", live.display())).expect("parses");
+        let dead_target = parse_target(&format!("unix:{},0750", dead.display())).expect("parses");
+        let listener = Listener::bind(&live_target).expect("a stays bound");
+        drop(Listener::bind(&dead_target).expect("b binds once"));
+        assert_eq!(
+            socket_table_names(&dead),
+            Some(false),
+            "a's staging name is not b's owner"
+        );
+        let recovered = Listener::bind(&dead_target).expect("b recovers while a stays bound");
+        assert!(probe_unix(&live).is_err(), "a is still live");
+        drop(recovered);
+        drop(listener);
+        std::fs::remove_file(&dead).ok();
+        std::fs::remove_file(&live).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 
