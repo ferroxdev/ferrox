@@ -3844,7 +3844,11 @@ mod tests {
             assert!(udp_datagram(
                 &UdpDatagram {
                     source: &[10, 0, 0, 2],
-                    destination: asked.parse::<std::net::Ipv4Addr>().unwrap().octets().as_slice(),
+                    destination: asked
+                        .parse::<std::net::Ipv4Addr>()
+                        .unwrap()
+                        .octets()
+                        .as_slice(),
                     source_port: source.port(),
                     destination_port: 53,
                     payload: b"query",

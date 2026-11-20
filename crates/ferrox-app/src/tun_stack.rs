@@ -228,6 +228,7 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
     #[cfg(not(unix))]
     let wake_write = ();
     let config = device_config(spec);
+    let dns_hijack = spec.dns_hijack();
     let stack_out = out.clone();
     let failed = Arc::new(AtomicBool::new(false));
     let stack_failed = Arc::clone(&failed);
@@ -240,7 +241,7 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             stack_out,
             Some(recycle),
             headroom,
-            spec.dns_hijack(),
+            dns_hijack,
             wake_read,
             stack_failed,
         );
@@ -252,7 +253,7 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             stack_out,
             Some(recycle),
             headroom,
-            spec.dns_hijack(),
+            dns_hijack,
             stack_failed,
         );
     });
