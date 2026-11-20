@@ -572,15 +572,24 @@ jobs:
           for line in lines:
               parts = line.rsplit(None, 4)
               if len(parts) == 5:
-                  label, size, seconds, speed, code = parts
+                  try:
+                      label, size, seconds, speed, code = parts[0], float(parts[1]), float(parts[2]), float(parts[3]), int(parts[4])
+                  except ValueError:
+                      parts = line.rsplit(None, 3)
+                      if len(parts) != 4:
+                          continue
+                      try:
+                          label, size, seconds, speed = parts[0], float(parts[1]), float(parts[2]), float(parts[3])
+                      except ValueError:
+                          continue
+                      code = 0
               elif len(parts) == 4:
-                  label, size, seconds, speed = parts
-                  code = "0"
+                  try:
+                      label, size, seconds, speed = parts[0], float(parts[1]), float(parts[2]), float(parts[3])
+                  except ValueError:
+                      continue
+                  code = 0
               else:
-                  continue
-              try:
-                  size, seconds, speed, code = float(size), float(seconds), float(speed), int(code)
-              except ValueError:
                   continue
               legs.append((label, size, seconds, speed, code))
 
