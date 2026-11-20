@@ -2127,7 +2127,7 @@ pub(crate) fn extract_meta<'a>(
     (sid, seq)
 }
 
-struct Session {
+pub(crate) struct Session {
     state: Mutex<SessionState>,
     cv: Condvar,
     id: String,
@@ -2381,6 +2381,7 @@ impl SessionHandle {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn session_handle(id: &str) -> SessionHandle {
     SessionHandle(get_or_create_session(id))
 }
