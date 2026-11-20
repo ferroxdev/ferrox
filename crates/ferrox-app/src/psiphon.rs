@@ -3415,7 +3415,6 @@ impl Settings {
         };
         let mut fronted_fallback = !conduit && !fronted;
         let selection_cdn = selection_enables_cdn(selection.as_deref());
-        let shirokhorshid_cdn = selection_is_cdn(selection.as_deref());
         let selection_tactics_disabled = selection_disables_tactics(selection.as_deref());
         // Explicit LimitTunnelProtocols wins; otherwise derive from protocolSelection.
         let mut protocols = protocol_list(settings);
@@ -3901,12 +3900,11 @@ impl Settings {
         }
         cdn_scan_specs.extend(cdn_scan_builtin.iter().cloned());
         let cdn_scan_state = Arc::new(Mutex::new(crate::psiphon_cdn::ScanState::new()));
-        if shirokhorshid_cdn {
+        if selection_cdn {
             fronted_overrides.extend(cdn_fronting_overrides(edge_sni.as_deref()));
-        } else if selection_cdn
-            || cdn_sets
-                .iter()
-                .any(|set| set.eq_ignore_ascii_case("fastly"))
+        } else if cdn_sets
+            .iter()
+            .any(|set| set.eq_ignore_ascii_case("fastly"))
         {
             fronted_overrides.push(FrontedOverride {
                 dials: vec!["pypi.org".to_owned()],
@@ -14726,6 +14724,38 @@ mod tests {
         assert_eq!(settings.protocols, Vec::<String>::new());
         assert!(!settings.disable_tactics);
         assert_ne!(settings.cdn_ips, Vec::<String>::new());
+    }
+
+    #[test]
+    fn auto_adds_the_android_edge_overrides() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"protocolSelection":"auto"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(
+            settings.fronted_overrides.len(),
+            2 + CDN_EDGE_ADDRESSES.len()
+        );
+        assert!(settings
+            .fronted_overrides
+            .iter()
+            .any(|fronted| fronted.override_id.as_deref() == Some("edge-a-1")));
+        assert!(settings
+            .fronted_overrides
+            .iter()
+            .any(|fronted| fronted.dials.iter().any(|dial| dial.as_str() == "pypi.org")));
+    }
+
+    #[test]
+    fn direct_adds_the_android_edge_overrides() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"protocolSelection":"direct"}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(
+            settings.fronted_overrides.len(),
+            2 + CDN_EDGE_ADDRESSES.len()
+        );
     }
 
     #[test]
