@@ -39,6 +39,7 @@ const RETRY_TOKEN_TTL: Duration = Duration::from_secs(60);
 const RETRY_TOKEN_TAG: usize = 32;
 const MAX_ASSOCIATIONS_PER_SESSION: usize = 256;
 const MAX_UDP_SOCKETS: usize = 2048;
+const MAX_TUIC_LANES: usize = 64;
 const MAX_RESOLVING_PER_SESSION: usize = 32;
 const MAX_RESOLVE_PAYLOADS: usize = 4;
 const RESOLVE_QUEUE: usize = 256;
@@ -90,7 +91,7 @@ pub(crate) struct TuicOut {
     cert_pins: Arc<[[u8; 32]]>,
     insecure: bool,
     heartbeat: Duration,
-    lane: Mutex<Option<Arc<Lane>>>,
+    lanes: Mutex<HashMap<LaneKey, Arc<Lane>>>,
     session: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
@@ -105,9 +106,28 @@ impl std::fmt::Debug for TuicOut {
     }
 }
 
+type LaneKey = (Option<IpAddr>, Option<Arc<crate::sockopt::SocketOptions>>);
+
+struct LaneLease(Arc<Lane>);
+
+impl std::ops::Deref for LaneLease {
+    type Target = Lane;
+
+    fn deref(&self) -> &Lane {
+        &self.0
+    }
+}
+
+impl Drop for LaneLease {
+    fn drop(&mut self) {
+        self.0.leases.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct Lane {
     conn: Arc<Mutex<quiche::Connection>>,
     sock: Arc<Datagram>,
+    leases: AtomicUsize,
     local: SocketAddr,
     next_bidi: Mutex<u64>,
     next_uni: AtomicU64,
@@ -327,32 +347,47 @@ impl TuicOut {
         proxy::resolve_outbound(&self.address, self.port)
     }
 
-    fn lane(&self) -> Option<Arc<Lane>> {
-        let mut held = self.lane.lock().ok()?;
-        if let Some(lane) = held.as_ref() {
+    fn lane(&self) -> Option<LaneLease> {
+        let options = proxy::dial_options();
+        let source = proxy::flow_source().ok()?;
+        let key = (source, options.clone());
+        let mut held = self.lanes.lock().ok()?;
+        held.retain(|_, lane| {
+            lane.leases.load(Ordering::Acquire) > 0
+                || !(lane.stop.load(Ordering::Relaxed)
+                    || lane.conn.lock().is_ok_and(|conn| conn.is_closed()))
+        });
+        if let Some(lane) = held.get(&key) {
             let live = !lane.stop.load(Ordering::Relaxed)
                 && lane
                     .conn
                     .lock()
                     .is_ok_and(|conn| lane_established(&conn, lane));
             if live {
-                return Some(Arc::clone(lane));
-            }
-            lane.stop.store(true, Ordering::Relaxed);
-            if let Ok(mut conn) = lane.conn.lock() {
-                if !conn.is_closed() {
-                    let _ = conn.close(true, 0, b"handshake deadline");
-                    quic::flush_egress(&mut conn, &lane.sock);
-                }
+                lane.leases.fetch_add(1, Ordering::AcqRel);
+                return Some(LaneLease(Arc::clone(lane)));
             }
         }
-        let lane = self.connect_lane()?;
-        *held = Some(Arc::clone(&lane));
-        Some(lane)
+        held.remove(&key);
+        if held.len() >= MAX_TUIC_LANES {
+            let idle = held
+                .iter()
+                .find(|(_, lane)| lane.leases.load(Ordering::Acquire) == 0)
+                .map(|(key, _)| key.clone());
+            let idle = idle?;
+            held.remove(&idle);
+        }
+        let lane = self.connect_lane(source, options)?;
+        lane.leases.fetch_add(1, Ordering::AcqRel);
+        held.insert(key, Arc::clone(&lane));
+        Some(LaneLease(lane))
     }
 
-    fn connect_lane(&self) -> Option<Arc<Lane>> {
-        let options = proxy::dial_options();
+    fn connect_lane(
+        &self,
+        source: Option<IpAddr>,
+        options: Option<Arc<crate::sockopt::SocketOptions>>,
+    ) -> Option<Arc<Lane>> {
         let (socket, peer, local) =
             if let Some(tag) = options.as_deref().and_then(|o| o.dialer_proxy()) {
                 let options = options.as_deref()?;
@@ -365,11 +400,11 @@ impl TuicOut {
                     &self.address,
                     self.port,
                     options.as_deref(),
-                    proxy::flow_source().ok()?,
+                    source,
                 )?;
                 (quic::Datagram::plain(sock).with_gro(false), peer, local)
             };
-        let socket = socket.with_options(options);
+        let socket = socket.with_options(options).with_source(source);
         let mut config = self.client_config()?;
         let mut scid = [0u8; SCID_LEN];
         getrandom::fill(&mut scid).ok()?;
@@ -394,6 +429,7 @@ impl TuicOut {
         let lane = Arc::new(Lane {
             conn,
             sock: socket,
+            leases: AtomicUsize::new(0),
             local,
             next_bidi: Mutex::new(0),
             next_uni: AtomicU64::new(6),
@@ -1387,7 +1423,7 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<TuicOut>, String> {
         cert_pins: Arc::clone(&tls.cert_pins),
         insecure: tls.insecure,
         heartbeat,
-        lane: Mutex::new(None),
+        lanes: Mutex::new(HashMap::new()),
         session: Arc::new(Mutex::new(None)),
     }))
 }
@@ -2769,7 +2805,7 @@ mod tests {
             cert_pins: Arc::new([]),
             insecure: false,
             heartbeat: Duration::from_secs(30),
-            lane: Mutex::new(None),
+            lanes: Mutex::new(HashMap::new()),
             session: Arc::new(Mutex::new(None)),
         }
     }
