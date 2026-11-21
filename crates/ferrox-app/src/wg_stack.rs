@@ -5198,6 +5198,58 @@ mod tests {
             "a client narrowed the MTU every tunnel shares"
         );
     }
+
+    /// A reply datagram reaches its lane in the buffer the tunnel read, and the lane's return puts
+    /// that same allocation back in the pool; a packet no lane claims comes back untouched.
+    #[test]
+    fn a_reply_datagram_reaches_its_lane_in_the_readers_buffer() {
+        let (to_tunnel, _packets) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&device(&["10.0.0.1"], true), to_tunnel, 0);
+        let (pool, recycled) = std::sync::mpsc::channel();
+        stack.device.recycle = Some(pool);
+        let (lane, replies) = std::sync::mpsc::channel();
+        stack.routes.lock().expect("routes").insert(4321, lane);
+        let mut bytes = vec![0u8; 16];
+        let base = bytes.as_ptr();
+        assert!(udp_datagram(
+            &UdpDatagram {
+                source: &[10, 0, 0, 2],
+                destination: &[10, 0, 0, 1],
+                source_port: 1234,
+                destination_port: 4321,
+                payload: b"hi",
+            },
+            &mut bytes,
+        ));
+        let want = bytes[16..].to_vec();
+        assert_eq!(stack.deliver_udp(bytes, 16), None, "the lane takes it");
+        let packet = replies.recv().expect("the lane's packet");
+        assert_eq!(packet.bytes.as_ptr(), base, "the reader's own buffer");
+        assert_eq!(packet.at, 16, "at the packet's offset");
+        assert_eq!(packet.packet(), &want[..], "the datagram's own bytes");
+        packet.release();
+        let returned = recycled.recv().expect("the pool's buffer");
+        assert_eq!(returned.as_ptr(), base, "the same allocation comes back");
+
+        let mut bytes = vec![7u8; 16];
+        let base = bytes.as_ptr();
+        assert!(udp_datagram(
+            &UdpDatagram {
+                source: &[10, 0, 0, 2],
+                destination: &[10, 0, 0, 1],
+                source_port: 1234,
+                destination_port: 4322,
+                payload: b"hi",
+            },
+            &mut bytes,
+        ));
+        let back = stack.deliver_udp(bytes, 16).expect("no lane claims it");
+        assert_eq!(
+            back.as_ptr(),
+            base,
+            "and the packet comes back as it went in"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5990,58 +6042,6 @@ mod client_tests {
             stack.device.capabilities().max_transmission_unit,
             INNER_MTU,
             "one peer narrowed the MTU every peer shares"
-        );
-    }
-
-    /// A reply datagram reaches its lane in the buffer the tunnel read, and the lane's return puts
-    /// that same allocation back in the pool; a packet no lane claims comes back untouched.
-    #[test]
-    fn a_reply_datagram_reaches_its_lane_in_the_readers_buffer() {
-        let (to_tunnel, _packets) = std::sync::mpsc::channel();
-        let mut stack = ClientStack::new(&device(&["10.0.0.1"], true), to_tunnel, 0);
-        let (pool, recycled) = std::sync::mpsc::channel();
-        stack.device.recycle = Some(pool);
-        let (lane, replies) = std::sync::mpsc::channel();
-        stack.routes.lock().expect("routes").insert(4321, lane);
-        let mut bytes = vec![0u8; 16];
-        let base = bytes.as_ptr();
-        assert!(udp_datagram(
-            &UdpDatagram {
-                source: &[10, 0, 0, 2],
-                destination: &[10, 0, 0, 1],
-                source_port: 1234,
-                destination_port: 4321,
-                payload: b"hi",
-            },
-            &mut bytes,
-        ));
-        let want = bytes[16..].to_vec();
-        assert_eq!(stack.deliver_udp(bytes, 16), None, "the lane takes it");
-        let packet = replies.recv().expect("the lane's packet");
-        assert_eq!(packet.bytes.as_ptr(), base, "the reader's own buffer");
-        assert_eq!(packet.at, 16, "at the packet's offset");
-        assert_eq!(packet.packet(), &want[..], "the datagram's own bytes");
-        packet.release();
-        let returned = recycled.recv().expect("the pool's buffer");
-        assert_eq!(returned.as_ptr(), base, "the same allocation comes back");
-
-        let mut bytes = vec![7u8; 16];
-        let base = bytes.as_ptr();
-        assert!(udp_datagram(
-            &UdpDatagram {
-                source: &[10, 0, 0, 2],
-                destination: &[10, 0, 0, 1],
-                source_port: 1234,
-                destination_port: 4322,
-                payload: b"hi",
-            },
-            &mut bytes,
-        ));
-        let back = stack.deliver_udp(bytes, 16).expect("no lane claims it");
-        assert_eq!(
-            back.as_ptr(),
-            base,
-            "and the packet comes back as it went in"
         );
     }
 }
