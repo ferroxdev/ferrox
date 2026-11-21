@@ -352,8 +352,8 @@ carrier-xhttp session-upload-window-copies 0 ferrox-app-xhttp::tests::a_windowed
 carrier-xhttp packet-window-copies 0 ferrox-app-xhttp::tests::a_packet_window_is_the_sessions_own_buffer
 carrier-xhttp packet-map-allocations-per-pending-round 0 ferrox-app-xhttp::tests::a_pending_packet_map_reuses_its_table_across_rounds
 carrier-xhttp packet-map-lookup-ns-per-packet 27.4 .github/workflows/bench.yml
-carrier-xhttp frame-body-allocations-per-short-frame 0 ferrox-app-xhttp_h2::tests::a_frames_body_reuses_the_buffer_the_last_reader_handed_back
-carrier-xhttp frame-body-zeroed-bytes-per-short-frame 0 ferrox-app-xhttp_h2::tests::a_frames_body_reuses_the_buffer_the_last_reader_handed_back
+carrier-xhttp frame-body-allocations-per-repeated-frame 0 ferrox-app-xhttp_h2::tests::a_frames_body_reuses_the_buffer_the_last_reader_handed_back
+carrier-xhttp frame-body-capacity-slack-bytes 0 ferrox-app-xhttp_h2::tests::a_frames_body_reuses_the_buffer_the_last_reader_handed_back
 carrier-xhttp chunk-bodies-per-window 8 ferrox-app-xhttp::tests::a_window_gathers_every_chunk_one_read_brought
 carrier-xhttp requests-served-per-connection 2 ferrox-app-xhttp::tests::one_connection_carries_the_packet_up_uplink
 carrier-xhttp requests-served-before-a-close 1 ferrox-app-xhttp::tests::a_request_that_says_close_takes_the_connection_with_it

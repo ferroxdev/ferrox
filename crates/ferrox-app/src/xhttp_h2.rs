@@ -2256,28 +2256,26 @@ fn fill_frame(
 }
 
 impl H2Conn {
-    /// A frame body taken from the room the last reader handed back: a frame no longer than that
-    /// buffer reads into bytes that are already initialized, so only a longer frame zeroes the tail
-    /// it grows.
+    /// A frame body taken from the room the last reader handed back. The buffer is reused only for a
+    /// frame of exactly its own room, so every queued body's allocation is its payload's length and
+    /// the queue's byte and chunk bounds still bound the memory the queue retains: a short frame in a
+    /// long buffer would otherwise park sixteen kilobytes behind a one-byte charge.
     fn take_body(&self, len: usize) -> Vec<u8> {
         let mut spare = self.spare.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut body = std::mem::take(&mut *spare);
+        let body = std::mem::take(&mut *spare);
         drop(spare);
-        if body.len() < len {
-            body = vec![0u8; len];
+        if body.capacity() == len {
+            body
         } else {
-            body.truncate(len);
+            vec![0u8; len]
         }
-        body
     }
 
-    /// Hands a consumed body back for the next frame, keeping the larger of the two buffers so a
-    /// short frame cannot cost the room a long one had already paid for.
+    /// Hands a consumed body back for the next frame: the room the stream is actually using is the
+    /// one worth keeping, so the latest buffer replaces the spare.
     fn spare_body(&self, body: Vec<u8>) {
         let mut spare = self.spare.lock().unwrap_or_else(PoisonError::into_inner);
-        if body.capacity() > spare.capacity() {
-            *spare = body;
-        }
+        *spare = body;
     }
 
     /// Whether another pump already holds the connection's read half.
@@ -4399,9 +4397,10 @@ mod tests {
         );
     }
 
-    /// A frame body reads into the room the last reader handed back: the same buffer comes back, a
-    /// shorter frame zeroes nothing, and a longer frame takes its own zeroed room. Each take is its
-    /// own window, so the row reads the frame's cost and not the pool's first allocation.
+    /// A frame body reads into the room the last reader handed back when it is the same length, so a
+    /// steady stream of full frames allocates and zeroes once; any other length takes its own room,
+    /// which keeps every queued body's allocation equal to its payload. Each take is its own window,
+    /// so the row reads the frame's cost and not the pool's first allocation.
     #[test]
     fn a_frames_body_reuses_the_buffer_the_last_reader_handed_back() {
         let (conn, _, _) = bare_conn();
@@ -4417,11 +4416,14 @@ mod tests {
         conn.spare_body(body);
         let (body, counts) = ferrox_core::alloc_count::measure(|| conn.take_body(1000));
         assert_eq!(body.len(), 1000);
-        assert_eq!(body.as_ptr(), first);
-        assert_eq!(counts.allocs, 0, "a shorter frame reuses the room");
         assert_eq!(
-            counts.zeroed_bytes, 0,
-            "a shorter frame reads initialized bytes"
+            counts.zeroed_bytes, 1000,
+            "a shorter frame takes its own room, not a retained 16 KiB"
+        );
+        assert_eq!(
+            body.capacity(),
+            1000,
+            "a queued body's allocation is its payload's length"
         );
         conn.spare_body(body);
         let (body, counts) = ferrox_core::alloc_count::measure(|| conn.take_body(8192));

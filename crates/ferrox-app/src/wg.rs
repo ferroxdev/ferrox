@@ -678,7 +678,7 @@ impl WireGuardOut {
 
     /// Answers a name through the kernel when Linux exposes one, and through the tunnel's DNS exchange otherwise.
     fn lookup(&self, host: &str) -> Vec<IpAddr> {
-        let trimmed = host.trim_end_matches('.');
+        let trimmed = host.strip_suffix('.').unwrap_or(host);
         let key = if trimmed.bytes().any(|byte| byte.is_ascii_uppercase()) {
             std::borrow::Cow::Owned(trimmed.to_ascii_lowercase())
         } else {
@@ -3264,12 +3264,16 @@ mod tests {
         assert_eq!(targets, vec![routed]);
         assert_eq!(counts.allocs, 1, "one list, no second collect");
         let unrouted: SocketAddr = "198.51.100.1:53".parse().unwrap();
-        let (targets, _) = ferrox_core::alloc_count::measure(|| {
+        let (targets, counts) = ferrox_core::alloc_count::measure(|| {
             wireguard.destinations(&Destination::Address(unrouted))
         });
         assert!(
             targets.is_empty(),
             "a peer that routes nothing dials nothing"
+        );
+        assert_eq!(
+            counts.allocs, 1,
+            "a literal's list is built before retain empties it"
         );
         let addrs: Vec<IpAddr> = vec!["192.0.2.7".parse().unwrap()];
         wireguard.resolved.lock().unwrap().insert(
