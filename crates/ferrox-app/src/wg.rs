@@ -943,12 +943,12 @@ impl WireGuardOut {
             if until <= now {
                 break None;
             }
-            let inner = match replies.recv_timeout(until - now) {
-                Ok(inner) => inner,
+            let packet = match replies.recv_timeout(until - now) {
+                Ok(packet) => packet,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
             };
-            let Some(datagram) = udp_from_packet(&inner) else {
+            let Some(datagram) = udp_from_packet(packet.packet()) else {
                 continue;
             };
             if datagram.source != destination_bytes.as_slice()
@@ -1027,7 +1027,7 @@ impl WireGuardOut {
         addresses(&answer, qtype)
     }
 
-    fn reserve_dns_route(&self) -> Option<(u16, Receiver<Vec<u8>>)> {
+    fn reserve_dns_route(&self) -> Option<(u16, Receiver<wg_stack::LanePacket>)> {
         let mut routes = self.routes.lock().ok()?;
         let span = u32::from(DNS_PORT_LAST - DNS_PORT_FIRST);
         for _ in 0..span {
@@ -2079,14 +2079,12 @@ fn deliver_data(
             {
                 if let Ok(table) = routes.lock() {
                     if let Some(lane) = table.get(&port) {
-                        let payload = if at == 0 {
-                            inner
-                        } else {
-                            let payload = inner[at..].to_vec();
-                            recycle_slot(inner, at, recycle);
-                            payload
+                        let packet = wg_stack::LanePacket {
+                            bytes: inner,
+                            at,
+                            recycle: recycle.filter(|_| at != 0).cloned(),
                         };
-                        let _ = lane.send(payload);
+                        let _ = lane.send(packet);
                         return;
                     }
                 }
@@ -3915,5 +3913,67 @@ mod tests {
         let (n, _) = client.recv_from(&mut answer).expect("handshake response");
         assert_eq!(u32::from(answer[0]), TYPE_RESPONSE);
         assert_eq!(n, 92);
+    }
+
+    /// A routed datagram reaches its lane in the buffer the tunnel read, not a copy of it, and the
+    /// lane hands that same allocation back to the pool instead of freeing it.
+    #[test]
+    fn a_routed_datagram_reaches_its_lane_in_the_readers_buffer() {
+        let config = DeviceConfig {
+            secret: [0x11; 32],
+            addresses: vec!["10.0.0.1".parse().unwrap()],
+            peers: vec![PeerConfig {
+                public: [0x22; 32],
+                preshared: [0; 32],
+                endpoint: None,
+                endpoints: Vec::new(),
+                keepalive: 0,
+                allowed: vec![("10.0.0.2".parse().unwrap(), 32)],
+            }],
+            mtu: 1420,
+            reserved: [0; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            large_segments: false,
+            dns: Vec::new(),
+        };
+        let peers = peers(&config, [0; 12], crate::noize::WireGuardNoize::off());
+        let (to_stack, _stack) = mpsc::channel();
+        let routes: UdpRoutes = Arc::default();
+        let (lane, received) = mpsc::channel();
+        routes.lock().expect("routes").insert(9, lane);
+        let (pool, recycled) = mpsc::channel();
+        let mut inner = vec![0u8; WG_HEADER_SIZE];
+        assert!(udp_datagram(
+            &UdpDatagram {
+                source: &[10, 0, 0, 2],
+                destination: &[192, 0, 2, 1],
+                source_port: 5555,
+                destination_port: 9,
+                payload: b"payload",
+            },
+            &mut inner,
+        ));
+        let base = inner.as_ptr();
+        deliver_data(
+            inner,
+            WG_HEADER_SIZE,
+            &peers,
+            Some(0),
+            Some(&routes),
+            &to_stack,
+            Some(&pool),
+        );
+        let packet = received.recv().expect("the lane's packet");
+        assert_eq!(
+            packet.bytes.as_ptr(),
+            base,
+            "the lane reads the reader's buffer"
+        );
+        assert_eq!(packet.at, WG_HEADER_SIZE, "at the packet's own offset");
+        assert_eq!(packet.packet().first(), Some(&0x45), "and its IP header");
+        packet.release();
+        let returned = recycled.recv().expect("the pool's buffer");
+        assert_eq!(returned.as_ptr(), base, "the buffer returns, not a copy");
     }
 }
