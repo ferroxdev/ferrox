@@ -202,7 +202,7 @@ impl Guard {
                     && route.destination().is_ipv4() == v4
                     && route.if_name().is_none_or(|name| name != &self.interface)
             })
-            .max_by_key(|route| default_metric(route))
+            .max_by_key(default_metric)
     }
 
     /// Keep one dialled address on the route that carried the default, so a name
