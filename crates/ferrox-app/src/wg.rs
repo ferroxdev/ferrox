@@ -1177,7 +1177,12 @@ pub(crate) fn verify_endpoint(
 
 /// Open the server's UDP socket and spawn its reader and stack. Returns the
 /// port the OS bound, or a refusal the startup names.
-pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Result<u16, String> {
+pub(crate) fn serve_inbound(
+    inbound: &Json,
+    out: &Outbound,
+    address: &str,
+    stop: Option<&Arc<crate::proxy::Stop>>,
+) -> Result<u16, String> {
     let settings = inbound
         .get("settings")
         .ok_or("wireguard inbound has no settings")?;
@@ -1203,23 +1208,13 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     let io_recycle = recycle.clone();
     let io_config = config.clone();
     let io_packets = packets_tx.clone();
-    std::thread::spawn(move || {
-        io(
-            io_config,
-            socket,
-            from_tunnel,
-            io_packets,
-            None,
-            None,
-            io_recycle,
-            recycled,
-            crate::noize::WireGuardNoize::off(),
-        );
-    });
+    let io_stop = stop.map(|stop| stop.shared());
+    let stack_stop = stop.map(|stop| stop.shared());
+    let io_closed = stop.cloned();
     let stack_config = config;
     let stack_tunnel = to_tunnel;
     let stack_out = out.clone();
-    std::thread::spawn(move || {
+    let stack = std::thread::spawn(move || {
         wg_stack::server(
             stack_config,
             stack_tunnel,
@@ -1227,7 +1222,26 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
             stack_out,
             WG_HEADER_SIZE,
             Some(recycle),
+            stack_stop,
         );
+    });
+    std::thread::spawn(move || {
+        io(
+            io_config,
+            socket,
+            from_tunnel,
+            io_packets,
+            None,
+            io_stop,
+            io_recycle,
+            recycled,
+            crate::noize::WireGuardNoize::off(),
+        );
+        // The stack can still start relay workers from queued packets; closure covers its end.
+        let _ = stack.join();
+        if let Some(stop) = io_closed {
+            stop.mark_closed();
+        }
     });
     Ok(port)
 }
@@ -3059,7 +3073,7 @@ mod tests {
         let inbound =
             crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let port = serve_inbound(&inbound, &out, "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None).expect("serve");
         assert_ne!(port, 0);
 
         let client = DeviceConfig::from_json(
@@ -3172,7 +3186,7 @@ mod tests {
         let inbound =
             crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let port = serve_inbound(&inbound, &out, "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None).expect("serve");
 
         let dead = UdpSocket::bind("127.0.0.1:0").expect("dead endpoint");
         let client = DeviceConfig {
@@ -3592,7 +3606,7 @@ mod tests {
         let inbound =
             crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let port = serve_inbound(&inbound, &out, "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None).expect("serve");
 
         let client = DeviceConfig::from_json(
             &crate::json::parse(&format!(

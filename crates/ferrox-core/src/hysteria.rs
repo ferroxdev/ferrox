@@ -394,10 +394,18 @@ impl UdpMessage<'_> {
 
     /// The refusals encoder and parser make alike before any byte moves: an empty or over-long address, an empty or over-large payload, and a fragment id outside its count.
     fn validate(&self) -> Result<(), RequestError> {
+        self.validate_allowing_empty(false)
+    }
+
+    fn validate_allowing_empty(&self, allow_empty: bool) -> Result<(), RequestError> {
         if self.address.is_empty() || self.address.len() > MAX_ADDRESS_LENGTH as usize {
             return Err(RequestError::Invalid);
         }
-        if self.payload.is_empty() || self.payload.len() > MAX_UDP_PAYLOAD {
+        if self.payload.is_empty() {
+            if !allow_empty || self.frags != 1 {
+                return Err(RequestError::Invalid);
+            }
+        } else if self.payload.len() > MAX_UDP_PAYLOAD {
             return Err(RequestError::Invalid);
         }
         if self.frags == 0 || (self.frags > 1 && self.frag >= self.frags) {
@@ -433,6 +441,18 @@ pub fn encode_udp_unchecked(message: &UdpMessage, out: &mut Vec<u8>) {
 
 /// Read one whole UDP message from a datagram; the payload is whatever follows the address, borrowed from the caller's buffer, so a relay never copies it to look at it.
 pub fn decode_udp(packet: &[u8]) -> Result<UdpMessage<'_>, RequestError> {
+    decode_udp_allowing_empty(packet, false)
+}
+
+/// Read one whole UDP message that may carry no payload, for the Hysteria v2 lane whose header-only frames deliver a zero-length datagram.
+pub fn decode_udp_allow_empty(packet: &[u8]) -> Result<UdpMessage<'_>, RequestError> {
+    decode_udp_allowing_empty(packet, true)
+}
+
+fn decode_udp_allowing_empty(
+    packet: &[u8],
+    allow_empty: bool,
+) -> Result<UdpMessage<'_>, RequestError> {
     let head = packet.get(..8).ok_or(RequestError::Incomplete)?;
     let mut at = 8usize;
     let raw = bounded(packet, &mut at, MAX_ADDRESS_LENGTH)?;
@@ -448,7 +468,7 @@ pub fn decode_udp(packet: &[u8]) -> Result<UdpMessage<'_>, RequestError> {
         address,
         payload: &packet[at..],
     };
-    message.validate()?;
+    message.validate_allowing_empty(allow_empty)?;
     Ok(message)
 }
 
@@ -461,12 +481,24 @@ pub struct Fragments<'a> {
     chunks: core::slice::Chunks<'a, u8>,
     next: u8,
     total: u8,
+    empty: bool,
 }
 
 impl<'a> Iterator for Fragments<'a> {
     type Item = UdpMessage<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.empty {
+            if self.next != 0 {
+                return None;
+            }
+            self.next = 1;
+            return Some(UdpMessage {
+                frag: 0,
+                frags: 1,
+                ..self.message
+            });
+        }
         let payload = self.chunks.next()?;
         let message = UdpMessage {
             frag: self.next,
@@ -479,6 +511,10 @@ impl<'a> Iterator for Fragments<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.empty {
+            let left = usize::from(self.next == 0);
+            return (left, Some(left));
+        }
         self.chunks.size_hint()
     }
 }
@@ -488,21 +524,45 @@ pub fn fragments_udp<'a>(
     message: &UdpMessage<'a>,
     max: usize,
 ) -> Result<Fragments<'a>, RequestError> {
-    message.validate()?;
+    fragments_udp_allowing_empty(message, max, false)
+}
+
+/// Split a whole message that may carry no payload into one zero-length fragment, for the Hysteria v2 lane.
+pub fn fragments_udp_allow_empty<'a>(
+    message: &UdpMessage<'a>,
+    max: usize,
+) -> Result<Fragments<'a>, RequestError> {
+    fragments_udp_allowing_empty(message, max, true)
+}
+
+fn fragments_udp_allowing_empty<'a>(
+    message: &UdpMessage<'a>,
+    max: usize,
+    allow_empty: bool,
+) -> Result<Fragments<'a>, RequestError> {
+    message.validate_allowing_empty(allow_empty)?;
     if message.frags != 1 {
         return Err(RequestError::Invalid);
     }
-    let capacity = max
+    let room = max
         .checked_sub(message.header_len())
-        .filter(|room| *room > 0)
         .ok_or(RequestError::Invalid)?;
-    let total = u8::try_from(message.payload.len().div_ceil(capacity))
-        .map_err(|_| RequestError::Invalid)?;
+    let empty = message.payload.is_empty();
+    let capacity = if empty { room.max(1) } else { room };
+    if capacity == 0 {
+        return Err(RequestError::Invalid);
+    }
+    let total = if empty {
+        1
+    } else {
+        u8::try_from(message.payload.len().div_ceil(capacity)).map_err(|_| RequestError::Invalid)?
+    };
     Ok(Fragments {
         message: *message,
         chunks: message.payload.chunks(capacity),
         next: 0,
         total,
+        empty,
     })
 }
 
@@ -528,7 +588,25 @@ impl Defrag {
         message: &UdpMessage<'a>,
         out: &'a mut Vec<u8>,
     ) -> Result<Option<(&'a str, &'a [u8])>, RequestError> {
-        message.validate()?;
+        self.feed_allowing_empty(message, out, false)
+    }
+
+    /// Fold in a message that may carry no payload, for the Hysteria v2 lane's zero-length datagrams.
+    pub fn feed_allow_empty<'a>(
+        &mut self,
+        message: &UdpMessage<'a>,
+        out: &'a mut Vec<u8>,
+    ) -> Result<Option<(&'a str, &'a [u8])>, RequestError> {
+        self.feed_allowing_empty(message, out, true)
+    }
+
+    fn feed_allowing_empty<'a>(
+        &mut self,
+        message: &UdpMessage<'a>,
+        out: &'a mut Vec<u8>,
+        allow_empty: bool,
+    ) -> Result<Option<(&'a str, &'a [u8])>, RequestError> {
+        message.validate_allowing_empty(allow_empty)?;
         if message.frags == 1 {
             *self = Self::default();
             return Ok(Some((message.address, message.payload)));
@@ -1468,6 +1546,45 @@ mod tests {
         let mut long = vec![0, 0, 0, 1, 0, 1, 0, 1];
         frames::quic_varint(&mut long, MAX_ADDRESS_LENGTH + 1);
         assert_eq!(decode_udp(&long), Err(RequestError::Invalid));
+    }
+
+    #[test]
+    fn a_zero_length_udp_payload_is_allowed_only_on_the_v2_lane() {
+        let message = UdpMessage {
+            session: 1,
+            packet: 2,
+            frag: 0,
+            frags: 1,
+            address: "a:1",
+            payload: b"",
+        };
+        assert_eq!(
+            encode_udp(&message, &mut Vec::new()),
+            Err(RequestError::Invalid)
+        );
+        assert!(fragments_udp(&message, 1200).is_err());
+        let frags: Vec<_> = fragments_udp_allow_empty(&message, 1200)
+            .expect("fragments")
+            .collect();
+        assert_eq!(frags, vec![message]);
+        let exact: Vec<_> = fragments_udp_allow_empty(&message, message.header_len())
+            .expect("a head-sized datagram carries the empty payload")
+            .collect();
+        assert_eq!(exact, vec![message]);
+        let mut wire = Vec::new();
+        encode_udp_unchecked(&message, &mut wire);
+        assert_eq!(decode_udp(&wire), Err(RequestError::Invalid));
+        assert_eq!(decode_udp_allow_empty(&wire), Ok(message));
+        let mut defrag = Defrag::new();
+        let mut assembled = Vec::new();
+        assert_eq!(
+            defrag.feed_allow_empty(&message, &mut assembled),
+            Ok(Some(("a:1", &[][..])))
+        );
+        assert_eq!(
+            Defrag::new().feed(&message, &mut assembled),
+            Err(RequestError::Invalid)
+        );
     }
 
     #[test]

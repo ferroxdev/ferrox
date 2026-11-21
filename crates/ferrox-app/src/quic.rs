@@ -5151,10 +5151,11 @@ struct ServerConn {
 /// One serving connection's identity: a session bound to it ends when the last stream drops it.
 #[derive(Default)]
 pub(crate) struct ConnectionToken {
-    close: Mutex<ConnectionCloses>,
+    closes: Mutex<ConnectionCloses>,
+    closed: AtomicBool,
 }
 
-/// What ends with one serving connection, run once when its token drops.
+/// What ends with one serving connection, run once when its token closes or drops.
 type ConnectionCloses = Vec<Box<dyn FnOnce() + Send>>;
 
 impl ConnectionToken {
@@ -5164,24 +5165,37 @@ impl ConnectionToken {
 
     /// Records what ends with this connection: a session id's record cannot outlive its transport.
     pub(crate) fn on_close(&self, close: Box<dyn FnOnce() + Send>) {
-        self.close
+        let mut closes = self
+            .closes
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(close);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) {
+            drop(closes);
+            close();
+            return;
+        }
+        closes.push(close);
+    }
+
+    /// Ends the sessions a shutdown must not wait for, before the last stream drops the token.
+    pub(crate) fn close(&self) {
+        let closes = {
+            let mut closes = self
+                .closes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.closed.store(true, Ordering::Release);
+            std::mem::take(&mut *closes)
+        };
+        for close in closes {
+            close();
+        }
     }
 }
 
 impl Drop for ConnectionToken {
     fn drop(&mut self) {
-        let close = std::mem::take(
-            &mut *self
-                .close
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        for close in close {
-            close();
-        }
+        self.close();
     }
 }
 
@@ -5213,6 +5227,7 @@ struct Scratch {
     fresh: Vec<FreshStream>,
     learned: Vec<(Vec<u8>, Arc<ServerConn>)>,
     closed: Vec<Vec<u8>>,
+    retired_owners: Vec<Arc<ConnectionToken>>,
     /// The stamp one reap writes on every state it visits, so a second key for that state is a load, not a scan.
     epoch: u64,
     /// The earliest timer a live connection wants, carried from the reap that read it to the wait it gates.
@@ -5238,6 +5253,7 @@ pub(crate) fn serve_loop(
         fresh: Vec::new(),
         learned: Vec::new(),
         closed: Vec::new(),
+        retired_owners: Vec::new(),
         epoch: 0,
         deadline: None,
     };
@@ -5255,7 +5271,7 @@ pub(crate) fn serve_loop(
             })
             .max(Duration::from_millis(1));
         if !sock.refresh_read_timeout(wait) {
-            return;
+            break;
         }
         // A serving lane takes the queue in a batch where the platform has one: a burst of a dozen packets is one read, one lock per lane and one reap, not one of each per packet.
         #[cfg(target_os = "linux")]
@@ -5278,7 +5294,7 @@ pub(crate) fn serve_loop(
             }
             Drain::Unbatchable => {}
             // A socket that coalesces must not be read one segment wide.
-            Drain::Unreadable => return,
+            Drain::Unreadable => break,
         }
         match sock.recv_from(&mut scratch.buf) {
             Ok((n, from)) => {
@@ -5290,7 +5306,7 @@ pub(crate) fn serve_loop(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
-            Err(_) => return,
+            Err(_) => break,
         }
         reap(serve, &sock, &mut routes, &mut scratch, &live);
     }
@@ -5300,6 +5316,7 @@ pub(crate) fn serve_loop(
             let _ = conn.close(false, 0, b"");
             flush_egress(&mut conn, sock.as_ref());
         }
+        state.owner.close();
     }
     let drain_deadline = Instant::now() + Duration::from_secs(5);
     while live.load(Ordering::SeqCst) != 0 && Instant::now() < drain_deadline {
@@ -5308,6 +5325,15 @@ pub(crate) fn serve_loop(
     let left = live.load(Ordering::SeqCst);
     if left != 0 {
         eprintln!("quic: {left} stream handlers still running at shutdown");
+    }
+    // A stream handler holds a socket clone; wait a bounded time for the last one to drop it.
+    let release_deadline = Instant::now() + Duration::from_secs(5);
+    while Arc::strong_count(&sock) > 1 && Instant::now() < release_deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let held = Arc::strong_count(&sock).saturating_sub(1);
+    if held != 0 {
+        eprintln!("quic: {held} socket references still held at shutdown");
     }
 }
 
@@ -5376,6 +5402,7 @@ fn note_closed(state: &ServerConn, key: &[u8], scratch: &mut Scratch, retired: &
         if !state.established.load(Ordering::Relaxed) {
             retired.unverified += 1;
         }
+        scratch.retired_owners.push(Arc::clone(&state.owner));
     }
     scratch.closed.push(key.to_vec());
 }
@@ -5530,6 +5557,7 @@ fn reap(
     scratch.fresh.clear();
     scratch.learned.clear();
     scratch.closed.clear();
+    scratch.retired_owners.clear();
     scratch.epoch = scratch.epoch.wrapping_add(1);
     let epoch = scratch.epoch;
     let mut deadline = None;
@@ -5605,6 +5633,9 @@ fn reap(
     }
     for key in scratch.closed.drain(..) {
         routes.conns.remove(&key);
+    }
+    for owner in scratch.retired_owners.drain(..) {
+        owner.close();
     }
     for (conn, stream, prefaced, stop, owner) in scratch.fresh.drain(..) {
         let session = QuicStream {

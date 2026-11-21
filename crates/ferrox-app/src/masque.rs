@@ -28,6 +28,7 @@ use crate::wg_stack::{self, ClientFlow, Packet, ToTunnel, UdpForwarder, UdpRoute
 use crate::wireguard::DeviceConfig;
 
 const TICK: Duration = Duration::from_millis(10);
+const DEMUX_POLL: Duration = Duration::from_millis(100);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
 /// Reconnect schedule: the first dial is immediate, a failure doubles from a second to a
 /// minute, and only a lane that lived past the stable window clears the history.
@@ -2806,9 +2807,38 @@ fn lane_udp_bind(address: &str) -> std::io::Result<UdpSocket> {
     quic::bind_datagram(address)
 }
 
+/// Counts the listeners that must release their socket before the inbound reports closed.
+#[derive(Clone)]
+pub(crate) struct ListenerDone {
+    remaining: Arc<AtomicUsize>,
+    stop: Option<Arc<crate::proxy::Stop>>,
+}
+
+impl ListenerDone {
+    fn new(count: usize, stop: Option<&Arc<crate::proxy::Stop>>) -> Self {
+        Self {
+            remaining: Arc::new(AtomicUsize::new(count)),
+            stop: stop.cloned(),
+        }
+    }
+
+    pub(crate) fn finish(&self) {
+        if self.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+            if let Some(stop) = &self.stop {
+                stop.mark_closed();
+            }
+        }
+    }
+}
+
 /// Open a server inbound's socket and spawn its demultiplexer, stack and forwarder.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Result<u16, String> {
+pub(crate) fn serve_inbound(
+    inbound: &Json,
+    out: &Outbound,
+    address: &str,
+    stop: Option<&Arc<crate::proxy::Stop>>,
+) -> Result<u16, String> {
     let spec = Arc::new(ServerSpec::from(inbound)?);
     let security = inbound
         .get("streamSettings")
@@ -2816,7 +2846,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         .and_then(Json::as_str)
         .unwrap_or_default();
     if security.eq_ignore_ascii_case("none") {
-        return serve_cleartext_inbound(&spec, out, address);
+        return serve_cleartext_inbound(&spec, out, address, stop);
     }
     let identity = crate::proxy::quic_inbound_identity(inbound)
         .ok_or("masque inbound requires security tls or none")?;
@@ -2850,11 +2880,15 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
             .local_addr()
             .map_err(|error| format!("masque `{address}` has no local address: {error}"))?;
         let h2_listener = if tcp {
-            if let Ok(listener) = TcpListener::bind(local) {
-                Some(listener)
-            } else {
-                eprintln!("masque: no TCP listener on {local}; h3 still serves");
-                None
+            match TcpListener::bind(local) {
+                Ok(listener) => Some(listener),
+                Err(error) if crate::proxy::binding_is_fallible() => {
+                    return Err(format!("cannot bind masque tcp `{local}`: {error}"));
+                }
+                Err(_) => {
+                    eprintln!("masque: no TCP listener on {local}; h3 still serves");
+                    None
+                }
             }
         } else {
             None
@@ -2881,6 +2915,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     };
     let sock = sock.with_options(spec.sockopt.clone());
     let sock = Arc::new(sock.with_gso(spec.quic.is_none_or(|params| !params.disable_gso)));
+    let _ = sock.set_read_timeout(Some(DEMUX_POLL));
     let (packets, packets_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
         pool: Mutex::new(spec.pool.clone()),
@@ -2889,14 +2924,18 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         local: spec.pool.server.clone(),
     });
     let (to_tunnel, from_stack) = mpsc::sync_channel(QUEUE);
+    let listener_done = ListenerDone::new(1 + usize::from(h2_listener.is_some()), stop);
     let dispatcher = Arc::clone(&shared);
-    std::thread::spawn(move || dispatch(&dispatcher, from_stack));
+    let dispatch_stop = stop.map(|stop| stop.shared());
+    std::thread::spawn(move || dispatch(&dispatcher, from_stack, dispatch_stop));
     if let Some(listener) = h2_listener {
         crate::masque_h2::serve(
             Arc::clone(&identity),
             Arc::clone(&shared),
             Arc::clone(&spec),
             listener,
+            stop.map(|stop| stop.shared()),
+            listener_done.clone(),
         );
     }
     let device = DeviceConfig {
@@ -2911,15 +2950,27 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         dns: Vec::new(),
     };
     let stack_out = out.clone();
+    let stack_stop = stop.map(|stop| stop.shared());
     std::thread::spawn(move || {
-        wg_stack::server(device, to_tunnel, packets_rx, stack_out, 0, None);
+        wg_stack::server(
+            device, to_tunnel, packets_rx, stack_out, 0, None, stack_stop,
+        );
     });
     let demux_config = Arc::new(Mutex::new(config));
     let demux_sock = Arc::clone(&sock);
     let demux_shared = Arc::clone(&shared);
     let demux_spec = Arc::clone(&spec);
+    let demux_stop = stop.map(|stop| stop.shared());
     std::thread::spawn(move || {
-        demux(demux_sock, local, demux_config, demux_shared, demux_spec);
+        demux(
+            demux_sock,
+            local,
+            demux_config,
+            demux_shared,
+            demux_spec,
+            demux_stop,
+        );
+        listener_done.finish();
     });
     Ok(local.port())
 }
@@ -2929,6 +2980,7 @@ fn serve_cleartext_inbound(
     spec: &Arc<ServerSpec>,
     out: &Outbound,
     address: &str,
+    stop: Option<&Arc<crate::proxy::Stop>>,
 ) -> Result<u16, String> {
     let listener = TcpListener::bind(address)
         .map_err(|error| format!("cannot bind masque `{address}`: {error}"))?;
@@ -2949,8 +3001,17 @@ fn serve_cleartext_inbound(
     });
     let (to_tunnel, from_stack) = mpsc::sync_channel(QUEUE);
     let dispatcher = Arc::clone(&shared);
-    std::thread::spawn(move || dispatch(&dispatcher, from_stack));
-    crate::masque_h2::serve_cleartext(Arc::clone(&shared), Arc::clone(spec), listener);
+    let dispatch_stop = stop.map(|stop| stop.shared());
+    std::thread::spawn(move || dispatch(&dispatcher, from_stack, dispatch_stop));
+    let clear_stop = stop.map(|stop| stop.shared());
+    let clear_done = ListenerDone::new(1, stop);
+    crate::masque_h2::serve_cleartext(
+        Arc::clone(&shared),
+        Arc::clone(spec),
+        listener,
+        clear_stop,
+        clear_done,
+    );
     let device = DeviceConfig {
         secret: [0u8; 32],
         addresses: spec.pool.server.clone(),
@@ -2963,8 +3024,11 @@ fn serve_cleartext_inbound(
         dns: Vec::new(),
     };
     let stack_out = out.clone();
+    let stack_stop = stop.map(|stop| stop.shared());
     std::thread::spawn(move || {
-        wg_stack::server(device, to_tunnel, packets_rx, stack_out, 0, None);
+        wg_stack::server(
+            device, to_tunnel, packets_rx, stack_out, 0, None, stack_stop,
+        );
     });
     Ok(local.port())
 }
@@ -3166,6 +3230,7 @@ impl ServerSpec {
 pub(crate) enum Arrival {
     Datagram(Vec<u8>, SocketAddr),
     Ready,
+    Stop,
 }
 
 /// One tunnel's inbox and the handle that wakes its worker. `pending` keeps at
@@ -3515,8 +3580,19 @@ impl Drop for Granted {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn dispatch(shared: &Shared, from_stack: Receiver<Vec<u8>>) {
-    while let Ok(packet) = from_stack.recv() {
+fn dispatch(shared: &Shared, from_stack: Receiver<Vec<u8>>, stop: Option<Arc<AtomicBool>>) {
+    loop {
+        if stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        let packet = match from_stack.recv_timeout(Duration::from_millis(100)) {
+            Ok(packet) => packet,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
         let Some(destination) = packet_destination(&packet) else {
             continue;
         };
@@ -3562,17 +3638,34 @@ fn admit_worker(live: &Arc<AtomicUsize>, cap: usize) -> Option<WorkerSlot> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines)]
 fn demux(
     sock: Arc<Datagram>,
     local: SocketAddr,
     config: Arc<Mutex<quiche::Config>>,
     shared: Arc<Shared>,
     spec: Arc<ServerSpec>,
+    stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
     let live = Arc::new(AtomicUsize::new(0));
     let mut buf = vec![0u8; 65535];
     loop {
+        if stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            if let Ok(table) = routes.lock() {
+                for (_, tx) in table.values() {
+                    let _ = tx.send(Arrival::Stop);
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while live.load(Ordering::Relaxed) != 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            return;
+        }
         let Ok((n, from)) = sock.recv_from(&mut buf) else {
             continue;
         };
@@ -3742,8 +3835,8 @@ fn worker(
                 let _ = conn.recv(&mut bytes, info);
             }
             Ok(Arrival::Ready) => tunnel.queue.pending.store(false, Ordering::Release),
+            Ok(Arrival::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
         sweep_due_timer(&mut conn);
         if conn.is_closed() {
@@ -5221,7 +5314,8 @@ mod tests {
         let inbound = inbound(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/30"]}"#,
         );
-        let port = serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0").expect("serve");
+        let port =
+            serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0", None).expect("serve");
         let first = MasqueOut::new(&outbound(port)).expect("the first tunnel");
         first.ensure().expect("the first tunnel opens");
         let second = MasqueOut::new(&outbound(port)).expect("the second tunnel");
@@ -5323,7 +5417,7 @@ mod tests {
             tunnels.insert(open, TunnelQueue::new(open_tx, None));
         }
         let (stack, from_stack) = mpsc::channel();
-        let dispatcher = std::thread::spawn(move || dispatch(&shared, from_stack));
+        let dispatcher = std::thread::spawn(move || dispatch(&shared, from_stack, None));
         stack
             .send(ipv4_packet([10, 14, 0, 2], [10, 14, 0, 3]))
             .expect("a packet for the full tunnel");
@@ -5679,7 +5773,7 @@ mod tests {
         let inbound = inbound_h1(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
         );
-        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0", None).expect("serve");
         (inbound, port)
     }
 
@@ -5697,7 +5791,7 @@ mod tests {
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]}"#,
         );
         let served =
-            serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0").expect("serve");
+            serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0", None).expect("serve");
         let tcp = TcpStream::connect(("127.0.0.1", served)).expect("tcp");
         tcp.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
@@ -5810,7 +5904,7 @@ mod tests {
         let inbound = inbound(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]}"#,
         );
-        let served = serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0")?;
+        let served = serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0", None)?;
         let spec = ClientSpec {
             address: "127.0.0.1".to_owned(),
             port: served,
@@ -5914,7 +6008,7 @@ mod tests {
         let inbound = inbound_h2c(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
         );
-        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0", None).expect("serve");
         (inbound, port)
     }
 
@@ -5922,7 +6016,7 @@ mod tests {
         let inbound = inbound_h2(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
         );
-        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0", None).expect("serve");
         (inbound, port)
     }
 
@@ -5934,7 +6028,7 @@ mod tests {
         let inbound = inbound_h2(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
         );
-        let _port = serve_inbound(&inbound, &freedom("127.0.0.1:0"), "127.0.0.1:0")
+        let _port = serve_inbound(&inbound, &freedom("127.0.0.1:0"), "127.0.0.1:0", None)
             .expect("h3 survives the pair failing to converge");
     }
 
@@ -5954,7 +6048,7 @@ mod tests {
         let inbound = inbound(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
         );
-        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
+        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0", None).expect("serve");
         (inbound, port)
     }
 

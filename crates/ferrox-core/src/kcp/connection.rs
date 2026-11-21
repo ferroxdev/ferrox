@@ -643,6 +643,16 @@ impl Connection {
         self.data_output.signal();
         self.terminated.store(true, Ordering::SeqCst);
         Self::wake_update();
+        {
+            let mut sink = self.ctx.output.lock().unwrap();
+            sink.buf.clear();
+            sink.write = Box::new(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "connection terminated",
+                ))
+            });
+        }
         if let Some(closer) = self.closer.lock().unwrap().take() {
             closer();
         }

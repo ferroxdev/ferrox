@@ -2215,6 +2215,426 @@ pub(crate) fn parse_target(address: &str) -> io::Result<Target> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "address resolved to nothing"))
 }
 
+#[cfg(unix)]
+fn unix_socket_is_live(path: &std::path::Path) -> io::Result<bool> {
+    match unix_connect(path, Duration::from_millis(50)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            Ok(!refused_socket_is_stale(path))
+        }
+        // A binder that may not connect still owns a live socket, so a permission refusal is not evidence of staleness.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// A refusal means stale only when the kernel's socket table no longer names the path; an unreadable table is inconclusive and preserves it.
+#[cfg(unix)]
+fn refused_socket_is_stale(path: &std::path::Path) -> bool {
+    socket_table_names(path) == Some(false)
+}
+
+/// Whether the kernel still has a listening unix socket bound to `path`, in the evidence each host offers.
+#[cfg(unix)]
+fn socket_table_names(path: &std::path::Path) -> Option<bool> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt as _;
+        let wanted = path.as_os_str().as_bytes();
+        // A listener can stay open after its path is unlinked, so only a matching inode names this socket.
+        let inode = std::fs::symlink_metadata(path).ok().map(|meta| meta.ino());
+        let table = std::fs::read("/proc/net/unix").ok()?;
+        let mut unknown_staged = false;
+        for line in table.split(|byte| *byte == b'\n').skip(1) {
+            let Some((listed, listening, listed_inode)) = proc_unix_entry(line) else {
+                continue;
+            };
+            if listed == wanted {
+                // An accepted connection keeps a copied address, so only the socket's own inode names a live binder.
+                if inode == Some(listed_inode) {
+                    return Some(true);
+                }
+                continue;
+            }
+            match staged_claim(listed, path) {
+                StagedClaim::Owned => return Some(true),
+                StagedClaim::Other => {}
+                StagedClaim::Unknown => {
+                    if listening
+                        && std::str::from_utf8(listed)
+                            .is_ok_and(|listed| staged_sibling(listed, path))
+                    {
+                        unknown_staged = true;
+                    }
+                }
+            }
+        }
+        (!unknown_staged).then_some(false)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_socket_table().and_then(|table| macos_table_names(&table, path))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// A row's path and whether the socket is still accepting, so an accepted connection's copied address is not mistaken for a listener.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn proc_unix_entry(line: &[u8]) -> Option<(&[u8], bool, u64)> {
+    let mut rest = line;
+    let mut flags = &[][..];
+    let mut inode = &[][..];
+    for field in 0..7 {
+        rest = trim_ascii_start(rest);
+        let end = rest
+            .iter()
+            .position(u8::is_ascii_whitespace)
+            .unwrap_or(rest.len());
+        if field == 3 {
+            flags = &rest[..end];
+        } else if field == 6 {
+            inode = &rest[..end];
+        }
+        rest = &rest[end..];
+    }
+    let listed = rest.strip_prefix(&b" "[..]).unwrap_or(rest);
+    if listed.is_empty() {
+        return None;
+    }
+    let flags = std::str::from_utf8(flags).ok()?;
+    let listening = u32::from_str_radix(flags, 16).ok()? & 0x0001_0000 != 0;
+    let inode = std::str::from_utf8(inode).ok()?.parse().ok()?;
+    Some((listed, listening, inode))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn trim_ascii_start(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    bytes
+}
+
+/// One staged bind: the private address, the published path, and the object that path named at publication.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+struct StagedBinding {
+    inner: std::path::PathBuf,
+    published: std::path::PathBuf,
+    identity: Option<(u64, u64)>,
+}
+
+/// A bind records the private staging address it bound, so a copied staging name is never mistaken for another path's listener.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+static STAGED_BINDINGS: std::sync::Mutex<Vec<StagedBinding>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn register_staged(
+    inner: &std::path::Path,
+    published: &std::path::Path,
+    identity: Option<(u64, u64)>,
+) {
+    STAGED_BINDINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(StagedBinding {
+            inner: inner.to_path_buf(),
+            published: published.to_path_buf(),
+            identity,
+        });
+}
+
+/// One staged bind's registry entry, released when its listener closes so repeated adds do not grow the table.
+#[cfg(unix)]
+pub(crate) struct StagedRegistration {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    inner: std::path::PathBuf,
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    published: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl StagedRegistration {
+    fn new(
+        inner: &std::path::Path,
+        published: &std::path::Path,
+        identity: Option<(u64, u64)>,
+    ) -> Self {
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        {
+            register_staged(inner, published, identity);
+            Self {
+                inner: inner.to_path_buf(),
+                published: published.to_path_buf(),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        {
+            let _ = (inner, published, identity);
+            Self {}
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StagedRegistration {
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        STAGED_BINDINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|binding| binding.inner != self.inner || binding.published != self.published);
+    }
+}
+
+/// Whether a table row's staging name is this path's published listener, a sibling's, or unknown.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+enum StagedClaim {
+    Owned,
+    Other,
+    Unknown,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn staged_claim(listed: &[u8], path: &std::path::Path) -> StagedClaim {
+    use std::os::unix::fs::MetadataExt as _;
+    let bindings = STAGED_BINDINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for binding in bindings.iter() {
+        if binding.inner.as_os_str().as_encoded_bytes() != listed {
+            continue;
+        }
+        // The registration claims only the object it published, so a re-created path or an alias name still points at that object.
+        let current = std::fs::metadata(path)
+            .ok()
+            .map(|meta| (meta.dev(), meta.ino()));
+        return if binding.identity.is_some() && binding.identity == current {
+            StagedClaim::Owned
+        } else {
+            StagedClaim::Other
+        };
+    }
+    StagedClaim::Unknown
+}
+
+/// A `.ferrox-*/s` address in this path's own directory is the shape a staged bind leaves, whether or not this process recorded it.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn staged_sibling(listed: &str, path: &std::path::Path) -> bool {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return false;
+    };
+    let listed = std::path::Path::new(listed);
+    let Some(dir) = listed.parent() else {
+        return false;
+    };
+    let Some(name) = dir.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return false;
+    };
+    listed.file_name().is_some_and(|file| file == "s")
+        && dir.parent() == Some(parent)
+        && name.starts_with(".ferrox-")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
+    const HEADER: usize = 24;
+    const VNODE_OFFSET: usize = 36;
+    const PATH_OFFSET: usize = 106;
+    const OPTIONS_OFFSET: usize = 630;
+    const RECORD: usize = OPTIONS_OFFSET + 2;
+    let mut at = HEADER;
+    let mut unknown_staged = false;
+    while at + 4 <= table.len() {
+        let len =
+            u32::from_le_bytes([table[at], table[at + 1], table[at + 2], table[at + 3]]) as usize;
+        if len < 4 || at + len > table.len() {
+            break;
+        }
+        if len >= RECORD {
+            let record = &table[at..at + len];
+            let options = u16::from_le_bytes([record[OPTIONS_OFFSET], record[OPTIONS_OFFSET + 1]]);
+            let listening = options & 0x0002 != 0;
+            // An accepted connection inherits its bound address without owning a vnode, so only a vnode-bearing row can be the path's owner.
+            let vnode = u64::from_le_bytes(record[VNODE_OFFSET..VNODE_OFFSET + 8].try_into().ok()?);
+            if vnode == 0 {
+                at += len;
+                continue;
+            }
+            let raw = &record[PATH_OFFSET..];
+            if let Some(end) = raw.iter().position(|byte| *byte == 0) {
+                if let Ok(listed) = std::str::from_utf8(&raw[..end]) {
+                    match staged_claim(listed.as_bytes(), path) {
+                        StagedClaim::Owned => return Some(true),
+                        StagedClaim::Other => {}
+                        StagedClaim::Unknown => {
+                            // A current name lookup cannot prove the PCB's bind identity, so a matching row is inconclusive rather than live.
+                            let row = std::path::Path::new(listed);
+                            // A case-insensitive volume reaches a moved entry through a different spelling, so compare names folded.
+                            let same_name = row.file_name().is_some_and(|name| {
+                                path.file_name().is_some_and(|path_name| {
+                                    name.to_string_lossy().to_lowercase()
+                                        == path_name.to_string_lossy().to_lowercase()
+                                })
+                            });
+                            // A relative bind resolves against the binder's directory, not this process's, so its row cannot be attributed from here.
+                            let moved = same_name && std::fs::symlink_metadata(row).is_err();
+                            if (row.is_relative() && same_name)
+                                || same_socket_object(row, path)
+                                || (listening && staged_sibling(listed, path))
+                                || moved
+                            {
+                                unknown_staged = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if len == HEADER {
+            break;
+        }
+        at += len;
+    }
+    (!unknown_staged).then_some(false)
+}
+
+/// Two names denote one socket when the filesystem gives them one identity, so an alternate spelling on a case-insensitive volume still matches.
+#[cfg(target_os = "macos")]
+fn same_socket_object(listed: &std::path::Path, path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let identity = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|meta| (meta.dev(), meta.ino()))
+    };
+    identity(listed).is_some_and(|listed| Some(listed) == identity(path))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_socket_table() -> Option<Vec<u8>> {
+    let name = c"net.local.stream.pcblist64";
+    // A table that grows between the size probe and the read refuses the read, so ask again rather than forget the socket.
+    for _ in 0..4 {
+        let mut len = 0usize;
+        // SAFETY: the name is NUL-terminated and the null pointers ask only for the required size.
+        let asked = unsafe {
+            sysctlbyname(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if asked != 0 || len == 0 {
+            continue;
+        }
+        let mut table = vec![0u8; len];
+        // SAFETY: `table` is writable for `len` bytes and `len` is a little over what the probe found.
+        let read = unsafe {
+            sysctlbyname(
+                name.as_ptr(),
+                table.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if read == 0 {
+            table.truncate(len);
+            return Some(table);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn sysctlbyname(
+        name: *const std::ffi::c_char,
+        old: *mut std::ffi::c_void,
+        old_len: *mut usize,
+        new: *mut std::ffi::c_void,
+        new_len: usize,
+    ) -> std::ffi::c_int;
+}
+
+/// Probe a unix listen path without creating or removing it: a live socket refuses the name, a stale one and an absent path pass, and a file that is not a socket is refused.
+#[cfg(any(unix, windows))]
+pub(crate) fn probe_unix(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some((name, padded)) = abstract_name(path) {
+            return abstract_listener(name, padded).map(|_| ());
+        }
+        let (path, _) = split_permission(path);
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if !meta.file_type().is_socket() => Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "a unix listen path names a file that is not a socket",
+            )),
+            Ok(_) => {
+                if unix_socket_is_live(path)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "a unix listen path names a live socket",
+                    ));
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(windows)]
+    {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) if !is_unix_socket(path)? => Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "a unix listen path names a file that is not a socket",
+            )),
+            Ok(_) => match UnixStream::connect(path) {
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "a unix listen path names a live socket",
+                )),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                    match windows_socket_state(path) {
+                        WindowsSocket::Absent | WindowsSocket::Stale => Ok(()),
+                        WindowsSocket::Live | WindowsSocket::Unknown => Err(io::Error::new(
+                            io::ErrorKind::AddrInUse,
+                            "a unix listen path refused but may still be live",
+                        )),
+                    }
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// One `http`/`https` URL taken apart for a dial: the scheme's TLS need, the host and port to reach,
 /// the authority a `Host` line repeats, and the path with its query.
 #[derive(Debug, Clone)]
@@ -2360,7 +2780,12 @@ impl HttpUrl {
 pub(crate) enum Listener {
     Tcp(std::net::TcpListener),
     #[cfg(any(unix, windows))]
-    Unix(UnixListener),
+    Unix {
+        listener: UnixListener,
+        #[cfg(unix)]
+        #[allow(dead_code, reason = "held until the listener drops")]
+        staged: Option<StagedRegistration>,
+    },
 }
 
 impl Listener {
@@ -2374,7 +2799,7 @@ impl Listener {
         match target {
             Target::Ip(addr) => std::net::TcpListener::bind(addr).map(Listener::Tcp),
             #[cfg(any(unix, windows))]
-            Target::Unix(path) => bind_unix(path).map(Listener::Unix),
+            Target::Unix(path) => bind_unix(path),
         }
     }
 
@@ -2407,7 +2832,7 @@ impl Listener {
         match self {
             Listener::Tcp(listener) => listener.local_addr(),
             #[cfg(any(unix, windows))]
-            Listener::Unix(_) => Err(io::Error::new(
+            Listener::Unix { .. } => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "a unix listener reports no socket address",
             )),
@@ -2433,7 +2858,7 @@ impl Iterator for Incoming<'_> {
                 .map(|stream| stream.map(Connection::Tcp))
                 .next(),
             #[cfg(any(unix, windows))]
-            Listener::Unix(listener) => listener
+            Listener::Unix { listener, .. } => listener
                 .incoming()
                 .map(|stream| stream.map(Connection::from))
                 .next(),
@@ -2538,7 +2963,7 @@ impl Listener {
                 .accept()
                 .map(|(stream, addr)| (Connection::Tcp(stream), addr)),
             #[cfg(any(unix, windows))]
-            Listener::Unix(listener) => listener.accept().map(|(stream, _addr)| {
+            Listener::Unix { listener, .. } => listener.accept().map(|(stream, _addr)| {
                 (
                     Connection::from(stream),
                     SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -2551,7 +2976,7 @@ impl Listener {
         match self {
             Listener::Tcp(listener) => listener.set_nonblocking(nonblocking),
             #[cfg(any(unix, windows))]
-            Listener::Unix(listener) => listener.set_nonblocking(nonblocking),
+            Listener::Unix { listener, .. } => listener.set_nonblocking(nonblocking),
         }
     }
 }
@@ -2617,11 +3042,14 @@ fn split_permission(path: &std::path::Path) -> (&std::path::Path, Option<u32>) {
 static UNIX_BIND: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(unix)]
-fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
+fn bind_unix(path: &std::path::Path) -> io::Result<Listener> {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some((name, padded)) = abstract_name(path) {
-        return abstract_listener(name, padded);
+        return abstract_listener(name, padded).map(|listener| Listener::Unix {
+            listener,
+            staged: None,
+        });
     }
     let _guard = UNIX_BIND
         .lock()
@@ -2638,12 +3066,24 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
+    if stale.is_some() && unix_socket_is_live(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "a unix listen path names a live socket",
+        ));
+    }
     let Some(mode) = perm else {
         take_stale(path, stale)?;
-        return UnixListener::bind(path);
+        return UnixListener::bind(path).map(|listener| Listener::Unix {
+            listener,
+            staged: None,
+        });
     };
-    if let Some(listener) = bind_staged(path, mode, stale)? {
-        return Ok(listener);
+    if let Some((listener, staged)) = bind_staged(path, mode, stale)? {
+        return Ok(Listener::Unix {
+            listener,
+            staged: Some(staged),
+        });
     }
     // The directory leaves no room for a staged name, so the mode goes on the path itself.
     take_stale(path, stale)?;
@@ -2656,7 +3096,10 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
         ));
     }
     apply_socket_mode(&listener, path, mode, (bound.dev(), bound.ino()))?;
-    Ok(listener)
+    Ok(Listener::Unix {
+        listener,
+        staged: None,
+    })
 }
 
 /// Apply the mode to the socket inode itself, then re-check that the path still names it.
@@ -2781,6 +3224,7 @@ fn take_stale(path: &std::path::Path, stale: Option<(u64, u64)>) -> io::Result<(
     let Some((dev, ino)) = stale else {
         return Ok(());
     };
+    // The inode check and unlink are not atomic across processes, so a replacement can slip between them.
     match std::fs::symlink_metadata(path) {
         Ok(meta) if (meta.dev(), meta.ino()) == (dev, ino) => std::fs::remove_file(path),
         Ok(_) => Err(io::Error::new(
@@ -2801,7 +3245,7 @@ fn bind_staged(
     path: &std::path::Path,
     mode: u32,
     stale: Option<(u64, u64)>,
-) -> io::Result<Option<UnixListener>> {
+) -> io::Result<Option<(UnixListener, StagedRegistration)>> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     for _ in 0..8 {
         let dir = staged_name(path);
@@ -2817,11 +3261,15 @@ fn bind_staged(
             Err(error) => return Err(error),
         }
         let published = (|| {
+            use std::os::unix::fs::MetadataExt as _;
             let listener = UnixListener::bind(&inner)?;
             std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(mode))?;
+            let identity = std::fs::symlink_metadata(&inner)
+                .ok()
+                .map(|meta| (meta.dev(), meta.ino()));
             take_stale(path, stale)?;
             std::fs::hard_link(&inner, path)?;
-            Ok(listener)
+            Ok((listener, StagedRegistration::new(&inner, path, identity)))
         })();
         let _ = std::fs::remove_file(&inner);
         let _ = std::fs::remove_dir(&dir);
@@ -2848,7 +3296,8 @@ fn staged_name(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[cfg(windows)]
-fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
+fn bind_unix(path: &std::path::Path) -> io::Result<Listener> {
+    let before = windows_file_id(path).ok();
     match std::fs::symlink_metadata(path) {
         Ok(_) if !is_unix_socket(path)? => {
             return Err(io::Error::new(
@@ -2856,22 +3305,280 @@ fn bind_unix(path: &std::path::Path) -> io::Result<UnixListener> {
                 "a unix listen path names a file that is not a socket",
             ))
         }
-        Ok(_) => std::fs::remove_file(path)?,
+        Ok(_) => match UnixStream::connect(path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "a unix listen path names a live socket",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                windows_delete_stale(path, before.as_ref())?;
+            }
+            Err(error) => return Err(error),
+        },
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
     let listener = UnixListener::bind(path)?;
-    Ok(listener)
+    Ok(Listener::Unix { listener })
+}
+
+/// What an exclusive Windows handle says about a refused socket path.
+#[cfg(windows)]
+enum WindowsSocket {
+    /// The path is gone, so the name is free without cleanup.
+    Absent,
+    /// The exclusive handle names the abandoned AF_UNIX socket, so it can be removed.
+    Stale,
+    /// Another owner, or a replacement that is not a socket, preserves the entry.
+    Live,
+    /// The handle could not decide, so the entry is preserved.
+    Unknown,
+}
+
+/// A refused Windows probe is not proof the listener is gone; only an exclusive handle naming an
+/// AF_UNIX socket is.
+#[cfg(windows)]
+fn windows_socket_state(path: &std::path::Path) -> WindowsSocket {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    match std::fs::OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+    {
+        Ok(file) => match is_unix_socket_handle(&file) {
+            Ok(true) => WindowsSocket::Stale,
+            Ok(false) => WindowsSocket::Live,
+            Err(_) => WindowsSocket::Unknown,
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => WindowsSocket::Absent,
+        Err(error) if matches!(error.raw_os_error(), Some(5) | Some(32)) => WindowsSocket::Live,
+        Err(_) => WindowsSocket::Unknown,
+    }
+}
+
+/// Delete the abandoned socket through the handle that verified its tag and identity.
+/// The volume and file identity a handle names, so a replacement is not mistaken for the socket checked.
+#[cfg(windows)]
+fn windows_file_id_handle(file: &std::fs::File) -> io::Result<(u32, u64, u32)> {
+    use std::os::windows::io::AsRawHandle as _;
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        creation: FileTime,
+        accessed: FileTime,
+        written: FileTime,
+        volume: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            handle: *mut core::ffi::c_void,
+            info: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+    let mut info = ByHandleFileInformation {
+        attributes: 0,
+        creation: FileTime { low: 0, high: 0 },
+        accessed: FileTime { low: 0, high: 0 },
+        written: FileTime { low: 0, high: 0 },
+        volume: 0,
+        size_high: 0,
+        size_low: 0,
+        links: 0,
+        index_high: 0,
+        index_low: 0,
+    };
+    // SAFETY: the handle is live and `info` is the structure the call fills.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        info.volume,
+        u64::from(info.index_high) << 32 | u64::from(info.index_low),
+        info.attributes,
+    ))
+}
+
+#[cfg(windows)]
+fn windows_file_id(path: &std::path::Path) -> io::Result<(u32, u64)> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_SHARE_ALL: u32 = 0x7;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    windows_file_id_handle(&file).map(|(volume, index, _)| (volume, index))
+}
+
+#[cfg(windows)]
+fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    #[repr(C)]
+    struct FileDispositionInfoEx {
+        flags: u32,
+    }
+    const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x1;
+    const FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x10;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetFileInformationByHandle(
+            handle: *mut core::ffi::c_void,
+            class: i32,
+            info: *const core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    let file = match std::fs::OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+    {
+        Ok(file) => file,
+        // The path vanished after its refusal: the name is already free.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if matches!(error.raw_os_error(), Some(5) | Some(32)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "a unix listen path refused but may still be live",
+            ))
+        }
+        Err(error) => return Err(error),
+    };
+    if !is_unix_socket_handle(&file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "a unix listen path was replaced by a file that is not a socket",
+        ));
+    }
+    let Some(before) = before else {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "a unix listen path could not be identified before binding",
+        ));
+    };
+    let attributes = match windows_file_id_handle(&file) {
+        Ok((volume, index, attributes)) if (volume, index) == *before => attributes,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "a unix listen path was replaced while binding",
+            ))
+        }
+    };
+    let disposition = FileDispositionInfoEx {
+        flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    // SAFETY: the handle is live and `disposition` is the class's structure.
+    let mut deleted = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            21,
+            (&raw const disposition).cast(),
+            std::mem::size_of::<FileDispositionInfoEx>() as u32,
+        )
+    };
+    if deleted == 0 {
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(50) | Some(87)) {
+            return Err(error);
+        }
+        if attributes & FILE_ATTRIBUTE_READONLY != 0 {
+            #[repr(C)]
+            struct FileBasicInfo {
+                creation: i64,
+                accessed: i64,
+                written: i64,
+                changed: i64,
+                attributes: u32,
+            }
+            let basic = FileBasicInfo {
+                creation: 0,
+                accessed: 0,
+                written: 0,
+                changed: 0,
+                attributes: attributes & !FILE_ATTRIBUTE_READONLY,
+            };
+            // SAFETY: the handle is live and `basic` is the class's structure.
+            let cleared = unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    0,
+                    (&raw const basic).cast(),
+                    std::mem::size_of::<FileBasicInfo>() as u32,
+                )
+            };
+            if cleared == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let plain = FileDispositionInfoEx {
+            flags: FILE_DISPOSITION_FLAG_DELETE,
+        };
+        // SAFETY: the handle is live and `plain` is the class's structure.
+        deleted = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                21,
+                (&raw const plain).cast(),
+                std::mem::size_of::<FileDispositionInfoEx>() as u32,
+            )
+        };
+    }
+    if deleted == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
 fn is_unix_socket(path: &std::path::Path) -> io::Result<bool> {
     use std::os::windows::fs::OpenOptionsExt as _;
-    use std::os::windows::io::AsRawHandle as _;
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
     const FILE_SHARE_ALL: u32 = 0x7;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    is_unix_socket_handle(&file)
+}
+
+#[cfg(windows)]
+fn is_unix_socket_handle(file: &std::fs::File) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle as _;
     const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
     #[repr(C)]
     struct AttributeTag {
@@ -2887,11 +3594,6 @@ fn is_unix_socket(path: &std::path::Path) -> io::Result<bool> {
             size: u32,
         ) -> i32;
     }
-    let file = std::fs::OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_ALL)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?;
     let mut info = AttributeTag {
         _attributes: 0,
         tag: 0,
@@ -4239,6 +4941,380 @@ mod tests {
             kept,
             "the file is untouched"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A preflight probe refuses a socket that still has a listener and leaves its path in place,
+    /// so a config that later proves unreadable cannot make the live listener unreachable.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_probe_refuses_a_live_socket_without_removing_it() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-probe-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("binds a live socket");
+        assert!(
+            probe_unix(&path).is_err(),
+            "a live socket refuses the probe"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "the live socket keeps its path"
+        );
+        drop(listener);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A dropped unix listener leaves its path behind; the probe must still call it stale and let a bind recover it.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_probe_recovers_a_socket_its_listener_left() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-stale-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("binds a socket");
+        drop(listener);
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        assert!(probe_unix(&path).is_ok(), "an abandoned socket is stale");
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        assert!(
+            probe_unix(&path).is_err(),
+            "without a socket table a refusal preserves the path"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An accepted connection keeps the listener's name in the kernel table, but only a listening socket makes the path live.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn a_unix_probe_recovers_after_its_listener_closes_with_a_connection_open() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-accepted-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("binds a socket");
+        let client = std::os::unix::net::UnixStream::connect(&path).expect("connects a client");
+        let (accepted, _) = listener.accept().expect("accepts the client");
+        drop(listener);
+        assert_eq!(
+            socket_table_names(&path),
+            Some(false),
+            "an accepted connection is not a listener"
+        );
+        assert!(probe_unix(&path).is_ok(), "the path is stale and reusable");
+        drop(accepted);
+        drop(client);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Linux writes pathname spaces unescaped, so a parser that splits on whitespace would turn `/tmp/a b` into `/tmp/a`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_proc_row_keeps_the_whole_pathname() {
+        let row = "0000000000000000: 00000002 00000000 00010000 0001 01   123 /tmp/a b";
+        assert_eq!(
+            proc_unix_entry(row.as_bytes()),
+            Some((&b"/tmp/a b"[..], true, 123)),
+            "a pathname with a space was truncated"
+        );
+        let abstract_row = b"0000000000000000: 00000002 00000000 00010000 0001 01   123 @a\xffb";
+        assert_eq!(
+            proc_unix_entry(abstract_row),
+            Some((&b"@a\xffb"[..], true, 123)),
+            "a non-utf8 abstract address rejected the whole table"
+        );
+    }
+
+    /// Repeated add and removal of a mode-bearing listener must not leave the staging registry growing.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn a_closed_staged_listener_is_released_from_the_registry() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-registry-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let staged = |path: &std::path::Path| {
+            STAGED_BINDINGS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|binding| binding.published == path)
+                .count()
+        };
+        for _ in 0..32 {
+            let target =
+                parse_target(&format!("unix:{},0750", path.display())).expect("parses a mode");
+            let listener = Listener::bind(&target).expect("binds under the staged mode");
+            assert_eq!(staged(&path), 1, "one live staged listener owns one entry");
+            drop(listener);
+        }
+        assert_eq!(staged(&path), 0, "closed listeners left entries behind");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A mode publishes the path by hard link, but the PCB keeps the private `.ferrox-*/s` name, which still names the live listener.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn a_unix_table_keeps_a_live_staged_listener() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-staged-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let target = parse_target(&format!("unix:{},0750", path.display())).expect("parses");
+        let listener = Listener::bind(&target).expect("binds under the staged mode");
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&path, &alias).expect("aliases the published path");
+        assert_eq!(
+            socket_table_names(&path),
+            Some(true),
+            "the staged name still names the published listener"
+        );
+        assert_eq!(
+            socket_table_names(&alias),
+            Some(true),
+            "an alias still names the published listener"
+        );
+        assert!(
+            probe_unix(&path).is_err(),
+            "the live listener keeps its path"
+        );
+        drop(listener);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A mode-bearing path recovers once its listener closes even while an accepted connection still holds the private staging name.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn a_unix_staged_path_recovers_while_an_accepted_connection_stays_open() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-unix-staged-accepted-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let target = parse_target(&format!("unix:{},0750", path.display())).expect("parses");
+        let listener = Listener::bind(&target).expect("binds under the staged mode");
+        assert!(
+            matches!(
+                &listener,
+                Listener::Unix {
+                    staged: Some(_),
+                    ..
+                }
+            ),
+            "the test needs a staged bind"
+        );
+        let client = std::os::unix::net::UnixStream::connect(&path).expect("connects a client");
+        let accepted = match &listener {
+            Listener::Unix { listener, .. } => listener.accept().expect("accepts the client").0,
+            Listener::Tcp(_) => panic!("a unix target binds a unix listener"),
+        };
+        drop(listener);
+        assert_eq!(
+            socket_table_names(&path),
+            Some(false),
+            "the accepted connection does not own the published path"
+        );
+        let recovered = Listener::bind(&target).expect("the path is free again");
+        drop(recovered);
+        drop(accepted);
+        drop(client);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One live staged listener's copied name must not keep a dead sibling's path alive: ownership follows the bind, not the directory.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn a_unix_staged_listener_does_not_own_a_dead_siblings_path() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-owner-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let live = dir.join("a");
+        let dead = dir.join("b");
+        let live_target = parse_target(&format!("unix:{},0750", live.display())).expect("parses");
+        let dead_target = parse_target(&format!("unix:{},0750", dead.display())).expect("parses");
+        let listener = Listener::bind(&live_target).expect("a stays bound");
+        drop(Listener::bind(&dead_target).expect("b binds once"));
+        assert_eq!(
+            socket_table_names(&dead),
+            Some(false),
+            "a's staging name is not b's owner"
+        );
+        let recovered = Listener::bind(&dead_target).expect("b recovers while a stays bound");
+        assert!(probe_unix(&live).is_err(), "a is still live");
+        drop(recovered);
+        drop(listener);
+        std::fs::remove_file(&dead).ok();
+        std::fs::remove_file(&live).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On macOS a full accept queue also refuses, so the probe must not unlink the live listener.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_unix_probe_keeps_a_live_socket_with_a_full_accept_queue() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-full-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("binds a live socket");
+        let mut clients = Vec::new();
+        while clients.len() < 4096 {
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(client) => clients.push(client),
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => break,
+                Err(error) => panic!("fills the accept queue: {error}"),
+            }
+        }
+        assert!(!clients.is_empty(), "the queue filled");
+        assert!(
+            probe_unix(&path).is_err(),
+            "a full live queue keeps its path"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "the live socket keeps its path"
+        );
+        drop(listener);
+        drop(clients);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stream client that bounds its own name before connecting keeps that name, so the probe must not take it for an accepted copy.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_unix_bound_client_keeps_its_own_path() {
+        use socket2::{Domain, Socket, Type};
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-client-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let server_path = dir.join("server");
+        let client_path = dir.join("client");
+        let server =
+            std::os::unix::net::UnixListener::bind(&server_path).expect("binds a live socket");
+        let client = Socket::new(Domain::UNIX, Type::STREAM, None).expect("opens a client");
+        client
+            .bind(&socket2::SockAddr::unix(&client_path).expect("names the client"))
+            .expect("binds the client name");
+        client
+            .connect(&socket2::SockAddr::unix(&server_path).expect("names the server"))
+            .expect("connects the client");
+        let accepted = server.accept().expect("accepts the client");
+        assert_ne!(
+            socket_table_names(&client_path),
+            Some(false),
+            "the connected client still owns its bound name"
+        );
+        let target =
+            parse_target(&format!("unix:{}", client_path.display())).expect("parses the path");
+        assert!(
+            Listener::bind(&target).is_err(),
+            "a live client name is not free"
+        );
+        assert!(
+            std::fs::symlink_metadata(&client_path).is_ok(),
+            "the client name stays"
+        );
+        drop(accepted);
+        drop(client);
+        drop(server);
+        std::fs::remove_file(&client_path).ok();
+        std::fs::remove_file(&server_path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A listener keeps its entry when its directory moves and the old bind name no longer resolves.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_unix_moved_listener_keeps_its_path() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-unix-moved-{}-{id}", std::process::id()));
+        let old_dir = dir.join("old");
+        std::fs::create_dir_all(&old_dir).expect("scratch dir");
+        let name = format!("sock-{id}");
+        let old_path = old_dir.join(&name);
+        let listener =
+            std::os::unix::net::UnixListener::bind(&old_path).expect("binds a live socket");
+        let new_dir = dir.join("new");
+        std::fs::rename(&old_dir, &new_dir).expect("moves the directory");
+        let new_path = new_dir.join(&name);
+        let alt_path = new_dir.join(name.to_uppercase());
+        // A case-sensitive volume gives the alternate spelling a name of its own, so probe the spelling the rename actually kept.
+        let probe_path = if alt_path.exists() {
+            alt_path.clone()
+        } else {
+            new_path.clone()
+        };
+        let mut clients = Vec::new();
+        let mut refused = false;
+        while clients.len() < 4096 {
+            match std::os::unix::net::UnixStream::connect(&probe_path) {
+                Ok(client) => clients.push(client),
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                    refused = true;
+                    break;
+                }
+                Err(error) => panic!("fills the moved queue: {error}"),
+            }
+        }
+        assert!(!clients.is_empty(), "the moved queue filled");
+        assert!(refused, "the full moved queue refused a connection");
+        let table = macos_socket_table().expect("reads the macOS socket table");
+        assert_eq!(
+            macos_table_names(&table, &probe_path),
+            None,
+            "the read table names the moved listener"
+        );
+        assert_ne!(
+            socket_table_names(&probe_path),
+            Some(false),
+            "an alternate spelling still names the moved listener"
+        );
+        assert!(
+            probe_unix(&probe_path).is_err(),
+            "a full queue behind the alternate spelling keeps its path"
+        );
+        let target = parse_target(&format!("unix:{}", probe_path.display())).expect("parses");
+        assert!(
+            Listener::bind(&target).is_err(),
+            "a live moved listener keeps its name"
+        );
+        assert!(
+            std::fs::symlink_metadata(&new_path).is_ok(),
+            "the moved entry stays"
+        );
+        drop(clients);
+        drop(listener);
+        std::fs::remove_file(&new_path).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 

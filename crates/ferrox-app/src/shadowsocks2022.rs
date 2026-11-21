@@ -2280,6 +2280,7 @@ pub(crate) fn serve_udp_relay(
     method: Method,
     relay_psk: &[u8],
     dests: &[(Vec<u8>, SocketAddr)],
+    stop: Option<&std::sync::atomic::AtomicBool>,
 ) {
     if method.is_chacha() || relay_psk.len() != method.key_len() {
         return;
@@ -2307,6 +2308,9 @@ pub(crate) fn serve_udp_relay(
     let mut buf = crate::proxy::udp_buffer();
     let mut rotate = 0usize;
     loop {
+        if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst)) {
+            break;
+        }
         match clients.recv_from(&mut buf) {
             Ok((n, src)) => {
                 if let Some((dest, session)) =
@@ -2365,7 +2369,13 @@ pub(crate) fn serve_udp_relay(
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, freedom: bool) {
+pub(crate) fn serve_udp_on(
+    clients: &UdpSocket,
+    password: &str,
+    method: &str,
+    freedom: bool,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) {
     let Some(method) = Method::parse(method) else {
         return;
     };
@@ -2399,6 +2409,9 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
     let mut cursor = 0usize;
     let mut resume: Option<(u64, bool)> = None;
     loop {
+        if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst)) {
+            break;
+        }
         match clients.recv_from(&mut buf) {
             Ok((n, src)) => {
                 if multi {
@@ -3807,10 +3820,16 @@ mod tests {
             }
         });
         thread::spawn(move || {
-            serve_udp_on(&dest_sock, &dest_b64, "2022-blake3-aes-256-gcm", true);
+            serve_udp_on(&dest_sock, &dest_b64, "2022-blake3-aes-256-gcm", true, None);
         });
         thread::spawn(move || {
-            serve_udp_relay(&relay_sock, method, &relay_psk, &[(dest_psk, dest_addr)]);
+            serve_udp_relay(
+                &relay_sock,
+                method,
+                &relay_psk,
+                &[(dest_psk, dest_addr)],
+                None,
+            );
         });
         let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
         client

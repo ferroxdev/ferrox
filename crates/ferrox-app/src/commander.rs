@@ -1287,6 +1287,9 @@ impl Api {
         let raw = request_bytes(request, 1)
             .ok_or_else(|| (3, "AddInbound carries no handler".to_owned()))?;
         let tag = crate::xray_pb::handler_tag(raw);
+        if tag.is_empty() {
+            return Err((2, "empty tag name!".to_owned()));
+        }
         let inbounds =
             crate::xray_pb::inbound(raw).map_err(|error| (3, format!("AddInbound: {error}")))?;
         let ports: Vec<String> = inbounds
@@ -3202,6 +3205,43 @@ mod tests {
         assert!(api.remove_inbound(&remove).is_ok());
         wait_for_port(first, false);
         wait_for_port(second, false);
+    }
+
+    /// A dynamic add is all-or-nothing: an occupied port refuses the handler and releases the
+    /// ports it already reserved, instead of ending the process or leaving a partial listener.
+    #[test]
+    fn add_inbound_rolls_back_when_one_port_is_taken() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"default","protocol":"freedom"}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let api = Api::new(ApiConfig {
+            tag: "api".to_owned(),
+            listen: None,
+            handler: true,
+            stats: false,
+            logger: false,
+            observatory: false,
+            routing: false,
+        });
+        api.set_runtime(std::sync::Arc::new(crate::proxy::test_runtime(&root)));
+        let held = TcpListener::bind(("127.0.0.1", 0)).expect("holds a port");
+        let second = held.local_addr().expect("addr").port();
+        let first = loop {
+            let port = free_port();
+            if port != second {
+                break port;
+            }
+        };
+        let raw = dokodemo_inbound(&[first, second]);
+        let mut add = Vec::new();
+        field_bytes(&mut add, 1, &raw);
+        assert!(api.add_inbound(&add).is_err());
+        drop(held);
+        assert!(
+            TcpListener::bind(("127.0.0.1", first)).is_ok(),
+            "the first port was left bound"
+        );
     }
 
     fn free_udp_port() -> u16 {

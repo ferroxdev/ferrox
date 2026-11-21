@@ -13,6 +13,7 @@ use crate::conn::Connection;
 use crate::proxy::{read_exact, under_handshake, write_all_runs, Destination, RelayPoll, UDP_BUF};
 
 const SALT_LEN: usize = 32;
+const STOP_POLL: Duration = Duration::from_millis(100);
 // Chunks one relay read takes and one write carries. A batch never waits for the chunk that has not arrived, so this is a syscall count rather than a latency budget: four costs the same one read and the same one write as one.
 const CHUNKS_PER_BATCH: usize = 4;
 // One relay read of a stream is exactly one chunk: a 16384 B read would seal as 16383 + 1, a second length seal and tag for a single tail byte, and a batch read of CHUNKS_PER_BATCH of them tiles into whole chunks for the same reason. A stream has no chunks to batch, so its granularity — and every carrier frame size that follows from it — is unchanged.
@@ -1531,7 +1532,12 @@ mod poll_set {
     }
 }
 
-pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool) {
+pub(crate) fn serve_udp_on(
+    clients: &UdpSocket,
+    users: &[SsUser],
+    freedom: bool,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) {
     if !freedom || users.is_empty() {
         return;
     }
@@ -1540,13 +1546,17 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool)
     }
     match users.iter().position(|user| user.method.is_stream()) {
         // Nothing in a stream datagram proves which client sent it, so the first stream account owns the front's udp side.
-        Some(which) => serve_udp_stream(clients, &users[which]),
-        None => serve_udp_aead(clients, users),
+        Some(which) => serve_udp_stream(clients, &users[which], stop),
+        None => serve_udp_aead(clients, users, stop),
     }
 }
 
 /// One socket pair and one destination table serve a stream account: a reply is addressed to the last client that named its destination, and the table is capped rather than grown, so a stream front admits no descriptor for traffic it cannot prove.
-fn serve_udp_stream(clients: &UdpSocket, user: &SsUser) {
+fn serve_udp_stream(
+    clients: &UdpSocket,
+    user: &SsUser,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) {
     let Ok(v4) = UdpSocket::bind("0.0.0.0:0") else {
         return;
     };
@@ -1565,11 +1575,14 @@ fn serve_udp_stream(clients: &UdpSocket, user: &SsUser) {
     let mut buf = vec![0u8; DATAGRAM_MAX];
     let mut reply = vec![0u8; DATAGRAM_MAX];
     loop {
+        if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst)) {
+            break;
+        }
         match clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
             Ok((n, src)) => {
                 let datagram = &mut buf[SEAL_ROOM..SEAL_ROOM + n];
                 if let Some((dest, payload)) =
-                    open_datagram(&user.master, user.method, datagram, &mut hop)
+                    open_datagram_watching(&user.master, user.method, datagram, &mut hop, stop)
                 {
                     if by_dest.len() >= SS_UDP_DESTS {
                         by_dest.clear();
@@ -1617,7 +1630,11 @@ fn serve_udp_stream(clients: &UdpSocket, user: &SsUser) {
 /// Serve an AEAD front: one upstream association per client source, each with its own sockets, so a
 /// reply reaches the one account that opened it. The pass parks in `poll` until a socket is ready or
 /// the earliest association goes idle, so a quiet front costs no wakeups.
-fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
+fn serve_udp_aead(
+    clients: &UdpSocket,
+    users: &[SsUser],
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) {
     if clients.set_nonblocking(true).is_err() {
         return;
     }
@@ -1629,6 +1646,9 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
     let mut owners: Vec<Option<(SocketAddr, bool)>> = Vec::new();
     let idle = crate::budgets::udp_idle();
     loop {
+        if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst)) {
+            break;
+        }
         rows.clear();
         owners.clear();
         rows.push(poll_set::socket_row(clients));
@@ -1649,6 +1669,16 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
             .map_or(-1, |left| {
                 i32::try_from(left.as_millis()).unwrap_or(i32::MAX)
             });
+        let timeout = if stop.is_some() {
+            let poll = i32::try_from(STOP_POLL.as_millis()).unwrap_or(i32::MAX);
+            if timeout < 0 {
+                poll
+            } else {
+                timeout.min(poll)
+            }
+        } else {
+            timeout
+        };
         let Ok(ready) = poll_set::wait(&mut rows, timeout) else {
             break;
         };
@@ -1659,6 +1689,9 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
                 }
                 let Some((src, is_v6)) = *owner else {
                     for _ in 0..UDP_DRAIN {
+                        if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::SeqCst)) {
+                            break;
+                        }
                         let Ok((n, src)) =
                             clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF])
                         else {
@@ -1669,9 +1702,13 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
                         let mut bound = false;
                         if let Some(source) = sources.get_mut(&src) {
                             let user = &users[source.user];
-                            if let Some((dest, payload)) =
-                                open_datagram(&user.master, user.method, datagram, &mut source.hop)
-                            {
+                            if let Some((dest, payload)) = open_datagram_watching(
+                                &user.master,
+                                user.method,
+                                datagram,
+                                &mut source.hop,
+                                stop,
+                            ) {
                                 source.last = now;
                                 let uplink = if dest.is_ipv6() {
                                     source.v6.as_ref()
@@ -1688,7 +1725,7 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
                             continue;
                         }
                         let Some((which, dest, payload)) =
-                            open_datagram_any(users, datagram, &mut probes)
+                            open_datagram_any_watching(users, datagram, &mut probes, stop)
                         else {
                             continue;
                         };
@@ -2108,6 +2145,16 @@ pub(crate) fn open_datagram<'a>(
     packet: &'a mut [u8],
     hop: &mut Option<Cipher>,
 ) -> Option<(SocketAddr, &'a [u8])> {
+    open_datagram_watching(master, method, packet, hop, None)
+}
+
+fn open_datagram_watching<'a>(
+    master: &MasterKey,
+    method: Method,
+    packet: &'a mut [u8],
+    hop: &mut Option<Cipher>,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<(SocketAddr, &'a [u8])> {
     if method.is_stream() {
         if packet.len() < IV_LEN + 1 {
             return None;
@@ -2117,7 +2164,7 @@ pub(crate) fn open_datagram<'a>(
         let key = rc4_md5_key(master.as_bytes(), &iv)?;
         let mut rc4 = Rc4::new(&key)?;
         rc4.crypt(&mut packet[IV_LEN..]);
-        let (target, used) = parse_addr_header(&packet[IV_LEN..])?;
+        let (target, used) = parse_addr_header_watching(&packet[IV_LEN..], stop)?;
         return Some((target, &packet[IV_LEN + used..]));
     }
     let salt_len = method.key_len();
@@ -2138,21 +2185,26 @@ pub(crate) fn open_datagram<'a>(
     };
     let body = &mut packet[salt_len..];
     let len = cipher.open_in_place(body)?;
-    let (target, used) = parse_addr_header(&body[..len])?;
+    let (target, used) = parse_addr_header_watching(&body[..len], stop)?;
     Some((target, &body[used..len]))
 }
 
 /// Open one wire datagram against every client: the first whose tag verifies names the flow and seals its replies, and a failed probe leaves the buffer untouched because the tag is checked before the body opens.
-pub(crate) fn open_datagram_any(
+fn open_datagram_any_watching(
     users: &[SsUser],
     packet: &mut [u8],
     hops: &mut [Option<Cipher>],
+    stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<(usize, SocketAddr, std::ops::Range<usize>)> {
     let base = packet.as_ptr() as usize;
     for (which, user) in users.iter().enumerate() {
-        if let Some((target, payload)) =
-            open_datagram(&user.master, user.method, &mut *packet, &mut hops[which])
-        {
+        if let Some((target, payload)) = open_datagram_watching(
+            &user.master,
+            user.method,
+            &mut *packet,
+            &mut hops[which],
+            stop,
+        ) {
             let start = payload.as_ptr() as usize - base;
             return Some((which, target, start..start + payload.len()));
         }
@@ -2161,6 +2213,13 @@ pub(crate) fn open_datagram_any(
 }
 
 fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
+    parse_addr_header_watching(buf, None)
+}
+
+fn parse_addr_header_watching(
+    buf: &[u8],
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<(SocketAddr, usize)> {
     let kind = match buf.first()? {
         1 => crate::proxy::AddrKind::V4,
         4 => crate::proxy::AddrKind::V6,
@@ -2173,7 +2232,9 @@ fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
     let target = match body {
         crate::proxy::AddrBody::V4(ip) => SocketAddr::new(std::net::IpAddr::V4(ip.into()), port),
         crate::proxy::AddrBody::V6(ip) => SocketAddr::new(std::net::IpAddr::V6(ip.into()), port),
-        crate::proxy::AddrBody::Domain(host) => crate::proxy::resolve_endpoint(host, port)?,
+        crate::proxy::AddrBody::Domain(host) => {
+            crate::proxy::resolve_endpoint_watching(host, port, stop)?
+        }
     };
     Some((target, used))
 }
@@ -2733,7 +2794,7 @@ mod tests {
         .collect();
         let mut hops: Vec<Option<Cipher>> = users.iter().map(|_| None).collect();
         let mut wire = seal_to_wire(&users[1].master, users[1].method, &target, b"ping");
-        let (which, got, payload) = open_datagram_any(&users, &mut wire, &mut hops)
+        let (which, got, payload) = open_datagram_any_watching(&users, &mut wire, &mut hops, None)
             .expect("the second client's datagram opens");
         assert_eq!(which, 1, "the matched client names the flow");
         assert_eq!(got, target);
@@ -2765,7 +2826,7 @@ mod tests {
             b"ping",
         );
         let mut wire = stranger;
-        assert!(open_datagram_any(&users, &mut wire, &mut hops).is_none());
+        assert!(open_datagram_any_watching(&users, &mut wire, &mut hops, None).is_none());
     }
 
     /// Each source answers on its own association: two clients naming one destination reach the
@@ -2807,7 +2868,7 @@ mod tests {
         let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let front_addr = front.local_addr().expect("addr");
         let serving = users.clone();
-        thread::spawn(move || serve_udp_on(&front, &serving, true));
+        thread::spawn(move || serve_udp_on(&front, &serving, true, None));
         let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let mut wire = vec![0u8; DATAGRAM_MAX];
@@ -2872,7 +2933,7 @@ mod tests {
         let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let front_addr = front.local_addr().expect("addr");
         let serving = users.clone();
-        thread::spawn(move || serve_udp_on(&front, &serving, true));
+        thread::spawn(move || serve_udp_on(&front, &serving, true, None));
         let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
         client
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -3804,7 +3865,7 @@ mod tests {
         }];
         let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let front_addr = front.local_addr().expect("addr");
-        thread::spawn(move || serve_udp_on(&front, &users, true));
+        thread::spawn(move || serve_udp_on(&front, &users, true, None));
         let (a, b) = (
             UdpSocket::bind("127.0.0.1:0").expect("binds"),
             UdpSocket::bind("127.0.0.1:0").expect("binds"),

@@ -547,6 +547,25 @@ fn inbound_is_xhttp_h3(inbound: &Json) -> bool {
     names.as_slice() == ["h3"]
 }
 
+fn stop_covers_inbound(inbound: &Json, protocol: &str) -> bool {
+    let carrier = inbound_carrier(inbound);
+    match protocol {
+        "vless" | "trojan" | "vmess" => !matches!(carrier, Carrier::Xdrive { .. }),
+        "shadowsocks" => match carrier {
+            Carrier::Raw(_) => {
+                let (tcp, udp) = inbound_ss_networks(inbound);
+                tcp || udp
+            }
+            Carrier::Kcp(_) | Carrier::Hysteria(_) => true,
+            Carrier::Xdrive { .. } | Carrier::Quic => false,
+            Carrier::Xhttp { .. } if inbound_is_xhttp_h3(inbound) => true,
+            _ => inbound_ss_networks(inbound).0,
+        },
+        "socks" | "http" | "mixed" => true,
+        _ => false,
+    }
+}
+
 #[allow(
     clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
@@ -565,6 +584,30 @@ fn serve_inbounds_counted(
     test: bool,
     fallible: bool,
 ) -> usize {
+    if fallible {
+        FALLIBLE_BIND.with(|fallible| fallible.set(true));
+        let requested = if test {
+            Vec::new()
+        } else {
+            proposed_listen_endpoints(root)
+        };
+        let mut closing = CLOSING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        closing.retain(|entry| !entry.stop.is_settled());
+        if closing.iter().any(|entry| {
+            entry.endpoints.iter().any(|held| {
+                requested.iter().any(|(wanted, tcp, udp)| {
+                    (entry.sockets.0 && *tcp || entry.sockets.1 && *udp)
+                        && endpoints_conflict(held, wanted)
+                })
+            })
+        }) {
+            eprintln!("inbound add refused: a previous listener on this address is still closing");
+            FALLIBLE_BIND.with(|fallible| fallible.set(false));
+            return 0;
+        }
+    }
     let routed =
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
     let mut inbounds = 0;
@@ -595,6 +638,12 @@ fn serve_inbounds_counted(
                 refuse_inbound(protocol, label, inbound);
                 continue;
             }
+            if fallible {
+                if let Err(reason) = preflight_inbound(inbound, protocol, &addresses) {
+                    eprintln!("inbound `{protocol}` in {label}: {reason}");
+                    continue;
+                }
+            }
             if prove {
                 if let Some(shared) = route {
                     prove_server_route(shared, inbound, label);
@@ -602,6 +651,9 @@ fn serve_inbounds_counted(
             }
             register_inbound_sniffing(inbound, label, &addresses);
             let handler_stop = api.map(|_| Arc::new(Stop::new()));
+            if let Some(stop) = handler_stop.as_ref().filter(|_| fallible) {
+                stop.track_sessions();
+            }
             let handler_tag = inbound_tag(inbound);
             let handler_raw = seed.and_then(|seed| {
                 let tag = handler_tag.as_deref().unwrap_or_default();
@@ -611,6 +663,12 @@ fn serve_inbounds_counted(
                     .map(|(_, raw)| raw.clone())
             });
             let mut handler_stops: Vec<(Arc<Stop>, String)> = Vec::new();
+            let mut extra_threads = 0usize;
+            let vmess_cached_before = protocol != "vmess"
+                || match (route, handler_tag.as_deref()) {
+                    (Some(shared), Some(tag)) => shared.has_vmess_users(tag),
+                    _ => true,
+                };
             let vmess_users = (protocol == "vmess").then(|| {
                 let make = || inbound_vmess_users(inbound);
                 let users = match (route, handler_tag.as_deref()) {
@@ -623,15 +681,21 @@ fn serve_inbounds_counted(
                 users
             });
             let before = inbounds;
-            let h3_stop = if inbound_is_xhttp_h3(inbound) {
+            let mut armed_addresses: Vec<String> = Vec::new();
+            let mut bind_failure = false;
+            let recorded_stop = if stop_covers_inbound(inbound, protocol) {
                 handler_stop.as_ref()
             } else {
                 None
             };
             for address in bind {
+                BIND_FAILED.with(|failed| failed.set(false));
+                let was = inbounds;
+                let mut wake_address = address.clone();
+                let wake_stream = inbound_sockets(inbound, protocol).0;
                 match protocol {
                     "vless" => {
-                        if serve_vless_inbound(
+                        if let Some(wake) = serve_vless_inbound_wake(
                             address,
                             inbound,
                             freedom,
@@ -639,16 +703,25 @@ fn serve_inbounds_counted(
                             portals,
                             handler_stop.as_ref(),
                         ) {
-                            if let Some(stop) = h3_stop {
-                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            if !wake.is_empty() {
+                                wake_address.clone_from(&wake);
+                            }
+                            if let Some(stop) = recorded_stop {
+                                handler_stops.push((Arc::clone(stop), wake));
                             }
                             inbounds += 1;
                         }
                     }
                     "trojan" => {
-                        if serve_trojan_inbound(address, inbound, freedom, handler_stop.as_ref()) {
-                            if let Some(stop) = h3_stop {
-                                handler_stops.push((Arc::clone(stop), address.clone()));
+                        if serve_trojan_inbound_wake(
+                            address,
+                            inbound,
+                            freedom,
+                            handler_stop.as_ref(),
+                            &mut wake_address,
+                        ) {
+                            if let Some(stop) = recorded_stop {
+                                handler_stops.push((Arc::clone(stop), wake_address.clone()));
                             }
                             inbounds += 1;
                         }
@@ -661,31 +734,28 @@ fn serve_inbounds_counted(
                             freedom,
                             handler_stop.as_ref().map(Arc::clone),
                             users,
+                            &mut wake_address,
                         ) {
-                            if let Some(stop) = &handler_stop {
-                                if !matches!(
-                                    inbound_carrier(inbound),
-                                    Carrier::Kcp(_)
-                                        | Carrier::Xdrive { .. }
-                                        | Carrier::Quic
-                                        | Carrier::Hysteria(_)
-                                ) {
-                                    handler_stops.push((Arc::clone(stop), address.clone()));
-                                }
+                            if let Some(stop) = recorded_stop {
+                                handler_stops.push((Arc::clone(stop), wake_address.clone()));
                             }
                             inbounds += 1;
                         }
                     }
                     "shadowsocks" => {
-                        if serve_shadowsocks_inbound(
+                        let listeners = serve_shadowsocks_inbound_wake(
                             address,
                             inbound,
                             freedom,
                             &configured,
                             handler_stop.as_ref(),
-                        ) {
-                            if let Some(stop) = h3_stop {
-                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            &mut wake_address,
+                        );
+                        if listeners > 0 {
+                            if let Some(stop) = recorded_stop {
+                                for _ in 0..listeners {
+                                    handler_stops.push((Arc::clone(stop), wake_address.clone()));
+                                }
                             }
                             inbounds += 1;
                         }
@@ -728,11 +798,21 @@ fn serve_inbounds_counted(
                             eprintln!(
                                 "inbound `{protocol}` in {label} names no outbound to carry it"
                             );
+                            if fallible {
+                                bind_failed();
+                                bind_failure = true;
+                                break;
+                            }
                             continue;
                         };
                         // A front with no tcp carrier has no chain to arm, so the inbound is refused rather than served unmasked.
                         if crate::config::has_tcp_mask(inbound.get("streamSettings")) {
                             eprintln!("inbound `{protocol}` in {label} asks for a finalmask tcp chain it cannot arm");
+                            if fallible {
+                                bind_failed();
+                                bind_failure = true;
+                                break;
+                            }
                             continue;
                         }
                         let accounts = Arc::new(if protocol == "http" {
@@ -745,12 +825,22 @@ fn serve_inbounds_counted(
                             "socks" => Role::Socks { out, accounts },
                             _ => Role::Mixed { out, accounts },
                         };
-                        spawn_role(address, inbound_role(inbound, role), inbound_tag(inbound));
-                        inbounds += 1;
+                        if let Some(wake) = spawn_role_wake(
+                            address,
+                            inbound_role(inbound, role),
+                            inbound_tag(inbound),
+                            handler_stop.clone(),
+                        ) {
+                            wake_address.clone_from(&wake);
+                            if let Some(stop) = recorded_stop {
+                                handler_stops.push((Arc::clone(stop), wake));
+                            }
+                            inbounds += 1;
+                        }
                     }
                     "dokodemo-door" => {
                         if let Some(out) = routed(inbound, true) {
-                            let (armed, tcp) = serve_dokodemo(
+                            let (armed, workers, wake) = serve_dokodemo(
                                 address,
                                 inbound,
                                 &out,
@@ -759,15 +849,25 @@ fn serve_inbounds_counted(
                                 fallible,
                             );
                             inbounds += armed;
-                            if tcp && !dokodemo_has(&dokodemo_networks(inbound), "udp") {
+                            if workers > 0 {
                                 if let Some(stop) = &handler_stop {
-                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                    handler_stops.push((Arc::clone(stop), wake));
                                 }
+                                extra_threads += workers - 1;
                             }
+                        } else if fallible {
+                            bind_failed();
+                            bind_failure = true;
+                            break;
                         }
                     }
                     "hc" => {
-                        if serve_hc_inbound(address, inbound) {
+                        if let Some(wake) = serve_hc_inbound(address, inbound, handler_stop.clone())
+                        {
+                            if let Some(stop) = &handler_stop {
+                                handler_stops.push((Arc::clone(stop), wake.clone()));
+                            }
+                            wake_address = wake;
                             inbounds += 1;
                         }
                     }
@@ -787,15 +887,30 @@ fn serve_inbounds_counted(
                     "tun" => {
                         // A tun flow has no source or local address, so a reaching rule that names one is refused here.
                         if refuse_source(route, inbound, label, "tun", prove) {
+                            if fallible {
+                                bind_failed();
+                                bind_failure = true;
+                                break;
+                            }
                             continue;
                         }
                         let Some(out) = routed(inbound, false) else {
+                            if fallible {
+                                bind_failed();
+                                bind_failure = true;
+                                break;
+                            }
                             continue;
                         };
                         let spec = match tun_spec(inbound) {
                             Ok(spec) => spec,
                             Err(error) => {
                                 eprintln!("tun inbound: {error}");
+                                if fallible {
+                                    bind_failed();
+                                    bind_failure = true;
+                                    break;
+                                }
                                 continue;
                             }
                         };
@@ -804,6 +919,11 @@ fn serve_inbounds_counted(
                             #[cfg(not(target_os = "linux"))]
                             if tun_stack(inbound) == "system" {
                                 eprintln!("tun inbound: the system tun stack is Linux-only");
+                                if fallible {
+                                    bind_failed();
+                                    bind_failure = true;
+                                    break;
+                                }
                                 continue;
                             }
                             inbounds += 1;
@@ -813,30 +933,118 @@ fn serve_inbounds_counted(
                     }
                     "wireguard" => {
                         if refuse_source(route, inbound, label, "tunnel", prove) {
+                            if fallible {
+                                bind_failed();
+                                bind_failure = true;
+                                break;
+                            }
                             continue;
                         }
                         let Some(out) = routed(inbound, false) else {
+                            if fallible {
+                                bind_failed();
+                                bind_failure = true;
+                                break;
+                            }
                             continue;
                         };
-                        match crate::wg::serve_inbound(inbound, &out, address) {
-                            Ok(_) => inbounds += 1,
+                        match crate::wg::serve_inbound(
+                            inbound,
+                            &out,
+                            address,
+                            handler_stop.as_ref(),
+                        ) {
+                            Ok(_) => {
+                                inbounds += 1;
+                                if let Some(stop) = &handler_stop {
+                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                }
+                            }
                             Err(reason) => eprintln!("wireguard inbound {address}: {reason}"),
                         }
                     }
                     "masque" => {
                         if refuse_source(route, inbound, label, "MASQUE", prove) {
+                            if fallible {
+                                bind_failed();
+                                bind_failure = true;
+                                break;
+                            }
                             continue;
                         }
                         let Some(out) = routed(inbound, false) else {
+                            if fallible {
+                                bind_failed();
+                                bind_failure = true;
+                                break;
+                            }
                             continue;
                         };
-                        match crate::masque::serve_inbound(inbound, &out, address) {
-                            Ok(_) => inbounds += 1,
+                        match crate::masque::serve_inbound(
+                            inbound,
+                            &out,
+                            address,
+                            handler_stop.as_ref(),
+                        ) {
+                            Ok(port) => {
+                                inbounds += 1;
+                                wake_address = swapped_port(address, port);
+                                if let Some(stop) = &handler_stop {
+                                    handler_stops.push((Arc::clone(stop), wake_address.clone()));
+                                }
+                            }
                             Err(reason) => eprintln!("masque inbound {address}: {reason}"),
                         }
                     }
                     _ => eprintln!("unsupported inbound protocol `{protocol}` in {label}"),
                 }
+                if inbounds > was && wake_stream {
+                    armed_addresses.push(wake_address);
+                }
+                if fallible && (BIND_FAILED.with(std::cell::Cell::get) || inbounds == was) {
+                    bind_failure = true;
+                    break;
+                }
+            }
+            if bind_failure {
+                if let Some(stop) = &handler_stop {
+                    if !handler_stops.is_empty() {
+                        stop.expect_listeners(handler_stops.len() + extra_threads);
+                    }
+                    stop.stop();
+                    for address in &armed_addresses {
+                        wake_listener(stop, address);
+                    }
+                    let waited = !handler_stops.is_empty();
+                    let closed = !waited || stop.wait_closed();
+                    stop.shutdown_sessions();
+                    let drained = stop.wait_drained();
+                    if !closed || !drained {
+                        eprintln!("inbound rollback: a listener or session is still closing");
+                        let mut endpoints: Vec<String> = handler_stops
+                            .iter()
+                            .map(|(_, address)| address.clone())
+                            .chain(armed_addresses.iter().cloned())
+                            .collect();
+                        endpoints.sort();
+                        endpoints.dedup();
+                        CLOSING
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(Closing {
+                                stop: Arc::clone(stop),
+                                endpoints,
+                                sockets: inbound_sockets(inbound, protocol),
+                            });
+                    }
+                }
+                inbounds = before;
+                if !vmess_cached_before {
+                    if let (Some(shared), Some(tag)) = (route, handler_tag.as_deref()) {
+                        shared.forget_vmess_users(tag);
+                    }
+                }
+                continue;
             }
             if !prove && inbounds > before {
                 if let Some(networks) = server_networks(inbound) {
@@ -851,7 +1059,8 @@ fn serve_inbounds_counted(
             }
             let handler_users = vmess_users;
             if let Some(stop) = &handler_stop {
-                stop.expect_listeners(handler_stops.len());
+                stop.untrack_sessions();
+                stop.expect_listeners(handler_stops.len() + extra_threads);
             }
             if let Some(api) = api {
                 if inbounds > before {
@@ -866,6 +1075,7 @@ fn serve_inbounds_counted(
             }
         }
     }
+    FALLIBLE_BIND.with(|fallible| fallible.set(false));
     inbounds
 }
 
@@ -911,6 +1121,146 @@ fn serve_addresses(inbound: &Json, protocol: &str) -> Option<Vec<String>> {
     }
     let addresses = inbound_addresses(inbound);
     (!addresses.is_empty()).then_some(addresses)
+}
+
+/// The sockets an inbound opens, as `(tcp, udp)`, for the dynamic path's all-or-nothing bind.
+fn inbound_sockets(inbound: &Json, protocol: &str) -> (bool, bool) {
+    match protocol {
+        "socks" | "http" | "mixed" | "anytls" | "hc" | "blackhole" => (true, false),
+        "hysteria" | "tuic" | "wireguard" => (false, true),
+        "masque" => {
+            let security = inbound
+                .get("streamSettings")
+                .and_then(|settings| settings.get("security"))
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            if security.eq_ignore_ascii_case("none") {
+                (true, false)
+            } else {
+                let tcp = quic_inbound_identity(inbound).is_some_and(|identity| {
+                    identity
+                        .alpn
+                        .iter()
+                        .any(|alpn| alpn == b"h2" || alpn == b"http/1.1")
+                });
+                (tcp, false)
+            }
+        }
+        "dokodemo-door" => (
+            dokodemo_has(&dokodemo_networks(inbound), "tcp"),
+            dokodemo_has(&dokodemo_networks(inbound), "udp"),
+        ),
+        "shadowsocks" => {
+            let (tcp, udp) = inbound_ss_networks(inbound);
+            match inbound_carrier(inbound) {
+                Carrier::Kcp(_) | Carrier::Hysteria(_) => (false, tcp),
+                // CR-029: a tcp carrier still serves when its optional udp front loses the bind, so only preflight a udp-only inbound.
+                Carrier::Raw(_) => (tcp, udp && !tcp),
+                Carrier::Xhttp { .. } if inbound_is_xhttp_h3(inbound) => (false, true),
+                Carrier::Xdrive { .. } => (false, false),
+                _ => (tcp, false),
+            }
+        }
+        "vless" | "trojan" | "vmess" => match inbound_carrier(inbound) {
+            Carrier::Kcp(_) | Carrier::Hysteria(_) | Carrier::Quic => (false, true),
+            Carrier::Xdrive { .. } => (false, false),
+            _ if inbound_is_xhttp_h3(inbound) => (false, true),
+            _ => (true, false),
+        },
+        _ => (false, false),
+    }
+}
+
+#[allow(dead_code)]
+enum Reservation {
+    Tcp(crate::conn::Listener),
+    Udp(UdpSocket),
+}
+
+/// Reserve a listener without destroying a unix socket: a path is probed for a live listener, an IP target is bound.
+fn preflight_tcp(
+    target: &crate::conn::Target,
+    address: &str,
+    transparent: bool,
+) -> Result<Option<Reservation>, String> {
+    #[cfg(any(unix, windows))]
+    if let crate::conn::Target::Unix(path) = target {
+        crate::conn::probe_unix(path)
+            .map_err(|error| format!("cannot listen on {address}: {error}"))?;
+        return Ok(None);
+    }
+    let listener = if transparent {
+        crate::conn::Listener::bind_transparent(target)
+    } else {
+        crate::conn::Listener::bind(target)
+    }
+    .map_err(|error| format!("cannot listen on {address}: {error}"))?;
+    Ok(Some(Reservation::Tcp(listener)))
+}
+
+fn dokodemo_transparent_mode(inbound: &Json) -> Option<crate::sockopt::Tproxy> {
+    let settings = inbound.get("settings");
+    let follow = settings
+        .and_then(|settings| settings.get("followRedirect"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    let receive = inbound
+        .get("receiveOriginalDestination")
+        .and_then(Json::as_bool)
+        .unwrap_or(follow);
+    let mode = crate::sockopt::inbound_tproxy(inbound.get("streamSettings")).ok()?;
+    match dokodemo_transparent(receive, mode) {
+        Some(crate::sockopt::Tproxy::Tproxy) if !crate::transparent::TPROXY => {
+            crate::transparent::REDIRECT.then_some(crate::sockopt::Tproxy::Redirect)
+        }
+        Some(crate::sockopt::Tproxy::Redirect) if !crate::transparent::REDIRECT => None,
+        mode => mode,
+    }
+}
+
+/// Bind every socket a dynamic inbound opens before serving any, so one taken port refuses the whole add.
+fn preflight_inbound(inbound: &Json, protocol: &str, addresses: &[String]) -> Result<(), String> {
+    let (tcp, udp) = inbound_sockets(inbound, protocol);
+    // A transparent door binds its sockets with options plain `bind` cannot set.
+    let transparent_door =
+        protocol == "dokodemo-door" && dokodemo_transparent_mode(inbound).is_some();
+    let mut held = Vec::new();
+    for address in addresses {
+        if address.is_empty() {
+            continue;
+        }
+        if tcp {
+            let target = parse_target(address).map_err(|error| format!("{address}: {error}"))?;
+            if let Some(reservation) = preflight_tcp(&target, address, transparent_door)? {
+                held.push(reservation);
+            }
+        }
+        if udp && transparent_door {
+            let follow = inbound
+                .get("settings")
+                .and_then(|settings| settings.get("followRedirect"))
+                .and_then(Json::as_bool)
+                .unwrap_or(false);
+            let rewrite = DokodemoRewrite::from_config(inbound);
+            let target = parse_target(address).map_err(|error| format!("{address}: {error}"))?;
+            let crate::conn::Target::Ip(bound) = target else {
+                return Err(format!("{address} names no IP for a transparent udp door"));
+            };
+            let socket = match crate::transparent::bind_udp(bound) {
+                Ok(socket) => socket,
+                Err(_) if !follow || rewrite.configured().is_some() => UdpSocket::bind(address)
+                    .map_err(|error| format!("cannot bind {address}: {error}"))?,
+                Err(error) => return Err(format!("cannot bind {address}: {error}")),
+            };
+            held.push(Reservation::Udp(socket));
+        } else if udp {
+            let socket = UdpSocket::bind(address)
+                .map_err(|error| format!("cannot bind {address}: {error}"))?;
+            held.push(Reservation::Udp(socket));
+        }
+    }
+    drop(held);
+    Ok(())
 }
 
 /// A device inbound is refused with the reason the device layer computes from the config; any other unserved inbound is refused by name.
@@ -961,6 +1311,78 @@ fn inbound_served(protocol: &str) -> bool {
     SERVED_INBOUNDS.contains(&protocol)
 }
 
+thread_local! {
+    /// A management add owns the dynamic listener path: a bind failure is reported to the caller
+    /// instead of ending the process.
+    static FALLIBLE_BIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BIND_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A rollback's stop and the endpoints its failed add may still hold, so only an add that reaches one waits.
+struct Closing {
+    stop: Arc<Stop>,
+    endpoints: Vec<String>,
+    sockets: (bool, bool),
+}
+
+static CLOSING: std::sync::Mutex<Vec<Closing>> = std::sync::Mutex::new(Vec::new());
+
+/// Every address this config names, before a test takes its ephemeral port, so an overlapping add can be told apart from an unrelated one.
+fn proposed_listen_endpoints(root: &Json) -> Vec<(String, bool, bool)> {
+    let mut out = Vec::new();
+    if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
+        for inbound in list {
+            let protocol =
+                canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
+            let sockets = inbound_sockets(inbound, protocol);
+            for address in serve_addresses(inbound, protocol).unwrap_or_default() {
+                if address.is_empty() {
+                    continue;
+                }
+                match out.iter_mut().find(|(known, _, _)| known == &address) {
+                    Some((_, tcp, udp)) => {
+                        *tcp |= sockets.0;
+                        *udp |= sockets.1;
+                    }
+                    None => out.push((address, sockets.0, sockets.1)),
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Two listen addresses contend for one socket: an equal port on the same or a wildcard address, or the same unix path.
+fn endpoints_conflict(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let (Ok(crate::conn::Target::Ip(left)), Ok(crate::conn::Target::Ip(right))) =
+        (parse_target(left), parse_target(right))
+    else {
+        #[cfg(any(unix, windows))]
+        return matches!(
+            (parse_target(left), parse_target(right)),
+            (
+                Ok(crate::conn::Target::Unix(left)),
+                Ok(crate::conn::Target::Unix(right))
+            ) if left == right
+        );
+        #[cfg(not(any(unix, windows)))]
+        return false;
+    };
+    left.port() == right.port()
+        && (left.ip().is_unspecified() || right.ip().is_unspecified() || left.ip() == right.ip())
+}
+
+fn bind_failed() {
+    BIND_FAILED.with(|failed| failed.set(true));
+}
+
+pub(crate) fn binding_is_fallible() -> bool {
+    FALLIBLE_BIND.with(std::cell::Cell::get)
+}
+
 /// A listener's stop flag: removal sets it and dials the address, so a blocked accept wakes, sees
 /// the flag, and drops the socket instead of waiting for a flow that will never come.
 #[derive(Debug, Default)]
@@ -968,7 +1390,49 @@ pub(crate) struct Stop {
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     listeners: std::sync::atomic::AtomicUsize,
     closed: std::sync::Mutex<bool>,
+    sessions: std::sync::Mutex<HashMap<u64, Connection>>,
+    next_session: std::sync::atomic::AtomicU64,
+    track_sessions: AtomicBool,
     wake: std::sync::Condvar,
+    drained: std::sync::Condvar,
+}
+
+/// One accepted session's registration: the stop holds a socket clone it can shut down, and the guard removes it when the work ends.
+struct TrackedSession {
+    stop: Arc<Stop>,
+    id: u64,
+}
+
+impl Drop for TrackedSession {
+    fn drop(&mut self) {
+        if let Ok(mut sessions) = self.stop.sessions.lock() {
+            sessions.remove(&self.id);
+        }
+        self.stop.drained.notify_all();
+    }
+}
+
+thread_local! {
+    static ACCEPTED_SESSION: std::cell::RefCell<Option<TrackedSession>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Holds one accepted session for the setup work's thread and clears it when that work returns, unless the relay took it for its own lifetime.
+struct SessionScope;
+
+impl SessionScope {
+    fn install(session: Option<TrackedSession>) -> Self {
+        ACCEPTED_SESSION.with(|slot| *slot.borrow_mut() = session);
+        Self
+    }
+}
+
+impl Drop for SessionScope {
+    fn drop(&mut self) {
+        ACCEPTED_SESSION.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
 }
 
 impl Stop {
@@ -997,6 +1461,66 @@ impl Stop {
 
     fn stopped(&self) -> bool {
         self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.lock().is_ok_and(|closed| *closed)
+    }
+
+    fn is_settled(&self) -> bool {
+        self.is_closed()
+            && self
+                .sessions
+                .lock()
+                .is_ok_and(|sessions| sessions.is_empty())
+    }
+
+    fn track_sessions(&self) {
+        self.track_sessions.store(true, Ordering::Relaxed);
+    }
+
+    fn untrack_sessions(&self) {
+        self.track_sessions.store(false, Ordering::Relaxed);
+    }
+
+    /// Registers an accepted stream so rollback can shut it down and wait for its work to leave.
+    fn track_session(self: &Arc<Self>, stream: &Connection) -> Option<TrackedSession> {
+        if !self.track_sessions.load(Ordering::Relaxed) {
+            return None;
+        }
+        let clone = stream.try_clone().ok()?;
+        let id = self.next_session.fetch_add(1, Ordering::Relaxed);
+        self.sessions.lock().ok()?.insert(id, clone);
+        Some(TrackedSession {
+            stop: Arc::clone(self),
+            id,
+        })
+    }
+
+    fn shutdown_sessions(&self) {
+        if let Ok(sessions) = self.sessions.lock() {
+            for stream in sessions.values() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    fn wait_drained(&self) -> bool {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return false;
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !sessions.is_empty() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let Ok(next) = self.drained.wait_timeout(sessions, left) else {
+                return false;
+            };
+            sessions = next.0;
+        }
+        true
     }
 
     pub(crate) fn mark_closed(&self) {
@@ -1034,6 +1558,14 @@ impl Stop {
     }
 }
 
+/// Replace an ephemeral port with the one the listener actually bound, so a wake can reach it.
+fn swapped_port(address: &str, port: u16) -> String {
+    match address.rsplit_once(':') {
+        Some((host, _)) => format!("{host}:{port}"),
+        None => address.to_owned(),
+    }
+}
+
 /// Wake a listener the stop flag already named; the accepted connection carries no flow.
 pub(crate) fn wake_listener(stop: &Stop, address: &str) {
     if !stop.stopped() {
@@ -1044,32 +1576,54 @@ pub(crate) fn wake_listener(stop: &Stop, address: &str) {
     }
 }
 
-fn spawn_role(address: &str, role: Role, tag: Option<String>) {
-    spawn_role_stopped(address, role, tag, None);
+/// Marks a worker's socket released when its serving loop leaves, whichever path it took.
+struct WorkerDone(Option<Arc<Stop>>);
+
+impl Drop for WorkerDone {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.0 {
+            stop.mark_closed();
+        }
+    }
 }
 
-fn spawn_role_stopped(
+/// The same bind, returning the address a removal must dial: an ephemeral port is replaced by the one the socket took.
+fn spawn_role_wake(
     address: &str,
     role: Role,
     tag: Option<String>,
     stop: Option<std::sync::Arc<Stop>>,
-) {
-    let listener = bind_listener(address, &role)
-        .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
+) -> Option<String> {
+    let listener = match bind_listener(address, &role) {
+        Ok(listener) => listener,
+        Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
+            bind_failed();
+            eprintln!("cannot listen on {address}: {error}");
+            return None;
+        }
+        Err(error) => exit(&format!("cannot listen on {address}: {error}")),
+    };
+    let wake = listener
+        .local_addr()
+        .map_or_else(|_| address.to_owned(), |bound| bound.to_string());
     let address = address.to_owned();
     thread::spawn(move || accept_listener(listener, &address, &role, tag.as_deref(), stop));
+    Some(wake)
 }
 
-fn try_spawn_role_stopped(
+fn try_spawn_role_wake(
     address: &str,
     role: Role,
     tag: Option<String>,
     stop: Option<std::sync::Arc<Stop>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<String> {
     let listener = bind_listener(address, &role)?;
+    let wake = listener
+        .local_addr()
+        .map_or_else(|_| address.to_owned(), |bound| bound.to_string());
     let address = address.to_owned();
     thread::spawn(move || accept_listener(listener, &address, &role, tag.as_deref(), stop));
-    Ok(())
+    Ok(wake)
 }
 
 /// The role a listener serves, wrapped when its config says the first bytes are a PROXY header.
@@ -1081,6 +1635,7 @@ fn inbound_role(inbound: &Json, role: Role) -> Role {
     }
 }
 
+#[cfg(test)]
 fn serve_vless_inbound(
     address: &str,
     inbound: &Json,
@@ -1089,43 +1644,55 @@ fn serve_vless_inbound(
     portals: &crate::reverse::Portals,
     stop: Option<&Arc<Stop>>,
 ) -> bool {
+    serve_vless_inbound_wake(address, inbound, freedom, path, portals, stop).is_some()
+}
+
+fn serve_vless_inbound_wake(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    path: &str,
+    portals: &crate::reverse::Portals,
+    stop: Option<&Arc<Stop>>,
+) -> Option<String> {
     let users = inbound_users(inbound, portals);
     let carrier = inbound_carrier(inbound);
     let sec = stream_security(inbound);
     // QUIC arrives on UDP with its own handshake, so it never reaches the TCP accept loop.
     if matches!(carrier, Carrier::Quic) {
-        return serve_vless_quic_inbound(address, inbound, &users, freedom, path);
+        return serve_vless_quic_inbound(address, inbound, &users, freedom, path, stop)
+            .then(String::new);
     }
     if let Carrier::Unknown { network } = &carrier {
         eprintln!("unsupported network `{network}` in {path}: refused, not served");
-        return false;
+        return None;
     }
     // An xdrive inbound has no socket: its `security` belongs to the store's lanes, so the stream is served as it arrives from the log.
     if let Carrier::Xdrive { settings } = &carrier {
         serve_vless_xdrive_inbound(address, inbound, &users, settings, freedom);
-        return true;
+        return Some(String::new());
     }
     match sec {
         // Hysteria carries its own QUIC TLS, so xray's `security: tls` names that handshake rather than a second layer above it.
         _ if matches!(carrier, Carrier::Hysteria(_)) => {
             let Carrier::Hysteria(config) = carrier else {
-                return false;
+                return None;
             };
             if config.version != 2 {
                 eprintln!(
                     "hysteria v{} carrier in {path} is not the v2 serve `hysteria` names: serves nothing",
                     config.version
                 );
-                return false;
+                return None;
             }
             let owned = address.to_owned();
             let Some(settings) = inbound.get("streamSettings") else {
                 eprintln!("unreadable hysteria identity in {path}: serves nothing");
-                return false;
+                return None;
             };
             let Some(identity) = crate::config::tls_identity_from_settings(settings) else {
                 eprintln!("unreadable hysteria identity in {path}: serves nothing");
-                return false;
+                return None;
             };
             let masq = crate::config::masquerade_from_stream(Some(settings));
             let users = Arc::clone(&users);
@@ -1133,13 +1700,15 @@ fn serve_vless_inbound(
             let serve: crate::hysteria::Serve = Arc::new(move |flow| {
                 serve_vless_hysteria(flow.with_meter(meter.clone()), &users, freedom);
             });
-            serve_hysteria_thread(&owned, &config, &identity, &masq, &serve)
+            serve_hysteria_thread(&owned, &config, &identity, &masq, &serve, stop).then(String::new)
         }
         "tls" => serve_vless_tls_inbound(address, inbound, &users, &carrier, freedom, path, stop),
-        "reality" => serve_vless_reality_inbound(address, inbound, &users, &carrier, freedom, path),
+        "reality" => {
+            serve_vless_reality_inbound(address, inbound, &users, &carrier, freedom, path, stop)
+        }
         _ if !vless_security_supported(sec) => {
             eprintln!("unsupported vless security `{sec}` in {path}: serves raw TCP only");
-            false
+            None
         }
         _ => {
             let owned = address.to_owned();
@@ -1150,27 +1719,27 @@ fn serve_vless_inbound(
                     let _flow = crate::accesslog::flow(Some(conn.remote_addr()), "", 0);
                     serve_vless_kcp(conn, &users, freedom, meter.clone());
                 });
-                return serve_kcp_bound(&owned, config, &serve, inbound);
+                return serve_kcp_bound(&owned, config, &serve, inbound, stop).then(String::new);
             }
             let fallbacks = match server_fallbacks(inbound) {
                 Ok(fallbacks) => fallbacks.map(Arc::from),
                 Err(error) => {
                     eprintln!("{error} in {path}: inbound refused");
-                    return false;
+                    return None;
                 }
             };
             let decryption = match crate::config::server_decryption(inbound) {
                 Ok(decryption) => decryption,
                 Err(error) => {
                     eprintln!("{error} in {path}: inbound refused");
-                    return false;
+                    return None;
                 }
             };
             if decryption.is_some() && fallbacks.is_some() {
                 eprintln!(
                     r#"VLESS settings: "fallbacks" can not be used together with "decryption" in {path}: inbound refused"#
                 );
-                return false;
+                return None;
             }
             let role = inbound_role(
                 inbound,
@@ -1182,8 +1751,7 @@ fn serve_vless_inbound(
                     decryption,
                 },
             );
-            spawn_role_stopped(&owned, role, inbound_tag(inbound), None);
-            true
+            spawn_role_wake(&owned, role, inbound_tag(inbound), stop.cloned())
         }
     }
 }
@@ -1195,6 +1763,7 @@ fn serve_hysteria_thread(
     identity: &ferrox_core::tls::TlsServerConfig,
     masq: &ferrox_core::hysteria::Masquerade,
     serve: &crate::hysteria::Serve,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let Some(prepared) = crate::hysteria::prepare(
         address,
@@ -1211,6 +1780,8 @@ fn serve_hysteria_thread(
     let realm = config.realm.clone();
     let masq = masq.clone();
     let serve = Arc::clone(serve);
+    let worker_stop = stop.cloned();
+    let cancel = stop.map(|stop| stop.shared());
     thread::spawn(move || {
         crate::hysteria::serve_prepared(
             prepared,
@@ -1220,7 +1791,11 @@ fn serve_hysteria_thread(
             udp_idle,
             quic.as_ref(),
             realm.as_deref(),
+            cancel.as_ref(),
         );
+        if let Some(stop) = worker_stop {
+            stop.mark_closed();
+        }
     });
     true
 }
@@ -1764,7 +2339,16 @@ pub(crate) fn dial_udp_through_proxy(
             let _source = SendThroughGuard::enter(source);
             let _target = TargetStrategyGuard::enter(strategy);
             let _tag = OutboundTag::enter(Some(&name));
-            serve_udp_lane_with(&relay, &out, None, None, source, sockopts.as_ref());
+            serve_udp_lane_with(
+                &relay,
+                &out,
+                None,
+                None,
+                source,
+                sockopts.as_ref(),
+                None,
+                Some(&relay_stop),
+            );
             relay_stop.store(true, Ordering::Relaxed);
         })
         .is_err()
@@ -2724,7 +3308,7 @@ pub(crate) struct RouteShared {
     vmess_users: Mutex<HashMap<String, crate::vmess::UsersRef>>,
     observatory: Option<Arc<crate::observatory::Observatory>>,
     /// The script router, kept outside the routing lock: a script callback re-enters the table.
-    script_router: Option<Arc<crate::router_script::ScriptRouter>>,
+    script_router: RwLock<Option<Arc<crate::router_script::ScriptRouter>>>,
     script: Option<crate::router_script::ScriptCallbacks>,
     default: Outbound,
     default_tag: Option<String>,
@@ -2762,6 +3346,12 @@ impl RouteShared {
         else {
             return Ok(());
         };
+        let next_script = next.script_shared();
+        // Both writers swap rules and script as one generation, so a flow reads one whole script or one whole table.
+        let mut script = self
+            .script_router
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut current = self
             .routing
             .write()
@@ -2769,6 +3359,7 @@ impl RouteShared {
         next.adopt_added_rules(&mut current)?;
         next.adopt_balancer_state(&mut current);
         *current = next;
+        *script = next_script;
         Ok(())
     }
 
@@ -2891,6 +3482,13 @@ impl RouteShared {
         ));
     }
 
+    fn has_vmess_users(&self, tag: &str) -> bool {
+        self.vmess_users
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(tag)
+    }
+
     fn forget_vmess_users(&self, tag: &str) {
         self.vmess_users
             .lock()
@@ -2988,7 +3586,14 @@ impl RouteShared {
     /// script a live flow would get, without the default outbound the reference leaves to the caller.
     /// A matched rule's webhook fires here too, as the reference's `PickRoute` fires it.
     fn routed_tag(&self, probe: &crate::router::Probe<'_>) -> Result<Option<String>, String> {
-        if let Some(script) = self.script_router.as_deref() {
+        let script = {
+            let router = self
+                .script_router
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            router.as_ref().map(Arc::clone)
+        };
+        if let Some(script) = script {
             let Some(callbacks) = self.script.as_ref() else {
                 return Ok(None);
             };
@@ -3598,7 +4203,15 @@ impl RoutePlan {
             attrs: facts.attrs,
             process: facts.process,
         };
-        if let Some(script) = self.shared.script_router.as_deref() {
+        let script = {
+            let router = self
+                .shared
+                .script_router
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            router.as_ref().map(Arc::clone)
+        };
+        if let Some(script) = script {
             let Some(callbacks) = self.shared.script.as_ref() else {
                 return self.default_lane();
             };
@@ -4464,7 +5077,7 @@ fn route_shared_with_api(
         server_inbounds: Mutex::new(server_inbounds),
         vmess_users: Mutex::new(HashMap::new()),
         observatory,
-        script_router,
+        script_router: RwLock::new(script_router),
         script,
         default,
         default_tag,
@@ -5821,10 +6434,12 @@ fn accept_listener(
             let stream = with_account(stream, role.account(), false);
             // The ClientHello peek runs on a setup lane, so a stalled hello cannot hold the accept loop.
             let accepted_at = Instant::now();
-            let mut work = Some((role, stream, sniffing));
+            let session = stop.as_ref().and_then(|stop| stop.track_session(&stream));
+            let mut work = Some((role, stream, sniffing, session));
             lane_pool::submit_setup(
                 Box::new(move || {
-                    if let Some((role, stream, sniffing)) = work.take() {
+                    if let Some((role, stream, sniffing, session)) = work.take() {
+                        let _session = SessionScope::install(session);
                         // The header handshake reads the peer's first bytes; the lane spends what is left of the handshake budget, queue time included.
                         let budget = budgets::handshake();
                         let waited = accepted_at.elapsed();
@@ -5845,10 +6460,12 @@ fn accept_listener(
         let tag = tag.map(str::to_owned);
         let accepted_at = Instant::now();
         if role.tcp_stream() {
-            let mut work = Some((stream, role, tag, sniffing));
+            let session = stop.as_ref().and_then(|stop| stop.track_session(&stream));
+            let mut work = Some((stream, role, tag, sniffing, session));
             lane_pool::submit_setup(
                 Box::new(move || {
-                    if let Some((stream, role, tag, sniffing)) = work.take() {
+                    if let Some((stream, role, tag, sniffing, session)) = work.take() {
+                        let _session = SessionScope::install(session);
                         serve_accepted(stream, role, tag.as_deref(), sniffing, accepted_at);
                     }
                     lane_pool::Next::Done
@@ -5856,7 +6473,9 @@ fn accept_listener(
                 Box::new(|| {}),
             );
         } else {
+            let session = stop.as_ref().and_then(|stop| stop.track_session(&stream));
             thread::spawn(move || {
+                let _session = SessionScope::install(session);
                 serve_accepted(stream, role, tag.as_deref(), sniffing, accepted_at);
             });
         }
@@ -8826,6 +9445,8 @@ const RESOLVE_STACK: usize = 256 * 1024;
 static RESOLVE_POOL: Mutex<Option<ResolvePool>> = Mutex::new(None);
 /// Latency probes resolve here, so their fan-out cannot take the workers a flow's dial waits on.
 static PROBE_POOL: Mutex<Option<ResolvePool>> = Mutex::new(None);
+/// DNS-app lookups ride their own workers: a stopped caller's lookup cannot hold a dial's worker.
+static DNS_APP_POOL: Mutex<Option<ResolvePool>> = Mutex::new(None);
 
 impl ResolvePool {
     /// Start one set of long-lived workers; a resolver that hangs parks a worker, not a flow's thread.
@@ -8892,7 +9513,20 @@ pub(crate) fn resolve_bounded<F>(
 where
     F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
 {
-    resolve_on(&RESOLVE_POOL, host, port, budget, lookup)
+    resolve_bounded_watching(host, port, budget, None, lookup)
+}
+
+fn resolve_bounded_watching<F>(
+    host: &str,
+    port: u16,
+    budget: Duration,
+    stop: Option<&AtomicBool>,
+    lookup: F,
+) -> Option<Vec<SocketAddr>>
+where
+    F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    resolve_on(&RESOLVE_POOL, host, port, budget, stop, lookup)
 }
 
 /// A latency probe's lookup rides its own pool: a probe fan-out that stalls answers expires there
@@ -8906,7 +9540,7 @@ pub(crate) fn resolve_probe<F>(
 where
     F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
 {
-    resolve_on(&PROBE_POOL, host, port, budget, lookup)
+    resolve_on(&PROBE_POOL, host, port, budget, None, lookup)
 }
 
 fn resolve_on<F>(
@@ -8914,6 +9548,7 @@ fn resolve_on<F>(
     host: &str,
     port: u16,
     budget: Duration,
+    stop: Option<&AtomicBool>,
     lookup: F,
 ) -> Option<Vec<SocketAddr>>
 where
@@ -8944,9 +9579,31 @@ where
     }
     result.ok()?;
     drop(held);
-    match receiver.recv_timeout(budget) {
-        Ok(Ok(addrs)) => Some(addrs),
-        Ok(Err(_)) | Err(_) => None,
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .unwrap_or_else(Instant::now);
+    loop {
+        if stopped(stop) {
+            return None;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        let slice = if stop.is_some() {
+            left.min(Duration::from_millis(100))
+        } else {
+            left
+        };
+        match receiver.recv_timeout(slice) {
+            Ok(Ok(addrs)) => return (!stopped(stop)).then_some(addrs),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if slice >= left {
+                    return None;
+                }
+            }
+            Ok(Err(_)) | Err(_) => return None,
+        }
     }
 }
 
@@ -9187,7 +9844,7 @@ fn dns_udp_with(
         .name("ferrox-dns".to_owned())
         .spawn({
             let out = out.clone();
-            move || serve_udp_lane(&lane, &out, None, None)
+            move || serve_udp_lane(&lane, &out, None, None, None)
         })
         .ok()?;
     let mut framed = Vec::with_capacity(3 + 1 + 4 + 2 + query.len());
@@ -9203,12 +9860,57 @@ pub(crate) fn resolve_endpoint(host: &str, port: u16) -> Option<SocketAddr> {
     resolve_name(host, port, false)
 }
 
+/// A shutdown-aware lookup: the caller's stop ends the wait, so a listener close is not held by a slow resolver.
+pub(crate) fn resolve_endpoint_watching(
+    host: &str,
+    port: u16,
+    stop: Option<&AtomicBool>,
+) -> Option<SocketAddr> {
+    resolve_name_watching(host, port, false, stop)
+}
+
 fn resolve_name(host: &str, port: u16, local: bool) -> Option<SocketAddr> {
+    resolve_name_watching(host, port, local, None)
+}
+
+fn resolve_name_watching(
+    host: &str,
+    port: u16,
+    local: bool,
+    stop: Option<&AtomicBool>,
+) -> Option<SocketAddr> {
     // An address literal parses straight to an address: no cache key and no resolver iterator.
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Some(SocketAddr::new(ip, port));
     }
+    if stopped(stop) {
+        return None;
+    }
     if let Some(resolver) = crate::dnsapp::installed() {
+        if stop.is_some() {
+            let addrs = resolve_on(
+                &DNS_APP_POOL,
+                host,
+                port,
+                budgets::dial(),
+                stop,
+                move |host, port| {
+                    let answer = if local {
+                        resolver.lookup_local(host)
+                    } else {
+                        resolver.lookup(host)
+                    };
+                    answer
+                        .map(|(ips, _)| {
+                            ips.into_iter()
+                                .map(|ip| SocketAddr::new(ip, port))
+                                .collect()
+                        })
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+                },
+            )?;
+            return addrs.first().copied();
+        }
         let (ips, _) = if local {
             resolver.lookup_local(host)?
         } else {
@@ -9220,7 +9922,7 @@ fn resolve_name(host: &str, port: u16, local: bool) -> Option<SocketAddr> {
         addrs
     } else {
         // The tuple asks the resolver for host and port directly: no `host:port` re-serialisation, no String, no port re-scan.
-        let addrs = resolve_bounded(host, port, budgets::dial(), |host, port| {
+        let addrs = resolve_bounded_watching(host, port, budgets::dial(), stop, |host, port| {
             (host, port)
                 .to_socket_addrs()
                 .map(std::iter::Iterator::collect)
@@ -9228,6 +9930,10 @@ fn resolve_name(host: &str, port: u16, local: bool) -> Option<SocketAddr> {
         remember_lookup(host, port, &addrs)
     };
     addrs.first().copied()
+}
+
+fn stopped(stop: Option<&AtomicBool>) -> bool {
+    stop.is_some_and(|stop| stop.load(Ordering::SeqCst))
 }
 
 fn mux_target_of(addr: SocketAddr) -> ferrox_core::mux::Target<'static> {
@@ -10264,6 +10970,7 @@ fn serve_vless_quic_inbound(
     users: &VlessUsers,
     freedom: bool,
     path: &str,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let Some(identity) = quic_inbound_identity(inbound) else {
         eprintln!("quic inbound in {path} needs security tls with a certificate: serves nothing");
@@ -10294,13 +11001,20 @@ fn serve_vless_quic_inbound(
             decryption.as_deref(),
         );
     });
+    let stop = stop.cloned();
+    let poll = stop
+        .as_ref()
+        .map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
     thread::spawn(move || {
         crate::quic::serve_loop(
             crate::quic::Datagram::plain(sock),
             &Arc::new(Mutex::new(config)),
             &serve,
-            &Arc::new(AtomicBool::new(false)),
+            &poll,
         );
+        if let Some(stop) = stop {
+            stop.mark_closed();
+        }
     });
     true
 }
@@ -10540,30 +11254,30 @@ fn serve_vless_tls_inbound(
     freedom: bool,
     path: &str,
     stop: Option<&Arc<Stop>>,
-) -> bool {
+) -> Option<String> {
     let Some(server) = inbound_tls_identity(inbound) else {
         eprintln!("unreadable vless tls identity in {path}: serves raw TCP only");
-        return false;
+        return None;
     };
     let fallbacks = match server_fallbacks(inbound) {
         Ok(fallbacks) => fallbacks.map(Arc::from),
         Err(error) => {
             eprintln!("{error} in {path}: inbound refused");
-            return false;
+            return None;
         }
     };
     let decryption = match crate::config::server_decryption(inbound) {
         Ok(decryption) => decryption,
         Err(error) => {
             eprintln!("{error} in {path}: inbound refused");
-            return false;
+            return None;
         }
     };
     if decryption.is_some() && fallbacks.is_some() {
         eprintln!(
             r#"VLESS settings: "fallbacks" can not be used together with "decryption" in {path}: inbound refused"#
         );
-        return false;
+        return None;
     }
     if let Carrier::Xhttp { settings } = carrier {
         if crate::xhttp_h3::is_h3(&server.alpn) {
@@ -10576,7 +11290,8 @@ fn serve_vless_tls_inbound(
                 service,
                 stop,
                 &format!("xhttp h3 in {path}"),
-            );
+            )
+            .then(String::new);
         }
     }
     let owned = address.to_owned();
@@ -10588,7 +11303,7 @@ fn serve_vless_tls_inbound(
             let _flow = crate::accesslog::flow(Some(conn.remote_addr()), "", 0);
             serve_vless_kcp_tls(conn, &users, freedom, &server, meter.clone());
         });
-        return serve_kcp_bound(&owned, config, &serve, inbound);
+        return serve_kcp_bound(&owned, config, &serve, inbound, stop).then(String::new);
     }
     let role = inbound_role(
         inbound,
@@ -10601,8 +11316,7 @@ fn serve_vless_tls_inbound(
             decryption,
         },
     );
-    spawn_role_stopped(&owned, role, inbound_tag(inbound), None);
-    true
+    spawn_role_wake(&owned, role, inbound_tag(inbound), stop.cloned())
 }
 
 fn serve_vless_reality_inbound(
@@ -10612,34 +11326,35 @@ fn serve_vless_reality_inbound(
     carrier: &Carrier,
     freedom: bool,
     path: &str,
-) -> bool {
+    stop: Option<&Arc<Stop>>,
+) -> Option<String> {
     let Some(server) = inbound_reality_config(inbound) else {
         eprintln!("unreadable vless reality settings in {path}: serves nothing");
-        return false;
+        return None;
     };
     if let Err(error) = crate::config::reality_mldsa(inbound, true) {
         eprintln!("{error} in {path}: inbound refused");
-        return false;
+        return None;
     }
     let fallbacks = match server_fallbacks(inbound) {
         Ok(fallbacks) => fallbacks.map(Arc::from),
         Err(error) => {
             eprintln!("{error} in {path}: inbound refused");
-            return false;
+            return None;
         }
     };
     let decryption = match crate::config::server_decryption(inbound) {
         Ok(decryption) => decryption,
         Err(error) => {
             eprintln!("{error} in {path}: inbound refused");
-            return false;
+            return None;
         }
     };
     if decryption.is_some() && fallbacks.is_some() {
         eprintln!(
             r#"VLESS settings: "fallbacks" can not be used together with "decryption" in {path}: inbound refused"#
         );
-        return false;
+        return None;
     }
     let owned = address.to_owned();
     if let Carrier::Kcp(config) = carrier {
@@ -10651,7 +11366,7 @@ fn serve_vless_reality_inbound(
             let _flow = crate::accesslog::flow(Some(conn.remote_addr()), "", 0);
             serve_vless_kcp_reality(conn, &users, freedom, &server, meter.clone());
         });
-        return serve_kcp_bound(&owned, config, &serve, inbound);
+        return serve_kcp_bound(&owned, config, &serve, inbound, stop).then(String::new);
     }
     let role = inbound_role(
         inbound,
@@ -10664,8 +11379,7 @@ fn serve_vless_reality_inbound(
             decryption,
         },
     );
-    spawn_role_stopped(&owned, role, inbound_tag(inbound), None);
-    true
+    spawn_role_wake(&owned, role, inbound_tag(inbound), stop.cloned())
 }
 
 fn serve_session_ws<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'static>(
@@ -14215,6 +14929,7 @@ fn serve_vless_kcp(
 
 /// Hysteria v2 flow: acknowledge before dialing, so a refused dial reads as EOF rather than as a refusal.
 fn serve_hysteria_flow(mut flow: crate::hysteria::Flow, freedom: bool) {
+    let _jobs = RelayJobsGuard::new();
     if !freedom {
         return;
     }
@@ -14428,6 +15143,7 @@ fn serve_hysteria_v1_flow(mut flow: crate::hysteria::Flow, host: &str, port: u16
 }
 
 fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], freedom: bool) {
+    let _jobs = RelayJobsGuard::new();
     let allows = |id: &[u8; 16], flow: Flow, cmd: u8| {
         vless_user_allows(users, id, flow, cmd, freedom, false)
     };
@@ -15546,6 +16262,7 @@ fn serve_kcp_bound(
     config: ferrox_core::kcp::Config,
     serve: &KcpServe,
     inbound: &Json,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let Some(server) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
         return false;
@@ -15564,16 +16281,32 @@ fn serve_kcp_bound(
     let Ok(listener) = ferrox_core::kcp::Listener::with_socket(sock, config) else {
         return false;
     };
+    let listener = Arc::new(listener);
+    let worker = Arc::clone(&listener);
     let serve = Arc::clone(serve);
-    thread::spawn(move || serve_kcp_each(&listener, &serve));
+    let worker_stop = stop.cloned();
+    thread::spawn(move || {
+        serve_kcp_each(&worker, &serve);
+        worker.wait_closed();
+        if let Some(stop) = worker_stop {
+            stop.mark_closed();
+        }
+    });
+    if let Some(stop) = stop {
+        let listener = Arc::clone(&listener);
+        let stop = Arc::clone(stop);
+        thread::spawn(move || {
+            while !stop.stopped() {
+                thread::sleep(RELAY_POLL);
+            }
+            listener.close();
+        });
+    }
     true
 }
 
 fn serve_kcp_each(listener: &ferrox_core::kcp::Listener, serve: &KcpServe) {
-    loop {
-        let Ok(session) = listener.accept() else {
-            continue;
-        };
+    while let Ok(session) = listener.accept() {
         let serve = Arc::clone(serve);
         std::thread::spawn(move || serve(&session));
     }
@@ -15613,18 +16346,25 @@ fn serve_blackhole_inbound(
             inbound_tag(inbound).as_deref().unwrap_or("<untagged>")
         )),
     };
-    let address = address.to_owned();
-    thread::spawn(move || {
-        if stop.as_ref().is_some_and(|stop| stop.stopped()) {
-            if let Some(stop) = stop {
-                stop.mark_closed();
-            }
-            return;
+    let target = match parse_target(address) {
+        Ok(target) => target,
+        Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
+            bind_failed();
+            eprintln!("cannot resolve {address}: {error}");
+            return false;
         }
-        let target = parse_target(&address)
-            .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
-        let listener = Listener::bind(&target)
-            .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
+        Err(error) => exit(&format!("cannot resolve {address}: {error}")),
+    };
+    let listener = match Listener::bind(&target) {
+        Ok(listener) => listener,
+        Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
+            bind_failed();
+            eprintln!("cannot listen on {address}: {error}");
+            return false;
+        }
+        Err(error) => exit(&format!("cannot listen on {address}: {error}")),
+    };
+    thread::spawn(move || {
         if stop.as_ref().is_some_and(|stop| stop.stopped()) {
             drop(listener);
             if let Some(stop) = stop {
@@ -15651,42 +16391,65 @@ fn serve_blackhole_inbound(
 
 /// Leaf's healthcheck door: one exact request line and, for `POST`, one exact body answer a
 /// fixed `200` body. A mismatch closes without an answer.
-fn serve_hc_inbound(address: &str, inbound: &Json) -> bool {
+fn serve_hc_inbound(address: &str, inbound: &Json, stop: Option<Arc<Stop>>) -> Option<String> {
     let Some(settings) = inbound.get("settings") else {
         eprintln!("inbound `hc` names no settings");
-        return false;
+        return None;
     };
     let Some(path) = settings.get("path").and_then(Json::as_str) else {
         eprintln!("inbound `hc` names no path");
-        return false;
+        return None;
     };
     let Some(response) = settings.get("response").and_then(Json::as_str) else {
         eprintln!("inbound `hc` names no response");
-        return false;
+        return None;
     };
     let request = match settings.get("request") {
         None | Some(Json::Null) => String::new(),
         Some(Json::Str(request)) => request.clone(),
         Some(_) => {
             eprintln!("inbound `hc` request is not a string");
-            return false;
+            return None;
         }
     };
     let handler = std::sync::Arc::new(HcHandler::new(path, request, response));
-    let address = address.to_owned();
+    let target = match parse_target(address) {
+        Ok(target) => target,
+        Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
+            bind_failed();
+            eprintln!("cannot resolve {address}: {error}");
+            return None;
+        }
+        Err(error) => exit(&format!("cannot resolve {address}: {error}")),
+    };
+    let listener = match Listener::bind(&target) {
+        Ok(listener) => listener,
+        Err(error) if FALLIBLE_BIND.with(std::cell::Cell::get) => {
+            bind_failed();
+            eprintln!("cannot listen on {address}: {error}");
+            return None;
+        }
+        Err(error) => exit(&format!("cannot listen on {address}: {error}")),
+    };
+    let wake = listener
+        .local_addr()
+        .map_or_else(|_| address.to_owned(), |bound| bound.to_string());
     thread::spawn(move || {
-        let target = parse_target(&address)
-            .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
-        let listener = Listener::bind(&target)
-            .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
         for stream in listener.incoming() {
+            if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+                break;
+            }
             let Ok(stream) = stream else { continue };
             no_delay(&stream);
             let handler = std::sync::Arc::clone(&handler);
             thread::spawn(move || handler.serve(stream));
         }
+        drop(listener);
+        if let Some(stop) = stop {
+            stop.mark_closed();
+        }
     });
-    true
+    Some(wake)
 }
 
 /// The `hc` request's head and the octets behind it, one window at a time: the terminator scan resumes three octets before the bytes that just arrived, so a head that arrives in pieces is walked once rather than once per piece, and it reaches the tree's one `\r\n\r\n` scan rather than reopening the four-byte window.
@@ -15799,11 +16562,24 @@ fn hc_content_length(head: &str) -> Option<usize> {
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn serve_trojan_inbound(
     address: &str,
     inbound: &Json,
     freedom: bool,
     stop: Option<&Arc<Stop>>,
+) -> bool {
+    let mut wake = address.to_owned();
+    serve_trojan_inbound_wake(address, inbound, freedom, stop, &mut wake)
+}
+
+#[allow(clippy::too_many_lines)]
+fn serve_trojan_inbound_wake(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    stop: Option<&Arc<Stop>>,
+    wake: &mut String,
 ) -> bool {
     let key = inbound_trojan_keys(inbound);
     let account = inbound_account(inbound);
@@ -15815,7 +16591,7 @@ fn serve_trojan_inbound(
         return false;
     }
     if let Some(served) =
-        serve_trojan_transport_inbound(address, inbound, Arc::clone(&key), &carrier, freedom)
+        serve_trojan_transport_inbound(address, inbound, Arc::clone(&key), &carrier, freedom, stop)
     {
         return served;
     }
@@ -15872,7 +16648,7 @@ fn serve_trojan_inbound(
                     serve_trojan_kcp(conn, &key, &accounts, freedom, meter.clone());
                 })
             };
-            serve_kcp_bound(address, config, &serve, inbound)
+            serve_kcp_bound(address, config, &serve, inbound, stop)
         }
         Carrier::Xdrive { settings } => {
             let email = account.email.clone();
@@ -15896,7 +16672,7 @@ fn serve_trojan_inbound(
                 eprintln!("{error} on {address}: inbound refused");
                 return false;
             }
-            spawn_role(
+            if let Some(bound) = spawn_role_wake(
                 address,
                 inbound_role(
                     inbound,
@@ -15910,8 +16686,13 @@ fn serve_trojan_inbound(
                     },
                 ),
                 inbound_tag(inbound),
-            );
-            true
+                stop.cloned(),
+            ) {
+                *wake = bound;
+                true
+            } else {
+                false
+            }
         }
         // A listener that declares tls answers the session its config names; an identity it cannot load is refused, never served as plaintext.
         carrier if sec == "tls" => {
@@ -15939,7 +16720,7 @@ fn serve_trojan_inbound(
                     );
                 }
             }
-            spawn_role(
+            if let Some(bound) = spawn_role_wake(
                 address,
                 inbound_role(
                     inbound,
@@ -15953,11 +16734,16 @@ fn serve_trojan_inbound(
                     },
                 ),
                 inbound_tag(inbound),
-            );
-            true
+                stop.cloned(),
+            ) {
+                *wake = bound;
+                true
+            } else {
+                false
+            }
         }
         carrier => {
-            spawn_role(
+            if let Some(bound) = spawn_role_wake(
                 address,
                 inbound_role(
                     inbound,
@@ -15969,8 +16755,13 @@ fn serve_trojan_inbound(
                     },
                 ),
                 inbound_tag(inbound),
-            );
-            true
+                stop.cloned(),
+            ) {
+                *wake = bound;
+                true
+            } else {
+                false
+            }
         }
     }
 }
@@ -15981,9 +16772,12 @@ fn serve_trojan_transport_inbound(
     key: Arc<[[u8; 56]]>,
     carrier: &Carrier,
     freedom: bool,
+    stop: Option<&Arc<Stop>>,
 ) -> Option<bool> {
     if matches!(carrier, Carrier::Quic) {
-        return Some(serve_trojan_quic_inbound(address, inbound, key, freedom));
+        return Some(serve_trojan_quic_inbound(
+            address, inbound, key, freedom, stop,
+        ));
     }
     let Carrier::Hysteria(config) = carrier else {
         return None;
@@ -16012,7 +16806,7 @@ fn serve_trojan_transport_inbound(
         serve_trojan_hysteria(flow.with_meter(meter.clone()), &key, freedom);
     });
     Some(serve_hysteria_thread(
-        &owned, &config, &identity, &masq, &serve,
+        &owned, &config, &identity, &masq, &serve, stop,
     ))
 }
 
@@ -16021,6 +16815,7 @@ fn serve_trojan_quic_inbound(
     inbound: &Json,
     key: Arc<[[u8; 56]]>,
     freedom: bool,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let Some(identity) = quic_inbound_identity(inbound) else {
         eprintln!("trojan quic inbound needs security tls with a certificate: serves nothing");
@@ -16038,13 +16833,20 @@ fn serve_trojan_quic_inbound(
     let serve: crate::quic::Serve = Arc::new(move |stream| {
         serve_trojan_quic(stream.with_meter(meter.clone()), &key, freedom);
     });
+    let stop = stop.cloned();
+    let poll = stop
+        .as_ref()
+        .map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
     thread::spawn(move || {
         crate::quic::serve_loop(
             crate::quic::Datagram::plain(sock),
             &Arc::new(Mutex::new(config)),
             &serve,
-            &Arc::new(AtomicBool::new(false)),
+            &poll,
         );
+        if let Some(stop) = stop {
+            stop.mark_closed();
+        }
     });
     true
 }
@@ -16131,6 +16933,7 @@ fn serve_ss_hysteria(
     accounts: &crate::shadowsocks::SsAccounts,
     freedom: bool,
 ) {
+    let _jobs = RelayJobsGuard::new();
     if !freedom {
         io.close();
         return;
@@ -16154,6 +16957,7 @@ fn serve_ss_hysteria(
 }
 
 fn serve_trojan_hysteria(mut io: crate::hysteria::Flow, key: &[[u8; 56]], freedom: bool) {
+    let _jobs = RelayJobsGuard::new();
     if !freedom {
         io.close();
         return;
@@ -16205,7 +17009,8 @@ fn serve_vmess_inbound(
     stop: Option<Arc<Stop>>,
 ) -> (crate::vmess::UsersRef, bool) {
     let users = inbound_vmess_users(inbound);
-    let served = serve_vmess_inbound_users(address, inbound, freedom, stop, &users);
+    let mut wake = address.to_owned();
+    let served = serve_vmess_inbound_users(address, inbound, freedom, stop, &users, &mut wake);
     (users, served)
 }
 
@@ -16217,6 +17022,7 @@ fn serve_vmess_inbound_users(
     freedom: bool,
     stop: Option<Arc<Stop>>,
     users: &crate::vmess::UsersRef,
+    wake: &mut String,
 ) -> bool {
     let account = inbound_account(inbound);
     let sec = stream_security(inbound);
@@ -16248,7 +17054,7 @@ fn serve_vmess_inbound_users(
                 })
             };
             let owned = address.to_owned();
-            serve_kcp_bound(&owned, config, &serve, inbound)
+            serve_kcp_bound(&owned, config, &serve, inbound, stop.as_ref())
         }
         Carrier::Xdrive { settings } => {
             let email = account.email.clone();
@@ -16262,9 +17068,11 @@ fn serve_vmess_inbound_users(
             serve_xdrive_loop(&settings, address, accept);
             true
         }
-        Carrier::Quic => serve_vmess_quic_inbound(address, inbound, users, freedom, address),
+        Carrier::Quic => {
+            serve_vmess_quic_inbound(address, inbound, users, freedom, address, stop.as_ref())
+        }
         Carrier::Hysteria(config) => {
-            serve_vmess_hysteria_inbound(address, inbound, &config, users, freedom)
+            serve_vmess_hysteria_inbound(address, inbound, &config, users, freedom, stop.as_ref())
         }
         carrier if sec == "reality" => {
             if !carrier.tcp_stream() {
@@ -16279,7 +17087,7 @@ fn serve_vmess_inbound_users(
                 eprintln!("{error} on {address}: inbound refused");
                 return false;
             }
-            spawn_role_stopped(
+            if let Some(bound) = spawn_role_wake(
                 address,
                 inbound_role(
                     inbound,
@@ -16293,8 +17101,12 @@ fn serve_vmess_inbound_users(
                 ),
                 inbound_tag(inbound),
                 stop,
-            );
-            true
+            ) {
+                *wake = bound;
+                true
+            } else {
+                false
+            }
         }
         carrier if sec == "tls" => {
             let Some(server) = inbound_tls_identity(inbound) else {
@@ -16324,7 +17136,7 @@ fn serve_vmess_inbound_users(
                     );
                 }
             }
-            spawn_role_stopped(
+            if let Some(bound) = spawn_role_wake(
                 address,
                 inbound_role(
                     inbound,
@@ -16338,11 +17150,15 @@ fn serve_vmess_inbound_users(
                 ),
                 inbound_tag(inbound),
                 stop,
-            );
-            true
+            ) {
+                *wake = bound;
+                true
+            } else {
+                false
+            }
         }
         other => {
-            spawn_role_stopped(
+            if let Some(bound) = spawn_role_wake(
                 address,
                 inbound_role(
                     inbound,
@@ -16355,8 +17171,12 @@ fn serve_vmess_inbound_users(
                 ),
                 inbound_tag(inbound),
                 stop,
-            );
-            true
+            ) {
+                *wake = bound;
+                true
+            } else {
+                false
+            }
         }
     }
 }
@@ -16367,6 +17187,7 @@ fn serve_vmess_hysteria_inbound(
     config: &ferrox_core::hysteria::Config,
     users: &crate::vmess::UsersRef,
     freedom: bool,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     if config.version != 2 {
         eprintln!(
@@ -16400,6 +17221,8 @@ fn serve_vmess_hysteria_inbound(
     let serve: crate::hysteria::Serve = Arc::new(move |flow| {
         serve_vmess_hysteria(flow.with_meter(meter.clone()), &hysteria_users, freedom);
     });
+    let worker_stop = stop.cloned();
+    let cancel = stop.as_ref().map(|stop| stop.shared());
     thread::spawn(move || {
         crate::hysteria::serve_prepared(
             prepared,
@@ -16409,7 +17232,11 @@ fn serve_vmess_hysteria_inbound(
             std::time::Duration::from_secs(config.udp_idle),
             config.quic.as_ref(),
             config.realm.as_deref(),
+            cancel.as_ref(),
         );
+        if let Some(stop) = worker_stop {
+            stop.mark_closed();
+        }
     });
     true
 }
@@ -16420,6 +17247,7 @@ fn serve_vmess_quic_inbound(
     users: &crate::vmess::UsersRef,
     freedom: bool,
     path: &str,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let Some(identity) = quic_inbound_identity(inbound) else {
         eprintln!("quic inbound in {path} needs security tls with a certificate: serves nothing");
@@ -16438,13 +17266,20 @@ fn serve_vmess_quic_inbound(
     let serve: crate::quic::Serve = Arc::new(move |stream| {
         serve_vmess_quic(stream.with_meter(meter.clone()), &users, freedom);
     });
+    let stop = stop.cloned();
+    let poll = stop
+        .as_ref()
+        .map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
     thread::spawn(move || {
         crate::quic::serve_loop(
             crate::quic::Datagram::plain(sock),
             &Arc::new(Mutex::new(config)),
             &serve,
-            &Arc::new(AtomicBool::new(false)),
+            &poll,
         );
+        if let Some(stop) = stop {
+            stop.mark_closed();
+        }
     });
     true
 }
@@ -16482,6 +17317,7 @@ fn serve_vmess_quic(
 }
 
 fn serve_vmess_hysteria(flow: crate::hysteria::Flow, users: &crate::vmess::Users, freedom: bool) {
+    let _jobs = RelayJobsGuard::new();
     let mut reader = crate::hysteria::FlowRead::new(flow.clone());
     let decoded = crate::vmess::accept_request_bounded(&mut reader, users);
     let closer = flow.clone();
@@ -16704,7 +17540,8 @@ fn serve_vmess_reality(
 }
 
 /// Bind a dokodemo-door flow and rewrite it to the target its config names, and say how many
-/// inbounds it armed. The tcp flow and the udp flow are served when the config names them.
+/// inbounds it armed and how many worker threads that leaves to close. The tcp flow and the udp
+/// flow are served when the config names them.
 #[allow(clippy::too_many_lines)]
 fn serve_dokodemo(
     address: &str,
@@ -16713,7 +17550,7 @@ fn serve_dokodemo(
     label: &str,
     stop: Option<&Arc<Stop>>,
     fallible: bool,
-) -> (usize, bool) {
+) -> (usize, usize, String) {
     let follow_redirect = inbound
         .get("settings")
         .and_then(|settings| settings.get("followRedirect"))
@@ -16728,13 +17565,13 @@ fn serve_dokodemo(
     let networks = dokodemo_networks(inbound);
     if !dokodemo_has(&networks, "tcp") && !dokodemo_has(&networks, "udp") {
         eprintln!("dokodemo-door without tcp or udp in {label}: no flow to serve");
-        return (0, false);
+        return (0, 0, String::new());
     }
     let mode = match crate::sockopt::inbound_tproxy(inbound.get("streamSettings")) {
         Ok(mode) => mode,
         Err(reason) => {
             eprintln!("dokodemo-door sockopt in {label}: {reason}");
-            return (0, false);
+            return (0, 0, String::new());
         }
     };
     let requested = dokodemo_transparent(receive_original_destination, mode);
@@ -16754,14 +17591,14 @@ fn serve_dokodemo(
         Some(_) => None,
         None => {
             eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");
-            return (0, false);
+            return (0, 0, String::new());
         }
     };
     let port_map = match dokodemo_port_map(inbound) {
         Ok(map) => map,
         Err(reason) => {
             eprintln!("dokodemo-door portMap in {label}: {reason}");
-            return (0, false);
+            return (0, 0, String::new());
         }
     };
     let listen = match parse_target(address) {
@@ -16779,6 +17616,7 @@ fn serve_dokodemo(
         );
     }
     let mut tcp_armed = false;
+    let mut bound = None;
     if dokodemo_has(&networks, "tcp") {
         let role = inbound_role(
             inbound,
@@ -16798,27 +17636,37 @@ fn serve_dokodemo(
             },
         );
         if fallible {
-            match try_spawn_role_stopped(address, role, inbound_tag(inbound), stop.cloned()) {
-                Ok(()) => tcp_armed = true,
+            match try_spawn_role_wake(address, role, inbound_tag(inbound), stop.cloned()) {
+                Ok(wake) => {
+                    tcp_armed = true;
+                    bound = Some(wake);
+                }
                 Err(error) => {
+                    bind_failed();
                     eprintln!("dokodemo-door tcp: cannot listen on {address} in {label}: {error}");
                 }
             }
         } else {
-            spawn_role_stopped(address, role, inbound_tag(inbound), stop.cloned());
-            tcp_armed = true;
+            bound = spawn_role_wake(address, role, inbound_tag(inbound), stop.cloned());
+            tcp_armed = bound.is_some();
         }
         if tcp_armed {
             armed += 1;
         }
+    }
+    let mut workers = tcp_armed as usize;
+    let wake = bound.unwrap_or_default();
+    if fallible && dokodemo_has(&networks, "tcp") && !tcp_armed {
+        return (armed, workers, wake);
     }
     if dokodemo_has(&networks, "udp") {
         // The door's own socket is bound before the inbound is armed: a port nobody holds answers a datagram with a refusal.
         let mut listen = None;
         let socket = if transparent.is_some() {
             let Ok(crate::conn::Target::Ip(bound)) = parse_target(address) else {
+                bind_failed();
                 eprintln!("dokodemo-door udp: {address} names no IP in {label}");
-                return (armed, dokodemo_has(&networks, "tcp"));
+                return (armed, workers, wake.clone());
             };
             listen = Some(bound);
             crate::transparent::bind_udp(bound)
@@ -16836,23 +17684,36 @@ fn serve_dokodemo(
             {
                 eprintln!("dokodemo-door udp: a transparent listener is unavailable in {label}; the rewrite target carries the flow");
                 let Ok(socket) = UdpSocket::bind(address) else {
+                    bind_failed();
                     eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
-                    return (armed, dokodemo_has(&networks, "tcp"));
+                    return (armed, workers, wake.clone());
                 };
                 (socket, false)
             }
             Err(_) => {
+                bind_failed();
                 eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
-                return (armed, dokodemo_has(&networks, "tcp"));
+                return (armed, workers, wake.clone());
             }
         };
         let door = out.clone();
         if transparent_udp {
             let Some(listen) = socket.local_addr().ok().or(listen) else {
+                bind_failed();
                 eprintln!("dokodemo-door udp: cannot read the bound address in {label}");
-                return (armed, dokodemo_has(&networks, "tcp"));
+                return (armed, workers, wake.clone());
             };
-            thread::spawn(move || dokodemo_transparent_udp_door(&socket, &door, listen));
+            let worker_stop = stop.cloned();
+            if thread::Builder::new()
+                .spawn(move || {
+                    dokodemo_transparent_udp_door(&socket, &door, listen, worker_stop.as_ref());
+                })
+                .is_err()
+            {
+                bind_failed();
+                eprintln!("dokodemo-door udp: cannot start the worker for {address} in {label}");
+                return (armed, workers, wake.clone());
+            }
         } else {
             let dest = if follow_redirect {
                 rewrite.configured()
@@ -16860,16 +17721,37 @@ fn serve_dokodemo(
                 Some(rewrite.resolved(socket.local_addr().ok(), &port_map))
             };
             let Some(dest) = dest else {
+                bind_failed();
                 eprintln!(
                     "dokodemo-door udp: followRedirect needs a rewrite address in {label}; no UDP flow is served"
                 );
-                return (armed, dokodemo_has(&networks, "tcp"));
+                return (armed, workers, wake.clone());
             };
-            thread::spawn(move || dokodemo_udp_door(&socket, &dest, &door));
+            let dest = if fallible && matches!(&dest, Destination::Name(..)) {
+                if let Some(address) = dest.socket() {
+                    Destination::Address(address)
+                } else {
+                    bind_failed();
+                    eprintln!("dokodemo-door udp: the rewrite address does not resolve in {label}");
+                    return (armed, workers, wake.clone());
+                }
+            } else {
+                dest
+            };
+            let worker_stop = stop.cloned();
+            if thread::Builder::new()
+                .spawn(move || dokodemo_udp_door(&socket, &dest, &door, worker_stop.as_ref()))
+                .is_err()
+            {
+                bind_failed();
+                eprintln!("dokodemo-door udp: cannot start the worker for {address} in {label}");
+                return (armed, workers, wake.clone());
+            }
         }
         armed += 1;
+        workers += 1;
     }
-    (armed, tcp_armed)
+    (armed, workers, wake)
 }
 
 fn dokodemo_original_destination(
@@ -17048,6 +17930,7 @@ fn inbound_ss_destinations(inbound: &Json, method: &str) -> Vec<(Vec<u8>, Socket
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_ss_kcp_listener(
     address: &str,
     inbound: &Json,
@@ -17056,6 +17939,7 @@ fn serve_ss_kcp_listener(
     freedom: bool,
     email: &str,
     level: u32,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     let accounts = Arc::clone(accounts);
     let email = email.to_owned();
@@ -17090,7 +17974,7 @@ fn serve_ss_kcp_listener(
             }
         })
     };
-    serve_kcp_bound(address, config, &serve, inbound)
+    serve_kcp_bound(address, config, &serve, inbound, stop)
 }
 
 /// The datagram half a shadowsocks listener owns before it reports served: bound here, refused here, or never asked for.
@@ -17120,7 +18004,7 @@ fn bind_udp_front(address: &str, tcp: bool, wanted: bool, label: &str) -> UdpFro
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RelayFront {
     NotRelay,
-    Served,
+    Served(usize),
     Refused,
 }
 
@@ -17129,6 +18013,7 @@ fn serve_ss_relay_inbound(
     inbound: &Json,
     password: &str,
     method: &str,
+    stop: Option<&Arc<Stop>>,
 ) -> RelayFront {
     let relay_dests = inbound_ss_destinations(inbound, method);
     if relay_dests.is_empty() {
@@ -17154,33 +18039,78 @@ fn serve_ss_relay_inbound(
         UdpFront::Unasked => None,
         UdpFront::Bound(clients) => Some(clients),
     };
-    let udp_served = udp_front.is_some();
-    let tcp_address = address.to_owned();
     if tcp {
-        let method = method.to_owned();
-        let psk = psk.clone();
-        let relay_dests = relay_dests.clone();
+        let Ok(target) = parse_target(address) else {
+            if FALLIBLE_BIND.with(std::cell::Cell::get) {
+                bind_failed();
+            }
+            return RelayFront::Refused;
+        };
+        let listener = match Listener::bind(&target) {
+            Ok(listener) => listener,
+            Err(error) => {
+                if FALLIBLE_BIND.with(std::cell::Cell::get) {
+                    bind_failed();
+                }
+                eprintln!("shadowsocks relay tcp on {address}: {error}");
+                return RelayFront::Refused;
+            }
+        };
+        let method = Arc::new(method.to_owned());
+        let psk = Arc::new(psk.clone());
+        let relay_dests = Arc::new(relay_dests.clone());
+        let stop = stop.cloned();
         thread::spawn(move || {
-            let Ok(target) = parse_target(&tcp_address) else {
-                return;
-            };
-            let Ok(listener) = Listener::bind(&target) else {
-                return;
-            };
-            for stream in listener.incoming().flatten() {
-                crate::shadowsocks2022::serve_relay(stream, &method, &psk, &relay_dests);
+            for stream in listener.incoming() {
+                if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+                    break;
+                }
+                let Ok(stream) = stream else {
+                    continue;
+                };
+                let (method, psk, relay_dests) = (
+                    Arc::clone(&method),
+                    Arc::clone(&psk),
+                    Arc::clone(&relay_dests),
+                );
+                thread::spawn(move || {
+                    crate::shadowsocks2022::serve_relay(
+                        stream,
+                        method.as_str(),
+                        &psk[..],
+                        &relay_dests[..],
+                    );
+                });
+            }
+            drop(listener);
+            if let Some(stop) = stop {
+                stop.mark_closed();
             }
         });
     }
+    let mut listeners = usize::from(tcp);
     if let Some(clients) = udp_front {
+        listeners += 1;
         let udp_dests = relay_dests.clone();
         let udp_psk = psk.clone();
+        let udp_stop = stop.cloned();
+        let udp_cancel = stop.map(|stop| stop.shared());
         thread::spawn(move || {
-            crate::shadowsocks2022::serve_udp_relay(&clients, parsed, &udp_psk, &udp_dests);
+            crate::shadowsocks2022::serve_udp_relay(
+                &clients,
+                parsed,
+                &udp_psk,
+                &udp_dests,
+                udp_cancel.as_deref(),
+            );
+            drop(clients);
+            if let Some(stop) = udp_stop {
+                stop.mark_closed();
+            }
         });
     }
-    if tcp || udp_served {
-        RelayFront::Served
+    if listeners > 0 {
+        RelayFront::Served(listeners)
     } else {
         RelayFront::Refused
     }
@@ -17192,19 +18122,20 @@ fn serve_ss_relay_front(
     accounts: &Arc<crate::shadowsocks::SsAccounts>,
     carrier: &Carrier,
     freedom: bool,
-) -> Option<bool> {
+    stop: Option<&Arc<Stop>>,
+) -> Option<usize> {
     if let Carrier::Hysteria(config) = carrier {
         let tcp = inbound_ss_networks(inbound).0;
-        return Some(serve_ss_hysteria_front(
-            config, address, inbound, accounts, tcp, freedom,
-        ));
+        return Some(usize::from(serve_ss_hysteria_front(
+            config, address, inbound, accounts, tcp, freedom, stop,
+        )));
     }
     if !matches!(carrier, Carrier::Raw(_)) {
         return None;
     }
-    match serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method) {
-        RelayFront::Served => Some(true),
-        RelayFront::Refused => Some(false),
+    match serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method, stop) {
+        RelayFront::Served(listeners) => Some(listeners),
+        RelayFront::Refused => Some(0),
         RelayFront::NotRelay => None,
     }
 }
@@ -17246,6 +18177,7 @@ fn serve_ss_hysteria_front(
     accounts: &Arc<crate::shadowsocks::SsAccounts>,
     tcp: bool,
     freedom: bool,
+    stop: Option<&Arc<Stop>>,
 ) -> bool {
     if !tcp {
         return false;
@@ -17273,7 +18205,7 @@ fn serve_ss_hysteria_front(
     let serve: crate::hysteria::Serve = Arc::new(move |flow| {
         serve_ss_hysteria(flow.with_meter(meter.clone()), &accounts, freedom);
     });
-    serve_hysteria_thread(&owned, &config, &identity, &masq, &serve)
+    serve_hysteria_thread(&owned, &config, &identity, &masq, &serve, stop)
 }
 
 fn serve_ss_xhttp_h3(
@@ -17322,20 +18254,24 @@ fn serve_ss_tls_front(
     accounts: Arc<crate::shadowsocks::SsAccounts>,
     freedom: bool,
     stop: Option<&Arc<Stop>>,
-) -> Option<bool> {
+    wake: &mut String,
+) -> Option<usize> {
     let Some(server) = inbound_tls_identity(inbound) else {
-        // A refused identity takes only the stream half: a udp relay this config asked for still opens.
+        // A refused identity takes only the stream half unless this binary owns the add, where the requested front must not silently disappear.
         eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
+        if FALLIBLE_BIND.with(std::cell::Cell::get) {
+            bind_failed();
+        }
         return None;
     };
     if let Carrier::Xhttp { settings } = &carrier {
         if crate::xhttp_h3::is_h3(&server.alpn) {
-            return Some(serve_ss_xhttp_h3(
+            return Some(usize::from(serve_ss_xhttp_h3(
                 address, &server, settings, &accounts, freedom, stop,
-            ));
+            )));
         }
     }
-    spawn_role(
+    let Some(bound) = spawn_role_wake(
         address,
         inbound_role(
             inbound,
@@ -17347,24 +18283,61 @@ fn serve_ss_tls_front(
             },
         ),
         inbound_tag(inbound),
-    );
-    None
+        stop.cloned(),
+    ) else {
+        return Some(0);
+    };
+    *wake = bound;
+    Some(1)
 }
 
+#[cfg(test)]
 fn serve_shadowsocks_inbound(
     address: &str,
     inbound: &Json,
     freedom: bool,
     configured: &HashSet<String>,
     stop: Option<&Arc<Stop>>,
-) -> bool {
+) -> usize {
+    let mut wake = address.to_owned();
+    serve_shadowsocks_inbound_wake(address, inbound, freedom, configured, stop, &mut wake)
+}
+
+#[allow(clippy::too_many_lines)]
+fn serve_shadowsocks_inbound_wake(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    configured: &HashSet<String>,
+    stop: Option<&Arc<Stop>>,
+    wake: &mut String,
+) -> usize {
     let password = inbound_ss_password(inbound);
     let account = inbound_account(inbound);
     let method = inbound_method(inbound);
     let carrier = inbound_carrier(inbound);
     let (tcp, udp) = inbound_ss_networks(inbound);
     let accounts = ss_accounts(inbound, address, password, method, configured);
-    let udp_accounts = (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
+    let mut udp_accounts =
+        (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
+    if let Some(front) = &udp_accounts {
+        // A 2022 datagram front opens with a parsed key; one it cannot parse would drop its socket after the add reported success.
+        let parsed = ferrox_core::shadowsocks2022::Method::parse(&front.method);
+        if parsed.is_some_and(|parsed| {
+            ferrox_core::shadowsocks2022::parse_psk_list(&front.password, parsed.key_len())
+                .is_none()
+        }) {
+            eprintln!(
+                "shadowsocks 2022 udp on {address}: the password is not a valid key for `{}`",
+                front.method
+            );
+            if FALLIBLE_BIND.with(std::cell::Cell::get) {
+                bind_failed();
+                return 0;
+            }
+            udp_accounts = None;
+        }
+    }
     if udp && udp_accounts.is_none() {
         // A carrier that frames streams cannot carry datagrams; say so in one line instead of binding nothing and reporting a live inbound.
         eprintln!(
@@ -17372,19 +18345,20 @@ fn serve_shadowsocks_inbound(
         );
     }
     // The 2022 relay opens each listener the inbound's network list names, so a tcp-only relay binds no udp socket.
-    if let Some(served) = serve_ss_relay_front(address, inbound, &accounts, &carrier, freedom) {
+    if let Some(served) = serve_ss_relay_front(address, inbound, &accounts, &carrier, freedom, stop)
+    {
         return served;
     }
     // Bind the datagram front here: a worker that binds after this function answers true would turn a lost race for the port into a live inbound that never answers.
     let udp_front = match bind_udp_front(address, tcp, udp_accounts.is_some(), "shadowsocks udp") {
-        UdpFront::Refused => return false,
+        UdpFront::Refused => return 0,
         UdpFront::Unasked => None,
         UdpFront::Bound(socket) => Some(socket),
     };
     if !tcp && !udp {
-        return false;
+        return 0;
     }
-    let mut served = false;
+    let mut served = 0usize;
     if tcp {
         match carrier {
             Carrier::Kcp(config) => {
@@ -17396,10 +18370,11 @@ fn serve_shadowsocks_inbound(
                     freedom,
                     &account.email,
                     account.level,
+                    stop,
                 ) {
-                    return false;
+                    return 0;
                 }
-                served = true;
+                served += 1;
             }
             Carrier::Xdrive { settings } => {
                 let accounts = Arc::clone(&accounts);
@@ -17411,21 +18386,30 @@ fn serve_shadowsocks_inbound(
                     serve_ss_xdrive(session.with_meter(meter.clone()), &accounts, freedom);
                 });
                 serve_xdrive_loop(&settings, address, accept);
-                served = true;
+                served += 1;
             }
             carrier if stream_security(inbound) == "tls" => {
-                if let Some(served) =
-                    serve_ss_tls_front(address, inbound, carrier, accounts, freedom, stop)
+                if let Some(listeners) =
+                    serve_ss_tls_front(address, inbound, carrier, accounts, freedom, stop, wake)
                 {
-                    return served;
+                    if listeners == 0 && FALLIBLE_BIND.with(std::cell::Cell::get) {
+                        return 0;
+                    }
+                    served += listeners;
+                } else if FALLIBLE_BIND.with(std::cell::Cell::get) {
+                    return 0;
                 }
             }
             _ if !matches!(stream_security(inbound), "" | "none") => {
                 let security = stream_security(inbound);
                 eprintln!("shadowsocks security `{security}` on {address}: refused, not served");
+                if FALLIBLE_BIND.with(std::cell::Cell::get) {
+                    bind_failed();
+                    return 0;
+                }
             }
             other => {
-                spawn_role(
+                if let Some(bound) = spawn_role_wake(
                     address,
                     inbound_role(
                         inbound,
@@ -17437,27 +18421,53 @@ fn serve_shadowsocks_inbound(
                         },
                     ),
                     inbound_tag(inbound),
-                );
-                served = true;
+                    stop.cloned(),
+                ) {
+                    *wake = bound;
+                    served += 1;
+                } else if FALLIBLE_BIND.with(std::cell::Cell::get) {
+                    return 0;
+                }
             }
         }
     }
     if let (Some(accounts), Some(clients)) = (udp_accounts, udp_front) {
-        served = true;
-        thread::spawn(move || {
-            if accounts.is_2022 {
-                crate::shadowsocks2022::serve_udp_on(
-                    &clients,
-                    &accounts.password,
-                    &accounts.method,
-                    freedom,
-                );
-            } else {
-                crate::shadowsocks::serve_udp_on(&clients, &accounts.users, freedom);
-            }
-        });
+        served += 1;
+        serve_ss_udp_front(accounts, clients, freedom, stop);
     }
     served
+}
+
+fn serve_ss_udp_front(
+    accounts: Arc<crate::shadowsocks::SsAccounts>,
+    clients: UdpSocket,
+    freedom: bool,
+    stop: Option<&Arc<Stop>>,
+) {
+    let udp_stop = stop.cloned();
+    let udp_cancel = stop.map(|stop| stop.shared());
+    thread::spawn(move || {
+        if accounts.is_2022 {
+            crate::shadowsocks2022::serve_udp_on(
+                &clients,
+                &accounts.password,
+                &accounts.method,
+                freedom,
+                udp_cancel.as_deref(),
+            );
+        } else {
+            crate::shadowsocks::serve_udp_on(
+                &clients,
+                &accounts.users,
+                freedom,
+                udp_cancel.as_deref(),
+            );
+        }
+        drop(clients);
+        if let Some(stop) = udp_stop {
+            stop.mark_closed();
+        }
+    });
 }
 
 /// The inbound's own key, preferring `settings`.
@@ -29180,6 +30190,15 @@ pub(crate) fn relay_leg_armed(
 /// One association per source; the bound keeps distinct sources from pinning threads and sockets for the door's life.
 const MAX_DOKODEMO_LEGS: usize = 1024;
 
+/// A removed door wakes at least this often to see the stop flag; an idle door keeps its normal wait.
+fn door_idle(stop: Option<&Arc<Stop>>) -> std::time::Duration {
+    if stop.is_some() {
+        budgets::udp_idle().min(std::time::Duration::from_millis(250))
+    } else {
+        budgets::udp_idle()
+    }
+}
+
 /// The dokodemo UDP door: a datagram a client sends goes to the target the config
 /// names, and the answer comes back to the client that sent it.
 ///
@@ -29190,42 +30209,60 @@ const MAX_DOKODEMO_LEGS: usize = 1024;
 /// The socket is the one the front bound, so the port is held from the moment the
 /// inbound is armed, and a datagram that arrives before the door reads it waits in the
 /// kernel rather than in a refusal.
-fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
+type DokodemoLeg = (
+    UdpSocket,
+    Connection,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<()>,
+);
+
+#[allow(clippy::too_many_lines)]
+fn dokodemo_udp_door(
+    socket: &UdpSocket,
+    dest: &Destination,
+    out: &Outbound,
+    stop: Option<&Arc<Stop>>,
+) {
+    let _done = WorkerDone(stop.cloned());
     let Some(target) = dest.socket() else {
         eprintln!("dokodemo-door udp: rewrite target unusable, refused");
         return;
     };
     // One association per client: the upstream answers the source the request came from, so a shared association cannot route two clients' replies.
-    let mut legs: HashMap<SocketAddr, (UdpSocket, Connection, Arc<AtomicBool>)> = HashMap::new();
+    let mut legs: HashMap<SocketAddr, DokodemoLeg> = HashMap::new();
     let mut buf = udp_buffer();
+    let legs_stop = Arc::new(AtomicBool::new(false));
     // The door's frame is the door's: the address it rewrites to is the same for every datagram.
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-    let _ = socket.set_read_timeout(Some(budgets::udp_idle()));
+    let _ = socket.set_read_timeout(Some(door_idle(stop)));
     loop {
+        if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+            break;
+        }
         let (n, src) = match socket.recv_from(&mut buf) {
             Ok(read) => read,
             Err(error) if is_timeout(&error) => {
-                legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+                legs.retain(|_, (_, _, alive, _)| alive.load(Ordering::Relaxed));
                 continue;
             }
             Err(error) if is_udp_gone(&error) => {
                 thread::sleep(UDP_POLL);
-                legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+                legs.retain(|_, (_, _, alive, _)| alive.load(Ordering::Relaxed));
                 continue;
             }
-            Err(_) => return,
+            Err(_) => break,
         };
         if n == 0 {
             continue;
         }
         if legs
             .get(&src)
-            .is_some_and(|(_, _, alive)| !alive.load(Ordering::Relaxed))
+            .is_some_and(|(_, _, alive, _)| !alive.load(Ordering::Relaxed))
         {
             legs.remove(&src);
         }
         if !legs.contains_key(&src) && legs.len() >= MAX_DOKODEMO_LEGS {
-            legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+            legs.retain(|_, (_, _, alive, _)| alive.load(Ordering::Relaxed));
             if legs.len() >= MAX_DOKODEMO_LEGS {
                 continue;
             }
@@ -29250,36 +30287,70 @@ fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
                     continue;
                 };
                 let alive = Arc::new(AtomicBool::new(true));
-                let reader_alive = alive.clone();
-                thread::spawn(move || {
+                let reader_alive = Arc::clone(&alive);
+                let reader_stop = Arc::clone(&legs_stop);
+                let door_stop = stop.cloned();
+                let handle = thread::spawn(move || {
+                    let _ = reader.set_read_timeout(Some(UDP_POLL));
                     let mut back = udp_buffer();
-                    while let Ok(read) = reader.recv(&mut back) {
-                        let Some((_source, payload)) = parse_socks_udp(&back[..read]) else {
-                            continue;
-                        };
-                        if writer.send_to(payload, src).is_err() {
+                    let mut quiet = Instant::now();
+                    loop {
+                        if reader_stop.load(Ordering::Relaxed)
+                            || door_stop.as_ref().is_some_and(|stop| stop.stopped())
+                        {
                             break;
+                        }
+                        match reader.recv(&mut back) {
+                            Ok(read) => {
+                                quiet = Instant::now();
+                                let Some((_source, payload)) = parse_socks_udp(&back[..read])
+                                else {
+                                    continue;
+                                };
+                                if writer.send_to(payload, src).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(error) if is_timeout(&error) => {
+                                if quiet.elapsed() >= budgets::udp_idle() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
                         }
                     }
                     reader_alive.store(false, Ordering::Relaxed);
                 });
-                vacant.insert((leg, association.control, alive))
+                vacant.insert((leg, association.control, alive, handle))
             }
         };
         let out = socks_udp_frame(&mut frame, &target, &buf[..n]);
         let _ = leg.0.send(out);
     }
+    legs_stop.store(true, Ordering::Relaxed);
+    for (_, (_, _, _, handle)) in legs {
+        let _ = handle.join();
+    }
 }
 
 /// The transparent dokodemo UDP door: every datagram carries its own original destination,
 /// and the answer must leave from that destination or the client drops it.
-fn dokodemo_transparent_udp_door(socket: &UdpSocket, out: &Outbound, listen: SocketAddr) {
+fn dokodemo_transparent_udp_door(
+    socket: &UdpSocket,
+    out: &Outbound,
+    listen: SocketAddr,
+    stop: Option<&Arc<Stop>>,
+) {
     type Flow = (SocketAddr, SocketAddr);
+    let _done = WorkerDone(stop.cloned());
     let mut legs: HashMap<Flow, (UdpSocket, Connection, Arc<AtomicBool>)> = HashMap::new();
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-    let _ = socket.set_read_timeout(Some(budgets::udp_idle()));
+    let _ = socket.set_read_timeout(Some(door_idle(stop)));
     loop {
+        if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+            return;
+        }
         let (n, client, original) = match crate::transparent::receive_original(socket, &mut buf) {
             Ok(read) => read,
             Err(error) if is_timeout(&error) => {
@@ -29476,7 +30547,7 @@ fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
         return;
     };
     let peer = control_peer(Some(&client));
-    serve_udp_lane(&relay, out, Some(&client), peer);
+    serve_udp_lane(&relay, out, Some(&client), peer, None);
 }
 
 /// One outbound's datagram lane over a relay socket. `peer` is where the relay's datagrams must
@@ -29486,13 +30557,23 @@ pub(crate) fn serve_udp_lane(
     out: &Outbound,
     associate: Option<&Connection>,
     peer: Option<IpAddr>,
+    stop: Option<&AtomicBool>,
 ) {
     let source = SEND_THROUGH.with(std::cell::Cell::take);
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
-    serve_udp_lane_with(relay, out, associate, peer, source, sockopts.as_ref());
+    serve_udp_lane_with(
+        relay,
+        out,
+        associate,
+        peer,
+        source,
+        sockopts.as_ref(),
+        None,
+        stop,
+    );
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn serve_udp_lane_with(
     relay: &UdpSocket,
     out: &Outbound,
@@ -29500,6 +30581,8 @@ fn serve_udp_lane_with(
     peer: Option<IpAddr>,
     source: Option<SendThrough>,
     sockopts: Option<&Arc<crate::sockopt::SocketOptions>>,
+    relay_peer: Option<IpAddr>,
+    stop: Option<&AtomicBool>,
 ) {
     let _source = SendThroughGuard::enter(source);
     let _sockopts = DialSockoptsGuard::enter(sockopts.cloned());
@@ -29508,7 +30591,7 @@ fn serve_udp_lane_with(
         // Loopback is TCP-only in the reference; a routed front tag has no datagram lane.
         Outbound::Loopback(loopback) => {
             if let Some(dial) = &loopback.dial {
-                serve_udp_lane_with(relay, dial, associate, peer, None, None);
+                serve_udp_lane_with(relay, dial, associate, peer, None, None, relay_peer, stop);
             }
         }
         // Every carrier whose mux pool is open takes the same datagram lane: one XUDP flow per destination, framed by the carrier the opener dialled.
@@ -29550,7 +30633,7 @@ fn serve_udp_lane_with(
         Outbound::Hysteria(hy) => {
             let dial = hy.dial();
             if dial.config.version == 1 {
-                crate::hysteria_v1::serve_udp(relay, &dial, peer);
+                crate::hysteria_v1::serve_udp(relay, &dial, relay_peer.or(peer));
             } else {
                 crate::hysteria::serve_udp(relay, &dial, peer);
             }
@@ -29565,7 +30648,7 @@ fn serve_udp_lane_with(
         Outbound::Masque(masque) => masque.serve_udp(relay, associate, peer),
         Outbound::Warp(warp) => warp.serve_udp(relay, associate, peer),
         Outbound::Freedom(out) => {
-            serve_socks_udp_freedom(relay, out, source, sockopts, associate, peer);
+            serve_socks_udp_freedom(relay, out, source, sockopts, associate, peer, stop);
         }
         Outbound::Socks(socks) => {
             if socks.version == crate::socks::Version::V4 {
@@ -29582,6 +30665,7 @@ fn serve_udp_lane_with(
                 socks.version,
                 associate,
                 peer,
+                stop,
             );
         }
         Outbound::Psiphon(lane) => {
@@ -29592,6 +30676,7 @@ fn serve_udp_lane_with(
                 lane.version(),
                 associate,
                 peer,
+                stop,
             );
         }
         Outbound::Dns(dns) => serve_dns_udp(relay, dns, peer),
@@ -29912,7 +30997,18 @@ fn spawn_udp_lane(
         // The lane's own thread starts with the settings the pick left on this one.
         SEND_THROUGH.with(|cell| cell.set(source));
         DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
-        serve_udp_lane(&socket, &out, associate.as_ref(), peer);
+        let source = SEND_THROUGH.with(std::cell::Cell::take);
+        let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
+        serve_udp_lane_with(
+            &socket,
+            &out,
+            associate.as_ref(),
+            peer,
+            source,
+            sockopts.as_ref(),
+            Some(local),
+            None,
+        );
     });
     Some(UdpLane {
         address,
@@ -29948,6 +31044,7 @@ fn retire_udp_lanes(
 ///
 /// The control leg stays open for the association's life: dropping it ends the
 /// association, and the server stops relaying.
+#[allow(clippy::too_many_arguments)]
 fn serve_socks_udp_client(
     relay: &UdpSocket,
     server: SocketAddr,
@@ -29955,6 +31052,7 @@ fn serve_socks_udp_client(
     version: crate::socks::Version,
     associate: Option<&Connection>,
     peer: Option<IpAddr>,
+    cancel: Option<&AtomicBool>,
 ) {
     if version == crate::socks::Version::V4 {
         return;
@@ -30015,6 +31113,9 @@ fn serve_socks_udp_client(
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
     loop {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            break;
+        }
         match relay.recv_from(&mut buf) {
             Ok((n, src)) => {
                 if !source_admitted(peer, pinned, src) {
@@ -30043,7 +31144,8 @@ fn serve_socks_udp_client(
                 if is_udp_gone(&error) {
                     thread::sleep(UDP_POLL);
                 }
-                if peer_left(&control)
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+                    || peer_left(&control)
                     || associate.is_some_and(peer_left)
                     || idle_for(&activity) >= idle
                 {
@@ -30217,6 +31319,7 @@ fn datagram_uplink(
 }
 
 /// Freedom UDP: the machine's own socket per destination, since a datagram here has no carrier to ride.
+#[allow(clippy::too_many_lines)]
 fn serve_socks_udp_freedom(
     relay: &UdpSocket,
     freedom: &FreedomOut,
@@ -30224,6 +31327,7 @@ fn serve_socks_udp_freedom(
     sockopts: Option<&crate::sockopt::SocketOptions>,
     associate: Option<&Connection>,
     peer: Option<IpAddr>,
+    cancel: Option<&AtomicBool>,
 ) {
     arm_control(associate);
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
@@ -30233,7 +31337,20 @@ fn serve_socks_udp_freedom(
     let mut uplinks: HashMap<SocketAddr, FreedomUplink> = HashMap::new();
     let mut buf = udp_buffer();
     let mut seen = 0u64;
+    // The relay's read timeout is its idle deadline; a cancellable lane polls it instead and keeps that deadline here.
+    let idle = relay
+        .read_timeout()
+        .ok()
+        .flatten()
+        .unwrap_or_else(budgets::udp_idle);
+    if cancel.is_some() {
+        let _ = relay.set_read_timeout(Some(UDP_POLL));
+    }
+    let mut last = Instant::now();
     loop {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            break;
+        }
         let (n, src) = match relay.recv_from(&mut buf) {
             Ok(read) => read,
             Err(error)
@@ -30242,16 +31359,25 @@ fn serve_socks_udp_freedom(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) || is_udp_gone(&error) =>
             {
-                let now = replies.load(Ordering::Relaxed);
-                if associate.is_some_and(peer_left) || now == seen {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
                     break;
                 }
-                seen = now;
+                let now = replies.load(Ordering::Relaxed);
+                if associate.is_some_and(peer_left) {
+                    break;
+                }
+                if now != seen {
+                    seen = now;
+                    last = Instant::now();
+                    continue;
+                }
+                if last.elapsed() >= idle {
+                    break;
+                }
                 continue;
             }
             Err(_) => break,
         };
-        seen = replies.load(Ordering::Relaxed);
         // Only the control peer, then its first UDP source, may name a destination.
         if !source_admitted(peer, pinned, src) {
             continue;
@@ -30262,6 +31388,9 @@ fn serve_socks_udp_freedom(
         if payload.is_empty() {
             continue;
         }
+        // A datagram that passes admission and framing is the only one that keeps the lane alive.
+        seen = replies.load(Ordering::Relaxed);
+        last = Instant::now();
         let Some(dest) = freedom_socket(freedom, &Destination::Address(dest)) else {
             continue;
         };
@@ -32469,7 +33598,15 @@ fn relay_handoff_with(client: &Connection, target: &Connection, answer: Option<A
         return;
     }
     // A masked or metered leg needs the buffered copy, and a host without a descriptor pump keeps the lane pool.
-    relay_lanes(client_read, target_write, target_read, client_write, answer);
+    let session = ACCEPTED_SESSION.with(|slot| slot.borrow_mut().take());
+    relay_lanes(
+        client_read,
+        target_write,
+        target_read,
+        client_write,
+        answer,
+        session,
+    );
 }
 
 /// One direction of a TCP relay as a lane step: the descriptor pump's buffer and nonblocking
@@ -32480,6 +33617,7 @@ fn relay_lanes(
     target_read: Connection,
     client_write: Connection,
     answer: Option<AnswerHooks>,
+    session: Option<TrackedSession>,
 ) {
     // A pool with no worker would run forward inline before reply was queued, so use the owned copy.
     if !lane_pool::start() {
@@ -32502,6 +33640,9 @@ fn relay_lanes(
         .unwrap_or_else(crate::budgets::relay_stall);
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
     let flow = RelayFinish::new(false, close, None);
+    if let Some(session) = session {
+        flow.then(move || drop(session));
+    }
     let first = Arc::clone(&flow);
     let mut forward = TcpCopy::new(client_read, target_write);
     forward.stall = forward_stall;
@@ -36355,6 +37496,44 @@ pub(crate) mod lane_pool {
     }
 }
 
+thread_local! {
+    /// The relay jobs a Hysteria stream thread hands to the lane pool, drained before its listener closes.
+    static RELAY_JOBS: std::cell::RefCell<Option<Vec<Arc<RelayFinish>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Records every relay a Hysteria stream hands off, and waits for them when the stream returns.
+pub(crate) struct RelayJobsGuard;
+
+impl RelayJobsGuard {
+    pub(crate) fn new() -> Self {
+        RELAY_JOBS.with(|jobs| {
+            jobs.borrow_mut().get_or_insert_with(Vec::new);
+        });
+        Self
+    }
+}
+
+impl Drop for RelayJobsGuard {
+    fn drop(&mut self) {
+        let jobs = RELAY_JOBS.with(|jobs| jobs.borrow_mut().take());
+        if let Some(jobs) = jobs {
+            for job in jobs {
+                job.wait_done();
+            }
+        }
+    }
+}
+
+/// A relay a Hysteria stream started; the guard on that stream's thread waits for it.
+pub(crate) fn track_relay(finish: &Arc<RelayFinish>) {
+    RELAY_JOBS.with(|jobs| {
+        if let Some(jobs) = jobs.borrow_mut().as_mut() {
+            jobs.push(Arc::clone(finish));
+        }
+    });
+}
+
 /// What both directions of one wrapped flow share: the close that ends the pair when either
 /// side does, the optional hand-back once both have, and the flag a parked read checks.
 pub(crate) struct RelayFinish {
@@ -36369,9 +37548,7 @@ pub(crate) struct RelayFinish {
     close_first: bool,
     close: Arc<dyn Fn() + Send + Sync>,
     finish: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    #[cfg(test)]
     done: Mutex<bool>,
-    #[cfg(test)]
     wake: std::sync::Condvar,
 }
 
@@ -36391,9 +37568,7 @@ impl RelayFinish {
             close_first,
             close,
             finish: Mutex::new(finish),
-            #[cfg(test)]
             done: Mutex::new(false),
-            #[cfg(test)]
             wake: std::sync::Condvar::new(),
         })
     }
@@ -36500,12 +37675,23 @@ impl RelayFinish {
         if let Some(finish) = finish {
             finish();
         }
-        #[cfg(test)]
-        {
-            if let Ok(mut done) = self.done.lock() {
-                *done = true;
-            }
+        if let Ok(mut done) = self.done.lock() {
+            *done = true;
             self.wake.notify_all();
+        }
+    }
+
+    /// Wait for both directions to leave their lanes, so a listener close covers the relay jobs
+    /// that still hold its socket.
+    pub(crate) fn wait_done(&self) {
+        let Ok(mut done) = self.done.lock() else {
+            return;
+        };
+        while !*done {
+            let Ok(next) = self.wake.wait_timeout(done, Duration::from_millis(100)) else {
+                return;
+            };
+            done = next.0;
         }
     }
 
@@ -58648,7 +59834,7 @@ mod tests {
                 true,
                 &std::collections::HashSet::new(),
                 None,
-            ),
+            ) > 0,
             "the kcp listener arms"
         );
         let ss = ShadowsocksOut {
@@ -58770,13 +59956,13 @@ mod tests {
         )
         .expect("parses");
         assert!(
-            !serve_shadowsocks_inbound(
+            serve_shadowsocks_inbound(
                 "127.0.0.1:0",
                 &inbound,
                 true,
                 &std::collections::HashSet::new(),
                 None
-            ),
+            ) == 0,
             "a network list with neither tcp nor udp opens no listener"
         );
     }
@@ -59136,7 +60322,7 @@ mod tests {
         let echo_port = udp_echo_loop();
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let relay_addr = relay.local_addr().expect("addr");
-        thread::spawn(move || serve_udp_lane(&relay, &out, None, None));
+        thread::spawn(move || serve_udp_lane(&relay, &out, None, None, None));
         let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
         source
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -59235,7 +60421,7 @@ mod tests {
         let out = Outbound::Vless(vless);
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let relay_addr = relay.local_addr().expect("addr");
-        thread::spawn(move || serve_udp_lane(&relay, &out, None, None));
+        thread::spawn(move || serve_udp_lane(&relay, &out, None, None, None));
         let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
         source
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -59293,13 +60479,15 @@ mod tests {
                 "streamSettings": {{{settings}}}}}"#
         ))
         .expect("parses");
-        assert!(serve_shadowsocks_inbound(
-            "127.0.0.1:9",
-            &inbound,
-            true,
-            &std::collections::HashSet::new(),
-            None
-        ));
+        assert!(
+            serve_shadowsocks_inbound(
+                "127.0.0.1:9",
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None
+            ) > 0
+        );
         let root = crate::json::parse(&format!(
             r#"{{"outbounds": [{{"protocol": "shadowsocks",
                 "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
@@ -59380,7 +60568,8 @@ mod tests {
             &format!("127.0.0.1:{port}"),
             config,
             &serve,
-            &inbound
+            &inbound,
+            None
         ));
         thread::sleep(Duration::from_millis(50));
         let root = crate::json::parse(&format!(
@@ -59530,13 +60719,15 @@ mod tests {
                 "streamSettings": {{{settings}}}}}"#
         ))
         .expect("parses");
-        assert!(serve_shadowsocks_inbound(
-            "127.0.0.1:9",
-            &inbound,
-            true,
-            &std::collections::HashSet::new(),
-            None
-        ));
+        assert!(
+            serve_shadowsocks_inbound(
+                "127.0.0.1:9",
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None
+            ) > 0
+        );
         let root = crate::json::parse(&format!(
             r#"{{"outbounds": [{{"protocol": "shadowsocks",
                 "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
@@ -63221,6 +64412,7 @@ mod tests {
                 &out,
                 Some(&associate),
                 Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                None,
             );
         });
         let mut head = Vec::new();
@@ -64388,7 +65580,7 @@ mod tests {
         let password = "an-example-shared-password";
         let users = crate::shadowsocks::account(password, "aes-256-gcm");
         thread::spawn(move || {
-            crate::shadowsocks::serve_udp_on(&front, &users, true);
+            crate::shadowsocks::serve_udp_on(&front, &users, true, None);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let master = ferrox_core::shadowsocks::MasterKey::new(password, 32);
@@ -64442,7 +65634,7 @@ mod tests {
         let users: Vec<crate::shadowsocks::SsUser> =
             first.iter().chain(second.iter()).cloned().collect();
         thread::spawn(move || {
-            crate::shadowsocks::serve_udp_on(&front, &users, true);
+            crate::shadowsocks::serve_udp_on(&front, &users, true, None);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let ask = |password: &str,
@@ -64678,13 +65870,15 @@ mod tests {
         .expect("parses");
         let port = trojan_mux_probe_port();
         let address = format!("127.0.0.1:{port}");
-        assert!(serve_shadowsocks_inbound(
-            &address,
-            &inbound,
-            true,
-            &std::collections::HashSet::new(),
-            None
-        ));
+        assert!(
+            serve_shadowsocks_inbound(
+                &address,
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None
+            ) > 0
+        );
         wait_tcp(port, "ss2022");
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let ss = ss2022_mux_out(port, Carrier::Raw(Chain::default()), &password);
@@ -64733,13 +65927,15 @@ mod tests {
         .expect("parses");
         let port = trojan_mux_probe_port();
         let address = format!("127.0.0.1:{port}");
-        assert!(serve_shadowsocks_inbound(
-            &address,
-            &inbound,
-            true,
-            &std::collections::HashSet::new(),
-            None
-        ));
+        assert!(
+            serve_shadowsocks_inbound(
+                &address,
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None
+            ) > 0
+        );
         wait_tcp(port, "ss2022 udp");
         let ss = ss2022_mux_out(port, Carrier::Raw(Chain::default()), &password);
         let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
@@ -64842,13 +66038,15 @@ mod tests {
             let port = probe.local_addr().expect("addr").port();
             drop(probe);
             let address = format!("127.0.0.1:{port}");
-            assert!(serve_shadowsocks_inbound(
-                &address,
-                &inbound,
-                true,
-                &std::collections::HashSet::new(),
-                None
-            ));
+            assert!(
+                serve_shadowsocks_inbound(
+                    &address,
+                    &inbound,
+                    true,
+                    &std::collections::HashSet::new(),
+                    None
+                ) > 0
+            );
             assert!(matches!(inbound_carrier(&inbound), Carrier::Kcp(_)));
             thread::sleep(Duration::from_millis(100));
             let ss = ss_mux_out(port, method, password, inbound_carrier(&inbound));
@@ -64883,13 +66081,15 @@ mod tests {
         .expect("parses");
         let port = trojan_mux_probe_port();
         let address = format!("127.0.0.1:{port}");
-        assert!(serve_shadowsocks_inbound(
-            &address,
-            &inbound,
-            true,
-            &std::collections::HashSet::new(),
-            None
-        ));
+        assert!(
+            serve_shadowsocks_inbound(
+                &address,
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None
+            ) > 0
+        );
         wait_tcp(port, "ss ws");
         let ss = ShadowsocksOut {
             address: "127.0.0.1".to_owned(),
@@ -65279,13 +66479,14 @@ mod tests {
                 drop(udp);
                 drop(tcp);
                 let address = format!("127.0.0.1:{port}");
-                if !serve_shadowsocks_inbound(
+                if serve_shadowsocks_inbound(
                     &address,
                     &inbound,
                     true,
                     &std::collections::HashSet::new(),
                     None,
-                ) {
+                ) == 0
+                {
                     return None;
                 }
                 std::net::TcpStream::connect(("127.0.0.1", port))
@@ -65343,13 +66544,13 @@ mod tests {
         )
         .expect("parses");
         assert!(
-            !serve_shadowsocks_inbound(
+            serve_shadowsocks_inbound(
                 "203.0.113.1:9",
                 &inbound,
                 true,
                 &std::collections::HashSet::new(),
                 None
-            ),
+            ) == 0,
             "a udp-only front that cannot bind is not served"
         );
     }
@@ -65366,7 +66567,8 @@ mod tests {
                 "203.0.113.1:9",
                 &inbound,
                 "MDEyMzQ1Njc4OUFCQ0RFRg==",
-                "2022-blake3-aes-128-gcm"
+                "2022-blake3-aes-128-gcm",
+                None
             ),
             RelayFront::Refused,
             "a udp-only relay that cannot bind is not served"
@@ -65425,7 +66627,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let users = crate::shadowsocks::account("an-example-shared-password", "aes-256-gcm");
-            crate::shadowsocks::serve_udp_on(&tunnel, &users, true);
+            crate::shadowsocks::serve_udp_on(&tunnel, &users, true, None);
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -65506,7 +66708,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let users = crate::shadowsocks::account("an-example-shared-password", "aes-256-gcm");
-            crate::shadowsocks::serve_udp_on(&tunnel, &users, true);
+            crate::shadowsocks::serve_udp_on(&tunnel, &users, true, None);
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -71709,9 +72911,29 @@ mod tests {
         };
         let serve: KcpServe = Arc::new(|conn| conn.close());
         assert!(
-            !serve_kcp_bound("127.0.0.1:0", config, &serve, &inbound),
+            !serve_kcp_bound("127.0.0.1:0", config, &serve, &inbound, None),
             "a sockopt the socket refused must refuse the listener, not bind without it"
         );
+    }
+
+    #[test]
+    fn a_stopped_kcp_listener_releases_its_port() {
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("finds a port");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let inbound = crate::json::parse("{}").expect("parses");
+        let stop = Arc::new(Stop::new());
+        let serve: KcpServe = Arc::new(|conn| conn.close());
+        assert!(serve_kcp_bound(
+            &format!("127.0.0.1:{port}"),
+            ferrox_core::kcp::Config::default(),
+            &serve,
+            &inbound,
+            Some(&stop)
+        ));
+        stop.stop();
+        assert!(stop.wait_closed(), "the worker drops its socket");
+        drop(UdpSocket::bind(("127.0.0.1", port)).expect("the port is free again"));
     }
 
     #[cfg(target_os = "linux")]
@@ -72758,7 +73980,7 @@ mod tests {
         };
         let users = crate::vmess::Users::single([0x62u8; 16]);
         assert!(!serve_vmess_hysteria_inbound(
-            &address, &inbound, &config, &users, true
+            &address, &inbound, &config, &users, true, None
         ));
         drop(held);
     }
@@ -73942,22 +75164,53 @@ mod tests {
         while let Ok((written, info)) = conn.send(&mut out) {
             sock.send_to(&out[..written], info.to).expect("pumps");
         }
-        // Read until the echo returns over the lane, driving the connection so the reply's packets are delivered.
+        hysteria_udp_echo_frames(&mut conn, &sock, &mut out, local, &address, horizon);
+    }
+
+    fn hysteria_udp_echo_frames(
+        conn: &mut quiche::Connection,
+        sock: &crate::quic::Datagram,
+        out: &mut [u8],
+        local: SocketAddr,
+        address: &str,
+        horizon: std::time::Instant,
+    ) {
+        // Read until the echo returns over the lane, driving the connection so the reply's packets are delivered; then repeat with a header-only frame that carries no payload.
         sock.set_read_timeout(Some(Duration::from_millis(200)))
             .expect("timeout");
+        let mut echoed = false;
         loop {
             assert!(std::time::Instant::now() < horizon, "echo never returns");
-            if let Ok((n, from)) = sock.recv_from(&mut out) {
+            if let Ok((n, from)) = sock.recv_from(out) {
                 let info = quiche::RecvInfo { from, to: local };
                 let _ = conn.recv(&mut out[..n], info);
             }
-            while let Ok((written, info)) = conn.send(&mut out) {
+            while let Ok((written, info)) = conn.send(out) {
                 let _ = sock.send_to(&out[..written], info.to);
             }
             if let Ok(data) = conn.dgram_recv_buf() {
-                let got = ferrox_core::hysteria::decode_udp(&data).expect("decodes");
-                if got.session == 1 && got.payload == b"hello" {
-                    assert_eq!(got.address, address);
+                let got = ferrox_core::hysteria::decode_udp_allow_empty(&data).expect("decodes");
+                if got.session != 1 {
+                    continue;
+                }
+                assert_eq!(got.address, address);
+                if !echoed && got.payload == b"hello" {
+                    echoed = true;
+                    let empty = ferrox_core::hysteria::UdpMessage {
+                        session: 1,
+                        packet: 2,
+                        frag: 0,
+                        frags: 1,
+                        address,
+                        payload: b"",
+                    };
+                    let mut wire = Vec::new();
+                    ferrox_core::hysteria::encode_udp_unchecked(&empty, &mut wire);
+                    conn.dgram_send(&wire).expect("sends");
+                    while let Ok((written, info)) = conn.send(out) {
+                        sock.send_to(&out[..written], info.to).expect("pumps");
+                    }
+                } else if echoed && got.payload.is_empty() {
                     return;
                 }
             }
@@ -74375,7 +75628,7 @@ mod tests {
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let relay_addr = relay.local_addr().expect("addr");
         let out = out;
-        thread::spawn(move || serve_udp_lane(&relay, &out, None, None));
+        thread::spawn(move || serve_udp_lane(&relay, &out, None, None, None));
         let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
         source
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -74430,7 +75683,7 @@ mod tests {
         });
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let relay_addr = relay.local_addr().expect("addr");
-        thread::spawn(move || serve_udp_lane(&relay, &out, None, None));
+        thread::spawn(move || serve_udp_lane(&relay, &out, None, None, None));
         let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
         source
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -74523,6 +75776,81 @@ mod tests {
         let mut back = [0u8; 2];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"v2");
+    }
+
+    #[test]
+    fn a_stopped_hysteria_listener_waits_for_an_active_stream_before_closing() {
+        let _serial = quic_serial();
+        let (identity, roots) = minted_tls_identity("localhost");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        let prepared = crate::hysteria::prepare(
+            &address,
+            &identity,
+            ferrox_core::hysteria::Congestion::Bbr,
+            "",
+            None,
+        )
+        .expect("prepares");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+            let _ = entered_tx.send(());
+            let _ = release_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv();
+            drop(flow);
+        });
+        let stop = Arc::new(Stop::default());
+        stop.expect_listeners(1);
+        let worker_stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let cancel = worker_stop.shared();
+            crate::hysteria::serve_prepared(
+                prepared,
+                &["auth".to_owned()],
+                &ferrox_core::hysteria::Masquerade::NotFound,
+                &serve,
+                std::time::Duration::from_secs(60),
+                None,
+                None,
+                Some(&cancel),
+            );
+            worker_stop.mark_closed();
+        });
+        let dial = crate::hysteria::Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port,
+            config: ferrox_core::hysteria::Config {
+                version: 2,
+                auth: "auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                ..ferrox_core::hysteria::Config::default()
+            },
+            roots: Some(roots.into()),
+        };
+        let flow = crate::hysteria::open(&dial, b"", 0).expect("opens a stream");
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the stream worker starts");
+        stop.stop();
+        thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            !stop.is_closed(),
+            "the listener closed while an active stream still held its socket"
+        );
+        release_tx.send(()).expect("releases the stream");
+        assert!(
+            stop.wait_closed(),
+            "the listener closes after the stream ends"
+        );
+        drop(flow);
+        UdpSocket::bind(format!("127.0.0.1:{port}")).expect("the port is free to bind");
     }
 
     #[test]
@@ -75982,7 +77310,7 @@ mod tests {
         let door = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let port = door.local_addr().expect("addr").port();
         let dest = Destination::Address(target_addr);
-        thread::spawn(move || dokodemo_udp_door(&door, &dest, &freedom()));
+        thread::spawn(move || dokodemo_udp_door(&door, &dest, &freedom(), None));
         let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
         client
             .connect(SocketAddr::from(([127, 0, 0, 1], port)))
@@ -76056,7 +77384,7 @@ mod tests {
         let door = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let port = door.local_addr().expect("addr").port();
         let dest = Destination::Address(target_addr);
-        thread::spawn(move || dokodemo_udp_door(&door, &dest, &out));
+        thread::spawn(move || dokodemo_udp_door(&door, &dest, &out, None));
         let door_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
@@ -79909,7 +81237,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(300)))
             .expect("timeout");
         let _serving = std::thread::spawn(move || {
-            serve_socks_udp_freedom(&relay, &FreedomOut::default(), None, None, None, None);
+            serve_socks_udp_freedom(&relay, &FreedomOut::default(), None, None, None, None, None);
         });
         let client = UdpSocket::bind("127.0.0.1:0").expect("client");
         client
@@ -86862,6 +88190,25 @@ mod hc_tests {
         let mut answer = Vec::new();
         client.read_to_end(&mut answer).expect("reads");
         answer
+    }
+
+    #[test]
+    fn an_hc_wake_names_the_ephemeral_port_it_bound() {
+        let inbound = crate::json::parse(r#"{"settings":{"path":"/health","response":"ok"}}"#)
+            .expect("parses");
+        let stop = Arc::new(Stop::new());
+        let wake = serve_hc_inbound("127.0.0.1:0", &inbound, Some(Arc::clone(&stop)))
+            .expect("binds an ephemeral port");
+        let port: u16 = wake
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse().ok())
+            .expect("the wake names a port");
+        assert_ne!(
+            port, 0,
+            "the wake names the port the listener actually bound"
+        );
+        stop.stop();
+        wake_listener(&stop, &wake);
     }
 
     #[test]

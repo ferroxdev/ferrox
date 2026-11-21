@@ -1389,10 +1389,17 @@ pub(crate) fn server(
     out: Outbound,
     headroom: usize,
     recycle: Option<Sender<Vec<u8>>>,
+    stop: Option<Arc<AtomicBool>>,
 ) {
     let mut stack = ServerStack::new(&config, to_tunnel, out, headroom);
     stack.device.recycle = recycle;
     loop {
+        if stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Relaxed))
+        {
+            return;
+        }
         if server_turn(&mut stack, &packets, TICK) {
             return;
         }
@@ -3027,9 +3034,11 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
         other => other.clone(),
     };
     let _ = relay.set_read_timeout(Some(crate::budgets::udp_idle()));
-    std::thread::spawn(move || serve_udp_lane(&relay, &outbound, None, None));
 
     let stop = Arc::new(AtomicBool::new(false));
+    let relay_stop = Arc::clone(&stop);
+    std::thread::spawn(move || serve_udp_lane(&relay, &outbound, None, None, Some(&relay_stop)));
+
     let reader_stop = Arc::clone(&stop);
     let reader_activity = Arc::clone(last_used);
     let tunnel = to_tunnel.clone().into();

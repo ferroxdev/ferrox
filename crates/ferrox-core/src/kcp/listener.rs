@@ -258,6 +258,10 @@ struct ListenerInner {
     ready_cv: Condvar,
     config: Config,
     closed: AtomicBool,
+    close_done: Mutex<bool>,
+    close_cv: Condvar,
+    feed_done: Mutex<bool>,
+    feed_cv: Condvar,
     addr: SocketAddr,
 }
 
@@ -282,6 +286,10 @@ impl Listener {
             ready_cv: Condvar::new(),
             config,
             closed: AtomicBool::new(false),
+            close_done: Mutex::new(false),
+            close_cv: Condvar::new(),
+            feed_done: Mutex::new(false),
+            feed_cv: Condvar::new(),
             addr: local,
         });
         let sock_r = sock;
@@ -371,6 +379,8 @@ impl Listener {
                             if inner.closed.load(Ordering::SeqCst)
                                 || sessions.len() >= inner.config.max_sessions
                             {
+                                drop(sessions);
+                                session.terminate();
                                 continue;
                             }
                             sessions.insert(key, Arc::clone(&session));
@@ -388,6 +398,7 @@ impl Listener {
                         if inner.closed.load(Ordering::SeqCst) {
                             drop(ready);
                             inner.sessions.lock().unwrap().remove(&key);
+                            session.terminate();
                             continue;
                         }
                         ready.push_back(session);
@@ -401,6 +412,11 @@ impl Listener {
                         ) => {}
                     Err(_) => break,
                 }
+            }
+            drop(sock_r);
+            if let Some(inner) = weak.upgrade() {
+                *inner.feed_done.lock().unwrap() = true;
+                inner.feed_cv.notify_all();
             }
         });
         Ok(Self { inner })
@@ -433,6 +449,23 @@ impl Listener {
         }
         self.inner.ready.lock().unwrap().clear();
         self.inner.ready_cv.notify_all();
+        if let Ok(mut done) = self.inner.close_done.lock() {
+            *done = true;
+            self.inner.close_cv.notify_all();
+        }
+    }
+
+    /// Wait for both session termination and the feed thread's socket release, so a closed listener has relinquished its port.
+    pub fn wait_closed(&self) {
+        let mut closed = self.inner.close_done.lock().unwrap();
+        while !*closed {
+            closed = self.inner.close_cv.wait(closed).unwrap();
+        }
+        drop(closed);
+        let mut done = self.inner.feed_done.lock().unwrap();
+        while !*done {
+            done = self.inner.feed_cv.wait(done).unwrap();
+        }
     }
 }
 
@@ -444,6 +477,13 @@ mod tests {
     use super::*;
     use crate::kcp::connection::ConnMetadata;
     use crate::kcp::mask::{HeaderKind, Mask, Spec};
+
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     #[cfg_attr(miri, ignore = "binds a loopback UDP socket")]
     /// The room a datagram is received into is zeroed once per feed thread, not per receive.
@@ -475,7 +515,10 @@ mod tests {
             dials.push(conn);
         }
         let deadline = Instant::now() + Duration::from_secs(5);
-        while listener.inner.sessions.lock().unwrap().len() < 4 && Instant::now() < deadline {
+        while (listener.inner.sessions.lock().unwrap().len() < 4
+            || listener.inner.ready.lock().unwrap().len() < 4)
+            && Instant::now() < deadline
+        {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(
@@ -517,13 +560,18 @@ mod tests {
                 inner.sessions.lock().unwrap().remove(&key);
             }
         });
+        let released = Arc::new(AtomicBool::new(false));
+        let guard = ReleaseOnDrop(Arc::clone(&released));
         let session = Connection::new(
             ConnMetadata {
                 local,
                 remote: local,
                 conversation: 1,
             },
-            Box::new(|_| Ok(())),
+            Box::new(move |_| {
+                let _ = &guard;
+                Ok(())
+            }),
             closer,
             Config::default(),
         );
@@ -542,6 +590,10 @@ mod tests {
         assert!(
             seen.recv_timeout(Duration::from_secs(5)).is_ok(),
             "close did not return: it held the session lock across terminate"
+        );
+        assert!(
+            released.load(Ordering::SeqCst),
+            "terminate must release the writer's socket clone"
         );
     }
 

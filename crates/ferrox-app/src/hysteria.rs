@@ -1330,6 +1330,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
             move || flow.close()
         })),
     );
+    crate::proxy::track_relay(&done);
 
     let mut up = flow.clone();
     let forward = Arc::clone(&done);
@@ -1467,6 +1468,7 @@ struct UdpFlow {
     defrag: Defrag,
     last: Instant,
     stop: Arc<AtomicBool>,
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 fn answer_auth(
@@ -2174,7 +2176,7 @@ fn open_udp(
     target.set_read_timeout(Some(UDP_POLL)).ok()?;
     let target = Arc::new(target);
     let stop = Arc::new(AtomicBool::new(false));
-    std::thread::spawn({
+    let reader = std::thread::spawn({
         let shared = Arc::clone(shared);
         let sock = Arc::clone(sock);
         let target = Arc::clone(&target);
@@ -2187,6 +2189,7 @@ fn open_udp(
         defrag: Defrag::new(),
         last: Instant::now(),
         stop,
+        reader: Some(reader),
     })
 }
 
@@ -2220,6 +2223,9 @@ fn udp_reader(
             }
             Err(_) => break,
         };
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let Ok(mut conn) = shared.lock() else {
             break;
         };
@@ -2238,7 +2244,7 @@ fn udp_reader(
             address,
             payload: &buf[..n],
         };
-        let Ok(fragments) = hysteria::fragments_udp(&message, max) else {
+        let Ok(fragments) = hysteria::fragments_udp_allow_empty(&message, max) else {
             break;
         };
         for frag in fragments {
@@ -2369,7 +2375,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
             address,
             payload,
         };
-        let Ok(fragments) = hysteria::fragments_udp(&message, max) else {
+        let Ok(fragments) = hysteria::fragments_udp_allow_empty(&message, max) else {
             continue;
         };
         for frag in fragments {
@@ -2406,7 +2412,7 @@ fn take_reply<'a>(
         .defrag
         .lock()
         .ok()?
-        .feed(message, assembled)
+        .feed_allow_empty(message, assembled)
         .ok()
         .flatten()
         .map(|(_address, payload)| payload)?;
@@ -2425,7 +2431,7 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
         }
         while let Some(data) = recv_one(session.shared.as_ref(), |conn| conn.dgram_recv_buf().ok())
         {
-            let Ok(message) = hysteria::decode_udp(&data) else {
+            let Ok(message) = hysteria::decode_udp_allow_empty(&data) else {
                 continue;
             };
             let Some((destination, src, payload)) =
@@ -2446,12 +2452,13 @@ fn relay_datagrams(
     sock: &Arc<crate::quic::Datagram>,
     shared: &Arc<Mutex<quiche::Connection>>,
     conn: &mut quiche::Connection,
+    retired: &mut Vec<std::thread::JoinHandle<()>>,
 ) {
     if !matches!(inbound.standing, Standing::Authed) {
         return;
     }
     while let Ok(data) = conn.dgram_recv_buf() {
-        let Ok(message) = hysteria::decode_udp(&data) else {
+        let Ok(message) = hysteria::decode_udp_allow_empty(&data) else {
             continue;
         };
         let session = message.session;
@@ -2469,7 +2476,7 @@ fn relay_datagrams(
             }
         };
         let mut assembled = Vec::new();
-        let whole = flow.defrag.feed(&message, &mut assembled);
+        let whole = flow.defrag.feed_allow_empty(&message, &mut assembled);
         flow.last = Instant::now();
         let forged = whole.is_err();
         match whole {
@@ -2480,7 +2487,11 @@ fn relay_datagrams(
             Err(_) => flow.stop.store(true, Ordering::Relaxed),
         }
         if forged {
-            inbound.udp.remove(&session);
+            if let Some(mut flow) = inbound.udp.remove(&session) {
+                if let Some(reader) = flow.reader.take() {
+                    retired.push(reader);
+                }
+            }
         }
     }
 }
@@ -2502,6 +2513,10 @@ struct Router<'a> {
     /// The route each client CID and initial DCID names, so an Initial's retransmit finds its lane in one probe instead of walking every route.
     by_client_cid: HashMap<Vec<u8>, Vec<u8>>,
     by_initial_dcid: HashMap<Vec<u8>, Vec<u8>>,
+    /// Readers whose association was reaped, kept so shutdown can join them before the listener closes.
+    retired: Vec<std::thread::JoinHandle<()>>,
+    /// Accepted stream workers, kept so shutdown can join them before the listener socket is released.
+    streams: Vec<std::thread::JoinHandle<()>>,
 }
 
 /// A stateless reset token belongs to one connection, so the shared template is minted afresh before each accept; a failed mint refuses the connection rather than sharing one.
@@ -2548,6 +2563,7 @@ impl Drop for CoverSlot {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn auth_exchange(
     sock: &Arc<crate::quic::Datagram>,
     conn: &mut quiche::Connection,
@@ -2556,6 +2572,7 @@ fn auth_exchange(
     inbound: &mut Inbound,
     peer: SocketAddr,
     masq: &Masquerade,
+    streams: &mut Vec<std::thread::JoinHandle<()>>,
 ) -> Option<Auth> {
     let mut room = Unfilled::<4096>::new();
     loop {
@@ -2601,7 +2618,7 @@ fn auth_exchange(
             let shared = Arc::clone(shared);
             let sock = Arc::clone(sock);
             let masq = masq.clone();
-            std::thread::spawn(move || {
+            streams.push(std::thread::spawn(move || {
                 let _slot = slot;
                 let mut reply = Vec::new();
                 masq_bytes(&masq, &request, Some(&peer), &mut reply);
@@ -2615,7 +2632,7 @@ fn auth_exchange(
                         Instant::now(),
                     );
                 }
-            });
+            }));
         } else {
             let mut reply = Vec::new();
             masq_bytes(masq, &request, Some(&peer), &mut reply);
@@ -2745,6 +2762,8 @@ impl Router<'_> {
             serve,
             masq,
             local,
+            retired,
+            streams,
             ..
         } = self;
         let Some(inbound) = routes.get_mut(dcid) else {
@@ -2777,7 +2796,16 @@ impl Router<'_> {
                 inbound.settings_sent = true;
             }
             if inbound.standing == Standing::Pending {
-                match auth_exchange(sock, &mut conn, Some(&shared), auths, inbound, from, masq) {
+                match auth_exchange(
+                    sock,
+                    &mut conn,
+                    Some(&shared),
+                    auths,
+                    inbound,
+                    from,
+                    masq,
+                    streams,
+                ) {
                     None => return true,
                     Some(Auth::Refused) => {
                         let _ = conn.close(false, 0, b"refused");
@@ -2812,7 +2840,7 @@ impl Router<'_> {
                 let thread_masq = Arc::clone(masq);
                 let local = *local;
                 let peer = from;
-                std::thread::spawn(move || {
+                streams.push(std::thread::spawn(move || {
                     let _slot = slot;
                     serve_stream(
                         &thread_shared,
@@ -2824,9 +2852,9 @@ impl Router<'_> {
                         &thread_masq,
                         wake,
                     );
-                });
+                }));
             }
-            relay_datagrams(inbound, sock, &shared, &mut conn);
+            relay_datagrams(inbound, sock, &shared, &mut conn, retired);
         }
         true
     }
@@ -2853,9 +2881,13 @@ impl Router<'_> {
             by_initial_dcid,
             sock,
             udp_idle,
+            retired,
+            streams,
             ..
         } = self;
         let now = Instant::now();
+        retired.retain(|reader| !reader.is_finished());
+        streams.retain(|stream| !stream.is_finished());
         // One pass, one lock per route: the dead are dropped where they are found, the living take their turn of the wheel, and a datagram association idle past the timeout is told to stop so its reader ends within one poll.
         routes.retain(|key, inbound| {
             let Ok(mut conn) = inbound.conn.lock() else {
@@ -2870,10 +2902,12 @@ impl Router<'_> {
                     &inbound.initial_dcid,
                     &inbound.source_ids,
                 );
-                for flow in inbound.udp.values() {
+                for (_, mut flow) in inbound.udp.drain() {
                     flow.stop.store(true, Ordering::Relaxed);
+                    if let Some(reader) = flow.reader.take() {
+                        retired.push(reader);
+                    }
                 }
-                inbound.udp.clear();
                 return false;
             }
             conn.on_timeout();
@@ -2881,6 +2915,9 @@ impl Router<'_> {
             inbound.udp.retain(|_, flow| {
                 if now.duration_since(flow.last) > *udp_idle {
                     flow.stop.store(true, Ordering::Relaxed);
+                    if let Some(reader) = flow.reader.take() {
+                        retired.push(reader);
+                    }
                     false
                 } else {
                     true
@@ -3009,9 +3046,10 @@ pub(crate) fn serve_loop(
     let Some(prepared) = prepare(address, identity, cc, obfs_password, quic) else {
         return;
     };
-    serve_prepared(prepared, auths, masq, serve, udp_idle, quic, realm);
+    serve_prepared(prepared, auths, masq, serve, udp_idle, quic, realm, None);
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn serve_prepared(
     prepared: Prepared,
     auths: &[String],
@@ -3020,6 +3058,7 @@ pub(crate) fn serve_prepared(
     udp_idle: Duration,
     quic: Option<&hysteria::QuicParams>,
     realm: Option<&ferrox_core::realm::Config>,
+    stop: Option<&Arc<AtomicBool>>,
 ) {
     let Prepared {
         sock,
@@ -3028,12 +3067,14 @@ pub(crate) fn serve_prepared(
     } = prepared;
     let sock = Arc::new(sock);
     let realm_state = realm.map(|_| crate::hysteria_realm::RealmState::new());
+    let realm_stop = Arc::new(AtomicBool::new(false));
+    let mut realm_worker = None;
     if let Some((cfg, state)) = realm.cloned().zip(realm_state.clone()) {
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&realm_stop);
         let sock_for_realm = Arc::clone(&sock);
-        std::thread::spawn(move || {
+        realm_worker = Some(std::thread::spawn(move || {
             crate::hysteria_realm::serve_registration(sock_for_realm, &cfg, state, stop);
-        });
+        }));
     }
     let mut router = Router {
         sock: Arc::clone(&sock),
@@ -3048,15 +3089,28 @@ pub(crate) fn serve_prepared(
         routes: HashMap::new(),
         by_client_cid: HashMap::new(),
         by_initial_dcid: HashMap::new(),
+        retired: Vec::new(),
+        streams: Vec::new(),
     };
     let mut buf = Unfilled::<RECV_ROOM>::new();
     if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
+        realm_stop.store(true, Ordering::SeqCst);
+        if let Some(state) = router.realm_state.as_ref() {
+            state.interrupt_events();
+            state.interrupt_requests();
+        }
+        if let Some(worker) = realm_worker.take() {
+            let _ = worker.join();
+        }
         return;
     }
     #[cfg(target_os = "linux")]
     let mut batch = crate::quic::Batch::new();
     let mut idle_at = Instant::now();
     loop {
+        if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+            break;
+        }
         #[cfg(target_os = "linux")]
         match crate::quic::recv_batch(&router.sock, &mut batch) {
             crate::quic::Drain::Read => {
@@ -3084,7 +3138,7 @@ pub(crate) fn serve_prepared(
             }
             crate::quic::Drain::Unbatchable => {}
             // A socket that coalesces must not be read one segment wide.
-            crate::quic::Drain::Unreadable => return,
+            crate::quic::Drain::Unreadable => break,
         }
         match router.sock.recv_from(buf.as_mut()) {
             Ok((n, from)) => {
@@ -3109,8 +3163,35 @@ pub(crate) fn serve_prepared(
             {
                 router.idle();
             }
-            Err(_) => return,
+            Err(_) => break,
         }
+    }
+    realm_stop.store(true, Ordering::SeqCst);
+    if let Some(state) = router.realm_state.as_ref() {
+        state.interrupt_events();
+        state.interrupt_requests();
+    }
+    let mut readers = Vec::new();
+    for inbound in router.routes.values_mut() {
+        for (_, mut flow) in inbound.udp.drain() {
+            flow.stop.store(true, Ordering::Relaxed);
+            if let Some(reader) = flow.reader.take() {
+                readers.push(reader);
+            }
+        }
+        if let Ok(mut conn) = inbound.conn.lock() {
+            let _ = conn.close(true, 0, b"");
+        }
+    }
+    readers.append(&mut router.retired);
+    for reader in readers {
+        let _ = reader.join();
+    }
+    for stream in router.streams.drain(..) {
+        let _ = stream.join();
+    }
+    if let Some(worker) = realm_worker {
+        let _ = worker.join();
     }
 }
 
@@ -3716,6 +3797,7 @@ mod tests {
                 &mut inbound,
                 client_addr,
                 &masq,
+                &mut Vec::new(),
             )
         };
         assert!(matches!(outcome, Some(Auth::Cover)));
@@ -3824,6 +3906,7 @@ mod tests {
                         .checked_sub(Duration::from_secs(6))
                         .expect("six seconds ago"),
                     stop: Arc::clone(&stop),
+                    reader: None,
                 },
             );
             let mut by_scid = HashMap::new();
@@ -3857,6 +3940,8 @@ mod tests {
                 routes: by_scid,
                 by_client_cid: HashMap::new(),
                 by_initial_dcid: HashMap::new(),
+                retired: Vec::new(),
+                streams: Vec::new(),
             };
             router.idle();
             stop.load(Ordering::Relaxed)
@@ -3895,6 +3980,8 @@ mod tests {
             routes: HashMap::new(),
             by_client_cid: HashMap::new(),
             by_initial_dcid: HashMap::new(),
+            retired: Vec::new(),
+            streams: Vec::new(),
         };
         let mut template = server_template(&hysteria::Config::default());
         let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
@@ -4029,6 +4116,8 @@ mod tests {
             )]),
             by_client_cid: HashMap::from([(client, key.clone())]),
             by_initial_dcid: HashMap::from([(initial, key)]),
+            retired: Vec::new(),
+            streams: Vec::new(),
         };
         router.idle();
         assert!(router.routes.is_empty());
