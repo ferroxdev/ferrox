@@ -1139,10 +1139,14 @@ fn share_uni_packets(data: Vec<u8>, replies: &SyncSender<Reply>) -> (Vec<u8>, bo
     loop {
         match wire::parse_packet_prefix(&bytes[at..]) {
             Ok((_, used)) => {
-                let _ = replies.try_send(Reply::Inside {
+                // A reliable packet waits for the forwarder's room; only QUIC datagrams drop.
+                let packet = Reply::Inside {
                     bytes: Arc::clone(&bytes),
                     at: at..at + used,
-                });
+                };
+                if replies.send(packet).is_err() {
+                    return (Vec::new(), true);
+                }
                 at += used;
             }
             Err(wire::FrameError::Short) => return (bytes[at..].to_vec(), false),
@@ -3093,6 +3097,32 @@ mod tests {
             .map(|reply| reply.packet().to_vec())
             .collect();
         assert_eq!(replied, before, "the same packets ride the same frames");
+    }
+
+    /// A full reply queue waits for the forwarder instead of dropping a stream packet: a
+    /// dropped one is a reliable byte the peer was promised.
+    #[test]
+    fn a_full_reply_queue_never_drops_a_stream_packet() {
+        let address = wire::address_port("127.0.0.1", 9).expect("an address");
+        let mut run = Vec::new();
+        for payload in [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()] {
+            let mut frame = Vec::new();
+            wire::encode_fragment(1, 2, 1, 0, &address, payload, &mut frame);
+            run.extend_from_slice(&frame);
+        }
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        let sender = std::thread::spawn(move || share_uni_packets(run, &reply_tx));
+        let mut seen = 0;
+        while seen < 3 {
+            let Ok(_) = reply_rx.recv_timeout(std::time::Duration::from_secs(5)) else {
+                break;
+            };
+            seen += 1;
+        }
+        assert_eq!(seen, 3, "a full queue never drops a stream packet");
+        let (rest, broken) = sender.join().expect("the reader's own thread");
+        assert!(!broken, "the stream is whole");
+        assert!(rest.is_empty(), "and nothing waits for the next read");
     }
 
     /// A read that ends mid-frame keeps the partial packet as the tail, and nothing else.

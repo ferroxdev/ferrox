@@ -3984,7 +3984,7 @@ mod tests {
             &copied[..],
             "the same datagram, not a copy"
         );
-        packet.release();
+        drop(packet);
         let returned = recycled.recv().expect("the pool's buffer");
         assert_eq!(returned.as_ptr(), base, "the buffer returns, not a copy");
     }

@@ -197,10 +197,17 @@ impl LanePacket {
         &self.bytes[self.at..]
     }
 
-    /// Return the buffer to the pool that read it, once this lane has spent it.
-    pub(crate) fn release(self) {
-        if let Some(recycle) = self.recycle {
-            let _ = recycle.send(self.bytes);
+    /// The packet's buffer, without returning it to the pool: the caller keeps it.
+    pub(crate) fn into_bytes(mut self) -> Vec<u8> {
+        self.recycle = None;
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for LanePacket {
+    fn drop(&mut self) {
+        if let Some(recycle) = self.recycle.take() {
+            let _ = recycle.send(std::mem::take(&mut self.bytes));
         }
     }
 }
@@ -1647,7 +1654,7 @@ impl ClientStack {
         };
         match lane.send(handed) {
             Ok(()) => None,
-            Err(back) => Some(back.0.bytes),
+            Err(back) => Some(back.0.into_bytes()),
         }
     }
 
@@ -2878,8 +2885,8 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
                 let out = crate::proxy::socks_udp_frame(&mut frame, &remote, datagram.payload);
                 let _ = relay.send_to(out, app);
                 quiet = StdInstant::now();
+                drop(packet);
             }
-            packet.release();
         }
         match relay.recv_from(&mut buf) {
             Ok((n, sender)) => {
@@ -3005,8 +3012,8 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
                     break 'packet;
                 };
                 let _ = relay.send_to(datagram.payload, app);
+                drop(packet);
             }
-            packet.release();
         }
         match relay.recv_from(&mut buf) {
             Ok((n, sender)) => {
@@ -5228,7 +5235,7 @@ mod tests {
         assert_eq!(packet.bytes.as_ptr(), base, "the reader's own buffer");
         assert_eq!(packet.at, 16, "at the packet's offset");
         assert_eq!(packet.packet(), &want[..], "the datagram's own bytes");
-        packet.release();
+        drop(packet);
         let returned = recycled.recv().expect("the pool's buffer");
         assert_eq!(returned.as_ptr(), base, "the same allocation comes back");
 
