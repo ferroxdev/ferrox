@@ -1208,7 +1208,7 @@ impl Inner {
                     if self.can_attach() {
                         self.offer(self.attach(id));
                     } else {
-                        self.send_reset(id);
+                        self.defer_reset(id, &AtomicBool::new(false));
                     }
                 }
                 SMUX_PSH => self.deliver(id, &data, false),

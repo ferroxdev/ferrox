@@ -4815,7 +4815,11 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             table,
             sock: Arc::new(sock),
             peer,
-            key: Arc::new(PoolKey::of(dial)?),
+            key: Arc::new(PoolKey {
+                server: QuicServer::of(dial),
+                source,
+                options: flow,
+            }),
         });
     }
     None

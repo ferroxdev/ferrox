@@ -7171,8 +7171,13 @@ mod tests {
             refused.to_string().contains("the bucket is full"),
             "{refused}"
         );
+        let marker = dir.join("streams/a/c2s/000000000.err");
+        let until = Instant::now() + Duration::from_secs(10);
+        while !marker.is_file() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
-            dir.join("streams/a/c2s/000000000.err").is_file(),
+            marker.is_file(),
             "the sequence that could not be stored is marked for the peer to read"
         );
         let rd = Rd {

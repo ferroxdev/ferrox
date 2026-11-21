@@ -108,6 +108,8 @@ impl std::fmt::Debug for TuicOut {
 struct Lane {
     conn: Arc<Mutex<quiche::Connection>>,
     sock: Arc<Datagram>,
+    source: Option<IpAddr>,
+    options: Option<Arc<crate::sockopt::SocketOptions>>,
     local: SocketAddr,
     next_bidi: Mutex<u64>,
     next_uni: AtomicU64,
@@ -328,9 +330,13 @@ impl TuicOut {
     }
 
     fn lane(&self) -> Option<Arc<Lane>> {
+        let options = proxy::dial_options();
+        let source = proxy::flow_source().ok()?;
         let mut held = self.lane.lock().ok()?;
         if let Some(lane) = held.as_ref() {
             let live = !lane.stop.load(Ordering::Relaxed)
+                && lane.source == source
+                && lane.options == options
                 && lane
                     .conn
                     .lock()
@@ -346,14 +352,16 @@ impl TuicOut {
                 }
             }
         }
-        let lane = self.connect_lane()?;
+        let lane = self.connect_lane(source, options)?;
         *held = Some(Arc::clone(&lane));
         Some(lane)
     }
 
-    fn connect_lane(&self) -> Option<Arc<Lane>> {
-        let options = proxy::dial_options();
-        let source = proxy::flow_source().ok()?;
+    fn connect_lane(
+        &self,
+        source: Option<IpAddr>,
+        options: Option<Arc<crate::sockopt::SocketOptions>>,
+    ) -> Option<Arc<Lane>> {
         let (socket, peer, local) =
             if let Some(tag) = options.as_deref().and_then(|o| o.dialer_proxy()) {
                 let options = options.as_deref()?;
@@ -370,7 +378,7 @@ impl TuicOut {
                 )?;
                 (quic::Datagram::plain(sock).with_gro(false), peer, local)
             };
-        let socket = socket.with_options(options).with_source(source);
+        let socket = socket.with_options(options.clone()).with_source(source);
         let mut config = self.client_config()?;
         let mut scid = [0u8; SCID_LEN];
         getrandom::fill(&mut scid).ok()?;
@@ -395,6 +403,8 @@ impl TuicOut {
         let lane = Arc::new(Lane {
             conn,
             sock: socket,
+            source,
+            options,
             local,
             next_bidi: Mutex::new(0),
             next_uni: AtomicU64::new(6),
