@@ -353,6 +353,7 @@ impl TuicOut {
 
     fn connect_lane(&self) -> Option<Arc<Lane>> {
         let options = proxy::dial_options();
+        let source = proxy::flow_source().ok()?;
         let (socket, peer, local) =
             if let Some(tag) = options.as_deref().and_then(|o| o.dialer_proxy()) {
                 let options = options.as_deref()?;
@@ -365,11 +366,11 @@ impl TuicOut {
                     &self.address,
                     self.port,
                     options.as_deref(),
-                    proxy::flow_source().ok()?,
+                    source,
                 )?;
                 (quic::Datagram::plain(sock).with_gro(false), peer, local)
             };
-        let socket = socket.with_options(options);
+        let socket = socket.with_options(options).with_source(source);
         let mut config = self.client_config()?;
         let mut scid = [0u8; SCID_LEN];
         getrandom::fill(&mut scid).ok()?;

@@ -83,6 +83,24 @@ impl QuicServer {
     }
 }
 
+/// What a pooled lane is shared by: the edge and its trust, plus the flow's own bind policy. Two flows that differ in source or socket options cannot ride one socket.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PoolKey {
+    server: QuicServer,
+    source: Option<IpAddr>,
+    options: Option<Arc<crate::sockopt::SocketOptions>>,
+}
+
+impl PoolKey {
+    fn of(dial: &QuicDial) -> Option<Self> {
+        Some(Self {
+            server: QuicServer::of(dial),
+            source: crate::proxy::flow_source().ok()?,
+            options: crate::proxy::flow_sockopts(),
+        })
+    }
+}
+
 /// How many flows one lane lends before it is handed back for a fresh dial: reuse without a bound is the leak the lane was first closed for, and a stream id only comes back if the edge grants it.
 pub(crate) const MAX_FLOWS_ON_LANE: u64 = 64;
 const MAX_SERVER_CONNECTIONS: usize = 1024;
@@ -203,17 +221,17 @@ struct PooledConn {
     table: Arc<Mutex<PooledState>>,
     sock: Arc<Datagram>,
     peer: SocketAddr,
-    key: Arc<QuicServer>,
+    key: Arc<PoolKey>,
 }
 
 struct QuicPool {
-    inner: Mutex<HashMap<QuicServer, PooledConn>>,
+    inner: Mutex<HashMap<PoolKey, PooledConn>>,
 }
 
 impl QuicPool {
     /// The connection already open to this edge, if there is one a flow can still ride.
     fn stream(&self, dial: &QuicDial) -> Option<PooledConn> {
-        let key = QuicServer::of(dial);
+        let key = PoolKey::of(dial)?;
         let entry = self.inner.lock().ok()?.get(&key).cloned()?;
         // Spent or let go by the edge while parked: hand the lane back rather than ride it, and the caller's `or_else` dials the next one.
         if flow_credit(&entry) && lane_is_live(&entry) {
@@ -224,7 +242,7 @@ impl QuicPool {
     }
 
     /// Drop this lane and no other: a concurrent dial can have put a fresh connection under the same key while we were reading the old one.
-    fn retire(&self, key: &QuicServer, entry: &PooledConn) {
+    fn retire(&self, key: &PoolKey, entry: &PooledConn) {
         if let Ok(mut pool) = self.inner.lock() {
             if pool
                 .get(key)
@@ -2076,6 +2094,9 @@ pub(crate) fn rebind_path(
     } else {
         bound
     };
+    if sock.fixed_source.is_some() {
+        return Rebind::Same;
+    }
     let options = sock.options.as_deref();
     let Some(source) = probe_source(peer, options) else {
         return Rebind::Retry;
@@ -2470,6 +2491,9 @@ pub(crate) struct Datagram {
     /// The `sockopt` this lane was dialled under, so a route move re-probes and
     /// rebinds under the same mark or device.
     options: Option<Arc<crate::sockopt::SocketOptions>>,
+    /// The source the flow named, not the one the kernel picked: a route move must
+    /// not replace an explicit bind with a default source.
+    fixed_source: Option<IpAddr>,
     /// A hopped client dial: the server port moves on a schedule and the socket
     /// with it, so a UDP flow keeps ending and a new one starting to a filter.
     /// Shared behind an `Arc` so a writer clone and a reader clone move together.
@@ -3094,6 +3118,7 @@ impl Datagram {
             proxy_peer: None,
             proxy_stop: None,
             options: None,
+            fixed_source: None,
         }
     }
 
@@ -3123,6 +3148,7 @@ impl Datagram {
             proxy_peer: None,
             proxy_stop: None,
             options: None,
+            fixed_source: None,
         }
     }
 
@@ -3147,6 +3173,7 @@ impl Datagram {
             proxy_peer: Some(peer),
             proxy_stop: Some(stop),
             options: None,
+            fixed_source: None,
         }
     }
 
@@ -3175,6 +3202,12 @@ impl Datagram {
         options: Option<Arc<crate::sockopt::SocketOptions>>,
     ) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Keep the flow's explicit source so a route move cannot replace it with a kernel default.
+    pub(crate) fn with_source(mut self, source: Option<IpAddr>) -> Self {
+        self.fixed_source = source;
         self
     }
 
@@ -3233,6 +3266,7 @@ impl Datagram {
             proxy_peer: None,
             proxy_stop: None,
             options: None,
+            fixed_source: None,
         }
     }
 
@@ -3256,6 +3290,7 @@ impl Datagram {
             proxy_peer: None,
             proxy_stop: None,
             options: None,
+            fixed_source: None,
         }
     }
 
@@ -3281,6 +3316,7 @@ impl Datagram {
             proxy_peer: None,
             proxy_stop: None,
             options: None,
+            fixed_source: None,
         }
     }
 
@@ -3311,6 +3347,7 @@ impl Datagram {
             proxy_peer: None,
             proxy_stop: None,
             options: None,
+            fixed_source: None,
         })
     }
 
@@ -3343,6 +3380,7 @@ impl Datagram {
             proxy_peer: None,
             proxy_stop: None,
             options: None,
+            fixed_source: None,
         })
     }
 
@@ -3377,6 +3415,7 @@ impl Datagram {
             proxy_peer: None,
             proxy_stop: None,
             options: None,
+            fixed_source: None,
         })
     }
 
@@ -3607,6 +3646,7 @@ impl Datagram {
             proxy_peer: self.proxy_peer,
             proxy_stop: self.proxy_stop.clone(),
             options: self.options.clone(),
+            fixed_source: self.fixed_source,
         })
     }
 
@@ -4427,7 +4467,7 @@ impl Drop for PumpExit<'_> {
 #[allow(clippy::too_many_lines)]
 fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
     #[cfg(test)]
-    let port = pooled.key.port;
+    let port = pooled.key.server.port;
     let Ok(flush_sock) = pooled.sock.try_clone() else {
         leave_session(&pooled.table, id);
         return;
@@ -4678,7 +4718,7 @@ pub(crate) fn lane_handed_back(dial: &QuicDial) -> bool {
 /// The lane a dial would be handed, read without judging it: a witness that retired what it was looking at would hide the leak it names.
 #[cfg(test)]
 fn peek(dial: &QuicDial) -> Option<PooledConn> {
-    let key = QuicServer::of(dial);
+    let key = PoolKey::of(dial)?;
     pool()
         .inner
         .lock()
@@ -4738,7 +4778,9 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
         let sock = match relay.as_ref() {
             Some((control, via)) => Datagram::relayed(sock, *via, Arc::clone(control)),
             None => Datagram::plain(sock),
-        };
+        }
+        .with_options(flow.clone())
+        .with_source(source);
         let bound = resolved.map(|_| Instant::now());
         let Some((conn, _early)) = handshake_within(
             &sock,
@@ -4773,7 +4815,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             table,
             sock: Arc::new(sock),
             peer,
-            key: Arc::new(QuicServer::of(dial)),
+            key: Arc::new(PoolKey::of(dial)?),
         });
     }
     None

@@ -502,6 +502,8 @@ struct Inner {
     resets: Mutex<Option<SyncSender<u32>>>,
     credits: Mutex<Option<SyncSender<()>>>,
     pending_credit: AtomicUsize,
+    /// Resets queued or draining: admission counts them against the stream cap so churn cannot fill the bounded reset channel and close unrelated streams.
+    pending_resets: AtomicUsize,
     accept_tx: Mutex<Option<Sender<Stream>>>,
     accept_rx: Mutex<Receiver<Stream>>,
     next_id: AtomicU32,
@@ -531,6 +533,7 @@ impl Inner {
             resets: Mutex::new(None),
             credits: Mutex::new(None),
             pending_credit: AtomicUsize::new(0),
+            pending_resets: AtomicUsize::new(0),
             accept_tx: Mutex::new(Some(accept_tx)),
             accept_rx: Mutex::new(accept_rx),
             next_id: AtomicU32::new(if role == Role::Client { 1 } else { 2 }),
@@ -692,7 +695,10 @@ impl Inner {
         } else {
             MAX_STREAMS
         };
-        self.sinks.lock().is_ok_and(|sinks| sinks.len() < cap)
+        let pending = self.pending_resets.load(Ordering::Acquire);
+        self.sinks
+            .lock()
+            .is_ok_and(|sinks| sinks.len().saturating_add(pending) < cap)
     }
 
     fn expect_status(&self, id: u32) {
@@ -855,10 +861,12 @@ impl Inner {
             return;
         }
         if resets.is_some() {
+            self.pending_resets.fetch_add(1, Ordering::AcqRel);
             let failed = resets
                 .as_ref()
                 .is_some_and(|sender| sender.try_send(id).is_err());
             if failed {
+                self.pending_resets.fetch_sub(1, Ordering::AcqRel);
                 drop(resets);
                 self.finish_deferred();
             }
@@ -874,6 +882,7 @@ impl Inner {
                         break;
                     };
                     inner.send_reset(id);
+                    inner.pending_resets.fetch_sub(1, Ordering::AcqRel);
                 }
             });
         if spawned.is_err() {
@@ -883,7 +892,10 @@ impl Inner {
         }
         *resets = Some(sender.clone());
         drop(resets);
-        let _ = sender.try_send(id);
+        self.pending_resets.fetch_add(1, Ordering::AcqRel);
+        if sender.try_send(id).is_err() {
+            self.pending_resets.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     fn defer_credit(&self, credit: usize) {

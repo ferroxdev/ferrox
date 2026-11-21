@@ -9,7 +9,7 @@ use std::time::Duration;
 /// socket it dials. Inbound-only fields are read and left alone, as the reference leaves them.
 /// The transparent spelling a socket config names, as xray's `TProxyMode` reads it.
 #[allow(clippy::enum_variant_names)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) enum Tproxy {
     #[default]
     Off,
@@ -19,7 +19,7 @@ pub(crate) enum Tproxy {
 
 /// xray's `AddressPortStrategy`: which half of a named edge an SRV or TXT
 /// answer replaces before the socket is dialled.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) enum AddressPortStrategy {
     #[default]
     None,
@@ -47,7 +47,7 @@ impl AddressPortStrategy {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub(crate) struct SocketOptions {
     mark: Option<i32>,
     tfo: Option<i32>,
@@ -95,7 +95,11 @@ impl PartialEq for RouteLink {
 
 impl Eq for RouteLink {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl std::hash::Hash for RouteLink {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum KeepAlive {
     /// xray starts from Chrome's 45-second defaults whenever a socket config exists.
     Enabled {
@@ -105,7 +109,7 @@ enum KeepAlive {
     Disabled,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 enum DomainStrategy {
     #[default]
     AsIs,
@@ -120,7 +124,7 @@ enum DomainStrategy {
     ForceIp64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CustomSockopt {
     system: String,
     network: String,
@@ -129,7 +133,7 @@ struct CustomSockopt {
     value: CustomValue,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CustomValue {
     Int(i32),
     Str(String),

@@ -1059,10 +1059,13 @@ impl Pool {
         self.run.notify_all();
     }
 
-    /// Wait for every promised job, giving up if the lane is cancelled underneath: a relay tearing down has no reader left to wait for.
-    fn wait_settled(&self, wake: &Wake) -> bool {
+    /// Wait for every promised job, giving up if the lane is cancelled or a sink failure is latched: a relay tearing down has no reader left to wait for.
+    fn wait_settled(&self, wake: &Wake, failed: impl Fn() -> bool) -> bool {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         for _ in 0..DRAIN_TRIES {
+            if failed() {
+                return false;
+            }
             if queue.left == 0 {
                 return true;
             }
@@ -1422,8 +1425,14 @@ impl Writer {
         self.ticker.done.store(true, Ordering::Release);
         Clock::global().wakeup();
         self.uploads.shut();
-        if !self.uploads.wait_settled(&self.sink.wake) {
+        if !self
+            .uploads
+            .wait_settled(&self.sink.wake, || self.sink.failure().is_some())
+        {
             self.uploads.abort();
+            if let Some(message) = self.sink.failure() {
+                return Err(carrier_error(message));
+            }
             return Err(carrier_error(
                 "the store stopped answering the last segments".to_owned(),
             ));
