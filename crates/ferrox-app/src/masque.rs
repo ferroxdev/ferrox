@@ -2714,12 +2714,7 @@ pub(crate) fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u
 }
 
 /// Hand a datagram's inner packet to the stack or a UDP lane, retaining the prefix the stack records as its offset.
-fn deliver_owned(
-    to_stack: &Sender<Packet>,
-    routes: &UdpRoutes,
-    mut datagram: Vec<u8>,
-    offset: usize,
-) {
+fn deliver_owned(to_stack: &Sender<Packet>, routes: &UdpRoutes, datagram: Vec<u8>, offset: usize) {
     let Some(to) = delivery(routes, &datagram[offset..]) else {
         return;
     };

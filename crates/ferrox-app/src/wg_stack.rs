@@ -5992,23 +5992,6 @@ mod client_tests {
             "one peer narrowed the MTU every peer shares"
         );
     }
-}
-
-#[cfg(all(test, unix))]
-mod readiness_tests {
-    use super::*;
-    use std::os::unix::net::UnixStream;
-
-    #[test]
-    fn readiness_names_only_the_stream_with_bytes() {
-        let (first, mut first_peer) = UnixStream::pair().expect("first pair");
-        let (second, _second_peer) = UnixStream::pair().expect("second pair");
-        let locals = [Connection::from(first), Connection::from(second)];
-        let mut readiness = Readiness::new();
-        assert_eq!(readiness.sync_locals(locals.iter()), &[false, false]);
-        first_peer.write_all(b"x").expect("write");
-        assert_eq!(readiness.sync_locals(locals.iter()), &[true, false]);
-    }
 
     /// A reply datagram reaches its lane in the buffer the tunnel read, and the lane's return puts
     /// that same allocation back in the pool; a packet no lane claims comes back untouched.
@@ -6060,5 +6043,22 @@ mod readiness_tests {
             base,
             "and the packet comes back as it went in"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod readiness_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn readiness_names_only_the_stream_with_bytes() {
+        let (first, mut first_peer) = UnixStream::pair().expect("first pair");
+        let (second, _second_peer) = UnixStream::pair().expect("second pair");
+        let locals = [Connection::from(first), Connection::from(second)];
+        let mut readiness = Readiness::new();
+        assert_eq!(readiness.sync_locals(locals.iter()), &[false, false]);
+        first_peer.write_all(b"x").expect("write");
+        assert_eq!(readiness.sync_locals(locals.iter()), &[true, false]);
     }
 }
