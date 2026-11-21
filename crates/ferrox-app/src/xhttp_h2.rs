@@ -4400,37 +4400,32 @@ mod tests {
     }
 
     /// A frame body reads into the room the last reader handed back: the same buffer comes back, a
-    /// shorter frame zeroes nothing, and only a longer frame pays for the tail it grows.
+    /// shorter frame zeroes nothing, and a longer frame takes its own zeroed room. Each take is its
+    /// own window, so the row reads the frame's cost and not the pool's first allocation.
     #[test]
     fn a_frames_body_reuses_the_buffer_the_last_reader_handed_back() {
         let (conn, _, _) = bare_conn();
-        let (first, counts) = ferrox_core::alloc_count::measure(|| {
-            let body = conn.take_body(4096);
-            let ptr = body.as_ptr();
-            conn.spare_body(body);
-            let body = conn.take_body(4096);
-            assert_eq!(body.as_ptr(), ptr, "the same buffer came back");
-            assert_eq!(body.len(), 4096);
-            conn.spare_body(body);
-            ptr
-        });
-        assert_eq!(counts.zeroed_bytes, 4096, "only the first body is zeroed");
-        assert_eq!(counts.allocs, 1, "the second frame allocates nothing");
-        let ((), counts) = ferrox_core::alloc_count::measure(|| {
-            let body = conn.take_body(1000);
-            assert_eq!(body.len(), 1000);
-            assert_eq!(body.as_ptr(), first);
-            conn.spare_body(body);
-        });
+        let (body, counts) = ferrox_core::alloc_count::measure(|| conn.take_body(4096));
+        assert_eq!(counts.zeroed_bytes, 4096, "the first body is zeroed once");
+        let first = body.as_ptr();
+        conn.spare_body(body);
+        let (body, counts) = ferrox_core::alloc_count::measure(|| conn.take_body(4096));
+        assert_eq!(body.as_ptr(), first, "the same buffer came back");
+        assert_eq!(body.len(), 4096);
+        assert_eq!(counts.allocs, 0, "the second frame allocates nothing");
+        assert_eq!(counts.zeroed_bytes, 0, "and zeroes nothing");
+        conn.spare_body(body);
+        let (body, counts) = ferrox_core::alloc_count::measure(|| conn.take_body(1000));
+        assert_eq!(body.len(), 1000);
+        assert_eq!(body.as_ptr(), first);
+        assert_eq!(counts.allocs, 0, "a shorter frame reuses the room");
         assert_eq!(
             counts.zeroed_bytes, 0,
             "a shorter frame reads initialized bytes"
         );
-        let ((), counts) = ferrox_core::alloc_count::measure(|| {
-            let body = conn.take_body(8192);
-            assert_eq!(body.len(), 8192);
-            conn.spare_body(body);
-        });
+        conn.spare_body(body);
+        let (body, counts) = ferrox_core::alloc_count::measure(|| conn.take_body(8192));
+        assert_eq!(body.len(), 8192);
         assert_eq!(
             counts.zeroed_bytes, 8192,
             "a longer frame pays for its own zeroed room"

@@ -868,7 +868,7 @@ mod tests {
         assert_eq!(found.as_deref(), Some("www.google.com"));
         assert_eq!(packet, arrived, "the header mask is put back byte for byte");
         let mut tailed = arrived.clone();
-        tailed.extend(std::iter::repeat(0xa5u8).take(4096));
+        tailed.extend(std::iter::repeat_n(0xa5u8, 4096));
         let (found, counts) = ferrox_core::alloc_count::measure(|| sniff_quic(&mut tailed));
         assert_eq!(found.as_deref(), Some("www.google.com"));
         assert_eq!(
