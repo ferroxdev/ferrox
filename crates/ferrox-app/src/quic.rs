@@ -1628,9 +1628,10 @@ pub(crate) fn pump_once(
                     let _ = conn.recv(bytes, info);
                     taken += 1;
                 }
-                // Re-armed once the packets the visit waited for land: what follows is queued and costs no wait, or is not coming yet and the caller's deadline should wait for it; a failed re-arm leaves the first arm in place.
+                // Re-armed once the packets the visit waited for land: what follows is queued and costs no wait, or is not coming yet and the caller's deadline should wait for it; a failed re-arm leaves the first arm in place. The ack for what just landed leaves before that wait, or the peer is paced by this loop's own tail instead of its round trip.
                 if taken > 0 {
                     let _ = sock.refresh_read_timeout(PUMP_TAIL);
+                    flush_egress(conn, sock);
                 }
                 if taken >= PUMP_BURST {
                     break;
@@ -1652,9 +1653,10 @@ pub(crate) fn pump_once(
                 let info = quiche::RecvInfo { from, to: local };
                 let _ = conn.recv(&mut buf[..n], info);
                 taken += 1;
-                // Re-armed once the packet the visit waited for lands: what follows is queued and costs no wait, or is not coming yet and the caller's deadline should wait for it; a failed re-arm leaves the first arm in place.
+                // Re-armed once the packet the visit waited for lands: what follows is queued and costs no wait, or is not coming yet and the caller's deadline should wait for it; a failed re-arm leaves the first arm in place. The ack for what just landed leaves before that wait, or the peer is paced by this loop's own tail instead of its round trip.
                 if taken == 1 {
                     let _ = sock.refresh_read_timeout(PUMP_TAIL);
+                    flush_egress(conn, sock);
                 }
                 if taken == PUMP_BURST {
                     break;
