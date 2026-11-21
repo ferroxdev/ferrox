@@ -350,17 +350,7 @@ mod tests {
         let peer = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
         let target: Ipv6Addr = "2001:db8::1".parse().unwrap();
         let asker: Ipv6Addr = "fe80::9".parse().unwrap();
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&[0x33, 0x33, 0xff, 0, 0, 1]);
-        frame.extend_from_slice(&peer);
-        frame.extend_from_slice(&IPV6.to_be_bytes());
-        frame.extend_from_slice(&[0x60, 0, 0, 0]);
-        frame.extend_from_slice(&24u16.to_be_bytes());
-        frame.extend_from_slice(&[ICMPV6, 255]);
-        frame.extend_from_slice(&asker.octets());
-        frame.extend_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-        frame.extend_from_slice(&[NEIGHBOR_SOLICITATION, 0, 0, 0, 0, 0, 0, 0]);
-        frame.extend_from_slice(&target.octets());
+        let frame = ns_frame(peer, asker, target);
         let Accepted::Reply(reply) = bridge.accept(&frame) else {
             panic!("a solicitation for its address is answered");
         };
@@ -532,7 +522,7 @@ mod tests {
         let target: Ipv6Addr = "2001:db8::1".parse().unwrap();
         let asker: Ipv6Addr = "fe80::9".parse().unwrap();
         let mut bad = ns_frame(peer, asker, target);
-        bad[7] = 64;
+        bad[21] = 64;
         assert!(matches!(bridge.accept(&bad), Accepted::Ignore));
         let mut bad = ns_frame(peer, asker, target);
         bad[56] ^= 0xff;
