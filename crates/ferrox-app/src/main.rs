@@ -1031,18 +1031,38 @@ fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
 }
 
 fn config_extension(source: &str) -> &str {
-    let path = if ["http://", "https://", "http+unix://"]
-        .iter()
-        .any(|prefix| source.starts_with(prefix))
-    {
-        source.split(['?', '#']).next().unwrap_or(source)
-    } else {
-        source
-    };
+    let path = http_target(source).unwrap_or(source);
     std::path::Path::new(path)
         .extension()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default()
+}
+
+fn http_target(source: &str) -> Option<&str> {
+    if let Some(raw) = source.strip_prefix("http+unix://") {
+        if let Some((socket, target)) = raw.split_once(":/") {
+            if is_socket_path(socket) {
+                return Some(without_query(target));
+            }
+        }
+        return Some(without_query(source));
+    }
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return Some(without_query(source));
+    }
+    let raw = source.strip_prefix("sock:").unwrap_or(source);
+    if let Some((socket, target)) = raw.split_once(":/") {
+        if is_socket_path(socket) {
+            return Some(without_query(target));
+        }
+    } else if source.starts_with("sock:") || raw.starts_with('@') {
+        return Some("");
+    }
+    None
+}
+
+fn without_query(text: &str) -> &str {
+    text.split(['?', '#']).next().unwrap_or(text)
 }
 
 fn redact_source(source: &str) -> std::borrow::Cow<'_, str> {
@@ -1887,6 +1907,29 @@ mod tests {
             crate::source_format(None, "site#blue.yaml"),
             crate::SourceFormat::Yaml
         ));
+        assert!(matches!(
+            crate::source_format(None, "site?blue.yaml"),
+            crate::SourceFormat::Yaml
+        ));
+    }
+
+    #[test]
+    fn a_queried_socket_target_keeps_its_format() {
+        for source in [
+            "sock:/tmp/config.sock:/config.yaml?rev=2",
+            "/tmp/config.sock:/config.yaml?rev=2",
+            "@ferrox/config.sock:/config.yaml?rev=2",
+            "http+unix:///tmp/config.sock:/config.yaml?rev=2",
+            "/tmp/config.sock:/config.yaml#rev",
+        ] {
+            assert!(
+                matches!(
+                    crate::source_format(None, source),
+                    crate::SourceFormat::Yaml
+                ),
+                "{source}"
+            );
+        }
     }
 
     #[test]
