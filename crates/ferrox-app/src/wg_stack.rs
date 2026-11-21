@@ -5210,7 +5210,6 @@ mod tests {
         let (lane, replies) = std::sync::mpsc::channel();
         stack.routes.lock().expect("routes").insert(4321, lane);
         let mut bytes = vec![0u8; 16];
-        let base = bytes.as_ptr();
         assert!(udp_datagram(
             &UdpDatagram {
                 source: &[10, 0, 0, 2],
@@ -5221,6 +5220,7 @@ mod tests {
             },
             &mut bytes,
         ));
+        let base = bytes.as_ptr();
         let want = bytes[16..].to_vec();
         assert_eq!(stack.deliver_udp(bytes, 16), None, "the lane takes it");
         let packet = replies.recv().expect("the lane's packet");
@@ -5232,7 +5232,6 @@ mod tests {
         assert_eq!(returned.as_ptr(), base, "the same allocation comes back");
 
         let mut bytes = vec![7u8; 16];
-        let base = bytes.as_ptr();
         assert!(udp_datagram(
             &UdpDatagram {
                 source: &[10, 0, 0, 2],
@@ -5243,6 +5242,7 @@ mod tests {
             },
             &mut bytes,
         ));
+        let base = bytes.as_ptr();
         let back = stack.deliver_udp(bytes, 16).expect("no lane claims it");
         assert_eq!(
             back.as_ptr(),
