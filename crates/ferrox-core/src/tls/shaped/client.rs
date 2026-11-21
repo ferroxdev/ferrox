@@ -3667,6 +3667,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_key_update_reply_is_sealed_before_the_write_key_advances() {
         let suite = Suite::Aes128GcmSha256;
