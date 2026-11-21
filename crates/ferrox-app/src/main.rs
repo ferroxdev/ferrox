@@ -1041,7 +1041,7 @@ fn config_extension(source: &str) -> &str {
 fn http_target(source: &str) -> Option<&str> {
     if let Some(raw) = source.strip_prefix("http+unix://") {
         if let Some((socket, target)) = raw.split_once(":/") {
-            if socket.starts_with('/') || socket.starts_with('@') {
+            if is_socket_endpoint(socket) {
                 return Some(without_query(target));
             }
         }
@@ -1052,13 +1052,17 @@ fn http_target(source: &str) -> Option<&str> {
     }
     let raw = source.strip_prefix("sock:").unwrap_or(source);
     if let Some((socket, target)) = raw.split_once(":/") {
-        if socket.starts_with('/') || socket.starts_with('@') {
+        if is_socket_endpoint(socket) {
             return Some(without_query(target));
         }
-    } else if source.starts_with("sock:") || raw.starts_with('@') {
+    } else if (source.starts_with("sock:") || raw.starts_with('@')) && is_socket_endpoint(raw) {
         return Some("");
     }
     None
+}
+
+fn is_socket_endpoint(path: &str) -> bool {
+    path.starts_with('/') || path.starts_with('@') || is_socket_path(path)
 }
 
 fn without_query(text: &str) -> &str {
@@ -1909,6 +1913,20 @@ mod tests {
         ));
         assert!(matches!(
             crate::source_format(None, "site?blue.yaml"),
+            crate::SourceFormat::Yaml
+        ));
+        #[cfg(unix)]
+        assert!(matches!(
+            crate::source_format(None, "sock:local.yaml"),
+            crate::SourceFormat::Yaml
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_socket_target_keeps_its_format() {
+        assert!(matches!(
+            crate::source_format(None, r"sock:C:\config\server.sock:/config.yaml?rev=2"),
             crate::SourceFormat::Yaml
         ));
     }
