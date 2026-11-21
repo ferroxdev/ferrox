@@ -1,7 +1,7 @@
 use std::mem::MaybeUninit;
 
 use crate::poly1305::Poly1305;
-use crate::record::{blocks_for, fill_exact, fill_exact_with_head};
+use crate::record::{fill_exact, fill_exact_with_head};
 
 /// Thirty-two bytes of block zero's keystream, requested at that length so the block's second half is never staged.
 fn poly_key(chacha_key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
