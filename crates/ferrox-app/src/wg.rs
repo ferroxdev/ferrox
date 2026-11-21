@@ -3386,7 +3386,11 @@ mod tests {
                     table
                         .get(&datagram.source_port)
                         .expect("the exchange reserved a route")
-                        .send(inner)
+                        .send(wg_stack::LanePacket {
+                            bytes: inner,
+                            at: 0,
+                            recycle: None,
+                        })
                         .expect("the answer reaches the route");
                     let _ = sent.send(count);
                     return;

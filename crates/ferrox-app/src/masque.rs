@@ -2671,7 +2671,7 @@ fn io(
 }
 
 enum Delivery {
-    Udp(Sender<Vec<u8>>),
+    Udp(Sender<wg_stack::LanePacket>),
     Stack,
 }
 
@@ -2696,7 +2696,11 @@ fn delivery(routes: &UdpRoutes, packet: &[u8]) -> Option<Delivery> {
 pub(crate) fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u8]) {
     match delivery(routes, packet) {
         Some(Delivery::Udp(lane)) => {
-            let _ = lane.send(packet.to_vec());
+            let _ = lane.send(wg_stack::LanePacket {
+                bytes: packet.to_vec(),
+                at: 0,
+                recycle: None,
+            });
         }
         Some(Delivery::Stack) => {
             let _ = to_stack.send(Packet {
@@ -2721,8 +2725,11 @@ fn deliver_owned(
     };
     match to {
         Delivery::Udp(lane) => {
-            datagram.drain(..offset);
-            let _ = lane.send(datagram);
+            let _ = lane.send(wg_stack::LanePacket {
+                bytes: datagram,
+                at: offset,
+                recycle: None,
+            });
         }
         Delivery::Stack => {
             let _ = to_stack.send(Packet {
