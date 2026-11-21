@@ -360,10 +360,11 @@ impl MasterKey {
         let mut digest = md5::compute(password.as_bytes()).0;
         bytes.extend_from_slice(&digest);
         for _ in 1..rounds {
-            let mut input = Vec::with_capacity(16 + password.len());
-            input.extend_from_slice(&digest);
-            input.extend_from_slice(password.as_bytes());
-            digest = md5::compute(&input).0;
+            // Hashing `digest || password` in one context keeps the join off the heap.
+            let mut context = md5::Context::new();
+            context.consume(digest);
+            context.consume(password.as_bytes());
+            digest = context.finalize().0;
             bytes.extend_from_slice(&digest);
         }
         bytes.truncate(key_len);
@@ -452,6 +453,19 @@ mod tests {
             &long.as_bytes()[..16],
             "a truncated derivation is the shorter one"
         );
+    }
+
+    /// The chained round streams `digest || password` into the hasher, so the key's own
+    /// buffer is the only allocation a dial pays for it; a scratch `Vec` per extra round
+    /// would show up here as one more allocation for every 32-byte method.
+    #[test]
+    fn a_master_key_is_one_allocation() {
+        let (key, counts) = crate::alloc_count::measure(|| MasterKey::new("secret", 32));
+        assert_eq!(key.rounds(), 2, "the case with a chained round");
+        assert_eq!(counts.allocs, 1, "no scratch buffer beside the key");
+        assert_eq!(counts.bytes, 32, "the key is exactly its own bytes");
+        let (_, short) = crate::alloc_count::measure(|| MasterKey::new("secret", 16));
+        assert_eq!(short.allocs, 1, "and the one-round case is the same");
     }
 
     #[test]
