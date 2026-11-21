@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{Stream, TlsError, TlsProvider};
 use crate::tls::rustls_backend::RustlsServerProvider;
@@ -24,6 +24,8 @@ const SIGNATURE_LEN: usize = 64;
 const MAX_RECORD: usize = 16_384 + 2_048;
 const MAX_HELLO: usize = 1 << 16;
 const WAIT_LIMIT: usize = 4096;
+/// The whole hello's budget, so a peer that trickles one byte per wait cannot hold the accept thread.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 
 const ED25519_SEED: [u8; 32] = [
     0x64, 0x6f, 0x76, 0x65, 0x74, 0x61, 0x69, 0x6c, 0x2d, 0x72, 0x65, 0x61, 0x6c, 0x69, 0x74, 0x79,
@@ -154,7 +156,8 @@ impl<S: Stream> RealityServer<S> {
         edges: Edges,
     ) -> Result<RealityAccept<S>, TlsError> {
         let mut replay = Replay::new(RecordLimiter::new(io));
-        let (mut raw, mut body, hello) = match read_client_hello(&mut replay) {
+        let deadline = Instant::now() + HELLO_TIMEOUT;
+        let (mut raw, mut body, hello) = match read_client_hello(&mut replay, deadline) {
             Ok(heard) => heard,
             Err((why, read)) => {
                 if read.is_empty() {
@@ -695,13 +698,16 @@ enum Body {
     Split(Vec<u8>),
 }
 
-fn read_client_hello<S: Read>(io: &mut S) -> Result<(Vec<u8>, Body, ClientHello), Refused> {
+fn read_client_hello<S: Read>(
+    io: &mut S,
+    deadline: Instant,
+) -> Result<(Vec<u8>, Body, ClientHello), Refused> {
     let mut raw: Vec<u8> = Vec::new();
     let mut split: Vec<u8> = Vec::new();
     let mut header = [0u8; 5];
     let mut first = true;
     loop {
-        if read_to_fill(io, &mut header) != header.len() {
+        if read_to_fill(io, &mut header, deadline) != header.len() {
             return Err((TlsError::Closed, raw));
         }
         if header[0] != 0x16 {
@@ -722,7 +728,7 @@ fn read_client_hello<S: Read>(io: &mut S) -> Result<(Vec<u8>, Body, ClientHello)
         let at = raw.len();
         raw.resize(at + 5 + len, 0);
         raw[at..at + 5].copy_from_slice(&header);
-        let filled = read_to_fill(io, &mut raw[at + 5..]);
+        let filled = read_to_fill(io, &mut raw[at + 5..], deadline);
         raw.truncate(at + 5 + filled);
         if filled < len {
             return Err((TlsError::Closed, raw));
@@ -763,10 +769,14 @@ fn read_client_hello<S: Read>(io: &mut S) -> Result<(Vec<u8>, Body, ClientHello)
 /// a hello it cannot authenticate.
 type Refused = (TlsError, Vec<u8>);
 
-pub(crate) fn read_to_fill<R: Read>(io: &mut R, buf: &mut [u8]) -> usize {
+pub(crate) fn read_to_fill<R: Read>(io: &mut R, buf: &mut [u8], deadline: Instant) -> usize {
     let mut at = 0;
     let mut waits = 0;
     while at < buf.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
         match io.read(&mut buf[at..]) {
             Ok(0) => break,
             Ok(n) => at += n,
@@ -775,7 +785,7 @@ pub(crate) fn read_to_fill<R: Read>(io: &mut R, buf: &mut [u8]) -> usize {
                 if waits > WAIT_LIMIT {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_millis(1).min(left));
             }
             Err(_) => break,
         }
@@ -3114,7 +3124,9 @@ mod tests {
         let bytes = good_hello();
         let body = &bytes[5..];
         let mut dribble = Dribble::of(&bytes);
-        let (mut raw, heard, hello) = read_client_hello(&mut dribble).expect("reads whole");
+        let (mut raw, heard, hello) =
+            read_client_hello(&mut dribble, Instant::now() + Duration::from_secs(30))
+                .expect("reads whole");
         assert_eq!(raw, bytes, "the record stream is kept whole");
         let Body::Inline { len: whole } = heard else {
             panic!("one record stays inline");
@@ -3508,8 +3520,10 @@ mod tests {
     fn reading_a_single_record_hello_allocates_one_buffer() {
         let bytes = good_hello();
         let mut dribble = Dribble::of(&bytes);
-        let ((raw, body, hello), counts) =
-            crate::alloc_count::measure(|| read_client_hello(&mut dribble).expect("reads whole"));
+        let ((raw, body, hello), counts) = crate::alloc_count::measure(|| {
+            read_client_hello(&mut dribble, Instant::now() + Duration::from_secs(30))
+                .expect("reads whole")
+        });
         assert_eq!(
             counts.allocs, 1,
             "the body is read out of the record stream: {counts:?}"
@@ -3535,8 +3549,10 @@ mod tests {
         second.extend_from_slice(&body[half..]);
         split.extend_from_slice(&second);
         let mut dribble = Dribble::of(&split);
-        let ((raw, heard, hello), counts) =
-            crate::alloc_count::measure(|| read_client_hello(&mut dribble).expect("reads whole"));
+        let ((raw, heard, hello), counts) = crate::alloc_count::measure(|| {
+            read_client_hello(&mut dribble, Instant::now() + Duration::from_secs(30))
+                .expect("reads whole")
+        });
         assert_eq!(raw, split);
         let Body::Split(gathered) = heard else {
             panic!("two records gather aside");
@@ -3546,6 +3562,23 @@ mod tests {
         assert_eq!(
             counts.allocs, 4,
             "one stream plus one gather, each grown once: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn a_hello_that_never_finishes_ends_at_its_deadline() {
+        struct Mute;
+        impl Read for Mute {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+        let start = Instant::now();
+        let outcome = read_client_hello(&mut Mute, start + Duration::from_millis(20));
+        assert!(outcome.is_err(), "a hello that never arrives is refused");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "and the overall deadline ends it, not the retry cap"
         );
     }
 

@@ -3668,6 +3668,35 @@ mod tests {
     }
 
     #[test]
+    fn a_key_update_reply_is_sealed_before_the_write_key_advances() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [23u8; 32];
+        let mut subject = session(
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+        subject.hs = vec![24, 0, 0, 1, 1];
+        subject.post_handshake().expect("the reply is queued");
+        let reply = std::mem::take(&mut subject.reply);
+        let header: [u8; 5] = reply[..5].try_into().expect("a record header");
+        let mut opened = reply[5..].to_vec();
+        let mut old = Direction::tls13(suite, &secret);
+        let (kind, len) = record::open13(&mut old, header, &mut opened)
+            .expect("the peer opens the reply under the key it already holds");
+        assert_eq!(kind, HANDSHAKE);
+        assert_eq!(&opened[..len], &[24, 0, 0, 1, 0]);
+        let mut advanced = Direction::tls13(suite, &secret);
+        advanced.update();
+        let mut again = reply[5..].to_vec();
+        assert!(
+            record::open13(&mut advanced, header, &mut again).is_err(),
+            "the advanced key is not the one that sealed it"
+        );
+    }
+
+    #[test]
     fn a_write_that_stalls_with_a_partial_record_resumes_it() {
         let suite = Suite::Aes128GcmSha256;
         let secret = [17u8; 32];
