@@ -148,7 +148,9 @@ impl<S: Stream> RealityServer<S> {
     /// with the splice. A hello that does not authenticate and has no cover
     /// origin configured is an error, which is the whole of a refusal. A peer
     /// that broke the parse rules is spliced too, carrying the bytes it already
-    /// spent; only one that sent nothing at all is closed.
+    /// spent; only one that sent nothing at all is closed. The read spends at
+    /// most `HELLO_TIMEOUT`, checked between reads, so the transport returns on
+    /// its own poll quantum or read timeout rather than blocking forever.
     pub fn accept(
         cfg: &RealityServerConfig,
         now_ms: u64,
