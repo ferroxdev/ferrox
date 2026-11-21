@@ -545,3 +545,432 @@ fn a_later_config_file_replaces_an_inbound_the_handler_builds() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn configuration(extension: &str) -> String {
+    match extension {
+        "yaml" | "yml" => r"inbounds:
+  - tag: in
+    listen: 127.0.0.1
+    port: 0
+    protocol: socks
+    settings:
+      auth: noauth
+outbounds:
+  - protocol: freedom
+"
+        .to_owned(),
+        "toml" => r#"[[inbounds]]
+tag = "in"
+listen = "127.0.0.1"
+port = 0
+protocol = "socks"
+[inbounds.settings]
+auth = "noauth"
+
+[[outbounds]]
+protocol = "freedom"
+"#
+        .to_owned(),
+        _ => r#"{"inbounds":[{"tag":"in","listen":"127.0.0.1","port":0,"protocol":"socks","settings":{"auth":"noauth"}}],"outbounds":[{"protocol":"freedom"}]}"#.to_owned(),
+    }
+}
+
+/// A YAML or TOML spelling reaches the same handler build and the same merged dump as JSON.
+#[test]
+fn yaml_and_toml_configs_build_and_dump_like_json() {
+    for extension in ["yaml", "toml"] {
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-test-{extension}-{}.{extension}",
+            std::process::id()
+        ));
+        std::fs::write(&path, configuration(extension)).expect("write config");
+        let named = path.to_string_lossy().into_owned();
+        let tested = run(&["-test", "-c", &named]);
+        assert_eq!(
+            tested.status.code(),
+            Some(0),
+            "`-test` refused a {extension} config: {}{}",
+            String::from_utf8_lossy(&tested.stdout),
+            String::from_utf8_lossy(&tested.stderr)
+        );
+        let dumped = run(&["-dump", "-c", &named]);
+        let stdout = String::from_utf8_lossy(&dumped.stdout);
+        assert_eq!(dumped.status.code(), Some(0), "{stdout}");
+        assert!(
+            stdout.contains(r#""tag":"in""#)
+                && stdout.contains(r#""protocol":"socks""#)
+                && stdout.contains(r#""protocol":"freedom""#),
+            "`-dump` dropped the {extension} config: {stdout}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+fn read_close(stream: &mut std::net::TcpStream, closed: &std::sync::atomic::AtomicBool) {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .expect("keep-alive read timeout");
+    let mut byte = [0u8; 1];
+    closed.store(
+        matches!(std::io::Read::read(stream, &mut byte), Ok(0)),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// A config served over HTTP is fetched like a file; a 404 and every wire shape keep the status the reference reports.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn http_config_is_fetched_and_a_missing_one_is_refused() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write as _;
+
+    let body = configuration("json");
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body.as_bytes()).expect("gzip config");
+    let gzip = encoder.finish().expect("finish gzip");
+    let split = body.len() / 2;
+    let chunked = format!(
+        "{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+        split,
+        &body[..split],
+        body.len() - split,
+        &body[split..]
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP config server");
+    let address = listener.local_addr().expect("HTTP config address");
+    let keep_alive_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let closed = keep_alive_closed.clone();
+    let server = std::thread::spawn(move || {
+        for _ in 0..7 {
+            let (mut stream, _) = listener.accept().expect("accept HTTP config request");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = std::io::Read::read(&mut stream, &mut chunk).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            let path = request.split_whitespace().nth(1).unwrap_or_default();
+            let (status, extra, body) = match path {
+                "/config.json" | "/keep-alive" => ("200 OK", "", body.as_bytes().to_vec()),
+                "/chunked" => (
+                    "200 OK",
+                    "Transfer-Encoding: chunked\r\n",
+                    chunked.as_bytes().to_vec(),
+                ),
+                "/gzip" => ("200 OK", "Content-Encoding: gzip\r\n", gzip.clone()),
+                "/redirect" => ("302 Found", "Location: /config.json\r\n", Vec::new()),
+                _ => ("404 Not Found", "", b"missing".to_vec()),
+            };
+            let close = if path == "/keep-alive" {
+                ""
+            } else {
+                "Connection: close\r\n"
+            };
+            let length = if path == "/chunked" {
+                String::new()
+            } else {
+                format!("Content-Length: {}\r\n", body.len())
+            };
+            let head = format!("HTTP/1.1 {status}\r\n{length}{extra}{close}\r\n");
+            std::io::Write::write_all(&mut stream, head.as_bytes()).expect("write HTTP head");
+            std::io::Write::write_all(&mut stream, &body).expect("write HTTP body");
+            if path == "/keep-alive" {
+                read_close(&mut stream, &closed);
+            }
+        }
+    });
+    let source = format!("http://{address}/config.json");
+    let output = run(&["-test", "-c", &source]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "`-test` refused an HTTP config: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for path in ["/chunked", "/gzip", "/redirect"] {
+        let output = run(&["-test", "-c", &format!("http://{address}{path}")]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "`-test` refused {path}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let keep_alive = run(&["-test", "-c", &format!("http://{address}/keep-alive")]);
+    assert_eq!(
+        keep_alive.status.code(),
+        Some(0),
+        "`-test` refused a keep-alive body: {}{}",
+        String::from_utf8_lossy(&keep_alive.stdout),
+        String::from_utf8_lossy(&keep_alive.stderr)
+    );
+    let missing = run(&["-test", "-c", &format!("http://{address}/missing")]);
+    let stdout = String::from_utf8_lossy(&missing.stdout);
+    assert_eq!(missing.status.code(), Some(23), "{stdout}");
+    assert!(
+        stdout.contains("Failed to start:") && stdout.contains("404"),
+        "a missing remote config names the status: {stdout}"
+    );
+    server.join().expect("HTTP config server");
+    assert!(
+        keep_alive_closed.load(std::sync::atomic::Ordering::Relaxed),
+        "a Content-Length body waited for the peer to close"
+    );
+}
+
+/// A scheme no source loader reads fails before any file lookup and names the source.
+#[test]
+fn an_unsupported_config_source_is_a_distinct_refusal() {
+    let output = run(&["-test", "-c", "ftp://127.0.0.1/config.json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(23), "{stdout}");
+    assert!(
+        stdout.contains("unsupported config source")
+            && stdout.contains("ftp://127.0.0.1/config.json"),
+        "the refusal names the source: {stdout}"
+    );
+}
+
+/// Every socket spelling `FetchHTTPContent` accepts reaches the same HTTP GET and body.
+#[cfg(unix)]
+#[test]
+fn configs_on_a_unix_socket_use_each_xray_spelling() {
+    use std::os::unix::net::UnixListener;
+
+    let path = std::env::temp_dir().join(format!("ferrox-test-config-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind config socket");
+    let body = configuration("json");
+    let server = std::thread::spawn(move || {
+        for _ in 0..4 {
+            let (mut stream, _) = listener.accept().expect("accept config request");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = std::io::Read::read(&mut stream, &mut chunk).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            std::io::Write::write_all(&mut stream, head.as_bytes()).expect("write HTTP head");
+            std::io::Write::write_all(&mut stream, body.as_bytes()).expect("write HTTP body");
+        }
+    });
+    let named = path.to_string_lossy().into_owned();
+    for source in [
+        format!("{named}:/config.json"),
+        format!("http+unix://{named}/config.json"),
+        format!("http+unix://{named}"),
+        format!("sock:{named}:/config.json"),
+    ] {
+        let output = run(&["-test", "-c", &source]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "`-test` refused {source}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    server.join().expect("config socket server");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A YAML merge key is the alias's own fields, with the explicit keys winning.
+#[test]
+fn yaml_merge_keys_reach_the_same_config() {
+    let text = r"
+base: &base
+  listen: 127.0.0.1
+  port: 0
+  protocol: socks
+  settings:
+    auth: noauth
+inbounds:
+  - <<: *base
+    tag: in
+outbounds:
+  - protocol: freedom
+";
+    let path = std::env::temp_dir().join(format!(
+        "ferrox-test-yaml-merge-{}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(&path, text).expect("write config");
+    let named = path.to_string_lossy().into_owned();
+    let output = run(&["-test", "-c", &named]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "`-test` refused a merged YAML config: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A YAML or TOML spelling that does not parse is the same status 23 with the reason on stdout.
+#[test]
+fn malformed_yaml_and_toml_are_config_errors() {
+    for (extension, text) in [("yaml", "inbounds: [\n"), ("toml", "[[inbounds]\n")] {
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-test-broken-{extension}-{}.{extension}",
+            std::process::id()
+        ));
+        std::fs::write(&path, text).expect("write config");
+        let named = path.to_string_lossy().into_owned();
+        let output = run(&["-test", "-c", &named]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(23), "{stdout}");
+        assert!(
+            stdout.contains("Failed to start:") && stdout.contains("bad config"),
+            "the refusal names the {extension} source: {stdout}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// A config directory reads YAML and TOML files in the same sorted merge as JSON.
+#[test]
+fn a_confdir_merges_yaml_and_toml_files() {
+    let base = r"inbounds:
+  - tag: in
+    listen: 127.0.0.1
+    port: 0
+    protocol: socks
+    settings:
+      auth: noauth
+";
+    let over = r#"[[outbounds]]
+protocol = "freedom"
+"#;
+    let dir = config_dir(
+        "formats",
+        &[("01-base.yaml", base), ("02-extra.toml", over)],
+    );
+    let named = dir.to_string_lossy().into_owned();
+    let tested = run(&["-test", "-confdir", &named]);
+    assert_eq!(
+        tested.status.code(),
+        Some(0),
+        "`-test` refused a YAML and TOML confdir: {}{}",
+        String::from_utf8_lossy(&tested.stdout),
+        String::from_utf8_lossy(&tested.stderr)
+    );
+    let dumped = run(&["-dump", "-confdir", &named]);
+    let stdout = String::from_utf8_lossy(&dumped.stdout);
+    assert_eq!(dumped.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains(r#""tag":"in""#) && stdout.contains(r#""protocol":"freedom""#),
+        "`-dump` dropped a confdir file: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `-format json` reads the JSON spellings alone, as the reference's regex does.
+#[test]
+fn a_confdir_honors_the_named_format() {
+    let json = |tag: &str| {
+        format!(
+            r#"{{"inbounds":[{{"tag":"{tag}","listen":"127.0.0.1","port":0,"protocol":"socks","settings":{{"auth":"noauth"}}}}]}}"#
+        )
+    };
+    let jsonc = |tag: &str| {
+        format!(
+            r#"{{
+  // the named json format selects this file
+  "inbounds":[{{"tag":"{tag}","listen":"127.0.0.1","port":0,"protocol":"socks","settings":{{"auth":"noauth"}}}}],
+}}"#
+        )
+    };
+    let yaml = r"inbounds:
+  - tag: yaml
+    listen: 127.0.0.1
+    port: 0
+    protocol: socks
+    settings:
+      auth: noauth
+";
+    let toml = r#"[[inbounds]]
+tag = "toml"
+listen = "127.0.0.1"
+port = 0
+protocol = "socks"
+[inbounds.settings]
+auth = "noauth"
+"#;
+    let dir = config_dir(
+        "format-filter",
+        &[
+            ("01.json", &json("json")),
+            ("02.jsonc", &jsonc("jsonc")),
+            ("03.yaml", yaml),
+            ("04.toml", toml),
+        ],
+    );
+    let named = dir.to_string_lossy().into_owned();
+    let dumped = run(&["-dump", "-confdir", &named, "-format", "json"]);
+    let stdout = String::from_utf8_lossy(&dumped.stdout);
+    assert_eq!(dumped.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains(r#""tag":"json""#) && stdout.contains(r#""tag":"jsonc""#),
+        "`-format json` dropped a JSON config: {stdout}"
+    );
+    assert!(
+        !stdout.contains(r#""tag":"yaml""#) && !stdout.contains(r#""tag":"toml""#),
+        "`-format json` read a non-JSON config: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// On Linux a `@name` source is the abstract socket xray's resolver names.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_config_on_an_abstract_socket_is_fetched() {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener};
+
+    let name = format!("ferrox-test-config-{}", std::process::id());
+    let address = SocketAddr::from_abstract_name(name.as_bytes()).expect("abstract address");
+    let listener = UnixListener::bind_addr(&address).expect("bind abstract config socket");
+    let body = configuration("json");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept abstract config request");
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = std::io::Read::read(&mut stream, &mut chunk).expect("read request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        std::io::Write::write_all(&mut stream, head.as_bytes()).expect("write HTTP head");
+        std::io::Write::write_all(&mut stream, body.as_bytes()).expect("write HTTP body");
+    });
+    let output = run(&["-test", "-c", &format!("@{name}:/config.json")]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "`-test` refused an abstract socket: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().expect("abstract config server");
+}
