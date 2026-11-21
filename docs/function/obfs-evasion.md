@@ -181,7 +181,7 @@ graph TD
 | empty-record-octets | 5 | ferrox-app-conn::tests::an_empty_shape_precedes_one_record |
 | noise-ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | decoy-ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
-| decoy-checksum-ns-per-1500-byte-buffer | UNBLESSED | .github/workflows/bench.yml |
+| decoy-checksum-ns-per-1500-byte-buffer | 144.7 | .github/workflows/bench.yml |
 | noise-syscalls-per-flow | UNBLESSED | scripts/count-ops.sh |
 | decoy-syscalls-per-hello | UNBLESSED | scripts/count-ops.sh |
 | noise-copies-per-packet | UNBLESSED | scripts/count-ops.sh |
@@ -224,9 +224,11 @@ record otherwise, which is the same count the `tlssni` stage already documents i
 
 ## Time
 
-**No row measures this lane.** `evasion-time` is `UNBLESSED` by `bench.yml`: neither `bench.yml`
-nor `parity.yml` has an evasion cell, and a noise entry's `delay` is a sleep the config asked for,
-so timing the path would price the schedule and the tunnel, not the code. The decoy's only
+**No row measures this lane's own duration.** `evasion-time` is `UNBLESSED` by `bench.yml`:
+neither `bench.yml` nor `parity.yml` has an evasion cell, and a noise entry's `delay` is a sleep the
+config asked for, so timing the path would price the schedule and the tunnel, not the code. The
+one function timed here is the decoy checksum fold, priced in an in-memory mirror rather than over
+a socket. The decoy's only
 duration is the raw `sendto`, which is one segment either way. What the slice is gated on instead
 is byte-identity and refusal: the checksum test holds the segment's bytes to the RFC's own
 checksum vector, the fragment tests hold the handshake to its original bytes after the records are
@@ -285,7 +287,11 @@ reassembled, and the parser tests hold every accepted form and its refusal.
   four loads and four adds, with the 0-to-7-byte tail still taken as words and a high-order odd
   byte. `the_wide_checksum_fold_matches_the_pair_wide_one` is the differential: every length
   from 0 to 1600 and three lengths around 64 KiB, folded by both forms, sixteen bits equal;
-  `decoy-checksum-ns-per-1500-byte-buffer` is the bench mirror's own row.
+  `decoy-checksum-ns-per-1500-byte-buffer` is the bench mirror's own row: CI's `bench.yml` run
+  `44859317206` prices the same 1500 bytes through both forms, **144.7 ns** eight bytes at a time
+  against **237.7** two at a time on linux x86_64 (1.64x), **62.9** against **111.5** on linux
+  aarch64 (1.77x), **36.0** against **61.2** on macos aarch64 (1.70x) and **115.9** against
+  **212.5** on windows x86_64 (1.83x).
 - **A second handshake parser for the cut.** The fragment stage and the mixed-case rewrite read
   the same `server_name_range` the record decoy already needed, so the bound checks (record
   length, handshake length, version, extensions) exist once and a truncated record can never

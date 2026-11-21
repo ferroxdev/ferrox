@@ -1264,7 +1264,7 @@ obfs-evasion sni-record-count 5 ferrox-core-finalmask::tests::an_sni_record_is_c
 obfs-evasion empty-record-octets 5 ferrox-app-conn::tests::an_empty_shape_precedes_one_record
 obfs-evasion noise-ops-retired-instructions UNBLESSED scripts/count-ops.sh
 obfs-evasion decoy-ops-retired-instructions UNBLESSED scripts/count-ops.sh
-obfs-evasion decoy-checksum-ns-per-1500-byte-buffer UNBLESSED .github/workflows/bench.yml
+obfs-evasion decoy-checksum-ns-per-1500-byte-buffer 144.7 .github/workflows/bench.yml
 obfs-evasion noise-syscalls-per-flow UNBLESSED scripts/count-ops.sh
 obfs-evasion decoy-syscalls-per-hello UNBLESSED scripts/count-ops.sh
 obfs-evasion noise-copies-per-packet UNBLESSED scripts/count-ops.sh
