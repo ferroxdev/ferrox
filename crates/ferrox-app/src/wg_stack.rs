@@ -20,6 +20,10 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
+thread_local! {
+    static DBG_WARP: [std::cell::Cell<u64>; 4] = [const { std::cell::Cell::new(0) }; 4];
+}
+
 use ferrox_core::foxy::connectip::{
     icmp_echo_reply, ipv4_checksum, tcp_checksum, udp_datagram, udp_from_packet, UdpDatagram,
     IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP,
@@ -1277,6 +1281,10 @@ type Packets = Receiver<Packet>;
 
 /// One packet the reader decrypted into the client stack.
 fn receive_client(stack: &mut ClientStack, packet: Packet) {
+    DBG_WARP.with(|c| {
+        c[0].set(c[0].get() + 1);
+        c[1].set(c[1].get() + packet.bytes.len() as u64);
+    });
     let at = packet.at;
     let bytes = match stack
         .reassembly
@@ -1320,6 +1328,7 @@ pub(crate) fn client(
     let mut stack = ClientStack::new(&config, to_tunnel, headroom);
     stack.routes = routes;
     stack.device.recycle = recycle;
+    let mut report = StdInstant::now();
     loop {
         while let Ok(flow) = flows.try_recv() {
             if let Err(error) = stack.connect(flow) {
@@ -1328,6 +1337,20 @@ pub(crate) fn client(
         }
         if client_turn(&mut stack, &packets) {
             return;
+        }
+        if report.elapsed() >= Duration::from_secs(1) {
+            report = StdInstant::now();
+            DBG_WARP.with(|c| {
+                eprintln!(
+                    "DBG wg: pkts {} in_bytes {} local_bytes {}",
+                    c[0].get(),
+                    c[1].get(),
+                    c[2].get()
+                );
+                for cell in c {
+                    cell.set(0);
+                }
+            });
         }
     }
 }
@@ -2221,7 +2244,10 @@ fn download(
         let data = &data[..data.len().min(DOWN_SPILL)];
         match local.write(data) {
             Ok(0) => (0, Down::Closed),
-            Ok(n) => (n, Down::Wrote(n)),
+            Ok(n) => {
+                DBG_WARP.with(|c| c[2].set(c[2].get() + n as u64));
+                (n, Down::Wrote(n))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 spill.clear();
                 spill.extend_from_slice(data);

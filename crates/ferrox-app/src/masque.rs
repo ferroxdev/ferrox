@@ -2579,6 +2579,13 @@ fn io(
     };
     let mut unsent: Option<Vec<u8>> = None;
     let mut keepalive_at = keepalive.map(|period| Instant::now() + period);
+    let mut report = Instant::now();
+    let mut dgrams_in = 0u64;
+    let mut last_recv = 0u64;
+    let mut last_sent = 0u64;
+    let mut last_lost = 0u64;
+    let mut last_retrans = 0u64;
+    let mut last_inner_in = 0u64;
     loop {
         if !alive.load(Ordering::Relaxed) {
             let _ = conn.close(false, 0, b"retired");
@@ -2652,6 +2659,8 @@ fn io(
                 continue;
             }
             let offset = datagram.len() - packet.len();
+            dgrams_in += 1;
+            last_inner_in += packet.len() as u64;
             deliver_owned(&to_stack, &routes, datagram, offset);
         }
         if let Some(period) = keepalive {
@@ -2667,6 +2676,27 @@ fn io(
         quic::flush_egress(&mut conn, sock);
         if let Some(pacer) = pacer.as_mut() {
             pacer.account(conn.stats().sent_bytes.saturating_sub(sent_bytes_before));
+        }
+        if report.elapsed() >= Duration::from_secs(1) {
+            report = Instant::now();
+            let stats = conn.stats();
+            let path = conn.path_stats().next();
+            eprintln!(
+                "DBG masque: dgrams {dgrams_in} inner_in {last_inner_in} recv {} sent {} lost {} retrans {} cwnd {} rtt {:?} delivery {}",
+                stats.recv.saturating_sub(last_recv),
+                stats.sent.saturating_sub(last_sent),
+                stats.lost.saturating_sub(last_lost),
+                stats.retrans.saturating_sub(last_retrans),
+                path.as_ref().map_or(0, |p| p.cwnd),
+                path.as_ref().map(|p| p.rtt),
+                path.as_ref().map_or(0, |p| p.delivery_rate),
+            );
+            last_recv = stats.recv;
+            last_sent = stats.sent;
+            last_lost = stats.lost;
+            last_retrans = stats.retrans;
+            dgrams_in = 0;
+            last_inner_in = 0;
         }
     }
 }
