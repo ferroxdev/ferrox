@@ -1592,8 +1592,8 @@ pub(crate) fn send_h3_server_opening(conn: &mut quiche::Connection, sock: &Datag
     true
 }
 
-/// The most datagrams one pump takes before it hands the connection back, so a busy socket cannot hold the lock from the other flows.
-const PUMP_BURST: usize = 64;
+/// The most datagrams one pump takes before it hands the connection back, so a busy socket cannot hold the lock from the other flows; the egress flush behind it is also the ACK the peer paces on, so a deep burst starves the sender's delivery estimate.
+const PUMP_BURST: usize = 8;
 
 /// How long a pump waits for a datagram once it has taken the one it came for: long enough to catch what is already in flight, far shorter than the caller's own deadline.
 pub(crate) const PUMP_TAIL: Duration = Duration::from_millis(1);
