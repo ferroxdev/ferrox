@@ -3553,6 +3553,9 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     }
                     return self.end();
                 }
+                let Some(conn) = &self.conn else {
+                    return self.end();
+                };
                 self.body = conn.take_body(len);
                 self.body_have = 0;
                 self.frame = (kind, flags, sid);
