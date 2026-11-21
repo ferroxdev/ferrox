@@ -2475,29 +2475,50 @@ pub(crate) fn inner_addresses(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
 
 /// A replied lane sends only to its winner; an unanswered one races the answers
 /// its configured source addresses can reach.
+/// The targets one datagram is sent to, in the order the answer gave them and capped at `RACES`:
+/// a literal is one slot and a name copies only the answers a peer routes, so the lane pays no
+/// heap for either.
 fn lane_targets(
-    destination: Destination,
+    destination: &Destination,
     resolve: &dyn Fn(&str, u16) -> Vec<SocketAddr>,
     addresses: &[IpAddr],
     winner: Option<SocketAddr>,
-) -> Vec<SocketAddr> {
+) -> ([SocketAddr; RACES], usize) {
+    let mut targets = [UNSPECIFIED; RACES];
     if let Some(won) = winner {
-        return vec![won];
+        targets[0] = won;
+        return (targets, 1);
     }
-    let raced = match destination {
-        Destination::Address(address) => vec![address],
-        Destination::Name(host, port) => resolve(&host, port),
+    let routed = |target: SocketAddr| {
+        addresses
+            .iter()
+            .any(|address| address.is_ipv4() == target.ip().is_ipv4())
     };
-    raced
-        .into_iter()
-        .filter(|target| {
-            addresses
-                .iter()
-                .any(|address| address.is_ipv4() == target.ip().is_ipv4())
-        })
-        .take(RACES)
-        .collect()
+    let mut len = 0;
+    match destination {
+        Destination::Address(address) => {
+            if routed(*address) {
+                targets[0] = *address;
+                len = 1;
+            }
+        }
+        Destination::Name(host, port) => {
+            for target in resolve(host, *port) {
+                if len == RACES {
+                    break;
+                }
+                if routed(target) {
+                    targets[len] = target;
+                    len += 1;
+                }
+            }
+        }
+    }
+    (targets, len)
 }
+
+/// The slot a target table starts at: every slot a lane uses is written before `len` covers it.
+const UNSPECIFIED: SocketAddr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 /// Build and send one datagram to a target; false means the tunnel is gone.
 fn lane_send(
@@ -2862,9 +2883,9 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
                 ) else {
                     break 'lane;
                 };
-                let targets = lane_targets(destination, resolve, &config.addresses, winner);
-                for target in targets {
-                    if !lane_send(config, source_port, target, payload, &to_tunnel, headroom) {
+                let (targets, len) = lane_targets(&destination, resolve, &config.addresses, winner);
+                for target in &targets[..len] {
+                    if !lane_send(config, source_port, *target, payload, &to_tunnel, headroom) {
                         break 'lane;
                     }
                 }
@@ -3208,6 +3229,62 @@ fn icmp_mtu(packet: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A datagram's targets are an array, not a heap list: a literal is one routing test, and a
+    /// name copies only the answers a peer routes, in the answer's order, up to `RACES`.
+    #[test]
+    fn a_datagrams_targets_never_reach_the_allocator() {
+        let addresses = ["10.0.0.2".parse().expect("an inner address")];
+        let literal: SocketAddr = "192.0.2.7:53".parse().expect("a destination");
+        let ((targets, count), counts) = ferrox_core::alloc_count::measure(|| {
+            lane_targets(
+                &Destination::Address(literal),
+                &|_, _| Vec::new(),
+                &addresses,
+                None,
+            )
+        });
+        assert_eq!(count, 1);
+        assert_eq!(targets[0], literal);
+        assert_eq!(counts.allocs, 0, "a literal target is a stack slot");
+        let asked = Destination::Name("example.test".to_owned(), 443);
+        let ((targets, count), counts) = ferrox_core::alloc_count::measure(|| {
+            lane_targets(
+                &asked,
+                &|_, port| {
+                    vec![
+                        SocketAddr::new(IpAddr::V4([192, 0, 2, 1].into()), port),
+                        SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port),
+                        SocketAddr::new(IpAddr::V4([192, 0, 2, 2].into()), port),
+                    ]
+                },
+                &addresses,
+                None,
+            )
+        });
+        assert_eq!(count, 2, "the unrouted family is skipped");
+        assert_eq!(
+            targets[..count],
+            [
+                SocketAddr::new(IpAddr::V4([192, 0, 2, 1].into()), 443),
+                SocketAddr::new(IpAddr::V4([192, 0, 2, 2].into()), 443),
+            ],
+            "the answer's order survives"
+        );
+        assert_eq!(
+            counts.allocs, 1,
+            "only the resolver's answer allocates, not the table"
+        );
+        let ((_, count), _) = ferrox_core::alloc_count::measure(|| {
+            lane_targets(
+                &asked,
+                &|_, _| vec!["[2001:db8::1]:443".parse().expect("one")],
+                &addresses,
+                None,
+            )
+        });
+        assert_eq!(count, 0, "an answer no peer routes races nothing");
+    }
 
     #[test]
     fn a_name_resolves_through_the_tunnel() {

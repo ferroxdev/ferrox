@@ -1262,13 +1262,17 @@ fn take_packet<'a>(
         reassembly.remove(&key);
     }
     if !reassembly.contains_key(&key) {
-        reassembly.retain(|_, parts| parts.at.elapsed() < REASSEMBLY_TTL);
         let mut per_assoc = 0usize;
         let mut retained = 0usize;
-        for ((assoc, _), parts) in &*reassembly {
-            per_assoc += usize::from(*assoc == packet.association);
-            retained += parts.buffer.len();
-        }
+        reassembly.retain(|(assoc, _), parts| {
+            if parts.at.elapsed() < REASSEMBLY_TTL {
+                per_assoc += usize::from(*assoc == packet.association);
+                retained += parts.buffer.len();
+                true
+            } else {
+                false
+            }
+        });
         if reassembly.len() >= MAX_REASSEMBLIES
             || per_assoc >= MAX_REASSEMBLIES_PER_ASSOC
             || retained.saturating_add(size) > MAX_REASSEMBLY_BYTES
@@ -3173,6 +3177,58 @@ mod tests {
         assert!(take_packet(&mut reassembly, &packet).is_none());
         assert_eq!(reassembly.len(), 1, "an expired piece made room");
         assert!(reassembly.contains_key(&(1, 700)));
+    }
+
+    /// The sweep a new fragmented packet pays is one walk: it drops the expired parts and counts the
+    /// association's live ones in the same pass, so the per-association cap still binds.
+    #[test]
+    fn a_new_reassembly_sweeps_and_counts_in_one_pass() {
+        let address = Some((wire::Address::V4([192, 0, 2, 1]), 53));
+        let payload = vec![7u8; 32];
+        let mut reassembly = HashMap::new();
+        for index in 0..MAX_REASSEMBLIES_PER_ASSOC as u16 {
+            reassembly.insert(
+                (1, index),
+                Parts {
+                    total: 2,
+                    address: None,
+                    slots: vec![Some((0, 32)), None],
+                    buffer: vec![0u8; 32],
+                    received: 1,
+                    at: Instant::now(),
+                },
+            );
+        }
+        let packet = wire::Packet {
+            association: 1,
+            packet: 700,
+            total: 2,
+            index: 0,
+            destination: address,
+            payload: &payload,
+        };
+        assert!(
+            take_packet(&mut reassembly, &packet).is_none(),
+            "the association's live cap still binds"
+        );
+        assert_eq!(
+            reassembly.len(),
+            MAX_REASSEMBLIES_PER_ASSOC,
+            "nothing expired, so nothing was dropped"
+        );
+        let other = wire::Packet {
+            association: 2,
+            packet: 700,
+            total: 2,
+            index: 0,
+            destination: address,
+            payload: &payload,
+        };
+        assert!(take_packet(&mut reassembly, &other).is_none());
+        assert!(
+            reassembly.contains_key(&(2, 700)),
+            "another association has room"
+        );
     }
 
     #[test]

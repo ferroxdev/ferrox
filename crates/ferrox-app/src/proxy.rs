@@ -29442,7 +29442,7 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
             }
             continue;
         }
-        let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
+        let Some((dest, payload)) = parse_socks_udp_dest_mut(&mut buf[..n]) else {
             continue;
         };
         quiet = Instant::now();
@@ -29746,7 +29746,7 @@ fn serve_socks_udp_split(
                     }
                     continue;
                 }
-                let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
+                let Some((dest, payload)) = parse_socks_udp_dest_mut(&mut buf[..n]) else {
                     continue;
                 };
                 quiet = Instant::now();
@@ -39074,6 +39074,20 @@ pub(crate) fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
 /// The same frame with the name kept: a routing rule may name a domain, and resolving here would
 /// hand the decision an address the client never asked for.
 pub(crate) fn parse_socks_udp_dest(packet: &[u8]) -> Option<(Destination, &[u8])> {
+    let (dest, used) = parse_socks_udp_parts(packet)?;
+    Some((dest, &packet[4 + used..]))
+}
+
+/// The same parse over a buffer the caller still owns mutably, so a sniffer can unmask a QUIC
+/// header in the datagram it arrived in and restore it, instead of copying the packet first.
+pub(crate) fn parse_socks_udp_dest_mut(packet: &mut [u8]) -> Option<(Destination, &mut [u8])> {
+    let (dest, used) = parse_socks_udp_parts(packet)?;
+    Some((dest, &mut packet[4 + used..]))
+}
+
+/// The header parse both callers share: the destination and the header's length, so each wrapper
+/// can hand back the payload with the ownership it was given.
+fn parse_socks_udp_parts(packet: &[u8]) -> Option<(Destination, usize)> {
     if packet.len() < 4 || packet[2] != 0 {
         return None;
     }
@@ -39115,7 +39129,7 @@ pub(crate) fn parse_socks_udp_dest(packet: &[u8]) -> Option<(Destination, &[u8])
         }
         _ => return None,
     };
-    Some((dest, &body[used..]))
+    Some((dest, used))
 }
 
 /// The handshake a front's client made: the command, the destination, and the version

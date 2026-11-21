@@ -28,13 +28,14 @@ graph TD
 | ops-retired-instructions | 1228 | scripts/count-ops.sh |
 | http-host-and-tls-sni-recognized | 2 | ferrox-app-sniff::tests::reads_http_host_and_tls_sni |
 | quic-initial-sni-recognized | 1 | ferrox-app-sniff::tests::reads_a_quic_initial_sni |
+| quic-sniff-packet-copies | 0 | ferrox-app-sniff::tests::sniffing_a_quic_initial_leaves_the_datagram_untouched |
 | bittorrent-and-utp-recognized | 2 | ferrox-app-sniff::tests::reads_bittorrent_and_utp |
 | excluded-targets-kept | 2 | ferrox-app-sniff::tests::exclusions_keep_the_original_destination |
 | loopback-sniffed-host-overrides | 1 | ferrox-app-proxy::tests::a_loopback_sniffing_overrides_the_re_inject_destination |
 | routed-protocol-selectors | 1 | ferrox-app-router::tests::a_protocol_rule_reads_the_sniffed_protocol |
 <!-- counts:end -->
 
-Syscalls: one TCP probe issues `peek` calls on the client until the HTTP head or TLS ClientHello is whole, the 32 KiB buffer fills, or 200 ms pass; UDP adds no syscall beyond the datagram already read. Copies: the probe fills one 32 KiB buffer per worker thread, held across flows, and the detected domain is one `String`; the buffer has a pointer-and-capacity test that separates its reuse from a per-flow allocation, and the `String` has none, so only the buffer is claimed. The worst case the TCP tests do not reach is a header split across `peek` boundaries: the loop re-peeks with the same buffer until the 200 ms deadline, so a slow client delays the dial rather than truncating the name; a full 32 KiB buffer with no match falls through to the original destination.
+Syscalls: one TCP probe issues `peek` calls on the client until the HTTP head or TLS ClientHello is whole, the 32 KiB buffer fills, or 200 ms pass; UDP adds no syscall beyond the datagram already read. Copies: one QUIC Initial is unmasked and restored in the datagram the lane already holds, never copied; `sniffing_a_quic_initial_leaves_the_datagram_untouched` holds the arrived bytes equal after the sniff, and sniffs the same Initial twice — alone and with 4096 bytes appended past it — to find the same allocation count and byte count both times, so no allocation follows the datagram's length. The probe fills one 32 KiB buffer per worker thread, held across flows, and the detected domain is one `String`; the buffer has a pointer-and-capacity test that separates its reuse from a per-flow allocation, and the `String` has none, so only the buffer is claimed. The worst case the TCP tests do not reach is a header split across `peek` boundaries: the loop re-peeks with the same buffer until the 200 ms deadline, so a slow client delays the dial rather than truncating the name; a full 32 KiB buffer with no match falls through to the original destination.
 
 ## Ops
 
@@ -52,6 +53,14 @@ Syscalls: one TCP probe issues `peek` calls on the client until the HTTP head or
 ## What we removed
 
 - **A buffer per protocol.** One 32 KiB `peek` buffer feeds HTTP, TLS and BitTorrent in order, and the parse functions borrow it; QUIC and µTP read the datagram the UDP lane already holds.
+- **A copy of every sniffed QUIC datagram.** The Initial's header protection cannot be removed
+  without patching the header, so the parse copied the whole packet into a `Vec`, unmasked the
+  copy and read the retry from it. The two masked regions are now patched in the datagram itself
+  and XORed back before it is left, which is the same two bytes and the packet-number run; the
+  copy, its allocation and the second pass over the payload are gone, and the bytes the caller
+  forwards are the bytes that arrived. `sniff_quic` takes `&mut`, so the two SOCKS UDP lanes parse
+  their destination with `parse_socks_udp_dest_mut` and hand the payload over mutably; the
+  immutable parse is the same header split and stays for the lanes that only read.
 - **A buffer per flow.** The 32 KiB probe buffer is the worker thread's, resized once and reused by every flow that thread accepts, so a flow no longer allocates or zeroes it; `the_probe_buffer_is_the_worker_threads_not_the_flows` holds its base and capacity across two flows and counts no zeroed bytes on the second. xray keeps the same buffer in `bytespool`, but acquires and releases it around every probe.
 - **A second routing lookup for a sniffed name.** The probe returns `protocol` and `domain` together, the router reads both from one `Flow`, and the override is applied to the same plan that selected the outbound.
 - **A byte-at-a-time line walk.** The HTTP sniffer found its request line's end, each following line's end and each field-name colon with `iter().position` over the peeked head; all three are now `ferrox_core::foxy::octet_in`, the eight-octet scan the http front's own head walk uses, and the rule that the name ends at the first colon and the line at the first `\n` is unchanged — `reads_http_host_and_tls_sni` and `parses_the_fields_xray_names` hold the fields the walk yields, and `an_attrs_rule_reads_the_head_the_sniffer_read` (in the app's proxy tests) holds that the attributes derived from it still route a sniffed flow.

@@ -352,6 +352,8 @@ carrier-xhttp session-upload-window-copies 0 ferrox-app-xhttp::tests::a_windowed
 carrier-xhttp packet-window-copies 0 ferrox-app-xhttp::tests::a_packet_window_is_the_sessions_own_buffer
 carrier-xhttp packet-map-allocations-per-pending-round 0 ferrox-app-xhttp::tests::a_pending_packet_map_reuses_its_table_across_rounds
 carrier-xhttp packet-map-lookup-ns-per-packet 27.4 .github/workflows/bench.yml
+carrier-xhttp frame-body-allocations-per-repeated-frame 0 ferrox-app-xhttp_h2::tests::a_frames_body_reuses_the_buffer_the_last_reader_handed_back
+carrier-xhttp frame-body-capacity-slack-bytes 0 ferrox-app-xhttp_h2::tests::a_frames_body_reuses_the_buffer_the_last_reader_handed_back
 carrier-xhttp chunk-bodies-per-window 8 ferrox-app-xhttp::tests::a_window_gathers_every_chunk_one_read_brought
 carrier-xhttp requests-served-per-connection 2 ferrox-app-xhttp::tests::one_connection_carries_the_packet_up_uplink
 carrier-xhttp requests-served-before-a-close 1 ferrox-app-xhttp::tests::a_request_that_says_close_takes_the_connection_with_it
@@ -779,6 +781,7 @@ security-ech heap-buffers-for-an-ech-cover 1 ferrox-core-tls::shaped::hello::tes
 engine-sniffing-http-tls-quic-fakedns ops-retired-instructions 1228 scripts/count-ops.sh
 engine-sniffing-http-tls-quic-fakedns http-host-and-tls-sni-recognized 2 ferrox-app-sniff::tests::reads_http_host_and_tls_sni
 engine-sniffing-http-tls-quic-fakedns quic-initial-sni-recognized 1 ferrox-app-sniff::tests::reads_a_quic_initial_sni
+engine-sniffing-http-tls-quic-fakedns quic-sniff-packet-copies 0 ferrox-app-sniff::tests::sniffing_a_quic_initial_leaves_the_datagram_untouched
 engine-sniffing-http-tls-quic-fakedns bittorrent-and-utp-recognized 2 ferrox-app-sniff::tests::reads_bittorrent_and_utp
 engine-sniffing-http-tls-quic-fakedns excluded-targets-kept 2 ferrox-app-sniff::tests::exclusions_keep_the_original_destination
 engine-sniffing-http-tls-quic-fakedns loopback-sniffed-host-overrides 1 ferrox-app-proxy::tests::a_loopback_sniffing_overrides_the_re_inject_destination
@@ -1116,6 +1119,10 @@ wireguard prefixed-record-zeroed-bytes 0 ferrox-core-wireguard::tests::a_prefixe
 wireguard received-record-copies 0 ferrox-core-wireguard::tests::an_owned_transport_record_keeps_the_received_allocation
 wireguard kernel-rule-priority 32765 ferrox-app-wg-kernel::tests::the_rule_marks_the_table
 wireguard kernel-iif-priority 32764 ferrox-app-wg-kernel::tests::the_iif_rule_keeps_the_reverse_path_inside_the_tunnel
+wireguard routed-destination-list-allocations 1 ferrox-app-wg::tests::a_routed_destination_costs_one_list_and_a_cached_name_one_answer
+wireguard cached-name-lookup-allocations 1 ferrox-app-wg::tests::a_routed_destination_costs_one_list_and_a_cached_name_one_answer
+wireguard routed-lane-target-allocations 0 ferrox-app-wg-stack::tests::a_datagrams_targets_never_reach_the_allocator
+wireguard routed-lane-targets-kept-in-answer-order 2 ferrox-app-wg-stack::tests::a_datagrams_targets_never_reach_the_allocator
 carrier-masque ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-masque tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_tunnel_to_a_freedom_dial
 carrier-masque ipv6-tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_tunnel_over_ipv6
@@ -1257,6 +1264,7 @@ obfs-evasion sni-record-count 5 ferrox-core-finalmask::tests::an_sni_record_is_c
 obfs-evasion empty-record-octets 5 ferrox-app-conn::tests::an_empty_shape_precedes_one_record
 obfs-evasion noise-ops-retired-instructions UNBLESSED scripts/count-ops.sh
 obfs-evasion decoy-ops-retired-instructions UNBLESSED scripts/count-ops.sh
+obfs-evasion decoy-checksum-ns-per-1500-byte-buffer 144.7 .github/workflows/bench.yml
 obfs-evasion noise-syscalls-per-flow UNBLESSED scripts/count-ops.sh
 obfs-evasion decoy-syscalls-per-hello UNBLESSED scripts/count-ops.sh
 obfs-evasion noise-copies-per-packet UNBLESSED scripts/count-ops.sh

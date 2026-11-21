@@ -811,6 +811,9 @@ pub(crate) struct H2Conn {
     client_head: Mutex<Option<(u32, Vec<u8>, bool)>>,
     raw: Option<Arc<crate::conn::Connection>>,
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+    /// The body buffer the reader handed back, so the next frame reads into the room the last one
+    /// left instead of a fresh allocation zeroed for it.
+    spare: Mutex<Vec<u8>>,
 }
 
 impl std::fmt::Debug for H2Conn {
@@ -881,7 +884,8 @@ impl H2StreamReader {
         buf[filled..filled + n].copy_from_slice(&self.cur[self.at..self.at + n]);
         self.at += n;
         if self.at == self.cur.len() {
-            self.cur.clear();
+            let done = std::mem::take(&mut self.cur);
+            self.conn.spare_body(done);
             self.at = 0;
             let wire = std::mem::take(&mut self.cur_wire);
             if wire != 0 {
@@ -933,7 +937,8 @@ impl Read for H2StreamReader {
                 st.queued_bytes = st.queued_bytes.saturating_sub(front.len());
                 let wire = st.credit.pop_front().unwrap_or(front.len() as u32);
                 drop(st);
-                self.cur = front;
+                let done = std::mem::replace(&mut self.cur, front);
+                self.conn.spare_body(done);
                 self.cur_wire = wire;
                 self.at = 0;
                 continue;
@@ -1047,7 +1052,8 @@ impl crate::proxy::WindowRead for H2StreamReader {
                 st.queued_bytes = st.queued_bytes.saturating_sub(front.len());
                 let wire = st.credit.pop_front().unwrap_or(front.len() as u32);
                 drop(st);
-                self.cur = front;
+                let done = std::mem::replace(&mut self.cur, front);
+                self.conn.spare_body(done);
                 self.cur_wire = wire;
                 self.at = 0;
                 continue;
@@ -2250,6 +2256,31 @@ fn fill_frame(
 }
 
 impl H2Conn {
+    /// A frame body taken from the room the last reader handed back. The buffer is reused only for a
+    /// frame of exactly its own room, so every queued body's allocation is its payload's length and
+    /// the queue's byte and chunk bounds still bound the memory the queue retains: a short frame in a
+    /// long buffer would otherwise park sixteen kilobytes behind a one-byte charge.
+    fn take_body(&self, len: usize) -> Vec<u8> {
+        let mut spare = self.spare.lock().unwrap_or_else(PoisonError::into_inner);
+        let body = std::mem::take(&mut *spare);
+        drop(spare);
+        if body.len() == len && body.capacity() == len {
+            body
+        } else {
+            vec![0u8; len]
+        }
+    }
+
+    /// Hands a consumed body back for the next frame: the room the stream is actually using is the
+    /// one worth keeping, so the latest nonempty buffer replaces the spare.
+    fn spare_body(&self, body: Vec<u8>) {
+        if body.capacity() == 0 {
+            return;
+        }
+        let mut spare = self.spare.lock().unwrap_or_else(PoisonError::into_inner);
+        *spare = body;
+    }
+
     /// Whether another pump already holds the connection's read half.
     fn read_busy(&self) -> bool {
         self.client_read
@@ -2308,7 +2339,7 @@ impl H2Conn {
                 }
                 let sid = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7FFF_FFFF;
                 partial.frame = Some((head[3], head[4], sid));
-                partial.body = vec![0u8; len];
+                partial.body = self.take_body(len);
             }
             let Some((kind, flags, sid)) = partial.frame else {
                 return Pumped::Dead;
@@ -2547,6 +2578,7 @@ impl H2Client {
             client_head: Mutex::new(None),
             raw,
             decryption: None,
+            spare: Mutex::new(Vec::new()),
         });
         {
             let mut write = conn.write.lock().unwrap_or_else(PoisonError::into_inner);
@@ -3493,6 +3525,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     client_head: Mutex::new(None),
                     raw: None,
                     decryption: self.decryption.take(),
+                    spare: Mutex::new(Vec::new()),
                 });
                 let mut initial = Vec::with_capacity(12);
                 initial.extend_from_slice(&S_WINDOW.to_be_bytes());
@@ -3521,7 +3554,10 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     }
                     return self.end();
                 }
-                self.body = vec![0u8; len];
+                let Some(conn) = &self.conn else {
+                    return self.end();
+                };
+                self.body = conn.take_body(len);
                 self.body_have = 0;
                 self.frame = (kind, flags, sid);
                 self.phase = Phase::Body;
@@ -4361,6 +4397,43 @@ mod tests {
             (counts.zeroed, counts.zeroed_bytes),
             (1, 4096),
             "the frame body is zeroed once"
+        );
+    }
+
+    /// A frame body reads into the room the last reader handed back when it is the same length, so a
+    /// steady stream of full frames allocates and zeroes once; any other length takes its own room,
+    /// which keeps every queued body's allocation equal to its payload. Each take is its own window,
+    /// so the row reads the frame's cost and not the pool's first allocation.
+    #[test]
+    fn a_frames_body_reuses_the_buffer_the_last_reader_handed_back() {
+        let (conn, _, _) = bare_conn();
+        let (body, counts) = ferrox_core::alloc_count::measure(|| conn.take_body(4096));
+        assert_eq!(counts.zeroed_bytes, 4096, "the first body is zeroed once");
+        let first = body.as_ptr();
+        conn.spare_body(body);
+        let (body, counts) = ferrox_core::alloc_count::measure(|| conn.take_body(4096));
+        assert_eq!(body.as_ptr(), first, "the same buffer came back");
+        assert_eq!(body.len(), 4096);
+        assert_eq!(counts.allocs, 0, "the second frame allocates nothing");
+        assert_eq!(counts.zeroed_bytes, 0, "and zeroes nothing");
+        conn.spare_body(body);
+        let (body, counts) = ferrox_core::alloc_count::measure(|| conn.take_body(1000));
+        assert_eq!(body.len(), 1000);
+        assert_eq!(
+            counts.zeroed_bytes, 1000,
+            "a shorter frame takes its own room, not a retained 16 KiB"
+        );
+        assert_eq!(
+            body.capacity(),
+            1000,
+            "a queued body's allocation is its payload's length"
+        );
+        conn.spare_body(body);
+        let (body, counts) = ferrox_core::alloc_count::measure(|| conn.take_body(8192));
+        assert_eq!(body.len(), 8192);
+        assert_eq!(
+            counts.zeroed_bytes, 8192,
+            "a longer frame pays for its own zeroed room"
         );
     }
 
@@ -6123,6 +6196,7 @@ mod tests {
             client_head: Mutex::new(None),
             raw: None,
             decryption: None,
+            spare: Mutex::new(Vec::new()),
         });
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
@@ -6665,6 +6739,7 @@ mod tests {
             client_head: Mutex::new(None),
             raw: None,
             decryption: None,
+            spare: Mutex::new(Vec::new()),
         })
     }
 

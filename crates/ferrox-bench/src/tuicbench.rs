@@ -307,6 +307,90 @@ fn packet_map_section(out: &mut String) {
     let _ = writeln!(out, "| HashMap, {PENDING} pending | {hash_best:.1} |");
 }
 
+/// The one's-complement checksum the SNI decoy writes over an IPv4 header and a TCP segment: the
+/// sixteen-bit word sum taken two bytes at a time, or eight bytes with the big-endian load's two
+/// halves added (each weight is 1 modulo 0xffff) and folded at the end.
+const CHECKSUM_BYTES: usize = 1500;
+
+fn checksum_pairs(mut sum: u64, bytes: &[u8]) -> u64 {
+    let (words, tail) = bytes.as_chunks::<2>();
+    for pair in words {
+        sum += u64::from(u16::from_be_bytes(*pair));
+    }
+    if let Some(byte) = tail.first() {
+        sum += u64::from(*byte) << 8;
+    }
+    sum
+}
+
+fn checksum_wide(mut sum: u64, bytes: &[u8]) -> u64 {
+    let (chunks, tail) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        let word = u64::from_be_bytes(*chunk);
+        sum += (word >> 32) + (word & 0xffff_ffff);
+    }
+    let (pairs, odd) = tail.as_chunks::<2>();
+    for pair in pairs {
+        sum += u64::from(u16::from_be_bytes(*pair));
+    }
+    if let Some(byte) = odd.first() {
+        sum += u64::from(*byte) << 8;
+    }
+    sum
+}
+
+fn checksum_fold(mut sum: u64) -> u16 {
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !u16::try_from(sum).expect("the folded sum is sixteen bits")
+}
+
+fn checksum_section(out: &mut String) {
+    let bytes: Vec<u8> = (0..CHECKSUM_BYTES)
+        .map(|at| u8::try_from((at * 37 + 11) & 0xff).expect("a byte"))
+        .collect();
+    for len in [0usize, 1, 7, 8, 9, 20, 64, CHECKSUM_BYTES] {
+        assert_eq!(
+            checksum_fold(checksum_wide(0, &bytes[..len])),
+            checksum_fold(checksum_pairs(0, &bytes[..len])),
+            "length {len}"
+        );
+    }
+    let mut pairs_best = f64::MAX;
+    let mut wide_best = f64::MAX;
+    for round in 0..ROUNDS {
+        if round % 2 == 0 {
+            let start = Instant::now();
+            for _ in 0..PACKETS {
+                let _ = black_box(checksum_fold(checksum_pairs(0, black_box(&bytes))));
+            }
+            pairs_best = pairs_best.min(start.elapsed().as_nanos() as f64 / PACKETS as f64);
+            let start = Instant::now();
+            for _ in 0..PACKETS {
+                let _ = black_box(checksum_fold(checksum_wide(0, black_box(&bytes))));
+            }
+            wide_best = wide_best.min(start.elapsed().as_nanos() as f64 / PACKETS as f64);
+        } else {
+            let start = Instant::now();
+            for _ in 0..PACKETS {
+                let _ = black_box(checksum_fold(checksum_wide(0, black_box(&bytes))));
+            }
+            wide_best = wide_best.min(start.elapsed().as_nanos() as f64 / PACKETS as f64);
+            let start = Instant::now();
+            for _ in 0..PACKETS {
+                let _ = black_box(checksum_fold(checksum_pairs(0, black_box(&bytes))));
+            }
+            pairs_best = pairs_best.min(start.elapsed().as_nanos() as f64 / PACKETS as f64);
+        }
+    }
+    let _ = writeln!(out, "\n## SNI decoy checksum\n");
+    let _ = writeln!(out, "| path | ns/{CHECKSUM_BYTES}-byte buffer |");
+    let _ = writeln!(out, "|---|---:|");
+    let _ = writeln!(out, "| two bytes at a time | {pairs_best:.1} |");
+    let _ = writeln!(out, "| eight bytes at a time | {wide_best:.1} |");
+}
+
 pub(crate) fn report() -> String {
     let address = ferrox_core::tuic::address_port("example.com", 443).expect("an address");
     let payload = [7u8; 1200];
@@ -378,5 +462,6 @@ pub(crate) fn report() -> String {
     sweep_section(&mut out);
     sink_section(&mut out);
     packet_map_section(&mut out);
+    checksum_section(&mut out);
     out
 }
