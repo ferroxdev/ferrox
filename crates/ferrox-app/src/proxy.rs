@@ -87174,11 +87174,14 @@ mod datagram_room_tests {
         assert_eq!(room.as_ptr(), base, "and its allocation never moved");
 
         // The shape this replaced: every datagram read into a buffer of its own.
+        let wire = same_wire();
         let (read, before) = ferrox_core::alloc_count::measure(|| {
-            let mut cursor = std::io::Cursor::new(same_wire());
+            let mut cursor = std::io::Cursor::new(wire);
             let mut frames = Vec::with_capacity(4);
             for _ in 0..4 {
-                let mut frame = vec![0u8; 10];
+                let mut len = [0u8; 2];
+                cursor.read_exact(&mut len).expect("a length");
+                let mut frame = vec![0u8; usize::from(u16::from_be_bytes(len))];
                 cursor.read_exact(&mut frame).expect("a frame");
                 frames.push(frame);
             }
