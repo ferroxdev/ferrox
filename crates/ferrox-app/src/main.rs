@@ -1041,7 +1041,7 @@ fn config_extension(source: &str) -> &str {
 fn http_target(source: &str) -> Option<&str> {
     if let Some(raw) = source.strip_prefix("http+unix://") {
         if let Some((socket, target)) = raw.split_once(":/") {
-            if is_socket_path(socket) {
+            if socket.starts_with('/') || socket.starts_with('@') {
                 return Some(without_query(target));
             }
         }
@@ -1052,7 +1052,7 @@ fn http_target(source: &str) -> Option<&str> {
     }
     let raw = source.strip_prefix("sock:").unwrap_or(source);
     if let Some((socket, target)) = raw.split_once(":/") {
-        if is_socket_path(socket) {
+        if socket.starts_with('/') || socket.starts_with('@') {
             return Some(without_query(target));
         }
     } else if source.starts_with("sock:") || raw.starts_with('@') {
