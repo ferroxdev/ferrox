@@ -2530,36 +2530,39 @@ fn same_socket_object(listed: &std::path::Path, path: &std::path::Path) -> bool 
 #[cfg(target_os = "macos")]
 fn macos_socket_table() -> Option<Vec<u8>> {
     let name = c"net.local.stream.pcblist64";
-    let mut len = 0usize;
-    // SAFETY: the name is NUL-terminated and the null pointers ask only for the required size.
-    let asked = unsafe {
-        sysctlbyname(
-            name.as_ptr(),
-            std::ptr::null_mut(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if asked != 0 || len == 0 {
-        return None;
+    // A table that grows between the size probe and the read refuses the read, so ask again rather than forget the socket.
+    for _ in 0..4 {
+        let mut len = 0usize;
+        // SAFETY: the name is NUL-terminated and the null pointers ask only for the required size.
+        let asked = unsafe {
+            sysctlbyname(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if asked != 0 || len == 0 {
+            continue;
+        }
+        let mut table = vec![0u8; len];
+        // SAFETY: `table` is writable for `len` bytes and `len` is a little over what the probe found.
+        let read = unsafe {
+            sysctlbyname(
+                name.as_ptr(),
+                table.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if read == 0 {
+            table.truncate(len);
+            return Some(table);
+        }
     }
-    let mut table = vec![0u8; len];
-    // SAFETY: `table` is writable for `len` bytes and `len` is a little over what the probe found.
-    let read = unsafe {
-        sysctlbyname(
-            name.as_ptr(),
-            table.as_mut_ptr().cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if read != 0 {
-        return None;
-    }
-    table.truncate(len);
-    Some(table)
+    None
 }
 
 #[cfg(target_os = "macos")]
