@@ -606,6 +606,17 @@ fn yaml_and_toml_configs_build_and_dump_like_json() {
     }
 }
 
+fn read_close(stream: &mut std::net::TcpStream, closed: &std::sync::atomic::AtomicBool) {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .expect("keep-alive read timeout");
+    let mut byte = [0u8; 1];
+    closed.store(
+        matches!(std::io::Read::read(stream, &mut byte), Ok(0)),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// A config served over HTTP is fetched like a file; a 404 and every wire shape keep the status the reference reports.
 #[test]
 fn http_config_is_fetched_and_a_missing_one_is_refused() {
@@ -627,6 +638,8 @@ fn http_config_is_fetched_and_a_missing_one_is_refused() {
     );
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP config server");
     let address = listener.local_addr().expect("HTTP config address");
+    let keep_alive_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let closed = keep_alive_closed.clone();
     let server = std::thread::spawn(move || {
         for _ in 0..7 {
             let (mut stream, _) = listener.accept().expect("accept HTTP config request");
@@ -664,7 +677,7 @@ fn http_config_is_fetched_and_a_missing_one_is_refused() {
             std::io::Write::write_all(&mut stream, head.as_bytes()).expect("write HTTP head");
             std::io::Write::write_all(&mut stream, &body).expect("write HTTP body");
             if path == "/keep-alive" {
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                read_close(&mut stream, &closed);
             }
         }
     });
@@ -687,7 +700,6 @@ fn http_config_is_fetched_and_a_missing_one_is_refused() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let started = std::time::Instant::now();
     let keep_alive = run(&["-test", "-c", &format!("http://{address}/keep-alive")]);
     assert_eq!(
         keep_alive.status.code(),
@@ -695,11 +707,6 @@ fn http_config_is_fetched_and_a_missing_one_is_refused() {
         "`-test` refused a keep-alive body: {}{}",
         String::from_utf8_lossy(&keep_alive.stdout),
         String::from_utf8_lossy(&keep_alive.stderr)
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(1500),
-        "a Content-Length body waited for the peer to close: {:?}",
-        started.elapsed()
     );
     let missing = run(&["-test", "-c", &format!("http://{address}/missing")]);
     let stdout = String::from_utf8_lossy(&missing.stdout);
@@ -709,6 +716,10 @@ fn http_config_is_fetched_and_a_missing_one_is_refused() {
         "a missing remote config names the status: {stdout}"
     );
     server.join().expect("HTTP config server");
+    assert!(
+        keep_alive_closed.load(std::sync::atomic::Ordering::Relaxed),
+        "a Content-Length body waited for the peer to close"
+    );
 }
 
 /// A scheme no source loader reads fails before any file lookup and names the source.
@@ -873,6 +884,14 @@ fn a_confdir_honors_the_named_format() {
             r#"{{"inbounds":[{{"tag":"{tag}","listen":"127.0.0.1","port":0,"protocol":"socks","settings":{{"auth":"noauth"}}}}]}}"#
         )
     };
+    let jsonc = |tag: &str| {
+        format!(
+            r#"{{
+  // the named json format selects this file
+  "inbounds":[{{"tag":"{tag}","listen":"127.0.0.1","port":0,"protocol":"socks","settings":{{"auth":"noauth"}}}}],
+}}"#
+        )
+    };
     let yaml = r"inbounds:
   - tag: yaml
     listen: 127.0.0.1
@@ -893,7 +912,7 @@ auth = "noauth"
         "format-filter",
         &[
             ("01.json", &json("json")),
-            ("02.jsonc", &json("jsonc")),
+            ("02.jsonc", &jsonc("jsonc")),
             ("03.yaml", yaml),
             ("04.toml", toml),
         ],

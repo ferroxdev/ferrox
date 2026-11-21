@@ -820,9 +820,10 @@ fn serve_from_flags(args: &[String]) -> ! {
     }
     let source = configs.pop().unwrap_or_else(discover_config);
     let format = source_format(format.as_deref(), &source);
+    let label = redact_source(&source).into_owned();
     let bytes = read_source(&source)
-        .unwrap_or_else(|error| proxy::exit(&format!("cannot read {source}: {error}")));
-    serve_source(&source, &bytes, format)
+        .unwrap_or_else(|error| proxy::exit(&format!("cannot read {label}: {error}")));
+    serve_source(&label, &bytes, format)
 }
 
 /// xray's `readConfDir`: every file the `-format` regex names, in `os.ReadDir`'s sorted order,
@@ -877,21 +878,27 @@ fn serve_files(files: &[String], format: Option<&str>) -> ! {
         if matches!(format, SourceFormat::Protobuf) {
             proxy::exit("Only one protobuf config file is allowed");
         }
+        let label = redact_source(file).into_owned();
         let bytes = read_source(file)
-            .unwrap_or_else(|error| proxy::exit(&format!("cannot read {file}: {error}")));
+            .unwrap_or_else(|error| proxy::exit(&format!("cannot read {label}: {error}")));
         let body = config_text(&bytes, format)
-            .unwrap_or_else(|error| proxy::exit(&format!("bad config {file}: {error}")));
+            .unwrap_or_else(|error| proxy::exit(&format!("bad config {label}: {error}")));
         let root = crate::json::parse(&body)
-            .unwrap_or_else(|error| proxy::exit(&format!("bad config {file}: {error}")));
+            .unwrap_or_else(|error| proxy::exit(&format!("bad config {label}: {error}")));
         if at == 0 {
             merged = root;
         } else {
-            crate::json::merge(&mut merged, &root, file);
+            crate::json::merge(&mut merged, &root, &label);
         }
     }
     let mut text = String::new();
     crate::json::write(&merged, &mut text);
-    proxy::serve_json(&files.join(", "), &text, test_only());
+    let label = files
+        .iter()
+        .map(|file| redact_source(file).into_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    proxy::serve_json(&label, &text, test_only());
 }
 
 /// xray's `-dump`: the merged config on stdout, without building or serving it. A file format the
@@ -910,17 +917,18 @@ fn dump_config(configs: &[String], named: Option<&str>) -> ! {
         if matches!(format, SourceFormat::Protobuf) {
             continue;
         }
+        let label = redact_source(file).into_owned();
         let bytes = read_source(file)
-            .unwrap_or_else(|error| dump_fail(&format!("cannot read {file}: {error}")));
+            .unwrap_or_else(|error| dump_fail(&format!("cannot read {label}: {error}")));
         let body = config_text(&bytes, format)
-            .unwrap_or_else(|error| dump_fail(&format!("bad config {file}: {error}")));
+            .unwrap_or_else(|error| dump_fail(&format!("bad config {label}: {error}")));
         let root = crate::json::parse(&body)
-            .unwrap_or_else(|error| dump_fail(&format!("bad config {file}: {error}")));
+            .unwrap_or_else(|error| dump_fail(&format!("bad config {label}: {error}")));
         if first {
             merged = root;
             first = false;
         } else {
-            crate::json::merge(&mut merged, &root, file);
+            crate::json::merge(&mut merged, &root, &label);
         }
     }
     let mut text = String::new();
@@ -981,16 +989,18 @@ fn discover_config() -> String {
 fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
     match named.map(str::to_ascii_lowercase).as_deref() {
         Some("pb" | "protobuf") => SourceFormat::Protobuf,
-        Some("json") => SourceFormat::Json,
+        Some("json") => {
+            if config_extension(source).eq_ignore_ascii_case("jsonc") {
+                SourceFormat::Jsonc
+            } else {
+                SourceFormat::Json
+            }
+        }
         Some("jsonc") => SourceFormat::Jsonc,
         Some("yaml" | "yml") => SourceFormat::Yaml,
         Some("toml") => SourceFormat::Toml,
         Some("auto") | None => {
-            let path = source.split(['?', '#']).next().unwrap_or(source);
-            let extension = std::path::Path::new(path)
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                .unwrap_or_default();
+            let extension = config_extension(source);
             if extension.eq_ignore_ascii_case("pb") || extension.eq_ignore_ascii_case("protobuf") {
                 SourceFormat::Protobuf
             } else if extension.eq_ignore_ascii_case("jsonc") {
@@ -1009,6 +1019,25 @@ fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
     }
 }
 
+fn config_extension(source: &str) -> &str {
+    let path = source.split(['?', '#']).next().unwrap_or(source);
+    std::path::Path::new(path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default()
+}
+
+fn redact_source(source: &str) -> std::borrow::Cow<'_, str> {
+    let Some((scheme, rest)) = source.split_once("://") else {
+        return std::borrow::Cow::Borrowed(source);
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let Some(at) = rest[..end].rfind('@') else {
+        return std::borrow::Cow::Borrowed(source);
+    };
+    std::borrow::Cow::Owned(format!("{scheme}://***{}", &rest[at..]))
+}
+
 /// A config source as xray reads it: a stream, an HTTP(S) URL, a socket endpoint, or a file.
 fn read_source(source: &str) -> Result<Vec<u8>, String> {
     if source == "stdin" || source == "stdin:" {
@@ -1021,8 +1050,9 @@ fn read_source(source: &str) -> Result<Vec<u8>, String> {
         return fetch_http(&url, socket.as_deref(), 10);
     }
     if let Some((scheme, _)) = source.split_once("://") {
+        let shown = redact_source(source);
         return Err(format!(
-            "unsupported config source `{source}`: scheme `{scheme}`"
+            "unsupported config source `{shown}`: scheme `{scheme}`"
         ));
     }
     std::fs::read(source).map_err(|error| error.to_string())
@@ -1049,10 +1079,15 @@ fn remote_source(source: &str) -> Option<(String, Option<String>)> {
             return Some(split_http_unix_url(raw));
         }
     }
-    if std::path::Path::new(source).is_absolute()
-        && (source.contains(":/") || is_unix_socket(source))
-    {
-        return Some(split_http_unix_url(source));
+    if std::path::Path::new(source).is_absolute() {
+        if let Some((head, _)) = source.split_once(":/") {
+            if !head.starts_with('@') && !std::path::Path::new(head).is_absolute() {
+                return None;
+            }
+        }
+        if source.contains(":/") || is_unix_socket(source) {
+            return Some(split_http_unix_url(source));
+        }
     }
     if source.starts_with('@') {
         return Some(split_http_unix_url(source));
@@ -1090,23 +1125,112 @@ fn is_unix_socket(_path: &str) -> bool {
 trait ReadWrite: std::io::Read + std::io::Write {}
 impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
 
+trait DeadlineIo: std::io::Read + std::io::Write {
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()>;
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()>;
+}
+
+impl DeadlineIo for std::net::TcpStream {
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        std::net::TcpStream::set_read_timeout(self, timeout)
+    }
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        std::net::TcpStream::set_write_timeout(self, timeout)
+    }
+}
+
+impl DeadlineIo for crate::conn::Connection {
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        crate::conn::Connection::set_read_timeout(self, timeout)
+    }
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        crate::conn::Connection::set_write_timeout(self, timeout)
+    }
+}
+
+struct Timed<S> {
+    inner: S,
+    deadline: std::time::Instant,
+}
+
+impl<S: DeadlineIo> Timed<S> {
+    fn new(inner: S, deadline: std::time::Instant) -> std::io::Result<Self> {
+        let left = Self::remaining(deadline)?;
+        let timed = Self { inner, deadline };
+        timed.arm_read(left)?;
+        timed.arm_write(left)?;
+        Ok(timed)
+    }
+    fn remaining(deadline: std::time::Instant) -> std::io::Result<std::time::Duration> {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request timed out",
+            ))
+        } else {
+            Ok(left)
+        }
+    }
+    fn left(&self) -> std::io::Result<std::time::Duration> {
+        Self::remaining(self.deadline)
+    }
+    fn arm_read(&self, left: std::time::Duration) -> std::io::Result<()> {
+        match self.inner.set_read_timeout(Some(left)) {
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            result => result,
+        }
+    }
+    fn arm_write(&self, left: std::time::Duration) -> std::io::Result<()> {
+        match self.inner.set_write_timeout(Some(left)) {
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            result => result,
+        }
+    }
+}
+
+impl<S: DeadlineIo> std::io::Read for Timed<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.left()?;
+        self.arm_read(left)?;
+        self.inner.read(buf)
+    }
+}
+
+impl<S: DeadlineIo> std::io::Write for Timed<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let left = self.left()?;
+        self.arm_write(left)?;
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// `FetchHTTPContent`: a 30-second request, redirects like `net/http`, status 200 only.
 fn fetch_http(url: &str, socket: Option<&str>, redirects: usize) -> Result<Vec<u8>, String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut url = url.to_owned();
     for remaining in (0..=redirects).rev() {
+        let shown = redact_source(&url).into_owned();
         let parsed = crate::conn::HttpUrl::parse(&url)
-            .map_err(|error| format!("invalid URL: {url}: {error}"))?;
+            .map_err(|error| format!("invalid URL: {shown}: {error}"))?;
         let left = deadline
             .checked_duration_since(std::time::Instant::now())
             .filter(|left| !left.is_zero())
-            .ok_or_else(|| format!("failed to dial to {url}: request timed out"))?;
+            .ok_or_else(|| format!("failed to dial to {shown}: request timed out"))?;
         let mut stream = if let Some(path) = socket {
-            socket_stream(path, left)
-                .map_err(|error| format!("failed to dial to {url}: {error}"))?
+            let timed = Timed::new(
+                socket_stream(path, left)
+                    .map_err(|error| format!("failed to dial to {shown}: {error}"))?,
+                deadline,
+            )
+            .map_err(|error| format!("failed to dial to {shown}: {error}"))?;
+            Box::new(timed) as Box<dyn ReadWrite>
         } else {
             let tcp = tcp_stream(&parsed.host, parsed.port, left)
-                .map_err(|error| format!("failed to dial to {url}: {error}"))?;
+                .map_err(|error| format!("failed to dial to {shown}: {error}"))?;
             if parsed.tls {
                 let config = ferrox_core::tls::TlsConfig {
                     server_name: parsed.host.clone(),
@@ -1115,12 +1239,17 @@ fn fetch_http(url: &str, socket: Option<&str>, redirects: usize) -> Result<Vec<u
                     resumption: true,
                     ..Default::default()
                 };
-                match ferrox_core::tls::RustlsProvider::connect(&config, tcp) {
+                let timed = Timed::new(tcp, deadline)
+                    .map_err(|error| format!("failed to dial to {shown}: {error}"))?;
+                match ferrox_core::tls::RustlsProvider::connect(&config, timed) {
                     Ok(tls) => Box::new(tls) as Box<dyn ReadWrite>,
-                    Err(error) => return Err(format!("failed to dial to {url}: {error}")),
+                    Err(error) => return Err(format!("failed to dial to {shown}: {error}")),
                 }
             } else {
-                Box::new(tcp) as Box<dyn ReadWrite>
+                Box::new(
+                    Timed::new(tcp, deadline)
+                        .map_err(|error| format!("failed to dial to {shown}: {error}"))?,
+                ) as Box<dyn ReadWrite>
             }
         };
         let mut request = format!(
@@ -1137,7 +1266,7 @@ fn fetch_http(url: &str, socket: Option<&str>, redirects: usize) -> Result<Vec<u
         stream
             .write_all(request.as_bytes())
             .and_then(|()| stream.flush())
-            .map_err(|error| format!("failed to dial to {url}: {error}"))?;
+            .map_err(|error| format!("failed to dial to {shown}: {error}"))?;
         let (status, headers, body) = read_http_head(&mut *stream)?;
         if status == 200 {
             return read_http_body(&mut *stream, body, &headers);
@@ -1150,7 +1279,7 @@ fn fetch_http(url: &str, socket: Option<&str>, redirects: usize) -> Result<Vec<u
             {
                 if remaining == 0 {
                     return Err(format!(
-                        "failed to dial to {url}: stopped after 10 redirects"
+                        "failed to dial to {shown}: stopped after {redirects} redirects"
                     ));
                 }
                 url = redirect_location(&parsed, location);
@@ -1169,16 +1298,82 @@ fn redirect_location(base: &crate::conn::HttpUrl, location: &str) -> String {
     }
     let scheme = if base.tls { "https" } else { "http" };
     if let Some(rest) = location.strip_prefix("//") {
-        return format!("{scheme}://{rest}");
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let credentials = if rest[..end].eq_ignore_ascii_case(&base.authority) {
+            credentials(base)
+        } else {
+            String::new()
+        };
+        return format!("{scheme}://{credentials}{rest}");
     }
+    let credentials = credentials(base);
+    let path = base.path.split('?').next().unwrap_or(&base.path);
     if location.starts_with('/') {
-        return format!("{scheme}://{}{location}", base.authority);
+        return format!("{scheme}://{credentials}{}{location}", base.authority);
     }
-    let directory = match base.path.rfind('/') {
+    if location.starts_with('?') {
+        return format!("{scheme}://{credentials}{}{path}{location}", base.authority);
+    }
+    if location.starts_with('#') {
+        return format!("{scheme}://{credentials}{}{}", base.authority, base.path);
+    }
+    let directory = match path.rfind('/') {
         Some(0) | None => "",
-        Some(at) => &base.path[..at],
+        Some(at) => &path[..at],
     };
-    format!("{scheme}://{}{directory}/{location}", base.authority)
+    format!(
+        "{scheme}://{credentials}{}{directory}/{location}",
+        base.authority
+    )
+}
+
+fn credentials(base: &crate::conn::HttpUrl) -> String {
+    base.userinfo
+        .as_deref()
+        .map(|userinfo| format!("{}@", encode_userinfo(userinfo)))
+        .unwrap_or_default()
+}
+
+fn encode_userinfo(userinfo: &[u8]) -> String {
+    let mut out = String::new();
+    for byte in userinfo {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b':') {
+            out.push(*byte as char);
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+fn resolve_addresses(
+    host: &str,
+    port: u16,
+    budget: std::time::Duration,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs as _;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let host = host.to_owned();
+    std::thread::spawn(move || {
+        let _ = sender.send(
+            (host.as_str(), port)
+                .to_socket_addrs()
+                .map(std::iter::Iterator::collect),
+        );
+    });
+    match receiver.recv_timeout(budget) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "resolve timed out",
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std::io::Error::other("resolver stopped"))
+        }
+    }
 }
 
 fn tcp_stream(
@@ -1186,23 +1381,19 @@ fn tcp_stream(
     port: u16,
     budget: std::time::Duration,
 ) -> std::io::Result<std::net::TcpStream> {
-    use std::net::ToSocketAddrs as _;
     let deadline = std::time::Instant::now() + budget;
     let mut last = None;
-    for address in (host, port).to_socket_addrs()? {
+    for address in resolve_addresses(
+        host,
+        port,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+    )? {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
             break;
         }
         match std::net::TcpStream::connect_timeout(&address, left) {
-            Ok(stream) => {
-                let left = deadline
-                    .saturating_duration_since(std::time::Instant::now())
-                    .max(std::time::Duration::from_millis(1));
-                stream.set_read_timeout(Some(left))?;
-                stream.set_write_timeout(Some(left))?;
-                return Ok(stream);
-            }
+            Ok(stream) => return Ok(stream),
             Err(error) => last = Some(error),
         }
     }
@@ -1211,22 +1402,21 @@ fn tcp_stream(
 }
 
 #[cfg(any(unix, windows))]
-fn socket_stream(path: &str, budget: std::time::Duration) -> std::io::Result<Box<dyn ReadWrite>> {
-    let started = std::time::Instant::now();
-    let stream = crate::conn::connect(
+fn socket_stream(
+    path: &str,
+    budget: std::time::Duration,
+) -> std::io::Result<crate::conn::Connection> {
+    crate::conn::connect(
         &crate::conn::Target::Unix(std::path::PathBuf::from(path)),
         budget,
-    )?;
-    let left = budget
-        .saturating_sub(started.elapsed())
-        .max(std::time::Duration::from_millis(1));
-    stream.set_read_timeout(Some(left))?;
-    stream.set_write_timeout(Some(left))?;
-    Ok(Box::new(stream))
+    )
 }
 
 #[cfg(not(any(unix, windows)))]
-fn socket_stream(path: &str, _budget: std::time::Duration) -> std::io::Result<Box<dyn ReadWrite>> {
+fn socket_stream(
+    path: &str,
+    _budget: std::time::Duration,
+) -> std::io::Result<crate::conn::Connection> {
     Err(std::io::Error::other(format!(
         "unix socket `{path}` is not supported on this platform"
     )))
@@ -1266,9 +1456,11 @@ fn read_http_head(stream: &mut dyn ReadWrite) -> Result<HttpHead, String> {
     }
 }
 
+const MAX_CONFIG_BYTES: usize = 64 << 20;
+
 fn read_http_body(
     stream: &mut dyn ReadWrite,
-    mut body: Vec<u8>,
+    body: Vec<u8>,
     headers: &[(String, String)],
 ) -> Result<Vec<u8>, String> {
     let header = |name: &str| {
@@ -1277,35 +1469,56 @@ fn read_http_body(
             .find(|(have, _)| have == name)
             .map(|(_, value)| value.as_str())
     };
-    if header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
-        body = read_chunked(stream, body)?;
-    } else if let Some(length) = header("content-length") {
-        let length = length
-            .parse::<usize>()
-            .map_err(|error| format!("failed to read HTTP response: {error}"))?;
-        if body.len() < length {
-            let start = body.len();
-            body.resize(length, 0);
-            stream
-                .read_exact(&mut body[start..])
+    let body =
+        if header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
+            read_chunked(stream, body)?
+        } else if let Some(length) = header("content-length") {
+            let length = length
+                .parse::<usize>()
                 .map_err(|error| format!("failed to read HTTP response: {error}"))?;
-        }
-        body.truncate(length);
-    } else {
-        stream
-            .read_to_end(&mut body)
-            .map_err(|error| format!("failed to read HTTP response: {error}"))?;
-    }
+            if length > MAX_CONFIG_BYTES {
+                return Err(format!(
+                    "failed to read HTTP response: body exceeds {MAX_CONFIG_BYTES} bytes"
+                ));
+            }
+            let mut body = body;
+            if body.len() < length {
+                let start = body.len();
+                body.resize(length, 0);
+                stream
+                    .read_exact(&mut body[start..])
+                    .map_err(|error| format!("failed to read HTTP response: {error}"))?;
+            }
+            body.truncate(length);
+            body
+        } else {
+            read_capped(stream, body)?
+        };
     if header("content-encoding").is_some_and(|value| value.eq_ignore_ascii_case("gzip")) {
-        let mut decoded = Vec::new();
-        std::io::Read::read_to_end(
-            &mut flate2::read::GzDecoder::new(body.as_slice()),
-            &mut decoded,
-        )
-        .map_err(|error| format!("failed to read HTTP response: {error}"))?;
-        return Ok(decoded);
+        return read_capped(
+            &mut flate2::read::MultiGzDecoder::new(body.as_slice()),
+            Vec::new(),
+        );
     }
     Ok(body)
+}
+
+fn read_capped(stream: &mut dyn std::io::Read, mut bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|error| format!("failed to read HTTP response: {error}"))?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len() + read > MAX_CONFIG_BYTES {
+            return Err(format!(
+                "failed to read HTTP response: body exceeds {MAX_CONFIG_BYTES} bytes"
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
 }
 
 fn read_chunked(stream: &mut dyn ReadWrite, mut bytes: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -1325,6 +1538,11 @@ fn read_chunked(stream: &mut dyn ReadWrite, mut bytes: Vec<u8>) -> Result<Vec<u8
         at += end + 2;
         if size == 0 {
             return Ok(out);
+        }
+        if out.len().saturating_add(size) > MAX_CONFIG_BYTES {
+            return Err(format!(
+                "failed to read HTTP response: body exceeds {MAX_CONFIG_BYTES} bytes"
+            ));
         }
         let wanted = at
             .checked_add(size)
@@ -1494,6 +1712,146 @@ fn serve_source(label: &str, bytes: &[u8], format: SourceFormat) -> ! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_jsonc_source_named_json_keeps_its_comments() {
+        assert!(matches!(
+            crate::source_format(Some("json"), "https://example/config.jsonc?v=1"),
+            crate::SourceFormat::Jsonc
+        ));
+        assert!(matches!(
+            crate::source_format(Some("json"), "https://example/config.json"),
+            crate::SourceFormat::Json
+        ));
+    }
+
+    #[test]
+    fn a_windows_drive_path_is_not_a_socket_target() {
+        assert_eq!(crate::remote_source("C:/config.json"), None);
+        assert_eq!(crate::remote_source("C:\\config.json"), None);
+    }
+
+    #[test]
+    fn a_source_label_redacts_userinfo() {
+        assert_eq!(
+            crate::redact_source("https://user:secret@example.com/config.json?x=1"),
+            "https://***@example.com/config.json?x=1"
+        );
+        assert_eq!(
+            crate::redact_source("https://example.com/config.json"),
+            "https://example.com/config.json"
+        );
+    }
+
+    #[test]
+    fn a_relative_redirect_keeps_credentials_and_replaces_the_query() {
+        let base =
+            crate::conn::HttpUrl::parse("http://user:pass@example.com/a/b?x=1").expect("URL");
+        assert_eq!(
+            crate::redirect_location(&base, "?rev=2"),
+            "http://user:pass@example.com/a/b?rev=2"
+        );
+        assert_eq!(
+            crate::redirect_location(&base, "next"),
+            "http://user:pass@example.com/a/next"
+        );
+        assert_eq!(
+            crate::redirect_location(&base, "//other.example/x"),
+            "http://other.example/x"
+        );
+    }
+
+    #[test]
+    fn a_concatenated_gzip_body_is_read_to_the_end() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let mut gzip = Vec::new();
+        for part in [&b"{\"a\":"[..], &b"1}"[..]] {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(part).expect("gzip");
+            gzip.extend(encoder.finish().expect("gzip"));
+        }
+        let headers = vec![("content-encoding".to_owned(), "gzip".to_owned())];
+        let mut stream = std::io::Cursor::new(gzip);
+        assert_eq!(
+            crate::read_http_body(&mut stream, Vec::new(), &headers).expect("body"),
+            br#"{"a":1}"#
+        );
+    }
+
+    #[test]
+    fn a_declared_body_larger_than_the_cap_is_refused_before_a_read() {
+        struct Unread;
+        impl std::io::Read for Unread {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("read past the cap");
+            }
+        }
+        impl std::io::Write for Unread {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let headers = vec![(
+            "content-length".to_owned(),
+            (crate::MAX_CONFIG_BYTES + 1).to_string(),
+        )];
+        assert!(crate::read_http_body(&mut Unread, Vec::new(), &headers).is_err());
+    }
+
+    #[test]
+    fn a_timed_stream_stops_at_the_deadline() {
+        struct Drip;
+        impl std::io::Read for Drip {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                buf[0] = 0;
+                Ok(1)
+            }
+        }
+        impl std::io::Write for Drip {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::DeadlineIo for Drip {
+            fn set_read_timeout(
+                &self,
+                _timeout: Option<std::time::Duration>,
+            ) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn set_write_timeout(
+                &self,
+                _timeout: Option<std::time::Duration>,
+            ) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(25);
+        let mut timed = crate::Timed::new(Drip, deadline).expect("arms");
+        let mut byte = [0u8; 1];
+        let mut reads = 0;
+        loop {
+            match std::io::Read::read(&mut timed, &mut byte) {
+                Ok(_) => {
+                    reads += 1;
+                    assert!(reads < 100, "the deadline never stopped a drip");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => break,
+                Err(error) => panic!("unexpected read error: {error}"),
+            }
+        }
+        assert!(reads > 0);
+    }
+
     #[test]
     fn shadowsocks_server_password_shape() {
         let root = crate::json::parse(
