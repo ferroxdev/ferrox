@@ -162,7 +162,7 @@ impl Bridge {
             .iter()
             .any(|address| matches!(address, IpAddr::V6(v6) if *v6 == target));
         // A duplicate-address probe is only answered for an address the bridge owns; a proxy reply to a target it does not carry would make a host reject a fresh address.
-        if (!self.proxy && !owned) || (source.is_unspecified() && !owned) {
+        if !owned && (!self.proxy || source.is_unspecified()) {
             return None;
         }
         // RFC 4861: a solicitation from the unspecified source is answered to all-nodes with the solicited flag clear. A proxy answer for an address this bridge does not own leaves override clear so the real owner's advertisement wins.
