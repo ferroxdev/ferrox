@@ -542,7 +542,10 @@ fn encode_address_list(addrs: &[SocketAddr]) -> String {
 fn read_http_body(stream: &mut dyn Io, with_tls: bool) -> Option<String> {
     const MAX_BODY: usize = 64 * 1024;
     let _ = with_tls;
-    let mut reader = BufReader::new(StreamReader(stream));
+    let mut reader = BufReader::new(StreamReader {
+        stream,
+        deadline: Some(Instant::now() + Duration::from_secs(5)),
+    });
     let mut head = String::new();
     reader.read_line(&mut head).ok()?;
     let status = head.split_whitespace().nth(1)?.parse::<u16>().ok()?;
@@ -571,6 +574,7 @@ fn read_http_body(stream: &mut dyn Io, with_tls: bool) -> Option<String> {
             }
         }
     }
+    reader.get_mut().deadline = None;
     let deadline = Instant::now() + Duration::from_secs(5);
     let body = if chunked {
         let mut out = String::new();
@@ -612,11 +616,23 @@ fn read_http_body(stream: &mut dyn Io, with_tls: bool) -> Option<String> {
 
 /// Borrow open-ended [`Read`] for [`BufReader`]: the ownership this helper hands `BufReader` a
 /// `&mut dyn` and then gives back, without a wrapper type that lives beside the stream.
-struct StreamReader<'a>(&'a mut dyn Io);
+struct StreamReader<'a> {
+    stream: &'a mut dyn Io,
+    deadline: Option<Instant>,
+}
 
 impl Read for StreamReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the response header deadline passed",
+            ));
+        }
+        self.stream.read(buf)
     }
 }
 
@@ -1204,6 +1220,7 @@ pub(crate) fn serve_registration(
                 );
             }));
         }
+        punches.retain(|handle| !handle.is_finished());
         state.clear_events();
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             break;
