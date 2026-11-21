@@ -170,7 +170,7 @@ jobs:
           git -C "$RUNNER_TEMP/sing-box-head" remote add origin https://github.com/SagerNet/sing-box
           git -C "$RUNNER_TEMP/sing-box-head" fetch --quiet --no-tags --depth 1 origin "$SINGBOX_HEAD_REV"
           git -C "$RUNNER_TEMP/sing-box-head" checkout --quiet FETCH_HEAD
-          ( cd "$RUNNER_TEMP/sing-box-head" && go build -trimpath -o "$RUNNER_TEMP/singbox-head-bin" ./cmd/sing-box )
+          ( cd "$RUNNER_TEMP/sing-box-head" && go build -trimpath -tags with_gvisor -o "$RUNNER_TEMP/singbox-head-bin" ./cmd/sing-box )
           echo "SINGBOX_HEAD_SHA=$(git -C "$RUNNER_TEMP/sing-box-head" rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: fetch tun2socks
