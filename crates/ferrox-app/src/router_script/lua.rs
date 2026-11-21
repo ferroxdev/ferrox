@@ -117,6 +117,7 @@ struct ScriptContext {
     protocol: String,
     user: String,
     vless_route: u16,
+    skip_dns: bool,
     attributes: HashMap<String, String>,
 }
 
@@ -196,6 +197,7 @@ impl ScriptRouter {
         &self,
         flow: &Flow,
         callbacks: &ScriptCallbacks,
+        skip_dns: bool,
     ) -> Result<Option<String>, String> {
         let state = self.acquire()?;
         let context = ScriptContext {
@@ -215,6 +217,7 @@ impl ScriptRouter {
             protocol: flow.protocol.unwrap_or("").to_owned(),
             user: flow.user.unwrap_or("").to_owned(),
             vless_route: flow.vless_route,
+            skip_dns,
             attributes: flow.attrs.map_or_else(HashMap::new, |attrs| {
                 attrs
                     .iter()
@@ -280,6 +283,7 @@ fn call(lua: &Lua, context: ScriptContext) -> Result<Option<String>, String> {
         protocol,
         user,
         vless_route,
+        skip_dns,
         attributes,
     } = context;
     let context = lua
@@ -302,7 +306,7 @@ fn call(lua: &Lua, context: ScriptContext) -> Result<Option<String>, String> {
             protocol,
             user,
             vless_route,
-            false,
+            skip_dns,
         ))
         .map_err(|error| error.to_string())?;
     let mut values = values.into_iter();
@@ -1090,8 +1094,34 @@ end
             ScriptRouter::parse_in(&dir.join("route.lua").display().to_string(), vec![dir])
                 .expect("parses");
         assert_eq!(
-            router.route(&flow(), &callbacks()).expect("routes"),
+            router.route(&flow(), &callbacks(), false).expect("routes"),
             Some("picked-proxy".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_script_sees_the_loopback_skip_dns_flag() {
+        let dir = dir();
+        std::fs::write(
+            dir.join("route.lua"),
+            r#"
+function HandleRoute(ctx, inbound, sourcePort, targetPort, localPort, targetDomain, network, protocol, user, vlessRoute, skipDNSResolve)
+  if skipDNSResolve then return "direct" end
+  return nil
+end
+"#,
+        )
+        .expect("write");
+        let router =
+            ScriptRouter::parse_in(&dir.join("route.lua").display().to_string(), vec![dir])
+                .expect("parses");
+        assert_eq!(
+            router.route(&flow(), &callbacks(), true).expect("routes"),
+            Some("direct".to_owned())
+        );
+        assert_eq!(
+            router.route(&flow(), &callbacks(), false).expect("routes"),
+            None
         );
     }
 
@@ -1106,7 +1136,10 @@ end
         let router =
             ScriptRouter::parse_in(&dir.join("route.lua").display().to_string(), vec![dir])
                 .expect("parses");
-        assert_eq!(router.route(&flow(), &callbacks()).expect("routes"), None);
+        assert_eq!(
+            router.route(&flow(), &callbacks(), false).expect("routes"),
+            None
+        );
     }
 
     #[test]
@@ -1117,7 +1150,9 @@ end
         let router =
             ScriptRouter::parse_in(&dir.join("route.lua").display().to_string(), vec![dir])
                 .expect("parses");
-        let error = router.route(&flow(), &callbacks()).expect_err("refused");
+        let error = router
+            .route(&flow(), &callbacks(), false)
+            .expect_err("refused");
         assert!(error.contains("outboundTag"), "{error}");
     }
 
@@ -1145,7 +1180,7 @@ end
             pick: Arc::new(|tag| Ok(format!("picked-{tag}"))),
         };
         assert_eq!(
-            router.route(&flow(), &callbacks).expect("routes"),
+            router.route(&flow(), &callbacks, false).expect("routes"),
             Some("direct".to_owned())
         );
     }
@@ -1179,7 +1214,7 @@ end
             pick: Arc::new(|tag| Ok(format!("picked-{tag}"))),
         };
         assert_eq!(
-            router.route(&flow(), &callbacks).expect("routes"),
+            router.route(&flow(), &callbacks, false).expect("routes"),
             Some("direct".to_owned())
         );
     }

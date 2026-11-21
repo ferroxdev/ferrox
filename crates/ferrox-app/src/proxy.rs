@@ -3016,7 +3016,7 @@ impl RouteShared {
                 return Ok(None);
             };
             let first = probe.flow(probe.targets[0], probe.sources[0], probe.locals[0]);
-            if let Some(tag) = script.route(&first, callbacks)? {
+            if let Some(tag) = script.route(&first, callbacks, false)? {
                 return Ok(Some(tag));
             }
         }
@@ -3650,7 +3650,7 @@ impl RoutePlan {
             let Some(callbacks) = self.shared.script.as_ref() else {
                 return self.default_lane();
             };
-            match script.route(&flow, callbacks) {
+            match script.route(&flow, callbacks, self.skip_dns) {
                 Ok(Some(tag)) => {
                     let out = self.target(&tag);
                     return (out, Some(std::borrow::Cow::Owned(tag)));
@@ -18024,7 +18024,7 @@ fn serve_tun_inbound(
     let legs = crate::tun::Legs::default();
     let dial = Some(device_dial(out));
     let datagram = device_datagram(out);
-    let stopping = stop.map(Stop::shared);
+    let stopping = stop.map(|stop| stop.shared());
     let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(devices.len()));
     for device in devices {
         let outbound = out.clone();
