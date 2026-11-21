@@ -23,31 +23,18 @@ pub fn chacha20_poly1305_seal_in_place_unfused(
     state.finish()
 }
 
-// 4 KiB won 1.20x-1.26x on x86_64 outside Windows; elsewhere bench 44889561375 lost 0.94x-1.00x.
-#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
-const MAC_CHUNK: usize = 4096;
-#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
-const _: () = assert!(MAC_CHUNK.is_multiple_of(64));
-#[cfg(not(all(target_arch = "x86_64", not(target_os = "windows"))))]
-const MAC_CHUNK: usize = usize::MAX;
-
-fn mac_start(state: &mut Poly1305, aad: &[u8]) {
-    state.update(aad);
-    state.pad_to_block();
-}
-
-fn mac_finish(state: &mut Poly1305, aad_len: usize, ciphertext_len: usize) {
-    state.pad_to_block();
-    let mut lengths = [0u8; 16];
-    lengths[..8].copy_from_slice(&(aad_len as u64).to_le_bytes());
-    lengths[8..].copy_from_slice(&(ciphertext_len as u64).to_le_bytes());
-    state.update(&lengths);
-}
+/// The longest message where the fused head still saves a pass; above it the two-call shape fills whole passes and is cheaper.
+const FUSED_HEAD_BYTES: usize = 448;
 
 fn mac(state: &mut Poly1305, aad: &[u8], ciphertext: &[u8]) {
-    mac_start(state, aad);
-    state.update(ciphertext);
-    mac_finish(state, aad.len(), ciphertext.len());
+    for section in [aad, ciphertext] {
+        state.update(section);
+        state.pad_to_block();
+    }
+    let mut lengths = [0u8; 16];
+    lengths[..8].copy_from_slice(&(aad.len() as u64).to_le_bytes());
+    lengths[8..].copy_from_slice(&(ciphertext.len() as u64).to_le_bytes());
+    state.update(&lengths);
 }
 
 #[must_use]
@@ -57,28 +44,14 @@ pub fn chacha20_poly1305_seal_in_place(
     aad: &[u8],
     buf: &mut [u8],
 ) -> [u8; 16] {
-    let first = buf.len().min(MAC_CHUNK);
+    if buf.len() > FUSED_HEAD_BYTES {
+        return chacha20_poly1305_seal_in_place_unfused(key, nonce, aad, buf);
+    }
     let mut one_time = [0u8; 32];
-    fill_exact_with_head(key, nonce, 0, &mut one_time, &mut buf[..first]);
+    fill_exact_with_head(key, nonce, 0, &mut one_time, buf);
 
     let mut state = Poly1305::new(&one_time);
-    mac_start(&mut state, aad);
-    state.update(&buf[..first]);
-    let mut done = first;
-    if done < buf.len() {
-        let mut start_block =
-            1 + u32::try_from(blocks_for(first)).expect("the first chunk's blocks fit a counter");
-        while done < buf.len() {
-            let end = done.saturating_add(MAC_CHUNK).min(buf.len());
-            fill_exact(key, nonce, start_block, &mut buf[done..end]);
-            state.update(&buf[done..end]);
-            start_block = start_block
-                .checked_add(u32::try_from(blocks_for(end - done)).expect("a chunk's blocks fit"))
-                .expect("the fill guard proved the counter");
-            done = end;
-        }
-    }
-    mac_finish(&mut state, aad.len(), buf.len());
+    mac(&mut state, aad, buf);
     state.finish()
 }
 
@@ -105,41 +78,17 @@ fn seal_from_initialized(
     src: &[u8],
     dst: &mut [u8],
 ) -> [u8; 16] {
-    let first = src.len().min(MAC_CHUNK);
+    if src.len() > FUSED_HEAD_BYTES {
+        crate::record::fill_exact_from(key, nonce, 1, src, dst);
+        let mut state = Poly1305::new(&poly_key(key, nonce));
+        mac(&mut state, aad, dst);
+        return state.finish();
+    }
     let mut one_time = [0u8; 32];
-    crate::record::fill_exact_with_head_from(
-        key,
-        nonce,
-        0,
-        &mut one_time,
-        &src[..first],
-        &mut dst[..first],
-    );
+    crate::record::fill_exact_with_head_from(key, nonce, 0, &mut one_time, src, dst);
 
     let mut state = Poly1305::new(&one_time);
-    mac_start(&mut state, aad);
-    state.update(&dst[..first]);
-    let mut done = first;
-    if done < src.len() {
-        let mut start_block =
-            1 + u32::try_from(blocks_for(first)).expect("the first chunk's blocks fit a counter");
-        while done < src.len() {
-            let end = done.saturating_add(MAC_CHUNK).min(src.len());
-            crate::record::fill_exact_from(
-                key,
-                nonce,
-                start_block,
-                &src[done..end],
-                &mut dst[done..end],
-            );
-            state.update(&dst[done..end]);
-            start_block = start_block
-                .checked_add(u32::try_from(blocks_for(end - done)).expect("a chunk's blocks fit"))
-                .expect("the fill guard proved the counter");
-            done = end;
-        }
-    }
-    mac_finish(&mut state, aad.len(), src.len());
+    mac(&mut state, aad, dst);
     state.finish()
 }
 
@@ -252,20 +201,13 @@ mod tests {
     }
 
     #[test]
-    fn the_chunked_mac_is_compiled_out_where_ci_measured_a_loss() {
-        #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
-        assert_eq!(MAC_CHUNK, 4096);
-        #[cfg(not(all(target_arch = "x86_64", not(target_os = "windows"))))]
-        assert_eq!(MAC_CHUNK, usize::MAX);
-    }
-
-    #[test]
-    fn the_seal_is_the_unfused_seal_across_every_chunk_boundary() {
+    fn the_seal_is_the_unfused_seal_on_both_sides_of_the_fused_head_cutoff() {
         let key = [0x5bu8; 32];
         let nonce = [0xa7u8; 12];
         let aad = b"a header";
         for len in [
-            0, 1, 63, 64, 65, 4095, 4096, 4097, 8191, 8192, 8193, 16383, 16384, 16385,
+            0, 1, 63, 64, 65, 255, 256, 257, 447, 448, 449, 1023, 1024, 1025, 4095, 4096, 4097,
+            16384,
         ] {
             let plain: Vec<u8> = (0..len)
                 .map(|i| (i as u8).wrapping_mul(251).wrapping_add(11))
