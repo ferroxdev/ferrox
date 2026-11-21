@@ -619,6 +619,7 @@ fn read_close(stream: &mut std::net::TcpStream, closed: &std::sync::atomic::Atom
 
 /// A config served over HTTP is fetched like a file; a 404 and every wire shape keep the status the reference reports.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn http_config_is_fetched_and_a_missing_one_is_refused() {
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -670,10 +671,12 @@ fn http_config_is_fetched_and_a_missing_one_is_refused() {
             } else {
                 "Connection: close\r\n"
             };
-            let head = format!(
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}{close}\r\n",
-                body.len()
-            );
+            let length = if path == "/chunked" {
+                String::new()
+            } else {
+                format!("Content-Length: {}\r\n", body.len())
+            };
+            let head = format!("HTTP/1.1 {status}\r\n{length}{extra}{close}\r\n");
             std::io::Write::write_all(&mut stream, head.as_bytes()).expect("write HTTP head");
             std::io::Write::write_all(&mut stream, &body).expect("write HTTP body");
             if path == "/keep-alive" {

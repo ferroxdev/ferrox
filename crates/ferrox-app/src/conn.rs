@@ -2565,7 +2565,23 @@ pub(crate) fn connect(target: &Target, timeout: Duration) -> io::Result<Connecti
         #[cfg(unix)]
         Target::Unix(path) => unix_connect(path, timeout),
         #[cfg(windows)]
-        Target::Unix(path) => UnixStream::connect(path).map(Connection::Unix),
+        Target::Unix(path) => {
+            let path = path.clone();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(UnixStream::connect(&path));
+            });
+            match receiver.recv_timeout(timeout) {
+                Ok(result) => result.map(Connection::Unix),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "unix connect timed out",
+                )),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(io::Error::other("unix connector stopped"))
+                }
+            }
+        }
     }
 }
 
@@ -2605,6 +2621,18 @@ fn split_permission(path: &std::path::Path) -> (&std::path::Path, Option<u32>) {
     };
     let head = std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..comma]));
     (head, Some(mode))
+}
+
+/// Dial a config source's filesystem socket path literally, suffix included.
+#[cfg(unix)]
+pub(crate) fn connect_unix_literal(
+    path: &std::path::Path,
+    timeout: Duration,
+) -> io::Result<Connection> {
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    let address = socket2::SockAddr::unix(path)?;
+    connect_bounded(&socket, &address, timeout)?;
+    Ok(unix_connection(socket))
 }
 
 /// Bind a unix listener from the text a config names: an abstract name on the hosts that serve

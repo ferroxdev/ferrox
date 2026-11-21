@@ -885,6 +885,8 @@ fn serve_files(files: &[String], format: Option<&str>) -> ! {
             .unwrap_or_else(|error| proxy::exit(&format!("bad config {label}: {error}")));
         let root = crate::json::parse(&body)
             .unwrap_or_else(|error| proxy::exit(&format!("bad config {label}: {error}")));
+        let root = require_object(root)
+            .unwrap_or_else(|error| proxy::exit(&format!("bad config {label}: {error}")));
         if at == 0 {
             merged = root;
         } else {
@@ -924,6 +926,8 @@ fn dump_config(configs: &[String], named: Option<&str>) -> ! {
             .unwrap_or_else(|error| dump_fail(&format!("bad config {label}: {error}")));
         let root = crate::json::parse(&body)
             .unwrap_or_else(|error| dump_fail(&format!("bad config {label}: {error}")));
+        let root = require_object(root)
+            .unwrap_or_else(|error| dump_fail(&format!("bad config {label}: {error}")));
         if first {
             merged = root;
             first = false;
@@ -940,6 +944,13 @@ fn dump_config(configs: &[String], named: Option<&str>) -> ! {
 fn dump_fail(message: &str) -> ! {
     println!("{message}");
     std::process::exit(23);
+}
+
+fn require_object(root: crate::json::Json) -> Result<crate::json::Json, String> {
+    match root {
+        root @ crate::json::Json::Obj(_) => Ok(root),
+        _ => Err("top-level value must be an object".to_owned()),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1020,7 +1031,14 @@ fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
 }
 
 fn config_extension(source: &str) -> &str {
-    let path = source.split(['?', '#']).next().unwrap_or(source);
+    let path = if ["http://", "https://", "http+unix://"]
+        .iter()
+        .any(|prefix| source.starts_with(prefix))
+    {
+        source.split(['?', '#']).next().unwrap_or(source)
+    } else {
+        source
+    };
     std::path::Path::new(path)
         .extension()
         .and_then(std::ffi::OsStr::to_str)
@@ -1068,6 +1086,9 @@ fn remote_source(source: &str) -> Option<(String, Option<String>)> {
         };
         if is_socket_path(&canonical) {
             return Some(split_http_unix_url(&canonical));
+        }
+        if raw.contains('@') {
+            return Some((format!("http+unix://{raw}"), None));
         }
         return Some((canonical, None));
     }
@@ -1128,6 +1149,9 @@ impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
 trait DeadlineIo: std::io::Read + std::io::Write {
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()>;
     fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()>;
+    fn readable_now(&self) -> std::io::Result<bool> {
+        Ok(false)
+    }
 }
 
 impl DeadlineIo for std::net::TcpStream {
@@ -1145,6 +1169,16 @@ impl DeadlineIo for crate::conn::Connection {
     }
     fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
         crate::conn::Connection::set_write_timeout(self, timeout)
+    }
+    fn readable_now(&self) -> std::io::Result<bool> {
+        #[cfg(any(unix, windows))]
+        {
+            self.wait_readable(std::time::Duration::ZERO)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(false)
+        }
     }
 }
 
@@ -1169,7 +1203,7 @@ impl<S: DeadlineIo> Timed<S> {
                 "request timed out",
             ))
         } else {
-            Ok(left)
+            Ok(left.max(std::time::Duration::from_millis(1)))
         }
     }
     fn left(&self) -> std::io::Result<std::time::Duration> {
@@ -1177,15 +1211,18 @@ impl<S: DeadlineIo> Timed<S> {
     }
     fn arm_read(&self, left: std::time::Duration) -> std::io::Result<()> {
         match self.inner.set_read_timeout(Some(left)) {
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                if self.inner.readable_now()? {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
             result => result,
         }
     }
     fn arm_write(&self, left: std::time::Duration) -> std::io::Result<()> {
-        match self.inner.set_write_timeout(Some(left)) {
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
-            result => result,
-        }
+        self.inner.set_write_timeout(Some(left))
     }
 }
 
@@ -1220,37 +1257,37 @@ fn fetch_http(url: &str, socket: Option<&str>, redirects: usize) -> Result<Vec<u
             .checked_duration_since(std::time::Instant::now())
             .filter(|left| !left.is_zero())
             .ok_or_else(|| format!("failed to dial to {shown}: request timed out"))?;
-        let mut stream = if let Some(path) = socket {
-            let timed = Timed::new(
-                socket_stream(path, left)
-                    .map_err(|error| format!("failed to dial to {shown}: {error}"))?,
-                deadline,
+        let transport: Box<dyn ReadWrite> = if let Some(path) = socket {
+            Box::new(
+                Timed::new(
+                    socket_stream(path, left)
+                        .map_err(|error| format!("failed to dial to {shown}: {error}"))?,
+                    deadline,
+                )
+                .map_err(|error| format!("failed to dial to {shown}: {error}"))?,
             )
-            .map_err(|error| format!("failed to dial to {shown}: {error}"))?;
-            Box::new(timed) as Box<dyn ReadWrite>
         } else {
             let tcp = tcp_stream(&parsed.host, parsed.port, left)
                 .map_err(|error| format!("failed to dial to {shown}: {error}"))?;
-            if parsed.tls {
-                let config = ferrox_core::tls::TlsConfig {
-                    server_name: parsed.host.clone(),
-                    alpn: vec![b"http/1.1".to_vec()].into(),
-                    roots: crate::quic::system_roots(),
-                    resumption: true,
-                    ..Default::default()
-                };
-                let timed = Timed::new(tcp, deadline)
-                    .map_err(|error| format!("failed to dial to {shown}: {error}"))?;
-                match ferrox_core::tls::RustlsProvider::connect(&config, timed) {
-                    Ok(tls) => Box::new(tls) as Box<dyn ReadWrite>,
-                    Err(error) => return Err(format!("failed to dial to {shown}: {error}")),
-                }
-            } else {
-                Box::new(
-                    Timed::new(tcp, deadline)
-                        .map_err(|error| format!("failed to dial to {shown}: {error}"))?,
-                ) as Box<dyn ReadWrite>
+            Box::new(
+                Timed::new(tcp, deadline)
+                    .map_err(|error| format!("failed to dial to {shown}: {error}"))?,
+            )
+        };
+        let mut stream = if parsed.tls {
+            let config = ferrox_core::tls::TlsConfig {
+                server_name: parsed.host.clone(),
+                alpn: vec![b"http/1.1".to_vec()].into(),
+                roots: crate::quic::system_roots(),
+                resumption: true,
+                ..Default::default()
+            };
+            match ferrox_core::tls::RustlsProvider::connect(&config, transport) {
+                Ok(tls) => Box::new(tls) as Box<dyn ReadWrite>,
+                Err(error) => return Err(format!("failed to dial to {shown}: {error}")),
             }
+        } else {
+            transport
         };
         let mut request = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: ferrox-app\r\nAccept-Encoding: gzip\r\n",
@@ -1267,7 +1304,7 @@ fn fetch_http(url: &str, socket: Option<&str>, redirects: usize) -> Result<Vec<u
             .write_all(request.as_bytes())
             .and_then(|()| stream.flush())
             .map_err(|error| format!("failed to dial to {shown}: {error}"))?;
-        let (status, headers, body) = read_http_head(&mut *stream)?;
+        let (status, headers, body) = read_final_http_head(&mut *stream)?;
         if status == 200 {
             return read_http_body(&mut *stream, body, &headers);
         }
@@ -1309,7 +1346,11 @@ fn redirect_location(base: &crate::conn::HttpUrl, location: &str) -> String {
     let credentials = credentials(base);
     let path = base.path.split('?').next().unwrap_or(&base.path);
     if location.starts_with('/') {
-        return format!("{scheme}://{credentials}{}{location}", base.authority);
+        return format!(
+            "{scheme}://{credentials}{}{}",
+            base.authority,
+            normalize_path(location)
+        );
     }
     if location.starts_with('?') {
         return format!("{scheme}://{credentials}{}{path}{location}", base.authority);
@@ -1322,9 +1363,54 @@ fn redirect_location(base: &crate::conn::HttpUrl, location: &str) -> String {
         Some(at) => &path[..at],
     };
     format!(
-        "{scheme}://{credentials}{}{directory}/{location}",
-        base.authority
+        "{scheme}://{credentials}{}{}",
+        base.authority,
+        normalize_path(&format!("{directory}/{location}"))
     )
+}
+
+fn normalize_path(path: &str) -> String {
+    let (path, tail) = match path.find(['?', '#']) {
+        Some(at) => (&path[..at], &path[at..]),
+        None => (path, ""),
+    };
+    let mut input = path;
+    let mut out = String::with_capacity(path.len());
+    while !input.is_empty() {
+        if let Some(rest) = input.strip_prefix("../") {
+            input = rest;
+        } else if let Some(rest) = input.strip_prefix("./") {
+            input = rest;
+        } else if input.starts_with("/./") {
+            input = &input[2..];
+        } else if input == "/." {
+            input = "/";
+        } else if input.starts_with("/../") {
+            input = &input[3..];
+            remove_last_segment(&mut out);
+        } else if input == "/.." {
+            input = "/";
+            remove_last_segment(&mut out);
+        } else if input == "." || input == ".." {
+            input = "";
+        } else {
+            let start = usize::from(input.starts_with('/'));
+            let end = input[start..]
+                .find('/')
+                .map_or(input.len(), |at| at + start);
+            out.push_str(&input[..end]);
+            input = &input[end..];
+        }
+    }
+    out.push_str(tail);
+    out
+}
+
+fn remove_last_segment(out: &mut String) {
+    match out.rfind('/') {
+        Some(at) => out.truncate(at),
+        None => out.clear(),
+    }
 }
 
 fn credentials(base: &crate::conn::HttpUrl) -> String {
@@ -1401,7 +1487,21 @@ fn tcp_stream(
         .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out")))
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
+fn socket_stream(
+    path: &str,
+    budget: std::time::Duration,
+) -> std::io::Result<crate::conn::Connection> {
+    if path.starts_with('@') {
+        return crate::conn::connect(
+            &crate::conn::Target::Unix(std::path::PathBuf::from(path)),
+            budget,
+        );
+    }
+    crate::conn::connect_unix_literal(std::path::Path::new(path), budget)
+}
+
+#[cfg(windows)]
 fn socket_stream(
     path: &str,
     budget: std::time::Duration,
@@ -1424,17 +1524,20 @@ fn socket_stream(
 
 type HttpHead = (u16, Vec<(String, String)>, Vec<u8>);
 
-fn read_http_head(stream: &mut dyn ReadWrite) -> Result<HttpHead, String> {
-    let mut raw = Vec::new();
+fn read_final_http_head(stream: &mut dyn ReadWrite) -> Result<HttpHead, String> {
+    let mut head = read_http_head(stream, Vec::new())?;
+    while (100..200).contains(&head.0) {
+        if head.0 == 101 {
+            return Err("failed to read HTTP response: protocol switched".to_owned());
+        }
+        head = read_http_head(stream, head.2)?;
+    }
+    Ok(head)
+}
+
+fn read_http_head(stream: &mut dyn ReadWrite, mut raw: Vec<u8>) -> Result<HttpHead, String> {
     let mut chunk = [0u8; 8192];
     loop {
-        let read = stream
-            .read(&mut chunk)
-            .map_err(|error| format!("failed to read HTTP response: {error}"))?;
-        if read == 0 {
-            return Err("failed to read HTTP response: unexpected end of stream".to_owned());
-        }
-        raw.extend_from_slice(&chunk[..read]);
         if let Some(at) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
             let head = std::str::from_utf8(&raw[..at])
                 .map_err(|error| format!("failed to read HTTP response: {error}"))?;
@@ -1453,6 +1556,13 @@ fn read_http_head(stream: &mut dyn ReadWrite) -> Result<HttpHead, String> {
         if raw.len() > 1 << 20 {
             return Err("failed to read HTTP response: headers too large".to_owned());
         }
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|error| format!("failed to read HTTP response: {error}"))?;
+        if read == 0 {
+            return Err("failed to read HTTP response: unexpected end of stream".to_owned());
+        }
+        raw.extend_from_slice(&chunk[..read]);
     }
 }
 
@@ -1522,40 +1632,60 @@ fn read_capped(stream: &mut dyn std::io::Read, mut bytes: Vec<u8>) -> Result<Vec
 }
 
 fn read_chunked(stream: &mut dyn ReadWrite, mut bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    const MAX_CHUNK_LINE: usize = 8 * 1024;
     let mut out = Vec::new();
-    let mut at = 0usize;
     loop {
-        let end = loop {
-            if let Some(end) = bytes[at..].windows(2).position(|window| window == b"\r\n") {
-                break end;
-            }
-            read_more(stream, &mut bytes)?;
-        };
-        let line = std::str::from_utf8(&bytes[at..at + end])
+        let end = chunk_line(stream, &mut bytes, MAX_CHUNK_LINE)?;
+        let line = std::str::from_utf8(&bytes[..end])
             .map_err(|error| format!("failed to read HTTP response: {error}"))?;
         let size = usize::from_str_radix(line.split(';').next().unwrap_or(line).trim(), 16)
             .map_err(|error| format!("failed to read HTTP response: {error}"))?;
-        at += end + 2;
+        bytes.drain(..end + 2);
         if size == 0 {
-            return Ok(out);
+            loop {
+                let end = chunk_line(stream, &mut bytes, MAX_CHUNK_LINE)?;
+                let empty = end == 0;
+                bytes.drain(..end + 2);
+                if empty {
+                    return Ok(out);
+                }
+            }
         }
         if out.len().saturating_add(size) > MAX_CONFIG_BYTES {
             return Err(format!(
                 "failed to read HTTP response: body exceeds {MAX_CONFIG_BYTES} bytes"
             ));
         }
-        let wanted = at
-            .checked_add(size)
-            .and_then(|wanted| wanted.checked_add(2))
+        let wanted = size
+            .checked_add(2)
             .ok_or_else(|| "failed to read HTTP response: incomplete chunk".to_owned())?;
         while bytes.len() < wanted {
             read_more(stream, &mut bytes)?;
         }
-        out.extend_from_slice(&bytes[at..at + size]);
-        if &bytes[at + size..wanted] != b"\r\n" {
+        out.extend_from_slice(&bytes[..size]);
+        if &bytes[size..wanted] != b"\r\n" {
             return Err("failed to read HTTP response: malformed chunk".to_owned());
         }
-        at = wanted;
+        bytes.drain(..wanted);
+    }
+}
+
+fn chunk_line(
+    stream: &mut dyn ReadWrite,
+    bytes: &mut Vec<u8>,
+    cap: usize,
+) -> Result<usize, String> {
+    loop {
+        if let Some(end) = bytes.windows(2).position(|window| window == b"\r\n") {
+            if end > cap {
+                return Err("failed to read HTTP response: chunk framing is too large".to_owned());
+            }
+            return Ok(end);
+        }
+        if bytes.len() > cap {
+            return Err("failed to read HTTP response: chunk framing is too large".to_owned());
+        }
+        read_more(stream, bytes)?;
     }
 }
 
@@ -1604,15 +1734,21 @@ fn yaml_mapping(map: &serde_yaml_ng::Mapping) -> Result<Vec<(String, crate::json
     let mut explicit = Vec::new();
     let mut merge_values = Vec::new();
     for (key, value) in map {
-        let serde_yaml_ng::Value::String(key) = key else {
-            return Err(format!(
-                "failed to convert yaml to json: map key {key:?} is not a string"
-            ));
-        };
-        if key == "<<" {
+        let key = yaml_key(key)?;
+        if key == "<<"
+            && matches!(
+                value,
+                serde_yaml_ng::Value::Mapping(_) | serde_yaml_ng::Value::Sequence(_)
+            )
+        {
             merge_values.push(value);
         } else {
-            explicit.push((key.clone(), yaml_json(value)?));
+            if explicit.iter().any(|(have, _)| have == &key) {
+                return Err(format!(
+                    "failed to convert yaml to json: duplicate map key {key:?}"
+                ));
+            }
+            explicit.push((key, yaml_json(value)?));
         }
     }
     let mut inherited: Vec<(String, crate::json::Json)> = Vec::new();
@@ -1630,6 +1766,23 @@ fn yaml_mapping(map: &serde_yaml_ng::Mapping) -> Result<Vec<(String, crate::json
     explicit.extend(inherited);
     explicit.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(explicit)
+}
+
+fn yaml_key(key: &serde_yaml_ng::Value) -> Result<String, String> {
+    use serde_yaml_ng::Value;
+    match key {
+        Value::String(key) => Ok(key.clone()),
+        Value::Number(number) => number
+            .as_i64()
+            .map(|value| value.to_string())
+            .or_else(|| number.as_u64().map(|value| value.to_string()))
+            .ok_or_else(|| {
+                format!("failed to convert yaml to json: map key {number:?} is not an integer")
+            }),
+        key => Err(format!(
+            "failed to convert yaml to json: map key {key:?} is not a string"
+        )),
+    }
 }
 
 fn yaml_merge_sources(
@@ -1725,6 +1878,24 @@ mod tests {
     }
 
     #[test]
+    fn a_local_path_keeps_query_like_text_in_its_extension() {
+        assert!(matches!(
+            crate::source_format(Some("json"), "config#blue.jsonc"),
+            crate::SourceFormat::Jsonc
+        ));
+        assert!(matches!(
+            crate::source_format(None, "site#blue.yaml"),
+            crate::SourceFormat::Yaml
+        ));
+    }
+
+    #[test]
+    fn an_overlay_root_must_be_an_object() {
+        assert!(crate::require_object(crate::json::Json::Arr(Vec::new())).is_err());
+        assert!(crate::require_object(crate::json::Json::Obj(Vec::new())).is_ok());
+    }
+
+    #[test]
     fn a_windows_drive_path_is_not_a_socket_target() {
         assert_eq!(crate::remote_source("C:/config.json"), None);
         assert_eq!(crate::remote_source("C:\\config.json"), None);
@@ -1740,6 +1911,9 @@ mod tests {
             crate::redact_source("https://example.com/config.json"),
             "https://example.com/config.json"
         );
+        let error =
+            crate::read_source("http+unix://user:secret@example.com/config.json").unwrap_err();
+        assert!(!error.contains("secret"), "{error}");
     }
 
     #[test]
@@ -1755,9 +1929,86 @@ mod tests {
             "http://user:pass@example.com/a/next"
         );
         assert_eq!(
+            crate::redirect_location(&base, "../stable/./config.json"),
+            "http://user:pass@example.com/stable/config.json"
+        );
+        assert_eq!(
+            crate::redirect_location(&base, "/a/../b?rev=3"),
+            "http://user:pass@example.com/b?rev=3"
+        );
+        assert_eq!(
+            crate::redirect_location(&base, "/a//b/../c"),
+            "http://user:pass@example.com/a//c"
+        );
+        assert_eq!(
+            crate::redirect_location(&base, "/a/."),
+            "http://user:pass@example.com/a/"
+        );
+        assert_eq!(
             crate::redirect_location(&base, "//other.example/x"),
             "http://other.example/x"
         );
+    }
+
+    #[test]
+    fn early_hints_are_skipped_before_the_config_response() {
+        let raw = b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+        let mut stream = std::io::Cursor::new(raw.to_vec());
+        let (status, _, body) = crate::read_final_http_head(&mut stream).expect("final head");
+        assert_eq!((status, body.as_slice()), (200, &b"{}"[..]));
+    }
+
+    #[test]
+    fn a_protocol_switch_is_not_a_config_response() {
+        let raw = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+        let mut stream = std::io::Cursor::new(raw.to_vec());
+        assert!(crate::read_final_http_head(&mut stream).is_err());
+    }
+
+    #[test]
+    fn yaml_integer_keys_become_object_names() {
+        let text = "policy:\n  levels:\n    0:\n      handshake: 1\n";
+        let json = crate::config_text(text.as_bytes(), crate::SourceFormat::Yaml).expect("yaml");
+        let root = crate::json::parse(&json).expect("json");
+        assert!(root
+            .get("policy")
+            .and_then(|policy| policy.get("levels"))
+            .and_then(|levels| levels.get("0"))
+            .is_some());
+    }
+
+    #[test]
+    fn a_quoted_merge_key_stays_data() {
+        let text = "env:\n  \"<<\": literal\n";
+        let json = crate::config_text(text.as_bytes(), crate::SourceFormat::Yaml).expect("yaml");
+        let root = crate::json::parse(&json).expect("json");
+        assert_eq!(
+            root.get("env")
+                .and_then(|env| env.get("<<"))
+                .and_then(crate::json::Json::as_str),
+            Some("literal")
+        );
+    }
+
+    #[test]
+    fn a_chunked_body_waits_for_its_trailer_terminator() {
+        let mut incomplete = std::io::Cursor::new(b"1\r\na\r\n0\r\n".to_vec());
+        assert!(crate::read_chunked(&mut incomplete, Vec::new()).is_err());
+        let mut complete = std::io::Cursor::new(b"1\r\na\r\n0\r\nX: y\r\n\r\n".to_vec());
+        assert_eq!(
+            crate::read_chunked(&mut complete, Vec::new()).expect("body"),
+            b"a"
+        );
+    }
+
+    #[test]
+    fn an_overlong_chunk_line_is_refused_at_the_cap() {
+        let mut stream = std::io::Cursor::new(vec![b'0'; 9000]);
+        assert!(crate::read_chunked(&mut stream, Vec::new()).is_err());
+        let mut terminated = vec![b'0'; 9000];
+        terminated.extend_from_slice(b"\r\n");
+        let mut stream = std::io::Cursor::new(terminated);
+        assert!(crate::read_chunked(&mut stream, Vec::new()).is_err());
     }
 
     #[test]
@@ -1805,15 +2056,14 @@ mod tests {
 
     #[test]
     fn a_timed_stream_stops_at_the_deadline() {
-        struct Drip;
-        impl std::io::Read for Drip {
+        struct Ready;
+        impl std::io::Read for Ready {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                std::thread::sleep(std::time::Duration::from_millis(10));
                 buf[0] = 0;
                 Ok(1)
             }
         }
-        impl std::io::Write for Drip {
+        impl std::io::Write for Ready {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
                 Ok(buf.len())
             }
@@ -1821,7 +2071,7 @@ mod tests {
                 Ok(())
             }
         }
-        impl crate::DeadlineIo for Drip {
+        impl crate::DeadlineIo for Ready {
             fn set_read_timeout(
                 &self,
                 _timeout: Option<std::time::Duration>,
@@ -1835,21 +2085,94 @@ mod tests {
                 Ok(())
             }
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(25);
-        let mut timed = crate::Timed::new(Drip, deadline).expect("arms");
-        let mut byte = [0u8; 1];
-        let mut reads = 0;
-        loop {
-            match std::io::Read::read(&mut timed, &mut byte) {
-                Ok(_) => {
-                    reads += 1;
-                    assert!(reads < 100, "the deadline never stopped a drip");
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => break,
-                Err(error) => panic!("unexpected read error: {error}"),
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut timed = crate::Timed::new(Ready, future).expect("arms a future deadline");
+        assert_eq!(
+            std::io::Read::read(&mut timed, &mut [0u8; 1]).expect("before the deadline"),
+            1
+        );
+        timed.deadline = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("a past instant");
+        let error = std::io::Read::read(&mut timed, &mut [0u8; 1]).expect_err("deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(crate::Timed::new(
+            Ready,
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .expect("a past instant")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_failed_rearm_does_not_read_with_a_stale_timeout() {
+        struct Closed {
+            armed: std::cell::Cell<bool>,
+        }
+        impl std::io::Read for Closed {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("read after an unconfirmed rearm");
             }
         }
-        assert!(reads > 0);
+        impl std::io::Write for Closed {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::DeadlineIo for Closed {
+            fn set_read_timeout(
+                &self,
+                _timeout: Option<std::time::Duration>,
+            ) -> std::io::Result<()> {
+                if self.armed.replace(false) {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+                }
+            }
+            fn set_write_timeout(
+                &self,
+                _timeout: Option<std::time::Duration>,
+            ) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn readable_now(&self) -> std::io::Result<bool> {
+                Ok(false)
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut timed = crate::Timed::new(Closed { armed: true.into() }, deadline).expect("arms");
+        assert!(std::io::Read::read(&mut timed, &mut [0u8; 1]).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_socket_source_dials_its_path_literally() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixListener;
+
+        let path =
+            std::env::temp_dir().join(format!("ferrox-test-literal-{}-,0600", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind literal socket");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept literal socket");
+            stream.write_all(b"ok").expect("write");
+        });
+        let mut stream = crate::socket_stream(
+            path.to_str().expect("utf-8 socket path"),
+            std::time::Duration::from_secs(1),
+        )
+        .expect("dials the literal path");
+        let mut body = [0u8; 2];
+        std::io::Read::read_exact(&mut stream, &mut body).expect("read");
+        assert_eq!(&body, b"ok");
+        server.join().expect("socket server");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
