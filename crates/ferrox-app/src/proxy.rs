@@ -7845,21 +7845,17 @@ fn serve_singmux_datagram(stream: crate::singmux::Stream, target: &Destination, 
     let read_done = Arc::clone(&up_done);
     let up = RelayPool::global().run(move || {
         let mut stream = stream;
-        let mut head = [0u8; 2];
+        let mut data = Vec::new();
         loop {
-            if stream.read_exact(&mut head).is_err() {
+            let Some(len) = read_datagram_room(&mut stream, &mut data) else {
                 break;
-            }
-            let len = usize::from(u16::from_be_bytes(head));
-            let mut data = vec![0u8; len];
-            if len > 0 && stream.read_exact(&mut data).is_err() {
-                break;
-            }
-            let _ = send.send(&data);
+            };
+            let _ = send.send(&data[..len]);
         }
         read_done.store(true, Ordering::Relaxed);
     });
     let mut buf = udp_buffer();
+    let mut frame = Vec::with_capacity(3);
     let mut first = true;
     let idle = budgets::udp_idle();
     let mut quiet = Instant::now();
@@ -7867,7 +7863,7 @@ fn serve_singmux_datagram(stream: crate::singmux::Stream, target: &Destination, 
         match socket.recv(&mut buf) {
             Ok(n) => {
                 quiet = Instant::now();
-                let mut frame = Vec::with_capacity(n + 3);
+                frame.clear();
                 if first {
                     frame.push(0);
                     first = false;
@@ -7909,21 +7905,17 @@ fn serve_singmux_packet_addr(stream: crate::singmux::Stream) {
     let read_done = Arc::clone(&up_done);
     let up = RelayPool::global().run(move || {
         let mut stream = stream;
+        let mut data = Vec::new();
         while let Some(destination) = read_socks_addr(&mut stream) {
-            let mut head = [0u8; 2];
-            if stream.read_exact(&mut head).is_err() {
+            let Some(len) = read_datagram_room(&mut stream, &mut data) else {
                 break;
-            }
-            let len = usize::from(u16::from_be_bytes(head));
-            let mut data = vec![0u8; len];
-            if len > 0 && stream.read_exact(&mut data).is_err() {
-                break;
-            }
-            let _ = packet_addr_send(&send, &data, destination);
+            };
+            let _ = packet_addr_send(&send, &data[..len], destination);
         }
         read_done.store(true, Ordering::Relaxed);
     });
     let mut buf = udp_buffer();
+    let mut frame = Vec::with_capacity(HEAD + 3);
     let mut first = true;
     let idle = budgets::udp_idle();
     let mut quiet = Instant::now();
@@ -7931,7 +7923,7 @@ fn serve_singmux_packet_addr(stream: crate::singmux::Stream) {
         match socket.recv_from(&mut buf) {
             Ok((n, source)) => {
                 quiet = Instant::now();
-                let mut frame = Vec::with_capacity(n + HEAD + 3);
+                frame.clear();
                 if first {
                     frame.push(0);
                     first = false;
@@ -33168,6 +33160,22 @@ fn read_udp_datagram(stream: &mut dyn Read, buf: &mut [u8]) -> Option<usize> {
         return None;
     }
     read_exact(stream, &mut buf[..len]).ok()?;
+    Some(len)
+}
+
+/// Read one length-prefixed datagram into a room that keeps its capacity across calls: only a
+/// datagram longer than any before it grows the room, so a steady stream costs no allocation and
+/// the bytes read are the frame's own. A zero-length datagram is a datagram, not an end.
+fn read_datagram_room(stream: &mut dyn Read, room: &mut Vec<u8>) -> Option<usize> {
+    let mut len = [0u8; 2];
+    read_exact(stream, &mut len).ok()?;
+    let len = usize::from(u16::from_be_bytes(len));
+    if room.len() < len {
+        room.resize(len, 0);
+    }
+    if len > 0 {
+        read_exact(stream, &mut room[..len]).ok()?;
+    }
     Some(len)
 }
 
@@ -87082,5 +87090,45 @@ mod h2_carrier_tests {
             out.lock().expect("lock").ends_with(b"0\r\n\r\n"),
             "the refusal did not end the carrier"
         );
+    }
+}
+
+#[cfg(test)]
+mod datagram_room_tests {
+    use super::*;
+
+    /// The room a lane reads its datagrams into keeps its capacity: only a longer datagram grows
+    /// it, and every read lands in the same allocation, so a steady stream allocates nothing.
+    #[test]
+    fn a_datagram_read_reuses_one_room_over_a_stream() {
+        let frames = [vec![1u8; 10], vec![2u8; 10], vec![3u8; 6000], vec![4u8; 10]];
+        let mut wire = Vec::new();
+        for frame in &frames {
+            wire.extend_from_slice(&(frame.len() as u16).to_be_bytes());
+            wire.extend_from_slice(frame);
+        }
+        let mut cursor = std::io::Cursor::new(wire);
+        let mut room = Vec::new();
+        for frame in &frames {
+            let len = read_datagram_room(&mut cursor, &mut room).expect("a frame");
+            assert_eq!(&room[..len], &frame[..], "the frame's own bytes");
+        }
+        let warm = room.capacity();
+        let base = room.as_ptr();
+        let mut wire = Vec::new();
+        for _ in 0..4 {
+            wire.extend_from_slice(&10u16.to_be_bytes());
+            wire.extend_from_slice(&[5u8; 10]);
+        }
+        let mut cursor = std::io::Cursor::new(wire);
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..4 {
+                assert_eq!(read_datagram_room(&mut cursor, &mut room), Some(10));
+            }
+        });
+        assert_eq!(counts.allocs, 0, "a warmed room is written in place");
+        assert_eq!(counts.bytes, 0, "and nothing is allocated behind it");
+        assert_eq!(room.capacity(), warm, "the room's capacity is steady");
+        assert_eq!(room.as_ptr(), base, "and its allocation never moved");
     }
 }
