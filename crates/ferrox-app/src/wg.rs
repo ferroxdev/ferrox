@@ -3244,8 +3244,8 @@ mod tests {
             peers: vec![PeerConfig {
                 public: [0x44; 32],
                 preshared: [0; 32],
-                endpoint: None,
-                endpoints: Vec::new(),
+                endpoint: Some("127.0.0.1:9".parse().expect("endpoint")),
+                endpoints: vec!["127.0.0.1:9".parse().expect("endpoint")],
                 keepalive: 0,
                 allowed: vec![("192.0.2.0".parse().unwrap(), 24)],
             }],

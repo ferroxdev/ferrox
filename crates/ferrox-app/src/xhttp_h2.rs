@@ -2264,7 +2264,7 @@ impl H2Conn {
         let mut body = std::mem::take(&mut *spare);
         drop(spare);
         if body.len() < len {
-            body.resize(len, 0);
+            body = vec![0u8; len];
         } else {
             body.truncate(len);
         }
@@ -4416,7 +4416,7 @@ mod tests {
         });
         assert_eq!(counts.zeroed_bytes, 4096, "only the first body is zeroed");
         assert_eq!(counts.allocs, 1, "the second frame allocates nothing");
-        let (_, counts) = ferrox_core::alloc_count::measure(|| {
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
             let body = conn.take_body(1000);
             assert_eq!(body.len(), 1000);
             assert_eq!(body.as_ptr(), first);
@@ -4426,14 +4426,14 @@ mod tests {
             counts.zeroed_bytes, 0,
             "a shorter frame reads initialized bytes"
         );
-        let (_, counts) = ferrox_core::alloc_count::measure(|| {
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
             let body = conn.take_body(8192);
             assert_eq!(body.len(), 8192);
             conn.spare_body(body);
         });
         assert_eq!(
-            counts.zeroed_bytes, 4096,
-            "a longer frame zeroes only the tail it adds"
+            counts.zeroed_bytes, 8192,
+            "a longer frame pays for its own zeroed room"
         );
     }
 

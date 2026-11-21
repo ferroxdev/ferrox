@@ -2479,7 +2479,7 @@ pub(crate) fn inner_addresses(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
 /// a literal is one slot and a name copies only the answers a peer routes, so the lane pays no
 /// heap for either.
 fn lane_targets(
-    destination: Destination,
+    destination: &Destination,
     resolve: &dyn Fn(&str, u16) -> Vec<SocketAddr>,
     addresses: &[IpAddr],
     winner: Option<SocketAddr>,
@@ -2497,13 +2497,13 @@ fn lane_targets(
     let mut len = 0;
     match destination {
         Destination::Address(address) => {
-            if routed(address) {
-                targets[0] = address;
+            if routed(*address) {
+                targets[0] = *address;
                 len = 1;
             }
         }
         Destination::Name(host, port) => {
-            for target in resolve(&host, port) {
+            for target in resolve(host, *port) {
                 if len == RACES {
                     break;
                 }
@@ -2883,7 +2883,7 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
                 ) else {
                     break 'lane;
                 };
-                let (targets, len) = lane_targets(destination, resolve, &config.addresses, winner);
+                let (targets, len) = lane_targets(&destination, resolve, &config.addresses, winner);
                 for target in &targets[..len] {
                     if !lane_send(config, source_port, *target, payload, &to_tunnel, headroom) {
                         break 'lane;
@@ -3238,7 +3238,7 @@ mod tests {
         let literal: SocketAddr = "192.0.2.7:53".parse().expect("a destination");
         let ((targets, count), counts) = ferrox_core::alloc_count::measure(|| {
             lane_targets(
-                Destination::Address(literal),
+                &Destination::Address(literal),
                 &|_, _| Vec::new(),
                 &addresses,
                 None,
@@ -3247,9 +3247,10 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(targets[0], literal);
         assert_eq!(counts.allocs, 0, "a literal target is a stack slot");
+        let asked = Destination::Name("example.test".to_owned(), 443);
         let ((targets, count), counts) = ferrox_core::alloc_count::measure(|| {
             lane_targets(
-                Destination::Name("example.test".to_owned(), 443),
+                &asked,
                 &|_, port| {
                     vec![
                         SocketAddr::new(IpAddr::V4([192, 0, 2, 1].into()), port),
@@ -3276,7 +3277,7 @@ mod tests {
         );
         let ((_, count), _) = ferrox_core::alloc_count::measure(|| {
             lane_targets(
-                Destination::Name("example.test".to_owned(), 443),
+                &asked,
                 &|_, _| vec!["[2001:db8::1]:443".parse().expect("one")],
                 &addresses,
                 None,
