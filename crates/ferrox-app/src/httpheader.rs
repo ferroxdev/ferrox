@@ -450,6 +450,7 @@ struct Chunked<'a, R> {
     reader: &'a mut R,
     pending: Vec<u8>,
     at: usize,
+    scan: usize,
     init: usize,
 }
 
@@ -459,6 +460,7 @@ impl<'a, R: Read + crate::proxy::RelayPoll> Chunked<'a, R> {
             reader,
             pending: Vec::with_capacity(SKIP_ROOM),
             at: 0,
+            scan: 0,
             init: 0,
         }
     }
@@ -471,6 +473,7 @@ impl<'a, R: Read + crate::proxy::RelayPoll> Chunked<'a, R> {
         self.pending.copy_within(self.at..len, 0);
         self.pending.truncate(len - self.at);
         self.init = self.init.saturating_sub(self.at);
+        self.scan = self.scan.saturating_sub(self.at);
         self.at = 0;
     }
 
@@ -527,30 +530,28 @@ impl<'a, R: Read + crate::proxy::RelayPoll> Chunked<'a, R> {
         Some(())
     }
 
-    fn line(&mut self, until: Instant) -> Option<Vec<u8>> {
-        let mut line = Vec::new();
+    /// The next line without its `\r\n`, borrowed from the read room: the scan moves the cursor and hands back the bytes it found, so a body of n chunks is not n allocations. A line split across reads keeps its start at the cursor, so the fill's compaction moves the unfinished bytes instead of dropping them; `scan` is how far into them the search already went.
+    fn line(&mut self, until: Instant) -> Option<&[u8]> {
+        self.scan = self.at;
         loop {
-            if let Some(rel) = self.pending[self.at..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-            {
-                let end = self.at + rel;
-                if line.len() + rel > HEAD_LIMIT {
+            let start = self.at;
+            let room = self.pending.get(self.scan..)?;
+            if let Some(rel) = room.iter().position(|byte| *byte == b'\n') {
+                let end = self.scan + rel;
+                if end - start > HEAD_LIMIT {
                     return None;
                 }
-                line.extend_from_slice(&self.pending[self.at..end]);
                 self.at = end + 1;
+                let line = self.pending.get(start..end)?;
                 if line.last() != Some(&b'\r') {
                     return None;
                 }
-                line.pop();
-                return Some(line);
+                return line.get(..line.len() - 1);
             }
-            line.extend_from_slice(&self.pending[self.at..]);
-            self.at = self.pending.len();
-            if line.len() > HEAD_LIMIT {
+            if self.pending.len() - start > HEAD_LIMIT {
                 return None;
             }
+            self.scan = self.pending.len();
             self.fill(until)?;
         }
     }
@@ -577,9 +578,10 @@ fn skip_chunked_body<R: Read + crate::proxy::RelayPoll>(
 ) -> Option<()> {
     let mut trailers = HEAD_LIMIT;
     loop {
-        let line = chunks.line(until)?;
-        let size = trim_ows(line.split(|byte| *byte == b';').next()?);
-        let size = parse_hex(size)?;
+        let size = {
+            let line = chunks.line(until)?;
+            parse_hex(trim_ows(line.split(|byte| *byte == b';').next()?))?
+        };
         if size == 0 {
             loop {
                 let line = chunks.line(until)?;
@@ -1153,6 +1155,60 @@ mod tests {
             &[],
         )
         .is_none());
+    }
+
+    #[test]
+    fn a_chunked_body_is_skipped_without_a_line_allocation() {
+        let mut body = Vec::new();
+        for _ in 0..64 {
+            body.extend_from_slice(b"10\r\n0123456789abcdef\r\n");
+        }
+        body.extend_from_slice(b"0\r\n\r\n");
+        let mut read = std::io::Cursor::new(body);
+        let until = Instant::now() + std::time::Duration::from_secs(5);
+        let mut chunks = Chunked::new(&mut read);
+        let (answer, counts) =
+            ferrox_core::alloc_count::measure(|| skip_chunked_body(&mut chunks, until));
+        assert_eq!(answer, Some(()));
+        assert_eq!(counts.allocs, 0, "a line is scanned, not collected");
+    }
+
+    #[test]
+    fn a_chunk_line_split_across_reads_is_still_one_line() {
+        struct Splits {
+            body: Vec<u8>,
+            at: usize,
+            most: usize,
+        }
+        impl Read for Splits {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = (self.body.len() - self.at).min(buf.len()).min(self.most);
+                buf[..n].copy_from_slice(&self.body[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+        impl crate::proxy::RelayPoll for Splits {
+            fn arm_relay_poll(&mut self) {}
+        }
+        let body = b"10\r\n0123456789abcdef\r\n0\r\nx-trailer: v\r\n\r\nnext".to_vec();
+        for most in 1..=8 {
+            let mut read = Splits {
+                body: body.clone(),
+                at: 0,
+                most,
+            };
+            let until = Instant::now() + std::time::Duration::from_secs(5);
+            let mut chunks = Chunked::new(&mut read);
+            assert_eq!(
+                skip_chunked_body(&mut chunks, until),
+                Some(()),
+                "a line split into {most}-byte reads"
+            );
+            let mut leftover = chunks.take_remainder();
+            leftover.extend_from_slice(&read.body[read.at..]);
+            assert_eq!(leftover, b"next", "a line split into {most}-byte reads");
+        }
     }
 
     #[test]
