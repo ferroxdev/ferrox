@@ -2581,10 +2581,10 @@ fn io(
     let mut keepalive_at = keepalive.map(|period| Instant::now() + period);
     let mut report = Instant::now();
     let mut dgrams_in = 0u64;
-    let mut last_recv = 0u64;
-    let mut last_sent = 0u64;
-    let mut last_lost = 0u64;
-    let mut last_retrans = 0u64;
+    let mut last_recv = 0usize;
+    let mut last_sent = 0usize;
+    let mut last_lost = 0usize;
+    let mut last_retrans = 0usize;
     let mut last_inner_in = 0u64;
     loop {
         if !alive.load(Ordering::Relaxed) {
