@@ -2272,8 +2272,11 @@ impl H2Conn {
     }
 
     /// Hands a consumed body back for the next frame: the room the stream is actually using is the
-    /// one worth keeping, so the latest buffer replaces the spare.
+    /// one worth keeping, so the latest nonempty buffer replaces the spare.
     fn spare_body(&self, body: Vec<u8>) {
+        if body.capacity() == 0 {
+            return;
+        }
         let mut spare = self.spare.lock().unwrap_or_else(PoisonError::into_inner);
         *spare = body;
     }
