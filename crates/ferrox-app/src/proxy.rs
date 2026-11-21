@@ -31981,9 +31981,9 @@ fn serve_socks_udp_pool<F, G>(
             let Some(peer) = *slot else {
                 return;
             };
-            let mut head = Vec::with_capacity(HEAD);
-            let out = socks_udp_frame(&mut head, &target.unwrap_or(dest), data);
-            let _ = sink_reply.send_to(out, peer);
+            let mut room = [0u8; HEAD];
+            let head = socks_udp_head_into(&mut room, &target.unwrap_or(dest));
+            let _ = send_to_two(&sink_reply, head, data, peer);
         });
         if let Some(flow) = pool.udp(dest, id.as_ref(), &buf[at..at + len], &deliver) {
             flows.insert(dest, flow);
@@ -38971,6 +38971,27 @@ fn socks_udp_head(out: &mut Vec<u8>, dest: &SocketAddr) {
     out.clear();
     out.extend_from_slice(&[0, 0, 0]);
     push_socks_addr(out, dest);
+}
+
+/// The same head for a literal destination, written into the caller's `HEAD`-byte room: the
+/// longest head is a type byte, sixteen address bytes and a port, so the fixed room holds any.
+fn socks_udp_head_into<'a>(room: &'a mut [u8; HEAD], dest: &SocketAddr) -> &'a [u8] {
+    room[..3].copy_from_slice(&[0, 0, 0]);
+    let used = match dest {
+        SocketAddr::V4(dest) => {
+            room[3] = 1;
+            room[4..8].copy_from_slice(&dest.ip().octets());
+            room[8..10].copy_from_slice(&dest.port().to_be_bytes());
+            10
+        }
+        SocketAddr::V6(dest) => {
+            room[3] = 4;
+            room[4..20].copy_from_slice(&dest.ip().octets());
+            room[20..22].copy_from_slice(&dest.port().to_be_bytes());
+            22
+        }
+    };
+    &room[..used]
 }
 
 /// The SOCKS5 UDP frame to send for a datagram: the head and the payload.
@@ -76460,6 +76481,28 @@ mod tests {
             forwarded, rebuilt,
             "the bytes on the wire are the tree's own"
         );
+    }
+
+    /// The reply head is written into a fixed 22-byte room, so the frame costs no buffer of
+    /// its own and the head is still byte for byte the one the tree builds.
+    #[test]
+    fn a_reply_head_is_written_without_a_buffer() {
+        let mut room = [0u8; HEAD];
+        for dest in ["198.51.100.7:443", "[2001:db8::7]:443"] {
+            let dest: SocketAddr = dest.parse().expect("addr");
+            let mut want = Vec::new();
+            socks_udp_head(&mut want, &dest);
+            let (len, counts) =
+                ferrox_core::alloc_count::measure(|| socks_udp_head_into(&mut room, &dest).len());
+            assert_eq!(counts.allocs, 0, "the head costs no buffer of its own");
+            assert_eq!(&room[..len], &want[..], "the head is the tree's own bytes");
+            let into = socks_udp_head_into(&mut room, &dest);
+            assert_eq!(
+                into.as_ptr() as usize,
+                room.as_ptr() as usize,
+                "the head is the caller's room"
+            );
+        }
     }
 
     /// The IPv6 header has its own length, and a matching frame is still handed back by
