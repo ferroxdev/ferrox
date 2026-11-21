@@ -991,20 +991,20 @@ fn service(conn: &mut quiche::Connection, lane: &Lane) -> bool {
     !conn.is_closed()
 }
 
-fn reply_worker(weak: &std::sync::Weak<Lane>) -> std::sync::mpsc::SyncSender<Vec<u8>> {
-    let (replies, backlog) = std::sync::mpsc::sync_channel::<Vec<u8>>(MAX_CLIENT_REPLIES);
+fn reply_worker(weak: &std::sync::Weak<Lane>) -> SyncSender<Reply> {
+    let (replies, backlog) = std::sync::mpsc::sync_channel::<Reply>(MAX_CLIENT_REPLIES);
     let worker = weak.clone();
     thread::spawn(move || {
         let mut reassembly = HashMap::new();
         let mut head = Vec::with_capacity(22);
-        while let Ok(data) = backlog.recv() {
+        while let Ok(reply) = backlog.recv() {
             let Some(owner) = worker.upgrade() else {
                 break;
             };
             if owner.stop.load(Ordering::Relaxed) {
                 break;
             }
-            dispatch_client(&data, &owner, &mut reassembly, &mut head);
+            dispatch_client(reply.packet(), &owner, &mut reassembly, &mut head);
         }
     });
     replies
@@ -1108,6 +1108,49 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
     }
 }
 
+/// One packet for the reply worker: a datagram's own buffer, or a slice of a uni stream's read
+/// shared with every packet that read carried, so a run of N packets costs one allocation.
+enum Reply {
+    Whole(Vec<u8>),
+    Inside {
+        bytes: Arc<Vec<u8>>,
+        at: std::ops::Range<usize>,
+    },
+}
+
+impl Reply {
+    fn packet(&self) -> &[u8] {
+        match self {
+            Self::Whole(bytes) => bytes,
+            Self::Inside { bytes, at } => &bytes[at.clone()],
+        }
+    }
+}
+
+/// Queue every complete packet one uni read carried as a slice of that read's single buffer, and
+/// return what is left: the partial packet at the tail, or nothing when the read ended on a frame
+/// boundary. `true` marks a stream the packets don't parse in, which the caller shuts down.
+fn share_uni_packets(data: Vec<u8>, replies: &SyncSender<Reply>) -> (Vec<u8>, bool) {
+    if data.get(1) != Some(&wire::PACKET) {
+        return (data, false);
+    }
+    let bytes = Arc::new(data);
+    let mut at = 0usize;
+    loop {
+        match wire::parse_packet_prefix(&bytes[at..]) {
+            Ok((_, used)) => {
+                let _ = replies.try_send(Reply::Inside {
+                    bytes: Arc::clone(&bytes),
+                    at: at..at + used,
+                });
+                at += used;
+            }
+            Err(wire::FrameError::Short) => return (bytes[at..].to_vec(), false),
+            Err(_) => return (Vec::new(), true),
+        }
+    }
+}
+
 /// The work one received batch owes: the datagrams it queued, the streams it made readable, and
 /// the timers behind them. The lock, the readable sweep and the egress flush are each paid once
 /// per batch instead of once per packet.
@@ -1115,13 +1158,13 @@ fn client_turn(
     conn: &mut quiche::Connection,
     lane: &Lane,
     buf: &mut [u8],
-    replies: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    replies: &SyncSender<Reply>,
     uni: &mut HashMap<u64, Vec<u8>>,
     ids: &mut Vec<u64>,
 ) -> bool {
     remember_session(conn, &lane.session);
     while let Ok(data) = conn.dgram_recv_buf() {
-        let _ = replies.try_send(data);
+        let _ = replies.try_send(Reply::Whole(data));
     }
     ids.clear();
     ids.extend(conn.readable());
@@ -1140,27 +1183,11 @@ fn client_turn(
             }
             data.extend_from_slice(&buf[..read]);
         }
-        if data.get(1) == Some(&wire::PACKET) {
-            let mut at = 0usize;
-            loop {
-                match wire::parse_packet_prefix(&data[at..]) {
-                    Ok((_, used)) => {
-                        let _ = replies.try_send(data[at..at + used].to_vec());
-                        at += used;
-                    }
-                    Err(wire::FrameError::Short) => break,
-                    Err(_) => {
-                        let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-                        data.clear();
-                        at = 0;
-                        break;
-                    }
-                }
-            }
-            if at > 0 {
-                data.drain(..at);
-            }
+        let (rest, broken) = share_uni_packets(data, replies);
+        if broken {
+            let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
         }
+        data = rest;
         if !conn.stream_finished(id) && !data.is_empty() {
             uni.insert(id, data);
         }
@@ -2988,6 +3015,84 @@ mod tests {
         assert_eq!((out.address.as_str(), out.port), ("tuic.test", 443));
         assert_eq!(out.mode, RelayMode::Quic);
         assert!(out.zero_rtt);
+    }
+
+    /// A uni read carrying three packets hands them over as three slices of one buffer: one
+    /// allocation for the run, no per-packet copy, and the same base under every packet.
+    #[test]
+    fn a_uni_run_shares_one_buffer_across_its_packets() {
+        let address = wire::address_port("127.0.0.1", 9).expect("an address");
+        let mut run = Vec::new();
+        for payload in [
+            b"first".as_slice(),
+            b"second".as_slice(),
+            b"third".as_slice(),
+        ] {
+            let mut frame = Vec::new();
+            wire::encode_fragment(1, 2, 1, 0, &address, payload, &mut frame);
+            run.extend_from_slice(&frame);
+        }
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(8);
+        let shared = run.clone();
+        let (rest, broken) =
+            ferrox_core::alloc_count::measure(|| share_uni_packets(shared, &reply_tx)).0;
+        assert!(!broken, "the run parses whole");
+        assert!(rest.is_empty(), "and leaves no tail");
+        let mut replies = Vec::new();
+        while let Ok(reply) = reply_rx.try_recv() {
+            replies.push(reply);
+        }
+        assert_eq!(replies.len(), 3, "one reply per packet");
+        let base = match &replies[0] {
+            Reply::Inside { bytes, .. } => bytes.as_ptr(),
+            Reply::Whole(_) => panic!("a uni packet is a slice, not its own buffer"),
+        };
+        let mut at = 0usize;
+        for reply in &replies {
+            let Reply::Inside { bytes, at: span } = reply else {
+                panic!("a uni packet is a slice, not its own buffer");
+            };
+            assert_eq!(bytes.as_ptr(), base, "every packet reads the same buffer");
+            assert_eq!(span.start, at, "and its own span in the run");
+            assert_eq!(&bytes[span.clone()], &run[at..span.end]);
+            at = span.end;
+        }
+        assert_eq!(at, run.len(), "the spans cover the read");
+    }
+
+    /// The allocator witness for the run above: after the read's buffer is built, handing three
+    /// packets over costs the shared cell and nothing per packet.
+    #[test]
+    fn a_uni_run_is_one_allocation() {
+        let address = wire::address_port("127.0.0.1", 9).expect("an address");
+        let mut run = Vec::new();
+        for payload in [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()] {
+            let mut frame = Vec::new();
+            wire::encode_fragment(1, 2, 1, 0, &address, payload, &mut frame);
+            run.extend_from_slice(&frame);
+        }
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(8);
+        let (_, counts) = ferrox_core::alloc_count::measure(|| share_uni_packets(run, &reply_tx));
+        assert_eq!(
+            counts.allocs, 1,
+            "the shared cell, not one buffer per packet"
+        );
+        assert_eq!(reply_rx.try_iter().count(), 3, "three packets ride it");
+    }
+
+    /// A read that ends mid-frame keeps the partial packet as the tail, and nothing else.
+    #[test]
+    fn a_uni_run_keeps_only_the_partial_tail() {
+        let address = wire::address_port("127.0.0.1", 9).expect("an address");
+        let mut frame = Vec::new();
+        wire::encode_fragment(1, 2, 1, 0, &address, b"whole", &mut frame);
+        let mut run = frame.clone();
+        run.extend_from_slice(&frame[..7]);
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(8);
+        let (rest, broken) = share_uni_packets(run, &reply_tx);
+        assert!(!broken, "a short tail is not a broken stream");
+        assert_eq!(rest, frame[..7], "the partial packet waits for the rest");
+        assert_eq!(reply_rx.try_iter().count(), 1, "the whole one went out");
     }
 
     #[test]

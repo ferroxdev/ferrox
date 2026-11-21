@@ -7846,10 +7846,7 @@ fn serve_singmux_datagram(stream: crate::singmux::Stream, target: &Destination, 
     let up = RelayPool::global().run(move || {
         let mut stream = stream;
         let mut data = Vec::new();
-        loop {
-            let Some(len) = read_datagram_room(&mut stream, &mut data) else {
-                break;
-            };
+        while let Some(len) = read_datagram_room(&mut stream, &mut data) {
             let _ = send.send(&data[..len]);
         }
         read_done.store(true, Ordering::Relaxed);
@@ -87121,7 +87118,7 @@ mod datagram_room_tests {
             wire.extend_from_slice(&[5u8; 10]);
         }
         let mut cursor = std::io::Cursor::new(wire);
-        let ((), counts) = crate::alloc_count::measure(|| {
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
             for _ in 0..4 {
                 assert_eq!(read_datagram_room(&mut cursor, &mut room), Some(10));
             }
