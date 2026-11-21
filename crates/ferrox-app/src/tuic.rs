@@ -39,6 +39,7 @@ const RETRY_TOKEN_TTL: Duration = Duration::from_secs(60);
 const RETRY_TOKEN_TAG: usize = 32;
 const MAX_ASSOCIATIONS_PER_SESSION: usize = 256;
 const MAX_UDP_SOCKETS: usize = 2048;
+const MAX_TUIC_LANES: usize = 64;
 const MAX_RESOLVING_PER_SESSION: usize = 32;
 const MAX_RESOLVE_PAYLOADS: usize = 4;
 const RESOLVE_QUEUE: usize = 256;
@@ -334,6 +335,11 @@ impl TuicOut {
         let source = proxy::flow_source().ok()?;
         let key = (source, options.clone());
         let mut held = self.lanes.lock().ok()?;
+        held.retain(|_, lane| {
+            Arc::strong_count(lane) > 1
+                || !(lane.stop.load(Ordering::Relaxed)
+                    || lane.conn.lock().is_ok_and(|conn| conn.is_closed()))
+        });
         if let Some(lane) = held.get(&key) {
             let live = !lane.stop.load(Ordering::Relaxed)
                 && lane
@@ -344,14 +350,16 @@ impl TuicOut {
                 return Some(Arc::clone(lane));
             }
         }
-        if let Some(lane) = held.remove(&key) {
-            lane.stop.store(true, Ordering::Relaxed);
-            if let Ok(mut conn) = lane.conn.lock() {
-                if !conn.is_closed() {
-                    let _ = conn.close(true, 0, b"handshake deadline");
-                    quic::flush_egress(&mut conn, &lane.sock);
-                }
-            }
+        held.remove(&key);
+        if held.len() >= MAX_TUIC_LANES {
+            let idle = held
+                .iter()
+                .find(|(_, lane)| Arc::strong_count(lane) == 1)
+                .map(|(key, _)| key.clone());
+            let Some(idle) = idle else {
+                return None;
+            };
+            held.remove(&idle);
         }
         let lane = self.connect_lane(source, options)?;
         held.insert(key, Arc::clone(&lane));
