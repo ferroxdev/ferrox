@@ -30199,39 +30199,46 @@ fn dokodemo_udp_door(
         return;
     };
     // One association per client: the upstream answers the source the request came from, so a shared association cannot route two clients' replies.
-    let mut legs: HashMap<SocketAddr, (UdpSocket, Connection, Arc<AtomicBool>)> = HashMap::new();
+    type Leg = (
+        UdpSocket,
+        Connection,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    );
+    let mut legs: HashMap<SocketAddr, Leg> = HashMap::new();
     let mut buf = udp_buffer();
+    let legs_stop = Arc::new(AtomicBool::new(false));
     // The door's frame is the door's: the address it rewrites to is the same for every datagram.
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
     let _ = socket.set_read_timeout(Some(door_idle(stop)));
     loop {
         if stop.as_ref().is_some_and(|stop| stop.stopped()) {
-            return;
+            break;
         }
         let (n, src) = match socket.recv_from(&mut buf) {
             Ok(read) => read,
             Err(error) if is_timeout(&error) => {
-                legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+                legs.retain(|_, (_, _, alive, _)| alive.load(Ordering::Relaxed));
                 continue;
             }
             Err(error) if is_udp_gone(&error) => {
                 thread::sleep(UDP_POLL);
-                legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+                legs.retain(|_, (_, _, alive, _)| alive.load(Ordering::Relaxed));
                 continue;
             }
-            Err(_) => return,
+            Err(_) => break,
         };
         if n == 0 {
             continue;
         }
         if legs
             .get(&src)
-            .is_some_and(|(_, _, alive)| !alive.load(Ordering::Relaxed))
+            .is_some_and(|(_, _, alive, _)| !alive.load(Ordering::Relaxed))
         {
             legs.remove(&src);
         }
         if !legs.contains_key(&src) && legs.len() >= MAX_DOKODEMO_LEGS {
-            legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+            legs.retain(|_, (_, _, alive, _)| alive.load(Ordering::Relaxed));
             if legs.len() >= MAX_DOKODEMO_LEGS {
                 continue;
             }
@@ -30256,24 +30263,43 @@ fn dokodemo_udp_door(
                     continue;
                 };
                 let alive = Arc::new(AtomicBool::new(true));
-                let reader_alive = alive.clone();
-                thread::spawn(move || {
+                let reader_alive = Arc::clone(&alive);
+                let reader_stop = Arc::clone(&legs_stop);
+                let door_stop = stop.cloned();
+                let handle = thread::spawn(move || {
+                    let _ = reader.set_read_timeout(Some(UDP_POLL));
                     let mut back = udp_buffer();
-                    while let Ok(read) = reader.recv(&mut back) {
-                        let Some((_source, payload)) = parse_socks_udp(&back[..read]) else {
-                            continue;
-                        };
-                        if writer.send_to(payload, src).is_err() {
+                    loop {
+                        if reader_stop.load(Ordering::Relaxed)
+                            || door_stop.as_ref().is_some_and(|stop| stop.stopped())
+                        {
                             break;
+                        }
+                        match reader.recv(&mut back) {
+                            Ok(read) => {
+                                let Some((_source, payload)) = parse_socks_udp(&back[..read])
+                                else {
+                                    continue;
+                                };
+                                if writer.send_to(payload, src).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(error) if is_timeout(&error) => {}
+                            Err(_) => break,
                         }
                     }
                     reader_alive.store(false, Ordering::Relaxed);
                 });
-                vacant.insert((leg, association.control, alive))
+                vacant.insert((leg, association.control, alive, handle))
             }
         };
         let out = socks_udp_frame(&mut frame, &target, &buf[..n]);
         let _ = leg.0.send(out);
+    }
+    legs_stop.store(true, Ordering::Relaxed);
+    for (_, _, _, handle) in legs {
+        let _ = handle.join();
     }
 }
 

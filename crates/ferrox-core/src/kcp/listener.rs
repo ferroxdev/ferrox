@@ -258,6 +258,8 @@ struct ListenerInner {
     ready_cv: Condvar,
     config: Config,
     closed: AtomicBool,
+    close_done: Mutex<bool>,
+    close_cv: Condvar,
     feed_done: Mutex<bool>,
     feed_cv: Condvar,
     addr: SocketAddr,
@@ -284,6 +286,8 @@ impl Listener {
             ready_cv: Condvar::new(),
             config,
             closed: AtomicBool::new(false),
+            close_done: Mutex::new(false),
+            close_cv: Condvar::new(),
             feed_done: Mutex::new(false),
             feed_cv: Condvar::new(),
             addr: local,
@@ -375,6 +379,8 @@ impl Listener {
                             if inner.closed.load(Ordering::SeqCst)
                                 || sessions.len() >= inner.config.max_sessions
                             {
+                                drop(sessions);
+                                session.terminate();
                                 continue;
                             }
                             sessions.insert(key, Arc::clone(&session));
@@ -392,6 +398,7 @@ impl Listener {
                         if inner.closed.load(Ordering::SeqCst) {
                             drop(ready);
                             inner.sessions.lock().unwrap().remove(&key);
+                            session.terminate();
                             continue;
                         }
                         ready.push_back(session);
@@ -442,10 +449,19 @@ impl Listener {
         }
         self.inner.ready.lock().unwrap().clear();
         self.inner.ready_cv.notify_all();
+        if let Ok(mut done) = self.inner.close_done.lock() {
+            *done = true;
+            self.inner.close_cv.notify_all();
+        }
     }
 
-    /// Wait for the feed thread to drop the socket it read from, so a closed listener has released its port.
+    /// Wait for both session termination and the feed thread's socket release, so a closed listener has relinquished its port.
     pub fn wait_closed(&self) {
+        let mut closed = self.inner.close_done.lock().unwrap();
+        while !*closed {
+            closed = self.inner.close_cv.wait(closed).unwrap();
+        }
+        drop(closed);
         let mut done = self.inner.feed_done.lock().unwrap();
         while !*done {
             done = self.inner.feed_cv.wait(done).unwrap();

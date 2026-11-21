@@ -32,6 +32,16 @@ fn napping(duration: Duration, stopped: impl Fn() -> bool) {
     }
 }
 
+struct RequestScope<'a>(Option<&'a RealmState>);
+
+impl Drop for RequestScope<'_> {
+    fn drop(&mut self) {
+        if let Some(state) = self.0 {
+            state.forget_requests();
+        }
+    }
+}
+
 /// The realm rendezvous over hand-written HTTP/1.1. One request is one closed exchange, so the
 /// caller never holds a pooled HTTP connection beside the QUIC peer it punches for.
 #[derive(Clone)]
@@ -66,7 +76,25 @@ impl Client {
         token: &str,
         body: Option<&str>,
     ) -> Option<String> {
-        let mut stream = self.open()?;
+        self.exchange_watching(method, path, token, body, None)
+    }
+
+    fn exchange_watching(
+        &self,
+        method: &str,
+        path: &str,
+        token: &str,
+        body: Option<&str>,
+        state: Option<&RealmState>,
+    ) -> Option<String> {
+        let mut stream = match state {
+            Some(state) => self
+                .open_with_timeout(Some(Duration::from_secs(5)), |handle| {
+                    state.watch_request(handle)
+                })
+                .map(|(stream, _)| stream)?,
+            None => self.open()?,
+        };
         let host_header = self.host_header();
         let mut request = Vec::with_capacity(256 + body.map_or(0, str::len));
         let _ = write!(request, "{method} {path} HTTP/1.1\r\n");
@@ -82,6 +110,7 @@ impl Client {
         } else {
             let _ = write!(request, "Connection: close\r\n\r\n");
         }
+        let _scope = RequestScope(state);
         stream.write_all(&request).ok()?;
         stream.flush().ok()?;
         read_http_body(&mut stream, self.is_https())
@@ -135,9 +164,15 @@ impl Client {
 
     /// `POST /v1/{id}/` with the locals this side announces, answered with `{session_id, ttl}`.
     #[must_use]
-    pub(crate) fn register(&self, id: &str, locals: &[SocketAddr]) -> Option<(String, u64)> {
+    pub(crate) fn register(
+        &self,
+        id: &str,
+        locals: &[SocketAddr],
+        state: Option<&RealmState>,
+    ) -> Option<(String, u64)> {
         let body = encode_addresses(locals);
-        let reply = self.exchange("POST", &join_path(id, ""), &self.token, Some(&body))?;
+        let reply =
+            self.exchange_watching("POST", &join_path(id, ""), &self.token, Some(&body), state)?;
         Some((
             json_string(&reply, "session_id")?,
             json_u64(&reply, "ttl").unwrap_or(60),
@@ -203,13 +238,15 @@ impl Client {
         session: &str,
         nonce: &str,
         locals: &[SocketAddr],
+        state: Option<&RealmState>,
     ) -> bool {
         let body = encode_addresses(locals);
-        self.exchange(
+        self.exchange_watching(
             "POST",
             &format!("/v1/{}/connects/{nonce}", sanitize_id(id)),
             session,
             Some(&body),
+            state,
         )
         .is_some()
     }
@@ -716,6 +753,8 @@ pub(crate) fn dial_peer(socket: &UdpSocket, config: &Config) -> Option<SocketAdd
 pub(crate) struct RealmState {
     events_stopped: std::sync::atomic::AtomicBool,
     events: std::sync::Mutex<Option<TcpStream>>,
+    requests_stopped: std::sync::atomic::AtomicBool,
+    requests: std::sync::Mutex<Vec<TcpStream>>,
     stun: std::sync::Mutex<
         std::collections::HashMap<
             [u8; ferrox_core::stun::TRANSACTION_SIZE],
@@ -737,6 +776,8 @@ impl RealmState {
         std::sync::Arc::new(Self {
             events_stopped: std::sync::atomic::AtomicBool::new(false),
             events: std::sync::Mutex::new(None),
+            requests_stopped: std::sync::atomic::AtomicBool::new(false),
+            requests: std::sync::Mutex::new(Vec::new()),
             stun: std::sync::Mutex::new(std::collections::HashMap::new()),
             punch: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
@@ -762,6 +803,40 @@ impl RealmState {
     pub(crate) fn clear_events(&self) {
         if let Ok(mut slot) = self.events.lock() {
             let _ = slot.take();
+        }
+    }
+
+    /// Remember the socket an in-flight registration request waits on, refusing one that arrives after cancellation.
+    fn watch_request(&self, stream: TcpStream) -> bool {
+        if let Ok(mut requests) = self.requests.lock() {
+            if self
+                .requests_stopped
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return false;
+            }
+            requests.push(stream);
+            return true;
+        }
+        false
+    }
+
+    /// Forget the request sockets after their exchange returns.
+    fn forget_requests(&self) {
+        if let Ok(mut requests) = self.requests.lock() {
+            requests.clear();
+        }
+    }
+
+    /// Shut registration request sockets so a blocked exchange returns before the worker joins.
+    pub(crate) fn interrupt_requests(&self) {
+        self.requests_stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut requests) = self.requests.lock() {
+            for stream in requests.drain(..) {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
         }
     }
 
@@ -846,6 +921,7 @@ pub(crate) fn punch_via_state(
     sock: &crate::quic::Datagram,
     meta: &realm::Metadata,
     peers: &[SocketAddr],
+    stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<SocketAddr> {
     if peers.is_empty() {
         return None;
@@ -857,6 +933,9 @@ pub(crate) fn punch_via_state(
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut next_send = Instant::now();
     let found = loop {
+        if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed)) {
+            break None;
+        }
         let now = Instant::now();
         if now >= deadline {
             break None;
@@ -943,6 +1022,18 @@ pub(crate) fn demux(
     true
 }
 
+fn end_registration_session(
+    session_stop: &mut Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    heartbeat: &mut Option<std::thread::JoinHandle<()>>,
+) {
+    if let Some(stop) = session_stop.take() {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(handle) = heartbeat.take() {
+        let _ = handle.join();
+    }
+}
+
 /// Register this serve at the rendezvous and answer its punches until `stop` names the end: the
 /// heartbeat and the events stream run beside each other, each recovering from a refused or closed
 /// rendezvous with the reference's backoff (one second doubling to thirty), and each punch event
@@ -962,9 +1053,12 @@ pub(crate) fn serve_registration(
 ) {
     let client = Client::new(config);
     let mut backoff = Duration::from_secs(1);
+    let mut heartbeat: Option<std::thread::JoinHandle<()>> = None;
+    let mut punches: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let mut active_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
     loop {
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
+            break;
         }
         let Some(base) =
             stun_discover_via_state(&state, &sock, &config.stun_servers, config.family)
@@ -992,7 +1086,7 @@ pub(crate) fn serve_registration(
             }
         }
         let shared_locals = std::sync::Arc::new(std::sync::Mutex::new(locals.clone()));
-        let Some((session, ttl)) = client.register(&config.id, &locals) else {
+        let Some((session, ttl)) = client.register(&config.id, &locals, Some(&state)) else {
             napping(backoff.min(Duration::from_secs(30)), || {
                 stop.load(std::sync::atomic::Ordering::Relaxed)
             });
@@ -1012,7 +1106,7 @@ pub(crate) fn serve_registration(
         let ttl_for_heartbeat = ttl;
         let session_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let heartbeat_session_stop = std::sync::Arc::clone(&session_stop);
-        std::thread::spawn(move || {
+        heartbeat = Some(std::thread::spawn(move || {
             heartbeat_loop(
                 heartbeat_client,
                 &heartbeat_id,
@@ -1027,12 +1121,12 @@ pub(crate) fn serve_registration(
                 heartbeat_stop,
                 heartbeat_session_stop,
             );
-        });
+        }));
+        active_stop = Some(std::sync::Arc::clone(&session_stop));
         let events_client = client.clone();
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
-            session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = events_client.deregister(&config.id, &session);
-            return;
+            break;
         }
         let Some(mut stream) = events_client.open_events(
             &config.id,
@@ -1041,7 +1135,7 @@ pub(crate) fn serve_registration(
             |handle| state.watch_events(handle),
         ) else {
             state.clear_events();
-            session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            end_registration_session(&mut active_stop, &mut heartbeat);
             napping(backoff.min(Duration::from_secs(30)), || {
                 stop.load(std::sync::atomic::Ordering::Relaxed)
             });
@@ -1050,13 +1144,11 @@ pub(crate) fn serve_registration(
         };
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             state.clear_events();
-            session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            return;
+            break;
         }
         backoff = Duration::from_secs(1);
         while let Some((peer_addresses, meta)) = stream.next_punch() {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
             let current_locals = shared_locals
@@ -1068,21 +1160,42 @@ pub(crate) fn serve_registration(
                 continue;
             }
             let nonce_hex = realm::hex_encode(&meta.nonce);
-            let _ =
-                events_client.connect_response(&config.id, &session, &nonce_hex, &current_locals);
+            let _ = events_client.connect_response(
+                &config.id,
+                &session,
+                &nonce_hex,
+                &current_locals,
+                Some(&state),
+            );
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             let punch_state = std::sync::Arc::clone(&state);
             let punch_sock = std::sync::Arc::clone(&sock);
-            std::thread::spawn(move || {
-                let _ = punch_via_state(&punch_state, &punch_sock, &meta, &expanded);
-            });
+            let punch_stop = std::sync::Arc::clone(&stop);
+            punches.push(std::thread::spawn(move || {
+                let _ = punch_via_state(
+                    &punch_state,
+                    &punch_sock,
+                    &meta,
+                    &expanded,
+                    Some(&punch_stop),
+                );
+            }));
         }
-        // The stream ended: re-register with the same backoff a refused register pays.
         state.clear_events();
-        session_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        end_registration_session(&mut active_stop, &mut heartbeat);
         napping(backoff.min(Duration::from_secs(30)), || {
             stop.load(std::sync::atomic::Ordering::Relaxed)
         });
         backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+    end_registration_session(&mut active_stop, &mut heartbeat);
+    for handle in punches {
+        let _ = handle.join();
     }
 }
 

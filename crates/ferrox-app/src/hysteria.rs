@@ -2563,6 +2563,7 @@ impl Drop for CoverSlot {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn auth_exchange(
     sock: &Arc<crate::quic::Datagram>,
     conn: &mut quiche::Connection,
@@ -2571,6 +2572,7 @@ fn auth_exchange(
     inbound: &mut Inbound,
     peer: SocketAddr,
     masq: &Masquerade,
+    streams: &mut Vec<std::thread::JoinHandle<()>>,
 ) -> Option<Auth> {
     let mut room = Unfilled::<4096>::new();
     loop {
@@ -2616,7 +2618,7 @@ fn auth_exchange(
             let shared = Arc::clone(shared);
             let sock = Arc::clone(sock);
             let masq = masq.clone();
-            std::thread::spawn(move || {
+            streams.push(std::thread::spawn(move || {
                 let _slot = slot;
                 let mut reply = Vec::new();
                 masq_bytes(&masq, &request, Some(&peer), &mut reply);
@@ -2630,7 +2632,7 @@ fn auth_exchange(
                         Instant::now(),
                     );
                 }
-            });
+            }));
         } else {
             let mut reply = Vec::new();
             masq_bytes(masq, &request, Some(&peer), &mut reply);
@@ -2794,7 +2796,16 @@ impl Router<'_> {
                 inbound.settings_sent = true;
             }
             if inbound.standing == Standing::Pending {
-                match auth_exchange(sock, &mut conn, Some(&shared), auths, inbound, from, masq) {
+                match auth_exchange(
+                    sock,
+                    &mut conn,
+                    Some(&shared),
+                    auths,
+                    inbound,
+                    from,
+                    masq,
+                    streams,
+                ) {
                     None => return true,
                     Some(Auth::Refused) => {
                         let _ = conn.close(false, 0, b"refused");
@@ -3086,6 +3097,7 @@ pub(crate) fn serve_prepared(
         realm_stop.store(true, Ordering::SeqCst);
         if let Some(state) = router.realm_state.as_ref() {
             state.interrupt_events();
+            state.interrupt_requests();
         }
         if let Some(worker) = realm_worker.take() {
             let _ = worker.join();
@@ -3157,6 +3169,7 @@ pub(crate) fn serve_prepared(
     realm_stop.store(true, Ordering::SeqCst);
     if let Some(state) = router.realm_state.as_ref() {
         state.interrupt_events();
+        state.interrupt_requests();
     }
     let mut readers = Vec::new();
     for inbound in router.routes.values_mut() {
@@ -3784,6 +3797,7 @@ mod tests {
                 &mut inbound,
                 client_addr,
                 &masq,
+                &mut Vec::new(),
             )
         };
         assert!(matches!(outcome, Some(Auth::Cover)));
