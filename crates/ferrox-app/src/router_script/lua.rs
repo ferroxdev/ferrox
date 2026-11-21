@@ -466,7 +466,7 @@ fn install(lua: &Lua, hooks: &Arc<CallHooks>, dirs: &Arc<Vec<PathBuf>>) -> LuaRe
             server.set(
                 "Query",
                 lua.create_function(
-                    move |lua, (name, ipv4, ipv6, fake): (String, bool, bool, bool)| match resolver
+                    move |lua, (_server, name, ipv4, ipv6, fake): (Value, String, bool, bool, bool)| match resolver
                         .script_query(index, &name, ipv4, ipv6, fake)
                     {
                         crate::dnsapp::Lookup::Records(addrs, ttl) => {
@@ -893,24 +893,24 @@ fn equal(left: IpAddr, right: IpAddr) -> bool {
 }
 
 fn unspecified(addr: IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(ip) => ip.is_unspecified(),
-        IpAddr::V6(ip) => ip.is_unspecified(),
+    if let Some(ip) = to4(addr) {
+        return ip.is_unspecified();
     }
+    matches!(addr, IpAddr::V6(ip) if ip.is_unspecified())
 }
 
 fn loopback(addr: IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(ip) => ip.is_loopback(),
-        IpAddr::V6(ip) => ip.is_loopback(),
+    if let Some(ip) = to4(addr) {
+        return ip.is_loopback();
     }
+    matches!(addr, IpAddr::V6(ip) if ip.is_loopback())
 }
 
 fn multicast(addr: IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(ip) => ip.is_multicast(),
-        IpAddr::V6(ip) => ip.is_multicast(),
+    if let Some(ip) = to4(addr) {
+        return ip.is_multicast();
     }
+    matches!(addr, IpAddr::V6(ip) if ip.is_multicast())
 }
 
 fn private(addr: IpAddr) -> bool {
@@ -936,23 +936,19 @@ fn interface_multicast(addr: IpAddr) -> bool {
 }
 
 fn link_multicast(addr: IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            octets[0] == 224 && octets[1] == 0 && octets[2] == 0
-        }
-        IpAddr::V6(ip) => ip.segments()[0] & 0xff0f == 0xff02,
+    if let Some(ip) = to4(addr) {
+        let octets = ip.octets();
+        return octets[0] == 224 && octets[1] == 0 && octets[2] == 0;
     }
+    matches!(addr, IpAddr::V6(ip) if ip.segments()[0] & 0xff0f == 0xff02)
 }
 
 fn link_unicast(addr: IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            octets[0] == 169 && octets[1] == 254
-        }
-        IpAddr::V6(ip) => ip.segments()[0] & 0xffc0 == 0xfe80,
+    if let Some(ip) = to4(addr) {
+        let octets = ip.octets();
+        return octets[0] == 169 && octets[1] == 254;
     }
+    matches!(addr, IpAddr::V6(ip) if ip.segments()[0] & 0xffc0 == 0xfe80)
 }
 
 fn default_mask(addr: IpAddr) -> Option<Vec<u8>> {
@@ -1090,7 +1086,9 @@ end
 "#,
         )
         .expect("write");
-        let router = ScriptRouter::parse_in("route.lua", vec![dir]).expect("parses");
+        let router =
+            ScriptRouter::parse_in(&dir.join("route.lua").display().to_string(), vec![dir])
+                .expect("parses");
         assert_eq!(
             router.route(&flow(), &callbacks()).expect("routes"),
             Some("picked-proxy".to_owned())
@@ -1105,7 +1103,9 @@ end
             "function HandleRoute() return nil end",
         )
         .expect("write");
-        let router = ScriptRouter::parse_in("route.lua", vec![dir]).expect("parses");
+        let router =
+            ScriptRouter::parse_in(&dir.join("route.lua").display().to_string(), vec![dir])
+                .expect("parses");
         assert_eq!(router.route(&flow(), &callbacks()).expect("routes"), None);
     }
 
@@ -1114,7 +1114,9 @@ end
         let dir = dir();
         std::fs::write(dir.join("route.lua"), "function HandleRoute() return 7 end")
             .expect("write");
-        let router = ScriptRouter::parse_in("route.lua", vec![dir]).expect("parses");
+        let router =
+            ScriptRouter::parse_in(&dir.join("route.lua").display().to_string(), vec![dir])
+                .expect("parses");
         let error = router.route(&flow(), &callbacks()).expect_err("refused");
         assert!(error.contains("outboundTag"), "{error}");
     }
@@ -1135,7 +1137,9 @@ end
 "#,
         )
         .expect("write");
-        let router = ScriptRouter::parse_in("route.lua", vec![dir]).expect("parses");
+        let router =
+            ScriptRouter::parse_in(&dir.join("route.lua").display().to_string(), vec![dir])
+                .expect("parses");
         let callbacks = ScriptCallbacks {
             resolve: Arc::new(|_, _, _, _, _| (vec!["192.0.2.9".parse().expect("address")], 60)),
             pick: Arc::new(|tag| Ok(format!("picked-{tag}"))),
@@ -1161,7 +1165,9 @@ end
 "#,
         )
         .expect("write");
-        let router = ScriptRouter::parse_in("route.lua", vec![dir]).expect("parses");
+        let router =
+            ScriptRouter::parse_in(&dir.join("route.lua").display().to_string(), vec![dir])
+                .expect("parses");
         let callbacks = ScriptCallbacks {
             resolve: Arc::new(|host, _, fake, v4, v6| {
                 assert_eq!(host, "example.com");
@@ -1179,6 +1185,16 @@ end
     }
 
     #[test]
+    fn ipv4_mapped_addresses_use_the_ipv4_predicates() {
+        let mapped = |text: &str| text.parse::<IpAddr>().expect("address");
+        assert!(loopback(mapped("::ffff:127.0.0.1")));
+        assert!(unspecified(mapped("::ffff:0.0.0.0")));
+        assert!(multicast(mapped("::ffff:224.0.0.1")));
+        assert!(link_unicast(mapped("::ffff:169.254.1.1")));
+        assert!(link_multicast(mapped("::ffff:224.0.0.1")));
+    }
+
+    #[test]
     fn a_script_path_must_end_in_lua_after_symlinks() {
         let dir = dir();
         std::fs::write(
@@ -1186,7 +1202,11 @@ end
             "function HandleRoute() return nil end",
         )
         .expect("write");
-        let error = ScriptRouter::parse_in("route.dat", vec![dir.clone()]).expect_err("refused");
+        let error = ScriptRouter::parse_in(
+            &dir.join("route.dat").display().to_string(),
+            vec![dir.clone()],
+        )
+        .expect_err("refused");
         assert!(error.contains(".lua"), "{error}");
         #[cfg(unix)]
         {
@@ -1197,7 +1217,8 @@ end
             .expect("write");
             std::os::unix::fs::symlink(dir.join("route.lua"), dir.join("alias.dat"))
                 .expect("symlink");
-            ScriptRouter::parse_in("alias.dat", vec![dir]).expect("a symlink to .lua parses");
+            ScriptRouter::parse_in(&dir.join("alias.dat").display().to_string(), vec![dir])
+                .expect("a symlink to .lua parses");
         }
     }
 }

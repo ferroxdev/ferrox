@@ -814,6 +814,9 @@ fn serve_inbounds_counted(
                             address,
                             handler_stop.as_ref(),
                         ) {
+                            if let Some(stop) = &handler_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            }
                             inbounds += 1;
                         }
                     }
@@ -17773,7 +17776,8 @@ fn tun_prefixes(
 
 /// `dns_mode: hijack` names the resolver a hijacked query rides; `system`, `none`, `forward` and the empty mode leave DNS to the device, and a word outside that set is refused rather than read as a silent forward.
 fn tun_dns_hijack(inbound: &Json) -> Result<Option<IpAddr>, String> {
-    let hijack = match tun_string(inbound, "dns_mode")? {
+    let mode = tun_string(inbound, "dns_mode")?;
+    let hijack = match mode {
         None | Some("" | "system" | "none" | "forward") => false,
         Some("hijack") => true,
         Some(other) => {
@@ -17783,13 +17787,15 @@ fn tun_dns_hijack(inbound: &Json) -> Result<Option<IpAddr>, String> {
         }
     };
     if !hijack {
-        // xray names the resolvers `DNS` and selects the takeover with the switch below; without `dns_mode`, the first plain address is what a query rides.
-        if let Some(first) = tun_addresses(inbound, "DNS")?.first() {
-            match first.parse::<IpAddr>() {
-                Ok(address) => return Ok(Some(address)),
-                Err(_) => eprintln!(
-                    "tun inbound: `DNS` entry `{first}` is not an address; queries keep the device's own resolver"
-                ),
+        // xray names the resolvers `DNS`, and without a `dns_mode` the first plain address is what a query rides; an explicit `none`, `system` or `forward` leaves DNS to the device.
+        if mode.is_none() {
+            if let Some(first) = tun_addresses(inbound, "DNS")?.first() {
+                match first.parse::<IpAddr>() {
+                    Ok(address) => return Ok(Some(address)),
+                    Err(_) => eprintln!(
+                        "tun inbound: `DNS` entry `{first}` is not an address; queries keep the device's own resolver"
+                    ),
+                }
             }
         }
         if tun_bool(inbound, "auto_system_dns_to_gateway")?.unwrap_or(false) {
@@ -18018,6 +18024,8 @@ fn serve_tun_inbound(
     let legs = crate::tun::Legs::default();
     let dial = Some(device_dial(out));
     let datagram = device_datagram(out);
+    let stopping = stop.map(Stop::shared);
+    let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(devices.len()));
     for device in devices {
         let outbound = out.clone();
         let relay: crate::tun::Relay = std::sync::Arc::new(move |conn, lane, dest| {
@@ -18037,9 +18045,19 @@ fn serve_tun_inbound(
             legs.clone(),
             spec,
         );
+        if let Some(flag) = stopping.clone() {
+            handler.set_stopping(flag);
+        }
+        let remaining = std::sync::Arc::clone(&remaining);
+        let closed = stop.map(std::sync::Arc::clone);
         thread::spawn(move || {
             if let Err(e) = handler.serve() {
                 eprintln!("tun handler ended: {e}");
+            }
+            if remaining.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                if let Some(stop) = closed {
+                    stop.mark_closed();
+                }
             }
         });
     }
@@ -44380,6 +44398,19 @@ mod tests {
             .expect("the system resolver")
             .dns_hijack()
             .is_none());
+        assert!(
+            spec(r#"{"dns_mode":"none","DNS":["192.0.2.53"]}"#)
+                .expect("an explicit mode leaves DNS alone")
+                .dns_hijack()
+                .is_none(),
+            "`DNS` is the absent-mode fallback, not a resolver for `none`"
+        );
+        assert_eq!(
+            spec(r#"{"DNS":["192.0.2.53"]}"#)
+                .expect("the absent-mode fallback")
+                .dns_hijack(),
+            Some("192.0.2.53".parse::<std::net::IpAddr>().unwrap())
+        );
         assert!(
             spec(r#"{"dns_mode":"hijack"}"#).is_err(),
             "hijack names a resolver"
@@ -80437,15 +80468,31 @@ end
         };
         let blocked = Destination::Name("blocked.test".to_owned(), 80);
         let (picked, tag) = plan.lane(&blocked, crate::router::Network::Tcp, None, None);
-        assert_eq!(tag.as_deref(), Some("block"));
-        assert!(matches!(&*picked, Outbound::Block(_)));
+        #[cfg(not(target_os = "ios"))]
+        {
+            assert_eq!(tag.as_deref(), Some("block"));
+            assert!(matches!(&*picked, Outbound::Block(_)));
+        }
+        #[cfg(target_os = "ios")]
+        {
+            assert_eq!(tag.as_deref(), Some("direct"));
+            assert!(matches!(&*picked, Outbound::Freedom(_)));
+        }
         let other = Destination::Name("other.test".to_owned(), 80);
         let (_, tag) = plan.lane(&other, crate::router::Network::Tcp, None, None);
         assert_eq!(tag.as_deref(), Some("direct"));
         let broken = Destination::Name("broken.test".to_owned(), 80);
         let (picked, tag) = plan.lane(&broken, crate::router::Network::Tcp, None, None);
-        assert_eq!(tag, None);
-        assert!(matches!(&*picked, Outbound::Block(_)));
+        #[cfg(not(target_os = "ios"))]
+        {
+            assert_eq!(tag, None);
+            assert!(matches!(&*picked, Outbound::Block(_)));
+        }
+        #[cfg(target_os = "ios")]
+        {
+            assert_eq!(tag.as_deref(), Some("direct"));
+            assert!(matches!(&*picked, Outbound::Freedom(_)));
+        }
     }
 
     /// A script's pick wins over the rule table; a script that names no tag falls through to it.
@@ -80490,7 +80537,10 @@ end
             None,
             None,
         );
+        #[cfg(not(target_os = "ios"))]
         assert_eq!(tag.as_deref(), Some("block"));
+        #[cfg(target_os = "ios")]
+        assert_eq!(tag.as_deref(), Some("rule"));
         let (_, tag) = plan.lane(
             &Destination::Name("other.test".to_owned(), 80),
             crate::router::Network::Tcp,

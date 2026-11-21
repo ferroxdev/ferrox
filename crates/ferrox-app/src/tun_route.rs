@@ -111,6 +111,7 @@ pub(crate) struct Guard {
     added: Mutex<Vec<Route>>,
     pinned: Mutex<Vec<(IpAddr, u8)>>,
     plan: Plan,
+    interface: String,
     default_v4: Option<Route>,
     default_v6: Option<Route>,
 }
@@ -177,6 +178,7 @@ impl Guard {
             added: Mutex::new(added),
             pinned: Mutex::new(Vec::new()),
             plan: plan.clone(),
+            interface: interface.to_owned(),
             default_v4,
             default_v6,
         });
@@ -185,6 +187,22 @@ impl Guard {
             slot.push(Arc::downgrade(&guard));
         }
         Ok(guard)
+    }
+
+    /// The host's current default for this family, read after the capture so a network change since install does not pin a new edge to the old interface. The stored default is the fallback when the table cannot be listed.
+    fn default_now(&self, address: IpAddr) -> Option<Route> {
+        let mut manager = self.manager.lock().ok()?;
+        let v4 = address.is_ipv4();
+        manager
+            .list()
+            .ok()?
+            .into_iter()
+            .filter(|route| {
+                route.prefix() == 0
+                    && route.destination().is_ipv4() == v4
+                    && route.if_name().is_none_or(|name| name != &self.interface)
+            })
+            .max_by_key(|route| route.metric().unwrap_or(0))
     }
 
     /// Keep one dialled address on the route that carried the default, so a name
@@ -199,23 +217,24 @@ impl Guard {
         if self.plan.keep().iter().any(covered) {
             return;
         }
-        let base = if address.is_ipv4() {
-            self.default_v4.as_ref()
-        } else {
-            self.default_v6.as_ref()
-        };
-        let Ok(mut pinned) = self.pinned.lock() else {
-            return;
-        };
-        if pinned.contains(&(address, bits)) {
-            return;
-        }
-        pinned.push((address, bits));
-        drop(pinned);
+        let base = self.default_now(address).or_else(|| {
+            if address.is_ipv4() {
+                self.default_v4.clone()
+            } else {
+                self.default_v6.clone()
+            }
+        });
         let Some(base) = base else {
             eprintln!("tun inbound: no default route to pin {address} to");
             return;
         };
+        if self
+            .pinned
+            .lock()
+            .is_ok_and(|pinned| pinned.contains(&(address, bits)))
+        {
+            return;
+        }
         let mut route = Route::new(address, bits);
         if let Some(gateway) = base.gateway() {
             route = route.with_gateway(gateway);
@@ -228,19 +247,20 @@ impl Guard {
         let Ok(mut manager) = self.manager.lock() else {
             return;
         };
-        match manager.add(&route) {
-            Ok(()) => {
-                if let Ok(mut added) = self.added.lock() {
-                    added.push(route);
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if let Ok(mut added) = self.added.lock() {
-                    added.push(route);
-                }
-            }
+        let added = match manager.add(&route) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => true,
             Err(error) => {
                 eprintln!("tun inbound: could not pin the outbound edge {address}: {error}");
+                false
+            }
+        };
+        if added {
+            if let Ok(mut routes) = self.added.lock() {
+                routes.push(route);
+            }
+            if let Ok(mut pinned) = self.pinned.lock() {
+                pinned.push((address, bits));
             }
         }
     }

@@ -1001,6 +1001,44 @@ impl Device {
         ))
     }
 
+    /// Make the queue's descriptor nonblocking, so a handler being removed can wake between packets instead of parking in a read.
+    #[cfg(unix)]
+    pub(crate) fn set_nonblocking(&self, on: bool) -> io::Result<()> {
+        let fd = self.handle.fd();
+        // SAFETY: `fd` is this device's open descriptor; `fcntl` reads or writes only its status flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let next = if on {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
+        // SAFETY: same descriptor, and the new value is a status-flag set `fcntl` accepts.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, next) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Wait up to `budget` for the queue to become readable; a nonblocking read uses this so a stop signal is seen on an idle device.
+    #[cfg(unix)]
+    pub(crate) fn wait_readable(&self, budget: std::time::Duration) -> io::Result<bool> {
+        let mut row = libc::pollfd {
+            fd: self.handle.fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = i32::try_from(budget.as_millis()).unwrap_or(i32::MAX);
+        // SAFETY: one descriptor this device owns, one array element, and `poll` writes only `revents`.
+        let ready = unsafe { libc::poll(&raw mut row, 1, millis) };
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ready > 0 && (row.revents & libc::POLLIN) != 0)
+    }
+
     pub(crate) fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if let Some(bridge) = &self.bridge {
             let mut frame = std::mem::take(&mut self.frame);
@@ -2079,6 +2117,8 @@ pub(crate) struct Handler {
     served: Vec<u8>,
     /// The direct datagram lane this handler opened, kept alive by its control connection.
     direct_datagram: Option<crate::proxy::DirectDatagram>,
+    /// Set when the inbound can be removed through the API: the read loop checks it and the descriptor is nonblocking so an idle queue wakes.
+    stopping: Option<Arc<AtomicBool>>,
     /// The direct lane's association while a worker dials it: the dial and its handshake cost a
     /// network round trip, and the queue keeps dispatching while it is pending.
     opening: Option<mpsc::Receiver<Option<crate::proxy::DirectDatagram>>>,
@@ -2153,6 +2193,7 @@ impl Handler {
             emit,
             served: Vec::new(),
             direct_datagram: None,
+            stopping: None,
             opening: None,
             datagram_retry: None,
             direct_dead: Arc::new(AtomicBool::new(false)),
@@ -2170,13 +2211,36 @@ impl Handler {
         }
     }
 
+    /// Register the API's stop flag: a removed inbound sets it, and the queue returns instead of waiting for the next packet.
+    pub(crate) fn set_stopping(&mut self, stopping: Arc<AtomicBool>) {
+        self.stopping = Some(stopping);
+    }
+
     pub(crate) fn serve(&mut self) -> io::Result<()> {
         let mut buf = vec![0u8; MAX_PACKET + 64];
+        // A removable inbound reads a nonblocking descriptor and polls only when it is empty; a queue with no stop keeps its blocking read.
+        #[cfg(unix)]
+        if self.stopping.is_some() {
+            self.device.set_nonblocking(true)?;
+        }
         loop {
+            if self
+                .stopping
+                .as_ref()
+                .is_some_and(|flag| flag.load(Relaxed))
+            {
+                return Ok(());
+            }
             let n = match self.device.read_packet(&mut buf) {
                 Ok(n) => n,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    // Android's `VpnService` hands back a nonblocking descriptor; the queue keeps its thread and reads again.
+                    // Android's `VpnService` hands back a nonblocking descriptor; a removable queue polls so the stop flag wakes it, and every other queue keeps its thread and reads again.
+                    #[cfg(unix)]
+                    if self.stopping.is_some() {
+                        self.device
+                            .wait_readable(std::time::Duration::from_millis(200))?;
+                        continue;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }

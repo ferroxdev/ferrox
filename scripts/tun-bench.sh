@@ -474,6 +474,7 @@ while [ "$rep" -le "$REPEAT" ]; do
         case "$engine" in
             ferrox|ferrox-*) [ -n "$FERROX" ] || continue ;;
             hev|hev-socks5-tunnel) [ -n "$HEV" ] || continue ;;
+            singbox-head-*|sing-tun-head-*) [ -n "$SINGBOX_HEAD" ] || continue ;;
             singbox-*|sing-tun-*) [ -n "$SINGBOX" ] || continue ;;
             xray) [ -n "$XRAY" ] || continue ;;
             tun2socks) [ -n "$TUN2SOCKS" ] || continue ;;
