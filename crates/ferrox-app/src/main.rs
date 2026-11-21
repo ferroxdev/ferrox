@@ -834,7 +834,7 @@ fn read_conf_dir(dir: &str, format: Option<&str>, out: &mut Vec<String>) {
     let entries = std::fs::read_dir(dir)
         .unwrap_or_else(|error| proxy::exit(&format!("cannot read {dir}: {error}")));
     let suffixes: &[&str] = match format.map(str::to_ascii_lowercase).as_deref() {
-        Some("jsonc") => &["jsonc"],
+        Some("json" | "jsonc") => &["json", "jsonc"],
         Some("toml") => &["toml"],
         Some("yaml" | "yml") => &["yaml", "yml"],
         _ => &["json", "jsonc", "toml", "yaml", "yml"],
@@ -986,7 +986,8 @@ fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
         Some("yaml" | "yml") => SourceFormat::Yaml,
         Some("toml") => SourceFormat::Toml,
         Some("auto") | None => {
-            let extension = std::path::Path::new(source)
+            let path = source.split(['?', '#']).next().unwrap_or(source);
+            let extension = std::path::Path::new(path)
                 .extension()
                 .and_then(std::ffi::OsStr::to_str)
                 .unwrap_or_default();
@@ -1035,7 +1036,7 @@ fn remote_source(source: &str) -> Option<(String, Option<String>)> {
         } else {
             raw.to_owned()
         };
-        if canonical.starts_with('/') || canonical.starts_with('@') {
+        if is_socket_path(&canonical) {
             return Some(split_http_unix_url(&canonical));
         }
         return Some((canonical, None));
@@ -1044,17 +1045,23 @@ fn remote_source(source: &str) -> Option<(String, Option<String>)> {
         return Some((source.to_owned(), None));
     }
     if let Some(raw) = source.strip_prefix("sock:") {
-        if raw.starts_with('/') || raw.starts_with('@') {
+        if is_socket_path(raw) {
             return Some(split_http_unix_url(raw));
         }
     }
-    if source.starts_with('/') && (source.contains(":/") || is_unix_socket(source)) {
+    if std::path::Path::new(source).is_absolute()
+        && (source.contains(":/") || is_unix_socket(source))
+    {
         return Some(split_http_unix_url(source));
     }
     if source.starts_with('@') {
         return Some(split_http_unix_url(source));
     }
     None
+}
+
+fn is_socket_path(path: &str) -> bool {
+    path.starts_with('@') || std::path::Path::new(path).is_absolute()
 }
 
 /// xray's `SplitHTTPUnixURL`: a socket path and an optional `:/path` HTTP target.
@@ -1085,14 +1092,20 @@ impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
 
 /// `FetchHTTPContent`: a 30-second request, redirects like `net/http`, status 200 only.
 fn fetch_http(url: &str, socket: Option<&str>, redirects: usize) -> Result<Vec<u8>, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut url = url.to_owned();
     for remaining in (0..=redirects).rev() {
         let parsed = crate::conn::HttpUrl::parse(&url)
             .map_err(|error| format!("invalid URL: {url}: {error}"))?;
+        let left = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| format!("failed to dial to {url}: request timed out"))?;
         let mut stream = if let Some(path) = socket {
-            socket_stream(path).map_err(|error| format!("failed to dial to {url}: {error}"))?
+            socket_stream(path, left)
+                .map_err(|error| format!("failed to dial to {url}: {error}"))?
         } else {
-            let tcp = tcp_stream(&parsed.host, parsed.port)
+            let tcp = tcp_stream(&parsed.host, parsed.port, left)
                 .map_err(|error| format!("failed to dial to {url}: {error}"))?;
             if parsed.tls {
                 let config = ferrox_core::tls::TlsConfig {
@@ -1129,14 +1142,16 @@ fn fetch_http(url: &str, socket: Option<&str>, redirects: usize) -> Result<Vec<u
         if status == 200 {
             return read_http_body(&mut *stream, body, &headers);
         }
-        let location = headers
-            .iter()
-            .find(|(name, _)| name == "location")
-            .map(|(_, value)| value.as_str());
-        if (300..400).contains(&status) {
-            if let Some(location) = location {
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            if let Some(location) = headers
+                .iter()
+                .find(|(name, _)| name == "location")
+                .map(|(_, value)| value.as_str())
+            {
                 if remaining == 0 {
-                    return Err("stopped after 10 redirects".to_owned());
+                    return Err(format!(
+                        "failed to dial to {url}: stopped after 10 redirects"
+                    ));
                 }
                 url = redirect_location(&parsed, location);
                 continue;
@@ -1166,53 +1181,52 @@ fn redirect_location(base: &crate::conn::HttpUrl, location: &str) -> String {
     format!("{scheme}://{}{directory}/{location}", base.authority)
 }
 
-fn tcp_stream(host: &str, port: u16) -> std::io::Result<std::net::TcpStream> {
+fn tcp_stream(
+    host: &str,
+    port: u16,
+    budget: std::time::Duration,
+) -> std::io::Result<std::net::TcpStream> {
     use std::net::ToSocketAddrs as _;
+    let deadline = std::time::Instant::now() + budget;
     let mut last = None;
     for address in (host, port).to_socket_addrs()? {
-        match std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(30)) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match std::net::TcpStream::connect_timeout(&address, left) {
             Ok(stream) => {
-                stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
-                stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+                let left = deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .max(std::time::Duration::from_millis(1));
+                stream.set_read_timeout(Some(left))?;
+                stream.set_write_timeout(Some(left))?;
                 return Ok(stream);
             }
             Err(error) => last = Some(error),
         }
     }
-    Err(last.unwrap_or_else(|| std::io::Error::other("no address resolved")))
+    Err(last
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out")))
 }
 
-#[cfg(unix)]
-fn socket_stream(path: &str) -> std::io::Result<Box<dyn ReadWrite>> {
-    use std::os::unix::net::UnixStream;
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::linux::net::SocketAddrExt;
-        if let Some(name) = path.strip_prefix("@@") {
-            let mut padded = vec![0u8; 107];
-            let raw = name.as_bytes();
-            let len = raw.len().min(padded.len());
-            padded[..len].copy_from_slice(&raw[..len]);
-            let address = std::os::linux::net::SocketAddr::from_abstract_name(&padded)?;
-            return finish_socket(UnixStream::connect_addr(&address)?);
-        }
-        if let Some(name) = path.strip_prefix('@') {
-            let address = std::os::linux::net::SocketAddr::from_abstract_name(name.as_bytes())?;
-            return finish_socket(UnixStream::connect_addr(&address)?);
-        }
-    }
-    finish_socket(UnixStream::connect(path)?)
-}
-
-#[cfg(unix)]
-fn finish_socket(stream: std::os::unix::net::UnixStream) -> std::io::Result<Box<dyn ReadWrite>> {
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+#[cfg(any(unix, windows))]
+fn socket_stream(path: &str, budget: std::time::Duration) -> std::io::Result<Box<dyn ReadWrite>> {
+    let started = std::time::Instant::now();
+    let stream = crate::conn::connect(
+        &crate::conn::Target::Unix(std::path::PathBuf::from(path)),
+        budget,
+    )?;
+    let left = budget
+        .saturating_sub(started.elapsed())
+        .max(std::time::Duration::from_millis(1));
+    stream.set_read_timeout(Some(left))?;
+    stream.set_write_timeout(Some(left))?;
     Ok(Box::new(stream))
 }
 
-#[cfg(not(unix))]
-fn socket_stream(path: &str) -> std::io::Result<Box<dyn ReadWrite>> {
+#[cfg(not(any(unix, windows)))]
+fn socket_stream(path: &str, _budget: std::time::Duration) -> std::io::Result<Box<dyn ReadWrite>> {
     Err(std::io::Error::other(format!(
         "unix socket `{path}` is not supported on this platform"
     )))
@@ -1257,9 +1271,6 @@ fn read_http_body(
     mut body: Vec<u8>,
     headers: &[(String, String)],
 ) -> Result<Vec<u8>, String> {
-    stream
-        .read_to_end(&mut body)
-        .map_err(|error| format!("failed to read HTTP response: {error}"))?;
     let header = |name: &str| {
         headers
             .iter()
@@ -1267,15 +1278,23 @@ fn read_http_body(
             .map(|(_, value)| value.as_str())
     };
     if header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
-        body = decode_chunked(&body)?;
+        body = read_chunked(stream, body)?;
     } else if let Some(length) = header("content-length") {
         let length = length
             .parse::<usize>()
             .map_err(|error| format!("failed to read HTTP response: {error}"))?;
         if body.len() < length {
-            return Err("failed to read HTTP response: unexpected end of stream".to_owned());
+            let start = body.len();
+            body.resize(length, 0);
+            stream
+                .read_exact(&mut body[start..])
+                .map_err(|error| format!("failed to read HTTP response: {error}"))?;
         }
         body.truncate(length);
+    } else {
+        stream
+            .read_to_end(&mut body)
+            .map_err(|error| format!("failed to read HTTP response: {error}"))?;
     }
     if header("content-encoding").is_some_and(|value| value.eq_ignore_ascii_case("gzip")) {
         let mut decoded = Vec::new();
@@ -1289,30 +1308,49 @@ fn read_http_body(
     Ok(body)
 }
 
-fn decode_chunked(bytes: &[u8]) -> Result<Vec<u8>, String> {
+fn read_chunked(stream: &mut dyn ReadWrite, mut bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut at = 0usize;
     loop {
-        let end = bytes[at..]
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .ok_or_else(|| "failed to read HTTP response: incomplete chunk".to_owned())?;
+        let end = loop {
+            if let Some(end) = bytes[at..].windows(2).position(|window| window == b"\r\n") {
+                break end;
+            }
+            read_more(stream, &mut bytes)?;
+        };
         let line = std::str::from_utf8(&bytes[at..at + end])
             .map_err(|error| format!("failed to read HTTP response: {error}"))?;
         let size = usize::from_str_radix(line.split(';').next().unwrap_or(line).trim(), 16)
             .map_err(|error| format!("failed to read HTTP response: {error}"))?;
         at += end + 2;
         if size == 0 {
-            break;
+            return Ok(out);
         }
-        let next = at
-            .checked_add(size + 2)
-            .filter(|next| *next <= bytes.len())
+        let wanted = at
+            .checked_add(size)
+            .and_then(|wanted| wanted.checked_add(2))
             .ok_or_else(|| "failed to read HTTP response: incomplete chunk".to_owned())?;
+        while bytes.len() < wanted {
+            read_more(stream, &mut bytes)?;
+        }
         out.extend_from_slice(&bytes[at..at + size]);
-        at = next;
+        if &bytes[at + size..wanted] != b"\r\n" {
+            return Err("failed to read HTTP response: malformed chunk".to_owned());
+        }
+        at = wanted;
     }
-    Ok(out)
+}
+
+fn read_more(stream: &mut dyn ReadWrite, bytes: &mut Vec<u8>) -> Result<(), String> {
+    let mut chunk = [0u8; 8192];
+    let read = stream
+        .read(&mut chunk)
+        .map_err(|error| format!("failed to read HTTP response: {error}"))?;
+    if read == 0 {
+        return Err("failed to read HTTP response: unexpected end of stream".to_owned());
+    }
+    bytes.extend_from_slice(&chunk[..read]);
+    Ok(())
 }
 
 /// The JSON stream a YAML or TOML spelling feeds to the same handler builder.

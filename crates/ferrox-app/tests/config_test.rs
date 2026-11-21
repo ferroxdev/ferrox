@@ -628,7 +628,7 @@ fn http_config_is_fetched_and_a_missing_one_is_refused() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP config server");
     let address = listener.local_addr().expect("HTTP config address");
     let server = std::thread::spawn(move || {
-        for _ in 0..6 {
+        for _ in 0..7 {
             let (mut stream, _) = listener.accept().expect("accept HTTP config request");
             let mut request = Vec::new();
             let mut chunk = [0u8; 1024];
@@ -642,7 +642,7 @@ fn http_config_is_fetched_and_a_missing_one_is_refused() {
             let request = String::from_utf8_lossy(&request);
             let path = request.split_whitespace().nth(1).unwrap_or_default();
             let (status, extra, body) = match path {
-                "/config.json" => ("200 OK", "", body.as_bytes().to_vec()),
+                "/config.json" | "/keep-alive" => ("200 OK", "", body.as_bytes().to_vec()),
                 "/chunked" => (
                     "200 OK",
                     "Transfer-Encoding: chunked\r\n",
@@ -652,12 +652,20 @@ fn http_config_is_fetched_and_a_missing_one_is_refused() {
                 "/redirect" => ("302 Found", "Location: /config.json\r\n", Vec::new()),
                 _ => ("404 Not Found", "", b"missing".to_vec()),
             };
+            let close = if path == "/keep-alive" {
+                ""
+            } else {
+                "Connection: close\r\n"
+            };
             let head = format!(
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}{close}\r\n",
                 body.len()
             );
             std::io::Write::write_all(&mut stream, head.as_bytes()).expect("write HTTP head");
             std::io::Write::write_all(&mut stream, &body).expect("write HTTP body");
+            if path == "/keep-alive" {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
         }
     });
     let source = format!("http://{address}/config.json");
@@ -679,6 +687,20 @@ fn http_config_is_fetched_and_a_missing_one_is_refused() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    let started = std::time::Instant::now();
+    let keep_alive = run(&["-test", "-c", &format!("http://{address}/keep-alive")]);
+    assert_eq!(
+        keep_alive.status.code(),
+        Some(0),
+        "`-test` refused a keep-alive body: {}{}",
+        String::from_utf8_lossy(&keep_alive.stdout),
+        String::from_utf8_lossy(&keep_alive.stderr)
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1500),
+        "a Content-Length body waited for the peer to close: {:?}",
+        started.elapsed()
+    );
     let missing = run(&["-test", "-c", &format!("http://{address}/missing")]);
     let stdout = String::from_utf8_lossy(&missing.stdout);
     assert_eq!(missing.status.code(), Some(23), "{stdout}");
@@ -839,6 +861,54 @@ protocol = "freedom"
     assert!(
         stdout.contains(r#""tag":"in""#) && stdout.contains(r#""protocol":"freedom""#),
         "`-dump` dropped a confdir file: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `-format json` reads the JSON spellings alone, as the reference's regex does.
+#[test]
+fn a_confdir_honors_the_named_format() {
+    let json = |tag: &str| {
+        format!(
+            r#"{{"inbounds":[{{"tag":"{tag}","listen":"127.0.0.1","port":0,"protocol":"socks","settings":{{"auth":"noauth"}}}}]}}"#
+        )
+    };
+    let yaml = r"inbounds:
+  - tag: yaml
+    listen: 127.0.0.1
+    port: 0
+    protocol: socks
+    settings:
+      auth: noauth
+";
+    let toml = r#"[[inbounds]]
+tag = "toml"
+listen = "127.0.0.1"
+port = 0
+protocol = "socks"
+[inbounds.settings]
+auth = "noauth"
+"#;
+    let dir = config_dir(
+        "format-filter",
+        &[
+            ("01.json", &json("json")),
+            ("02.jsonc", &json("jsonc")),
+            ("03.yaml", yaml),
+            ("04.toml", toml),
+        ],
+    );
+    let named = dir.to_string_lossy().into_owned();
+    let dumped = run(&["-dump", "-confdir", &named, "-format", "json"]);
+    let stdout = String::from_utf8_lossy(&dumped.stdout);
+    assert_eq!(dumped.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains(r#""tag":"json""#) && stdout.contains(r#""tag":"jsonc""#),
+        "`-format json` dropped a JSON config: {stdout}"
+    );
+    assert!(
+        !stdout.contains(r#""tag":"yaml""#) && !stdout.contains(r#""tag":"toml""#),
+        "`-format json` read a non-JSON config: {stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
