@@ -574,8 +574,8 @@ fn read_http_body(stream: &mut dyn Io, with_tls: bool) -> Option<String> {
             }
         }
     }
-    reader.get_mut().deadline = None;
     let deadline = Instant::now() + Duration::from_secs(5);
+    reader.get_mut().deadline = Some(deadline);
     let body = if chunked {
         let mut out = String::new();
         loop {
