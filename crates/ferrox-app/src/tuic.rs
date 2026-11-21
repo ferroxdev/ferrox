@@ -90,7 +90,7 @@ pub(crate) struct TuicOut {
     cert_pins: Arc<[[u8; 32]]>,
     insecure: bool,
     heartbeat: Duration,
-    lanes: Mutex<HashMap<(Option<IpAddr>, Option<Arc<crate::sockopt::SocketOptions>>), Arc<Lane>>>,
+    lanes: Mutex<HashMap<LaneKey, Arc<Lane>>>,
     session: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
@@ -104,6 +104,8 @@ impl std::fmt::Debug for TuicOut {
             .finish_non_exhaustive()
     }
 }
+
+type LaneKey = (Option<IpAddr>, Option<Arc<crate::sockopt::SocketOptions>>);
 
 struct Lane {
     conn: Arc<Mutex<quiche::Connection>>,
