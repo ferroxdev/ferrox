@@ -356,9 +356,7 @@ impl TuicOut {
                 .iter()
                 .find(|(_, lane)| Arc::strong_count(lane) == 1)
                 .map(|(key, _)| key.clone());
-            let Some(idle) = idle else {
-                return None;
-            };
+            let idle = idle?;
             held.remove(&idle);
         }
         let lane = self.connect_lane(source, options)?;
