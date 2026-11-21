@@ -2097,6 +2097,14 @@ mod tests {
         assert_eq!(counts.allocs, 0, "the established destination costs no key");
         assert_eq!(back, Some(peer));
         assert_eq!(dests.len(), 1, "the table is not rewritten");
+        let ((), before) = ferrox_core::alloc_count::measure(|| {
+            let mut table = HashMap::new();
+            table.insert(key.clone(), peer);
+        });
+        assert!(
+            before.allocs > counts.allocs,
+            "the old shape cloned the key each time"
+        );
 
         let literal = ("203.0.113.9".to_owned(), 53);
         let (back, _) =
@@ -2120,6 +2128,13 @@ mod tests {
         assert!(kept);
         assert_eq!(counts.allocs, 0, "tracking a known key costs no key");
         assert_eq!(flow.used.len(), 1);
+        let ((), before) = ferrox_core::alloc_count::measure(|| {
+            flow.used.insert(key.clone(), Instant::now());
+        });
+        assert!(
+            before.allocs > counts.allocs,
+            "the old shape cloned the key per datagram"
+        );
     }
 
     /// The host a datagram's message carries is the address's own text, written into a stack
@@ -2131,6 +2146,16 @@ mod tests {
         let (mine, counts) = ferrox_core::alloc_count::measure(|| host_of(ip, &mut room));
         assert_eq!(counts.allocs, 0, "the host is written into the room");
         assert_eq!(mine, Some("2001:db8::1"), "and it is the address's text");
+        let (text, before) = ferrox_core::alloc_count::measure(|| ip.to_string());
+        assert!(
+            before.allocs > counts.allocs,
+            "the old shape allocated the text"
+        );
+        assert_eq!(
+            &text[..],
+            mine.expect("the room's text"),
+            "of the same text"
+        );
         for text in [
             "10.0.0.2",
             "::1",

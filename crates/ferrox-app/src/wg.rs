@@ -3959,6 +3959,9 @@ mod tests {
             &mut inner,
         ));
         let base = inner.as_ptr();
+        let (copied, copy_counts) =
+            ferrox_core::alloc_count::measure(|| inner[WG_HEADER_SIZE..].to_vec());
+        assert_eq!(copy_counts.allocs, 1, "the old shape copied the datagram");
         deliver_data(
             inner,
             WG_HEADER_SIZE,
@@ -3976,6 +3979,11 @@ mod tests {
         );
         assert_eq!(packet.at, WG_HEADER_SIZE, "at the packet's own offset");
         assert_eq!(packet.packet().first(), Some(&0x45), "and its IP header");
+        assert_eq!(
+            packet.packet(),
+            &copied[..],
+            "the same datagram, not a copy"
+        );
         packet.release();
         let returned = recycled.recv().expect("the pool's buffer");
         assert_eq!(returned.as_ptr(), base, "the buffer returns, not a copy");

@@ -76502,6 +76502,13 @@ mod tests {
                 room.as_ptr() as usize,
                 "the head is the caller's room"
             );
+            let (before, counts) = ferrox_core::alloc_count::measure(|| {
+                let mut head = Vec::with_capacity(HEAD);
+                socks_udp_head(&mut head, &dest);
+                head
+            });
+            assert_eq!(before, want, "both shapes write the same head");
+            assert_eq!(counts.allocs, 1, "the old shape allocated the head");
         }
     }
 
@@ -87155,12 +87162,7 @@ mod datagram_room_tests {
         }
         let warm = room.capacity();
         let base = room.as_ptr();
-        let mut wire = Vec::new();
-        for _ in 0..4 {
-            wire.extend_from_slice(&10u16.to_be_bytes());
-            wire.extend_from_slice(&[5u8; 10]);
-        }
-        let mut cursor = std::io::Cursor::new(wire);
+        let mut cursor = std::io::Cursor::new(same_wire());
         let ((), counts) = ferrox_core::alloc_count::measure(|| {
             for _ in 0..4 {
                 assert_eq!(read_datagram_room(&mut cursor, &mut room), Some(10));
@@ -87170,5 +87172,35 @@ mod datagram_room_tests {
         assert_eq!(counts.bytes, 0, "and nothing is allocated behind it");
         assert_eq!(room.capacity(), warm, "the room's capacity is steady");
         assert_eq!(room.as_ptr(), base, "and its allocation never moved");
+
+        // The shape this replaced: every datagram read into a buffer of its own.
+        let (read, before) = ferrox_core::alloc_count::measure(|| {
+            let mut cursor = std::io::Cursor::new(same_wire());
+            let mut frames = Vec::with_capacity(4);
+            for _ in 0..4 {
+                let mut frame = vec![0u8; 10];
+                cursor.read_exact(&mut frame).expect("a frame");
+                frames.push(frame);
+            }
+            frames
+        });
+        assert_eq!(before.allocs, 5, "a list and a buffer per datagram");
+        assert!(
+            counts.allocs < before.allocs,
+            "the room is the cheaper shape"
+        );
+        assert!(
+            read.iter().all(|frame| frame == &[5u8; 10][..]),
+            "and both read the same bytes"
+        );
+    }
+
+    fn same_wire() -> Vec<u8> {
+        let mut wire = Vec::new();
+        for _ in 0..4 {
+            wire.extend_from_slice(&10u16.to_be_bytes());
+            wire.extend_from_slice(&[5u8; 10]);
+        }
+        wire
     }
 }

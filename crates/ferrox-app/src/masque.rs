@@ -5458,6 +5458,7 @@ mod tests {
         datagram.extend_from_slice(&packet);
         let base = datagram.as_ptr();
         let offset = datagram.len() - packet.len();
+        let prefix = datagram[..offset].to_vec();
         deliver_owned(&to_stack, &routes, datagram, offset);
         let handed = lanes.recv().expect("the lane's packet");
         assert_eq!(handed.at, offset, "the prefix stays an offset");
@@ -5467,6 +5468,27 @@ mod tests {
             "the lane reads the buffer that arrived"
         );
         assert_eq!(&handed.bytes[handed.at..], packet.as_slice());
+        assert_eq!(
+            &handed.bytes[..offset],
+            &prefix[..],
+            "and the prefix is still where it arrived"
+        );
+
+        // The shape this replaced: drain the prefix, moving every packet byte forward.
+        let mut drained = handed.bytes.clone();
+        let moved = drained.len() - offset;
+        drained.drain(..offset);
+        assert_eq!(
+            drained.as_slice(),
+            packet.as_slice(),
+            "the old shape fronted it"
+        );
+        assert_eq!(moved, packet.len(), "and moved every packet byte");
+        assert_eq!(
+            &handed.bytes[offset..],
+            &drained[..],
+            "the new shape reads the same packet where it lies"
+        );
     }
 
     /// A first IPv4 UDP fragment goes to the stack, not the datagram lane.

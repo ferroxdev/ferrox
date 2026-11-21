@@ -382,6 +382,26 @@ impl MasterKey {
     }
 }
 
+/// The shape `MasterKey::new` replaced: each chained round joins `digest || password` in a
+/// fresh buffer before hashing it, so every round past the first allocates a scratch join.
+#[cfg(any(test, feature = "bench-reference"))]
+#[must_use]
+pub fn reference_master_key(password: &str, key_len: usize) -> Vec<u8> {
+    let rounds = key_len.div_ceil(16).max(1);
+    let mut bytes = Vec::with_capacity(rounds * 16);
+    let mut digest = md5::compute(password.as_bytes()).0;
+    bytes.extend_from_slice(&digest);
+    for _ in 1..rounds {
+        let mut joined = Vec::with_capacity(digest.len() + password.len());
+        joined.extend_from_slice(&digest);
+        joined.extend_from_slice(password.as_bytes());
+        digest = md5::compute(&joined).0;
+        bytes.extend_from_slice(&digest);
+    }
+    bytes.truncate(key_len);
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,6 +486,18 @@ mod tests {
         assert_eq!(counts.bytes, 32, "the key is exactly its own bytes");
         let (_, short) = crate::alloc_count::measure(|| MasterKey::new("secret", 16));
         assert_eq!(short.allocs, 1, "and the one-round case is the same");
+        let (scratch, before) = crate::alloc_count::measure(|| reference_master_key("secret", 32));
+        assert_eq!(
+            scratch,
+            key.as_bytes(),
+            "the streaming key is the joined key"
+        );
+        assert!(
+            before.allocs > counts.allocs,
+            "the joined shape pays a scratch buffer the streamed one does not: {} > {}",
+            before.allocs,
+            counts.allocs
+        );
     }
 
     #[test]

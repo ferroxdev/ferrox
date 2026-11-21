@@ -5221,7 +5221,8 @@ mod tests {
             &mut bytes,
         ));
         let base = bytes.as_ptr();
-        let want = bytes[16..].to_vec();
+        let (want, copy_counts) = ferrox_core::alloc_count::measure(|| bytes[16..].to_vec());
+        assert_eq!(copy_counts.allocs, 1, "the old shape copied the datagram");
         assert_eq!(stack.deliver_udp(bytes, 16), None, "the lane takes it");
         let packet = replies.recv().expect("the lane's packet");
         assert_eq!(packet.bytes.as_ptr(), base, "the reader's own buffer");

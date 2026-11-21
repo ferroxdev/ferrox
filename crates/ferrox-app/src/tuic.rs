@@ -3065,19 +3065,34 @@ mod tests {
     #[test]
     fn a_uni_run_is_one_allocation() {
         let address = wire::address_port("127.0.0.1", 9).expect("an address");
+        let mut frames = Vec::new();
         let mut run = Vec::new();
         for payload in [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()] {
             let mut frame = Vec::new();
             wire::encode_fragment(1, 2, 1, 0, &address, payload, &mut frame);
             run.extend_from_slice(&frame);
+            frames.push(frame);
         }
+        let (before, before_counts) = ferrox_core::alloc_count::measure(|| {
+            let mut packets = Vec::with_capacity(3);
+            for frame in &frames {
+                packets.push(frame.clone());
+            }
+            packets
+        });
+        assert_eq!(before_counts.allocs, 4, "a list and a copy per packet");
         let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(8);
         let (_, counts) = ferrox_core::alloc_count::measure(|| share_uni_packets(run, &reply_tx));
         assert_eq!(
             counts.allocs, 1,
             "the shared cell, not one buffer per packet"
         );
-        assert_eq!(reply_rx.try_iter().count(), 3, "three packets ride it");
+        assert!(counts.allocs < before_counts.allocs, "one cell for the run");
+        let replied: Vec<Vec<u8>> = reply_rx
+            .try_iter()
+            .map(|reply| reply.packet().to_vec())
+            .collect();
+        assert_eq!(replied, before, "the same packets ride the same frames");
     }
 
     /// A read that ends mid-frame keeps the partial packet as the tail, and nothing else.
