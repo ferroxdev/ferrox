@@ -820,14 +820,7 @@ fn serve_from_flags(args: &[String]) -> ! {
     }
     let source = configs.pop().unwrap_or_else(discover_config);
     let format = source_format(format.as_deref(), &source);
-    if source == "stdin" || source == "stdin:" {
-        let mut bytes = Vec::new();
-        if let Err(error) = std::io::stdin().read_to_end(&mut bytes) {
-            proxy::exit(&format!("cannot read stdin: {error}"));
-        }
-        serve_source("stdin:", &bytes, format);
-    }
-    let bytes = std::fs::read(&source)
+    let bytes = read_source(&source)
         .unwrap_or_else(|error| proxy::exit(&format!("cannot read {source}: {error}")));
     serve_source(&source, &bytes, format)
 }
@@ -844,7 +837,7 @@ fn read_conf_dir(dir: &str, format: Option<&str>, out: &mut Vec<String>) {
         Some("jsonc") => &["jsonc"],
         Some("toml") => &["toml"],
         Some("yaml" | "yml") => &["yaml", "yml"],
-        _ => &["json", "jsonc"],
+        _ => &["json", "jsonc", "toml", "yaml", "yml"],
     };
     let mut names: Vec<std::path::PathBuf> = entries
         .filter_map(Result::ok)
@@ -884,23 +877,10 @@ fn serve_files(files: &[String], format: Option<&str>) -> ! {
         if matches!(format, SourceFormat::Protobuf) {
             proxy::exit("Only one protobuf config file is allowed");
         }
-        let bytes = if file == "stdin" || file == "stdin:" {
-            let mut bytes = Vec::new();
-            if let Err(error) = std::io::stdin().read_to_end(&mut bytes) {
-                proxy::exit(&format!("cannot read stdin: {error}"));
-            }
-            bytes
-        } else {
-            std::fs::read(file)
-                .unwrap_or_else(|error| proxy::exit(&format!("cannot read {file}: {error}")))
-        };
-        let body = std::str::from_utf8(&bytes)
+        let bytes = read_source(file)
+            .unwrap_or_else(|error| proxy::exit(&format!("cannot read {file}: {error}")));
+        let body = config_text(&bytes, format)
             .unwrap_or_else(|error| proxy::exit(&format!("bad config {file}: {error}")));
-        let body = if matches!(format, SourceFormat::Jsonc) {
-            crate::json::strip_jsonc(body)
-        } else {
-            std::borrow::Cow::Borrowed(body)
-        };
         let root = crate::json::parse(&body)
             .unwrap_or_else(|error| proxy::exit(&format!("bad config {file}: {error}")));
         if at == 0 {
@@ -927,28 +907,13 @@ fn dump_config(configs: &[String], named: Option<&str>) -> ! {
     let mut first = true;
     for file in &files {
         let format = source_format(named, file);
-        let strip = match format {
-            SourceFormat::Json => false,
-            SourceFormat::Jsonc => true,
-            SourceFormat::Protobuf => continue,
-        };
-        let bytes = if file == "stdin" || file == "stdin:" {
-            let mut bytes = Vec::new();
-            if let Err(error) = std::io::stdin().read_to_end(&mut bytes) {
-                dump_fail(&format!("cannot read stdin: {error}"));
-            }
-            bytes
-        } else {
-            std::fs::read(file)
-                .unwrap_or_else(|error| dump_fail(&format!("cannot read {file}: {error}")))
-        };
-        let body = std::str::from_utf8(&bytes)
+        if matches!(format, SourceFormat::Protobuf) {
+            continue;
+        }
+        let bytes = read_source(file)
+            .unwrap_or_else(|error| dump_fail(&format!("cannot read {file}: {error}")));
+        let body = config_text(&bytes, format)
             .unwrap_or_else(|error| dump_fail(&format!("bad config {file}: {error}")));
-        let body = if strip {
-            crate::json::strip_jsonc(body)
-        } else {
-            std::borrow::Cow::Borrowed(body)
-        };
         let root = crate::json::parse(&body)
             .unwrap_or_else(|error| dump_fail(&format!("bad config {file}: {error}")));
         if first {
@@ -973,6 +938,8 @@ fn dump_fail(message: &str) -> ! {
 enum SourceFormat {
     Json,
     Jsonc,
+    Yaml,
+    Toml,
     Protobuf,
 }
 
@@ -1016,6 +983,8 @@ fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
         Some("pb" | "protobuf") => SourceFormat::Protobuf,
         Some("json") => SourceFormat::Json,
         Some("jsonc") => SourceFormat::Jsonc,
+        Some("yaml" | "yml") => SourceFormat::Yaml,
+        Some("toml") => SourceFormat::Toml,
         Some("auto") | None => {
             let extension = std::path::Path::new(source)
                 .extension()
@@ -1025,33 +994,464 @@ fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
                 SourceFormat::Protobuf
             } else if extension.eq_ignore_ascii_case("jsonc") {
                 SourceFormat::Jsonc
+            } else if extension.eq_ignore_ascii_case("yaml")
+                || extension.eq_ignore_ascii_case("yml")
+            {
+                SourceFormat::Yaml
+            } else if extension.eq_ignore_ascii_case("toml") {
+                SourceFormat::Toml
             } else {
                 SourceFormat::Json
             }
-        }
-        Some(other @ ("toml" | "yaml" | "yml")) => {
-            proxy::exit(&format!(
-                "config format `{other}` is not carried; json and protobuf are"
-            ));
         }
         Some(other) => proxy::exit(&format!("unknown config format `{other}`")),
     }
 }
 
-fn serve_source(label: &str, bytes: &[u8], format: SourceFormat) -> ! {
-    match format {
-        SourceFormat::Protobuf => proxy::serve_protobuf(label, bytes, test_only()),
-        SourceFormat::Json | SourceFormat::Jsonc => {
-            let body = std::str::from_utf8(bytes)
-                .unwrap_or_else(|error| proxy::exit(&format!("bad config {label}: {error}")));
-            let body = if matches!(format, SourceFormat::Jsonc) {
-                crate::json::strip_jsonc(body)
-            } else {
-                std::borrow::Cow::Borrowed(body)
-            };
-            proxy::serve_json(label, &body, test_only())
+/// A config source as xray reads it: a stream, an HTTP(S) URL, a socket endpoint, or a file.
+fn read_source(source: &str) -> Result<Vec<u8>, String> {
+    if source == "stdin" || source == "stdin:" {
+        let mut bytes = Vec::new();
+        return std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
+            .map(|_| bytes)
+            .map_err(|error| error.to_string());
+    }
+    if let Some((url, socket)) = remote_source(source) {
+        return fetch_http(&url, socket.as_deref(), 10);
+    }
+    if let Some((scheme, _)) = source.split_once("://") {
+        return Err(format!(
+            "unsupported config source `{source}`: scheme `{scheme}`"
+        ));
+    }
+    std::fs::read(source).map_err(|error| error.to_string())
+}
+
+/// The forms `ConfigLoader` sends to `FetchHTTPContent`, plus its deprecated `http+unix://` spelling.
+fn remote_source(source: &str) -> Option<(String, Option<String>)> {
+    if let Some(raw) = source.strip_prefix("http+unix://") {
+        let canonical = if let Some(at) = raw.find(".sock/") {
+            format!("{}:{}", &raw[..at + 5], &raw[at + 5..])
+        } else {
+            raw.to_owned()
+        };
+        if canonical.starts_with('/') || canonical.starts_with('@') {
+            return Some(split_http_unix_url(&canonical));
+        }
+        return Some((canonical, None));
+    }
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return Some((source.to_owned(), None));
+    }
+    if let Some(raw) = source.strip_prefix("sock:") {
+        if raw.starts_with('/') || raw.starts_with('@') {
+            return Some(split_http_unix_url(raw));
         }
     }
+    if source.starts_with('/') && (source.contains(":/") || is_unix_socket(source)) {
+        return Some(split_http_unix_url(source));
+    }
+    if source.starts_with('@') {
+        return Some(split_http_unix_url(source));
+    }
+    None
+}
+
+/// xray's `SplitHTTPUnixURL`: a socket path and an optional `:/path` HTTP target.
+fn split_http_unix_url(raw: &str) -> (String, Option<String>) {
+    if let Some(at) = raw.find(":/") {
+        (
+            format!("http://localhost{}", &raw[at + 1..]),
+            Some(raw[..at].to_owned()),
+        )
+    } else {
+        ("http://localhost/".to_owned(), Some(raw.to_owned()))
+    }
+}
+
+#[cfg(unix)]
+fn is_unix_socket(path: &str) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_socket())
+}
+
+#[cfg(not(unix))]
+fn is_unix_socket(_path: &str) -> bool {
+    false
+}
+
+trait ReadWrite: std::io::Read + std::io::Write {}
+impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
+
+/// `FetchHTTPContent`: a 30-second request, redirects like `net/http`, status 200 only.
+fn fetch_http(url: &str, socket: Option<&str>, redirects: usize) -> Result<Vec<u8>, String> {
+    let mut url = url.to_owned();
+    for remaining in (0..=redirects).rev() {
+        let parsed = crate::conn::HttpUrl::parse(&url)
+            .map_err(|error| format!("invalid URL: {url}: {error}"))?;
+        let mut stream = if let Some(path) = socket {
+            socket_stream(path).map_err(|error| format!("failed to dial to {url}: {error}"))?
+        } else {
+            let tcp = tcp_stream(&parsed.host, parsed.port)
+                .map_err(|error| format!("failed to dial to {url}: {error}"))?;
+            if parsed.tls {
+                let config = ferrox_core::tls::TlsConfig {
+                    server_name: parsed.host.clone(),
+                    alpn: vec![b"http/1.1".to_vec()].into(),
+                    roots: crate::quic::system_roots(),
+                    resumption: true,
+                    ..Default::default()
+                };
+                match ferrox_core::tls::RustlsProvider::connect(&config, tcp) {
+                    Ok(tls) => Box::new(tls) as Box<dyn ReadWrite>,
+                    Err(error) => return Err(format!("failed to dial to {url}: {error}")),
+                }
+            } else {
+                Box::new(tcp) as Box<dyn ReadWrite>
+            }
+        };
+        let mut request = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: ferrox-app\r\nAccept-Encoding: gzip\r\n",
+            parsed.path, parsed.authority
+        );
+        if let Some(userinfo) = &parsed.userinfo {
+            use base64::Engine as _;
+            request.push_str("Authorization: Basic ");
+            request.push_str(&base64::engine::general_purpose::STANDARD.encode(userinfo));
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .and_then(|()| stream.flush())
+            .map_err(|error| format!("failed to dial to {url}: {error}"))?;
+        let (status, headers, body) = read_http_head(&mut *stream)?;
+        if status == 200 {
+            return read_http_body(&mut *stream, body, &headers);
+        }
+        let location = headers
+            .iter()
+            .find(|(name, _)| name == "location")
+            .map(|(_, value)| value.as_str());
+        if (300..400).contains(&status) {
+            if let Some(location) = location {
+                if remaining == 0 {
+                    return Err("stopped after 10 redirects".to_owned());
+                }
+                url = redirect_location(&parsed, location);
+                continue;
+            }
+        }
+        return Err(format!("unexpected HTTP status code: {status}"));
+    }
+    Err("stopped after 10 redirects".to_owned())
+}
+
+fn redirect_location(base: &crate::conn::HttpUrl, location: &str) -> String {
+    let location = location.trim();
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return location.to_owned();
+    }
+    let scheme = if base.tls { "https" } else { "http" };
+    if let Some(rest) = location.strip_prefix("//") {
+        return format!("{scheme}://{rest}");
+    }
+    if location.starts_with('/') {
+        return format!("{scheme}://{}{location}", base.authority);
+    }
+    let directory = match base.path.rfind('/') {
+        Some(0) | None => "",
+        Some(at) => &base.path[..at],
+    };
+    format!("{scheme}://{}{directory}/{location}", base.authority)
+}
+
+fn tcp_stream(host: &str, port: u16) -> std::io::Result<std::net::TcpStream> {
+    use std::net::ToSocketAddrs as _;
+    let mut last = None;
+    for address in (host, port).to_socket_addrs()? {
+        match std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(30)) {
+            Ok(stream) => {
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+                stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+                return Ok(stream);
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no address resolved")))
+}
+
+#[cfg(unix)]
+fn socket_stream(path: &str) -> std::io::Result<Box<dyn ReadWrite>> {
+    use std::os::unix::net::UnixStream;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::linux::net::SocketAddrExt;
+        if let Some(name) = path.strip_prefix("@@") {
+            let mut padded = vec![0u8; 107];
+            let raw = name.as_bytes();
+            let len = raw.len().min(padded.len());
+            padded[..len].copy_from_slice(&raw[..len]);
+            let address = std::os::linux::net::SocketAddr::from_abstract_name(&padded)?;
+            return finish_socket(UnixStream::connect_addr(&address)?);
+        }
+        if let Some(name) = path.strip_prefix('@') {
+            let address = std::os::linux::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+            return finish_socket(UnixStream::connect_addr(&address)?);
+        }
+    }
+    finish_socket(UnixStream::connect(path)?)
+}
+
+#[cfg(unix)]
+fn finish_socket(stream: std::os::unix::net::UnixStream) -> std::io::Result<Box<dyn ReadWrite>> {
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+    Ok(Box::new(stream))
+}
+
+#[cfg(not(unix))]
+fn socket_stream(path: &str) -> std::io::Result<Box<dyn ReadWrite>> {
+    Err(std::io::Error::other(format!(
+        "unix socket `{path}` is not supported on this platform"
+    )))
+}
+
+type HttpHead = (u16, Vec<(String, String)>, Vec<u8>);
+
+fn read_http_head(stream: &mut dyn ReadWrite) -> Result<HttpHead, String> {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|error| format!("failed to read HTTP response: {error}"))?;
+        if read == 0 {
+            return Err("failed to read HTTP response: unexpected end of stream".to_owned());
+        }
+        raw.extend_from_slice(&chunk[..read]);
+        if let Some(at) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = std::str::from_utf8(&raw[..at])
+                .map_err(|error| format!("failed to read HTTP response: {error}"))?;
+            let mut lines = head.split("\r\n");
+            let status = lines
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|code| code.parse::<u16>().ok())
+                .ok_or_else(|| "failed to read HTTP response: bad status line".to_owned())?;
+            let headers = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+                .collect();
+            return Ok((status, headers, raw[at + 4..].to_vec()));
+        }
+        if raw.len() > 1 << 20 {
+            return Err("failed to read HTTP response: headers too large".to_owned());
+        }
+    }
+}
+
+fn read_http_body(
+    stream: &mut dyn ReadWrite,
+    mut body: Vec<u8>,
+    headers: &[(String, String)],
+) -> Result<Vec<u8>, String> {
+    stream
+        .read_to_end(&mut body)
+        .map_err(|error| format!("failed to read HTTP response: {error}"))?;
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(have, _)| have == name)
+            .map(|(_, value)| value.as_str())
+    };
+    if header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
+        body = decode_chunked(&body)?;
+    } else if let Some(length) = header("content-length") {
+        let length = length
+            .parse::<usize>()
+            .map_err(|error| format!("failed to read HTTP response: {error}"))?;
+        if body.len() < length {
+            return Err("failed to read HTTP response: unexpected end of stream".to_owned());
+        }
+        body.truncate(length);
+    }
+    if header("content-encoding").is_some_and(|value| value.eq_ignore_ascii_case("gzip")) {
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(body.as_slice()),
+            &mut decoded,
+        )
+        .map_err(|error| format!("failed to read HTTP response: {error}"))?;
+        return Ok(decoded);
+    }
+    Ok(body)
+}
+
+fn decode_chunked(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    loop {
+        let end = bytes[at..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or_else(|| "failed to read HTTP response: incomplete chunk".to_owned())?;
+        let line = std::str::from_utf8(&bytes[at..at + end])
+            .map_err(|error| format!("failed to read HTTP response: {error}"))?;
+        let size = usize::from_str_radix(line.split(';').next().unwrap_or(line).trim(), 16)
+            .map_err(|error| format!("failed to read HTTP response: {error}"))?;
+        at += end + 2;
+        if size == 0 {
+            break;
+        }
+        let next = at
+            .checked_add(size + 2)
+            .filter(|next| *next <= bytes.len())
+            .ok_or_else(|| "failed to read HTTP response: incomplete chunk".to_owned())?;
+        out.extend_from_slice(&bytes[at..at + size]);
+        at = next;
+    }
+    Ok(out)
+}
+
+/// The JSON stream a YAML or TOML spelling feeds to the same handler builder.
+fn config_text(bytes: &[u8], format: SourceFormat) -> Result<std::borrow::Cow<'_, str>, String> {
+    match format {
+        SourceFormat::Yaml => {
+            let text = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+            let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(text)
+                .map_err(|error| format!("failed to convert yaml to json: {error}"))?;
+            let mut out = String::new();
+            crate::json::write(&yaml_json(&value)?, &mut out);
+            Ok(std::borrow::Cow::Owned(out))
+        }
+        SourceFormat::Toml => {
+            let text = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+            let value: toml::Value = toml::from_str(text)
+                .map_err(|error| format!("failed to convert toml to map: {error}"))?;
+            let mut out = String::new();
+            crate::json::write(&toml_json(&value)?, &mut out);
+            Ok(std::borrow::Cow::Owned(out))
+        }
+        SourceFormat::Json => Ok(std::borrow::Cow::Borrowed(
+            std::str::from_utf8(bytes).map_err(|error| error.to_string())?,
+        )),
+        SourceFormat::Jsonc => Ok(crate::json::strip_jsonc(
+            std::str::from_utf8(bytes).map_err(|error| error.to_string())?,
+        )),
+        SourceFormat::Protobuf => Err("protobuf is not JSON".to_owned()),
+    }
+}
+
+fn yaml_mapping(map: &serde_yaml_ng::Mapping) -> Result<Vec<(String, crate::json::Json)>, String> {
+    let mut explicit = Vec::new();
+    let mut merge_values = Vec::new();
+    for (key, value) in map {
+        let serde_yaml_ng::Value::String(key) = key else {
+            return Err(format!(
+                "failed to convert yaml to json: map key {key:?} is not a string"
+            ));
+        };
+        if key == "<<" {
+            merge_values.push(value);
+        } else {
+            explicit.push((key.clone(), yaml_json(value)?));
+        }
+    }
+    let mut inherited: Vec<(String, crate::json::Json)> = Vec::new();
+    for value in merge_values {
+        for source in yaml_merge_sources(value)? {
+            for (key, value) in source {
+                if !explicit.iter().any(|(have, _)| have == &key)
+                    && !inherited.iter().any(|(have, _)| have == &key)
+                {
+                    inherited.push((key, value));
+                }
+            }
+        }
+    }
+    explicit.extend(inherited);
+    explicit.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(explicit)
+}
+
+fn yaml_merge_sources(
+    value: &serde_yaml_ng::Value,
+) -> Result<Vec<Vec<(String, crate::json::Json)>>, String> {
+    match value {
+        serde_yaml_ng::Value::Mapping(map) => Ok(vec![yaml_mapping(map)?]),
+        serde_yaml_ng::Value::Sequence(items) => items
+            .iter()
+            .map(|item| match item {
+                serde_yaml_ng::Value::Mapping(map) => yaml_mapping(map),
+                _ => Err("failed to convert yaml to json: merge value is not a mapping".to_owned()),
+            })
+            .collect(),
+        _ => Err("failed to convert yaml to json: merge value is not a mapping".to_owned()),
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn yaml_json(value: &serde_yaml_ng::Value) -> Result<crate::json::Json, String> {
+    use crate::json::Json;
+    Ok(match value {
+        serde_yaml_ng::Value::Null => Json::Null,
+        serde_yaml_ng::Value::Bool(value) => Json::Bool(*value),
+        serde_yaml_ng::Value::Number(number) => {
+            let number = number
+                .as_i64()
+                .map(|value| value as f64)
+                .or_else(|| number.as_u64().map(|value| value as f64))
+                .or_else(|| number.as_f64())
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    format!("failed to convert yaml to json: unsupported number {number:?}")
+                })?;
+            Json::Num(number)
+        }
+        serde_yaml_ng::Value::String(value) => Json::Str(value.clone()),
+        serde_yaml_ng::Value::Sequence(items) => {
+            Json::Arr(items.iter().map(yaml_json).collect::<Result<_, _>>()?)
+        }
+        serde_yaml_ng::Value::Mapping(map) => Json::Obj(yaml_mapping(map)?),
+        serde_yaml_ng::Value::Tagged(tagged) => yaml_json(&tagged.value)?,
+    })
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn toml_json(value: &toml::Value) -> Result<crate::json::Json, String> {
+    use crate::json::Json;
+    Ok(match value {
+        toml::Value::String(value) => Json::Str(value.clone()),
+        toml::Value::Integer(value) => Json::Num(*value as f64),
+        toml::Value::Float(value) if value.is_finite() => Json::Num(*value),
+        toml::Value::Float(value) => {
+            return Err(format!(
+                "failed to convert toml to map: unsupported number {value}"
+            ));
+        }
+        toml::Value::Boolean(value) => Json::Bool(*value),
+        toml::Value::Datetime(value) => Json::Str(value.to_string()),
+        toml::Value::Array(items) => {
+            Json::Arr(items.iter().map(toml_json).collect::<Result<_, _>>()?)
+        }
+        toml::Value::Table(table) => Json::Obj(
+            table
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), toml_json(value)?)))
+                .collect::<Result<_, String>>()?,
+        ),
+    })
+}
+
+fn serve_source(label: &str, bytes: &[u8], format: SourceFormat) -> ! {
+    if let SourceFormat::Protobuf = format {
+        proxy::serve_protobuf(label, bytes, test_only());
+    }
+    let body = config_text(bytes, format)
+        .unwrap_or_else(|error| proxy::exit(&format!("bad config {label}: {error}")));
+    proxy::serve_json(label, &body, test_only())
 }
 
 #[cfg(test)]

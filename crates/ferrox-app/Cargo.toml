@@ -24,6 +24,8 @@ libc = "0.2"
 md5 = "0.8"
 mlua = { version = "0.12", features = ["lua51", "vendored", "send"] }
 regex = "1"
+serde_yaml_ng = "0.10"
+toml = "0.9"
 ring = "0.17"
 base64 = "0.23"
 boring = "5.4"
