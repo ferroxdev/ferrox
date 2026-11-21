@@ -30298,7 +30298,7 @@ fn dokodemo_udp_door(
         let _ = leg.0.send(out);
     }
     legs_stop.store(true, Ordering::Relaxed);
-    for (_, _, _, handle) in legs {
+    for (_, (_, _, _, handle)) in legs {
         let _ = handle.join();
     }
 }
