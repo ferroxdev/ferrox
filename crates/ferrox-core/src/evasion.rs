@@ -421,20 +421,28 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
     checksum_finish(checksum_add(0, bytes))
 }
 
+/// Sixteen-bit words add into the accumulator whole: a 64-bit big-endian load is the same four
+/// words scaled by 2^48, 2^32, 2^16 and 2^0, and each of those powers is 1 modulo 0xffff, so the
+/// end-around fold below cannot tell a word added at its own weight from the same load. One load
+/// and one add per eight bytes replace four loads and four adds per eight.
 #[cfg(any(target_os = "linux", test))]
-fn checksum_add(mut sum: u32, bytes: &[u8]) -> u32 {
-    let (words, tail) = bytes.as_chunks::<2>();
-    for pair in words {
-        sum += u32::from(u16::from_be_bytes(*pair));
+fn checksum_add(mut sum: u64, bytes: &[u8]) -> u64 {
+    let (chunks, tail) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        sum += u64::from_be_bytes(*chunk);
     }
-    if let Some(byte) = tail.first() {
-        sum += u32::from(*byte) << 8;
+    let (pairs, odd) = tail.as_chunks::<2>();
+    for pair in pairs {
+        sum += u64::from(u16::from_be_bytes(*pair));
+    }
+    if let Some(byte) = odd.first() {
+        sum += u64::from(*byte) << 8;
     }
     sum
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn checksum_finish(mut sum: u32) -> u16 {
+fn checksum_finish(mut sum: u64) -> u16 {
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
@@ -735,8 +743,41 @@ mod tests {
     #[test]
     fn the_internet_checksum_matches_the_rfc_example() {
         let sum = checksum_add(0, &[0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7]);
-        assert_eq!((sum & 0xffff) + (sum >> 16), 0xddf2);
         assert_eq!(checksum_finish(sum), 0x220d);
+    }
+
+    /// The eight-byte load is the two-byte form scaled: every eight-byte chunk carries its four
+    /// sixteen-bit words at weights 2^48, 2^32, 2^16 and 1, each congruent to 1 modulo 0xffff, so
+    /// the fold lands on the same sixteen bits for every length and tail.
+    #[test]
+    fn the_wide_checksum_fold_matches_the_pair_wide_one() {
+        fn pairs(mut sum: u64, bytes: &[u8]) -> u64 {
+            let (words, tail) = bytes.as_chunks::<2>();
+            for pair in words {
+                sum += u64::from(u16::from_be_bytes(*pair));
+            }
+            if let Some(byte) = tail.first() {
+                sum += u64::from(*byte) << 8;
+            }
+            sum
+        }
+        let mut seed = 0x243f_6a88_85a3_08d3u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for len in (0..=1600usize).chain([65535usize, 65536, 65537]) {
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| u8::try_from(next() & 0xff).expect("a byte"))
+                .collect();
+            assert_eq!(
+                checksum_finish(checksum_add(0, &bytes)),
+                checksum_finish(pairs(0, &bytes)),
+                "length {len}"
+            );
+        }
     }
 
     #[test]

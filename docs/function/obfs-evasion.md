@@ -181,6 +181,7 @@ graph TD
 | empty-record-octets | 5 | ferrox-app-conn::tests::an_empty_shape_precedes_one_record |
 | noise-ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | decoy-ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| decoy-checksum-ns-per-1500-byte-buffer | UNBLESSED | .github/workflows/bench.yml |
 | noise-syscalls-per-flow | UNBLESSED | scripts/count-ops.sh |
 | decoy-syscalls-per-hello | UNBLESSED | scripts/count-ops.sh |
 | noise-copies-per-packet | UNBLESSED | scripts/count-ops.sh |
@@ -274,6 +275,15 @@ reassembled, and the parser tests hold every accepted form and its refusal.
   the kernel refuses the option or the server sends no cookie, with one warning per process, and
   silently behind a `dialerProxy` because the inner leg owns the hello. Neither is silently
   skipped: a config that asks for fast open still sends a hello.
+- **A sixteen-bit word per addition in the decoy's checksums.** The one's-complement sum took
+  two bytes at a time into a `u32`, one load and one add per word. Whether the sum is taken as
+  sixteen-bit words or as eight-byte big-endian loads does not change the answer: a load is its
+  four words weighted by 2^48, 2^32, 2^16 and 1, and every one of those weights is 1 modulo
+  0xffff, so the end-around fold below cannot tell them apart. One load and one add per eight
+  bytes now replace four of each, with the 0-to-7-byte tail still taken as words and a high-order
+  odd byte. `the_wide_checksum_fold_matches_the_pair_wide_one` is the differential: every length
+  from 0 to 1600 and three lengths around 64 KiB, folded by both forms, sixteen bits equal;
+  `decoy-checksum-ns-per-1500-byte-buffer` is the bench mirror's own row.
 - **A second handshake parser for the cut.** The fragment stage and the mixed-case rewrite read
   the same `server_name_range` the record decoy already needed, so the bound checks (record
   length, handshake length, version, extensions) exist once and a truncated record can never
