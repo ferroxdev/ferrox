@@ -589,7 +589,7 @@ fn serve_inbounds_counted(
         let requested = if test {
             Vec::new()
         } else {
-            proposed_listen_addresses(root)
+            proposed_listen_endpoints(root)
         };
         let mut closing = CLOSING
             .lock()
@@ -597,9 +597,10 @@ fn serve_inbounds_counted(
         closing.retain(|entry| !entry.stop.is_settled());
         if closing.iter().any(|entry| {
             entry.endpoints.iter().any(|held| {
-                requested
-                    .iter()
-                    .any(|wanted| endpoints_conflict(held, wanted))
+                requested.iter().any(|(wanted, tcp, udp)| {
+                    (entry.sockets.0 && *tcp || entry.sockets.1 && *udp)
+                        && endpoints_conflict(held, wanted)
+                })
             })
         }) {
             eprintln!("inbound add refused: a previous listener on this address is still closing");
@@ -1033,6 +1034,7 @@ fn serve_inbounds_counted(
                             .push(Closing {
                                 stop: Arc::clone(stop),
                                 endpoints,
+                                sockets: inbound_sockets(inbound, protocol),
                             });
                     }
                 }
@@ -1320,20 +1322,29 @@ thread_local! {
 struct Closing {
     stop: Arc<Stop>,
     endpoints: Vec<String>,
+    sockets: (bool, bool),
 }
 
 static CLOSING: std::sync::Mutex<Vec<Closing>> = std::sync::Mutex::new(Vec::new());
 
 /// Every address this config names, before a test takes its ephemeral port, so an overlapping add can be told apart from an unrelated one.
-fn proposed_listen_addresses(root: &Json) -> Vec<String> {
+fn proposed_listen_endpoints(root: &Json) -> Vec<(String, bool, bool)> {
     let mut out = Vec::new();
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
             let protocol =
                 canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
+            let sockets = inbound_sockets(inbound, protocol);
             for address in serve_addresses(inbound, protocol).unwrap_or_default() {
-                if !address.is_empty() && !out.contains(&address) {
-                    out.push(address);
+                if address.is_empty() {
+                    continue;
+                }
+                match out.iter_mut().find(|(known, _, _)| known == &address) {
+                    Some((_, tcp, udp)) => {
+                        *tcp |= sockets.0;
+                        *udp |= sockets.1;
+                    }
+                    None => out.push((address, sockets.0, sockets.1)),
                 }
             }
         }
@@ -1592,10 +1603,9 @@ fn spawn_role_wake(
         }
         Err(error) => exit(&format!("cannot listen on {address}: {error}")),
     };
-    let wake = listener.local_addr().map_or_else(
-        |_| address.to_owned(),
-        |bound| swapped_port(address, bound.port()),
-    );
+    let wake = listener
+        .local_addr()
+        .map_or_else(|_| address.to_owned(), |bound| bound.to_string());
     let address = address.to_owned();
     thread::spawn(move || accept_listener(listener, &address, &role, tag.as_deref(), stop));
     Some(wake)
@@ -1608,10 +1618,9 @@ fn try_spawn_role_wake(
     stop: Option<std::sync::Arc<Stop>>,
 ) -> std::io::Result<String> {
     let listener = bind_listener(address, &role)?;
-    let wake = listener.local_addr().map_or_else(
-        |_| address.to_owned(),
-        |bound| swapped_port(address, bound.port()),
-    );
+    let wake = listener
+        .local_addr()
+        .map_or_else(|_| address.to_owned(), |bound| bound.to_string());
     let address = address.to_owned();
     thread::spawn(move || accept_listener(listener, &address, &role, tag.as_deref(), stop));
     Ok(wake)
@@ -16422,10 +16431,9 @@ fn serve_hc_inbound(address: &str, inbound: &Json, stop: Option<Arc<Stop>>) -> O
         }
         Err(error) => exit(&format!("cannot listen on {address}: {error}")),
     };
-    let wake = listener.local_addr().map_or_else(
-        |_| address.to_owned(),
-        |bound| swapped_port(address, bound.port()),
-    );
+    let wake = listener
+        .local_addr()
+        .map_or_else(|_| address.to_owned(), |bound| bound.to_string());
     thread::spawn(move || {
         for stream in listener.incoming() {
             if stop.as_ref().is_some_and(|stop| stop.stopped()) {
@@ -17696,9 +17704,16 @@ fn serve_dokodemo(
                 return (armed, workers, wake.clone());
             };
             let worker_stop = stop.cloned();
-            thread::spawn(move || {
-                dokodemo_transparent_udp_door(&socket, &door, listen, worker_stop.as_ref());
-            });
+            if thread::Builder::new()
+                .spawn(move || {
+                    dokodemo_transparent_udp_door(&socket, &door, listen, worker_stop.as_ref());
+                })
+                .is_err()
+            {
+                bind_failed();
+                eprintln!("dokodemo-door udp: cannot start the worker for {address} in {label}");
+                return (armed, workers, wake.clone());
+            }
         } else {
             let dest = if follow_redirect {
                 rewrite.configured()
@@ -17724,7 +17739,14 @@ fn serve_dokodemo(
                 dest
             };
             let worker_stop = stop.cloned();
-            thread::spawn(move || dokodemo_udp_door(&socket, &dest, &door, worker_stop.as_ref()));
+            if thread::Builder::new()
+                .spawn(move || dokodemo_udp_door(&socket, &dest, &door, worker_stop.as_ref()))
+                .is_err()
+            {
+                bind_failed();
+                eprintln!("dokodemo-door udp: cannot start the worker for {address} in {label}");
+                return (armed, workers, wake.clone());
+            }
         }
         armed += 1;
         workers += 1;
@@ -30271,6 +30293,7 @@ fn dokodemo_udp_door(
                 let handle = thread::spawn(move || {
                     let _ = reader.set_read_timeout(Some(UDP_POLL));
                     let mut back = udp_buffer();
+                    let mut quiet = Instant::now();
                     loop {
                         if reader_stop.load(Ordering::Relaxed)
                             || door_stop.as_ref().is_some_and(|stop| stop.stopped())
@@ -30279,6 +30302,7 @@ fn dokodemo_udp_door(
                         }
                         match reader.recv(&mut back) {
                             Ok(read) => {
+                                quiet = Instant::now();
                                 let Some((_source, payload)) = parse_socks_udp(&back[..read])
                                 else {
                                     continue;
@@ -30287,7 +30311,11 @@ fn dokodemo_udp_door(
                                     break;
                                 }
                             }
-                            Err(error) if is_timeout(&error) => {}
+                            Err(error) if is_timeout(&error) => {
+                                if quiet.elapsed() >= budgets::udp_idle() {
+                                    break;
+                                }
+                            }
                             Err(_) => break,
                         }
                     }

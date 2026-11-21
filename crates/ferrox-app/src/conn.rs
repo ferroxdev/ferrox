@@ -3367,7 +3367,7 @@ fn windows_socket_state(path: &std::path::Path) -> WindowsSocket {
 /// Delete the abandoned socket through the handle that verified its tag and identity.
 /// The volume and file identity a handle names, so a replacement is not mistaken for the socket checked.
 #[cfg(windows)]
-fn windows_file_id_handle(file: &std::fs::File) -> io::Result<(u32, u64)> {
+fn windows_file_id_handle(file: &std::fs::File) -> io::Result<(u32, u64, u32)> {
     use std::os::windows::io::AsRawHandle as _;
     #[repr(C)]
     struct FileTime {
@@ -3414,6 +3414,7 @@ fn windows_file_id_handle(file: &std::fs::File) -> io::Result<(u32, u64)> {
     Ok((
         info.volume,
         u64::from(info.index_high) << 32 | u64::from(info.index_low),
+        info.attributes,
     ))
 }
 
@@ -3429,7 +3430,7 @@ fn windows_file_id(path: &std::path::Path) -> io::Result<(u32, u64)> {
         .share_mode(FILE_SHARE_ALL)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
-    windows_file_id_handle(&file)
+    windows_file_id_handle(&file).map(|(volume, index, _)| (volume, index))
 }
 
 #[cfg(windows)]
@@ -3438,6 +3439,8 @@ fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> 
     use std::os::windows::io::AsRawHandle as _;
     const DELETE: u32 = 0x0001_0000;
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     #[repr(C)]
@@ -3456,7 +3459,7 @@ fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> 
         ) -> i32;
     }
     let file = match std::fs::OpenOptions::new()
-        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
         .share_mode(0)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
@@ -3484,20 +3487,20 @@ fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> 
             "a unix listen path could not be identified before binding",
         ));
     };
-    match windows_file_id_handle(&file) {
-        Ok(current) if current == *before => {}
+    let attributes = match windows_file_id_handle(&file) {
+        Ok((volume, index, attributes)) if (volume, index) == *before => attributes,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "a unix listen path was replaced while binding",
             ))
         }
-    }
+    };
     let disposition = FileDispositionInfoEx {
         flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
     };
     // SAFETY: the handle is live and `disposition` is the class's structure.
-    let ok = unsafe {
+    let mut deleted = unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle(),
             21,
@@ -3505,7 +3508,54 @@ fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> 
             std::mem::size_of::<FileDispositionInfoEx>() as u32,
         )
     };
-    if ok == 0 {
+    if deleted == 0 {
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(50) | Some(87)) {
+            return Err(error);
+        }
+        if attributes & FILE_ATTRIBUTE_READONLY != 0 {
+            #[repr(C)]
+            struct FileBasicInfo {
+                creation: i64,
+                accessed: i64,
+                written: i64,
+                changed: i64,
+                attributes: u32,
+            }
+            let basic = FileBasicInfo {
+                creation: 0,
+                accessed: 0,
+                written: 0,
+                changed: 0,
+                attributes: attributes & !FILE_ATTRIBUTE_READONLY,
+            };
+            // SAFETY: the handle is live and `basic` is the class's structure.
+            let cleared = unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    0,
+                    (&raw const basic).cast(),
+                    std::mem::size_of::<FileBasicInfo>() as u32,
+                )
+            };
+            if cleared == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let plain = FileDispositionInfoEx {
+            flags: FILE_DISPOSITION_FLAG_DELETE,
+        };
+        // SAFETY: the handle is live and `plain` is the class's structure.
+        deleted = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                21,
+                (&raw const plain).cast(),
+                std::mem::size_of::<FileDispositionInfoEx>() as u32,
+            )
+        };
+    }
+    if deleted == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
