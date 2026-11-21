@@ -30187,6 +30187,14 @@ fn door_idle(stop: Option<&Arc<Stop>>) -> std::time::Duration {
 /// The socket is the one the front bound, so the port is held from the moment the
 /// inbound is armed, and a datagram that arrives before the door reads it waits in the
 /// kernel rather than in a refusal.
+type DokodemoLeg = (
+    UdpSocket,
+    Connection,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<()>,
+);
+
+#[allow(clippy::too_many_lines)]
 fn dokodemo_udp_door(
     socket: &UdpSocket,
     dest: &Destination,
@@ -30199,13 +30207,7 @@ fn dokodemo_udp_door(
         return;
     };
     // One association per client: the upstream answers the source the request came from, so a shared association cannot route two clients' replies.
-    type Leg = (
-        UdpSocket,
-        Connection,
-        Arc<AtomicBool>,
-        std::thread::JoinHandle<()>,
-    );
-    let mut legs: HashMap<SocketAddr, Leg> = HashMap::new();
+    let mut legs: HashMap<SocketAddr, DokodemoLeg> = HashMap::new();
     let mut buf = udp_buffer();
     let legs_stop = Arc::new(AtomicBool::new(false));
     // The door's frame is the door's: the address it rewrites to is the same for every datagram.
