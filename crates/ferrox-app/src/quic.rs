@@ -4823,7 +4823,9 @@ impl Read for QuicStream {
         if self.stop.load(Ordering::Relaxed) {
             return Ok(0);
         }
-        let quantum = if crate::proxy::relay_step_owns_poll() {
+        // An empty read in a lane step hands the lane back to the pool's readiness wait; sleeping a grain here holds a worker that the datagram filling this stream cannot wake.
+        let relayed = crate::proxy::relay_step_owns_poll();
+        let quantum = if relayed {
             crate::budgets::RELAY_POLL
         } else {
             STREAM_QUANTUM
@@ -4860,7 +4862,7 @@ impl Read for QuicStream {
                     return Err(std::io::Error::other("quic connection lock poisoned"));
                 }
             }
-            if Instant::now() >= deadline {
+            if relayed || Instant::now() >= deadline {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
             let left = deadline.saturating_duration_since(Instant::now());
