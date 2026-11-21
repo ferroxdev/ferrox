@@ -108,9 +108,26 @@ impl std::fmt::Debug for TuicOut {
 
 type LaneKey = (Option<IpAddr>, Option<Arc<crate::sockopt::SocketOptions>>);
 
+struct LaneLease(Arc<Lane>);
+
+impl std::ops::Deref for LaneLease {
+    type Target = Lane;
+
+    fn deref(&self) -> &Lane {
+        &self.0
+    }
+}
+
+impl Drop for LaneLease {
+    fn drop(&mut self) {
+        self.0.leases.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct Lane {
     conn: Arc<Mutex<quiche::Connection>>,
     sock: Arc<Datagram>,
+    leases: AtomicUsize,
     local: SocketAddr,
     next_bidi: Mutex<u64>,
     next_uni: AtomicU64,
@@ -330,13 +347,13 @@ impl TuicOut {
         proxy::resolve_outbound(&self.address, self.port)
     }
 
-    fn lane(&self) -> Option<Arc<Lane>> {
+    fn lane(&self) -> Option<LaneLease> {
         let options = proxy::dial_options();
         let source = proxy::flow_source().ok()?;
         let key = (source, options.clone());
         let mut held = self.lanes.lock().ok()?;
         held.retain(|_, lane| {
-            Arc::strong_count(lane) > 1
+            lane.leases.load(Ordering::Acquire) > 0
                 || !(lane.stop.load(Ordering::Relaxed)
                     || lane.conn.lock().is_ok_and(|conn| conn.is_closed()))
         });
@@ -347,21 +364,23 @@ impl TuicOut {
                     .lock()
                     .is_ok_and(|conn| lane_established(&conn, lane));
             if live {
-                return Some(Arc::clone(lane));
+                lane.leases.fetch_add(1, Ordering::AcqRel);
+                return Some(LaneLease(Arc::clone(lane)));
             }
         }
         held.remove(&key);
         if held.len() >= MAX_TUIC_LANES {
             let idle = held
                 .iter()
-                .find(|(_, lane)| Arc::strong_count(lane) == 1)
+                .find(|(_, lane)| lane.leases.load(Ordering::Acquire) == 0)
                 .map(|(key, _)| key.clone());
             let idle = idle?;
             held.remove(&idle);
         }
         let lane = self.connect_lane(source, options)?;
+        lane.leases.fetch_add(1, Ordering::AcqRel);
         held.insert(key, Arc::clone(&lane));
-        Some(lane)
+        Some(LaneLease(lane))
     }
 
     fn connect_lane(
@@ -410,6 +429,7 @@ impl TuicOut {
         let lane = Arc::new(Lane {
             conn,
             sock: socket,
+            leases: AtomicUsize::new(0),
             local,
             next_bidi: Mutex::new(0),
             next_uni: AtomicU64::new(6),
