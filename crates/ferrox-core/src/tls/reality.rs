@@ -707,7 +707,9 @@ fn read_client_hello<S: Read>(
     let mut header = [0u8; 5];
     let mut first = true;
     loop {
-        if read_to_fill(io, &mut header, deadline) != header.len() {
+        let filled = read_to_fill(io, &mut header, deadline);
+        if filled != header.len() {
+            raw.extend_from_slice(&header[..filled]);
             return Err((TlsError::Closed, raw));
         }
         if header[0] != 0x16 {
@@ -3579,6 +3581,32 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(3),
             "and the overall deadline ends it, not the retry cap"
+        );
+    }
+
+    #[test]
+    fn a_partial_header_survives_the_deadline() {
+        struct Trickle(bool);
+        impl Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                self.0 = true;
+                buf[..2].copy_from_slice(&[0x16, 0x03]);
+                Ok(2)
+            }
+        }
+        let (why, raw) = read_client_hello(
+            &mut Trickle(false),
+            Instant::now() + Duration::from_millis(20),
+        )
+        .expect_err("a header the peer never finishes is refused");
+        assert!(matches!(why, TlsError::Closed));
+        assert_eq!(
+            raw,
+            [0x16, 0x03],
+            "the bytes the peer sent are kept for the cover origin"
         );
     }
 
