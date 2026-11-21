@@ -202,7 +202,7 @@ impl Guard {
                     && route.destination().is_ipv4() == v4
                     && route.if_name().is_none_or(|name| name != &self.interface)
             })
-            .max_by_key(|route| route.metric().unwrap_or(0))
+            .max_by_key(|route| default_metric(route))
     }
 
     /// Keep one dialled address on the route that carried the default, so a name
@@ -313,6 +313,16 @@ impl Guard {
             "`auto_route` needs a platform routing table; the host routes its own VpnService",
         ))
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn default_metric(route: &Route) -> u32 {
+    route.metric().unwrap_or(0)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn default_metric(_route: &Route) -> u32 {
+    0
 }
 
 fn same_family(outer: IpAddr, inner: IpAddr) -> bool {
