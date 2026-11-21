@@ -23,6 +23,7 @@ pub fn chacha20_poly1305_seal_in_place_unfused(
     state.finish()
 }
 
+// 4 KiB won 1.20x-1.26x on x86_64 outside Windows; elsewhere bench 44889561375 lost 0.94x-1.00x.
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 const MAC_CHUNK: usize = 4096;
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
@@ -251,7 +252,15 @@ mod tests {
     }
 
     #[test]
-    fn the_chunked_seal_is_the_unfused_seal_across_every_chunk_boundary() {
+    fn the_chunked_mac_is_compiled_out_where_ci_measured_a_loss() {
+        #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+        assert_eq!(MAC_CHUNK, 4096);
+        #[cfg(not(all(target_arch = "x86_64", not(target_os = "windows"))))]
+        assert_eq!(MAC_CHUNK, usize::MAX);
+    }
+
+    #[test]
+    fn the_seal_is_the_unfused_seal_across_every_chunk_boundary() {
         let key = [0x5bu8; 32];
         let nonce = [0xa7u8; 12];
         let aad = b"a header";
