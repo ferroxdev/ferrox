@@ -2264,7 +2264,7 @@ impl H2Conn {
         let mut spare = self.spare.lock().unwrap_or_else(PoisonError::into_inner);
         let body = std::mem::take(&mut *spare);
         drop(spare);
-        if body.capacity() == len {
+        if body.len() == len && body.capacity() == len {
             body
         } else {
             vec![0u8; len]
