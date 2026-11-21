@@ -3155,7 +3155,7 @@ mod tests {
                 (1, index),
                 Parts {
                     total: 2,
-                    address,
+                    address: None,
                     slots: vec![Some((0, 32)), None],
                     buffer: vec![0u8; 32],
                     received: 1,

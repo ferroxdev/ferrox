@@ -423,13 +423,15 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
 
 /// Sixteen-bit words add into the accumulator whole: a 64-bit big-endian load is the same four
 /// words scaled by 2^48, 2^32, 2^16 and 2^0, and each of those powers is 1 modulo 0xffff, so the
-/// end-around fold below cannot tell a word added at its own weight from the same load. One load
-/// and one add per eight bytes replace four loads and four adds per eight.
+/// end-around fold below cannot tell a word added at its own weight from the same load. The two
+/// halves are added rather than the load itself, which keeps the accumulator below 2^33 per eight
+/// bytes and so cannot wrap for any segment that fits: one load, two shifts and two adds per eight.
 #[cfg(any(target_os = "linux", test))]
 fn checksum_add(mut sum: u64, bytes: &[u8]) -> u64 {
     let (chunks, tail) = bytes.as_chunks::<8>();
     for chunk in chunks {
-        sum += u64::from_be_bytes(*chunk);
+        let word = u64::from_be_bytes(*chunk);
+        sum += (word >> 32) + (word & 0xffff_ffff);
     }
     let (pairs, odd) = tail.as_chunks::<2>();
     for pair in pairs {

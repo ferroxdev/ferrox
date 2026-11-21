@@ -279,9 +279,11 @@ reassembled, and the parser tests hold every accepted form and its refusal.
   two bytes at a time into a `u32`, one load and one add per word. Whether the sum is taken as
   sixteen-bit words or as eight-byte big-endian loads does not change the answer: a load is its
   four words weighted by 2^48, 2^32, 2^16 and 1, and every one of those weights is 1 modulo
-  0xffff, so the end-around fold below cannot tell them apart. One load and one add per eight
-  bytes now replace four of each, with the 0-to-7-byte tail still taken as words and a high-order
-  odd byte. `the_wide_checksum_fold_matches_the_pair_wide_one` is the differential: every length
+  0xffff, so the end-around fold below cannot tell them apart. The load's two halves are added
+  rather than the load itself, which keeps the accumulator below 2^33 per eight bytes and so
+  cannot wrap for a segment that fits: one load, two shifts and two adds per eight bytes replace
+  four loads and four adds, with the 0-to-7-byte tail still taken as words and a high-order odd
+  byte. `the_wide_checksum_fold_matches_the_pair_wide_one` is the differential: every length
   from 0 to 1600 and three lengths around 64 KiB, folded by both forms, sixteen bits equal;
   `decoy-checksum-ns-per-1500-byte-buffer` is the bench mirror's own row.
 - **A second handshake parser for the cut.** The fragment stage and the mixed-case rewrite read

@@ -308,8 +308,8 @@ fn packet_map_section(out: &mut String) {
 }
 
 /// The one's-complement checksum the SNI decoy writes over an IPv4 header and a TCP segment: the
-/// sixteen-bit word sum taken two bytes at a time, or eight bytes with the big-endian load's four
-/// words folded at the end (each weight is 1 modulo 0xffff).
+/// sixteen-bit word sum taken two bytes at a time, or eight bytes with the big-endian load's two
+/// halves added (each weight is 1 modulo 0xffff) and folded at the end.
 const CHECKSUM_BYTES: usize = 1500;
 
 fn checksum_pairs(mut sum: u64, bytes: &[u8]) -> u64 {
@@ -326,7 +326,8 @@ fn checksum_pairs(mut sum: u64, bytes: &[u8]) -> u64 {
 fn checksum_wide(mut sum: u64, bytes: &[u8]) -> u64 {
     let (chunks, tail) = bytes.as_chunks::<8>();
     for chunk in chunks {
-        sum += u64::from_be_bytes(*chunk);
+        let word = u64::from_be_bytes(*chunk);
+        sum += (word >> 32) + (word & 0xffff_ffff);
     }
     let (pairs, odd) = tail.as_chunks::<2>();
     for pair in pairs {
