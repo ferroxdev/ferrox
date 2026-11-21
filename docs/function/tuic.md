@@ -44,6 +44,8 @@ graph TD
 | sink-lookup-ns-per-datagram | 4.7 | .github/workflows/bench.yml |
 | address-families | 3 | ferrox-core-tuic::tests::the_three_address_families_match_the_wire |
 | outbound-spellings-parsed | 1 | ferrox-app-tuic::tests::a_tuic_outbound_reads_the_reference_spellings |
+| uni-read-buffer-allocations-per-run | 1 | ferrox-app-tuic::tests::a_uni_run_is_one_allocation |
+| uni-read-copies-per-packet | 0 | ferrox-app-tuic::tests::a_uni_run_shares_one_buffer_across_its_packets |
 <!-- counts:end -->
 
 ## What was removed

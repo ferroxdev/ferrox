@@ -117,6 +117,7 @@ graph TD
 | quic-v2-generic-default | off | ferrox-app-masque::tests::the_quic_v2_setting_is_opt_in_for_generic_masque |
 | quic-v2-bait-bytes | 1200 | ferrox-app-masque::tests::the_bait_is_a_v2_versioned_long_header_of_the_minimum_size |
 | quic-v2-bait-answer | consumed | ferrox-app-masque::tests::the_bait_triggers_a_version_negotiation_from_a_v1_only_server |
+| h3-lane-prefix-bytes-moved-per-datagram | 0 | ferrox-app-masque::tests::a_lane_datagram_keeps_its_prefix |
 <!-- counts:end -->
 
 The row 194 noise hook is the HTTP/3 client's: `masqueSettings.noize` is read into `ClientSpec`, and `attempt` sends that profile's junk and `i1`/`i2` before `quiche::connect`, so the QUIC ClientHello follows them. The default is `off` when the setting is absent; WARP-generated MASQUE settings always write `firewall` unless the operator chooses another profile. HTTP/2 and HTTP/1.1 have no pre-handshake UDP datagrams and take no noise, and the server role is unchanged. `noize::tests::masque_signatures_follow_the_reference_order` and `noize::tests::an_off_profile_sends_nothing` are the checkers.

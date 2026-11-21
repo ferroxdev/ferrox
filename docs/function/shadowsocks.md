@@ -94,6 +94,7 @@ Every row is a claim with a checker that runs. `scripts/method-counts.txt` holds
 | stream-udp-payload-buffers-per-datagram | 1 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes |
 | stream-udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes |
 
+| master-key-scratch-heap-buffers | 0 | ferrox-core-shadowsocks::tests::a_master_key_is_one_allocation |
 <!-- counts:end -->
 
 What those per-batch rows add up to, as arithmetic on the rows and not as a measurement: one GiB in each direction is 65 540 chunks of 16 383 B. The uplink used to pay a read and a write for every one of them (131 080) and the downlink a read per 32 798 B window and a write per chunk (98 345), which is 229 425 syscalls per GiB both legs together. A batch is four chunks, so the uplink is 32 770 and the downlink 32 790: **65 560**, 3.5× fewer. No strace has counted this on a live relay — `scripts/count-ops.sh` counts retired instructions in a unit test, not syscalls on a socket, and every loopback test in this tree is told not to gate a syscall count — so the figure is what the gated rows imply, named here rather than blessed anywhere. What is measured is what the kernel work costs: the Time section's matched pair of `shadowsocks-raw-down-8` cells puts throughput against the reference at 1.162× before and 1.394× after, with disjoint intervals.

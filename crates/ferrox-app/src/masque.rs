@@ -5437,6 +5437,43 @@ mod tests {
         );
     }
 
+    /// A datagram that reaches a lane keeps its prefix: the lane reads the packet at its
+    /// offset rather than a copy that moved it.
+    #[test]
+    fn a_lane_datagram_keeps_its_prefix() {
+        let (to_stack, _stack_rx) = mpsc::channel();
+        let (lane, lanes) = mpsc::channel();
+        let mut table = HashMap::new();
+        table.insert(4321, lane);
+        let routes = Arc::new(Mutex::new(table));
+        let payload = b"ping";
+        let mut packet = Vec::new();
+        assert!(connectip::udp_datagram(
+            &connectip::UdpDatagram {
+                source: &[10, 14, 0, 2],
+                destination: &[192, 0, 2, 1],
+                source_port: 1234,
+                destination_port: 4321,
+                payload: &payload[..],
+            },
+            &mut packet,
+        ));
+        let mut datagram = Vec::with_capacity(4 + packet.len());
+        connectip::datagram_prefix(4, &mut datagram);
+        datagram.extend_from_slice(&packet);
+        let base = datagram.as_ptr();
+        let offset = datagram.len() - packet.len();
+        deliver_owned(&to_stack, &routes, datagram, offset);
+        let handed = lanes.recv().expect("the lane's packet");
+        assert_eq!(handed.at, offset, "the prefix stays an offset");
+        assert_eq!(
+            handed.bytes.as_ptr(),
+            base,
+            "the lane reads the buffer that arrived"
+        );
+        assert_eq!(&handed.bytes[handed.at..], packet.as_slice());
+    }
+
     /// A first IPv4 UDP fragment goes to the stack, not the datagram lane.
     #[test]
     fn an_ipv4_udp_fragment_reaches_the_stack() {
