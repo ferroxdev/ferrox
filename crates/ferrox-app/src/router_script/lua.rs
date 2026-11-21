@@ -1224,9 +1224,10 @@ end
         let mapped = |text: &str| text.parse::<IpAddr>().expect("address");
         assert!(loopback(mapped("::ffff:127.0.0.1")));
         assert!(unspecified(mapped("::ffff:0.0.0.0")));
-        assert!(multicast(mapped("::ffff:224.0.0.1")));
+        let multicast_mapped = IpAddr::V6(Ipv4Addr::new(224, 0, 0, 1).to_ipv6_mapped());
+        assert!(multicast(multicast_mapped));
         assert!(link_unicast(mapped("::ffff:169.254.1.1")));
-        assert!(link_multicast(mapped("::ffff:224.0.0.1")));
+        assert!(link_multicast(multicast_mapped));
     }
 
     #[test]
