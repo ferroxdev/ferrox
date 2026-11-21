@@ -2328,9 +2328,6 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
         let Some((dest, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
             continue;
         };
-        if payload.is_empty() {
-            continue;
-        }
         let Ok(mut conn) = session.shared.lock() else {
             break;
         };
