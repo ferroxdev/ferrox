@@ -1,7 +1,7 @@
 use std::mem::MaybeUninit;
 
 use crate::poly1305::Poly1305;
-use crate::record::{fill_exact, fill_exact_with_head};
+use crate::record::{blocks_for, fill_exact, fill_exact_with_head};
 
 /// Thirty-two bytes of block zero's keystream, requested at that length so the block's second half is never staged.
 fn poly_key(chacha_key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
@@ -23,15 +23,26 @@ pub fn chacha20_poly1305_seal_in_place_unfused(
     state.finish()
 }
 
-fn mac(state: &mut Poly1305, aad: &[u8], ciphertext: &[u8]) {
-    for section in [aad, ciphertext] {
-        state.update(section);
-        state.pad_to_block();
-    }
+const MAC_CHUNK: usize = 4096;
+const _: () = assert!(MAC_CHUNK.is_multiple_of(64));
+
+fn mac_start(state: &mut Poly1305, aad: &[u8]) {
+    state.update(aad);
+    state.pad_to_block();
+}
+
+fn mac_finish(state: &mut Poly1305, aad_len: usize, ciphertext_len: usize) {
+    state.pad_to_block();
     let mut lengths = [0u8; 16];
-    lengths[..8].copy_from_slice(&(aad.len() as u64).to_le_bytes());
-    lengths[8..].copy_from_slice(&(ciphertext.len() as u64).to_le_bytes());
+    lengths[..8].copy_from_slice(&(aad_len as u64).to_le_bytes());
+    lengths[8..].copy_from_slice(&(ciphertext_len as u64).to_le_bytes());
     state.update(&lengths);
+}
+
+fn mac(state: &mut Poly1305, aad: &[u8], ciphertext: &[u8]) {
+    mac_start(state, aad);
+    state.update(ciphertext);
+    mac_finish(state, aad.len(), ciphertext.len());
 }
 
 #[must_use]
@@ -41,11 +52,26 @@ pub fn chacha20_poly1305_seal_in_place(
     aad: &[u8],
     buf: &mut [u8],
 ) -> [u8; 16] {
+    let first = buf.len().min(MAC_CHUNK);
     let mut one_time = [0u8; 32];
-    fill_exact_with_head(key, nonce, 0, &mut one_time, buf);
+    fill_exact_with_head(key, nonce, 0, &mut one_time, &mut buf[..first]);
 
     let mut state = Poly1305::new(&one_time);
-    mac(&mut state, aad, buf);
+    mac_start(&mut state, aad);
+    state.update(&buf[..first]);
+    let mut done = first;
+    let mut start_block =
+        1 + u32::try_from(blocks_for(first)).expect("the first chunk's blocks fit a counter");
+    while done < buf.len() {
+        let end = (done + MAC_CHUNK).min(buf.len());
+        fill_exact(key, nonce, start_block, &mut buf[done..end]);
+        state.update(&buf[done..end]);
+        start_block = start_block
+            .checked_add(u32::try_from(blocks_for(end - done)).expect("a chunk's blocks fit"))
+            .expect("the fill guard proved the counter");
+        done = end;
+    }
+    mac_finish(&mut state, aad.len(), buf.len());
     state.finish()
 }
 
@@ -62,11 +88,49 @@ pub fn chacha20_poly1305_seal_from(
         dst.len(),
         "the source and the wire are the same message"
     );
+    seal_from_initialized(key, nonce, aad, src, dst)
+}
+
+fn seal_from_initialized(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    src: &[u8],
+    dst: &mut [u8],
+) -> [u8; 16] {
+    let first = src.len().min(MAC_CHUNK);
     let mut one_time = [0u8; 32];
-    crate::record::fill_exact_with_head_from(key, nonce, 0, &mut one_time, src, dst);
+    crate::record::fill_exact_with_head_from(
+        key,
+        nonce,
+        0,
+        &mut one_time,
+        &src[..first],
+        &mut dst[..first],
+    );
 
     let mut state = Poly1305::new(&one_time);
-    mac(&mut state, aad, dst);
+    mac_start(&mut state, aad);
+    state.update(&dst[..first]);
+    let mut done = first;
+    let mut start_block =
+        1 + u32::try_from(blocks_for(first)).expect("the first chunk's blocks fit a counter");
+    while done < src.len() {
+        let end = (done + MAC_CHUNK).min(src.len());
+        crate::record::fill_exact_from(
+            key,
+            nonce,
+            start_block,
+            &src[done..end],
+            &mut dst[done..end],
+        );
+        state.update(&dst[done..end]);
+        start_block = start_block
+            .checked_add(u32::try_from(blocks_for(end - done)).expect("a chunk's blocks fit"))
+            .expect("the fill guard proved the counter");
+        done = end;
+    }
+    mac_finish(&mut state, aad.len(), src.len());
     state.finish()
 }
 
@@ -86,17 +150,12 @@ pub fn chacha20_poly1305_seal_from_uninit(
         dst.len(),
         "the source and the wire are the same message"
     );
-    let mut one_time = [0u8; 32];
     // SAFETY: write_bytes initializes every byte before the slice exists; the fill overwrites all of them.
     let dst_initialized = unsafe {
         std::ptr::write_bytes(dst.as_mut_ptr(), 0, dst.len());
         std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len())
     };
-    crate::record::fill_exact_with_head_from(key, nonce, 0, &mut one_time, src, dst_initialized);
-
-    let mut state = Poly1305::new(&one_time);
-    mac(&mut state, aad, dst_initialized);
-    state.finish()
+    seal_from_initialized(key, nonce, aad, src, dst_initialized)
 }
 
 #[must_use]
@@ -180,6 +239,42 @@ mod tests {
                 unsafe { std::slice::from_raw_parts(uninit.as_ptr().cast::<u8>(), uninit.len()) };
             assert_eq!(uninit, in_place, "uninit ciphertext at length {len}");
             assert_eq!(plain, original, "source at length {len}");
+        }
+    }
+
+    #[test]
+    fn the_chunked_seal_is_the_unfused_seal_across_every_chunk_boundary() {
+        let key = [0x5bu8; 32];
+        let nonce = [0xa7u8; 12];
+        let aad = b"a header";
+        for len in [
+            0, 1, 63, 64, 65, 4095, 4096, 4097, 8191, 8192, 8193, 16383, 16384, 16385,
+        ] {
+            let plain: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(251).wrapping_add(11))
+                .collect();
+            let mut fused = plain.clone();
+            let mut unfused = plain.clone();
+            let fused_tag = chacha20_poly1305_seal_in_place(&key, &nonce, aad, &mut fused);
+            let unfused_tag =
+                chacha20_poly1305_seal_in_place_unfused(&key, &nonce, aad, &mut unfused);
+            assert_eq!(fused, unfused, "ciphertext at length {len}");
+            assert_eq!(fused_tag, unfused_tag, "tag at length {len}");
+
+            let mut from = vec![0u8; len];
+            let from_tag = chacha20_poly1305_seal_from(&key, &nonce, aad, &plain, &mut from);
+            assert_eq!(from, unfused, "from ciphertext at length {len}");
+            assert_eq!(from_tag, unfused_tag, "from tag at length {len}");
+
+            let mut uninit: Vec<std::mem::MaybeUninit<u8>> =
+                (0..len).map(|_| std::mem::MaybeUninit::uninit()).collect();
+            let uninit_tag =
+                chacha20_poly1305_seal_from_uninit(&key, &nonce, aad, &plain, &mut uninit);
+            // SAFETY: seal_from_uninit wrote every byte of the destination.
+            let uninit =
+                unsafe { std::slice::from_raw_parts(uninit.as_ptr().cast::<u8>(), uninit.len()) };
+            assert_eq!(uninit, unfused, "uninit ciphertext at length {len}");
+            assert_eq!(uninit_tag, unfused_tag, "uninit tag at length {len}");
         }
     }
 
