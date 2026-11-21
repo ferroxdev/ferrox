@@ -90,7 +90,7 @@ pub(crate) struct TuicOut {
     cert_pins: Arc<[[u8; 32]]>,
     insecure: bool,
     heartbeat: Duration,
-    lane: Mutex<Option<Arc<Lane>>>,
+    lanes: Mutex<HashMap<(Option<IpAddr>, Option<Arc<crate::sockopt::SocketOptions>>), Arc<Lane>>>,
     session: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
@@ -108,8 +108,6 @@ impl std::fmt::Debug for TuicOut {
 struct Lane {
     conn: Arc<Mutex<quiche::Connection>>,
     sock: Arc<Datagram>,
-    source: Option<IpAddr>,
-    options: Option<Arc<crate::sockopt::SocketOptions>>,
     local: SocketAddr,
     next_bidi: Mutex<u64>,
     next_uni: AtomicU64,
@@ -332,11 +330,10 @@ impl TuicOut {
     fn lane(&self) -> Option<Arc<Lane>> {
         let options = proxy::dial_options();
         let source = proxy::flow_source().ok()?;
-        let mut held = self.lane.lock().ok()?;
-        if let Some(lane) = held.as_ref() {
+        let key = (source, options.clone());
+        let mut held = self.lanes.lock().ok()?;
+        if let Some(lane) = held.get(&key) {
             let live = !lane.stop.load(Ordering::Relaxed)
-                && lane.source == source
-                && lane.options == options
                 && lane
                     .conn
                     .lock()
@@ -344,6 +341,8 @@ impl TuicOut {
             if live {
                 return Some(Arc::clone(lane));
             }
+        }
+        if let Some(lane) = held.remove(&key) {
             lane.stop.store(true, Ordering::Relaxed);
             if let Ok(mut conn) = lane.conn.lock() {
                 if !conn.is_closed() {
@@ -353,7 +352,7 @@ impl TuicOut {
             }
         }
         let lane = self.connect_lane(source, options)?;
-        *held = Some(Arc::clone(&lane));
+        held.insert(key, Arc::clone(&lane));
         Some(lane)
     }
 
@@ -378,7 +377,7 @@ impl TuicOut {
                 )?;
                 (quic::Datagram::plain(sock).with_gro(false), peer, local)
             };
-        let socket = socket.with_options(options.clone()).with_source(source);
+        let socket = socket.with_options(options).with_source(source);
         let mut config = self.client_config()?;
         let mut scid = [0u8; SCID_LEN];
         getrandom::fill(&mut scid).ok()?;
@@ -403,8 +402,6 @@ impl TuicOut {
         let lane = Arc::new(Lane {
             conn,
             sock: socket,
-            source,
-            options,
             local,
             next_bidi: Mutex::new(0),
             next_uni: AtomicU64::new(6),
@@ -1381,7 +1378,7 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<TuicOut>, String> {
         cert_pins: Arc::clone(&tls.cert_pins),
         insecure: tls.insecure,
         heartbeat,
-        lane: Mutex::new(None),
+        lanes: Mutex::new(HashMap::new()),
         session: Arc::new(Mutex::new(None)),
     }))
 }
@@ -2763,7 +2760,7 @@ mod tests {
             cert_pins: Arc::new([]),
             insecure: false,
             heartbeat: Duration::from_secs(30),
-            lane: Mutex::new(None),
+            lanes: Mutex::new(HashMap::new()),
             session: Arc::new(Mutex::new(None)),
         }
     }

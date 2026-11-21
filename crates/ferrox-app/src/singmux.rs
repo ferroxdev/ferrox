@@ -84,6 +84,7 @@ const FLAG_UDP: u16 = 1;
 const FLAG_ADDR: u16 = 2;
 const MAX_STREAMS: usize = 1024;
 const RESET_QUEUE: usize = MAX_STREAMS;
+const REFUSAL_QUEUE: usize = 64;
 
 /// One stream's opening request: a TCP destination, or the destination a connected UDP flow
 /// speaks to; `packet_addr` marks the full-cone form where every frame names its own address.
@@ -500,6 +501,7 @@ struct Inner {
     write: Mutex<Box<dyn Write + Send>>,
     sinks: Mutex<HashMap<u32, Sink>>,
     resets: Mutex<Option<SyncSender<u32>>>,
+    refusals: Mutex<Option<SyncSender<u32>>>,
     credits: Mutex<Option<SyncSender<()>>>,
     pending_credit: AtomicUsize,
     /// Resets queued or draining: admission counts them against the stream cap so churn cannot fill the bounded reset channel and close unrelated streams.
@@ -531,6 +533,7 @@ impl Inner {
             write: Mutex::new(write),
             sinks: Mutex::new(HashMap::new()),
             resets: Mutex::new(None),
+            refusals: Mutex::new(None),
             credits: Mutex::new(None),
             pending_credit: AtomicUsize::new(0),
             pending_resets: AtomicUsize::new(0),
@@ -898,6 +901,40 @@ impl Inner {
         }
     }
 
+    /// A refused SYN still owes the peer a reset, but the demux cannot wait on the carrier: a small
+    /// separate queue drops refusals under a flood instead of letting them crowd out a stream's own
+    /// reset or close a session that still has unrelated active streams.
+    fn defer_refusal(&self, id: u32) {
+        let mut refusals = match self.refusals.lock() {
+            Ok(refusals) => refusals,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.dead() {
+            return;
+        }
+        if let Some(sender) = refusals.as_ref() {
+            let _ = sender.try_send(id);
+            return;
+        }
+        let (sender, pending) = sync_channel(REFUSAL_QUEUE);
+        let inner = Arc::downgrade(&self.clone_handle());
+        let spawned = std::thread::Builder::new()
+            .name("singmux-refuse".to_owned())
+            .spawn(move || {
+                while let Ok(id) = pending.recv() {
+                    let Some(inner) = inner.upgrade() else {
+                        break;
+                    };
+                    inner.send_reset(id);
+                }
+            });
+        if spawned.is_err() {
+            return;
+        }
+        *refusals = Some(sender.clone());
+        let _ = sender.try_send(id);
+    }
+
     fn defer_credit(&self, credit: usize) {
         if self.protocol != Protocol::H2Mux || credit == 0 {
             return;
@@ -1164,6 +1201,10 @@ impl Inner {
             Ok(mut resets) => drop(resets.take()),
             Err(poisoned) => drop(poisoned.into_inner().take()),
         }
+        match self.refusals.lock() {
+            Ok(mut refusals) => drop(refusals.take()),
+            Err(poisoned) => drop(poisoned.into_inner().take()),
+        }
         match self.credits.lock() {
             Ok(mut credits) => drop(credits.take()),
             Err(poisoned) => drop(poisoned.into_inner().take()),
@@ -1208,7 +1249,7 @@ impl Inner {
                     if self.can_attach() {
                         self.offer(self.attach(id));
                     } else {
-                        self.defer_reset(id, &AtomicBool::new(false));
+                        self.defer_refusal(id);
                     }
                 }
                 SMUX_PSH => self.deliver(id, &data, false),
