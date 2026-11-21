@@ -23,8 +23,12 @@ pub fn chacha20_poly1305_seal_in_place_unfused(
     state.finish()
 }
 
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 const MAC_CHUNK: usize = 4096;
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 const _: () = assert!(MAC_CHUNK.is_multiple_of(64));
+#[cfg(not(all(target_arch = "x86_64", not(target_os = "windows"))))]
+const MAC_CHUNK: usize = usize::MAX;
 
 fn mac_start(state: &mut Poly1305, aad: &[u8]) {
     state.update(aad);
@@ -60,16 +64,18 @@ pub fn chacha20_poly1305_seal_in_place(
     mac_start(&mut state, aad);
     state.update(&buf[..first]);
     let mut done = first;
-    let mut start_block =
-        1 + u32::try_from(blocks_for(first)).expect("the first chunk's blocks fit a counter");
-    while done < buf.len() {
-        let end = (done + MAC_CHUNK).min(buf.len());
-        fill_exact(key, nonce, start_block, &mut buf[done..end]);
-        state.update(&buf[done..end]);
-        start_block = start_block
-            .checked_add(u32::try_from(blocks_for(end - done)).expect("a chunk's blocks fit"))
-            .expect("the fill guard proved the counter");
-        done = end;
+    if done < buf.len() {
+        let mut start_block =
+            1 + u32::try_from(blocks_for(first)).expect("the first chunk's blocks fit a counter");
+        while done < buf.len() {
+            let end = done.saturating_add(MAC_CHUNK).min(buf.len());
+            fill_exact(key, nonce, start_block, &mut buf[done..end]);
+            state.update(&buf[done..end]);
+            start_block = start_block
+                .checked_add(u32::try_from(blocks_for(end - done)).expect("a chunk's blocks fit"))
+                .expect("the fill guard proved the counter");
+            done = end;
+        }
     }
     mac_finish(&mut state, aad.len(), buf.len());
     state.finish()
@@ -113,22 +119,24 @@ fn seal_from_initialized(
     mac_start(&mut state, aad);
     state.update(&dst[..first]);
     let mut done = first;
-    let mut start_block =
-        1 + u32::try_from(blocks_for(first)).expect("the first chunk's blocks fit a counter");
-    while done < src.len() {
-        let end = (done + MAC_CHUNK).min(src.len());
-        crate::record::fill_exact_from(
-            key,
-            nonce,
-            start_block,
-            &src[done..end],
-            &mut dst[done..end],
-        );
-        state.update(&dst[done..end]);
-        start_block = start_block
-            .checked_add(u32::try_from(blocks_for(end - done)).expect("a chunk's blocks fit"))
-            .expect("the fill guard proved the counter");
-        done = end;
+    if done < src.len() {
+        let mut start_block =
+            1 + u32::try_from(blocks_for(first)).expect("the first chunk's blocks fit a counter");
+        while done < src.len() {
+            let end = done.saturating_add(MAC_CHUNK).min(src.len());
+            crate::record::fill_exact_from(
+                key,
+                nonce,
+                start_block,
+                &src[done..end],
+                &mut dst[done..end],
+            );
+            state.update(&dst[done..end]);
+            start_block = start_block
+                .checked_add(u32::try_from(blocks_for(end - done)).expect("a chunk's blocks fit"))
+                .expect("the fill guard proved the counter");
+            done = end;
+        }
     }
     mac_finish(&mut state, aad.len(), src.len());
     state.finish()
