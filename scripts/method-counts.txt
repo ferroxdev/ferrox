@@ -779,6 +779,7 @@ security-ech heap-buffers-for-an-ech-cover 1 ferrox-core-tls::shaped::hello::tes
 engine-sniffing-http-tls-quic-fakedns ops-retired-instructions 1228 scripts/count-ops.sh
 engine-sniffing-http-tls-quic-fakedns http-host-and-tls-sni-recognized 2 ferrox-app-sniff::tests::reads_http_host_and_tls_sni
 engine-sniffing-http-tls-quic-fakedns quic-initial-sni-recognized 1 ferrox-app-sniff::tests::reads_a_quic_initial_sni
+engine-sniffing-http-tls-quic-fakedns quic-sniff-packet-copies 0 ferrox-app-sniff::tests::sniffing_a_quic_initial_leaves_the_datagram_untouched
 engine-sniffing-http-tls-quic-fakedns bittorrent-and-utp-recognized 2 ferrox-app-sniff::tests::reads_bittorrent_and_utp
 engine-sniffing-http-tls-quic-fakedns excluded-targets-kept 2 ferrox-app-sniff::tests::exclusions_keep_the_original_destination
 engine-sniffing-http-tls-quic-fakedns loopback-sniffed-host-overrides 1 ferrox-app-proxy::tests::a_loopback_sniffing_overrides_the_re_inject_destination

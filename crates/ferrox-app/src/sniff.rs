@@ -186,7 +186,7 @@ impl Sniffing {
         None
     }
 
-    pub(crate) fn inspect_udp(&self, asked: &Destination, bytes: &[u8]) -> Option<Sniffed> {
+    pub(crate) fn inspect_udp(&self, asked: &Destination, bytes: &mut [u8]) -> Option<Sniffed> {
         if !self.enabled {
             return None;
         }
@@ -630,7 +630,9 @@ const QUIC_VERSIONS: [QuicVersion; 3] = [
     },
 ];
 
-fn sniff_quic(mut bytes: &[u8]) -> Option<String> {
+/// The QUIC Initial's header protection is unmasked in the datagram it arrived in and XORed back
+/// before the packet is left, so sniffing costs no copy of a packet the caller forwards unchanged.
+fn sniff_quic(mut bytes: &mut [u8]) -> Option<String> {
     while !bytes.is_empty() {
         let first = *bytes.first()?;
         if first & 0xc0 != 0xc0 {
@@ -652,7 +654,7 @@ fn sniff_quic(mut bytes: &[u8]) -> Option<String> {
         let packet_type = (first & 0x30) >> 4;
         if packet_type != spec.initial {
             let (length, used) = quic_varint(bytes, at)?;
-            bytes = bytes.get(at + used + usize::try_from(length).ok()?..)?;
+            bytes = bytes.get_mut(at + used + usize::try_from(length).ok()?..)?;
             continue;
         }
         let (token_len, used) = quic_varint(bytes, at)?;
@@ -665,42 +667,46 @@ fn sniff_quic(mut bytes: &[u8]) -> Option<String> {
         if length < 4 || packet_end > bytes.len() {
             return None;
         }
-        let sample = bytes.get(at + 4..at + 20)?;
+        let mut sample = [0u8; 16];
+        sample.copy_from_slice(bytes.get(at + 4..at + 20)?);
         let (prk, _) = Hkdf::<Sha256>::extract(Some(&spec.salt), dcid);
         let secret = hkdf_label(prk.as_slice(), "client in", 32)?;
         let hp_key = hkdf_label(&secret, &format!("{} hp", spec.label), 16)?;
-        let mut header = bytes[..packet_end].to_vec();
-        let mut block = aes::Block::try_from(sample).expect("length");
+        let head = bytes.get_mut(..packet_end)?;
+        let mut block = aes::Block::try_from(&sample[..]).expect("length");
         aes::Aes128::new_from_slice(&hp_key)
             .ok()?
             .encrypt_block(&mut block);
-        header[0] ^= block[0] & 0x0f;
-        let packet_number_len = usize::from(header[0] & 0x03) + 1;
+        head[0] ^= block[0] & 0x0f;
+        let packet_number_len = usize::from(head[0] & 0x03) + 1;
+        let header = at + packet_number_len;
         for index in 0..packet_number_len {
-            header[at + index] ^= block[index + 1];
+            *head.get_mut(at + index)? ^= block[index + 1];
         }
-        let pn = &header[at..at + packet_number_len];
         let key = hkdf_label(&secret, &format!("{} key", spec.label), 16)?;
         let iv = hkdf_label(&secret, &format!("{} iv", spec.label), 12)?;
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&iv);
-        for (index, byte) in pn.iter().enumerate() {
+        for (index, byte) in head.get(at..header)?.iter().enumerate() {
             nonce[12 - packet_number_len + index] ^= byte;
         }
         let cipher = Aes128Gcm::new_from_slice(&key).ok()?;
-        let plain = cipher
-            .decrypt(
-                &Nonce::try_from(&nonce[..]).expect("length"),
-                Payload {
-                    msg: &header[at + packet_number_len..],
-                    aad: &header[..at + packet_number_len],
-                },
-            )
-            .ok()?;
+        let answer = cipher.decrypt(
+            &Nonce::try_from(&nonce[..]).expect("length"),
+            Payload {
+                msg: head.get(header..)?,
+                aad: head.get(..header)?,
+            },
+        );
+        head[0] ^= block[0] & 0x0f;
+        for index in 0..packet_number_len {
+            *head.get_mut(at + index)? ^= block[index + 1];
+        }
+        let plain = answer.ok()?;
         if let Some(domain) = quic_crypto_domain(&plain) {
             return Some(domain);
         }
-        bytes = bytes.get(packet_end..)?;
+        bytes = bytes.get_mut(packet_end..)?;
     }
     None
 }
@@ -845,10 +851,28 @@ mod tests {
     #[test]
     fn reads_a_quic_initial_sni() {
         assert_eq!(
-            sniff_quic(&unhex("cd0000000108f1fb7bcc78aa5e7203a8f86400421531fe825b19541876db6c55c38890cd73149d267a084afee6087304095417a3033df6a81bbb71d8512e7a3e16df1e277cae5df3182cb214b8fe982ba3fdffbaa9ffec474547d55945f0fddbeadfb0b5243890b2fa3da45169e2bd34ec04b2e29382f48d612b28432a559757504d158e9e505407a77dd34f4b60b8d3b555ee85aacd6648686802f4de25e7216b19e54c5f78e8a5963380c742d861306db4c16e4f7fc94957aa50b9578a0b61f1e406b2ad5f0cd3cd271c4d99476409797b0c3cb3efec256118912d4b7e4fd79d9cb9016b6e5eaa4f5e57b637b217755daf8968a4092bed0ed5413f5d04904b3a61e4064f9211b2629e5b52a89c7b19f37a713e41e27743ea6dfa736dfa1bb0a4b2bc8c8dc632c6ce963493a20c550e6fdb2475213665e9a85cfc394da9cec0cf41f0c8abed3fc83be5245b2b5aa5e825d29349f721d30774ef5bf965b540f3d8d98febe20956b1fc8fa047e10e7d2f921c9c6622389e02322e80621a1cf5264e245b7276966eb02932584e3f7038bd36aa908766ad3fb98344025dec18670d6db43a1c5daac00937fce7b7c7d61ff4e6efd01a2bdee0ee183108b926393df4f3d74bbcbb015f240e7e346b7d01c41111a401225ce3b095ab4623a5836169bf9599eeca79d1d2e9b2202b5960a09211e978058d6fc0484eff3e91ce4649a5e3ba15b906d334cf66e28d9ff575406e1ae1ac2febafd72870b6f5d58fc5fb949cb1f40feb7c1d9ce5e71b")).as_deref(),
+            sniff_quic(&mut unhex("cd0000000108f1fb7bcc78aa5e7203a8f86400421531fe825b19541876db6c55c38890cd73149d267a084afee6087304095417a3033df6a81bbb71d8512e7a3e16df1e277cae5df3182cb214b8fe982ba3fdffbaa9ffec474547d55945f0fddbeadfb0b5243890b2fa3da45169e2bd34ec04b2e29382f48d612b28432a559757504d158e9e505407a77dd34f4b60b8d3b555ee85aacd6648686802f4de25e7216b19e54c5f78e8a5963380c742d861306db4c16e4f7fc94957aa50b9578a0b61f1e406b2ad5f0cd3cd271c4d99476409797b0c3cb3efec256118912d4b7e4fd79d9cb9016b6e5eaa4f5e57b637b217755daf8968a4092bed0ed5413f5d04904b3a61e4064f9211b2629e5b52a89c7b19f37a713e41e27743ea6dfa736dfa1bb0a4b2bc8c8dc632c6ce963493a20c550e6fdb2475213665e9a85cfc394da9cec0cf41f0c8abed3fc83be5245b2b5aa5e825d29349f721d30774ef5bf965b540f3d8d98febe20956b1fc8fa047e10e7d2f921c9c6622389e02322e80621a1cf5264e245b7276966eb02932584e3f7038bd36aa908766ad3fb98344025dec18670d6db43a1c5daac00937fce7b7c7d61ff4e6efd01a2bdee0ee183108b926393df4f3d74bbcbb015f240e7e346b7d01c41111a401225ce3b095ab4623a5836169bf9599eeca79d1d2e9b2202b5960a09211e978058d6fc0484eff3e91ce4649a5e3ba15b906d334cf66e28d9ff575406e1ae1ac2febafd72870b6f5d58fc5fb949cb1f40feb7c1d9ce5e71b")).as_deref(),
             Some("www.google.com")
         );
-        assert!(sniff_quic(b"not quic").is_none());
+        let mut other = *b"not quic";
+        assert!(sniff_quic(&mut other).is_none());
+    }
+
+    /// The sniff unmasks the Initial's header where it lies and puts the mask back, so the datagram
+    /// the caller forwards is the one that arrived and no packet-sized buffer is built for it.
+    #[test]
+    fn sniffing_a_quic_initial_leaves_the_datagram_untouched() {
+        let mut packet = unhex("cd0000000108f1fb7bcc78aa5e7203a8f86400421531fe825b19541876db6c55c38890cd73149d267a084afee6087304095417a3033df6a81bbb71d8512e7a3e16df1e277cae5df3182cb214b8fe982ba3fdffbaa9ffec474547d55945f0fddbeadfb0b5243890b2fa3da45169e2bd34ec04b2e29382f48d612b28432a559757504d158e9e505407a77dd34f4b60b8d3b555ee85aacd6648686802f4de25e7216b19e54c5f78e8a5963380c742d861306db4c16e4f7fc94957aa50b9578a0b61f1e406b2ad5f0cd3cd271c4d99476409797b0c3cb3efec256118912d4b7e4fd79d9cb9016b6e5eaa4f5e57b637b217755daf8968a4092bed0ed5413f5d04904b3a61e4064f9211b2629e5b52a89c7b19f37a713e41e27743ea6dfa736dfa1bb0a4b2bc8c8dc632c6ce963493a20c550e6fdb2475213665e9a85cfc394da9cec0cf41f0c8abed3fc83be5245b2b5aa5e825d29349f721d30774ef5bf965b540f3d8d98febe20956b1fc8fa047e10e7d2f921c9c6622389e02322e80621a1cf5264e245b7276966eb02932584e3f7038bd36aa908766ad3fb98344025dec18670d6db43a1c5daac00937fce7b7c7d61ff4e6efd01a2bdee0ee183108b926393df4f3d74bbcbb015f240e7e346b7d01c41111a401225ce3b095ab4623a5836169bf9599eeca79d1d2e9b2202b5960a09211e978058d6fc0484eff3e91ce4649a5e3ba15b906d334cf66e28d9ff575406e1ae1ac2febafd72870b6f5d58fc5fb949cb1f40feb7c1d9ce5e71b");
+        let arrived = packet.clone();
+        let (found, counts) = ferrox_core::alloc_count::measure(|| sniff_quic(&mut packet));
+        assert_eq!(found.as_deref(), Some("www.google.com"));
+        assert_eq!(packet, arrived, "the header mask is put back byte for byte");
+        assert!(
+            counts.bytes < packet.len(),
+            "a {}-byte packet is sniffed without copying it, in {} allocated bytes",
+            packet.len(),
+            counts.bytes
+        );
     }
 
     #[test]
