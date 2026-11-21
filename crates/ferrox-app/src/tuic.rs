@@ -113,7 +113,7 @@ struct Lane {
     next_uni: AtomicU64,
     next_assoc: AtomicU16,
     stop: Arc<AtomicBool>,
-    sinks: Mutex<Vec<Arc<UdpSink>>>,
+    sinks: Mutex<HashMap<u16, Arc<UdpSink>>>,
     pending: Mutex<Vec<Pending>>,
     session: Arc<Mutex<Option<Vec<u8>>>>,
     heartbeat: thread::Thread,
@@ -399,7 +399,7 @@ impl TuicOut {
             next_uni: AtomicU64::new(6),
             next_assoc: AtomicU16::new(0),
             stop,
-            sinks: Mutex::new(Vec::new()),
+            sinks: Mutex::new(HashMap::new()),
             pending: Mutex::new(Vec::new()),
             session: Arc::clone(&self.session),
             heartbeat,
@@ -521,7 +521,7 @@ impl TuicOut {
         let mut tries = 0usize;
         let association = loop {
             let candidate = lane.next_assoc.fetch_add(1, Ordering::Relaxed);
-            if !sinks.iter().any(|sink| sink.association == candidate) {
+            if !sinks.contains_key(&candidate) {
                 break candidate;
             }
             tries += 1;
@@ -535,7 +535,7 @@ impl TuicOut {
             source: Mutex::new(None),
             last: Mutex::new(Instant::now()),
         });
-        sinks.push(Arc::clone(&sink));
+        sinks.insert(association, Arc::clone(&sink));
         drop(sinks);
         let cancelled = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
@@ -626,7 +626,7 @@ impl TuicOut {
             }
         }
         if let Ok(mut sinks) = lane.sinks.lock() {
-            sinks.retain(|held| !Arc::ptr_eq(held, &sink));
+            sinks.remove(&sink.association);
         }
         finished.store(true, Ordering::Relaxed);
         if let Some(watcher) = watcher {
@@ -1149,22 +1149,22 @@ fn dispatch_client(
     let Ok(packet) = wire::parse_packet(data) else {
         return;
     };
-    let Ok(sinks) = lane.sinks.lock() else {
+    let sink = lane
+        .sinks
+        .lock()
+        .ok()
+        .and_then(|sinks| sinks.get(&packet.association).cloned());
+    let Some(sink) = sink else {
         return;
     };
-    for sink in sinks.iter() {
-        if sink.association != packet.association {
-            continue;
-        }
-        client_reply(
-            &packet,
-            reassembly,
-            &sink.source,
-            &sink.last,
-            &sink.reply,
-            head,
-        );
-    }
+    client_reply(
+        &packet,
+        reassembly,
+        &sink.source,
+        &sink.last,
+        &sink.reply,
+        head,
+    );
 }
 
 fn client_reply(
@@ -1226,11 +1226,12 @@ fn take_packet<'a>(
         reassembly.remove(&key);
     }
     if !reassembly.contains_key(&key) {
+        reassembly.retain(|_, parts| parts.at.elapsed() < REASSEMBLY_TTL);
         let mut per_assoc = 0usize;
         let mut retained = 0usize;
         for ((assoc, _), parts) in &*reassembly {
             per_assoc += usize::from(*assoc == packet.association);
-            retained += parts.bytes;
+            retained += parts.buffer.len();
         }
         if reassembly.len() >= MAX_REASSEMBLIES
             || per_assoc >= MAX_REASSEMBLIES_PER_ASSOC
@@ -1241,8 +1242,8 @@ fn take_packet<'a>(
     }
     let bad = reassembly.get(&key).is_some_and(|entry| {
         entry.total != packet.total
-            || entry.payload[usize::from(packet.index)].is_some()
-            || entry.bytes.saturating_add(size) > MAX_PACKET_PAYLOAD
+            || entry.slots[usize::from(packet.index)].is_some()
+            || entry.buffer.len().saturating_add(size) > MAX_PACKET_PAYLOAD
     });
     if bad {
         reassembly.remove(&key);
@@ -1251,25 +1252,41 @@ fn take_packet<'a>(
     let entry = reassembly.entry(key).or_insert_with(|| Parts {
         total: packet.total,
         address: None,
-        payload: vec![None; usize::from(packet.total)],
+        slots: vec![None; usize::from(packet.total)],
+        buffer: Vec::new(),
         received: 0,
-        bytes: 0,
         at: Instant::now(),
     });
     if let Some((address, port)) = packet.destination {
         entry.address = Some(destination_of(address, port));
     }
-    entry.payload[usize::from(packet.index)] = Some(packet.payload.to_vec());
+    let at = u32::try_from(entry.buffer.len()).ok()?;
+    let len = u16::try_from(size).ok()?;
+    entry.slots[usize::from(packet.index)] = Some((at, len));
+    entry.buffer.extend_from_slice(packet.payload);
     entry.received += 1;
-    entry.bytes += size;
     if entry.received != entry.total {
         return None;
     }
     let entry = reassembly.remove(&key)?;
     let destination = entry.address?;
-    let mut payload = Vec::with_capacity(entry.bytes);
-    for part in entry.payload {
-        payload.extend_from_slice(part.as_deref()?);
+    // Fragments that arrived in packet order already sit in that order: the buffer is the datagram.
+    let mut next = 0usize;
+    let ordered = entry.slots.iter().all(|slot| match *slot {
+        Some((at, len)) if at as usize == next => {
+            next += usize::from(len);
+            true
+        }
+        _ => false,
+    });
+    if ordered {
+        return Some((destination, Cow::Owned(entry.buffer)));
+    }
+    let mut payload = Vec::with_capacity(entry.buffer.len());
+    for slot in &entry.slots {
+        let (at, len) = (*slot)?;
+        let at = at as usize;
+        payload.extend_from_slice(entry.buffer.get(at..at + usize::from(len))?);
     }
     Some((destination, Cow::Owned(payload)))
 }
@@ -1277,9 +1294,9 @@ fn take_packet<'a>(
 struct Parts {
     total: u8,
     address: Option<Destination>,
-    payload: Vec<Option<Vec<u8>>>,
+    slots: Vec<Option<(u32, u16)>>,
+    buffer: Vec<u8>,
     received: u8,
-    bytes: usize,
     at: Instant,
 }
 
@@ -3086,6 +3103,112 @@ mod tests {
         assert_eq!(copied.as_ptr(), source);
         assert_eq!(counts.allocs - base.allocs, 0);
         assert_eq!(counts.bytes - base.bytes, 0);
+    }
+
+    #[test]
+    fn expired_reassemblies_do_not_hold_the_client_back() {
+        let address = Some((wire::Address::V4([192, 0, 2, 1]), 53));
+        let payload = vec![7u8; 32];
+        let mut reassembly = HashMap::new();
+        let stale = Instant::now()
+            .checked_sub(REASSEMBLY_TTL + Duration::from_secs(1))
+            .expect("the process has run for six seconds");
+        for index in 0..MAX_REASSEMBLIES as u16 {
+            reassembly.insert(
+                (1, index),
+                Parts {
+                    total: 2,
+                    address: None,
+                    slots: vec![Some((0, 32)), None],
+                    buffer: vec![0u8; 32],
+                    received: 1,
+                    at: stale,
+                },
+            );
+        }
+        let packet = wire::Packet {
+            association: 1,
+            packet: 700,
+            total: 2,
+            index: 0,
+            destination: address,
+            payload: &payload,
+        };
+        assert!(take_packet(&mut reassembly, &packet).is_none());
+        assert_eq!(reassembly.len(), 1, "an expired piece made room");
+        assert!(reassembly.contains_key(&(1, 700)));
+    }
+
+    #[test]
+    fn an_ordered_reassembly_hands_over_the_fragments_own_buffer() {
+        let mut buffer = Vec::with_capacity(64);
+        buffer.extend_from_slice(&[1u8; 4]);
+        let base = buffer.as_ptr();
+        let mut reassembly = HashMap::new();
+        reassembly.insert(
+            (9, 1),
+            Parts {
+                total: 2,
+                address: Some(Destination::Address(SocketAddr::new(
+                    IpAddr::V4([192, 0, 2, 1].into()),
+                    53,
+                ))),
+                slots: vec![Some((0, 4)), None],
+                buffer,
+                received: 1,
+                at: Instant::now(),
+            },
+        );
+        let second = [2u8; 4];
+        let packet = wire::Packet {
+            association: 9,
+            packet: 1,
+            total: 2,
+            index: 1,
+            destination: None,
+            payload: &second,
+        };
+        let (taken, counts) =
+            ferrox_core::alloc_count::measure(|| take_packet(&mut reassembly, &packet));
+        let (_, payload) = taken.expect("both fragments");
+        assert_eq!(&*payload, &[1, 1, 1, 1, 2, 2, 2, 2]);
+        assert_eq!(counts.allocs, 0, "the fragment's room was already there");
+        let Cow::Owned(buffer) = payload else {
+            panic!("a reassembled datagram is owned");
+        };
+        assert_eq!(
+            buffer.as_ptr(),
+            base,
+            "the fragments' buffer is the datagram"
+        );
+        assert_eq!(buffer.capacity(), 64, "the buffer held its room");
+    }
+
+    #[test]
+    fn a_reassembly_in_arrival_order_is_put_back_in_packet_order() {
+        let mut reassembly = HashMap::new();
+        let address = Some((wire::Address::V4([192, 0, 2, 1]), 53));
+        let high = [2u8; 4];
+        let low = [1u8; 4];
+        let second = wire::Packet {
+            association: 3,
+            packet: 5,
+            total: 2,
+            index: 1,
+            destination: None,
+            payload: &high,
+        };
+        assert!(take_packet(&mut reassembly, &second).is_none());
+        let first = wire::Packet {
+            association: 3,
+            packet: 5,
+            total: 2,
+            index: 0,
+            destination: address,
+            payload: &low,
+        };
+        let (_, payload) = take_packet(&mut reassembly, &first).expect("both fragments");
+        assert_eq!(&*payload, &[1, 1, 1, 1, 2, 2, 2, 2]);
     }
 
     #[test]
