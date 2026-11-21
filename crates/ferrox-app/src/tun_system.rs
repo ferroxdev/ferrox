@@ -509,7 +509,7 @@ pub(crate) fn serve(
     spec: &crate::tun::Spec,
     out: &crate::proxy::Outbound,
     hybrid: bool,
-) -> io::Result<()> {
+) -> io::Result<String> {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
@@ -536,7 +536,8 @@ pub(crate) fn serve(
         );
     }
     let device = Arc::new(tun_stack::build(spec, false, false)?.0);
-    let listener = std::net::TcpListener::bind(listener_address(local, &device.name()?)?)?;
+    let name = device.name()?;
+    let listener = std::net::TcpListener::bind(listener_address(local, &name)?)?;
     listener.set_nonblocking(true)?;
     let listener_port = listener.local_addr()?.port();
     if spec.queues() > 1 {
@@ -554,6 +555,7 @@ pub(crate) fn serve(
     wake_write.set_nonblocking(true)?;
     let stack_wake = wake_write.try_clone()?;
     let config = tun_stack::device_config(spec);
+    let dns_hijack = spec.dns_hijack();
     let stack_out = out.clone();
     let stack_failed = Arc::clone(&failed);
     let stack_recycle = recycle.clone();
@@ -566,6 +568,7 @@ pub(crate) fn serve(
             stack_out,
             Some(stack_recycle),
             0,
+            dns_hijack,
             wake_read,
             stack_failed,
         );
@@ -600,7 +603,7 @@ pub(crate) fn serve(
 
     let mtu = spec.mtu();
     thread::spawn(move || tun_stack::recv_loop(device, packets, reused, mtu, 0, wake_write));
-    Ok(())
+    Ok(name)
 }
 
 #[cfg(target_os = "linux")]

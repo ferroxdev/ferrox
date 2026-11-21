@@ -1168,7 +1168,17 @@ impl Routing {
                 if path.is_empty() {
                     return Err("routing script is empty".into());
                 }
-                Some(Arc::new(ScriptRouter::parse_in(path, dirs.clone())?))
+                #[cfg(not(target_os = "ios"))]
+                let script = Some(Arc::new(ScriptRouter::parse_in(path, dirs.clone())?));
+                #[cfg(target_os = "ios")]
+                let script = {
+                    // The script never runs on iOS; parse it while it resolves so a reload after the operator removes it still refreshes rules and geodata.
+                    if crate::router_script::resolve(path, &dirs).is_ok() {
+                        ScriptRouter::parse_in(path, dirs.clone())?;
+                    }
+                    None
+                };
+                script
             }
             _ => None,
         };

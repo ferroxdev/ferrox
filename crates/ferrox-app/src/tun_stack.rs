@@ -15,7 +15,15 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
 
-use tun_rs::{DeviceBuilder, SyncDevice};
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+)))]
+use tun_rs::DeviceBuilder;
+use tun_rs::SyncDevice;
 
 #[cfg(target_os = "linux")]
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
@@ -43,15 +51,15 @@ pub(crate) enum Mode {
     Hybrid,
 }
 
-/// Open the device and start the configured TCP stack.
-pub(crate) fn serve(spec: &Spec, out: &Outbound, mode: Mode) -> io::Result<()> {
+/// Open the device and start the configured TCP stack, returning the interface the platform gave it so a route can name it.
+pub(crate) fn serve(spec: &Spec, out: &Outbound, mode: Mode) -> io::Result<String> {
     match mode {
         Mode::Userspace => serve_userspace(spec, out),
         #[cfg(target_os = "linux")]
         Mode::System => crate::tun_system::serve(spec, out, false),
         #[cfg(target_os = "linux")]
         Mode::Hybrid => match crate::tun_system::serve(spec, out, true) {
-            Ok(()) => Ok(()),
+            Ok(name) => Ok(name),
             Err(error) => {
                 eprintln!(
                     "tun inbound: the hybrid stack is unavailable ({error}), using the userspace stack"
@@ -72,8 +80,24 @@ pub(crate) fn serve(spec: &Spec, out: &Outbound, mode: Mode) -> io::Result<()> {
     }
 }
 
-fn serve_userspace(spec: &Spec, out: &Outbound) -> io::Result<()> {
+fn serve_userspace(spec: &Spec, out: &Outbound) -> io::Result<String> {
     let (first, offload, queues) = open(spec)?;
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+    )))]
+    let name = first.name().unwrap_or_default();
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+    ))]
+    let name = String::new();
     let first = Arc::new(first);
     spawn_queue(Arc::clone(&first), spec, offload, out.clone());
     #[cfg(target_os = "linux")]
@@ -83,7 +107,7 @@ fn serve_userspace(spec: &Spec, out: &Outbound) -> io::Result<()> {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = queues;
-    Ok(())
+    Ok(name)
 }
 
 fn open(spec: &Spec) -> io::Result<(SyncDevice, bool, usize)> {
@@ -117,6 +141,13 @@ fn open(spec: &Spec) -> io::Result<(SyncDevice, bool, usize)> {
     }
 }
 
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+)))]
 pub(crate) fn build(
     spec: &Spec,
     multi: bool,
@@ -149,7 +180,15 @@ pub(crate) fn build(
     }
     #[cfg(target_os = "linux")]
     let builder = builder.offload(offload).multi_queue(multi);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let builder = if spec.tap() {
+        builder
+            .layer(tun_rs::Layer::L2)
+            .peer_feth(spec.peer().unwrap_or("feth1"))
+    } else {
+        builder
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let builder = builder;
     let device = builder.build_sync()?;
     attach_addresses(&device, &extra);
@@ -160,13 +199,42 @@ pub(crate) fn build(
     Ok((device, offload, multi))
 }
 
+/// A mobile host already owns the device its VpnService or utun opened, so the userspace stack adopts that descriptor instead of opening one by name.
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+))]
+pub(crate) fn build(
+    spec: &Spec,
+    _multi: bool,
+    _offload: bool,
+) -> io::Result<(SyncDevice, bool, bool)> {
+    spec.validate()?;
+    let fd = spec.fd().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the userspace stack needs the host's `fd` on this platform",
+        )
+    })?;
+    // SAFETY: `dup` reads a live descriptor and returns a fresh one this process owns.
+    let duplicated = unsafe { libc::dup(fd) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { libc::fcntl(duplicated, libc::F_SETFD, libc::FD_CLOEXEC) };
+    // SAFETY: the duplicate is an owned TUN descriptor and closes with the device.
+    let device = unsafe { SyncDevice::from_fd(duplicated)? };
+    Ok((device, false, false))
+}
+
 /// Attach the addresses the builder's single IPv4 slot cannot carry: the device is already up with its primary address, so a platform that refuses one says so in a line rather than taking the inbound down.
 fn attach_addresses(device: &SyncDevice, extra: &[(IpAddr, u8)]) {
     #[cfg(any(
         target_os = "linux",
         target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd"
@@ -185,8 +253,6 @@ fn attach_addresses(device: &SyncDevice, extra: &[(IpAddr, u8)]) {
     #[cfg(not(any(
         target_os = "linux",
         target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd"
@@ -227,6 +293,7 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
     #[cfg(not(unix))]
     let wake_write = ();
     let config = device_config(spec);
+    let dns_hijack = spec.dns_hijack();
     let stack_out = out.clone();
     let failed = Arc::new(AtomicBool::new(false));
     let stack_failed = Arc::clone(&failed);
@@ -239,6 +306,7 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             stack_out,
             Some(recycle),
             headroom,
+            dns_hijack,
             wake_read,
             stack_failed,
         );
@@ -250,6 +318,7 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
             stack_out,
             Some(recycle),
             headroom,
+            dns_hijack,
             stack_failed,
         );
     });

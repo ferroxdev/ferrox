@@ -1416,10 +1416,12 @@ pub(crate) fn serve_tun_device(
     out: Outbound,
     recycle: Option<SyncSender<Vec<u8>>>,
     headroom: usize,
+    dns_hijack: Option<IpAddr>,
     wake: std::os::unix::net::UnixStream,
     failed: Arc<AtomicBool>,
 ) {
-    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, headroom);
+    let mut stack =
+        ServerStack::new_tun(&config, to_tunnel, out, headroom).with_dns_hijack(dns_hijack);
     stack.device.tun_recycle = recycle;
     let _ = wake.set_nonblocking(true);
     loop {
@@ -1460,9 +1462,11 @@ pub(crate) fn serve_tun_device(
     out: Outbound,
     recycle: Option<SyncSender<Vec<u8>>>,
     headroom: usize,
+    dns_hijack: Option<IpAddr>,
     failed: Arc<AtomicBool>,
 ) {
-    let mut stack = ServerStack::new_tun(&config, to_tunnel, out, headroom);
+    let mut stack =
+        ServerStack::new_tun(&config, to_tunnel, out, headroom).with_dns_hijack(dns_hijack);
     stack.device.tun_recycle = recycle;
     loop {
         if failed.load(Ordering::Relaxed) {
@@ -1848,6 +1852,7 @@ struct ServerStack {
     reassembly: Reassembly,
     fragment: usize,
     started: StdInstant,
+    dns_hijack: Option<IpAddr>,
 }
 
 impl ServerStack {
@@ -1910,6 +1915,20 @@ impl ServerStack {
             reassembly: Reassembly::default(),
             fragment,
             started: StdInstant::now(),
+            dns_hijack: None,
+        }
+    }
+
+    /// `dns_mode: hijack`: a port-53 flow dials the resolver while the answer keeps the address the device asked for, rendered from the key's target.
+    fn with_dns_hijack(mut self, dns: Option<IpAddr>) -> Self {
+        self.dns_hijack = dns;
+        self
+    }
+
+    fn hijack(&self, destination: SocketAddr) -> SocketAddr {
+        match self.dns_hijack {
+            Some(dns) if destination.port() == 53 => SocketAddr::new(dns, destination.port()),
+            _ => destination,
         }
     }
 
@@ -1965,6 +1984,7 @@ impl ServerStack {
         let Some(target) = socket_addr(datagram.destination, datagram.destination_port) else {
             return;
         };
+        let dial = self.hijack(target);
         let key = (peer, source, target);
         let now = elapsed_ms(self.started);
         let lane = if let Some(lane) = self.udp.get_mut(&key) {
@@ -1976,6 +1996,7 @@ impl ServerStack {
             let last_used = Arc::new(AtomicU64::new(elapsed_ms(self.started)));
             let Some((uplink, stop)) = server_udp(
                 key,
+                dial,
                 self.started,
                 &last_used,
                 &self.out,
@@ -2000,7 +2021,7 @@ impl ServerStack {
         };
         lane.last_used.store(now, Ordering::Relaxed);
         let (head, payload) =
-            crate::proxy::socks_udp_parts(&mut lane.head, &target, datagram.payload);
+            crate::proxy::socks_udp_parts(&mut lane.head, &dial, datagram.payload);
         #[cfg(test)]
         remember_server_datagram(head, payload);
         let _ = crate::proxy::send_two(&lane.uplink, head, payload);
@@ -2138,6 +2159,7 @@ impl ServerStack {
                 IpAddress::Ipv4(address) => SocketAddr::new(IpAddr::V4(address), remote.port),
                 IpAddress::Ipv6(address) => SocketAddr::new(IpAddr::V6(address), remote.port),
             };
+            let dial = self.hijack(destination);
             let Ok((tun, proxy)) = loopback() else {
                 self.sockets.remove(handle);
                 continue;
@@ -2148,7 +2170,7 @@ impl ServerStack {
                     proxy.with_peer(peer),
                     None,
                     &out,
-                    &Destination::Address(destination),
+                    &Destination::Address(dial),
                 );
             });
             if tun.set_nonblocking(true).is_err() {
@@ -3010,6 +3032,7 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
 /// expects back.
 pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
     flow: ([u8; 32], SocketAddr, SocketAddr),
+    dial: SocketAddr,
     started: StdInstant,
     last_used: &Arc<AtomicU64>,
     out: &Outbound,
@@ -3025,7 +3048,7 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
     let outbound = match out {
         Outbound::Route(plan) => plan
             .pick(
-                &Destination::Address(target),
+                &Destination::Address(dial),
                 crate::router::Network::Udp,
                 None,
                 None,
@@ -3883,6 +3906,87 @@ mod tests {
         assert_eq!(packet, reference, "the stack room writes the same packet");
     }
 
+    /// `dns_mode: hijack` on the smoltcp stack: a port-53 datagram's SOCKS header names the resolver, while its lane key keeps the asked address so the answer is rendered from it, and two asked servers keep two lanes.
+    #[test]
+    fn a_hijacked_datagram_dials_the_resolver_and_keeps_the_asked_address_per_lane() {
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.1".parse().unwrap()],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(false),
+            no_kernel_tun: true,
+            large_segments: false,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, _replies) = std::sync::mpsc::channel();
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let mut stack = ServerStack::new(&config, to_tunnel, out, 0)
+            .with_dns_hijack(Some("127.0.0.1".parse().unwrap()));
+        let source: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+        for asked in ["203.0.113.7", "203.0.113.8"] {
+            let mut inner = Vec::new();
+            assert!(udp_datagram(
+                &UdpDatagram {
+                    source: &[10, 0, 0, 2],
+                    destination: asked
+                        .parse::<std::net::Ipv4Addr>()
+                        .unwrap()
+                        .octets()
+                        .as_slice(),
+                    source_port: source.port(),
+                    destination_port: 53,
+                    payload: b"query",
+                },
+                &mut inner,
+            ));
+            stack.receive(Packet {
+                peer: [0x11; 32],
+                bytes: inner,
+                at: 0,
+            });
+        }
+        assert_eq!(stack.udp.len(), 2, "each asked server keeps its own lane");
+        for ((_, _, asked), lane) in &stack.udp {
+            assert_eq!(asked.port(), 53);
+            assert_ne!(asked.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+            let (dial, _) = crate::proxy::parse_socks_udp(&lane.head).expect("socks header");
+            assert_eq!(dial, "127.0.0.1:53".parse().expect("resolver"));
+        }
+        let asked: Vec<_> = stack.udp.keys().map(|(_, _, target)| target.ip()).collect();
+        assert!(asked.contains(&"203.0.113.7".parse().unwrap()));
+        assert!(asked.contains(&"203.0.113.8".parse().unwrap()));
+    }
+
+    /// The stream half of `dns_mode: hijack` on this stack: `handoff` dials `hijack`, which moves only a port-53 destination to the resolver and leaves every other port where it was.
+    #[test]
+    fn a_hijacked_stream_dial_moves_only_a_port_53_destination() {
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.1".parse().unwrap()],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(false),
+            no_kernel_tun: true,
+            large_segments: false,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, _replies) = std::sync::mpsc::channel();
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let stack = ServerStack::new(&config, to_tunnel, out, 0)
+            .with_dns_hijack(Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(
+            stack.hijack("203.0.113.7:53".parse().expect("asked")),
+            "127.0.0.1:53".parse().expect("resolver")
+        );
+        assert_eq!(
+            stack.hijack("203.0.113.7:443".parse().expect("asked")),
+            "203.0.113.7:443".parse().expect("asked")
+        );
+    }
+
     /// A server datagram lane carries its payload through the freedom outbound.
     #[test]
     fn a_server_datagram_lane_echoes_through_freedom() {
@@ -3903,6 +4007,7 @@ mod tests {
         let last_used = Arc::new(AtomicU64::new(0));
         let (uplink, _) = server_udp(
             ([0x11; 32], source, target),
+            target,
             started,
             &last_used,
             &out,
@@ -4042,7 +4147,7 @@ mod tests {
         stack.started = started;
         let last_used = Arc::new(AtomicU64::new(0));
         let (uplink, stop) =
-            server_udp(key, started, &last_used, &out, &to_tunnel, 0).expect("lane");
+            server_udp(key, target, started, &last_used, &out, &to_tunnel, 0).expect("lane");
         stack.udp.insert(
             key,
             UdpLane {

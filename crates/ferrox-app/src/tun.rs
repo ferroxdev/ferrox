@@ -8,8 +8,8 @@
 //! the loopback test set; the oracle lives in `scripts/tun-oracle`.
 //!
 //! Platform opens: the `tun-rs` builder on Linux and macOS, or an inherited descriptor
-//! (`FERROX_TUN_FD`). The privileged opens are compile-checked only — no CI runner holds
-//! `CAP_NET_ADMIN` — while the inherited-fd path runs fully in tests.
+//! (`FERROX_TUN_FD`). The inherited-fd path runs fully in tests; `ci.yml` runs the privileged
+//! Linux TUN open, the Linux route table and the macOS `feth` pair under `sudo`.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -92,6 +92,7 @@ const DEFAULT_PREFIX: u8 = 15;
 const DEFAULT_PREFIX_V6: u8 = 64;
 const MAX_QUEUES: usize = 4;
 
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Spec {
     name: String,
     mtu: usize,
@@ -102,6 +103,13 @@ pub(crate) struct Spec {
     udp_idle: std::time::Duration,
     endpoint_independent_nat: bool,
     gso: bool,
+    auto_route: bool,
+    route_address: Vec<(IpAddr, u8)>,
+    route_exclude: Vec<(IpAddr, u8)>,
+    dns_hijack: Option<IpAddr>,
+    fd: Option<i32>,
+    tap: bool,
+    peer: Option<String>,
 }
 
 impl Spec {
@@ -137,6 +145,13 @@ impl Spec {
             udp_idle: budgets::udp_idle(),
             endpoint_independent_nat: false,
             gso: true,
+            auto_route: false,
+            route_address: Vec::new(),
+            route_exclude: Vec::new(),
+            dns_hijack: None,
+            fd: None,
+            tap: false,
+            peer: None,
         }
     }
 
@@ -156,6 +171,67 @@ impl Spec {
     pub(crate) fn with_gso(mut self, on: bool) -> Self {
         self.gso = on;
         self
+    }
+
+    /// The reference's `auto_route`: the default route the device captures, and what it leaves alone.
+    pub(crate) fn with_routes(
+        mut self,
+        auto_route: bool,
+        route_address: Vec<(IpAddr, u8)>,
+        route_exclude: Vec<(IpAddr, u8)>,
+    ) -> Self {
+        self.auto_route = auto_route;
+        self.route_address = route_address;
+        self.route_exclude = route_exclude;
+        self
+    }
+
+    /// An inherited descriptor: the `VpnService` or utun the app already opened, duplicated and served instead of a platform open.
+    pub(crate) fn with_fd(mut self, fd: Option<i32>) -> Self {
+        self.fd = fd;
+        self
+    }
+
+    /// A macOS TAP opens a `feth` pair and its `peer` names the half the kernel stack uses.
+    pub(crate) fn with_tap(mut self, tap: bool, peer: Option<&str>) -> Self {
+        self.tap = tap;
+        self.peer = peer.map(str::to_owned);
+        self
+    }
+
+    pub(crate) fn tap(&self) -> bool {
+        self.tap
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn peer(&self) -> Option<&str> {
+        self.peer.as_deref()
+    }
+
+    /// `dns_mode: hijack`: every port-53 query rides this server while its answer keeps the address the device asked.
+    pub(crate) fn with_dns_hijack(mut self, dns: Option<IpAddr>) -> Self {
+        self.dns_hijack = dns;
+        self
+    }
+
+    pub(crate) fn auto_route(&self) -> bool {
+        self.auto_route
+    }
+
+    pub(crate) fn route_address(&self) -> &[(IpAddr, u8)] {
+        &self.route_address
+    }
+
+    pub(crate) fn route_exclude(&self) -> &[(IpAddr, u8)] {
+        &self.route_exclude
+    }
+
+    pub(crate) fn dns_hijack(&self) -> Option<IpAddr> {
+        self.dns_hijack
+    }
+
+    pub(crate) fn fd(&self) -> Option<i32> {
+        self.fd
     }
 
     pub(crate) fn udp_idle(&self) -> std::time::Duration {
@@ -731,25 +807,109 @@ enum Ended {
     Datagram(UdpKey, u64),
 }
 
-/// A TUN device: a file descriptor carrying IP packets, with the framing its platform puts in front of each one.
+/// What carries a device's packets: a Unix descriptor, or the Wintun session the same builder opens on Windows.
+pub(crate) enum Handle {
+    #[cfg(unix)]
+    File(std::fs::File),
+    #[cfg(any(windows, target_os = "macos"))]
+    Session(std::sync::Arc<tun_rs::SyncDevice>),
+}
+
+impl Handle {
+    #[cfg(unix)]
+    fn fd(&self) -> RawFd {
+        match self {
+            Self::File(file) => file.as_raw_fd(),
+            #[cfg(target_os = "macos")]
+            Self::Session(device) => device.as_raw_fd(),
+        }
+    }
+
+    fn try_clone(&self) -> io::Result<Self> {
+        match self {
+            #[cfg(unix)]
+            Self::File(file) => Ok(Self::File(file.try_clone()?)),
+            #[cfg(any(windows, target_os = "macos"))]
+            Self::Session(device) => Ok(Self::Session(std::sync::Arc::clone(device))),
+        }
+    }
+}
+
+impl Read for Handle {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Self::File(file) => file.read(buf),
+            #[cfg(any(windows, target_os = "macos"))]
+            Self::Session(device) => device.recv(buf),
+        }
+    }
+}
+
+impl Write for Handle {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Self::File(file) => file.write(buf),
+            #[cfg(any(windows, target_os = "macos"))]
+            Self::Session(device) => device.send(buf),
+        }
+    }
+
+    /// Wintun takes one whole packet, so a framed write is joined before the send; the Windows framing is raw, which never reaches this.
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Self::File(file) => file.write_vectored(bufs),
+            #[cfg(any(windows, target_os = "macos"))]
+            Self::Session(device) => {
+                let mut joined = Vec::with_capacity(bufs.iter().map(|slice| slice.len()).sum());
+                for slice in bufs {
+                    joined.extend_from_slice(slice);
+                }
+                device.send(&joined)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A TUN device: a handle carrying IP packets, with the framing its platform puts in front of each one.
 pub(crate) struct Device {
-    handle: std::fs::File,
+    handle: Handle,
+    /// The interface the platform opened; empty for an inherited descriptor, whose name only the caller knows.
+    name: String,
     mtu: usize,
     framing: Framing,
     /// The builder enabled `TUN_F_TSO4|TUN_F_TSO6`; an inherited descriptor's `IFF_VNET_HDR` says nothing about that.
     gso: bool,
+    /// A macOS TAP carries Ethernet frames, so the link header is stripped and written around the IP packet.
+    bridge: Option<std::sync::Arc<crate::tun_tap::Bridge>>,
+    frame: Vec<u8>,
 }
 
 impl Device {
     /// One device per configured queue; every handler reads its own queue and passes the same flow table, so a segment that lands on another queue still finds its flow.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn open_all(spec: &Spec) -> io::Result<Vec<Self>> {
+        #[cfg(unix)]
+        if let Some(fd) = spec.fd() {
+            return Ok(vec![Self::from_host_fd(fd, spec.mtu)?]);
+        }
+        #[cfg(unix)]
         if let Some(handle) = inherited_handle() {
             let framing = inherited_framing(&handle);
             return Ok(vec![Self {
-                handle,
+                handle: Handle::File(handle),
+                name: String::new(),
                 mtu: spec.mtu,
                 framing,
                 gso: false,
+                bridge: None,
+                frame: Vec::new(),
             }]);
         }
         #[cfg(target_os = "linux")]
@@ -764,10 +924,15 @@ impl Device {
             Ok(devices
                 .into_iter()
                 .map(|device| Self {
-                    handle: unsafe { std::fs::File::from_raw_fd(device.into_raw_fd()) },
+                    name: device.name().unwrap_or_default(),
+                    handle: Handle::File(unsafe {
+                        std::fs::File::from_raw_fd(device.into_raw_fd())
+                    }),
                     mtu: spec.mtu,
                     framing,
                     gso: offload,
+                    bridge: None,
+                    frame: Vec::new(),
                 })
                 .collect())
         }
@@ -775,22 +940,112 @@ impl Device {
         {
             use std::os::unix::io::IntoRawFd;
             let (device, _, _) = crate::tun_stack::build(spec, false, true)?;
+            let name = device.name().unwrap_or_default();
+            if spec.tap() {
+                let addresses = spec
+                    .addresses()
+                    .iter()
+                    .map(|(address, _)| *address)
+                    .collect();
+                return Ok(vec![Self {
+                    handle: Handle::Session(std::sync::Arc::new(device)),
+                    name: name.clone(),
+                    mtu: spec.mtu,
+                    framing: Framing::Raw,
+                    gso: false,
+                    bridge: Some(std::sync::Arc::new(crate::tun_tap::Bridge::new(
+                        &name,
+                        addresses,
+                        spec.auto_route(),
+                    ))),
+                    frame: Vec::with_capacity(spec.mtu + crate::tun_tap::HEADER_LEN + 64),
+                }]);
+            }
             let handle = unsafe { std::fs::File::from_raw_fd(device.into_raw_fd()) };
             Ok(vec![Self {
-                handle,
+                handle: Handle::File(handle),
+                name,
                 mtu: spec.mtu,
                 framing: Framing::Utun,
                 gso: false,
+                bridge: None,
+                frame: Vec::new(),
             }])
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        if spec.fd().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "an inherited descriptor needs a Unix host; a Windows TUN opens by name",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            // Wintun loads `wintun.dll` from the search path; the session carries whole packets with no framing.
+            let (device, _, _) = crate::tun_stack::build(spec, false, false)?;
+            let name = device.name().unwrap_or_default();
+            Ok(vec![Self {
+                handle: Handle::Session(std::sync::Arc::new(device)),
+                name,
+                mtu: spec.mtu,
+                framing: Framing::Raw,
+                gso: false,
+                bridge: None,
+                frame: Vec::new(),
+            }])
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "no TUN platform open; set FERROX_TUN_FD for an inherited descriptor",
         ))
     }
 
+    /// Make the queue's descriptor nonblocking, so a handler being removed can wake between packets instead of parking in a read.
+    #[cfg(unix)]
+    pub(crate) fn set_nonblocking(&self, on: bool) -> io::Result<()> {
+        let fd = self.handle.fd();
+        // SAFETY: `fd` is this device's open descriptor; `fcntl` reads or writes only its status flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let next = if on {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
+        // SAFETY: same descriptor, and the new value is a status-flag set `fcntl` accepts.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, next) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Wait up to `budget` for the queue to become readable; a nonblocking read uses this so a stop signal is seen on an idle device.
+    #[cfg(unix)]
+    pub(crate) fn wait_readable(&self, budget: std::time::Duration) -> io::Result<bool> {
+        let mut row = libc::pollfd {
+            fd: self.handle.fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = i32::try_from(budget.as_millis()).unwrap_or(i32::MAX);
+        // SAFETY: one descriptor this device owns, one array element, and `poll` writes only `revents`.
+        let ready = unsafe { libc::poll(&raw mut row, 1, millis) };
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ready > 0 && (row.revents & libc::POLLIN) != 0)
+    }
+
     pub(crate) fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(bridge) = &self.bridge {
+            let mut frame = std::mem::take(&mut self.frame);
+            let read = read_bridged(&mut self.handle, bridge, &mut frame, buf);
+            self.frame = frame;
+            return read;
+        }
         let head = self.framing.header_len();
         if head == 0 {
             return self.handle.read(buf);
@@ -809,7 +1064,7 @@ impl Device {
                 },
             ];
             loop {
-                let n = unsafe { libc::readv(self.handle.as_raw_fd(), iov.as_mut_ptr(), 2) };
+                let n = unsafe { libc::readv(self.handle.fd(), iov.as_mut_ptr(), 2) };
                 if n < 0 {
                     let error = io::Error::last_os_error();
                     if error.kind() == io::ErrorKind::Interrupted {
@@ -830,9 +1085,8 @@ impl Device {
     /// Whether another packet is already waiting on the device, so a queue with work serves it instead of waiting on one flow's answer: one `poll` with no timeout, and nothing on a host whose descriptor cannot say.
     #[cfg(unix)]
     fn readable_now(&self) -> bool {
-        use std::os::fd::AsRawFd;
         let mut row = libc::pollfd {
-            fd: self.handle.as_raw_fd(),
+            fd: self.handle.fd(),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -841,6 +1095,12 @@ impl Device {
     }
 
     fn write_packet(&mut self, packet: &[u8]) -> io::Result<bool> {
+        if let Some(bridge) = &self.bridge {
+            let mut frame = std::mem::take(&mut self.frame);
+            let written = write_bridged(&mut self.handle, bridge, &mut frame, packet);
+            self.frame = frame;
+            return written;
+        }
         write_framed(&mut self.handle, self.framing, None, packet)
     }
 
@@ -849,11 +1109,23 @@ impl Device {
             handle: self.handle.try_clone()?,
             framing: self.framing,
             gso: self.gso,
+            bridge: self.bridge.clone(),
+            frame: Vec::new(),
         })
     }
 
     /// A packet tunnel's descriptor: the reference dups it, closes it on exec, and makes it nonblocking.
     pub(crate) fn from_inherited(fd: i32, mtu: usize) -> io::Result<Self> {
+        Self::dup_fd(fd, mtu, true)
+    }
+
+    /// A host's descriptor for the blocking handler: duplicated and close-on-exec, with the flags the host set kept.
+    #[cfg(unix)]
+    pub(crate) fn from_host_fd(fd: i32, mtu: usize) -> io::Result<Self> {
+        Self::dup_fd(fd, mtu, false)
+    }
+
+    fn dup_fd(fd: i32, mtu: usize, nonblocking: bool) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::fd::FromRawFd;
@@ -862,21 +1134,26 @@ impl Device {
                 return Err(io::Error::last_os_error());
             }
             unsafe { libc::fcntl(duplicated, libc::F_SETFD, libc::FD_CLOEXEC) };
-            let flags = unsafe { libc::fcntl(duplicated, libc::F_GETFL) };
-            if flags >= 0 {
-                unsafe { libc::fcntl(duplicated, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            if nonblocking {
+                let flags = unsafe { libc::fcntl(duplicated, libc::F_GETFL) };
+                if flags >= 0 {
+                    unsafe { libc::fcntl(duplicated, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+                }
             }
             let handle = unsafe { std::fs::File::from_raw_fd(duplicated) };
             Ok(Self {
                 framing: inherited_framing(&handle),
-                handle,
+                handle: Handle::File(handle),
+                name: String::new(),
                 mtu,
                 gso: false,
+                bridge: None,
+                frame: Vec::new(),
             })
         }
         #[cfg(not(unix))]
         {
-            let _ = (fd, mtu);
+            let _ = (fd, mtu, nonblocking);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "packet tunnel needs a Unix descriptor",
@@ -884,10 +1161,14 @@ impl Device {
         }
     }
 
+    /// The interface the platform opened, or an empty name for an inherited descriptor.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
     #[cfg(unix)]
     pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
-        use std::os::fd::AsRawFd;
-        self.handle.as_raw_fd()
+        self.handle.fd()
     }
 
     #[cfg(not(unix))]
@@ -907,23 +1188,31 @@ impl Device {
     #[cfg(all(test, unix))]
     fn from_handle(handle: std::fs::File, mtu: usize) -> Self {
         Self {
-            handle,
+            handle: Handle::File(handle),
+            name: String::new(),
             mtu,
             framing: Framing::Raw,
             gso: false,
+            bridge: None,
+            frame: Vec::new(),
         }
     }
 }
 
 /// A flow's writer: the descriptor clone plus the framing an emit owes it.
 pub(crate) struct PacketWriter {
-    handle: std::fs::File,
+    handle: Handle,
     framing: Framing,
     gso: bool,
+    bridge: Option<std::sync::Arc<crate::tun_tap::Bridge>>,
+    frame: Vec<u8>,
 }
 
 impl PacketWriter {
     pub(crate) fn write_packet(&mut self, packet: &[u8]) -> io::Result<bool> {
+        if let Some(bridge) = &self.bridge {
+            return write_bridged(&mut self.handle, bridge, &mut self.frame, packet);
+        }
         write_framed(&mut self.handle, self.framing, None, packet)
     }
 
@@ -960,9 +1249,47 @@ fn virtio_header(packet: &[u8], gso: Option<u16>) -> [u8; VIRTIO_NET_HDR_LEN] {
     header
 }
 
+/// One read from a TAP: an answer the bridge owes is written back, and a frame that carries no IP packet is read past.
+fn read_bridged(
+    handle: &mut Handle,
+    bridge: &crate::tun_tap::Bridge,
+    frame: &mut Vec<u8>,
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    loop {
+        if frame.len() < 65536 {
+            frame.resize(65536, 0);
+        }
+        let read = handle.read(frame)?;
+        match bridge.accept(&frame[..read]) {
+            crate::tun_tap::Accepted::Ip(packet) => {
+                let length = packet.len().min(buf.len());
+                buf[..length].copy_from_slice(&packet[..length]);
+                return Ok(length);
+            }
+            crate::tun_tap::Accepted::Reply(reply) => handle.write_all(&reply)?,
+            crate::tun_tap::Accepted::Ignore => {}
+        }
+    }
+}
+
+/// One packet write on a TAP: the link header names the peer and the device, and a packet that is not IP is dropped.
+fn write_bridged(
+    handle: &mut Handle,
+    bridge: &crate::tun_tap::Bridge,
+    frame: &mut Vec<u8>,
+    packet: &[u8],
+) -> io::Result<bool> {
+    if !bridge.frame(packet, frame) {
+        return Ok(false);
+    }
+    handle.write_all(frame)?;
+    Ok(true)
+}
+
 /// One packet write with the descriptor's framing in front of it, all-or-nothing: a full write is carried, a short or refused write is dropped.
 fn write_framed(
-    handle: &mut std::fs::File,
+    handle: &mut Handle,
     framing: Framing,
     gso: Option<u16>,
     packet: &[u8],
@@ -1012,7 +1339,7 @@ fn write_packet_to<W: Write>(writer: &mut W, packet: &[u8]) -> io::Result<bool> 
 #[cfg(unix)]
 impl AsRawFd for Device {
     fn as_raw_fd(&self) -> RawFd {
-        self.handle.as_raw_fd()
+        self.handle.fd()
     }
 }
 
@@ -1042,29 +1369,28 @@ fn inherited_framing(handle: &std::fs::File) -> Framing {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn inherited_framing(_handle: &std::fs::File) -> Framing {
     Framing::Utun
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "ios"))
+))]
 fn inherited_framing(_handle: &std::fs::File) -> Framing {
     Framing::Raw
 }
 
+#[cfg(unix)]
 fn inherited_handle() -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd;
     let fd_str = std::env::var_os("FERROX_TUN_FD")?;
     let fd: i32 = fd_str.to_str()?.parse().ok()?;
     if fd < 3 {
         return None;
     }
-    #[cfg(unix)]
-    return Some(unsafe { std::fs::File::from_raw_fd(fd) });
-    #[cfg(not(unix))]
-    {
-        let _ = fd;
-        None
-    }
+    Some(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// A Linux open refused the optional offload, so the same spec is retried without it.
@@ -1631,7 +1957,7 @@ pub(crate) type Associate = Arc<dyn Fn(Connection) + Send + Sync>;
 
 /// The device's one association: the control leg stays open for its life, as every other SOCKS front's does, and `relay` is where every flow's framed datagram is sent.
 struct Association {
-    control: Connection,
+    _control: Connection,
     relay: SocketAddr,
 }
 
@@ -1649,7 +1975,7 @@ impl Association {
                 )
             })?;
         Ok(Self {
-            control: association.control,
+            _control: association.control,
             relay: association.relay,
         })
     }
@@ -1710,12 +2036,16 @@ impl Flows {
     }
 }
 
-/// One leg in the shared datagram table: its id, the socket that frames its datagrams, and the
-/// direct relay it was opened for, so a dead control drops only the legs that rode that relay.
+/// One leg in the shared datagram table: its id, the socket that frames its datagrams, the
+/// direct relay it was opened for (so a dead control drops only the legs that rode it), and the
+/// association the leg opened for itself on the front lane, whose one accepted source is why two
+/// legs cannot share it.
 struct Leg {
     id: u64,
     socket: Arc<UdpSocket>,
     relay: Option<SocketAddr>,
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
+    association: Option<Association>,
 }
 
 /// The datagram table every queue reads: one leg per tuple, so a client's packets that hash to
@@ -1748,6 +2078,25 @@ impl Legs {
     fn relay_of(&self, key: &UdpKey) -> Option<SocketAddr> {
         self.table().get(key).and_then(|leg| leg.relay)
     }
+
+    #[cfg(all(test, unix))]
+    fn associations(&self) -> Vec<SocketAddr> {
+        self.table()
+            .values()
+            .filter_map(|leg| {
+                leg.association
+                    .as_ref()
+                    .map(|association| association.relay)
+            })
+            .collect()
+    }
+}
+
+/// Which lane a datagram leg frames at, or that a direct lane still opening holds it.
+enum Lane {
+    Direct(SocketAddr),
+    Front,
+    Hold,
 }
 
 /// The TUN handler: reads packets, relays each TCP flow and each UDP flow through the proxy outbound.
@@ -1766,9 +2115,10 @@ pub(crate) struct Handler {
     emit: Vec<u8>,
     /// The inline serve's buffer: sized once to one read's worth and never cleared, so an answer a queue takes keeps the flow thread's zeroing out of the hot path.
     served: Vec<u8>,
-    association: Option<Association>,
     /// The direct datagram lane this handler opened, kept alive by its control connection.
     direct_datagram: Option<crate::proxy::DirectDatagram>,
+    /// Set when the inbound can be removed through the API: the read loop checks it and the descriptor is nonblocking so an idle queue wakes.
+    stopping: Option<Arc<AtomicBool>>,
     /// The direct lane's association while a worker dials it: the dial and its handshake cost a
     /// network round trip, and the queue keeps dispatching while it is pending.
     opening: Option<mpsc::Receiver<Option<crate::proxy::DirectDatagram>>>,
@@ -1780,6 +2130,7 @@ pub(crate) struct Handler {
     direct_dead: Arc<AtomicBool>,
     udp_idle: std::time::Duration,
     endpoint_independent_nat: bool,
+    dns_hijack: Option<IpAddr>,
 }
 
 impl Handler {
@@ -1841,20 +2192,60 @@ impl Handler {
             frame: Vec::with_capacity(FRAME_CAP),
             emit,
             served: Vec::new(),
-            association: None,
             direct_datagram: None,
+            stopping: None,
             opening: None,
             datagram_retry: None,
             direct_dead: Arc::new(AtomicBool::new(false)),
             udp_idle: spec.udp_idle(),
             endpoint_independent_nat: spec.endpoint_independent_nat(),
+            dns_hijack: spec.dns_hijack(),
         }
+    }
+
+    /// `dns_mode: hijack`: a port-53 query rides the configured resolver, and the answer keeps the address the device asked for because only the frame's destination moves.
+    fn hijack(&self, destination: IpAddr, port: u16) -> IpAddr {
+        match self.dns_hijack {
+            Some(dns) if port == 53 => dns,
+            _ => destination,
+        }
+    }
+
+    /// Register the API's stop flag: a removed inbound sets it, and the queue returns instead of waiting for the next packet.
+    pub(crate) fn set_stopping(&mut self, stopping: Arc<AtomicBool>) {
+        self.stopping = Some(stopping);
     }
 
     pub(crate) fn serve(&mut self) -> io::Result<()> {
         let mut buf = vec![0u8; MAX_PACKET + 64];
+        // A removable inbound reads a nonblocking descriptor and polls only when it is empty; a queue with no stop keeps its blocking read.
+        #[cfg(unix)]
+        if self.stopping.is_some() {
+            self.device.set_nonblocking(true)?;
+        }
         loop {
-            let n = self.device.read_packet(&mut buf)?;
+            if self
+                .stopping
+                .as_ref()
+                .is_some_and(|flag| flag.load(Relaxed))
+            {
+                return Ok(());
+            }
+            let n = match self.device.read_packet(&mut buf) {
+                Ok(n) => n,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    // Android's `VpnService` hands back a nonblocking descriptor; a removable queue polls so the stop flag wakes it, and every other queue keeps its thread and reads again.
+                    #[cfg(unix)]
+                    if self.stopping.is_some() {
+                        self.device
+                            .wait_readable(std::time::Duration::from_millis(200))?;
+                        continue;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if n == 0 {
                 return Ok(());
             }
@@ -1892,25 +2283,18 @@ impl Handler {
             }
             self.datagram_retry = Some(std::time::Instant::now() + budgets::handshake());
         }
-        self.poll_datagram_lane();
-        if self.association.is_none() && self.direct_datagram.is_none() && self.opening.is_none() {
-            let direct_due = self
-                .datagram_retry
-                .is_none_or(|at| std::time::Instant::now() >= at);
-            if self.datagram.as_ref().is_some_and(Datagram::ready) && direct_due {
-                self.open_datagram_lane();
-            } else if let Ok(association) = Association::open(&self.associate) {
-                self.association = Some(association);
-            }
-        }
-        let (relay, direct_relay) = match (&self.direct_datagram, &self.association) {
-            (Some(direct), _) => (direct.relay, Some(direct.relay)),
-            (None, Some(association)) => (association.relay, None),
-            (None, None) => return Ok(()),
+        let target = SocketAddr::new(
+            self.hijack(ip.destination, udp.destination_port),
+            udp.destination_port,
+        );
+        // A hijacked query's answer must keep the address the device asked, so that address is the leg's render target while its frame carries the resolver.
+        let render = if self.hijack(ip.destination, udp.destination_port) == ip.destination {
+            None
+        } else {
+            Some((ip.destination, udp.destination_port))
         };
-        let target = SocketAddr::new(ip.destination, udp.destination_port);
-        // An endpoint-independent mapping keys on the client source alone; the frame still names each datagram's destination, and the reply's source comes back off that frame.
-        let (key, pinned) = if self.endpoint_independent_nat {
+        // An endpoint-independent mapping keys on the client source alone; the frame still names each datagram's destination, and the reply's source comes back off that frame. A hijacked query keeps its own key, because its answer names the address the device asked rather than the last frame the shared socket sent.
+        let (key, pinned) = if self.endpoint_independent_nat && render.is_none() {
             (
                 UdpKey {
                     source: ip.source,
@@ -1931,6 +2315,17 @@ impl Handler {
                 Some((ip.destination, udp.destination_port)),
             )
         };
+        // A tuple that already has a leg keeps it while the direct lane is still opening; only a datagram that needs a new association waits.
+        let direct_relay = if self.legs.table().contains_key(&key) {
+            None
+        } else {
+            self.poll_datagram_lane();
+            match self.leg_lane() {
+                Lane::Hold => return Ok(()),
+                Lane::Direct(relay) => Some(relay),
+                Lane::Front => None,
+            }
+        };
         let (id, leg) = {
             let mut table = self.legs.table();
             match table.entry(key) {
@@ -1940,10 +2335,20 @@ impl Handler {
                 }
                 std::collections::hash_map::Entry::Vacant(vacant) => {
                     let id = self.legs.next_id();
+                    // The front lane pins the first datagram source an association sees, so each leg opens its own association instead of sharing one relay and being refused as a second source.
+                    let (relay, association) = match direct_relay {
+                        Some(relay) => (relay, None),
+                        None => match Association::open(&self.associate) {
+                            Ok(association) => (association.relay, Some(association)),
+                            Err(_) => return Ok(()),
+                        },
+                    };
+                    let filter = pinned.map(|_| (target.ip(), target.port()));
                     let socket = Arc::new(open_leg(
                         &self.device,
                         relay,
-                        pinned,
+                        filter,
+                        render.or(pinned),
                         (ip.source, udp.source_port),
                         self.udp_idle,
                         key,
@@ -1954,6 +2359,7 @@ impl Handler {
                         id,
                         socket: Arc::clone(&socket),
                         relay: direct_relay,
+                        association,
                     });
                     (id, socket)
                 }
@@ -1970,6 +2376,26 @@ impl Handler {
             }
         }
         Ok(())
+    }
+
+    /// Which lane a new leg frames at: the open direct relay, the front lane when the config
+    /// names no direct lane or its refusal is waiting out the retry budget, and `None` while a
+    /// direct lane is opening, so the datagram is held rather than sent down the wrong lane.
+    fn leg_lane(&mut self) -> Lane {
+        let direct_due = self
+            .datagram_retry
+            .is_none_or(|at| std::time::Instant::now() >= at);
+        let ready = self.datagram.as_ref().is_some_and(Datagram::ready);
+        if self.direct_datagram.is_none() && self.opening.is_none() && ready && direct_due {
+            self.open_datagram_lane();
+        }
+        if let Some(direct) = self.direct_datagram.as_ref() {
+            return Lane::Direct(direct.relay);
+        }
+        if !ready || !direct_due {
+            return Lane::Front;
+        }
+        Lane::Hold
     }
 
     /// Start the direct datagram lane's association on a worker: the dial and the server's SOCKS
@@ -2096,27 +2522,36 @@ impl Handler {
                 // The response carried this segment's ack, so the standalone one would only repeat it, and the cursor stored is the one that left rather than whatever another queue advanced meanwhile.
                 flow.last_acked.store(ack, Relaxed);
             } else if fin || !payload.is_empty() || unacked > 0 {
-                let snd = flow.snd_nxt.load(Relaxed);
-                let rcv = flow.rcv_nxt.load(Relaxed);
-                let mut emit = std::mem::take(&mut self.emit);
-                render_tcp_packet_ip(
+                self.emit_ack(
+                    &flow,
                     (ip.destination, tcp.destination_port),
                     (ip.source, tcp.source_port),
-                    snd,
-                    rcv,
-                    FLAG_ACK,
-                    65535,
-                    &[],
-                    &[],
-                    false,
-                    &mut emit,
                 );
-                let _ = self.device.write_packet(&emit);
-                self.emit = emit;
-                flow.last_acked.store(rcv, Relaxed);
             }
         }
         Ok(())
+    }
+
+    /// Answer the bytes a segment left in the flow, carrying the cursor the flow holds for its own download.
+    fn emit_ack(&mut self, flow: &Flow, src: (IpAddr, u16), dst: (IpAddr, u16)) {
+        let snd = flow.snd_nxt.load(Relaxed);
+        let rcv = flow.rcv_nxt.load(Relaxed);
+        let mut emit = std::mem::take(&mut self.emit);
+        render_tcp_packet_ip(
+            src,
+            dst,
+            snd,
+            rcv,
+            FLAG_ACK,
+            65535,
+            &[],
+            &[],
+            false,
+            &mut emit,
+        );
+        let _ = self.device.write_packet(&emit);
+        self.emit = emit;
+        flow.last_acked.store(rcv, Relaxed);
     }
 
     /// Take the answer a request-and-reply earns, on the queue thread that still holds the flow, so the transaction costs no response-thread wake. A non-blocking read never waits and the stream hands each byte to exactly one reader, so a flow thread parked in its own read keeps what this leaves. A flow learns whether an answer is due: it waits one exchange window while answers have been landing, and a bulk upload's four misses cost a millisecond once and leave it one non-blocking read per segment.
@@ -2273,7 +2708,10 @@ impl Handler {
         ));
 
         // The lane comes first and the SYN-ACK follows it, so a refused edge never opens a half handshake and no segment outruns the pipe that carries it.
-        let target = SocketAddr::new(ip.destination, tcp.destination_port);
+        let target = SocketAddr::new(
+            self.hijack(ip.destination, tcp.destination_port),
+            tcp.destination_port,
+        );
         let destination = crate::proxy::Destination::from(target);
         let relay = Arc::clone(&self.relay);
         let dial = self.dial.clone();
@@ -2671,9 +3109,6 @@ impl Handler {
 impl Drop for Handler {
     /// The device is gone: closing the control leg ends the association, whose relay socket and reader threads would otherwise outlive the inbound that opened them.
     fn drop(&mut self) {
-        if let Some(association) = self.association.take() {
-            let _ = association.control.shutdown(Shutdown::Both);
-        }
         if let Some(direct) = self.direct_datagram.take() {
             let _ = direct.control.shutdown(Shutdown::Both);
         }
@@ -2719,6 +3154,7 @@ fn refuse_flow(
 fn open_leg(
     device: &Device,
     relay: SocketAddr,
+    filter: Option<(IpAddr, u16)>,
     pinned: Option<(IpAddr, u16)>,
     client: (IpAddr, u16),
     idle: std::time::Duration,
@@ -2732,6 +3168,7 @@ fn open_leg(
     let mtu = device.mtu;
     let ended = ended.clone();
     let (client_bytes, client_len) = addr_octets(client.0);
+    let filter = filter.map(|(ip, port)| SocketAddr::new(ip, port));
     let target = pinned.map(|(ip, port)| SocketAddr::new(ip, port));
     std::thread::spawn(move || {
         let mut buf = crate::proxy::udp_buffer();
@@ -2740,7 +3177,7 @@ fn open_leg(
             let Some((source, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
                 continue;
             };
-            if target.is_some_and(|target| source != target) {
+            if filter.is_some_and(|filter| source != filter) {
                 continue;
             }
             let (endpoint, source_port) = target.map_or((source.ip(), source.port()), |target| {
@@ -2824,6 +3261,68 @@ mod tests {
         assert!(Spec::with(None, None, None, Some(0), None)
             .validate()
             .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spec_fd_opens_the_inherited_descriptor_once() {
+        use std::os::fd::IntoRawFd;
+        let (held, _peer) = UnixStream::pair().expect("pair");
+        held.set_nonblocking(true).expect("nonblocking");
+        let fd = held.into_raw_fd();
+        // `dup` shares the file-status flags, so the host's mode is left as it is: an Android descriptor stays nonblocking and the serve loop retries `WouldBlock`.
+        let spec = Spec::new(None, None).with_fd(Some(fd));
+        let devices = Device::open_all(&spec).expect("the descriptor opens");
+        assert_eq!(devices.len(), 1, "one descriptor is one queue");
+        assert_eq!(devices[0].name(), "");
+        assert_ne!(devices[0].raw_fd(), fd, "the descriptor is duplicated");
+        let flags = unsafe { libc::fcntl(devices[0].raw_fd(), libc::F_GETFL) };
+        assert_ne!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "the shared mode is not changed on either descriptor"
+        );
+        let host = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_ne!(
+            host & libc::O_NONBLOCK,
+            0,
+            "the host's own flags are left alone"
+        );
+        unsafe { libc::close(fd) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN; ci.yml runs it as root"]
+    fn a_real_tun_device_opens_and_names_itself() {
+        let name = format!("fxt{}", std::process::id() % 10000);
+        let spec = Spec::new(Some(&name), Some(1500))
+            .with_addresses(vec![("192.0.2.1".parse().unwrap(), 24)]);
+        let (device, _, _) =
+            crate::tun_stack::build(&spec, false, false).expect("create a real TUN device");
+        assert_eq!(device.name().expect("the kernel names the device"), name);
+        device.set_nonblocking(true).expect("poll the device");
+        let mut buf = [0u8; 2048];
+        // The kernel may emit neighbour discovery for the fresh address; drain it until the queue is empty.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match device.recv(&mut buf) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("read the idle device: {error}"),
+                Ok(_) if std::time::Instant::now() < deadline => {}
+                Ok(_) => break,
+            }
+        }
+    }
+
+    #[test]
+    fn a_spec_carries_the_tap_and_the_peer_half() {
+        let spec = Spec::new(None, None).with_tap(true, Some("feth9"));
+        assert!(spec.tap());
+        assert_eq!(spec.peer(), Some("feth9"));
+        let off = spec.with_tap(false, None);
+        assert!(!off.tap());
+        assert_eq!(off.peer(), None);
     }
 
     #[test]
@@ -3000,10 +3499,13 @@ mod tests {
             Ok(())
         });
         let device = Device {
-            handle: a,
+            handle: Handle::File(a),
+            name: String::new(),
             mtu: 100,
             framing: Framing::Virtio,
             gso: true,
+            bridge: None,
+            frame: Vec::new(),
         };
         let mut handler = Handler::new(device, relay, no_associate());
         let client = (SCRIPT_CLIENT, 51001);
@@ -3285,7 +3787,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_framed_packet_takes_one_write() {
-        let (mut writer, mut reader) = unix_socketpair().unwrap();
+        let (writer, mut reader) = unix_socketpair().unwrap();
+        let mut writer = Handle::File(writer);
         let packet = [0x45u8; 20];
         for framing in [Framing::Raw, Framing::Utun, Framing::Virtio] {
             let mut expected = match framing {
@@ -4567,6 +5070,78 @@ mod tests {
         assert_eq!(got, expected, "the dial set is the reference's own");
     }
 
+    /// `dns_mode: hijack` on TCP: the lane dials the resolver, while the answer leaves the device
+    /// with the address the flow asked for as its source.
+    #[cfg(unix)]
+    #[test]
+    fn a_hijacked_tcp_flow_dials_the_resolver_and_answers_from_the_asked_address() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let (upstream, mut lane) = UnixStream::pair().unwrap();
+        lane.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let dialed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let seen = Arc::clone(&dialed);
+        let dial: Dial = Arc::new(move |dest| {
+            *seen.lock().unwrap() = Some(dest.authority());
+            DialOutcome::Direct(Connection::from(upstream.try_clone().unwrap()))
+        });
+        let spec =
+            Spec::new(None, None).with_dns_hijack(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 53))));
+        let mut handler = Handler::on(
+            Device::from_handle(a, DEFAULT_MTU),
+            Arc::new(|_conn, _lane, _dest| Ok(())),
+            no_associate(),
+            Some(dial),
+            None,
+            Flows::default(),
+            Legs::default(),
+            &spec,
+        );
+
+        let client = ([10, 0, 0, 2], 44444);
+        let endpoint = ([8, 8, 8, 8], 53);
+        let syn = build_tcp_packet(client, endpoint, 1, 0, FLAG_SYN, 65535, &[]);
+        peer.write_all(&syn).unwrap();
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+        let syn_ack = next_syn_ack(&mut peer);
+        assert_eq!(
+            dialed.lock().unwrap().as_deref(),
+            Some("203.0.113.53:53"),
+            "the lane dials the configured resolver"
+        );
+
+        let ack = syn_ack.seq.wrapping_add(1);
+        let request = build_tcp_packet(
+            client,
+            endpoint,
+            2,
+            ack,
+            FLAG_PSH | FLAG_ACK,
+            65535,
+            b"ping",
+        );
+        peer.write_all(&request).unwrap();
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+        let mut got = [0u8; 4];
+        lane.read_exact(&mut got).unwrap();
+        let (ack, _) = next_tcp_packet(&mut peer, &mut buf);
+        assert_eq!(ack.flags, FLAG_ACK);
+
+        lane.write_all(b"pong").unwrap();
+        let n = next_datagram(&mut peer, &mut buf);
+        let (ip, body) = ipv4_head(&buf[..n]).unwrap();
+        assert_eq!(
+            (ip.source, ip.destination),
+            ([8, 8, 8, 8], SCRIPT_CLIENT),
+            "the answer keeps the address the flow asked"
+        );
+        let (_, payload) = tcp_head(body).unwrap();
+        assert_eq!(payload, b"pong");
+    }
+
     /// The direct lane's whole path: the device's bytes reach the dialed stream, the stream's
     /// answer leaves as the device's next segment, and the close that ends it is the stream's own.
     #[cfg(unix)]
@@ -4991,6 +5566,110 @@ mod tests {
         assert_eq!(payload, b"who-is");
     }
 
+    /// `dns_mode: hijack`: the frame names the configured resolver while the answer keeps the
+    /// address the device asked, because only the destination handed to the leg moves.
+    #[cfg(unix)]
+    #[test]
+    fn a_hijacked_query_rides_the_dns_server_and_the_answer_keeps_its_address() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+        let spec =
+            Spec::new(None, None).with_dns_hijack(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 53))));
+        let mut handler = Handler::on(
+            Device::from_handle(a, DEFAULT_MTU),
+            relay,
+            echo_associate(frames.clone()),
+            None,
+            None,
+            Flows::default(),
+            Legs::default(),
+            &spec,
+        );
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let query = datagram(SCRIPT_CLIENT, [198, 51, 100, 7], 51500, 53, b"who-is");
+        peer.write_all(&query).unwrap();
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+
+        let mut want = vec![0u8, 0, 0, 1, 203, 0, 113, 53, 0, 53];
+        want.extend_from_slice(b"who-is");
+        wait_for_frames(&frames, 1);
+        assert_eq!(
+            frames.lock().unwrap().first().map(Vec::as_slice),
+            Some(want.as_slice()),
+            "the association carries the query to the configured resolver"
+        );
+
+        let n = next_datagram(&mut peer, &mut buf);
+        let (ip, _) = ipv4_head(&buf[..n]).unwrap();
+        assert_eq!(
+            (ip.source, ip.destination),
+            ([198, 51, 100, 7], SCRIPT_CLIENT),
+            "the answer keeps the address the device asked"
+        );
+    }
+
+    /// Endpoint-independent NAT does not fold hijacked queries together: each asked address keeps a leg, so an answer names the address its own query asked.
+    #[cfg(unix)]
+    #[test]
+    fn a_hijacked_query_keeps_its_own_leg_under_endpoint_independent_nat() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+        let spec = Spec::new(None, None)
+            .with_endpoint_independent_nat(true)
+            .with_dns_hijack(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 53))));
+        let mut handler = Handler::on(
+            Device::from_handle(a, DEFAULT_MTU),
+            relay,
+            echo_associate(frames.clone()),
+            None,
+            None,
+            Flows::default(),
+            Legs::default(),
+            &spec,
+        );
+        let asked = [
+            ([198, 51, 100, 7], &b"one"[..]),
+            ([203, 0, 113, 9], &b"two"[..]),
+        ];
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        for (destination, payload) in asked {
+            let query = datagram(SCRIPT_CLIENT, destination, 51500, 53, payload);
+            peer.write_all(&query).unwrap();
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+        }
+        assert_eq!(
+            handler.legs.len(),
+            2,
+            "each asked address keeps its own leg"
+        );
+        wait_for_frames(&frames, 2);
+        let on_wire = frames.lock().unwrap().clone();
+        for (destination, payload) in asked {
+            let mut want = vec![0u8, 0, 0, 1, 203, 0, 113, 53, 0, 53];
+            want.extend_from_slice(payload);
+            assert!(
+                on_wire.iter().any(|frame| frame == &want),
+                "the query to {destination:?} rides the resolver"
+            );
+        }
+        let mut sources = Vec::new();
+        for _ in 0..asked.len() {
+            let n = next_datagram(&mut peer, &mut buf);
+            let (ip, _) = ipv4_head(&buf[..n]).unwrap();
+            sources.push(ip.source);
+        }
+        sources.sort_unstable();
+        assert_eq!(
+            sources,
+            vec![[198, 51, 100, 7], [203, 0, 113, 9]],
+            "each answer keeps the address its own query asked"
+        );
+    }
+
     /// A direct datagram lane frames the outbound's own relay and renders its answer without the
     /// front's loopback association: the handler writes the same RFC 1928 request the association
     /// path writes, and the leg reader turns the relay's framed answer back into a device packet.
@@ -5242,6 +5921,37 @@ mod tests {
         }
         wait_for_frames(&frames, 2);
         assert_eq!(handler.legs.len(), 2, "one leg per destination");
+    }
+
+    /// The front pins the first datagram source it sees, so every leg opens its own association: two destinations must name two relay addresses.
+    #[cfg(unix)]
+    #[test]
+    fn each_front_leg_names_its_own_association() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay: Relay = Arc::new(|_conn, _lane, _dest| Ok(()));
+        let mut handler = Handler::on(
+            Device::from_handle(a, DEFAULT_MTU),
+            relay,
+            echo_associate(frames.clone()),
+            None,
+            None,
+            Flows::default(),
+            Legs::default(),
+            &Spec::new(None, None),
+        );
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        for destination in [[198, 51, 100, 7], [203, 0, 113, 9]] {
+            let query = datagram(SCRIPT_CLIENT, destination, 51500, 53, b"x");
+            peer.write_all(&query).unwrap();
+            let n = handler.device.read_packet(&mut buf).unwrap();
+            handler.dispatch(&buf[..n]).unwrap();
+        }
+        wait_for_frames(&frames, 2);
+        let mut relays = handler.legs.associations();
+        relays.sort_unstable();
+        relays.dedup();
+        assert_eq!(relays.len(), 2, "each leg names its own association relay");
     }
 
     /// A recording association: the SOCKS5 UDP server the device's leg reaches, but
